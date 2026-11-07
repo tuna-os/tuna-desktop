@@ -88,6 +88,16 @@ for parent_mode in none x11 wayland; do
         done
     done
 done
+# GTK3 uses its installed public GDK exporter against the same real provider,
+# with live-parent input controls and an actually revoked handle negative.
+python3 /repo/scripts/lib/tuna-gtk3-portal-proof.py /out
+browser="$(command -v chromium-browser || command -v chromium)"
+python3 /repo/scripts/tuna-toplevel-drag-proof --browser "$browser" \
+    --compositor-pid "$compositor_pid" --state "$TUNA_COMPOSITOR_STATE" \
+    --artifacts /out/toplevel-drag-browser --input-display "$DISPLAY" \
+    --wayland-display "$WAYLAND_DISPLAY" \
+    --source-revision "$(cat /out/observer-source-revision.txt)" \
+    --source-status /out/observer-source-status.txt
 python3 /repo/scripts/lib/tuna-nautilus-file-operations.py > /out/nautilus-operations.log 2>&1
 if grep -qE 'Failed to open service channel Wayland connection|Compositor service channel missing' /out/nautilus.log; then
     cat /out/nautilus.log

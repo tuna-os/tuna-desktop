@@ -308,6 +308,8 @@ pub struct GlesRenderer {
     // textures the current frame read without a fence yet, and scratch space for the fence each
     // one had; see `fence_frame_reads`
     frame_reads: Vec<(GlesTexture, Option<Arc<ReadFence>>)>,
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    accessed_buffers: Vec<super::utils::Buffer>,
 
     // cleanup
     destruction_callback: Receiver<CleanupResource>,
@@ -639,6 +641,8 @@ impl GlesRenderer {
             non_opaque_damage: Vec::with_capacity(16),
             opaque_damage: Vec::with_capacity(16),
             frame_reads: Vec::with_capacity(16),
+            #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+            accessed_buffers: Vec::new(),
 
             destruction_callback: rx,
             destruction_callback_sender: tx,
@@ -2326,6 +2330,23 @@ impl Frame for GlesFrame<'_, '_> {
         self.renderer.wait(sync)
     }
 
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    fn note_buffer_access(&mut self, buffer: &super::utils::Buffer) -> Result<(), Self::Error> {
+        let Some(acquire) = buffer.acquire_point() else {
+            return Ok(());
+        };
+        if !self
+            .renderer
+            .accessed_buffers
+            .iter()
+            .any(|held| held.same_commit(buffer))
+        {
+            self.renderer.wait(&SyncPoint::from(acquire.clone()))?;
+            self.renderer.accessed_buffers.push(buffer.clone());
+        }
+        Ok(())
+    }
+
     #[profiling::function]
     fn finish(mut self) -> Result<SyncPoint, Self::Error> {
         self.finish_internal()
@@ -2361,7 +2382,12 @@ impl GlesFrame<'_, '_> {
                 unsafe {
                     self.renderer.gl.Flush();
                 }
-                return Ok(SyncPoint::from(fence));
+                let sync = SyncPoint::from(fence);
+                #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+                for buffer in self.renderer.accessed_buffers.drain(..) {
+                    buffer.set_release_fence(sync.clone());
+                }
+                return Ok(sync);
             }
         }
 
@@ -2369,6 +2395,8 @@ impl GlesFrame<'_, '_> {
         unsafe {
             self.renderer.gl.Finish();
         }
+        #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+        self.renderer.accessed_buffers.clear();
         Ok(SyncPoint::signaled())
     }
 

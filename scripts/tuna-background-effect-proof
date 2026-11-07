@@ -1,0 +1,120 @@
+#!/usr/bin/python3
+"""Real Wayland shm blur proof in an already-owned graphical session.
+
+Requires Pillow, a built tuna-background-effect-client, and a capture command
+(JSON argv) containing {output}. That command must capture the actual compositor
+output to PNG, not a fixture/client buffer. No compositor or VM is started here.
+Run only in approved CI or the caller's owned Corral VM. Keep the cursor outside
+the proof window; disable animations, colour filters and scaling for this SDR
+pixel comparison. This is not an HDR-output/FP16 qualification receipt.
+
+Example capture argv: '["grim", "{output}"]' where screencopy is available;
+otherwise use the session's trusted portal/native output capture helper.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import select
+import subprocess
+import sys
+import time
+from PIL import Image
+from lib.background_effect_oracle import STEPS, locate, require, verify
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--client", type=Path, required=True)
+    parser.add_argument("--artifacts", type=Path, required=True)
+    parser.add_argument("--capture-argv", required=True, help="JSON argv containing {output}; no shell")
+    args = parser.parse_args()
+    capture = json.loads(args.capture_argv)
+    require(isinstance(capture, list) and capture and all(isinstance(item, str) for item in capture), "invalid capture argv")
+    require(any("{output}" in item for item in capture), "capture argv lacks {output}")
+    artifact = args.artifacts.resolve()
+    artifact.mkdir(parents=True, exist_ok=False)
+    client_path = args.client.resolve(strict=True)
+    stderr = (artifact / "client.stderr").open("w")
+    receipts, images = [], {}
+    process = subprocess.Popen([str(client_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=stderr, text=True, bufsize=1)
+
+    def receipt():
+        ready, _, _ = select.select([process.stdout], [], [], 20)
+        require(ready, "timed out waiting for actual client frame/protocol receipt")
+        line = process.stdout.readline()
+        require(line, f"consumer exited without a receipt (status {process.poll()})")
+        result = json.loads(line)
+        receipts.append(result)
+        if result.get("result") == "unsupported":
+            raise Unsupported(result["reason"])
+        return result
+
+    def command(name):
+        process.stdin.write(name + "\n")
+        process.stdin.flush()
+        result = receipt()
+        require(result.get("command") == name and result.get("result") == "command-applied", "unexpected command receipt")
+
+    def screenshot(name):
+        # Callback precedes scanout on some paths; allow presentation/capture
+        # to settle. Pixel assertions, not this delay, decide success.
+        time.sleep(.15)
+        path = artifact / f"{name}.png"
+        subprocess.run([item.replace("{output}", str(path)) for item in capture], check=True, timeout=20)
+        with Image.open(path) as image:
+            images[name] = image.convert("RGB")
+
+    result = {"result": "failed", "qualification": "real-wayland-sdr-output-pixels",
+              "hdr_precision_qualified": False,
+              "client_sha256": hashlib.sha256(client_path.read_bytes()).hexdigest(),
+              "wayland_display": os.environ.get("WAYLAND_DISPLAY"), "capture_argv": capture}
+    code = 1
+    try:
+        require(receipt().get("result") == "ready", "consumer did not map real buffers")
+        screenshot("off")
+        rect = locate(images["off"])
+        for operation, name in STEPS[1:]:
+            command(operation)
+            screenshot(name)
+        result.update(verify(images, rect))
+        result.update(result="passed", content_rect=list(rect))
+        code = 0
+    except Unsupported as error:
+        result.update(result="unsupported", reason=str(error))
+        code = 77
+    except Exception as error:
+        result.update(result="failed", reason=str(error))
+    finally:
+        if process.poll() is None:
+            try:
+                process.stdin.write("quit\n")
+                process.stdin.flush()
+                process.wait(timeout=5)
+            except (BrokenPipeError, subprocess.TimeoutExpired):
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        stderr.close()
+        result["consumer_exit"] = process.returncode
+        if code == 0 and process.returncode != 0:
+            result.update(result="failed", reason="consumer failed during teardown")
+            code = 1
+        (artifact / "receipts.json").write_text(json.dumps(receipts, indent=2) + "\n")
+        (artifact / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result))
+    return code
+
+
+class Unsupported(RuntimeError):
+    pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

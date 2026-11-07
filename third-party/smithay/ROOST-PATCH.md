@@ -140,6 +140,132 @@ nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
 
+Issue #364 changes src/wayland/shell/xdg/mod.rs: xdg_wm_base is created at
+version 7, as Mutter 51 advertises it (META_XDG_WM_BASE_VERSION). Version 7
+adds only the four xdg_toplevel constrained_* states. A configure keeps
+every state a client's bind can name and drops the rest: tiled states below
+version 2, suspended below 6 and constrained below 7, the same version
+gates as Mutter's fill_states (meta-wayland-xdg-shell.c). Roost sets the
+states from Mutter's edge constraints. Real-client tests in
+crates/compositor/tests/windows.rs and
+crates/compositor/tests/support/xdg_version_boundaries.rs bind versions 7 and 6
+and consume actual configure arrays through layout changes, repeated requests,
+simultaneous binds and teardown/replacement.
+
+The same patch validates the locked XML's required request/error boundaries in
+handlers/surface.rs and handlers/surface/toplevel.rs. Nonpositive window
+geometry reports xdg_surface.InvalidSize; negative min/max hints report
+xdg_toplevel.InvalidSize before constructing a Size. Final double-buffered
+min/max relations are checked at commit, not eagerly between valid requests;
+zero maxima remain unbounded. Unknown, consumed or stale configure serials
+report xdg_surface.InvalidSerial on the actual surface. The pinned Mutter
+source instead warns/ignores invalid geometry and handles ACKs differently;
+these XML-required errors are not claimed to match that implementation.
+Socket consumers exercise the exact error target/code and valid double-buffered
+changes, rather than constructing expected enum sets. The isolated diff is
+retained in XDG-WM-BASE-7-PATCH.diff; the pinned version stays 0.7.0.
+
+Issue #364 additionally changes src/wayland/xdg_foreign/mod.rs and
+handlers.rs: zxdg_exporter_v1 and zxdg_importer_v1 join the v2 globals,
+sharing one handle table, as Mutter's meta-wayland-legacy-xdg-foreign.c
+calls the same export and import functions as v2. GTK 3 exports with v1 and
+the portal imports with v2, so each version imports the other's handles.
+Each import now parents at most one child (Mutter's imported->parent_of;
+upstream kept one child per export, so a second importer replaced the
+first's relationship), and revoking an export sends destroyed to every
+import and clears the parents they set, as meta_wayland_xdg_exported_destroy
+does; upstream only cleared the parent. An import of an unknown handle is
+destroyed at once, as before. An invalid v1 parent posts error 0 on the
+import, Mutter's WL_DISPLAY_ERROR_INVALID_OBJECT, since zxdg_imported_v1 has
+no error enum. Real socketpair tests in
+crates/compositor/tests/protocol_gaps.rs cover v1 export with v2 import, v2
+export with v1 import, revocation and unknown handles. The isolated diff is
+retained in XDG-FOREIGN-V1-PATCH.diff; the pinned version stays 0.7.0.
+
+Issues #364 and #588 change src/wayland/drm_lease/mod.rs, with a crate-private
+accessor in src/backend/drm/device/mod.rs and a crate-private re-export in
+src/backend/drm/mod.rs, for wp_drm_lease_device_v1 as Mutter 51 offers it
+(meta-wayland-drm-lease.c, meta-drm-lease.c). DrmLeaseBuilder is now Clone
+and shares its device's plane claims: a compositor keeps an empty builder and
+claims planes on a clone (DrmLeaseBuilder::claim_plane) when a request
+arrives, as the lease handler has no access to the DrmDevice. The additive
+DrmLeaseState::revoke_lease ends a lease from the compositor's side (finished,
+connectors offered again), for Mutter's update_leases (a lessee the kernel
+destroyed because its client closed the lease fd) and update_connectors (a
+leased connector unplugged). Request validation follows
+wp_drm_lease_request_request_connector and wp_drm_lease_request_submit: a
+connector of another lease device posts wrong_device and a repeated one
+duplicate_connector when it is requested (upstream checked only at submit
+and posted wrong_device for a withdrawn connector); an empty submit posts
+empty_lease and stops (upstream went on to call the handler); a connector
+withdrawn since it was requested fails the lease with finished. A binding
+that cannot open a non-master DRM fd stays pending without events, as
+Mutter's lease_device_bind keeps it, until
+DrmLeaseState::retry_pending_binds (session activation); upstream sent the
+released destructor from inside the bind, which made wayland-backend panic
+on the destroyed object, and refused to create the global when the
+compositor could not open the node, where Mutter advertises it anyway.
+drm-smoke's D-LEASE leases the vkms connector through it with a real
+client. The isolated diff is retained in DRM-LEASE-PATCH.diff; the pinned
+version stays 0.7.0.
+
+Connector withdrawal only retires its public offer, never the active kernel
+lease reference. A failed revoke therefore keeps its resource ownership across
+unplug/reappearance and session resume; newly reappearing connectors stay
+disabled until revocation succeeds. The compositor withdraws disappeared offers
+before revoking their leases, avoiding a transient re-offer during unplug.
+Live connector announcements use the same metadata and connector `done`
+boundary as bind/resume. The real D-LEASE client rejects device `done` before
+every live connector has completed its own metadata.
+
+Issues #364 and #588 additionally change
+src/wayland/selection/data_device/mod.rs and dnd_grab.rs for
+xdg_toplevel_drag_v1, which Roost implements outside Smithay
+(crates/compositor/src/toplevel_drag.rs). Mutter's drag_grab_release
+(meta-wayland-data-device.c) reports dnd_drop_performed to the source of a
+drag that moves a toplevel before it resolves the drop, then cancels the
+source as usual when no target accepted; upstream reports dnd_drop_performed
+only after an accepted drop. The additive
+ClientDndGrabHandler::drop_performed_without_target hook, asked once on a
+release that was not cancelled while the source lives, lets the handler opt a
+drag in: the source then hears dnd_drop_performed before the target's drop,
+exactly once, and cancelled afterwards if nothing accepted. The default
+returns false, keeping upstream behaviour for every other drag; Escape
+cancellation never reports a drop. Real socketpair tests in
+crates/compositor/tests/protocol_gaps.rs cover an unaccepted and an accepted
+toplevel drag drop. The isolated diff is retained in
+XDG-TOPLEVEL-DRAG-PATCH.diff; the pinned version stays 0.7.0.
+
+Issues #364 and #588 change src/wayland/drm_syncobj/mod.rs: a commit on a
+surface with a wp_linux_drm_syncobj_surface_v1 is checked as Mutter 51's
+meta_wayland_surface_explicit_sync_validate (meta-wayland-linux-drm-syncobj.c)
+does, and as the protocol's "if and only if" requires: a non-dmabuf buffer
+is unsupported_buffer whether or not points are set; a dmabuf without an
+acquire point is no_acquire_point (upstream let it through), then
+no_release_point; on one timeline acquire must be below release
+(conflicting_points); a point without a buffer is no_buffer (upstream
+called a lone release point no_acquire_point). Only the first error is
+posted. The check is the public pure function commit_error, with
+pending_commit_error reading it from a surface's pending state, so Roost's
+acquire-point pre-commit hook skips commits the check refuses. Unit tests in
+crates/compositor/src/explicit_sync.rs cover every case; real socketpair
+tests in crates/compositor/tests/protocol_gaps.rs cover surface_exists,
+invalid_timeline, unsupported_buffer and no_acquire_point. The isolated
+diff is retained in DRM-SYNCOBJ-PATCH.diff; the pinned version stays 0.7.0.
+
+Issues #364 and #89 change src/xwayland/xwm/mod.rs and surface.rs: the XWM
+interns `_XWAYLAND_MAY_GRAB_KEYBOARD` and records a client message of that
+type for a known window (data.l[0] non-zero allows, zero revokes), read with
+the additive `X11Surface::xwayland_may_grab_keyboard`. This is Mutter 51's
+`xwayland-may-grab-keyboard` window property, set from the same client
+message in src/x11/events.c; `meta_xwayland_grab_is_granted` grants a
+zwp_xwayland_keyboard_grab_v1 to such a window unless a deny rule matches.
+Smithay's xwayland_keyboard_grab module is used unchanged (its global is
+already visible to the Xwayland client only); Roost overrides its grab
+handler. The real Xwayland test in crates/compositor/src/xwayland_grab.rs
+sends the message from an X11 client. The isolated diff is retained in
+XWAYLAND-MAY-GRAB-PATCH.diff; the pinned version stays 0.7.0.
+
 Issue #364 additionally changes `src/wayland/input_method/{mod.rs,
 input_method_handle.rs,input_method_keyboard_grab.rs}`. Registry visibility
 and forced binds both enforce the compositor's input-method admission

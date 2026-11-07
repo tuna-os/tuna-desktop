@@ -337,6 +337,11 @@ impl Frame for GlowFrame<'_, '_> {
         self.frame.as_mut().unwrap().wait(sync)
     }
 
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    fn note_buffer_access(&mut self, buffer: &super::utils::Buffer) -> Result<(), Self::Error> {
+        self.frame.as_mut().unwrap().note_buffer_access(buffer)
+    }
+
     #[profiling::function]
     fn finish(mut self) -> Result<sync::SyncPoint, Self::Error> {
         self.finish_internal()

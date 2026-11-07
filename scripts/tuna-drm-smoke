@@ -10,6 +10,8 @@
 # minus real hardware. Asserts on state, not pixels:
 #   D-OUTPUT   the backend lit the vkms connector
 #   D-SHELL    the shell connected over the control socket (introspection)
+#   D-SYNCOBJ  explicit sync stays unadvertised on vkms, which has no
+#              timeline syncobjs (Mutter's check, P-SY-09)
 #   D-IDLE     an unchanged scene stops redundant scanout submissions
 #   D-FRAMES   a real active Wayland client receives 240 page-flip presentations
 #   D-SCALE    a GNOME monitors.xml giving the connector scale 2 is
@@ -36,6 +38,13 @@
 #              keybinding actions, strip keybindings, the pad OSD in the
 #              GTK shell (help button, org.gnome.Shell.Wacom.PadOsd),
 #              hotplug, and nothing reaching the client while locked
+#   D-LEASE    wp_drm_lease_device_v1 version 1 is advertised on the native
+#              session with a DRM fd and no connector: vkms' only connector
+#              is a desktop one. With TUNA_DEBUG_LEASE_CONNECTORS naming it
+#              (Mutter's MUTTER_DEBUG_LEASE_CONNECTORS), it stays off the
+#              desktop and is offered; a lease's fd holds it and one CRTC,
+#              it is withdrawn while leased, and it is offered again after
+#              the client destroys the lease or closes the lease fd
 # and captures a scanout screenshot with ffmpeg kmsgrab when possible.
 # Needs root (sudo) for modprobe, seatd and uinput. Exits nonzero on any failure.
 set -eu
@@ -68,9 +77,20 @@ SYSTEM_BUS_PID=""
 CALIBRATION_PID=""
 EMU_PID=""
 CLIENT_PID=""
+CARD_ACL=""
+CARD_RULE=""
+LEASE_OBSERVER_PID=""
+LEASE_FORCED_STATUS=""
 
 cleanup() {
     if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
+    if [ -n "$LEASE_OBSERVER_PID" ]; then
+        kill "$LEASE_OBSERVER_PID" 2>/dev/null || true
+        wait "$LEASE_OBSERVER_PID" 2>/dev/null || true
+    fi
+    if [ -n "$LEASE_FORCED_STATUS" ]; then
+        printf 'detect\n' | sudo tee "$LEASE_FORCED_STATUS" >/dev/null || true
+    fi
     # The emulator (root) exits when its command pipe closes.
     exec 8>&- 2>/dev/null || true
     if [ -n "$EMU_PID" ]; then wait "$EMU_PID" 2>/dev/null || true; fi
@@ -82,6 +102,11 @@ cleanup() {
     if [ -n "$SEATD_PID" ]; then sudo kill "$SEATD_PID" 2>/dev/null || true; fi
     # Put a stopped system seatd back exactly as we found it.
     if [ -n "$SYSTEM_SEATD" ]; then sudo systemctl start seatd 2>/dev/null || true; fi
+    if [ -n "$CARD_ACL" ]; then
+        sudo rm -f "$CARD_RULE"
+        sudo udevadm control --reload 2>/dev/null || true
+        sudo setfacl -x "u:$(id -un)" "$CARD_ACL" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT INT TERM
 
@@ -155,10 +180,34 @@ for dev in /sys/class/drm/card*; do
 done
 [ -n "$CARD" ] || { echo "tuna-drm-smoke: no vkms card appeared" >&2; exit 1; }
 echo "tuna-drm-smoke: vkms at $CARD"
+# A logind seat session gets read-write access to its card through udev's
+# uaccess ACL; seatd only hands the compositor its master fd. The lease
+# device opens its own non-master fd for clients, as Mutter does
+# (meta_kms_impl_device_open_non_privileged_fd), so grant the same ACL.
+# udev's uaccess builtin flushes foreign ACL entries on every change event
+# (each lease is one), so a runtime rule re-applies it after the builtin.
+CARD_RULE="/run/udev/rules.d/99-tuna-drm-smoke-$(basename "$CARD").rules"
+CARD_ACL="$CARD"
+sudo mkdir -p /run/udev/rules.d
+echo "SUBSYSTEM==\"drm\", KERNEL==\"$(basename "$CARD")\", RUN+=\"/usr/bin/setfacl -m u:$(id -un):rw \$devnode\"" |
+    sudo tee "$CARD_RULE" >/dev/null
+sudo udevadm control --reload 2>/dev/null || true
+sudo setfacl -m "u:$(id -un):rw" "$CARD"
 
 echo "tuna-drm-smoke: building"
 cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk
 "$ROOT/scripts/tuna-frame-pacer-build" "$ARTIFACTS/frame-pacer"
+# D-LEASE's client, built like the frame pacer from the system protocol XML.
+LEASE_PROBE="$ARTIFACTS/lease-probe/tuna-drm-lease-probe"
+mkdir -p "$ARTIFACTS/lease-probe"
+lease_xml="$(pkg-config --variable=pkgdatadir wayland-protocols)/staging/drm-lease/drm-lease-v1.xml"
+wayland-scanner client-header "$lease_xml" "$ARTIFACTS/lease-probe/drm-lease-v1-client-protocol.h"
+wayland-scanner private-code "$lease_xml" "$ARTIFACTS/lease-probe/drm-lease-v1-protocol.c"
+# pkg-config emits compiler and linker arguments, split on purpose.
+# shellcheck disable=SC2046
+cc -std=c11 -O2 -Wall -Wextra -Werror $(pkg-config --cflags wayland-client libdrm) -I "$ARTIFACTS/lease-probe" \
+    "$ROOT/scripts/lib/tuna-drm-lease-probe.c" "$ARTIFACTS/lease-probe/drm-lease-v1-protocol.c" \
+    $(pkg-config --libs wayland-client libdrm) -o "$LEASE_PROBE"
 
 # seatd always serves /run/seatd.sock (and removes a leftover one), so a
 # running system seatd is stopped for the test and restarted on exit.
@@ -200,6 +249,12 @@ until [ -s "$STATE" ] && jq -e '.revision != null' "$STATE" >/dev/null 2>&1; do
     sleep 0.2
 done
 pass D-SHELL "shell connected (revision $(jq .revision "$STATE"))"
+# Explicit sync (P-SY-09): the renderer on vkms has no timeline syncobjs,
+# so, as Mutter, the compositor creates no wp_linux_drm_syncobj_manager_v1
+# and logs why. The global itself is the cargo gating test's concern.
+grep -q 'tuna-compositor: explicit sync disabled: ' "$LOG" ||
+    fail D-SYNCOBJ "no explicit-sync verdict, or explicit sync enabled on vkms"
+pass D-SYNCOBJ "$(grep -m1 'explicit sync disabled: ' "$LOG" | sed 's/.*tuna-compositor: //')"
 
 sleep 2
 [ -s "$CSTATE" ] || fail D-IDLE "missing compositor frame counter"
@@ -243,6 +298,15 @@ with open(sys.argv[2], "rb") as stream:
     print(result)
 PYCODE
 pass D-ENDURANCE "real feedback, batch rollover and requested 16-second completion"
+# DRM leasing (Mutter's native backend): one lease device global, offering
+# nothing here because the vkms connector drives the desktop.
+timeout 20s env -u WAYLAND_SOCKET XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY=tuna-drm-smoke \
+    "$LEASE_PROBE" >"$ARTIFACTS/lease-devices.json" 2>"$ARTIFACTS/lease-probe.stderr" ||
+    fail D-LEASE "lease device probe failed: $(cat "$ARTIFACTS/lease-probe.stderr")"
+jq -e '.devices | length == 1 and .[0].version == 1 and .[0].drm_fd and (.[0].released | not)
+        and (.[0].connectors | length == 0)' "$ARTIFACTS/lease-devices.json" >/dev/null ||
+    fail D-LEASE "expected one v1 lease device with a DRM fd and no connector: $(cat "$ARTIFACTS/lease-devices.json")"
+pass D-LEASE "wp_drm_lease_device_v1 v1 advertised with a DRM fd; no connector for lease (the vkms connector is a desktop one)"
 if command -v ffmpeg >/dev/null 2>&1; then
     sudo ffmpeg -loglevel error -y -device "$CARD" -f kmsgrab -i - -frames:v 1 \
         -vf 'hwdownload,format=bgr0' "$ARTIFACTS/scanout.png" 2>"$ARTIFACTS/kmsgrab.log" &&
@@ -943,5 +1007,121 @@ kill -TERM "$COMP_PID"
 wait "$COMP_PID" || true
 COMP_PID=""
 if grep -q panicked "$TABLET_LOG"; then fail D-NOPANIC "panic in the tablet session"; fi
+
+# DRM leasing of a named connector (Mutter's MUTTER_DEBUG_LEASE_CONNECTORS,
+# here TUNA_DEBUG_LEASE_CONNECTORS): the vkms connector leaves the desktop
+# (the session runs with no monitor, as Mutter does) and is offered for
+# lease; real leases end by destroy and by closing the lease fd.
+LEASE_LOG="$ARTIFACTS/compositor-lease.log"
+LOG="$LEASE_LOG"
+env -u DISPLAY -u WAYLAND_DISPLAY \
+    XDG_RUNTIME_DIR="$RUNTIME" XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$ARTIFACTS/data" \
+    LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD" TUNA_DEBUG_LEASE_CONNECTORS="$CONNECTOR" \
+    "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-lease \
+    --shell-bin "$ROOT/target/debug/tuna-shell-host" >"$LEASE_LOG" 2>&1 &
+COMP_PID=$!
+end=$(($(date +%s) + 30))
+until grep -q 'drm-lease: [0-9][0-9]* wp_drm_lease_device_v1 advertised' "$LEASE_LOG" 2>/dev/null &&
+    [ -S "$RUNTIME/tuna-drm-lease" ]; do
+    kill -0 "$COMP_PID" 2>/dev/null || fail D-LEASE "the lease session exited during startup"
+    [ "$(date +%s)" -le "$end" ] || fail D-LEASE "the lease session never advertised its lease device"
+    sleep 0.2
+done
+grep -q "drm: connector $CONNECTOR is for lease, not the desktop" "$LEASE_LOG" ||
+    fail D-LEASE "$CONNECTOR was not kept off the desktop"
+if grep -q 'drm: output' "$LEASE_LOG"; then fail D-LEASE "$CONNECTOR still lit a desktop output"; fi
+lease_probe() {
+    timeout 30s env -u WAYLAND_SOCKET XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY=tuna-drm-lease \
+        "$LEASE_PROBE" "$@" 2>>"$ARTIFACTS/lease-probe.stderr"
+}
+lease_probe >"$ARTIFACTS/lease-offered.json" || fail D-LEASE "lease probe failed: $(tail -1 "$ARTIFACTS/lease-probe.stderr")"
+jq -e --arg name "$CONNECTOR" '.devices | length == 1 and .[0].drm_fd
+        and ([.[0].connectors[] | select(.name == $name and .id > 0 and .done)] | length == 1)' \
+    "$ARTIFACTS/lease-offered.json" >/dev/null ||
+    fail D-LEASE "$CONNECTOR not offered: $(cat "$ARTIFACTS/lease-offered.json")"
+lease_probe --empty >"$ARTIFACTS/lease-empty.jsonl" ||
+    fail D-LEASE "empty lease request did not produce empty_lease"
+lease_probe --lease "$CONNECTOR" --duplicate >"$ARTIFACTS/lease-duplicate.jsonl" ||
+    fail D-LEASE "duplicate connector request did not produce duplicate_connector"
+lease_probe --observe "$CONNECTOR" >"$ARTIFACTS/lease-observer.jsonl" &
+LEASE_OBSERVER_PID=$!
+end=$(($(date +%s) + 5))
+while ! jq -se 'any(.[]; .event == "devices")' "$ARTIFACTS/lease-observer.jsonl" >/dev/null 2>&1; do
+    kill -0 "$LEASE_OBSERVER_PID" 2>/dev/null || fail D-LEASE "independent lease observer exited before admission"
+    [ "$(date +%s)" -le "$end" ] || fail D-LEASE "independent lease observer never received its initial devices"
+    sleep 0.05
+done
+lease_probe --lease "$CONNECTOR" >"$ARTIFACTS/lease-destroy.jsonl" ||
+    fail D-LEASE "lease, withdraw and re-offer by destroy failed: $(tail -1 "$ARTIFACTS/lease-probe.stderr")"
+jq -se '[.[].event] == ["devices", "leased", "withdrawn", "reoffered"]
+        and (.[2].devices[0].connectors | length == 0) and (.[3].devices[0].connectors | length == 1)' \
+    "$ARTIFACTS/lease-destroy.jsonl" >/dev/null ||
+    fail D-LEASE "unexpected lease sequence: $(cat "$ARTIFACTS/lease-destroy.jsonl")"
+wait "$LEASE_OBSERVER_PID" || fail D-LEASE "independent client missed withdrawal or re-offering"
+LEASE_OBSERVER_PID=""
+jq -se '[.[].event] == ["devices", "observer-withdrawn", "observer-reoffered", "observer-complete"]' \
+    "$ARTIFACTS/lease-observer.jsonl" >/dev/null ||
+    fail D-LEASE "independent lease observer got an unexpected lifecycle"
+lease_probe --lease "$CONNECTOR" --stale >"$ARTIFACTS/lease-stale.jsonl" ||
+    fail D-LEASE "stale pre-withdrawal connector request was not refused"
+jq -se '[.[].event] == ["devices", "leased", "withdrawn", "stale-finished", "reoffered"]' \
+    "$ARTIFACTS/lease-stale.jsonl" >/dev/null ||
+    fail D-LEASE "unexpected stale lease request lifecycle"
+lease_probe --lease "$CONNECTOR" --disconnect >"$ARTIFACTS/lease-owner-exit.jsonl" ||
+    fail D-LEASE "Wayland owner loss did not revoke the still-open native lease FD"
+jq -se '[.[].event] == ["devices", "leased", "withdrawn", "owner-revoked", "reoffered"]' \
+    "$ARTIFACTS/lease-owner-exit.jsonl" >/dev/null ||
+    fail D-LEASE "unexpected owner-exit lease lifecycle"
+lease_probe --lease "$CONNECTOR" --close-fd >"$ARTIFACTS/lease-close.jsonl" ||
+    fail D-LEASE "closing the lease fd did not end the lease: $(tail -1 "$ARTIFACTS/lease-probe.stderr")"
+jq -se '[.[].event] == ["devices", "leased", "withdrawn", "finished", "reoffered"]' \
+    "$ARTIFACTS/lease-close.jsonl" >/dev/null ||
+    fail D-LEASE "unexpected lease sequence: $(cat "$ARTIFACTS/lease-close.jsonl")"
+grep -q "drm-lease: [0-9][0-9]* lessee .* disappeared" "$LEASE_LOG" ||
+    fail D-LEASE "the compositor did not notice the lessee go"
+# An actual vkms connector state transition, not a synthetic compositor event.
+# Keep the leased native FD open while forcing the owned emulated connector off.
+# vkms sysfs-forced status changes emit no uevents (verified: udevadm monitor
+# stays silent across off/detect); real hardware emits a change event on the
+# card. Synthesize exactly that card event so the compositor's real udev
+# hotplug path fires for the actual connector state change.
+fire_card_change() {
+    sudo udevadm trigger --action=change "/sys/class/drm/$(basename "$CARD")" >/dev/null ||
+        fail D-LEASE "could not synthesize the card change event for $1"
+    sudo udevadm settle --timeout=10 ||
+        fail D-LEASE "udev did not settle the synthesized change event for $1"
+}
+lease_probe --lease "$CONNECTOR" --expect-revoke >"$ARTIFACTS/lease-unplug.jsonl" &
+CLIENT_PID=$!
+end=$(($(date +%s) + 5))
+while ! jq -se 'any(.[]; .event == "withdrawn")' "$ARTIFACTS/lease-unplug.jsonl" >/dev/null 2>&1; do
+    kill -0 "$CLIENT_PID" 2>/dev/null || fail D-LEASE "unplug client exited before receiving its lease"
+    [ "$(date +%s)" -le "$end" ] || fail D-LEASE "unplug client never received its lease and withdrawal"
+    sleep 0.05
+done
+LEASE_FORCED_STATUS="/sys/class/drm/$(basename "$CARD")-$CONNECTOR/status"
+printf 'off\n' | sudo tee "$LEASE_FORCED_STATUS" >/dev/null ||
+    fail D-LEASE "could not unplug the owned vkms connector"
+fire_card_change "unplug"
+wait "$CLIENT_PID" || fail D-LEASE "actual emulated connector unplug did not revoke its lease FD"
+CLIENT_PID=""
+jq -se '[.[].event] == ["devices", "leased", "withdrawn", "unplug-revoked"]' \
+    "$ARTIFACTS/lease-unplug.jsonl" >/dev/null ||
+    fail D-LEASE "unexpected actual connector unplug lifecycle"
+printf 'detect\n' | sudo tee "$LEASE_FORCED_STATUS" >/dev/null ||
+    fail D-LEASE "could not restore owned vkms connector detection"
+fire_card_change "restore"
+LEASE_FORCED_STATUS=""
+lease_probe --await "$CONNECTOR" >"$ARTIFACTS/lease-replug.jsonl" ||
+    fail D-LEASE "actual restored vkms connector was not re-offered"
+jq -e --arg name "$CONNECTOR" '.event == "available"
+    and ([.devices[].connectors[] | select(.name == $name and .done)] | length == 1)' \
+    "$ARTIFACTS/lease-replug.jsonl" >/dev/null ||
+    fail D-LEASE "restored emulated connector identity changed"
+kill -TERM "$COMP_PID"
+wait "$COMP_PID" || true
+COMP_PID=""
+if grep -q panicked "$LEASE_LOG"; then fail D-NOPANIC "panic in the lease session"; fi
+pass D-LEASE "vkms named emulation: eligible connector kept off desktop; non-master device FD, real lessee master FD/ioctl, cross-client withdrawal/re-offer, empty/duplicate/stale denial, destroy/FD-close/Wayland-owner-loss revocation"
 
 echo "tuna-drm-smoke: OK, artifacts in $ARTIFACTS"

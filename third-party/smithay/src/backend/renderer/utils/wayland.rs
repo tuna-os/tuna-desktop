@@ -1,5 +1,9 @@
 #[cfg(feature = "backend_drm")]
 use crate::wayland::drm_syncobj::{DrmSyncPoint, DrmSyncobjCachedState};
+#[cfg(feature = "backend_drm")]
+use crate::backend::renderer::sync::SyncPoint;
+#[cfg(feature = "backend_drm")]
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use crate::{
     backend::renderer::{
         buffer_dimensions, buffer_has_alpha, element::RenderElement, ContextId, ErasedContextId, ImportAll,
@@ -63,18 +67,28 @@ struct InnerBuffer {
     acquire_point: Option<DrmSyncPoint>,
     #[cfg(feature = "backend_drm")]
     release_point: Option<DrmSyncPoint>,
+    #[cfg(feature = "backend_drm")]
+    release_fences: Mutex<smallvec::SmallVec<[SyncPoint; 4]>>,
 }
 
 impl Drop for InnerBuffer {
     #[inline]
     fn drop(&mut self) {
-        self.buffer.release();
         #[cfg(feature = "backend_drm")]
         if let Some(release_point) = &self.release_point {
-            if let Err(err) = release_point.signal() {
-                tracing::error!("Failed to signal syncobj release point: {}", err);
+            let fences = self.release_fences.get_mut().unwrap();
+            let result = if fences.is_empty() {
+                // Never sampled: there is no GPU access to wait for.
+                release_point.signal()
+            } else {
+                release_with_fences(release_point, fences)
+            };
+            if let Err(err) = result {
+                // A failed wait/import is not permission to recycle GPU memory.
+                tracing::error!("Failed to release syncobj buffer safely: {}", err);
             }
         }
+        self.buffer.release();
     }
 }
 
@@ -94,6 +108,8 @@ impl Buffer {
                 acquire_point: None,
                 #[cfg(feature = "backend_drm")]
                 release_point: None,
+                #[cfg(feature = "backend_drm")]
+                release_fences: Mutex::default(),
             }),
         }
     }
@@ -106,14 +122,89 @@ impl Buffer {
                 buffer,
                 acquire_point: Some(acquire_point),
                 release_point: Some(release_point),
+                release_fences: Mutex::default(),
             }),
         }
     }
 
+    /// Whether these references belong to the same committed buffer use.
     #[cfg(feature = "backend_drm")]
-    #[allow(dead_code)]
+    pub fn same_commit(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Record a fence covering GPU reads of this committed buffer. Keep
+    /// outstanding fences from every context: shared textures can have the
+    /// same ContextId but distinct GPU command queues.
+    #[cfg(feature = "backend_drm")]
+    pub fn set_release_fence(&self, fence: SyncPoint) {
+        let mut fences = self.inner.release_fences.lock().unwrap();
+        fences.retain(|previous| !previous.is_reached());
+        if !fence.is_reached() {
+            fences.push(fence);
+        }
+    }
+
+    #[cfg(feature = "backend_drm")]
     pub(crate) fn acquire_point(&self) -> Option<&DrmSyncPoint> {
         self.inner.acquire_point.as_ref()
+    }
+}
+
+#[cfg(feature = "backend_drm")]
+fn release_with_fences(
+    release: &DrmSyncPoint,
+    fences: &[SyncPoint],
+) -> std::io::Result<()> {
+    let native = (|| {
+        let mut merged: Option<OwnedFd> = None;
+        for fence in fences {
+            if fence.is_reached() {
+                continue;
+            }
+            let fd = fence.export().ok_or(std::io::ErrorKind::Unsupported)?;
+            merged = Some(match merged {
+                Some(previous) => merge_sync_files(previous, fd)?,
+                None => fd,
+            });
+        }
+        match merged {
+            Some(fd) => release.import_sync_file(fd.as_fd()),
+            None => release.signal(),
+        }
+    })();
+    if native.is_ok() {
+        return native;
+    }
+    // An exceptional export/merge/import failure still cannot produce an
+    // early release. Wait for the actual GPU fences before CPU signalling.
+    for fence in fences {
+        fence.wait().map_err(|_| std::io::Error::other("GPU release wait interrupted"))?;
+    }
+    release.signal()
+}
+
+#[cfg(feature = "backend_drm")]
+fn merge_sync_files(first: OwnedFd, second: OwnedFd) -> std::io::Result<OwnedFd> {
+    // linux/sync_file.h: SYNC_IOC_MERGE, including the fixed-width ABI.
+    #[repr(C)]
+    struct MergeData {
+        name: [u8; 32],
+        fd2: i32,
+        fence: i32,
+        flags: u32,
+        pad: u32,
+    }
+    const MERGE: rustix::ioctl::Opcode =
+        rustix::ioctl::opcode::read_write::<MergeData>(b'>', 3);
+    let mut data = MergeData {
+        name: [0; 32], fd2: second.as_raw_fd(), fence: -1, flags: 0, pad: 0,
+    };
+    // SAFETY: The sync-file ABI reads and writes exactly MergeData and returns
+    // a new owned fd on success. Both input fds stay alive for the ioctl.
+    unsafe {
+        rustix::ioctl::ioctl(first.as_fd(), rustix::ioctl::Updater::<MERGE, _>::new(&mut data))?;
+        Ok(OwnedFd::from_raw_fd(data.fence))
     }
 }
 
@@ -165,7 +256,11 @@ impl RendererSurfaceState {
                 self.buffer_scale = attrs.buffer_scale;
                 self.buffer_transform = attrs.buffer_transform.into();
 
-                if !self.buffer.as_ref().is_some_and(|b| b == buffer) {
+                #[cfg(feature = "backend_drm")]
+                let explicit = syncobj_state.acquire_point.is_some();
+                #[cfg(not(feature = "backend_drm"))]
+                let explicit = false;
+                if explicit || !self.buffer.as_ref().is_some_and(|b| b == buffer) {
                     self.buffer = Some(Buffer {
                         inner: Arc::new(InnerBuffer {
                             buffer,
@@ -173,6 +268,8 @@ impl RendererSurfaceState {
                             acquire_point: syncobj_state.acquire_point.take(),
                             #[cfg(feature = "backend_drm")]
                             release_point: syncobj_state.release_point.take(),
+                            #[cfg(feature = "backend_drm")]
+                            release_fences: Mutex::default(),
                         }),
                     });
                 }

@@ -19,6 +19,10 @@ pub struct SourceMetadata {
     pub mime_types: Vec<String>,
     /// The Drag'n'Drop actions supported by this source
     pub dnd_action: DndAction,
+    /// Whether this source has been accepted as a clipboard selection.
+    pub used_for_selection: bool,
+    /// Whether this source has started a drag-and-drop operation.
+    pub drag_started: bool,
 }
 
 impl Default for SourceMetadata {
@@ -26,6 +30,8 @@ impl Default for SourceMetadata {
         Self {
             mime_types: Vec::new(),
             dnd_action: DndAction::None,
+            used_for_selection: false,
+            drag_started: false,
         }
     }
 }

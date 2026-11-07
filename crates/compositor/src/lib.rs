@@ -83,6 +83,8 @@ mod a11y_shadow;
 pub mod animation;
 pub mod animation_clock;
 mod auth_owner;
+mod background_blur;
+pub mod background_effect;
 mod bell;
 pub mod capture_security;
 pub mod color_manager;
@@ -97,6 +99,8 @@ pub mod display_config;
 #[cfg(feature = "drm")]
 pub mod drm;
 pub mod edid;
+#[cfg(feature = "drm")]
+pub mod explicit_sync;
 pub(crate) mod focus_caret;
 pub mod focus_policy;
 pub mod fprintd;
@@ -164,6 +168,7 @@ pub mod supervise;
 pub mod tablet;
 pub mod tablet_actions;
 pub(crate) mod tablet_settings;
+pub(crate) mod toplevel_drag;
 mod transient_family;
 pub mod transitions;
 pub mod unlock;
@@ -184,6 +189,8 @@ mod x11_icons;
 pub mod x11_interop;
 pub mod xdg_session;
 pub mod xwayland;
+#[cfg(feature = "xwayland")]
+pub mod xwayland_grab;
 
 /// One compositor-tracked output: protocol handle plus geometry.
 /// The first entry is the primary output; single-output sessions hold
@@ -493,6 +500,10 @@ impl XdgShellHandler for State {
             self.closed_toplevel_parents
                 .insert(surface.wl_surface().clone(), parent);
         }
+        smithay::wayland::xdg_foreign::XdgForeignHandler::foreign_toplevel_destroyed(
+            self,
+            surface.wl_surface(),
+        );
     }
 
     fn parent_changed(&mut self, surface: ToplevelSurface) {
@@ -682,6 +693,9 @@ impl CompositorHandler for State {
     /// is created, so it runs before Smithay's: for a surface whose layer
     /// role is gone it marks the meaningless pending state as anchored on
     /// every edge, which the validator accepts.
+    ///
+    /// The same hook holds a commit until its explicit-sync acquire point
+    /// signals ([`explicit_sync`]).
     fn new_surface(&mut self, surface: &wl_surface::WlSurface) {
         smithay::wayland::compositor::add_pre_commit_hook::<State, _>(
             surface,
@@ -694,13 +708,31 @@ impl CompositorHandler for State {
                         cached.pending().anchor = smithay::wayland::shell::wlr_layer::Anchor::all();
                     });
                 }
+                #[cfg(feature = "drm")]
+                explicit_sync::hold_until_acquired(state, surface);
             },
         );
     }
 
     fn commit(&mut self, surface: &wl_surface::WlSurface) {
         self.pointer_scene_dirty = true;
+        let unmapped = smithay::wayland::compositor::with_states(surface, |states| {
+            matches!(
+                states
+                    .cached_state
+                    .get::<smithay::wayland::compositor::SurfaceAttributes>()
+                    .current()
+                    .buffer,
+                Some(smithay::wayland::compositor::BufferAssignment::Removed)
+            )
+        });
         on_commit_buffer_handler::<State>(surface);
+        if unmapped {
+            smithay::wayland::xdg_foreign::XdgForeignHandler::foreign_toplevel_destroyed(
+                self, surface,
+            );
+        }
+        self.protocols.toplevel_drag.surface_committed(surface);
         self.window_icons.commit(surface);
         self.popups.commit(surface);
         if let Some(smithay::desktop::PopupKind::Xdg(popup)) = self.popups.find_popup(surface) {
@@ -762,11 +794,12 @@ impl SelectionHandler for State {
 impl ClientDndGrabHandler for State {
     fn started(
         &mut self,
-        _source: Option<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
+        source: Option<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
         icon: Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
         _seat: Seat<Self>,
     ) {
         self.dnd_icon = icon;
+        self.protocols.toplevel_drag.drag_started(source);
     }
 
     fn dropped(
@@ -776,6 +809,15 @@ impl ClientDndGrabHandler for State {
         _seat: Seat<Self>,
     ) {
         self.dnd_icon = None;
+        self.protocols.toplevel_drag.drag_ended();
+    }
+
+    fn drop_performed_without_target(
+        &mut self,
+        source: &smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource,
+        _seat: Seat<Self>,
+    ) -> bool {
+        self.protocols.toplevel_drag.performs_drop(source)
     }
 }
 
@@ -793,6 +835,15 @@ impl ServerDndGrabHandler for State {}
 impl DataDeviceHandler for State {
     fn data_device_state(&self) -> &DataDeviceState {
         &self.data_device_state
+    }
+
+    fn allow_selection(
+        &mut self,
+        source: Option<&smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
+        _seat: &Seat<Self>,
+        _dh: &DisplayHandle,
+    ) -> bool {
+        source.is_none_or(|source| self.protocols.toplevel_drag.selection_allowed(source))
     }
 }
 
@@ -976,12 +1027,16 @@ impl State {
 
     pub(crate) fn cancel_client_dnd(&mut self, time: u32) -> bool {
         let seat = self.seat.clone();
-        smithay::wayland::selection::data_device::cancel_client_dnd(
+        // Mutter's Escape: the toplevel drag's window returns to its start.
+        self.protocols.toplevel_drag.set_cancelling(true);
+        let cancelled = smithay::wayland::selection::data_device::cancel_client_dnd(
             &seat,
             self,
             smithay::utils::SERIAL_COUNTER.next_serial(),
             time,
-        )
+        );
+        self.protocols.toplevel_drag.set_cancelling(false);
+        cancelled
     }
 
     /// Seat for capability attachment and input routing.

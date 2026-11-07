@@ -6,6 +6,26 @@ from pathlib import Path
 import re
 
 
+PROTOCOL_MEMBERS = ('/usr/libexec/tuna-explicit-sync-client',
+                    '/usr/libexec/tuna-background-effect-client',
+                    '/usr/share/tuna-explicit-sync/protocol-xml.sha256',
+                    '/usr/share/tuna-explicit-sync/protocol-source.json')
+PROTOCOL_INPUTS = ('scripts/tuna-explicit-sync-build',
+                   'scripts/tuna-background-effect-client-build',
+                   'scripts/lib/tuna-explicit-sync-client.c',
+                   'scripts/lib/tuna-background-effect-client.c')
+
+
+def fixture_members(fixture):
+    if fixture == 'lifecycle':
+        return {}
+    if fixture != 'explicit-sync':
+        raise ValueError('unknown native image fixture')
+    return {'/usr/libexec/tuna-vm-explicit-sync': 'scripts/lib/tuna-explicit-sync-guest.py',
+            '/usr/libexec/background_effect_oracle.py': 'scripts/lib/background_effect_oracle.py',
+            '/usr/share/tuna-explicit-sync/native-build.json': 'native-protocol-build.json'}
+
+
 def canonical_image_id(observed):
     """Canonicalize Podman's full image ID without admitting tags or short IDs."""
     if not isinstance(observed, str) or not re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', observed):
@@ -112,7 +132,7 @@ def validate_product_origin(origin, image, root):
             "actual original package inspection differs from authenticated capsule")
 
 
-def admission(package, observed, root, commit, image_id, base_image, *, capture_commit=None,
+def admission(package, observed, root, commit, image_id, base_image, *, fixture='lifecycle', capture_commit=None,
               product_origin=None, base_evidence=None):
     if not re.fullmatch(r'[0-9a-f]{40}', commit):
         raise ValueError('exact source commit missing')
@@ -127,6 +147,24 @@ def admission(package, observed, root, commit, image_id, base_image, *, capture_
     for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus'):
         path = Path(root) / 'packaging/marlin/vm-lane' / name
         expected['/usr/libexec/' + name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    for installed, source in fixture_members(fixture).items():
+        expected[installed] = hashlib.sha256((Path(root) / source).read_bytes()).hexdigest()
+    if fixture == 'explicit-sync':
+        build = json.loads((Path(root) / 'native-protocol-build.json').read_bytes())
+        sources = {name: hashlib.sha256((Path(root) / name).read_bytes()).hexdigest()
+                   for name in PROTOCOL_INPUTS}
+        if (set(build) != {'schema', 'source_sha256', 'member_sha256'}
+                or build['schema'] != 1 or build['source_sha256'] != sources):
+            raise ValueError('native protocol build inputs differ from exact source')
+        members = build['member_sha256']
+        if (type(members) is not dict or set(members) != set(PROTOCOL_MEMBERS)
+                or any(not isinstance(value, str) or not re.fullmatch('[0-9a-f]{64}', value)
+                       for value in members.values())):
+            raise ValueError('native protocol original build member identity missing')
+        staged = Path(root) / 'protocol-xml/wayland-protocols/source.json'
+        if members['/usr/share/tuna-explicit-sync/protocol-source.json'] != hashlib.sha256(staged.read_bytes()).hexdigest():
+            raise ValueError('native protocol XML source differs from independently staged locked archive')
+        expected.update(members)
     if observed.get('member_sha256') != expected:
         raise ValueError('final image installed executables differ from package/source bytes')
     digest = package['package']['sha256']
@@ -162,9 +200,7 @@ def admission(package, observed, root, commit, image_id, base_image, *, capture_
 
 # Executed inside the final immutable image by the existing CI job. No host
 # filesystem mounts, guest configuration changes, or credentials are required.
-IMAGE_INSPECTION = '''import hashlib,json,os,stat,sys
-names=["/usr/bin/tuna-"+n for n in ("compositor","session","shell-host","shell-gtk","ibus-bridge")]+["/usr/libexec/tuna-vm-input","/usr/libexec/tuna-vm-lifecycle","/usr/libexec/tuna-vm-shell-focus"]
-result={}
+_INSPECTION_BODY = '''result={}
 for name in names:
  fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW)
  try:
@@ -181,3 +217,14 @@ for name in names:
  finally: os.close(fd)
 print(json.dumps({"schema":1,"image_id":sys.argv[1],"member_sha256":result}))
 '''
+
+
+def inspection_program(fixture='lifecycle'):
+    names = ['/usr/bin/tuna-' + name for name in
+             ('compositor', 'session', 'shell-host', 'shell-gtk', 'ibus-bridge')]
+    names += ['/usr/libexec/tuna-vm-input', '/usr/libexec/tuna-vm-lifecycle',
+              '/usr/libexec/tuna-vm-shell-focus']
+    names += list(fixture_members(fixture))
+    if fixture == 'explicit-sync':
+        names += list(PROTOCOL_MEMBERS)
+    return 'import hashlib,json,os,stat,sys\nnames=' + repr(names) + '\n' + _INSPECTION_BODY

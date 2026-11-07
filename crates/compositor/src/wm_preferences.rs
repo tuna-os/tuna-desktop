@@ -1,6 +1,8 @@
-//! Owned GIO reader for GNOME's focus policy keys
-//! (`org.gnome.desktop.wm.preferences`, `org.gnome.mutter`), read by the
-//! compositor itself as Mutter's `prefs.c` does in-process.
+//! Owned GIO reader for the GNOME window-manager keys the compositor
+//! reads itself, as Mutter's `prefs.c` and `meta-settings.c` do
+//! in-process: the focus policy (`org.gnome.desktop.wm.preferences`,
+//! `org.gnome.mutter`) and the Xwayland grab access rules
+//! (`org.gnome.mutter.wayland`).
 //!
 //! The mechanics are `night_light_settings.rs`'s, without its preview:
 //! native `Settings` and their retained `changed` subscription live and
@@ -32,6 +34,9 @@ const KEY_RAISE_ON_CLICK: &str = "raise-on-click";
 const KEY_MOUSE_BUTTON_MODIFIER: &str = "mouse-button-modifier";
 const KEY_RESIZE_WITH_RIGHT_BUTTON: &str = "resize-with-right-button";
 const KEY_POINTER_REST: &str = "focus-change-on-pointer-rest";
+/// Mutter's Wayland settings (`meta-settings.c` `wayland_settings`).
+const WAYLAND_SCHEMA: &str = "org.gnome.mutter.wayland";
+const KEY_XWAYLAND_GRAB_ACCESS_RULES: &str = "xwayland-grab-access-rules";
 const WM_KEYS: [(&str, &str); 6] = [
     // An enum key's value type is its string nick.
     (KEY_FOCUS_MODE, "s"),
@@ -41,6 +46,15 @@ const WM_KEYS: [(&str, &str); 6] = [
     (KEY_MOUSE_BUTTON_MODIFIER, "s"),
     (KEY_RESIZE_WITH_RIGHT_BUTTON, "b"),
 ];
+
+/// One completed read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawWmPreferences {
+    pub(crate) focus: RawFocusSettings,
+    /// `xwayland-grab-access-rules`; `None` when `org.gnome.mutter.wayland`
+    /// is not installed (Mutter's built-in rules alone then apply).
+    pub(crate) xwayland_grab_access_rules: Option<Vec<String>>,
+}
 
 #[derive(Clone, Copy)]
 struct Operation {
@@ -54,7 +68,7 @@ struct State {
     stopped: bool,
     status: CacheStatus,
     last: Option<Instant>,
-    completion: Option<Result<RawFocusSettings, ReadError>>,
+    completion: Option<Result<RawWmPreferences, ReadError>>,
 }
 struct Shared {
     state: Mutex<State>,
@@ -63,7 +77,7 @@ struct Shared {
     operation_limit: Duration,
 }
 trait NativeReader {
-    fn read(&mut self) -> Result<RawFocusSettings, ReadError>;
+    fn read(&mut self) -> Result<RawWmPreferences, ReadError>;
     #[cfg(test)]
     fn change(&self) {
         panic!("not a native watch fixture");
@@ -144,7 +158,7 @@ impl Reader {
     }
     /// The frame consumer never invokes GIO, waits for a worker, or joins
     /// it. `Some` only for a completed, valid read.
-    pub(crate) fn poll(&self, now: Instant) -> Option<RawFocusSettings> {
+    pub(crate) fn poll(&self, now: Instant) -> Option<RawWmPreferences> {
         self.shared.expire(now);
         let (completion, request) = {
             let Ok(mut state) = self.shared.state.lock() else {
@@ -350,10 +364,13 @@ fn schema_matches(schema: &gio::SettingsSchema, keys: &[(&str, &str)]) -> bool {
     })
 }
 
-/// Watch `settings` on the owned context; only the focus keys re-read.
+/// Watch `settings` on the owned context; only the keys read re-read.
 fn watch(settings: &gio::Settings, shared: Weak<Shared>) -> glib::SignalHandlerId {
     settings.connect_changed(None, move |_, key| {
-        if key == KEY_POINTER_REST || WM_KEYS.iter().any(|(known, _)| *known == key) {
+        if key == KEY_POINTER_REST
+            || key == KEY_XWAYLAND_GRAB_ACCESS_RULES
+            || WM_KEYS.iter().any(|(known, _)| *known == key)
+        {
             if let Some(shared) = shared.upgrade() {
                 shared.request(Instant::now());
             }
@@ -365,6 +382,8 @@ struct GioReader {
     wm: gio::Settings,
     /// `org.gnome.mutter`, when installed with the pointer-rest key.
     mutter: Option<gio::Settings>,
+    /// `org.gnome.mutter.wayland`, when installed with the grab rules key.
+    wayland: Option<gio::Settings>,
     handlers: Vec<(gio::Settings, glib::SignalHandlerId)>,
 }
 impl GioReader {
@@ -375,11 +394,13 @@ impl GioReader {
             .lookup(WM_SCHEMA, true)
             .ok_or_else(|| ReadError("wm preferences schema unavailable".into()))?;
         let mutter = source.lookup(MUTTER_SCHEMA, true);
-        Self::from_schemas(&wm, mutter.as_ref(), None, shared)
+        let wayland = source.lookup(WAYLAND_SCHEMA, true);
+        Self::from_schemas(&wm, mutter.as_ref(), wayland.as_ref(), None, shared)
     }
     fn from_schemas(
         wm: &gio::SettingsSchema,
         mutter: Option<&gio::SettingsSchema>,
+        wayland: Option<&gio::SettingsSchema>,
         backend: Option<&gio::SettingsBackend>,
         shared: Weak<Shared>,
     ) -> Result<Self, ReadError> {
@@ -390,13 +411,18 @@ impl GioReader {
         let mutter = mutter
             .filter(|schema| schema_matches(schema, &[(KEY_POINTER_REST, "b")]))
             .map(|schema| gio::Settings::new_full(schema, backend, None));
+        let wayland = wayland
+            .filter(|schema| schema_matches(schema, &[(KEY_XWAYLAND_GRAB_ACCESS_RULES, "as")]))
+            .map(|schema| gio::Settings::new_full(schema, backend, None));
         let handlers = std::iter::once(&wm)
             .chain(mutter.as_ref())
+            .chain(wayland.as_ref())
             .map(|settings| (settings.clone(), watch(settings, shared.clone())))
             .collect();
         Ok(Self {
             wm,
             mutter,
+            wayland,
             handlers,
         })
     }
@@ -405,13 +431,18 @@ impl NativeReader for GioReader {
     #[cfg(test)]
     fn change(&self) {
         self.wm.set_string(KEY_FOCUS_MODE, "sloppy").unwrap();
+        if let Some(wayland) = &self.wayland {
+            wayland
+                .set_strv(KEY_XWAYLAND_GRAB_ACCESS_RULES, ["!remote-viewer", "spicy"])
+                .unwrap();
+        }
     }
-    fn read(&mut self) -> Result<RawFocusSettings, ReadError> {
+    fn read(&mut self) -> Result<RawWmPreferences, ReadError> {
         // Watches connected BEFORE these reads; GSettings emits `changed`
         // only for keys read since. Fixed types bound all data.
         let error = || ReadError("invalid wm preferences value".into());
         let value = |key| self.wm.value(key);
-        Ok(RawFocusSettings {
+        let focus = RawFocusSettings {
             focus_mode: value(KEY_FOCUS_MODE).get::<String>().ok_or_else(error)?,
             auto_raise: value(KEY_AUTO_RAISE).get::<bool>().ok_or_else(error)?,
             auto_raise_delay_ms: value(KEY_AUTO_RAISE_DELAY).get::<i32>().ok_or_else(error)?,
@@ -431,6 +462,19 @@ impl NativeReader for GioReader {
                 ),
                 None => None,
             },
+        };
+        let xwayland_grab_access_rules = match &self.wayland {
+            Some(wayland) => Some(
+                wayland
+                    .value(KEY_XWAYLAND_GRAB_ACCESS_RULES)
+                    .get::<Vec<String>>()
+                    .ok_or_else(error)?,
+            ),
+            None => None,
+        };
+        Ok(RawWmPreferences {
+            focus,
+            xwayland_grab_access_rules,
         })
     }
 }
@@ -464,7 +508,7 @@ mod tests {
         reader: &Reader,
         loop_: &mut calloop::EventLoop<usize>,
         poll_at: Instant,
-    ) -> RawFocusSettings {
+    ) -> RawWmPreferences {
         let deadline = Instant::now() + HARNESS_LIMIT;
         let mut count = 0;
         loop {
@@ -511,8 +555,20 @@ mod tests {
     const ENUM_XML: &str = "<enum id='org.gnome.desktop.GDesktopFocusMode'>\
         <value nick='click' value='0'/><value nick='sloppy' value='1'/><value nick='mouse' value='2'/>\
         </enum>";
+    const MUTTER_XML: &str = "<schema id='org.gnome.mutter' path='/tuna/mutter-proof/'>\
+        <key name='focus-change-on-pointer-rest' type='b'><default>false</default></key>\
+        </schema>";
+    const WAYLAND_XML: &str =
+        "<schema id='org.gnome.mutter.wayland' path='/tuna/mutter-wayland-proof/'>\
+        <key name='xwayland-grab-access-rules' type='as'><default>[]</default></key>\
+        </schema>";
 
-    fn gio_reader(wake: &Wake, dir: std::path::PathBuf, with_mutter: bool) -> Reader {
+    fn gio_reader(
+        wake: &Wake,
+        dir: std::path::PathBuf,
+        with_mutter: bool,
+        with_wayland: bool,
+    ) -> Reader {
         Reader::with_factory(
             wake,
             Box::new(move |shared| {
@@ -521,10 +577,14 @@ mod tests {
                 let mutter = with_mutter
                     .then(|| schemas.lookup(MUTTER_SCHEMA, false))
                     .flatten();
+                let wayland = with_wayland
+                    .then(|| schemas.lookup(WAYLAND_SCHEMA, false))
+                    .flatten();
                 let backend = gio::memory_settings_backend_new();
                 Ok(Box::new(GioReader::from_schemas(
                     &wm,
                     mutter.as_ref(),
+                    wayland.as_ref(),
                     Some(&backend),
                     shared,
                 )?))
@@ -538,22 +598,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         compile(
             dir.path(),
-            &format!(
-                "<schemalist>{ENUM_XML}{WM_XML}\
-                 <schema id='org.gnome.mutter' path='/tuna/mutter-proof/'>\
-                 <key name='focus-change-on-pointer-rest' type='b'><default>false</default></key>\
-                 </schema></schemalist>"
-            ),
+            &format!("<schemalist>{ENUM_XML}{WM_XML}{MUTTER_XML}{WAYLAND_XML}</schemalist>"),
         );
         let (wake, mut loop_) = wake_loop();
         // A frozen poll clock: only the genuine changed callback may
         // schedule the second read, never the periodic re-read.
         let poll_at = Instant::now();
-        let reader = gio_reader(&wake, dir.path().to_path_buf(), true);
+        let reader = gio_reader(&wake, dir.path().to_path_buf(), true, true);
         let first = completed(&reader, &mut loop_, poll_at);
-        assert_eq!(first.focus_mode, "click");
-        assert_eq!(first.mouse_button_modifier, "<Super>");
-        assert_eq!(first.focus_change_on_pointer_rest, Some(false));
+        assert_eq!(first.focus.focus_mode, "click");
+        assert_eq!(first.focus.mouse_button_modifier, "<Super>");
+        assert_eq!(first.focus.focus_change_on_pointer_rest, Some(false));
+        assert_eq!(first.xwayland_grab_access_rules, Some(Vec::new()));
         assert_eq!(reader.status(), CacheStatus::Fresh);
         let source = glib::idle_source_new(
             Some("tuna-wm-preferences-watch-proof"),
@@ -574,9 +630,13 @@ mod tests {
         );
         source.attach(Some(&reader.shared.context));
         let changed = completed(&reader, &mut loop_, poll_at);
-        assert_eq!(changed.focus_mode, "sloppy");
+        assert_eq!(changed.focus.focus_mode, "sloppy");
+        assert_eq!(
+            changed.xwayland_grab_access_rules,
+            Some(vec!["!remote-viewer".to_owned(), "spicy".to_owned()])
+        );
         let mut policy = FocusPolicy::default();
-        policy.apply(&changed);
+        policy.apply(&changed.focus);
         assert_eq!(policy.mode, FocusMode::Sloppy);
         assert!(!policy.focus_change_on_pointer_rest);
         retire(&reader);
@@ -591,12 +651,32 @@ mod tests {
             &format!("<schemalist>{ENUM_XML}{WM_XML}</schemalist>"),
         );
         let (wake, mut loop_) = wake_loop();
-        let reader = gio_reader(&wake, dir.path().to_path_buf(), false);
+        let reader = gio_reader(&wake, dir.path().to_path_buf(), false, false);
         let raw = completed(&reader, &mut loop_, Instant::now());
-        assert_eq!(raw.focus_change_on_pointer_rest, None);
+        assert_eq!(raw.focus.focus_change_on_pointer_rest, None);
+        // Mutter's built-in grab rules alone then apply.
+        assert_eq!(raw.xwayland_grab_access_rules, None);
         let mut policy = FocusPolicy::default();
-        policy.apply(&raw);
+        policy.apply(&raw.focus);
         assert_eq!(policy, FocusPolicy::default());
+        retire(&reader);
+    }
+
+    #[test]
+    fn mistyped_grab_rules_key_is_skipped_like_a_missing_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        compile(
+            dir.path(),
+            &format!(
+                "<schemalist>{ENUM_XML}{WM_XML}{}</schemalist>",
+                WAYLAND_XML.replace("type='as'><default>[]", "type='s'><default>''")
+            ),
+        );
+        let (wake, mut loop_) = wake_loop();
+        let reader = gio_reader(&wake, dir.path().to_path_buf(), false, true);
+        let raw = completed(&reader, &mut loop_, Instant::now());
+        assert_eq!(raw.xwayland_grab_access_rules, None);
+        assert_eq!(raw.focus.focus_mode, "click");
         retire(&reader);
     }
 
@@ -615,7 +695,7 @@ mod tests {
             ),
         );
         let (wake, mut loop_) = wake_loop();
-        let reader = gio_reader(&wake, dir.path().to_path_buf(), false);
+        let reader = gio_reader(&wake, dir.path().to_path_buf(), false, false);
         let deadline = Instant::now() + HARNESS_LIMIT;
         let mut count = 0;
         while reader.status() != CacheStatus::Unavailable {
@@ -631,11 +711,11 @@ mod tests {
 
     struct Blocked {
         events: mpsc::Sender<&'static str>,
-        answers: mpsc::Receiver<Result<RawFocusSettings, ReadError>>,
+        answers: mpsc::Receiver<Result<RawWmPreferences, ReadError>>,
         creator: std::thread::ThreadId,
     }
     impl NativeReader for Blocked {
-        fn read(&mut self) -> Result<RawFocusSettings, ReadError> {
+        fn read(&mut self) -> Result<RawWmPreferences, ReadError> {
             assert_eq!(self.creator, std::thread::current().id());
             self.events.send("entered").unwrap();
             self.answers.recv_timeout(HARNESS_LIMIT).unwrap()

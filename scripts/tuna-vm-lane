@@ -3096,6 +3096,39 @@ def await_login(agent, deadline):
     return False, login
 
 
+def wait_for_surface(qmp, out, deadline):
+    """Poll QMP screendump until virgl produces its first frame.
+
+    egl-headless copies guest virgl output back to a DisplaySurface for
+    screendump, but the surface exists only after the guest renders its
+    first frame; firmware and early boot have nothing to dump. This waits
+    for real guest rendering like greeter_ready waits for the greeter —
+    never a fixed sleep — and fails loudly when no frame ever arrives.
+    """
+    probe = os.path.join(out, ".scratch", "surface-probe.ppm")
+    gpu_events = ("virtio_gpu_cmd_set_scanout", "virtio_gpu_cmd_set_scanout_blob",
+                  "virtio_gpu_cmd_res_create_2d", "virtio_gpu_cmd_res_create_3d",
+                  "virtio_gpu_cmd_res_unref", "virtio_gpu_cmd_res_back_attach",
+                  "virtio_gpu_cmd_res_back_detach")
+    for event in gpu_events:
+        try:
+            qmp.cmd("trace-event-set-state", name=event, enable=True)
+        except (OSError, RuntimeError, ValueError, KeyError) as error:
+            # Tracing is diagnostic; the surface verdict must not depend on it.
+            log(f"surface wait: scanout trace {event} unavailable: {error}")
+            break
+    while time.monotonic() < deadline:
+        try:
+            qmp.cmd("screendump", filename=probe, format="ppm")
+            if os.path.exists(probe) and os.path.getsize(probe) > 0:
+                return
+        except (OSError, RuntimeError, ValueError) as error:
+            if "no surface" not in str(error):
+                raise
+        time.sleep(1)
+    raise RuntimeError("virgl display produced no QMP surface; guest never rendered a frame")
+
+
 def await_reference_login(agent, deadline, *, profile):
     """Only the independent observer admits paired native session principals."""
     from vm_gnome_reference import session_status
@@ -3110,7 +3143,7 @@ def await_reference_login(agent, deadline, *, profile):
     return False, observed if observed and observed["session"]["started"] else None
 
 
-def gdm_login(qmp, agent_path, out, record, *, reference_profile=None):
+def gdm_login(qmp, agent_path, out, record, wait_surface=False, *, reference_profile=None):
     """Drive the original stock GDM user list and password prompt.
 
     Paired DEV fixtures alone save a session choice; normal Tuna fixtures
@@ -3153,6 +3186,8 @@ def gdm_login(qmp, agent_path, out, record, *, reference_profile=None):
         with open(os.path.join(out, "greeter-before-login.json"), "w") as stream:
             json.dump(greeter, stream, indent=2)
         time.sleep(5)
+        if wait_surface:
+            wait_for_surface(qmp, out, time.monotonic() + 120)
         qmp.frame(os.path.join(out, "V-GDM-GREETER.png"))
         # The logout check compares the repainted greeter with this frame.
         qmp.cmd("screendump", filename=os.path.join(out, "greeter-before-login.ppm"), format="ppm")
@@ -3950,8 +3985,27 @@ def run_soak(qmp, vm, agent_path, out, record, seconds, warmup, interval, revisi
 
 
 
+def gpu_devices_for_receipt(explicit_sync=False):
+    if explicit_sync:
+        # Dual GPU: the default std VGA is the first graphics console, so
+        # QMP screendump (the independent capture) has a surface and the
+        # guest has a boot VGA; virtio-gpu-gl-pci is the rendering GPU.
+        # QEMU 10.2.1 gives a virgl console no screendump surface at all
+        # ("no surface", runs 41872623362 and 42342195558: virtio-gpu first
+        # or alone), and without any boot VGA the greeter never presents
+        # (run 41866163092). The session compositor now selects the
+        # rendering virtio-gpu over the KMS-only bochs boot GPU (run
+        # 42336367004: card0 bochs has no EGL device, so explicit sync and
+        # dmabuf feedback were off); its secondary GPU copy shows the frames
+        # on bochs's monitor, the VGA console QMP captures.
+        return ["-device", "pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1",
+                "-device", "virtio-gpu-gl-pci,bus=tuna-gpu-port,"
+                           f"xres={WIDTH},yres={HEIGHT}"]
+    return baseline.gpu_devices()
+
+
 def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, native_relative_mouse=False,
-         observer_records=None, credentials=()):
+         observer_records=None, credentials=(), explicit_sync_gpu=False):
     ovmf = next((p for p in OVMF if os.path.exists(p)), None)
     if not ovmf:
         sys.exit("tuna-vm-lane: OVMF firmware not found (install ovmf)")
@@ -3961,10 +4015,23 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
     qmp_path = os.path.join(scratch, "qmp.sock")
     agent_path = os.path.join(scratch, "qga.sock")
     serial = os.path.join(out, "serial.log")
+    gpu_devices = gpu_devices_for_receipt(explicit_sync_gpu)
+    gpu_display = "none"
+    if explicit_sync_gpu:
+        if (os.environ.get("LIBGL_ALWAYS_SOFTWARE") != "1"
+                or os.environ.get("GALLIUM_DRIVER") != "llvmpipe"):
+            raise RuntimeError("explicit-sync GPU profile requires its owned software-GL launcher (llvmpipe)")
+        if not os.access("/dev/dri/renderD128", os.R_OK | os.W_OK):
+            raise RuntimeError("explicit-sync GPU profile requires a readable+writable "
+                               "/dev/dri/renderD128 (modprobe vgem)")
+        # egl-headless copies guest virgl output back to a DisplaySurface, so
+        # QMP screendump keeps working; gtk,gl=on never produces a QMP
+        # surface (a GL console has no software framebuffer).
+        gpu_display = "egl-headless"
     qemu = ["qemu-system-x86_64", "-machine", "q35", "-m", "6144", "-smp", "4",
             "-bios", ovmf, "-snapshot",
             "-drive", f"file={disk},format=raw,if=virtio,cache=unsafe",
-            *baseline.gpu_devices(),
+            *gpu_devices,
             "-device", "qemu-xhci", "-device", "usb-tablet", "-device", "usb-kbd",
             # The virtio keyboard carries multimedia evdev codes; USB's
             # boot-protocol keyboard has no consumer-control usages.
@@ -3972,7 +4039,7 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
             "-audiodev", "none,id=tuna-audio",
             "-device", "ich9-intel-hda",
             "-device", "hda-duplex,audiodev=tuna-audio",
-            "-display", "none", "-serial", f"file:{serial}",
+            "-display", gpu_display, "-serial", f"file:{serial}",
             "-qmp", f"unix:{qmp_path},server=on,wait=off",
             "-nic", "user,model=virtio-net-pci"]
     if native_relative_mouse:
@@ -4240,6 +4307,8 @@ def main():
                     help="after the assertions, record the feature tour video")
     ap.add_argument("--strip-edge", action="store_true", help="explicit four-actor stationary edge consumer on final boot")
     ap.add_argument("--strip-image", help="exact same-run package/final-image receipt; installed strip acceptance on final tour boot")
+    ap.add_argument("--explicit-sync", action="store_true",
+                    help="extra strict native timeline/dmabuf stage on opt-in virtio-vga-gl host-software-GL profile")
     ap.add_argument("--published", action="store_true",
                     help="the disk holds the published marlin:tuna flavor; released-build gaps qualify "
                          "where the current-build lanes prove the newer behavior")
@@ -4264,6 +4333,13 @@ def main():
                     help="observe only the first tunastd login: bounded AccountsService call/reply headers "
                          "and pre-existing allowlisted worker markers; never enable GDM debug")
     a = ap.parse_args()
+    if a.explicit_sync and (a.published or a.boots != 1 or a.fresh_accounts or a.soak
+                            or a.tour or a.strip_edge or not a.strip_image or not a.require_kvm):
+        ap.error("--explicit-sync requires one KVM admitted current-build boot, without ordinary lifecycle substitution")
+    if a.explicit_sync and any(value.partition("=")[0] in
+                              {"gpu_profile", "gpu_devices", "assertions", "kvm", "lane", "session"}
+                              for value in a.meta):
+        ap.error("explicit-sync metadata cannot overwrite observed native qualification fields")
     if a.fresh_gdm_trace and not a.fresh_accounts:
         ap.error("--fresh-gdm-trace requires --fresh-accounts")
     if a.profile != "lifecycle":
@@ -4290,8 +4366,8 @@ def main():
     if a.strip_edge and not a.strip_image:
         ap.error("--strip-edge requires exact installed image admission")
     if a.strip_image:
-        if not a.tour:
-            ap.error("--strip-image requires --tour lifecycle")
+        if not a.tour and not a.explicit_sync:
+            ap.error("--strip-image requires --tour lifecycle or its explicit native protocol consumer")
         with open(a.strip_image, "rb") as stream:
             raw = stream.read(1048577)
         if len(raw) > 1048576:
@@ -4321,7 +4397,9 @@ def main():
         results[test_id] = (ok, desc)
         log(f"{test_id} {'pass' if ok else 'FAIL'}: {desc}")
 
-    vm, qmp_path, serial_path, kvm, agent_path = boot(os.path.abspath(a.disk), out, scratch, a.timeout, a.require_kvm, guest_agent=True, native_relative_mouse=True)
+    vm, qmp_path, serial_path, kvm, agent_path = boot(
+        os.path.abspath(a.disk), out, scratch, a.timeout, a.require_kvm,
+        guest_agent=True, native_relative_mouse=True, explicit_sync_gpu=a.explicit_sync)
     start = time.time()
     drm = shell = None
     elapsed = 0.0
@@ -4332,7 +4410,7 @@ def main():
     try:
         qmp = baseline.Qmp(qmp_path)
         try:
-            login_ok = gdm_login(qmp, agent_path, out, record)
+            login_ok = gdm_login(qmp, agent_path, out, record, wait_surface=a.explicit_sync)
         except (OSError, RuntimeError, ValueError) as error:
             record("V-GDM-LOGIN", False, str(error))
             login_ok = False
@@ -4417,6 +4495,16 @@ def main():
             finally:
                 if agent is not None:
                     agent.close()
+            if a.explicit_sync:
+                try:
+                    if not manager_ready:
+                        raise RuntimeError("native installed session owner admission failed")
+                    from explicit_sync_vm import run as run_explicit_sync
+                    factory = lambda *, deadline=None: guest_agent.GuestAgent(agent_path, deadline=deadline)
+                    run_explicit_sync(qmp, factory, out, strip_image, owner, vm)
+                    record("V-SYNCOBJ", True, "real native ioctl timelines, feedback-selected dmabuf, GPU fences, presentation, QMP pixels and invalid/teardown cases")
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                    record("V-SYNCOBJ", False, str(error))
             if a.soak and manager_ready:
                 run_soak(qmp, vm, agent_path, out, record, a.soak, a.soak_warmup, a.soak_interval,
                          a.soak_revision)
@@ -4461,6 +4549,7 @@ def main():
             vm.wait(timeout=30)
         except subprocess.TimeoutExpired:
             vm.kill()
+            vm.wait(timeout=10)
 
     text = read_text(serial_path)
     drm = drm or DRM_RE.search(text)
@@ -4470,6 +4559,8 @@ def main():
            "tuna-shell-gtk started under supervision" if shell
            else "no tuna-shell-gtk: keybindings line")
     results.setdefault("V-PANEL", (False, "session never came up, no screendump checked"))
+    if a.explicit_sync:
+        results.setdefault("V-SYNCOBJ", (False, "native session never became ready; no advertised-path proof"))
     if a.soak:
         results.setdefault("V-SOAK", (False, "the session never became ready, so the soak did not run"))
     # GDM starting its greeter on the login VT takes DRM master from the
@@ -4512,8 +4603,9 @@ def main():
         "resolution": f"{WIDTH}x{HEIGHT}",
         "kvm": kvm,
         "qemu": qemu_version,
-        "gpu_profile": baseline.GPU_PROFILE,
-        "gpu_devices": baseline.gpu_devices(),
+        "gpu_profile": "std-vga-plus-virtio-gl-render-v4" if a.explicit_sync else baseline.GPU_PROFILE,
+        "gpu_devices": gpu_devices_for_receipt(a.explicit_sync),
+        "gpu_display": "egl-headless" if a.explicit_sync else "none",
         "session_up_s": round(elapsed) if drm and shell else None,
         "drm_session_paused": paused,
         "captured_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

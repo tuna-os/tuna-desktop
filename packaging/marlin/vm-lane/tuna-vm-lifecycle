@@ -2728,10 +2728,20 @@ def main():
     if os.geteuid() != 0 or OWNER.pw_uid == 0:
         raise RuntimeError("probe must be root and session owner must not be root")
     action = sys.argv[1]
-    if action == "greeter-prompt":
+    if action == "explicit-sync":
+        if len(sys.argv) != 4 or sys.argv[2] not in {"init", "start", "state", "ack", "finish", "cleanup", "file"}:
+            raise ValueError("explicit-sync requires one fixed operation and one JSON payload")
+        output = call("/usr/libexec/tuna-vm-explicit-sync", sys.argv[2], sys.argv[3], check=False)
+        result = json.loads(output)
+        if type(result) is dict and set(result) == {"explicit_sync_error"}:
+            # The helper's one bounded failure record; the host's failure
+            # transport validates it (vm_guest_agent.FAILURE_RECORDS).
+            print(json.dumps(result))
+            raise SystemExit(1)
+    elif action == "greeter-prompt":
         print(json.dumps(greeter_prompt()))
         return
-    if action == "background-diagnostics":
+    elif action == "background-diagnostics":
         inventory()  # Verify the original actual login owner before re-exec.
         result = json.loads(call(sys.executable, __file__, "background-user-diagnostics", user=True))
     elif action == "inventory":

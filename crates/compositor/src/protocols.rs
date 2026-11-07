@@ -1,10 +1,13 @@
 //! Protocols beyond the core slice (#89): what GTK4, libadwaita and
 //! Chromium look for on a GNOME 51 session.
 //!
-//! - linux-dmabuf (v3, formats from the renderer): GPU clients and the
-//!   GTK4 GL renderer stop falling back to software. The runtime
-//!   creates the global once its renderer exists
-//!   ([`State::enable_dmabuf`]); buffers import lazily at draw time.
+//! - linux-dmabuf (v5 with feedback naming the renderer's device, v3
+//!   without one; formats from the renderer): GPU clients and the GTK4
+//!   GL renderer stop falling back to software. The runtime creates the
+//!   global once its renderer exists ([`State::enable_dmabuf`]); buffers
+//!   import lazily at draw time.
+//! - linux-drm-syncobj v1 (explicit sync): only when the renderer's
+//!   device has timeline syncobjs, as Mutter; see [`crate::explicit_sync`].
 //! - xdg-activation v1: an app may hand focus to another only with a
 //!   token minted while the requesting client held keyboard focus,
 //!   used within [`ACTIVATION_TOKEN_TTL`] (Mutter's focus-stealing
@@ -29,7 +32,7 @@
 //! - xdg-dialog v1: a modal dialog is attached to its parent as in
 //!   GNOME (attach-modal-dialogs): focusing the parent focuses the
 //!   dialog. xdg-foreign v2 lets the portal parent its dialogs to the
-//!   app's window the same way.
+//!   app's window the same way; v1 (GTK 3) shares v2's handle table.
 //! - xdg-system-bell v1: rings GNOME's `bell-window-system` theme sound
 //!   (Mutter's audible bell) through libcanberra's player.
 //! - xdg-toplevel-tag v1: each window keeps its tag and description.
@@ -38,9 +41,19 @@
 //!   restore-shortcuts) hands the shortcuts back until the window is
 //!   focused again. A trusted shell consent response is required first;
 //!   unapproved requests remain inactive, even after refocusing.
+//! - Xwayland keyboard grab v1 (Xwayland only): a granted X11 keyboard
+//!   grab inhibits shortcuts the same way, without consent; see
+//!   [`crate::xwayland_grab`].
 //! - pointer-warp v1: a client may move the pointer within its own
 //!   surface while it has pointer focus (the enter serial must match).
 //! - presentation-time, fifo and commit-timing: see [`crate::frame_timing`].
+//! - wl_fixes v1: `destroy_registry` frees a wl_registry, which the
+//!   core protocol gives no destructor (Mutter's meta-wayland-fixes.c).
+//! - ext-background-effect v1: the blur behind a surface's blur region
+//!   (`background_effect.rs`, drawn by `background_blur.rs`).
+//! - wp_drm_lease_device_v1 (native backend only): see `crate::drm::lease`.
+//! - xdg-toplevel-drag v1: a window attached to a drag-and-drop follows
+//!   the pointer (detachable tabs); see [`crate::toplevel_drag`].
 //!
 //! Deliberately absent, matching Mutter: xdg-decoration (GNOME is
 //! client-side decorations only).
@@ -61,8 +74,12 @@ use smithay::{
             xdg::shell::server::xdg_toplevel::XdgToplevel,
         },
         wayland_server::{
-            backend::GlobalId, protocol::wl_surface::WlSurface, Client, DataInit, Dispatch,
-            DisplayHandle, GlobalDispatch, New, Resource,
+            backend::GlobalId,
+            protocol::{
+                wl_fixes::{self, WlFixes},
+                wl_surface::WlSurface,
+            },
+            Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
         },
     },
     utils::{Logical, Point, Rectangle},
@@ -106,8 +123,23 @@ pub const ACTIVATION_TOKEN_TTL: Duration = Duration::from_secs(10);
 pub(crate) struct Protocols {
     #[cfg(feature = "xwayland")]
     pub(crate) x11_interop: crate::x11_interop::Interop,
+    #[cfg(feature = "xwayland")]
+    pub(crate) xwayland_grabs: crate::xwayland_grab::XwaylandGrabs,
     pub(crate) dmabuf_state: DmabufState,
     pub(crate) dmabuf_global: Option<DmabufGlobal>,
+    /// The actual backend is retained for synchronous EGL validation while
+    /// the client's params resource is still alive.
+    pub(crate) dmabuf_backend: Option<crate::runtime::Backend>,
+    /// wp_linux_drm_syncobj_manager_v1, once the renderer passes Mutter's
+    /// checks ([`crate::explicit_sync`]).
+    #[cfg(feature = "drm")]
+    pub(crate) syncobj: Option<smithay::wayland::drm_syncobj::DrmSyncobjState>,
+    /// Acquire points held commits wait on, until the event loop watches them.
+    #[cfg(feature = "drm")]
+    pub(crate) acquire_waits: Vec<(
+        smithay::wayland::drm_syncobj::DrmSyncPointSource,
+        smithay::reexports::wayland_server::Weak<WlSurface>,
+    )>,
     pub(crate) activation_state: XdgActivationState,
     _viewporter: ViewporterState,
     _fractional_scale: FractionalScaleManagerState,
@@ -136,6 +168,11 @@ pub(crate) struct Protocols {
     shortcut_changed: bool,
     pub(crate) shortcut_locked: bool,
     _pointer_warp: GlobalId,
+    _fixes: GlobalId,
+    /// ext_background_effect_manager_v1 (blur behind surfaces).
+    pub(crate) background_effects: crate::background_effect::BackgroundEffects,
+    /// xdg_toplevel_drag_manager_v1 and its toplevel drags.
+    pub(crate) toplevel_drag: crate::toplevel_drag::ToplevelDrags,
     /// Pointer warps clients asked for, drained by the window manager:
     /// surface, surface-local position, enter serial.
     pub(crate) pointer_warps: Vec<(WlSurface, Point<f64, Logical>, u32)>,
@@ -147,6 +184,10 @@ pub(crate) struct Protocols {
     pub(crate) preferred_scale: f64,
     /// Every text input's committed state, for the on-screen keyboard.
     pub(crate) text_inputs: crate::osk::TextInputs,
+    /// wp_drm_lease_device_v1 on the native backend (Mutter advertises it
+    /// nowhere else); see [`crate::drm::lease`].
+    #[cfg(feature = "drm")]
+    pub(crate) drm_lease: Option<crate::drm::lease::LeaseDevice>,
 }
 
 impl Protocols {
@@ -154,6 +195,11 @@ impl Protocols {
         Self {
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
+            dmabuf_backend: None,
+            #[cfg(feature = "drm")]
+            syncobj: None,
+            #[cfg(feature = "drm")]
+            acquire_waits: Vec::new(),
             activation_state: XdgActivationState::new::<State>(dh),
             _viewporter: ViewporterState::new::<State>(dh),
             _fractional_scale: FractionalScaleManagerState::new::<State>(dh),
@@ -196,12 +242,19 @@ impl Protocols {
             shortcut_locked: false,
             #[cfg(feature = "xwayland")]
             x11_interop: crate::x11_interop::Interop::new(dh),
+            #[cfg(feature = "xwayland")]
+            xwayland_grabs: crate::xwayland_grab::XwaylandGrabs::new(dh),
             _pointer_warp: dh.create_global::<State, WpPointerWarpV1, ()>(1, ()),
+            _fixes: dh.create_global::<State, WlFixes, ()>(1, ()),
+            background_effects: crate::background_effect::BackgroundEffects::new(dh),
+            toplevel_drag: crate::toplevel_drag::ToplevelDrags::new(dh),
             pointer_warps: Vec::new(),
             bell: Bell::default(),
             inhibitors: Vec::new(),
             preferred_scale: 1.0,
             text_inputs: crate::osk::TextInputs::default(),
+            #[cfg(feature = "drm")]
+            drm_lease: None,
         }
     }
 }
@@ -250,26 +303,92 @@ fn update_tag(state: &State, toplevel: &XdgToplevel, update: impl FnOnce(&mut To
     });
 }
 
+/// The main device Mutter gives linux-dmabuf feedback
+/// (`meta_wayland_dma_buf_manager_new` in meta-wayland-dma-buf.c): the
+/// renderer's EGL device's render node, else its DRM device node. None
+/// (no EGL device, neither extension, or the node cannot be read) keeps
+/// the global at version 3, as in Mutter.
+pub fn renderer_main_device(
+    renderer: &smithay::backend::renderer::gles::GlesRenderer,
+) -> Option<libc::dev_t> {
+    use std::os::unix::fs::MetadataExt;
+    let device = match smithay::backend::egl::EGLDevice::device_for_display(
+        renderer.egl_context().display(),
+    ) {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("tuna-compositor: renderer has no EGL device: {error}");
+            return None;
+        }
+    };
+    let path = match device
+        .render_device_path()
+        .or_else(|_| device.drm_device_path())
+    {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("tuna-compositor: renderer EGL device has no DRM node: {error}");
+            return None;
+        }
+    };
+    std::fs::metadata(path).ok().map(|meta| meta.rdev())
+}
+
 impl State {
     /// Advertise linux-dmabuf with the renderer's importable formats.
     /// No formats (software rendering) means no global: clients then
     /// use shm, exactly as before.
-    pub fn enable_dmabuf(&mut self, formats: Vec<Format>) {
-        if formats.is_empty() || self.protocols.dmabuf_global.is_some() {
-            if formats.is_empty() {
-                eprintln!("tuna-compositor: no dmabuf formats, linux-dmabuf not advertised");
-            }
+    ///
+    /// With the renderer's `main_device` the global is version 5, as
+    /// Mutter's: its default feedback names that device and one tranche
+    /// of the same formats, and surface feedback is the default (Tuna
+    /// Desktop composites every surface, so it offers no scanout
+    /// tranche). Without one it stays version 3, as Mutter does.
+    pub(crate) fn enable_dmabuf(&mut self, backend: crate::runtime::Backend) {
+        use smithay::backend::renderer::ImportDma;
+        if self.protocols.dmabuf_global.is_some() {
             return;
         }
-        eprintln!(
-            "tuna-compositor: linux-dmabuf v3 with {} formats",
-            formats.len()
-        );
+        let (formats, main_device): (Vec<Format>, _) = {
+            let renderer = backend.renderer();
+            (
+                renderer.dmabuf_formats().into_iter().collect(),
+                renderer_main_device(&renderer),
+            )
+        };
+        if formats.is_empty() {
+            eprintln!("tuna-compositor: no dmabuf formats, linux-dmabuf not advertised");
+            return;
+        }
+        self.protocols.dmabuf_backend = Some(backend);
+        let feedback = main_device.and_then(|device| {
+            smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(device, formats.iter().copied())
+                .build()
+                .map_err(|e| eprintln!("tuna-compositor: dmabuf feedback: {e}"))
+                .ok()
+        });
         let dh = self.dh.clone();
-        let global = self
-            .protocols
-            .dmabuf_state
-            .create_global::<State>(&dh, formats);
+        let global = match feedback {
+            Some(feedback) => {
+                eprintln!(
+                    "tuna-compositor: linux-dmabuf v5 with {} formats on device {:#x}",
+                    formats.len(),
+                    main_device.unwrap_or_default()
+                );
+                self.protocols
+                    .dmabuf_state
+                    .create_global_with_default_feedback::<State>(&dh, &feedback)
+            }
+            None => {
+                eprintln!(
+                    "tuna-compositor: linux-dmabuf v3 with {} formats (no renderer device)",
+                    formats.len()
+                );
+                self.protocols
+                    .dmabuf_state
+                    .create_global::<State>(&dh, formats)
+            }
+        };
         self.protocols.dmabuf_global = Some(global);
     }
 
@@ -309,7 +428,8 @@ impl State {
     }
 
     /// Whether the surface holding keyboard focus inhibits the
-    /// compositor's shortcuts (keyboard-shortcuts-inhibit).
+    /// compositor's shortcuts (keyboard-shortcuts-inhibit, or a granted
+    /// Xwayland keyboard grab).
     pub fn shortcuts_inhibited(&self) -> bool {
         if self.protocols.shortcut_locked {
             return false;
@@ -317,14 +437,19 @@ impl State {
         let Some(focus) = self.seat.get_keyboard().and_then(|k| k.current_focus()) else {
             return false;
         };
+        #[cfg(feature = "xwayland")]
+        if self.protocols.xwayland_grabs.inhibits(&focus) {
+            return true;
+        }
         self.seat
             .keyboard_shortcuts_inhibitor_for_surface(&focus)
             .is_some_and(|inhibitor| inhibitor.is_active())
     }
 
     /// Mutter's restore-shortcuts (Super+Escape): the focused surface's
-    /// inhibitor goes inactive until it is focused again. Returns
-    /// whether one was active.
+    /// inhibitor goes inactive until it is focused again, and its
+    /// Xwayland grab ends (`shortcuts_restored_cb`). Returns whether
+    /// either was active.
     pub fn restore_shortcuts(&mut self) -> bool {
         if self.protocols.shortcut_locked {
             return false;
@@ -332,12 +457,16 @@ impl State {
         let Some(focus) = self.seat.get_keyboard().and_then(|k| k.current_focus()) else {
             return false;
         };
+        #[cfg(feature = "xwayland")]
+        let grab = self.protocols.xwayland_grabs.restore(&focus);
+        #[cfg(not(feature = "xwayland"))]
+        let grab = false;
         match self.seat.keyboard_shortcuts_inhibitor_for_surface(&focus) {
             Some(inhibitor) if inhibitor.is_active() => {
                 inhibitor.inactivate();
                 true
             }
-            _ => false,
+            _ => grab,
         }
     }
 
@@ -484,13 +613,27 @@ impl DmabufHandler for State {
     fn dmabuf_imported(
         &mut self,
         _global: &DmabufGlobal,
-        _dmabuf: Dmabuf,
+        dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
-        // The renderer lives with the backend: buffers import when a
-        // frame first draws them, and a failed import only skips that
-        // surface. The global only lists formats the renderer imports.
-        let _ = notifier.successful::<State>();
+        use smithay::backend::renderer::ImportDma;
+        let imported = self
+            .protocols
+            .dmabuf_backend
+            .as_ref()
+            .is_some_and(|backend| {
+                // Import/cache on the real renderer before a following
+                // params.destroy can retire the error-reporting resource.
+                // Committed surface YUV conversion still owns its later
+                // cache invalidation/reimport, not this pre-commit check.
+                backend.renderer().import_dmabuf(&dmabuf, None).is_ok()
+            });
+        // The backend guard is dropped before either protocol completion.
+        if imported {
+            let _ = notifier.successful::<State>();
+        } else {
+            notifier.failed();
+        }
     }
 }
 delegate_dmabuf!(State);
@@ -964,6 +1107,38 @@ impl Dispatch<WpPointerWarpV1, ()> for State {
                 .protocols
                 .pointer_warps
                 .push((surface, (x, y).into(), serial));
+        }
+    }
+}
+
+impl GlobalDispatch<WlFixes, ()> for State {
+    fn bind(
+        _state: &mut Self,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<WlFixes>,
+        _data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<WlFixes, ()> for State {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &WlFixes,
+        request: wl_fixes::Request,
+        _data: &(),
+        dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        // Mutter's wl_fixes_destroy_registry: wl_resource_destroy on the
+        // registry, which tells the client its id is free (delete_id)
+        // and stops global announcements to it.
+        if let wl_fixes::Request::DestroyRegistry { registry } = request {
+            let _ = dh.backend_handle().destroy_object::<State>(&registry.id());
         }
     }
 }

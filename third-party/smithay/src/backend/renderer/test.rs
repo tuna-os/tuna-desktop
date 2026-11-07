@@ -273,6 +273,14 @@ impl Frame for DummyFrame {
         sync.wait().map_err(|_| DummyError::SyncInterrupted)
     }
 
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    fn note_buffer_access(&mut self, buffer: &super::utils::Buffer) -> Result<(), Self::Error> {
+        if let Some(acquire) = buffer.acquire_point() {
+            self.wait(&SyncPoint::from(acquire.clone()))?;
+        }
+        Ok(())
+    }
+
     fn finish(self) -> Result<SyncPoint, Self::Error> {
         Ok(SyncPoint::default())
     }

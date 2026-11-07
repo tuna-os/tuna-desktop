@@ -6,13 +6,15 @@
 //!
 //! - **Session**: libseat (logind or seatd) grants device access and
 //!   reports VT pause/activate. Ctrl+Alt+F1..F12 switches VTs.
-//! - **Device**: udev's primary GPU for the seat (or
-//!   `TUNA_DRM_DEVICE`), opened through the session; GBM allocates
-//!   scanout buffers and EGL/GLES renders into them.
+//! - **Device**: the seat's primary GPU in Mutter's order (or
+//!   `TUNA_DRM_DEVICE` alone), opened through the session; GBM allocates
+//!   scanout buffers and EGL/GLES renders into them. Other GPUs with a
+//!   connected monitor show a CPU copy of what it renders ([`secondary`]).
 //! - **Outputs**: every connected connector with its preferred mode and
 //!   a free CRTC, tiled left to right in the same order the output
 //!   inventory uses. Each output renders when its previous page flip
-//!   completed (vblank), so frames are paced by the display.
+//!   completed (vblank), so frames are paced by the display. Connectors
+//!   for lease (non-desktop ones, [`lease`]) stay off the desktop.
 //! - **Input**: libinput on the session's seat. Relative pointer motion
 //!   is accumulated here and clamped to the output union, so the window
 //!   manager keeps receiving absolute positions like the nested backend.
@@ -46,9 +48,11 @@ use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size};
 use crate::windows::ManagerInput;
 
 pub mod color;
+pub mod lease;
 pub mod libinput;
 pub mod libwacom;
 pub mod privacy;
+pub mod secondary;
 pub mod tablet;
 
 /// Scanout surface type: GBM buffers on the DRM device, each queued
@@ -80,6 +84,9 @@ pub struct DrmOutput {
     native_owner: Option<tuna_shell_control::NativeOutputInfo>,
     /// GBM swapchain bound to the CRTC.
     pub surface: ScanoutSurface,
+    /// Secondary GPU copy (the connector is on another KMS device than
+    /// the rendering GPU); `None` scans out what the primary GPU renders.
+    pub copy: Option<secondary::ScanoutCopy>,
     /// Protocol output advertised to clients.
     pub output: Output,
     /// The connector's modes in Mutter's order (#340), each with the
@@ -155,6 +162,52 @@ impl DrmOutput {
             self.name,
             self.surface.surface().commit_pending(),
         );
+    }
+
+    /// The secondary GPU (an index into the backend's) whose connector
+    /// this is; `None` on the primary GPU.
+    pub fn gpu(&self) -> Option<usize> {
+        self.copy.as_ref().map(|copy| copy.gpu)
+    }
+
+    /// What the next frame renders into, and its age.
+    pub fn next_render_target(
+        &mut self,
+        renderer: &mut GlesRenderer,
+    ) -> Result<(secondary::RenderTarget, u8), String> {
+        match &mut self.copy {
+            None => self
+                .surface
+                .next_buffer()
+                .map(|(dmabuf, age)| (secondary::RenderTarget::Scanout(dmabuf), age))
+                .map_err(|e| e.to_string()),
+            Some(copy) => copy.target(renderer, self.size),
+        }
+    }
+
+    /// Queue the rendered frame for the next page flip; a secondary GPU
+    /// copy first copies it into a scanout buffer of the output's device.
+    pub fn queue_render_target(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        target: secondary::RenderTarget,
+        sync: smithay::backend::renderer::sync::SyncPoint,
+        damage: Vec<Rectangle<i32, Physical>>,
+        feedback: OutputPresentationFeedback,
+    ) -> Result<(), String> {
+        let sync = match (target, self.copy.as_mut()) {
+            (secondary::RenderTarget::Scanout(_), None) => Some(sync),
+            (secondary::RenderTarget::Copy(texture), Some(copy)) => {
+                let (dmabuf, _) = self.surface.next_buffer().map_err(|e| e.to_string())?;
+                copy.write(renderer, &texture, self.surface.surface(), &dmabuf)?;
+                // The copy waited for the rendering; the CPU wrote the buffer.
+                None
+            }
+            _ => return Err("render target does not match the output's scanout".into()),
+        };
+        self.surface
+            .queue_buffer(sync, Some(damage), feedback)
+            .map_err(|e| e.to_string())
     }
 
     /// Size in logical pixels (mode size over scale, swapped under
@@ -266,8 +319,12 @@ impl DrmOutput {
 pub struct DrmBackend {
     /// libseat session (device access, VT switching).
     pub session: LibSeatSession,
-    /// Opened KMS device.
+    /// Opened KMS device of the GPU that renders (the primary GPU).
     pub drm: DrmDevice,
+    /// Its device path.
+    path: std::path::PathBuf,
+    /// Other KMS devices whose outputs show a secondary GPU copy.
+    pub secondary: Vec<secondary::SecondaryGpu>,
     /// GLES renderer on the device's EGL display.
     pub renderer: GlesRenderer,
     /// Lit outputs, primary first.
@@ -310,6 +367,7 @@ pub struct DrmBackend {
     gbm: GbmDevice<DrmDeviceFd>,
     render_formats: smithay::backend::allocator::format::FormatSet,
     native_device: Option<u64>,
+    lease_names: Vec<String>,
 }
 
 /// Connectors a hotplug rescan found connected or gone, by name.
@@ -331,6 +389,8 @@ pub struct DrmSources {
     pub session: LibSeatSessionNotifier,
     /// VBlank and device errors.
     pub drm: DrmDeviceNotifier,
+    /// The same, of each secondary GPU, by index.
+    pub secondary: Vec<DrmDeviceNotifier>,
     /// Input events.
     pub input: LibinputInputBackend,
     /// DRM device `change` uevents (privacy screen hw-state, #356);
@@ -348,8 +408,274 @@ impl std::fmt::Display for DrmInitError {
     }
 }
 
+/// The KMS device of an output on secondary GPU `gpu`, or the primary.
+fn device_of<'a>(
+    primary: &'a DrmDevice,
+    secondary: &'a [secondary::SecondaryGpu],
+    gpu: Option<usize>,
+) -> &'a DrmDevice {
+    gpu.and_then(|index| secondary.get(index))
+        .map_or(primary, |gpu| &gpu.drm)
+}
+
 fn err(context: &str) -> impl Fn(String) -> DrmInitError + '_ {
     move |e| DrmInitError(format!("{context}: {e}"))
+}
+
+/// What primary-GPU selection knows about one seat GPU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GpuCandidate {
+    path: std::path::PathBuf,
+    /// udev tag `mutter-device-preferred-primary` (Mutter's 61-mutter.rules).
+    preferred: bool,
+    /// The PCI boot VGA device.
+    boot: bool,
+    /// The device has a DRM render node: its EGL device has a DRM node, so
+    /// linux-dmabuf main-device feedback and explicit sync can be offered.
+    render_node: bool,
+    /// At least one connector reports `connected`.
+    connected: bool,
+}
+
+/// Mutter's primary GPU order, extended for KMS-only boot GPUs: a udev
+/// preferred-primary tag wins; then a boot GPU that can render; then, when
+/// the boot GPU is KMS-only (bochs, simpledrm, a BMC VGA), a GPU that both
+/// renders and drives a connected output, so the session keeps an EGL
+/// device (GNOME's Mutter also ends up on virtio-gpu beside bochs); then
+/// the boot GPU, then the first GPU.
+fn choose_primary_gpu(gpus: &[GpuCandidate]) -> Option<&GpuCandidate> {
+    gpus.iter()
+        .find(|gpu| gpu.preferred)
+        .or_else(|| gpus.iter().find(|gpu| gpu.boot && gpu.render_node))
+        .or_else(|| gpus.iter().find(|gpu| gpu.render_node && gpu.connected))
+        .or_else(|| gpus.iter().find(|gpu| gpu.boot))
+        .or_else(|| gpus.first())
+}
+
+/// `/sys/class/drm/cardN` name of a `/dev/dri/cardN` path.
+fn card_name(path: &std::path::Path) -> Option<&str> {
+    path.file_name()?
+        .to_str()
+        .filter(|name| name.starts_with("card"))
+}
+
+fn has_render_node(path: &std::path::Path) -> bool {
+    let Some(card) = card_name(path) else {
+        return false;
+    };
+    std::fs::read_dir(format!("/sys/class/drm/{card}/device/drm")).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("renderD"))
+        })
+    })
+}
+
+fn has_connected_output(path: &std::path::Path) -> bool {
+    let Some(card) = card_name(path) else {
+        return false;
+    };
+    let prefix = format!("{card}-");
+    std::fs::read_dir("/sys/class/drm").is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+                && std::fs::read_to_string(entry.path().join("status"))
+                    .is_ok_and(|status| status.trim() == "connected")
+        })
+    })
+}
+
+/// Whether udev's database tags the node `mutter-device-preferred-primary`.
+fn has_preferred_primary_tag(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let rdev = meta.rdev();
+    let database = format!(
+        "/run/udev/data/c{}:{}",
+        libc::major(rdev),
+        libc::minor(rdev)
+    );
+    std::fs::read_to_string(database).is_ok_and(|text| {
+        text.lines()
+            .filter_map(|line| line.strip_prefix("G:").or_else(|| line.strip_prefix("Q:")))
+            .any(|tags| {
+                tags.split_whitespace()
+                    .any(|tag| tag == "mutter-device-preferred-primary")
+            })
+    })
+}
+
+/// The seat GPUs whose connected outputs join the desktop through a
+/// secondary GPU copy: every GPU but the primary with a connected
+/// connector, in seat order (Mutter lights every GPU's monitors). A GPU
+/// with nothing connected at startup is not opened, so an idle second
+/// GPU is neither woken nor held.
+fn secondary_gpus<'a>(
+    gpus: &'a [GpuCandidate],
+    primary: &std::path::Path,
+) -> Vec<&'a std::path::Path> {
+    gpus.iter()
+        .filter(|gpu| gpu.path != primary && gpu.connected)
+        .map(|gpu| gpu.path.as_path())
+        .collect()
+}
+
+/// The seat's primary GPU and the secondary GPUs beside it, or None with
+/// no GPU on the seat.
+fn select_gpus(seat: &str) -> Option<(std::path::PathBuf, Vec<std::path::PathBuf>)> {
+    let boot = smithay::backend::udev::primary_gpu(seat).ok().flatten();
+    let gpus: Vec<GpuCandidate> = smithay::backend::udev::all_gpus(seat)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| GpuCandidate {
+            preferred: has_preferred_primary_tag(&path),
+            boot: boot.as_deref() == Some(path.as_path()),
+            render_node: has_render_node(&path),
+            connected: has_connected_output(&path),
+            path,
+        })
+        .collect();
+    for gpu in &gpus {
+        eprintln!(
+            "tuna-compositor: drm: GPU {} preferred={} boot={} render-node={} connected={}",
+            gpu.path.display(),
+            gpu.preferred,
+            gpu.boot,
+            gpu.render_node,
+            gpu.connected
+        );
+    }
+    let primary = choose_primary_gpu(&gpus)
+        .map(|gpu| gpu.path.clone())
+        .or(boot)?;
+    let secondary = secondary_gpus(&gpus, &primary)
+        .into_iter()
+        .map(std::path::Path::to_path_buf)
+        .collect();
+    Some((primary, secondary))
+}
+
+/// The desktop name of a connector: its kernel name, unless an output of
+/// an earlier GPU already has it (QEMU's bochs and virtio-gpu both drive
+/// a `Virtual-1`); then the sysfs name, `card1-Virtual-1`.
+fn output_name(connector: &str, card: &str, taken: &[&str]) -> String {
+    if taken.contains(&connector) {
+        format!("{card}-{connector}")
+    } else {
+        connector.to_owned()
+    }
+}
+
+/// The order of the primary GPU (`None`) and the secondary GPUs (by
+/// index) in the seat's GPU order, which `all_gpus` sorts by path.
+fn seat_order(primary: &std::path::Path, secondary: &[&std::path::Path]) -> Vec<Option<usize>> {
+    let mut order: Vec<Option<usize>> = std::iter::once(None)
+        .chain((0..secondary.len()).map(Some))
+        .collect();
+    order.sort_by_key(|gpu| gpu.map_or(primary, |index| secondary[index]));
+    order
+}
+
+/// Open a KMS device through the session.
+fn open_device(
+    session: &mut LibSeatSession,
+    path: &std::path::Path,
+) -> Result<DrmDeviceFd, DrmInitError> {
+    let fd = session
+        .open(
+            path,
+            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
+        )
+        .map_err(|e| err("open drm device")(format!("{}: {e}", path.display())))?;
+    Ok(DrmDeviceFd::new(DeviceFd::from(fd)))
+}
+
+/// Open a secondary GPU: KMS and GBM scanout buffers, no renderer.
+fn open_secondary(
+    session: &mut LibSeatSession,
+    path: &std::path::Path,
+) -> Result<(secondary::SecondaryGpu, DrmDeviceNotifier), DrmInitError> {
+    use std::os::fd::AsFd;
+    let fd = open_device(session, path)?;
+    let (drm, notifier) =
+        DrmDevice::new(fd.clone(), true).map_err(|e| err("drm device")(e.to_string()))?;
+    let gbm = GbmDevice::new(fd).map_err(|e| err("gbm device")(e.to_string()))?;
+    let native_device = crate::native_output::device(drm.device_fd().as_fd())
+        .ok()
+        .filter(|device| *device == drm.device_id());
+    Ok((
+        secondary::SecondaryGpu {
+            path: path.to_path_buf(),
+            drm,
+            gbm,
+            native_device,
+        },
+        notifier,
+    ))
+}
+
+/// Light the connected desktop connectors of one device that are not
+/// lit yet, after `outputs`, on CRTCs not in `used`. Returns the names
+/// lit and how many connected connectors are for lease. At `startup`
+/// connectors are not probed again and those for lease are logged.
+fn light_connectors(
+    drm: &mut DrmDevice,
+    lighting: &Lighting<'_>,
+    card: &str,
+    outputs: &mut Vec<DrmOutput>,
+    mut used: Vec<crtc::Handle>,
+    lease_names: &[String],
+    startup: bool,
+) -> (Vec<String>, usize) {
+    let mut added = Vec::new();
+    let mut for_lease = 0usize;
+    for handle in lighting.resources.connectors() {
+        if outputs
+            .iter()
+            .any(|o| o.gpu() == lighting.gpu && o.connector == *handle)
+        {
+            continue;
+        }
+        let Ok(info) = drm.get_connector(*handle, !startup) else {
+            continue;
+        };
+        if info.state() != connector::State::Connected {
+            continue;
+        }
+        let connector = lease::connector_name(&info);
+        // Connectors for lease never join the desktop (Mutter's
+        // meta_gpu_kms_read_current skips non-desktop ones).
+        if lease::is_for_lease(&connector, lease::non_desktop(drm, *handle), lease_names) {
+            if startup {
+                eprintln!(
+                    "tuna-compositor: drm: connector {connector} is for lease, not the desktop"
+                );
+            }
+            for_lease += 1;
+            continue;
+        }
+        let taken: Vec<&str> = outputs.iter().map(|o| o.name.as_str()).collect();
+        let name = output_name(&connector, card, &taken);
+        if let Some(out) = lighting.open(drm, *handle, &info, &used, name) {
+            if lighting.gpu.is_some() {
+                eprintln!(
+                    "tuna-compositor: drm: connector {} on {card} shows a secondary GPU copy",
+                    out.name
+                );
+            }
+            used.push(out.crtc);
+            added.push(out.name.clone());
+            outputs.push(out);
+        }
+    }
+    (added, for_lease)
 }
 
 // Evdev keycodes (backend keycodes minus the XKB offset of 8).
@@ -426,6 +752,9 @@ struct Lighting<'a> {
     render_formats: &'a smithay::backend::allocator::format::FormatSet,
     native_device: Option<u64>,
     resources: &'a control::ResourceHandles,
+    /// The secondary GPU the device is: its outputs show a secondary GPU
+    /// copy in linear XRGB8888 buffers the CPU writes.
+    gpu: Option<usize>,
 }
 
 impl Lighting<'_> {
@@ -439,6 +768,7 @@ impl Lighting<'_> {
         handle: connector::Handle,
         info: &connector::Info,
         used: &[crtc::Handle],
+        name: String,
     ) -> Option<DrmOutput> {
         // Mutter's monitor modes (#340): every connector mode,
         // deduplicated and sorted; the output starts in the preferred
@@ -463,7 +793,6 @@ impl Lighting<'_> {
             .collect();
         let preferred_mode = listed.preferred;
         let mode = modes[preferred_mode].1;
-        let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
         let Some(crtc) = info
             .encoders()
             .iter()
@@ -481,14 +810,21 @@ impl Lighting<'_> {
                 return None;
             }
         };
-        let allocator = GbmAllocator::new(
-            self.gbm.clone(),
-            GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-        );
+        let (flags, color_formats): (_, &[Fourcc]) = match self.gpu {
+            None => (
+                GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+                &[Fourcc::Argb8888, Fourcc::Xrgb8888],
+            ),
+            Some(_) => (
+                GbmBufferFlags::SCANOUT | GbmBufferFlags::LINEAR,
+                &[Fourcc::Xrgb8888],
+            ),
+        };
+        let allocator = GbmAllocator::new(self.gbm.clone(), flags);
         let surface = match GbmBufferedSurface::new(
             surface,
             allocator,
-            &[Fourcc::Argb8888, Fourcc::Xrgb8888],
+            color_formats,
             self.render_formats.iter().copied(),
         ) {
             Ok(surface) => surface,
@@ -517,14 +853,20 @@ impl Lighting<'_> {
         let out_mode = Mode::from(mode);
         output.change_current_state(Some(out_mode), None, None, None);
         output.set_preferred(out_mode);
+        // Native identity is the kernel connector, whatever the desktop
+        // calls it.
         let native_owner = self.native_device.and_then(|device| {
             crate::native_output::resolve(
                 std::path::Path::new("/sys"),
                 device,
-                &name,
+                &lease::connector_name(info),
                 u32::from(handle),
             )
             .ok()
+            .map(|owner| tuna_shell_control::NativeOutputInfo {
+                name: name.clone(),
+                ..owner
+            })
         });
         Some(DrmOutput {
             name,
@@ -532,6 +874,7 @@ impl Lighting<'_> {
             connector: handle,
             native_owner,
             surface,
+            copy: self.gpu.map(secondary::ScanoutCopy::new),
             output,
             modes,
             preferred_mode,
@@ -563,20 +906,49 @@ impl DrmBackend {
         if !self.active || !self.drm.is_active() {
             return Vec::new();
         }
-        let Ok(device) = crate::native_output::device(self.drm.device_fd().as_fd()) else {
-            return Vec::new();
+        // Each output's identity belongs to the device the backend holds
+        // it on: the actual char device of that KMS FD.
+        let owned = |gpu: Option<usize>| {
+            let drm = device_of(&self.drm, &self.secondary, gpu);
+            crate::native_output::device(drm.device_fd().as_fd())
+                .ok()
+                .filter(|device| *device == drm.device_id())
         };
-        if device != self.drm.device_id() {
-            return Vec::new();
-        }
+        let devices: Vec<Option<u64>> = std::iter::once(None)
+            .chain((0..self.secondary.len()).map(Some))
+            .map(owned)
+            .collect();
+        let device_of_output = |gpu: Option<usize>| devices[gpu.map_or(0, |index| index + 1)];
         // Identity is captured during actual connector discovery, not scanned
         // every render tick. Shell admission revalidates canonical status/object.
         self.outputs
             .iter()
-            .filter_map(|output| output.native_owner.as_ref())
-            .filter(|owner| owner.drm_device == device)
+            .filter_map(|output| {
+                let device = device_of_output(output.gpu())?;
+                output
+                    .native_owner
+                    .as_ref()
+                    .filter(|owner| owner.drm_device == device)
+            })
             .cloned()
             .collect()
+    }
+
+    /// The `wp_drm_lease_device_v1` global for the primary device
+    /// (Mutter's native backend only); it never leases the desktop's CRTCs
+    /// and primary planes.
+    pub fn lease_device(
+        &self,
+        dh: &smithay::reexports::wayland_server::DisplayHandle,
+    ) -> Result<lease::LeaseDevice, String> {
+        let desktop = || self.outputs.iter().filter(|o| o.gpu().is_none());
+        lease::LeaseDevice::new(
+            dh,
+            &self.drm,
+            desktop().map(|o| o.crtc).collect(),
+            desktop().map(|o| o.surface.plane()).collect(),
+            lease::debug_lease_connectors(),
+        )
     }
 
     /// Open the seat, the primary GPU, every connected output, and
@@ -586,25 +958,15 @@ impl DrmBackend {
         let (mut session, session_notifier) =
             LibSeatSession::new().map_err(|e| err("libseat session")(e.to_string()))?;
         let seat = session.seat();
-        let path = match std::env::var_os("TUNA_DRM_DEVICE") {
-            Some(path) => std::path::PathBuf::from(path),
-            None => smithay::backend::udev::primary_gpu(&seat)
-                .ok()
-                .flatten()
-                .or_else(|| {
-                    smithay::backend::udev::all_gpus(&seat)
-                        .ok()
-                        .and_then(|gpus| gpus.into_iter().next())
-                })
-                .ok_or_else(|| DrmInitError(format!("no GPU on seat {seat}")))?,
+        // TUNA_DRM_DEVICE names the one device to use.
+        let (path, secondary_paths) = match std::env::var_os("TUNA_DRM_DEVICE") {
+            Some(path) => (std::path::PathBuf::from(path), Vec::new()),
+            None => {
+                select_gpus(&seat).ok_or_else(|| DrmInitError(format!("no GPU on seat {seat}")))?
+            }
         };
-        let fd = session
-            .open(
-                &path,
-                OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
-            )
-            .map_err(|e| err("open drm device")(format!("{}: {e}", path.display())))?;
-        let fd = DrmDeviceFd::new(DeviceFd::from(fd));
+        let fd = open_device(&mut session, &path)?;
+        eprintln!("tuna-compositor: drm: opened {}", path.display());
         let (mut drm, drm_notifier) =
             DrmDevice::new(fd.clone(), true).map_err(|e| err("drm device")(e.to_string()))?;
         let gbm = GbmDevice::new(fd.clone()).map_err(|e| err("gbm device")(e.to_string()))?;
@@ -618,33 +980,87 @@ impl DrmBackend {
         let renderer =
             unsafe { GlesRenderer::new(context) }.map_err(|e| err("gles")(e.to_string()))?;
 
-        let resources = drm
-            .resource_handles()
-            .map_err(|e| err("drm resources")(e.to_string()))?;
         use std::os::fd::AsFd;
         let native_device = crate::native_output::device(drm.device_fd().as_fd())
             .ok()
             .filter(|device| *device == drm.device_id());
-        let mut outputs: Vec<DrmOutput> = Vec::new();
-        for handle in resources.connectors() {
-            let Ok(info) = drm.get_connector(*handle, false) else {
-                continue;
-            };
-            if info.state() != connector::State::Connected {
-                continue;
-            }
-            let used: Vec<crtc::Handle> = outputs.iter().map(|o| o.crtc).collect();
-            let lighting = Lighting {
-                gbm: &gbm,
-                render_formats: &render_formats,
-                native_device,
-                resources: &resources,
-            };
-            if let Some(out) = lighting.open(&mut drm, *handle, &info, &used) {
-                outputs.push(out);
+        // Other GPUs' monitors show a copy of what the primary GPU renders
+        // (Mutter's secondary GPU copy); one that cannot open stays dark.
+        let mut secondary: Vec<secondary::SecondaryGpu> = Vec::new();
+        let mut secondary_notifiers = Vec::new();
+        for gpu_path in secondary_paths {
+            match open_secondary(&mut session, &gpu_path) {
+                Ok((gpu, notifier)) => {
+                    eprintln!(
+                        "tuna-compositor: drm: opened {} for secondary GPU copy",
+                        gpu_path.display()
+                    );
+                    secondary.push(gpu);
+                    secondary_notifiers.push(notifier);
+                }
+                Err(error) => eprintln!(
+                    "tuna-compositor: drm: secondary GPU {}: {error}",
+                    gpu_path.display()
+                ),
             }
         }
-        if outputs.is_empty() {
+        let copy_formats = secondary::copy_formats();
+        let mut outputs: Vec<DrmOutput> = Vec::new();
+        let lease_names = lease::debug_lease_connectors();
+        let mut for_lease = 0usize;
+        // Monitors in seat GPU order, as Mutter lists them: a KMS-only
+        // boot GPU's monitor comes first and is the primary monitor.
+        let order = seat_order(
+            &path,
+            &secondary
+                .iter()
+                .map(|gpu| gpu.path.as_path())
+                .collect::<Vec<_>>(),
+        );
+        for gpu in order {
+            let (drm, gbm, render_formats, native_device, card) = match gpu {
+                None => (
+                    &mut drm,
+                    &gbm,
+                    &render_formats,
+                    native_device,
+                    path.as_path(),
+                ),
+                Some(index) => {
+                    let secondary::SecondaryGpu {
+                        path,
+                        drm,
+                        gbm,
+                        native_device,
+                    } = &mut secondary[index];
+                    (drm, &*gbm, &copy_formats, *native_device, path.as_path())
+                }
+            };
+            let resources = drm
+                .resource_handles()
+                .map_err(|e| err("drm resources")(e.to_string()))?;
+            let lighting = Lighting {
+                gbm,
+                render_formats,
+                native_device,
+                resources: &resources,
+                gpu,
+            };
+            let (_, leased) = light_connectors(
+                drm,
+                &lighting,
+                card_name(card).unwrap_or_default(),
+                &mut outputs,
+                Vec::new(),
+                &lease_names,
+                true,
+            );
+            for_lease += leased;
+        }
+        // Mutter runs with no monitor at all; a device whose connected
+        // connectors are all for lease (a headset alone) still starts, so
+        // the lease device can offer them. Nothing connected stays an error.
+        if outputs.is_empty() && for_lease == 0 {
             return Err(DrmInitError(format!(
                 "no connected output on {}",
                 path.display()
@@ -668,6 +1084,8 @@ impl DrmBackend {
         let mut backend = Self {
             session,
             drm,
+            path: path.clone(),
+            secondary,
             renderer,
             outputs,
             libinput,
@@ -694,8 +1112,12 @@ impl DrmBackend {
             gbm,
             render_formats,
             native_device,
+            lease_names,
         };
-        if let Err(error) = backend.apply_layout(&layouts) {
+        // With every connector for lease there is no layout to apply.
+        if backend.outputs.is_empty() {
+            eprintln!("tuna-compositor: drm: no desktop output; every connector is for lease");
+        } else if let Err(error) = backend.apply_layout(&layouts) {
             // A stored mode the kernel refused: Mutter falls back to its
             // default configuration the same way.
             eprintln!("tuna-compositor: drm: stored display configuration not applied: {error}");
@@ -705,13 +1127,14 @@ impl DrmBackend {
                 .map_err(|e| DrmInitError(format!("output layout: {e}")))?;
         }
         backend.log_outputs();
-        let (first_w, first_h) = backend.outputs[0].logical_size();
-        let first_loc = backend.outputs[0].loc;
-        backend.pointer = (
-            f64::from(first_loc.0) + f64::from(first_w) / 2.0,
-            f64::from(first_loc.1) + f64::from(first_h) / 2.0,
-        )
-            .into();
+        if let Some(first) = backend.outputs.first() {
+            let (first_w, first_h) = first.logical_size();
+            backend.pointer = (
+                f64::from(first.loc.0) + f64::from(first_w) / 2.0,
+                f64::from(first.loc.1) + f64::from(first_h) / 2.0,
+            )
+                .into();
+        }
         // Connector hotplug arrives as a udev change of the DRM device,
         // as Mutter's MetaUdev reports it (`hotplug` signal).
         let udev = match smithay::backend::udev::UdevBackend::new(&seat) {
@@ -735,6 +1158,7 @@ impl DrmBackend {
             DrmSources {
                 session: session_notifier,
                 drm: drm_notifier,
+                secondary: secondary_notifiers,
                 input,
                 udev,
             },
@@ -765,9 +1189,13 @@ impl DrmBackend {
         }
     }
 
-    /// Whether a udev change concerns this backend's DRM device.
+    /// Whether a udev change concerns one of this backend's DRM devices.
     pub fn is_device(&self, device_id: u64) -> bool {
         self.drm.device_id() == device_id
+            || self
+                .secondary
+                .iter()
+                .any(|gpu| gpu.drm.device_id() == device_id)
     }
 
     /// The connected connectors with their modes, for choosing a
@@ -783,7 +1211,10 @@ impl DrmBackend {
     /// connectors are lit at their preferred mode. The runtime then
     /// configures the new monitor set. Nothing is probed off-seat:
     /// activation rescans.
-    pub fn rescan_connectors(&mut self) -> ConnectorChanges {
+    pub fn rescan_connectors(
+        &mut self,
+        leased_crtcs: impl Iterator<Item = crtc::Handle>,
+    ) -> ConnectorChanges {
         let mut changes = ConnectorChanges::default();
         if !self.active || !self.drm.is_active() {
             return changes;
@@ -795,43 +1226,120 @@ impl DrmBackend {
                 return changes;
             }
         };
+        let secondary_resources: Vec<Option<control::ResourceHandles>> = self
+            .secondary
+            .iter()
+            .map(|gpu| match gpu.drm.resource_handles() {
+                Ok(resources) => Some(resources),
+                Err(error) => {
+                    eprintln!(
+                        "tuna-compositor: drm: hotplug: {}: resources: {error}",
+                        gpu.path.display()
+                    );
+                    None
+                }
+            })
+            .collect();
+        let Self {
+            path,
+            drm,
+            secondary,
+            outputs,
+            lease_names,
+            gbm,
+            render_formats,
+            native_device,
+            ..
+        } = self;
         let mut index = 0;
-        while index < self.outputs.len() {
-            let connected = self
-                .drm
-                .get_connector(self.outputs[index].connector, true)
-                .is_ok_and(|info| info.state() == connector::State::Connected);
+        while index < outputs.len() {
+            let device = device_of(drm, secondary, outputs[index].gpu());
+            let handle = outputs[index].connector;
+            let connected = device.get_connector(handle, true).is_ok_and(|info| {
+                info.state() == connector::State::Connected
+                    && !lease::is_for_lease(
+                        &lease::connector_name(&info),
+                        lease::non_desktop(device, handle),
+                        lease_names,
+                    )
+            });
             if connected {
                 index += 1;
                 continue;
             }
-            let mut gone = self.outputs.remove(index);
+            let mut gone = outputs.remove(index);
             for mut feedback in gone.surface.discard_pending_frames() {
                 feedback.discarded();
             }
             changes.removed.push(gone.name.clone());
         }
-        for handle in resources.connectors() {
-            if self.outputs.iter().any(|o| o.connector == *handle) {
-                continue;
-            }
-            let Ok(info) = self.drm.get_connector(*handle, true) else {
-                continue;
+        let copy_formats = secondary::copy_formats();
+        let mut leased_crtcs = Some(leased_crtcs);
+        let order = seat_order(
+            path,
+            &secondary
+                .iter()
+                .map(|gpu| gpu.path.as_path())
+                .collect::<Vec<_>>(),
+        );
+        for gpu in order {
+            let (drm, gbm, render_formats, native_device, card, resources) = match gpu {
+                None => (
+                    &mut *drm,
+                    &*gbm,
+                    &*render_formats,
+                    *native_device,
+                    path.as_path(),
+                    &resources,
+                ),
+                Some(index) => {
+                    let Some(resources) = &secondary_resources[index] else {
+                        continue;
+                    };
+                    let secondary::SecondaryGpu {
+                        path,
+                        drm,
+                        gbm,
+                        native_device,
+                    } = &mut secondary[index];
+                    (
+                        drm,
+                        &*gbm,
+                        &copy_formats,
+                        *native_device,
+                        path.as_path(),
+                        resources,
+                    )
+                }
             };
-            if info.state() != connector::State::Connected {
-                continue;
-            }
-            let used: Vec<crtc::Handle> = self.outputs.iter().map(|o| o.crtc).collect();
+            // The primary device's leased CRTCs are not free either.
+            let leased: Vec<crtc::Handle> = match gpu {
+                None => leased_crtcs.take().into_iter().flatten().collect(),
+                Some(_) => Vec::new(),
+            };
+            let used: Vec<_> = outputs
+                .iter()
+                .filter(|o| o.gpu() == gpu)
+                .map(|o| o.crtc)
+                .chain(leased)
+                .collect();
             let lighting = Lighting {
-                gbm: &self.gbm,
-                render_formats: &self.render_formats,
-                native_device: self.native_device,
-                resources: &resources,
+                gbm,
+                render_formats,
+                native_device,
+                resources,
+                gpu,
             };
-            if let Some(out) = lighting.open(&mut self.drm, *handle, &info, &used) {
-                changes.added.push(out.name.clone());
-                self.outputs.push(out);
-            }
+            let (added, _) = light_connectors(
+                drm,
+                &lighting,
+                card_name(card).unwrap_or_default(),
+                outputs,
+                used,
+                lease_names,
+                false,
+            );
+            changes.added.extend(added);
         }
         if !changes.is_empty() {
             self.layout_generation += 1;
@@ -1011,12 +1519,12 @@ impl DrmBackend {
         if !self.privacy_programmable() {
             return;
         }
-        let drm = &self.drm;
+        let (drm, secondary) = (&self.drm, &self.secondary);
         let mut targets: Vec<privacy::Target<'_>> = self
             .outputs
             .iter_mut()
             .map(|out| privacy::Target {
-                drm,
+                drm: device_of(drm, secondary, out.gpu()),
                 name: &out.name,
                 connector: out.connector,
                 active: out.enabled,
@@ -1052,7 +1560,8 @@ impl DrmBackend {
     fn privacy_refresh(&mut self) -> bool {
         let mut changed = false;
         for out in &mut self.outputs {
-            changed |= privacy::refresh(&self.drm, out.connector, &mut out.privacy);
+            let drm = device_of(&self.drm, &self.secondary, out.gpu());
+            changed |= privacy::refresh(drm, out.connector, &mut out.privacy);
         }
         changed
     }
@@ -1062,7 +1571,7 @@ impl DrmBackend {
     /// connector property event. An unrequested change writes the
     /// setting back (`on_kms_resources_changed`).
     pub fn on_device_changed(&mut self, device: libc::dev_t) {
-        if device != self.drm.device_id() || !self.privacy_programmable() {
+        if !self.is_device(device) || !self.privacy_programmable() {
             return;
         }
         if self.privacy_refresh() {
@@ -1156,7 +1665,6 @@ impl DrmBackend {
     /// connector with its EDID identity and CRTC gamma size; the first
     /// output is primary.
     pub fn colord_monitors(&self) -> Vec<crate::color_manager::ColordMonitor> {
-        let atomic = self.drm.is_atomic();
         self.outputs
             .iter()
             .enumerate()
@@ -1168,17 +1676,21 @@ impl DrmBackend {
                     out.size_mm,
                     color::pnp_vendor_name,
                 ),
-                gamma_lut_size: out.color.caps(atomic).gamma_lut_size,
+                gamma_lut_size: out.color.caps(self.atomic(out)).gamma_lut_size,
             })
             .collect()
     }
 
     /// Each connector's CRTC gamma size (calibration `GammaLutSize`).
     pub fn gamma_sizes(&self) -> Vec<(String, usize)> {
-        let atomic = self.drm.is_atomic();
         self.outputs
             .iter()
-            .map(|out| (out.name.clone(), out.color.caps(atomic).gamma_lut_size))
+            .map(|out| {
+                (
+                    out.name.clone(),
+                    out.color.caps(self.atomic(out)).gamma_lut_size,
+                )
+            })
             .collect()
     }
 
@@ -1196,16 +1708,17 @@ impl DrmBackend {
         if !self.active || !self.drm.is_active() {
             return self.outputs.iter().any(|o| o.tint_fallback);
         }
-        let atomic = self.drm.is_atomic();
+        let (drm, secondary) = (&self.drm, &self.secondary);
         for out in &mut self.outputs {
             // do_update: an inactive monitor is not updated.
             if !out.enabled {
                 continue;
             }
+            let drm = device_of(drm, secondary, out.gpu());
             let device = share.device(&out.name);
             let session = share.calibration_for(&out.name);
             let update = out.white_point.update(
-                out.color.caps(atomic),
+                out.color.caps(drm.is_atomic()),
                 device.as_ref().is_some_and(|d| d.assigned.is_some()),
                 device.as_ref().and_then(|d| d.calibration.as_deref()),
                 session.as_ref().map(Option::as_ref),
@@ -1213,7 +1726,7 @@ impl DrmBackend {
             );
             out.tint_fallback = update == WhitePointUpdate::Unsupported;
             if let WhitePointUpdate::Program(programming) = update {
-                if let Err(error) = out.color.program(&self.drm, &programming) {
+                if let Err(error) = out.color.program(drm, &programming) {
                     eprintln!("tuna-compositor: drm: {} white point: {error}", out.name);
                     out.white_point.invalidate();
                 }
@@ -1233,12 +1746,13 @@ impl DrmBackend {
     /// The CRTC colour state as the kernel reports it, for the state
     /// file the DRM smoke proof reads (GAMMA_LUT readback).
     pub fn color_state(&self) -> Vec<serde_json::Value> {
-        let atomic = self.drm.is_atomic();
         self.outputs
             .iter()
             .map(|out| {
-                let caps = out.color.caps(atomic);
-                let lut = out.color.read_gamma_lut(&self.drm);
+                let caps = out.color.caps(self.atomic(out));
+                let lut =
+                    out.color
+                        .read_gamma_lut(device_of(&self.drm, &self.secondary, out.gpu()));
                 serde_json::json!({
                     "connector": out.name,
                     "gamma_lut_size": caps.gamma_lut_size,
@@ -1260,8 +1774,7 @@ impl DrmBackend {
         self.outputs
             .iter()
             .map(|out| {
-                let mode = self
-                    .drm
+                let mode = device_of(&self.drm, &self.secondary, out.gpu())
                     .get_crtc(out.crtc)
                     .ok()
                     .and_then(|info| info.mode())
@@ -1269,6 +1782,11 @@ impl DrmBackend {
                 (out.name.clone(), mode)
             })
             .collect()
+    }
+
+    /// Whether `out`'s device does atomic modesetting.
+    fn atomic(&self, out: &DrmOutput) -> bool {
+        device_of(&self.drm, &self.secondary, out.gpu()).is_atomic()
     }
 
     /// Output rectangles in the global logical space.
@@ -1294,6 +1812,9 @@ impl DrmBackend {
                 self.active = false;
                 self.libinput.suspend();
                 self.drm.pause();
+                for gpu in &mut self.secondary {
+                    gpu.drm.pause();
+                }
             }
             SessionEvent::ActivateSession => {
                 eprintln!("tuna-compositor: drm: session activated");
@@ -1304,6 +1825,14 @@ impl DrmBackend {
                 // a VT switch: the next owner may have lit them.
                 if let Err(e) = self.drm.activate(self.outputs_disabled) {
                     eprintln!("tuna-compositor: drm: activate failed: {e}");
+                }
+                for gpu in &mut self.secondary {
+                    if let Err(e) = gpu.drm.activate(self.outputs_disabled) {
+                        eprintln!(
+                            "tuna-compositor: drm: activate {} failed: {e}",
+                            gpu.path.display()
+                        );
+                    }
                 }
                 for out in &mut self.outputs {
                     out.surface.reset_buffers();
@@ -1346,12 +1875,13 @@ impl DrmBackend {
         self.wake_scanout_blocked = false;
         if trace {
             for out in &self.outputs {
+                let drm = device_of(&self.drm, &self.secondary, out.gpu());
                 eprintln!(
                     "tuna-compositor: drm: wake reset {} atomic={} commit_pending={} crtc={:?}",
                     out.name,
-                    self.drm.is_atomic(),
+                    drm.is_atomic(),
                     out.surface.surface().commit_pending(),
-                    self.drm.get_crtc(out.crtc),
+                    drm.get_crtc(out.crtc),
                 );
             }
         }
@@ -1376,17 +1906,20 @@ impl DrmBackend {
         }
         // Reset actual connector/plane state too: an active VT does not imply
         // that the kernel restored its framebuffer.
-        self.drm
-            .reset_state()
-            .map_err(|error| format!("KMS reset failed: {error}"))?;
-        // The blocking disable commit has retired previous scanout. Drain
-        // its already queued completions before the first new submission.
-        // A valid modeset event can report the last vblank before submission,
-        // so its timestamp cannot identify an abandoned pre-sleep frame.
-        let count = drain_reset_events(|| self.drm.receive_events().map(|events| events.count()))
-            .map_err(|error| format!("event drain failed: {error}"))?;
-        if trace {
-            eprintln!("tuna-compositor: drm: wake obsolete events drained={count}");
+        let devices =
+            std::iter::once(&mut self.drm).chain(self.secondary.iter_mut().map(|gpu| &mut gpu.drm));
+        for drm in devices {
+            drm.reset_state()
+                .map_err(|error| format!("KMS reset failed: {error}"))?;
+            // The blocking disable commit has retired previous scanout. Drain
+            // its already queued completions before the first new submission.
+            // A valid modeset event can report the last vblank before submission,
+            // so its timestamp cannot identify an abandoned pre-sleep frame.
+            let count = drain_reset_events(|| drm.receive_events().map(|events| events.count()))
+                .map_err(|error| format!("event drain failed: {error}"))?;
+            if trace {
+                eprintln!("tuna-compositor: drm: wake obsolete events drained={count}");
+            }
         }
         Ok(())
     }
@@ -1430,10 +1963,12 @@ impl DrmBackend {
         self.active && !self.wake_scanout_blocked && !self.powered_off
     }
 
-    /// Page flip completion: the output may render again, and what its
-    /// frame drew has been presented.
+    /// Page flip completion on the primary GPU (`gpu` None) or a secondary
+    /// one: the output may render again, and what its frame drew has been
+    /// presented.
     pub fn on_drm_event(
         &mut self,
+        gpu: Option<usize>,
         event: DrmEvent,
         metadata: &mut Option<DrmEventMetadata>,
     ) -> Option<PageFlip> {
@@ -1445,7 +1980,10 @@ impl DrmBackend {
                         "tuna-compositor: drm: wake pageflip crtc={crtc:?} metadata={metadata:?}",
                     );
                 }
-                let index = self.outputs.iter().position(|o| o.crtc == crtc)?;
+                let index = self
+                    .outputs
+                    .iter()
+                    .position(|o| o.gpu() == gpu && o.crtc == crtc)?;
                 let out = &mut self.outputs[index];
                 let feedback = match out.surface.frame_submitted() {
                     Ok(feedback) => feedback,
@@ -1908,5 +2446,135 @@ mod tests {
         // Far left: onto the left edge of the first output.
         let left = clamp_to_outputs((-50.0, 10.0).into(), &outputs);
         assert_eq!(left, (0.0, 10.0).into());
+    }
+
+    fn gpu(
+        name: &str,
+        preferred: bool,
+        boot: bool,
+        render_node: bool,
+        connected: bool,
+    ) -> GpuCandidate {
+        GpuCandidate {
+            path: format!("/dev/dri/{name}").into(),
+            preferred,
+            boot,
+            render_node,
+            connected,
+        }
+    }
+
+    #[test]
+    fn primary_gpu_prefers_a_rendering_gpu_over_a_kms_only_boot_gpu() {
+        // QEMU std VGA (bochs, boot, no render node) beside virtio-gpu.
+        let gpus = [
+            gpu("card0", false, true, false, true),
+            gpu("card1", false, false, true, true),
+        ];
+        assert_eq!(
+            choose_primary_gpu(&gpus).map(|g| g.path.as_path()),
+            Some(std::path::Path::new("/dev/dri/card1"))
+        );
+    }
+
+    #[test]
+    fn primary_gpu_keeps_a_rendering_boot_gpu_and_honours_the_udev_tag() {
+        let gpus = [
+            gpu("card0", false, true, true, true),
+            gpu("card1", false, false, true, true),
+        ];
+        assert_eq!(
+            choose_primary_gpu(&gpus).map(|g| g.path.as_path()),
+            Some(std::path::Path::new("/dev/dri/card0"))
+        );
+        let tagged = [
+            gpu("card0", false, true, true, true),
+            gpu("card1", true, false, true, true),
+        ];
+        assert_eq!(
+            choose_primary_gpu(&tagged).map(|g| g.path.as_path()),
+            Some(std::path::Path::new("/dev/dri/card1"))
+        );
+    }
+
+    #[test]
+    fn primary_gpu_falls_back_to_the_boot_gpu_then_the_first() {
+        // The only renderer has nothing connected: stay on the boot GPU.
+        let gpus = [
+            gpu("card0", false, true, false, true),
+            gpu("card1", false, false, true, false),
+        ];
+        assert_eq!(
+            choose_primary_gpu(&gpus).map(|g| g.path.as_path()),
+            Some(std::path::Path::new("/dev/dri/card0"))
+        );
+        let none_boot = [
+            gpu("card0", false, false, false, true),
+            gpu("card1", false, false, false, true),
+        ];
+        assert_eq!(
+            choose_primary_gpu(&none_boot).map(|g| g.path.as_path()),
+            Some(std::path::Path::new("/dev/dri/card0"))
+        );
+        assert_eq!(choose_primary_gpu(&[]), None);
+    }
+
+    #[test]
+    fn a_kms_only_boot_gpu_becomes_a_secondary_copy_target_first_in_seat_order() {
+        // QEMU std VGA (bochs) beside virtio-gpu: virtio renders, bochs's
+        // monitor shows a copy and leads the monitor list.
+        let gpus = [
+            gpu("card0", false, true, false, true),
+            gpu("card1", false, false, true, true),
+        ];
+        let primary = &choose_primary_gpu(&gpus).unwrap().path;
+        let secondary = secondary_gpus(&gpus, primary);
+        assert_eq!(secondary, [std::path::Path::new("/dev/dri/card0")]);
+        assert_eq!(seat_order(primary, &secondary), [Some(0), None]);
+    }
+
+    #[test]
+    fn one_gpu_or_idle_other_gpus_have_no_secondary_copy() {
+        let single = [gpu("card0", false, true, true, true)];
+        assert!(secondary_gpus(&single, std::path::Path::new("/dev/dri/card0")).is_empty());
+        assert_eq!(
+            seat_order(std::path::Path::new("/dev/dri/card0"), &[]),
+            [None]
+        );
+        // A second GPU with nothing connected is not opened.
+        let hybrid = [
+            gpu("card0", false, true, true, true),
+            gpu("card1", false, false, true, false),
+        ];
+        assert!(secondary_gpus(&hybrid, std::path::Path::new("/dev/dri/card0")).is_empty());
+    }
+
+    #[test]
+    fn secondary_gpus_after_the_primary_keep_seat_order() {
+        let gpus = [
+            gpu("card0", false, true, true, true),
+            gpu("card1", false, false, true, true),
+            gpu("card2", false, false, false, true),
+        ];
+        let primary = std::path::Path::new("/dev/dri/card0");
+        let secondary = secondary_gpus(&gpus, primary);
+        assert_eq!(
+            secondary,
+            [
+                std::path::Path::new("/dev/dri/card1"),
+                std::path::Path::new("/dev/dri/card2")
+            ]
+        );
+        assert_eq!(seat_order(primary, &secondary), [None, Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn a_connector_name_another_gpu_took_gets_its_sysfs_name() {
+        assert_eq!(output_name("Virtual-1", "card1", &[]), "Virtual-1");
+        assert_eq!(
+            output_name("Virtual-1", "card1", &["Virtual-1"]),
+            "card1-Virtual-1"
+        );
+        assert_eq!(output_name("HDMI-A-1", "card1", &["eDP-1"]), "HDMI-A-1");
     }
 }

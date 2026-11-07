@@ -116,6 +116,19 @@ impl Occlusion {
         Rectangle::subtract_rects_many(self.damage.iter().copied(), self.covered.iter().copied())
     }
 
+    /// Let everything still to visit repaint `rects` again, whatever
+    /// covers them: a background blur's sample area, which reads what is
+    /// under its surface (Mutter takes it out of the opaque region).
+    pub(crate) fn uncover(&mut self, rects: &[PhysicalRect]) {
+        if self.covered.is_empty() || rects.is_empty() {
+            return;
+        }
+        self.covered = Rectangle::subtract_rects_many(
+            std::mem::take(&mut self.covered),
+            rects.iter().copied(),
+        );
+    }
+
     pub(crate) fn rendered(&self) -> usize {
         self.rendered
     }
@@ -356,6 +369,27 @@ mod tests {
         let visible = occlusion.visit(rect(320, 100, 640, 400), std::iter::empty());
         assert_eq!(area(&visible), 320 * 400);
         assert!(visible.iter().all(|r| r.loc.x >= 640));
+    }
+
+    #[test]
+    fn a_blur_sample_area_repaints_beneath_opaque_surfaces() {
+        // An opaque window with a blur region: what is under its sample
+        // area repaints for the blur to read, the rest stays culled.
+        let mut occlusion = Occlusion::new(full(), &[full()]);
+        let window = rect(100, 100, 400, 300);
+        assert_eq!(
+            occlusion.visit(window, [rect(0, 0, 400, 300)]),
+            vec![window]
+        );
+        let sample = rect(152, 152, 196, 96);
+        occlusion.uncover(&[sample]);
+        let below = occlusion.visit(full(), [rect(0, 0, OUTPUT.0, OUTPUT.1)]);
+        assert_eq!(
+            area(&below),
+            i64::from(OUTPUT.0 * OUTPUT.1) - 400 * 300 + 196 * 96
+        );
+        assert!(below.iter().any(|r| r.contains((200, 200))));
+        assert!(!below.iter().any(|r| r.contains((120, 120))));
     }
 
     #[test]

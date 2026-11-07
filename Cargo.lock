@@ -4264,6 +4264,7 @@ dependencies = [
  "wayland-protocols-wlr",
  "wayland-scanner",
  "wayland-server",
+ "x11rb",
  "xcursor",
  "xkbcommon 0.9.0",
  "zbus",

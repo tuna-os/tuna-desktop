@@ -275,6 +275,9 @@ where
                 });
 
                 PrivateSurfaceData::invoke_pre_commit_hooks(state, handle, surface);
+                if super::take_aborted_commit(surface) {
+                    return;
+                }
 
                 PrivateSurfaceData::commit(surface, handle, state);
             }

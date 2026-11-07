@@ -5,6 +5,7 @@ Protocol: https://www.qemu.org/docs/master/interop/qemu-ga-ref.html
 import base64
 import binascii
 import json
+import math
 import re
 import socket
 import time
@@ -181,10 +182,11 @@ FAILURE_RECORDS = {"orca-read": ("orca_read_error", valid_orca_read_error),
                    "strip-stop": ("strip_stop_error", valid_strip_stop_error),
                    "delayed-auth-state": ("delayed_auth_error", valid_delayed_auth_error),
                    "inventory": ("inventory_error", valid_inventory_error),
-                   "tour-public-ui": ("tour_public_ui_error", valid_tour_public_ui_error)}
+                   "tour-public-ui": ("tour_public_ui_error", valid_tour_public_ui_error),
+                   "explicit-sync": ("explicit_sync_error", valid_tour_public_ui_error)}
 # Records that must be the whole output and are logged before raising, so a
 # caller's cleanup failure cannot hide them.
-LOGGED_FAILURE_RECORDS = {"delayed-auth-state", "inventory"}
+LOGGED_FAILURE_RECORDS = {"delayed-auth-state", "inventory", "explicit-sync"}
 def speech_failure_diagnostic(encoded):
     if not isinstance(encoded, str) or len(encoded) > 5464:
         return None
@@ -251,7 +253,10 @@ class GuestAgent:
     """
     MAX_REPLY = 1024 * 1024
 
-    def __init__(self, path):
+    def __init__(self, path, *, deadline=None):
+        if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+            raise ValueError("finite absolute guest-agent acquisition/command deadline required")
+        self._caller_deadline = deadline
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.buffer = bytearray()
         self.poisoned = False
@@ -259,7 +264,8 @@ class GuestAgent:
         self.guest_exec_state = "none"
         self.command_nonce = f"tuna-qga-{time.time_ns()}"
         self.command_sequence = 0
-        deadline = time.monotonic() + 5
+        acquisition_deadline = time.monotonic() + 5
+        deadline = min(acquisition_deadline, deadline) if deadline is not None else acquisition_deadline
         try:
             self.socket.settimeout(self._remaining(deadline))
             self.socket.connect(path)
@@ -334,6 +340,9 @@ class GuestAgent:
 
     def command(self, name, *, deadline=None, **arguments):
         deadline = deadline if deadline is not None else time.monotonic() + 5
+        caller_deadline = getattr(self, "_caller_deadline", None)
+        if caller_deadline is not None:
+            deadline = min(deadline, caller_deadline)
         if getattr(self, "poisoned", False):
             raise RuntimeError("guest-agent transport poisoned")
         try:
@@ -376,6 +385,8 @@ class GuestAgent:
             self._poison()
 
     def run(self, action, *arguments, timeout=30):
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("finite positive guest-agent operation timeout required")
         path = "/usr/libexec/tuna-vm-lifecycle"
         argv = [action, *map(str, arguments)]
         if action == "gnome-reference":
@@ -393,6 +404,10 @@ class GuestAgent:
             path = "/usr/libexec/tuna-vm-gnome-reference"
             argv = list(arguments)
         deadline = time.monotonic() + timeout
+        caller_deadline = getattr(self, "_caller_deadline", None)
+        if caller_deadline is not None:
+            deadline = min(deadline, caller_deadline)
+        self._remaining(deadline)
         if getattr(self, "guest_exec_state", "none") != "none":
             raise RuntimeError("previous guest-exec retirement unconfirmed")
         # Set uncertainty before sending: a lost initial acknowledgement

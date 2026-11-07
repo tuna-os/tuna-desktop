@@ -13,11 +13,13 @@ No autologin or initial session exists: the lane drives GDM's user list and
 types the fixture password exactly as the published-flavor nightly does
 (`V-GREETER-LIST`, `V-GDM-FALLBACK`, `V-GDM-LOGIN`;
 `docs/marlin-tuna-nightly.md`), from the same `scripts/tuna-vm-lane` code.
-Logout must return to that GDM greeter. These ordinary lifecycle fixtures do
-not change the shipped preview image; the independent paired DEV profiles
-below are separate members of the same existing VM producer. GDM's session
-worker opens a journal stream for `gdm-wayland-session`, forwarded to the
-serial port. The fixture's session environment comes from `environment.d`,
+Logout must return to that GDM greeter. The ordinary two lifecycle/Orca rows,
+their five pristine boots and default GPU remain unchanged. A separate required
+DEV protocol row does not change the shipped preview; the independent paired
+DEV profiles below are separate members of the same existing VM producer.
+GDM's session worker opens a journal stream for `gdm-wayland-session`,
+forwarded to the serial port. The fixture's session environment comes from
+`environment.d`,
 which gdm-wayland-session imports from the user manager; the per-login Orca
 test secret comes from a user environment generator.
 The ordinary CLI profile is `--profile lifecycle` (the default); its two
@@ -59,6 +61,25 @@ state. GTK4 does not advertise `ENABLED`; requiring that additional bit
 would reject a genuinely focused, interactive button. Both observed bits
 remain in the receipt, but disabled controls remain ineligible. See the
 [GTK4 state mapping](https://github.com/GNOME/gtk/blob/main/gtk/a11y/gtkatspicontext.c).
+
+## Required DEV native protocol consumer
+
+Whenever `marlin-vm` is selected, the additional `native-explicit-sync` member
+uses a separate pristine KVM boot with virtio-vga-gl and an owned
+Xvfb/llvmpipe launcher. The primary Arch build stages XML from the exact
+verified Cargo-locked archive. Native image builders compile both original C
+clients and retain a fixed receipt of their four build inputs and four outputs.
+Final image admission checks those input hashes against the checkout, XML
+source against independent staging and all installed output/helper/oracle bytes.
+
+`--explicit-sync --require-kvm --strip-image ...` admits the same stock GDM
+and original nonroot native compositor before invoking only the finite
+`init/start/state/ack/finish/cleanup/file` helper operations. All 19 timeline
+and DMA-buffer cases plus the actual background-effect journey and every
+required physical framebuffer checkpoint remain mandatory. Missing original
+session admission, payload identity, observations or strict worker/client
+cleanup fails the member, parity ledger and aggregate gate. These DEV virgl
+receipts do not qualify a physical GPU or signed shipping release.
 
 ## Record-free fresh accounts (tunaOS#4092)
 

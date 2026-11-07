@@ -388,6 +388,8 @@ where
         damage: &[Rectangle<i32, Physical>],
         opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), R::Error> {
+        #[cfg(feature = "backend_drm")]
+        frame.note_buffer_access(&self.buffer)?;
         match self.texture {
             WaylandSurfaceTexture::Texture(ref texture) => frame.render_texture_from_to(
                 texture,
