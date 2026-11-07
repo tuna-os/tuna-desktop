@@ -235,6 +235,77 @@ fn set_idle_timeout_is_applied_and_handed_over_once() {
     assert!(!locked.get(), "a timeout change never locks");
 }
 
+/// A lock-screen notification wakes the screen only while locked
+/// (screenShield.js `_wakeUpScreen` returns unless the shield is
+/// active), is handed to the runtime once, and never unlocks.
+#[test]
+fn wake_up_screen_applies_only_while_locked_and_never_unlocks() {
+    let mut model = two_window_model();
+    let (server, mut client) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(TIMEOUT))
+        .and(client.set_write_timeout(Some(TIMEOUT)))
+        .unwrap();
+    let conn = ControlConn::new(server).unwrap();
+    let locked = Rc::new(Cell::new(false));
+    client_write(&mut client, &hello());
+    let mut session = Session::handshake_with(
+        conn,
+        &model,
+        deny_all_tokens,
+        Rc::new(|_| String::new()),
+        Rc::new(Cell::new(false)),
+        locked.clone(),
+    )
+    .unwrap();
+    assert!(matches!(client_read(&mut client), Message::Hello { .. }));
+    assert_unlocked_with_titles(&client_read(&mut client));
+
+    let mut wake = |id| {
+        client_write(
+            &mut client,
+            &Message::Command {
+                id,
+                kind: CommandKind::WakeUpScreen,
+            },
+        );
+        let handled = session.handle_next(&mut model).unwrap();
+        let Message::CommandResult {
+            id: answered,
+            status,
+        } = client_read(&mut client)
+        else {
+            panic!("expected CommandResult for WakeUpScreen");
+        };
+        assert_eq!(answered, id);
+        (handled, status, session.take_wake_up_screen())
+    };
+    let (handled, status, woke) = wake(7);
+    assert!(matches!(
+        handled,
+        Handled::CommandResult {
+            id: 7,
+            applied: false
+        }
+    ));
+    assert!(matches!(status, CommandStatus::Denied { .. }), "{status:?}");
+    assert!(!woke, "an unlocked session has no shield to wake");
+
+    locked.set(true);
+    let (handled, status, woke) = wake(8);
+    assert!(matches!(
+        handled,
+        Handled::CommandResult {
+            id: 8,
+            applied: true
+        }
+    ));
+    assert_eq!(status, CommandStatus::Applied);
+    assert!(woke, "the runtime is told to wake the shield");
+    assert!(locked.get(), "waking never unlocks");
+    assert!(!session.take_wake_up_screen(), "handed over once");
+}
+
 /// Control-command set path: `Lock` applies at once, the next poll
 /// strips the snapshot, deltas stay suppressed while locked, and
 /// clearing the flag restores full content.

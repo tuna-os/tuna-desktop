@@ -214,9 +214,12 @@ impl ProtocolVersion {
     /// the shell-to-compositor `CloseMenuUnanimated` command (panelMenu.js
     /// 51 `vfunc_hide`: a hidden panel button's menu closes without
     /// BoxPointer's close). Positional postcard peers must ship together.
+    /// `0.48` appends the shell-to-compositor `WakeUpScreen` command (a
+    /// notification wakes the locked, blanked screen, #348). Positional
+    /// postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 47,
+        minor: 48,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -509,6 +512,13 @@ pub enum CommandKind {
     /// compositor draws no BoxPointer close for the panel popup that goes
     /// next (or drops the one it just started).
     CloseMenuUnanimated,
+    /// Since 0.48: a notification reached the lock screen's list
+    /// (unlockDialog.js `_wakeUpScreenForSource`): undo the idle shield's
+    /// fade as screenShield.js `_wakeUpScreen` turns its lightbox off,
+    /// without counting as user activity and without unlocking. Denied
+    /// while the session is unlocked (`_wakeUpScreen` returns unless the
+    /// shield is active).
+    WakeUpScreen,
 }
 
 /// One on-screen keyboard action (gnome-shell 51 `KeyboardController`).
@@ -2507,11 +2517,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_47() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 47));
-        // A 0.46 shell still negotiates; a newer minor does not.
-        assert!(ProtocolVersion::new(0, 46).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 48).is_compatible_with(&CURRENT_VERSION));
+    fn current_version_is_0_48() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 48));
+        // A 0.47 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 47).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 49).is_compatible_with(&CURRENT_VERSION));
     }
 
     #[test]
@@ -3862,6 +3872,18 @@ mod tablet_osd_wire_order_tests {
         );
         let bytes = postcard::to_slice(&touch, &mut buffer).unwrap();
         assert_eq!(postcard::from_bytes::<Message>(bytes).unwrap(), touch);
+    }
+
+    #[test]
+    fn wake_up_screen_follows_the_0_47_menu_close() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 16];
+        let closed =
+            tag(postcard::to_slice(&CommandKind::CloseMenuUnanimated, &mut buffer).unwrap());
+        let wake = postcard::to_slice(&CommandKind::WakeUpScreen, &mut buffer).unwrap();
+        assert_eq!(wake, [closed + 1]);
+        let back: CommandKind = postcard::from_bytes(&[closed + 1]).unwrap();
+        assert_eq!(back, CommandKind::WakeUpScreen);
     }
 }
 
