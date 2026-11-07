@@ -40,8 +40,8 @@ pub const LOCKDOWN_IFACE: &str = "org.freedesktop.impl.portal.Lockdown";
 /// The `Lockdown` object: wire calls become policy mutations. The
 /// live policy is shared with [`LockdownBus`], which re-syncs it
 /// from GSettings and emits `PropertiesChanged`; bus-originated
-/// sets land in `pending` for the next poll to persist, so zbus
-/// worker threads never touch a settings backend.
+/// sets land in `pending` for the next poll to persist, so property
+/// handlers on the zbus runtime never touch a settings backend.
 #[derive(Debug)]
 struct Lockdown {
     live: Arc<Mutex<PrivacyPolicy>>,
@@ -70,14 +70,14 @@ impl Access {
     #[allow(clippy::too_many_arguments)]
     fn access_dialog(
         &self,
-        _handle: zbus::zvariant::OwnedObjectPath,
+        _handle: zbus::OwnedObjectPath,
         _app_id: String,
         _parent_window: String,
         _title: String,
         _subtitle: String,
         _body: String,
-        _options: HashMap<String, zbus::zvariant::OwnedValue>,
-    ) -> (u32, HashMap<String, zbus::zvariant::OwnedValue>) {
+        _options: HashMap<String, zbus::OwnedVariant>,
+    ) -> (u32, HashMap<String, zbus::OwnedVariant>) {
         (1, HashMap::new())
     }
 }
@@ -153,7 +153,7 @@ impl Lockdown {
 /// policy, so settings flips show up on the portal bus without a
 /// copy, on the slow tick.
 pub struct LockdownBus {
-    conn: Option<zbus::blocking::Connection>,
+    conn: Option<zbus::Connection>,
     live: Arc<Mutex<PrivacyPolicy>>,
     pending: Arc<Mutex<Option<PrivacyPolicy>>>,
 }
@@ -192,40 +192,25 @@ impl LockdownBus {
             return true;
         }
         let builder = match address {
-            Some(address) => zbus::blocking::connection::Builder::address(address),
-            None => zbus::blocking::connection::Builder::session(),
-        };
-        let builder = match builder {
-            Ok(builder) => builder,
-            Err(e) => {
-                eprintln!("tuna-shell-host: lockdown bus unavailable: {e}");
-                return false;
-            }
+            Some(address) => zbus::connection::Builder::address(address),
+            None => zbus::connection::Builder::session(),
         };
         let lockdown = Lockdown {
             live: self.live.clone(),
             pending: self.pending.clone(),
         };
-        let conn = match builder
+        let builder = builder
             .serve_at(LOCKDOWN_PATH, lockdown)
-            .and_then(|builder| builder.serve_at(LOCKDOWN_PATH, Access))
-        {
-            Ok(conn) => conn,
-            Err(e) => {
-                eprintln!("tuna-shell-host: lockdown serve failed: {e}");
-                return false;
-            }
-        };
-        let conn = match conn.build() {
+            .serve_at(LOCKDOWN_PATH, Access);
+        let conn = match zbus::block_on(builder.build()) {
             Ok(conn) => conn,
             Err(e) => {
                 eprintln!("tuna-shell-host: lockdown connect failed: {e}");
                 return false;
             }
         };
-        let reply = conn.request_name_with_flags(
-            LOCKDOWN_NAME,
-            zbus::fdo::RequestNameFlags::DoNotQueue.into(),
+        let reply = zbus::block_on(
+            conn.request_name_with_flags(LOCKDOWN_NAME, zbus::fdo::RequestNameFlags::DO_NOT_QUEUE),
         );
         match reply {
             Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
@@ -291,31 +276,31 @@ impl LockdownBus {
         if before.camera_disabled != after.camera_disabled {
             changed.insert(
                 "disable-camera".to_owned(),
-                zbus::zvariant::OwnedValue::from(after.camera_disabled),
+                zbus::OwnedVariant::from(after.camera_disabled),
             );
         }
         if before.microphone_disabled != after.microphone_disabled {
             changed.insert(
                 "disable-microphone".to_owned(),
-                zbus::zvariant::OwnedValue::from(after.microphone_disabled),
+                zbus::OwnedVariant::from(after.microphone_disabled),
             );
         }
         if before.sound_output_disabled != after.sound_output_disabled {
             changed.insert(
                 "disable-sound-output".to_owned(),
-                zbus::zvariant::OwnedValue::from(after.sound_output_disabled),
+                zbus::OwnedVariant::from(after.sound_output_disabled),
             );
         }
         if changed.is_empty() {
             return;
         }
-        if let Err(e) = conn.emit_signal(
+        if let Err(e) = zbus::block_on(conn.emit_signal(
             None::<&str>,
             LOCKDOWN_PATH,
             "org.freedesktop.DBus.Properties",
             "PropertiesChanged",
             &(LOCKDOWN_IFACE, changed, Vec::<String>::new()),
-        ) {
+        )) {
             eprintln!("tuna-shell-host: lockdown signal PropertiesChanged failed: {e}");
         }
     }
@@ -406,6 +391,8 @@ mod tests {
     mod live_bus {
         use std::time::Duration;
 
+        use futures_lite::StreamExt;
+
         use super::super::{
             LockdownBus, ACCESS_IFACE, LOCKDOWN_IFACE, LOCKDOWN_NAME, LOCKDOWN_PATH,
         };
@@ -457,13 +444,10 @@ mod tests {
 
         /// Connect a client to the private bus, retrying while the
         /// daemon starts listening.
-        fn client_conn(address: &str) -> Option<zbus::blocking::Connection> {
+        fn client_conn(address: &str) -> Option<zbus::Connection> {
             for _ in 0..50 {
-                match zbus::blocking::connection::Builder::address(address) {
-                    Ok(builder) => match builder.build() {
-                        Ok(conn) => return Some(conn),
-                        Err(_) => std::thread::sleep(Duration::from_millis(100)),
-                    },
+                match zbus::block_on(zbus::connection::Builder::address(address).build()) {
+                    Ok(conn) => return Some(conn),
                     Err(_) => std::thread::sleep(Duration::from_millis(100)),
                 }
             }
@@ -483,40 +467,40 @@ mod tests {
             None
         }
 
-        fn properties_proxy(
-            client: &zbus::blocking::Connection,
-        ) -> Option<zbus::blocking::Proxy<'_>> {
-            zbus::blocking::Proxy::new(
+        fn properties_proxy(client: &zbus::Connection) -> Option<zbus::Proxy<'_>> {
+            zbus::block_on(zbus::Proxy::new(
                 client,
                 LOCKDOWN_NAME,
                 LOCKDOWN_PATH,
                 "org.freedesktop.DBus.Properties",
-            )
+            ))
             .ok()
         }
 
-        fn get_bool(proxy: &zbus::blocking::Proxy<'_>, property: &str) -> bool {
-            proxy
-                .call::<&str, _, zbus::zvariant::OwnedValue>("Get", &(LOCKDOWN_IFACE, property))
-                .expect("stub Get reaches lockdown")
-                .try_into()
-                .expect("lockdown property is a boolean")
+        fn get_bool(proxy: &zbus::Proxy<'_>, property: &str) -> bool {
+            zbus::block_on(
+                proxy.call::<&str, _, zbus::OwnedVariant>("Get", &(LOCKDOWN_IFACE, property)),
+            )
+            .expect("stub Get reaches lockdown")
+            .try_into()
+            .expect("lockdown property is a boolean")
         }
 
         /// Subscribe to `PropertiesChanged` before triggering it, so
         /// the emission cannot race the subscription.
-        fn subscribe_changed(
-            client: &zbus::blocking::Connection,
-        ) -> zbus::blocking::MessageIterator {
+        fn subscribe_changed(client: &zbus::Connection) -> zbus::MessageStream {
             let rule = zbus::MatchRule::builder()
                 .msg_type(zbus::message::Type::Signal)
                 .interface("org.freedesktop.DBus.Properties")
-                .expect("signal rule")
                 .member("PropertiesChanged")
-                .expect("signal rule")
-                .build();
-            zbus::blocking::MessageIterator::for_match_rule(rule, client, Some(8))
-                .expect("signal subscription")
+                .build()
+                .expect("signal rule");
+            zbus::block_on(zbus::MessageStream::for_match_rule(
+                rule,
+                client,
+                std::num::NonZeroUsize::new(8),
+            ))
+            .expect("signal subscription")
         }
 
         #[test]
@@ -546,14 +530,18 @@ mod tests {
             assert!(!get_bool(&proxy, "disable-microphone"));
             assert!(!get_bool(&proxy, "disable-sound-output"));
 
-            let introspect: String = zbus::blocking::Proxy::new(
-                &client,
-                LOCKDOWN_NAME,
-                LOCKDOWN_PATH,
-                "org.freedesktop.DBus.Introspectable",
-            )
-            .expect("introspect proxy")
-            .call::<&str, _, String>("Introspect", &())
+            let introspect: String = zbus::block_on(async {
+                zbus::Proxy::new(
+                    &client,
+                    LOCKDOWN_NAME,
+                    LOCKDOWN_PATH,
+                    "org.freedesktop.DBus.Introspectable",
+                )
+                .await
+                .expect("introspect proxy")
+                .call::<&str, _, String>("Introspect", &())
+                .await
+            })
             .expect("stub Introspect reaches lockdown");
             for property in [
                 "disable-camera",
@@ -575,21 +563,22 @@ mod tests {
             );
 
             // The access dialog answers fail-closed, promptly.
-            let access =
-                zbus::blocking::Proxy::new(&client, LOCKDOWN_NAME, LOCKDOWN_PATH, ACCESS_IFACE)
-                    .expect("access proxy");
-            let options = std::collections::HashMap::<String, zbus::zvariant::OwnedValue>::new();
-            let (response, results): (
-                u32,
-                std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
-            ) = access
-                .call::<&str, _, (
+            let access = zbus::block_on(zbus::Proxy::new(
+                &client,
+                LOCKDOWN_NAME,
+                LOCKDOWN_PATH,
+                ACCESS_IFACE,
+            ))
+            .expect("access proxy");
+            let options = std::collections::HashMap::<String, zbus::OwnedVariant>::new();
+            let (response, results): (u32, std::collections::HashMap<String, zbus::OwnedVariant>) =
+                zbus::block_on(access.call::<&str, _, (
                     u32,
-                    std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+                    std::collections::HashMap<String, zbus::OwnedVariant>,
                 )>(
                     "AccessDialog",
                     &(
-                        zbus::zvariant::ObjectPath::from_str_unchecked("/org/test/request"),
+                        zbus::ObjectPath::from_str_unchecked("/org/test/request"),
                         "com.example.app",
                         "",
                         "Title",
@@ -597,7 +586,7 @@ mod tests {
                         "Body",
                         options,
                     ),
-                )
+                ))
                 .expect("stub AccessDialog reaches the backend");
             assert_eq!(response, 1, "access dialog denies fail-closed");
             assert!(results.is_empty());
@@ -619,13 +608,12 @@ mod tests {
             );
             assert!(get_bool(&proxy, "disable-camera"));
             assert!(!get_bool(&proxy, "disable-microphone"));
-            let msg = changed
-                .next()
+            let msg = zbus::block_on(changed.next())
                 .expect("change signal arrives")
                 .expect("change signal decodes");
             let (iface, values, _invalid): (
                 String,
-                std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+                std::collections::HashMap<String, zbus::OwnedVariant>,
                 Vec<String>,
             ) = msg.body().deserialize().expect("change signal body");
             assert_eq!(iface, LOCKDOWN_IFACE);
@@ -671,16 +659,15 @@ mod tests {
                 panic!("lockdown proxy builds on a private bus");
             };
 
-            proxy
-                .call::<&str, _, ()>(
-                    "Set",
-                    &(
-                        LOCKDOWN_IFACE,
-                        "disable-microphone",
-                        zbus::zvariant::Value::Bool(true),
-                    ),
-                )
-                .expect("stub Set reaches lockdown");
+            zbus::block_on(proxy.call::<&str, _, ()>(
+                "Set",
+                &(
+                    LOCKDOWN_IFACE,
+                    "disable-microphone",
+                    zbus::Variant::Bool(true),
+                ),
+            ))
+            .expect("stub Set reaches lockdown");
             // The set answers immediately, before any poll.
             assert!(get_bool(&proxy, "disable-microphone"));
 
@@ -715,14 +702,14 @@ mod tests {
                 return;
             };
             let client = client_conn(&address).expect("private permission-store bus");
-            let store = zbus::blocking::Proxy::new(
+            let store = zbus::block_on(zbus::Proxy::new(
                 &client,
                 "org.freedesktop.impl.portal.PermissionStore",
                 "/org/freedesktop/impl/portal/PermissionStore",
                 "org.freedesktop.impl.portal.PermissionStore",
-            )
+            ))
             .expect("permission-store proxy");
-            let result = store.call::<&str, _, ()>(
+            let result = zbus::block_on(store.call::<&str, _, ()>(
                 "SetPermission",
                 &(
                     "tuna-fixture-isolation",
@@ -731,7 +718,7 @@ mod tests {
                     "com.example.Fixture",
                     vec!["yes"],
                 ),
-            );
+            ));
             let _ = daemon.kill();
             let _ = daemon.wait();
             result.expect("actual activated permission store persists");
@@ -863,18 +850,18 @@ mod tests {
         }
 
         /// True once `name` has an owner on the private bus (20s).
-        fn wait_for_name(client: &zbus::blocking::Connection, name: &str) -> bool {
-            let proxy = zbus::blocking::Proxy::new(
+        fn wait_for_name(client: &zbus::Connection, name: &str) -> bool {
+            let proxy = zbus::block_on(zbus::Proxy::new(
                 client,
                 "org.freedesktop.DBus",
                 "/org/freedesktop/DBus",
                 "org.freedesktop.DBus",
-            )
+            ))
             .expect("bus proxy");
             for _ in 0..200 {
-                let owned: bool = proxy
-                    .call::<&str, _, bool>("NameHasOwner", &(name,))
-                    .unwrap_or(false);
+                let owned: bool =
+                    zbus::block_on(proxy.call::<&str, _, bool>("NameHasOwner", &(name,)))
+                        .unwrap_or(false);
                 if owned {
                     return true;
                 }
@@ -893,18 +880,19 @@ mod tests {
             std::thread::spawn(move || {
                 let denied = (|| {
                     let conn = client_conn(&address)?;
-                    let proxy = zbus::blocking::Proxy::new(
+                    let proxy = zbus::block_on(zbus::Proxy::new(
                         &conn,
                         "org.freedesktop.portal.Desktop",
                         "/org/freedesktop/portal/desktop",
                         "org.freedesktop.portal.Camera",
-                    )
+                    ))
                     .ok()?;
-                    let options =
-                        std::collections::HashMap::<String, zbus::zvariant::OwnedValue>::new();
-                    match proxy.call::<&str, _, (u32, zbus::zvariant::OwnedObjectPath)>(
-                        "AccessCamera",
-                        &(options,),
+                    let options = std::collections::HashMap::<String, zbus::OwnedVariant>::new();
+                    match zbus::block_on(
+                        proxy.call::<&str, _, (u32, zbus::OwnedObjectPath)>(
+                            "AccessCamera",
+                            &(options,),
+                        ),
                     ) {
                         Ok(_) => Some(false),
                         Err(e) => Some(format!("{e:?}").contains("Camera access disabled")),

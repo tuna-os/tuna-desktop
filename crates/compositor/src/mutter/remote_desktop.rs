@@ -181,7 +181,7 @@ pub(crate) fn queue_input(
     Ok(())
 }
 
-fn device_types(value: Option<&OwnedValue>) -> fdo::Result<u32> {
+fn device_types(value: Option<&OwnedVariant>) -> fdo::Result<u32> {
     let types = value
         .map(u32::try_from)
         .transpose()
@@ -445,9 +445,9 @@ impl RemoteSession {
     #[zbus(name = "ConnectToEIS")]
     async fn connect_to_eis(
         &self,
-        options: HashMap<String, OwnedValue>,
+        options: HashMap<String, OwnedVariant>,
         #[zbus(header)] header: zbus::message::Header<'_>,
-    ) -> fdo::Result<zbus::zvariant::OwnedFd> {
+    ) -> fdo::Result<zbus::OwnedFd> {
         // Mutter's handle_connect_to_eis has no started check: grd
         // connects before Start; input waits for it (remote_eis.rs).
         self.admitted(&header, false)?;
@@ -487,7 +487,7 @@ impl RemoteSession {
     #[zbus(signal)]
     pub async fn selection_owner_changed(
         ctxt: &SignalEmitter<'_>,
-        options: HashMap<String, OwnedValue>,
+        options: HashMap<String, OwnedVariant>,
     ) -> zbus::Result<()>;
     #[zbus(signal)]
     pub async fn selection_transfer(
@@ -499,9 +499,9 @@ impl RemoteSession {
     /// selection at once, otherwise hear about the current owner.
     async fn enable_clipboard(
         &self,
-        options: HashMap<String, OwnedValue>,
+        options: HashMap<String, OwnedVariant>,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+        #[zbus(signal_emitter)] ctxt: SignalEmitter<'_>,
     ) -> fdo::Result<()> {
         self.admitted(&header, false)?;
         let mime_types = super::remote_clipboard::mime_types(&options)?;
@@ -538,7 +538,7 @@ impl RemoteSession {
     }
     async fn set_selection(
         &self,
-        options: HashMap<String, OwnedValue>,
+        options: HashMap<String, OwnedVariant>,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> fdo::Result<()> {
         self.clipboard_admitted(&header)?;
@@ -554,7 +554,7 @@ impl RemoteSession {
         &self,
         serial: u32,
         #[zbus(header)] header: zbus::message::Header<'_>,
-    ) -> fdo::Result<zbus::zvariant::OwnedFd> {
+    ) -> fdo::Result<zbus::OwnedFd> {
         self.clipboard_admitted(&header)?;
         super::remote_clipboard::selection_write(&self.grant.clipboard, &self.grant.stopped, serial)
             .map(Into::into)
@@ -572,7 +572,7 @@ impl RemoteSession {
         &self,
         mime_type: String,
         #[zbus(header)] header: zbus::message::Header<'_>,
-    ) -> fdo::Result<zbus::zvariant::OwnedFd> {
+    ) -> fdo::Result<zbus::OwnedFd> {
         self.clipboard_admitted(&header)?;
         super::remote_clipboard::valid_mime_type(&mime_type)?;
         let shared = &self.grant.clipboard;
@@ -629,14 +629,14 @@ mod tests {
         assert_eq!(device_types(None).unwrap(), 3);
         for allowed in [1u32, 2, 3] {
             assert_eq!(
-                device_types(Some(&OwnedValue::from(allowed))).unwrap(),
+                device_types(Some(&OwnedVariant::from(allowed))).unwrap(),
                 allowed
             );
         }
         for denied in [0u32, 4, u32::MAX] {
-            assert!(device_types(Some(&OwnedValue::from(denied))).is_err());
+            assert!(device_types(Some(&OwnedVariant::from(denied))).is_err());
         }
-        assert!(device_types(Some(&OwnedValue::from(true))).is_err());
+        assert!(device_types(Some(&OwnedVariant::from(true))).is_err());
     }
     #[test]
     fn queue_bound_revocation_and_channel_failure_are_enforced() {

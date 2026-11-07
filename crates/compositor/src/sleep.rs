@@ -4,6 +4,7 @@
 //! notify us that the kernel discarded scanout. A retained system-bus proxy
 //! binds signals to logind's actual owner. Two flags bound work and storage.
 
+use futures_lite::StreamExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +17,7 @@ struct Pending {
 
 pub struct Monitor {
     wake: crate::wake::Wake,
-    connection: zbus::blocking::Connection,
+    connection: zbus::Connection,
     pending: Arc<Pending>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -25,23 +26,28 @@ impl Monitor {
     /// Each notification wakes the compositor loop through the
     /// [`Wake`](crate::wake::Wake) connected by [`set_wake`](Self::set_wake).
     pub fn start(generation: Arc<AtomicU64>) -> zbus::Result<Self> {
-        let connection = zbus::blocking::connection::Builder::system()?
-            .method_timeout(Duration::from_secs(5))
-            .build()?;
+        let connection = zbus::block_on(
+            zbus::connection::Builder::system()
+                .method_timeout(Duration::from_secs(5))
+                .build(),
+        )?;
         Self::from_connection(connection, generation)
     }
 
     fn from_connection(
-        connection: zbus::blocking::Connection,
+        connection: zbus::Connection,
         generation: Arc<AtomicU64>,
     ) -> zbus::Result<Self> {
-        let proxy = zbus::blocking::Proxy::new(
-            &connection,
-            "org.freedesktop.login1",
-            "/org/freedesktop/login1",
-            "org.freedesktop.login1.Manager",
-        )?;
-        let signals = proxy.receive_signal("PrepareForSleep")?;
+        let mut signals = zbus::block_on(async {
+            let proxy = zbus::Proxy::new(
+                &connection,
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+            )
+            .await?;
+            proxy.receive_signal("PrepareForSleep").await
+        })?;
         let wake = crate::wake::Wake::default();
         let worker_wake = wake.clone();
         let pending = Arc::new(Pending::default());
@@ -51,23 +57,25 @@ impl Monitor {
             .spawn(move || {
                 let _completion = worker_wake.completion();
                 let mut prepared = false;
-                for signal in signals {
-                    let Ok((sleeping,)) = signal.body().deserialize::<(bool,)>() else {
-                        continue;
-                    };
-                    if sleeping {
-                        // Invalidate old PAM results on the signal thread,
-                        // before the compositor can dequeue their callbacks.
-                        crate::auth_owner::advance_epoch(&generation);
-                        prepared = true;
-                        worker_pending.lock.store(true, Ordering::Release);
-                        worker_wake.signal();
-                    } else if prepared {
-                        prepared = false;
-                        worker_pending.wake.store(true, Ordering::Release);
-                        worker_wake.signal();
+                zbus::block_on(async {
+                    while let Some(signal) = signals.next().await {
+                        let Ok((sleeping,)) = signal.body().deserialize::<(bool,)>() else {
+                            continue;
+                        };
+                        if sleeping {
+                            // Invalidate old PAM results on the signal thread,
+                            // before the compositor can dequeue their callbacks.
+                            crate::auth_owner::advance_epoch(&generation);
+                            prepared = true;
+                            worker_pending.lock.store(true, Ordering::Release);
+                            worker_wake.signal();
+                        } else if prepared {
+                            prepared = false;
+                            worker_pending.wake.store(true, Ordering::Release);
+                            worker_wake.signal();
+                        }
                     }
-                }
+                });
             })?;
         Ok(Self {
             wake,
@@ -91,9 +99,9 @@ impl Monitor {
 
 impl Drop for Monitor {
     fn drop(&mut self) {
-        // Closing also ends the retained signal iterator/worker; no orphaned
+        // Closing also ends the retained signal stream/worker; no orphaned
         // subscription survives a runtime returning in this process.
-        let _ = self.connection.clone().close();
+        let _ = zbus::block_on(self.connection.clone().close());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -127,27 +135,27 @@ mod tests {
             .read_line(&mut address)
             .unwrap();
         let connect = || {
-            zbus::blocking::connection::Builder::address(address.trim())
-                .unwrap()
-                .method_timeout(Duration::from_secs(2))
-                .build()
-                .unwrap()
+            zbus::block_on(
+                zbus::connection::Builder::address(address.trim())
+                    .method_timeout(Duration::from_secs(2))
+                    .build(),
+            )
+            .unwrap()
         };
         let owner = connect();
-        owner.request_name("org.freedesktop.login1").unwrap();
+        zbus::block_on(owner.request_name("org.freedesktop.login1")).unwrap();
         let attacker = connect();
         let generation = Arc::new(AtomicU64::new(0));
         let monitor = Monitor::from_connection(connect(), generation.clone()).unwrap();
-        let emit = |connection: &zbus::blocking::Connection, sleeping: bool| {
-            connection
-                .emit_signal(
-                    None::<()>,
-                    "/org/freedesktop/login1",
-                    "org.freedesktop.login1.Manager",
-                    "PrepareForSleep",
-                    &(sleeping,),
-                )
-                .unwrap();
+        let emit = |connection: &zbus::Connection, sleeping: bool| {
+            zbus::block_on(connection.emit_signal(
+                None::<()>,
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                "PrepareForSleep",
+                &(sleeping,),
+            ))
+            .unwrap();
         };
         emit(&attacker, true);
         emit(&attacker, false);

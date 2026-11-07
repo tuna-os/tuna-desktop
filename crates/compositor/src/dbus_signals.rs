@@ -113,16 +113,17 @@ impl Inner {
 /// that has stopped reading and answering. Keep the socket alive for
 /// the test's duration.
 #[cfg(test)]
-pub(crate) fn wedged_link() -> (zbus::blocking::Connection, std::os::unix::net::UnixStream) {
+pub(crate) fn wedged_link() -> (zbus::Connection, std::os::unix::net::UnixStream) {
     use std::io::{BufRead, BufReader, Write};
     let (server_end, client_end) = std::os::unix::net::UnixStream::pair().unwrap();
     let server = std::thread::spawn(move || {
-        zbus::blocking::connection::Builder::async_io_unix_stream(server_end)
-            .server(zbus::Guid::generate())
-            .unwrap()
-            .p2p()
-            .build()
-            .unwrap()
+        zbus::block_on(
+            zbus::connection::Builder::unix_stream(server_end)
+                .server(zbus::Guid::generate())
+                .p2p()
+                .build(),
+        )
+        .unwrap()
     });
     let uid = rustix::process::geteuid().as_raw().to_string();
     let hex: String = uid.bytes().map(|b| format!("{b:02x}")).collect();
@@ -152,10 +153,10 @@ mod tests {
     const IFACE: &str = "org.tuna.Test";
 
     fn signal(
-        conn: &zbus::blocking::Connection,
+        conn: &zbus::Connection,
         payload: String,
     ) -> impl Future<Output = zbus::Result<()>> + Send + 'static {
-        let conn = conn.inner().clone();
+        let conn = conn.clone();
         async move {
             conn.emit_signal(None::<()>, PATH, IFACE, "Changed", &(payload,))
                 .await
@@ -197,33 +198,41 @@ mod tests {
     /// Emissions reach a reading peer complete and in submission order.
     #[test]
     fn emissions_arrive_in_submission_order() {
+        use futures_lite::StreamExt as _;
         let (server_end, client_end) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {
-            zbus::blocking::connection::Builder::async_io_unix_stream(server_end)
-                .server(zbus::Guid::generate())
-                .unwrap()
-                .p2p()
-                .build()
-                .unwrap()
+            zbus::block_on(
+                zbus::connection::Builder::unix_stream(server_end)
+                    .server(zbus::Guid::generate())
+                    .p2p()
+                    .build(),
+            )
+            .unwrap()
         });
-        let client = zbus::blocking::connection::Builder::async_io_unix_stream(client_end)
-            .p2p()
-            .build()
-            .unwrap();
+        let client = zbus::block_on(
+            zbus::connection::Builder::unix_stream(client_end)
+                .p2p()
+                .build(),
+        )
+        .unwrap();
         let server = server.join().unwrap();
         let rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .interface(IFACE)
-            .unwrap()
-            .build();
-        let mut received =
-            zbus::blocking::MessageIterator::for_match_rule(rule, &client, Some(512)).unwrap();
+            .build()
+            .unwrap();
+        let mut received = zbus::block_on(zbus::MessageStream::for_match_rule(
+            rule,
+            &client,
+            std::num::NonZeroUsize::new(512),
+        ))
+        .unwrap();
         let queue = SignalQueue::new("tuna-test-signals");
         for n in 0..200 {
             assert!(queue.emit(signal(&server, n.to_string())));
         }
         for n in 0..200 {
-            let message = received.next().unwrap().unwrap();
+            let message = zbus::block_on(received.next()).unwrap().unwrap();
             let (body,): (String,) = message.body().deserialize().unwrap();
             assert_eq!(body, n.to_string());
         }

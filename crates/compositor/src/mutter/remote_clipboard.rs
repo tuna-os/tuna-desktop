@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 
 use zbus::fdo;
 use zbus::object_server::SignalEmitter;
-use zbus::zvariant::{OwnedValue, StructureBuilder, Value};
+use zbus::wire::StructureBuilder;
+use zbus::{OwnedVariant, Variant};
 
 /// Mime types one selection may offer.
 pub(crate) const MAX_MIME_TYPES: usize = 64;
@@ -120,12 +121,12 @@ impl Shared {
 /// The `mime-types` option of EnableClipboard and SetSelection: absent,
 /// or a non-empty bounded list of printable names.
 pub(crate) fn mime_types(
-    options: &HashMap<String, OwnedValue>,
+    options: &HashMap<String, OwnedVariant>,
 ) -> fdo::Result<Option<Vec<String>>> {
     let Some(value) = options.get("mime-types") else {
         return Ok(None);
     };
-    let Value::Array(array) = &**value else {
+    let Variant::Array(array) = &**value else {
         return Err(fdo::Error::InvalidArgs(
             "mime-types must be a string array".into(),
         ));
@@ -141,7 +142,7 @@ pub(crate) fn mime_types(
     array
         .iter()
         .map(|value| match value {
-            Value::Str(name) => valid_mime_type(name.as_str()).map(str::to_owned),
+            Variant::Str(name) => valid_mime_type(name.as_str()).map(str::to_owned),
             _ => Err(fdo::Error::InvalidArgs(
                 "mime-types must be a string array".into(),
             )),
@@ -164,7 +165,7 @@ pub(crate) fn valid_mime_type(name: &str) -> fdo::Result<&str> {
 /// `session-is-owner`, or nothing when the selection has no owner.
 pub(crate) fn owner_changed_options(
     owner: Option<(&[String], bool)>,
-) -> HashMap<String, OwnedValue> {
+) -> HashMap<String, OwnedVariant> {
     let mut options = HashMap::new();
     let Some((mime_types, is_owner)) = owner else {
         return options;
@@ -173,11 +174,11 @@ pub(crate) fn owner_changed_options(
         .add_field(mime_types.to_vec())
         .build()
     {
-        if let Ok(value) = OwnedValue::try_from(Value::Structure(tuple)) {
+        if let Ok(value) = OwnedVariant::try_from(Variant::Structure(tuple)) {
             options.insert("mime-types".into(), value);
         }
     }
-    options.insert("session-is-owner".into(), OwnedValue::from(is_owner));
+    options.insert("session-is-owner".into(), OwnedVariant::from(is_owner));
     options
 }
 
@@ -458,7 +459,7 @@ impl Registry {
             .filter(|g| g.shared.enabled() && !g.stopped.load(Ordering::SeqCst))
     }
 
-    fn options_for(&self, session_id: u64) -> HashMap<String, OwnedValue> {
+    fn options_for(&self, session_id: u64) -> HashMap<String, OwnedVariant> {
         owner_changed_options(match &self.owner {
             None => None,
             Some(Owner::Client(types)) => Some((types, false)),
@@ -714,32 +715,35 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
-    fn options(value: Value<'_>) -> HashMap<String, OwnedValue> {
+    fn options(value: Variant<'_>) -> HashMap<String, OwnedVariant> {
         HashMap::from([(
             "mime-types".to_owned(),
-            OwnedValue::try_from(value).unwrap(),
+            OwnedVariant::try_from(value).unwrap(),
         )])
     }
 
     #[test]
     fn mime_type_options_are_bounded_and_typed() {
         assert_eq!(mime_types(&HashMap::new()).unwrap(), None);
-        let ok = options(Value::from(vec!["text/plain;charset=utf-8", "UTF8_STRING"]));
+        let ok = options(Variant::from(vec![
+            "text/plain;charset=utf-8",
+            "UTF8_STRING",
+        ]));
         assert_eq!(
             mime_types(&ok).unwrap().unwrap(),
             vec!["text/plain;charset=utf-8", "UTF8_STRING"]
         );
         // Garbage: wrong type, empty list, empty/oversized/control names,
         // too many entries.
-        assert!(mime_types(&options(Value::from(7u32))).is_err());
-        assert!(mime_types(&options(Value::from(Vec::<String>::new()))).is_err());
-        assert!(mime_types(&options(Value::from(vec![""]))).is_err());
-        assert!(mime_types(&options(Value::from(vec!["a\nb"]))).is_err());
-        assert!(mime_types(&options(Value::from(vec!["x".repeat(MAX_MIME_LEN + 1)]))).is_err());
-        assert!(mime_types(&options(Value::from(vec![1u32, 2]))).is_err());
+        assert!(mime_types(&options(Variant::from(7u32))).is_err());
+        assert!(mime_types(&options(Variant::from(Vec::<String>::new()))).is_err());
+        assert!(mime_types(&options(Variant::from(vec![""]))).is_err());
+        assert!(mime_types(&options(Variant::from(vec!["a\nb"]))).is_err());
+        assert!(mime_types(&options(Variant::from(vec!["x".repeat(MAX_MIME_LEN + 1)]))).is_err());
+        assert!(mime_types(&options(Variant::from(vec![1u32, 2]))).is_err());
         let many: Vec<String> = (0..=MAX_MIME_TYPES).map(|i| format!("a/{i}")).collect();
         assert!(matches!(
-            mime_types(&options(Value::from(many))),
+            mime_types(&options(Variant::from(many))),
             Err(fdo::Error::LimitsExceeded(_))
         ));
     }

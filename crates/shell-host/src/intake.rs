@@ -11,7 +11,8 @@
 //! D-Bus edge mirrors [`WatcherBus`](crate::watcher::WatcherBus): the
 //! owner calls [`NotificationBus::ensure`] until it connects, and a taken
 //! name (or no bus) reads as no intake — never a hang. Method calls
-//! arrive on zbus worker threads. `Notify` is filed on the owner's GLib
+//! run on the zbus runtime (zbus's helper thread, or the owner's thread
+//! while it is inside `zbus::block_on`). `Notify` is filed on the owner's GLib
 //! main context when it names one ([`NotificationBus::deliver_in`]),
 //! because filing consults a policy store that may use GSettings; other
 //! calls go straight into the shared center. Each then runs the
@@ -54,19 +55,19 @@ fn pair_actions(actions: &[String]) -> Vec<NotificationAction> {
 /// as a mistype — which silently dropped every desktop-entry, urgency
 /// and sound hint on real notifications.
 fn hint_value(
-    hints: &HashMap<String, zbus::zvariant::OwnedValue>,
+    hints: &HashMap<String, zbus::OwnedVariant>,
     key: &str,
-) -> Option<zbus::zvariant::Value<'static>> {
-    let value = zbus::zvariant::Value::from(hints.get(key)?.clone());
+) -> Option<zbus::Variant<'static>> {
+    let value = zbus::Variant::from(hints.get(key)?.clone());
     match value {
-        zbus::zvariant::Value::Value(inner) => Some(*inner),
+        zbus::Variant::Variant(inner) => Some(*inner),
         value => Some(value),
     }
 }
 
 /// Urgency from the `urgency` hint byte (0 low, 1 normal, 2
 /// critical). A missing or mistyped hint reads as normal.
-fn urgency_hint(hints: &HashMap<String, zbus::zvariant::OwnedValue>) -> Urgency {
+fn urgency_hint(hints: &HashMap<String, zbus::OwnedVariant>) -> Urgency {
     let level: Option<u8> = hint_value(hints, "urgency").and_then(|v| u8::try_from(v).ok());
     match level {
         Some(0) => Urgency::Low,
@@ -76,7 +77,7 @@ fn urgency_hint(hints: &HashMap<String, zbus::zvariant::OwnedValue>) -> Urgency 
 }
 
 /// A string hint, empty when absent or mistyped.
-fn string_hint(hints: &HashMap<String, zbus::zvariant::OwnedValue>, key: &str) -> String {
+fn string_hint(hints: &HashMap<String, zbus::OwnedVariant>, key: &str) -> String {
     hint_value(hints, key)
         .and_then(|v| String::try_from(v).ok())
         .unwrap_or_default()
@@ -84,7 +85,7 @@ fn string_hint(hints: &HashMap<String, zbus::zvariant::OwnedValue>, key: &str) -
 
 /// The sound a notification asks for: `sound-name` or `sound-file`,
 /// nothing when `suppress-sound` is set.
-fn sound_hints(hints: &HashMap<String, zbus::zvariant::OwnedValue>) -> Sound {
+fn sound_hints(hints: &HashMap<String, zbus::OwnedVariant>) -> Sound {
     let suppressed = hint_value(hints, "suppress-sound")
         .and_then(|v| bool::try_from(v).ok())
         .unwrap_or(false);
@@ -133,7 +134,7 @@ impl Notifications {
         summary: String,
         body: String,
         actions: Vec<String>,
-        hints: HashMap<String, zbus::zvariant::OwnedValue>,
+        hints: HashMap<String, zbus::OwnedVariant>,
         _expire_timeout: i32,
     ) -> u32 {
         // The source's notification policy (GNOME Settings) decides
@@ -217,7 +218,7 @@ impl Notifications {
 /// the panel share one center, so wire arrivals show up in banners
 /// without a copy.
 pub struct NotificationBus {
-    conn: Option<zbus::blocking::Connection>,
+    conn: Option<zbus::Connection>,
     center: Arc<Mutex<NotificationCenter>>,
     on_change: Option<OnChange>,
     deliver_in: Option<glib::MainContext>,
@@ -276,39 +277,26 @@ impl NotificationBus {
             return true;
         }
         let builder = match address {
-            Some(address) => zbus::blocking::connection::Builder::address(address),
-            None => zbus::blocking::connection::Builder::session(),
-        };
-        let builder = match builder {
-            Ok(builder) => builder,
-            Err(e) => {
-                eprintln!("tuna-shell-host: notification bus unavailable: {e}");
-                return false;
-            }
+            Some(address) => zbus::connection::Builder::address(address),
+            None => zbus::connection::Builder::session(),
         };
         let notifications = Notifications {
             center: self.center.clone(),
             on_change: self.on_change.clone(),
             deliver_in: self.deliver_in.clone(),
         };
-        let conn = match builder.serve_at(NOTIFICATIONS_PATH, notifications) {
-            Ok(conn) => conn,
-            Err(e) => {
-                eprintln!("tuna-shell-host: notification serve failed: {e}");
-                return false;
-            }
-        };
-        let conn = match conn.build() {
+        let builder = builder.serve_at(NOTIFICATIONS_PATH, notifications);
+        let conn = match zbus::block_on(builder.build()) {
             Ok(conn) => conn,
             Err(e) => {
                 eprintln!("tuna-shell-host: notification connect failed: {e}");
                 return false;
             }
         };
-        let reply = conn.request_name_with_flags(
+        let reply = zbus::block_on(conn.request_name_with_flags(
             NOTIFICATIONS_NAME,
-            zbus::fdo::RequestNameFlags::DoNotQueue.into(),
-        );
+            zbus::fdo::RequestNameFlags::DO_NOT_QUEUE,
+        ));
         match reply {
             Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
                 self.conn = Some(conn);
@@ -357,13 +345,13 @@ impl NotificationBus {
         let Some(conn) = self.conn.as_ref() else {
             return;
         };
-        if let Err(e) = conn.emit_signal(
+        if let Err(e) = zbus::block_on(conn.emit_signal(
             None::<&str>,
             NOTIFICATIONS_PATH,
             NOTIFICATIONS_NAME,
             "ActionInvoked",
             &(id, action.to_owned()),
-        ) {
+        )) {
             eprintln!("tuna-shell-host: notification signal ActionInvoked failed: {e}");
         }
     }
@@ -375,13 +363,13 @@ impl NotificationBus {
         let Some(conn) = self.conn.as_ref() else {
             return;
         };
-        if let Err(e) = conn.emit_signal(
+        if let Err(e) = zbus::block_on(conn.emit_signal(
             None::<&str>,
             NOTIFICATIONS_PATH,
             NOTIFICATIONS_NAME,
             "NotificationClosed",
             &(id, reason),
-        ) {
+        )) {
             eprintln!("tuna-shell-host: notification signal NotificationClosed failed: {e}");
         }
     }
@@ -418,13 +406,13 @@ mod tests {
 
     #[test]
     fn urgency_hint_maps_the_byte_and_defaults_to_normal() {
-        use zbus::zvariant::{OwnedValue, Value};
+        use zbus::{OwnedVariant, Variant};
 
         let hinted = |byte: u8| {
             let mut hints = HashMap::new();
             hints.insert(
                 "urgency".to_owned(),
-                Value::U8(byte).try_to_owned().expect("hint value"),
+                Variant::U8(byte).try_to_owned().expect("hint value"),
             );
             urgency_hint(&hints)
         };
@@ -434,7 +422,7 @@ mod tests {
         assert_eq!(hinted(9), Urgency::Critical);
         assert_eq!(urgency_hint(&HashMap::new()), Urgency::Normal);
         let mut mistyped = HashMap::new();
-        mistyped.insert("urgency".to_owned(), OwnedValue::from(true));
+        mistyped.insert("urgency".to_owned(), OwnedVariant::from(true));
         assert_eq!(urgency_hint(&mistyped), Urgency::Normal);
     }
 
@@ -442,14 +430,14 @@ mod tests {
     /// in a variant. The readers must see through the wrapper, or real
     /// notifications lose urgency, app identity and sound.
     fn wrapped_hints(
-        pairs: &[(&str, zbus::zvariant::Value<'static>)],
-    ) -> HashMap<String, zbus::zvariant::OwnedValue> {
-        use zbus::zvariant::Value;
+        pairs: &[(&str, zbus::Variant<'static>)],
+    ) -> HashMap<String, zbus::OwnedVariant> {
+        use zbus::Variant;
 
         pairs
             .iter()
             .map(|(key, value)| {
-                let wrapped = Value::Value(Box::new(value.clone()))
+                let wrapped = Variant::Variant(Box::new(value.clone()))
                     .try_to_owned()
                     .expect("hint value");
                 (key.to_string(), wrapped)
@@ -459,23 +447,23 @@ mod tests {
 
     #[test]
     fn hints_read_through_the_dbus_variant_layer() {
-        use zbus::zvariant::Value;
+        use zbus::Variant;
 
         let hints = wrapped_hints(&[
-            ("urgency", Value::U8(2)),
-            ("desktop-entry", Value::from("tuna-proof-notes")),
-            ("sound-name", Value::from("message-new-instant")),
-            ("suppress-sound", Value::Bool(true)),
+            ("urgency", Variant::U8(2)),
+            ("desktop-entry", Variant::from("tuna-proof-notes")),
+            ("sound-name", Variant::from("message-new-instant")),
+            ("suppress-sound", Variant::Bool(true)),
         ]);
         assert_eq!(urgency_hint(&hints), Urgency::Critical);
         assert_eq!(string_hint(&hints, "desktop-entry"), "tuna-proof-notes");
         // Suppressed wins over a named sound, as on the bus.
         assert!(sound_hints(&hints).is_empty());
 
-        let hints = wrapped_hints(&[("sound-name", Value::from("message-new-instant"))]);
+        let hints = wrapped_hints(&[("sound-name", Variant::from("message-new-instant"))]);
         assert_eq!(sound_hints(&hints).name, "message-new-instant");
 
-        let hints = wrapped_hints(&[("urgency", Value::U8(0))]);
+        let hints = wrapped_hints(&[("urgency", Variant::U8(0))]);
         assert_eq!(urgency_hint(&hints), Urgency::Low);
         assert_eq!(string_hint(&hints, "desktop-entry"), "");
     }
@@ -489,6 +477,8 @@ mod tests {
     mod live_bus {
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
+
+        use futures_lite::StreamExt;
 
         use super::super::{NotificationBus, NOTIFICATIONS_NAME, NOTIFICATIONS_PATH};
         use crate::notification_policy::{AppPrefs, GlobalPrefs, PolicyStore};
@@ -528,13 +518,10 @@ mod tests {
 
         /// Connect a client to the private bus, retrying while the
         /// daemon starts listening.
-        fn client_conn(address: &str) -> Option<zbus::blocking::Connection> {
+        fn client_conn(address: &str) -> Option<zbus::Connection> {
             for _ in 0..50 {
-                match zbus::blocking::connection::Builder::address(address) {
-                    Ok(builder) => match builder.build() {
-                        Ok(conn) => return Some(conn),
-                        Err(_) => std::thread::sleep(Duration::from_millis(100)),
-                    },
+                match zbus::block_on(zbus::connection::Builder::address(address).build()) {
+                    Ok(conn) => return Some(conn),
                     Err(_) => std::thread::sleep(Duration::from_millis(100)),
                 }
             }
@@ -560,54 +547,53 @@ mod tests {
             None
         }
 
-        fn notify_proxy(client: &zbus::blocking::Connection) -> Option<zbus::blocking::Proxy<'_>> {
-            zbus::blocking::Proxy::new(
+        fn notify_proxy(client: &zbus::Connection) -> Option<zbus::Proxy<'_>> {
+            zbus::block_on(zbus::Proxy::new(
                 client,
                 NOTIFICATIONS_NAME,
                 NOTIFICATIONS_PATH,
                 NOTIFICATIONS_NAME,
-            )
+            ))
             .ok()
         }
 
         /// Stub `Notify`: full freedesktop shape, empty hints.
-        fn stub_notify(proxy: &zbus::blocking::Proxy<'_>, actions: Vec<String>) -> u32 {
+        fn stub_notify(proxy: &zbus::Proxy<'_>, actions: Vec<String>) -> u32 {
             use std::collections::HashMap;
-            use zbus::zvariant::OwnedValue;
+            use zbus::OwnedVariant;
 
-            let hints: HashMap<String, OwnedValue> = HashMap::new();
-            proxy
-                .call::<&str, _, u32>(
-                    "Notify",
-                    &(
-                        "stub-app".to_owned(),
-                        0u32,
-                        String::new(),
-                        "Hello".to_owned(),
-                        "A stub notification".to_owned(),
-                        actions,
-                        hints,
-                        0i32,
-                    ),
-                )
-                .expect("stub Notify reaches the intake")
+            let hints: HashMap<String, OwnedVariant> = HashMap::new();
+            zbus::block_on(proxy.call::<&str, _, u32>(
+                "Notify",
+                &(
+                    "stub-app".to_owned(),
+                    0u32,
+                    String::new(),
+                    "Hello".to_owned(),
+                    "A stub notification".to_owned(),
+                    actions,
+                    hints,
+                    0i32,
+                ),
+            ))
+            .expect("stub Notify reaches the intake")
         }
 
         /// Subscribe to one intake signal before triggering it, so
         /// the emission cannot race the subscription.
-        fn subscribe(
-            client: &zbus::blocking::Connection,
-            member: &str,
-        ) -> zbus::blocking::MessageIterator {
+        fn subscribe(client: &zbus::Connection, member: &str) -> zbus::MessageStream {
             let rule = zbus::MatchRule::builder()
                 .msg_type(zbus::message::Type::Signal)
                 .interface(NOTIFICATIONS_NAME)
-                .expect("signal rule")
                 .member(member)
-                .expect("signal rule")
-                .build();
-            zbus::blocking::MessageIterator::for_match_rule(rule, client, Some(8))
-                .expect("signal subscription")
+                .build()
+                .expect("signal rule");
+            zbus::block_on(zbus::MessageStream::for_match_rule(
+                rule,
+                client,
+                std::num::NonZeroUsize::new(8),
+            ))
+            .expect("signal subscription")
         }
 
         #[test]
@@ -641,14 +627,14 @@ mod tests {
                 panic!("intake proxy builds on a private bus");
             };
 
-            let caps: Vec<String> = proxy
-                .call::<&str, _, Vec<String>>("GetCapabilities", &())
-                .expect("stub GetCapabilities reaches the intake");
+            let caps: Vec<String> =
+                zbus::block_on(proxy.call::<&str, _, Vec<String>>("GetCapabilities", &()))
+                    .expect("stub GetCapabilities reaches the intake");
             assert_eq!(caps, vec!["actions".to_owned(), "persistence".to_owned()]);
 
-            let info: (String, String, String, String) = proxy
-                .call("GetServerInformation", &())
-                .expect("libnotify's GetServerInformation reaches the intake");
+            let info: (String, String, String, String) =
+                zbus::block_on(proxy.call("GetServerInformation", &()))
+                    .expect("libnotify's GetServerInformation reaches the intake");
             assert_eq!(info.3, "1.2", "spec version as gnome-shell answers");
 
             let id = stub_notify(&proxy, vec!["default".to_owned(), "Open".to_owned()]);
@@ -673,8 +659,7 @@ mod tests {
                 "wire actions land on the banner"
             );
 
-            proxy
-                .call::<&str, _, ()>("CloseNotification", &(id,))
+            zbus::block_on(proxy.call::<&str, _, ()>("CloseNotification", &(id,)))
                 .expect("stub CloseNotification reaches the intake");
             assert!(
                 center.lock().expect("center lock").banners().is_empty(),
@@ -723,8 +708,7 @@ mod tests {
             // Banner-side press: the default row invokes once.
             bus.invoke_action(id, "default")
                 .expect("banner press invokes the default action");
-            let msg = invoked
-                .next()
+            let msg = zbus::block_on(invoked.next())
                 .expect("action signal arrives")
                 .expect("action signal decodes");
             let (got_id, got_key): (u32, String) =
@@ -772,8 +756,7 @@ mod tests {
 
             // Banner-side dismiss affordance: user-dismissed (2).
             bus.dismiss_banner(id, 2).expect("banner press dismisses");
-            let msg = closed
-                .next()
+            let msg = zbus::block_on(closed.next())
                 .expect("close signal arrives")
                 .expect("close signal decodes");
             let (got_id, got_reason): (u32, u32) =
