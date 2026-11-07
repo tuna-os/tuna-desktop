@@ -559,7 +559,7 @@ fn input_method_grab_receives_live_repeat_settings_and_usable_keymaps() {
     let mut comp = TestCompositor::new();
     comp.state.set_output_size(1280, 800);
     let mut manager = comp.window_manager();
-    let mut ime = connect(&mut comp);
+    let mut ime = connect_ime_bridge(&mut comp);
     pump(&mut comp, &mut manager, &mut [&mut ime]);
     let qh = ime.queue.handle();
     let im = ime

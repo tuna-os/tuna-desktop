@@ -138,8 +138,10 @@ live settings to that grab as well as ordinary `wl_keyboard` resources;
 `send_keymap` likewise publishes replacement keymaps and modifiers. Without
 these events the bridge could not honor repeat disabling or retire an old
 held key when the keyboard layout changed. The weak reference creates no
-ownership cycle and is replaced when a new grab is installed. The real
-Wayland consumer regression
+ownership cycle and is replaced when a new grab is installed. Keyboard-grab
+`unset` clears the registration only when it names the retiring resource, so
+a retired grab is never rearmed and a replacement's registration survives.
+The real Wayland consumer regression
 `input_method_grab_receives_live_repeat_settings_and_usable_keymaps`
 drives the production settings consumer, receives live repeat enable/disable,
 and parses the replacement keymap to interpret the German Z key correctly.
@@ -214,9 +216,8 @@ Permanent grab replacement also sends the retiring live IM grab
 `repeat_info(0, 0)` after releasing its state lock. Returned-key forwarding
 does not send a pause or change the live repeat rate. The consumer checks
 the actual pause event and that a later keyboard repeat-settings change
-does not rearm the retired grab. This baseline has no IM weak repeat
-registration; integrations which add one must clear only the retiring
-resource's registration, never a replacement's.
+does not rearm the retired grab. The IM weak repeat registration above is
+cleared only for the retiring resource, never a replacement's.
 
 A standard `grab_keyboard` request from the admitted current IM also
 rechecks actual seat ownership: it cannot replace a non-IM compositor grab.

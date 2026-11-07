@@ -109,7 +109,7 @@ impl State {
     fn osk_ime_unhandled(&mut self, keysym: u32) {
         use crate::osk::{level_modifier, pick_keycode};
         use smithay::backend::input::KeyState;
-        use smithay::input::keyboard::{xkb, FilterResult};
+        use smithay::input::keyboard::xkb;
         use smithay::wayland::input_method::InputMethodKeyboardGrab;
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
@@ -140,16 +140,11 @@ impl State {
         let Some((key, modifier)) = picked else {
             return;
         };
-        let grab = keyboard
-            .with_grab(|serial, grab| {
-                grab.downcast_ref::<InputMethodKeyboardGrab>()
-                    .cloned()
-                    .map(|grab| (serial, grab))
-            })
-            .flatten();
-        if grab.is_some() {
-            keyboard.unset_grab(self);
-        }
+        // Bypass, never unset, the IM grab: unsetting retires it and pauses
+        // its repeat clock, as a permanent replacement does.
+        let ime_grab = keyboard
+            .with_grab(|_, grab| grab.downcast_ref::<InputMethodKeyboardGrab>().is_some())
+            .unwrap_or(false);
         let time = crate::state::system_millis() as u32;
         for (code, pressed) in modifier
             .map(|m| (m, true))
@@ -157,21 +152,19 @@ impl State {
             .chain([(key, true), (key, false)])
             .chain(modifier.map(|m| (m, false)))
         {
-            keyboard.input::<(), _>(
-                self,
-                code.into(),
-                if pressed {
-                    KeyState::Pressed
-                } else {
-                    KeyState::Released
-                },
-                smithay::utils::SERIAL_COUNTER.next_serial(),
-                time,
-                |_, _, _| FilterResult::Forward,
-            );
-        }
-        if let Some((serial, grab)) = grab {
-            keyboard.set_grab(self, grab, serial);
+            let code = code.into();
+            let key_state = if pressed {
+                KeyState::Pressed
+            } else {
+                KeyState::Released
+            };
+            let ((), mods_changed) = keyboard.input_intercept(self, code, key_state, |_, _, _| ());
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            if ime_grab {
+                keyboard.input_forward_to_focus(self, code, key_state, serial, time, mods_changed);
+            } else {
+                keyboard.input_forward(self, code, key_state, serial, time, mods_changed);
+            }
         }
     }
 }
