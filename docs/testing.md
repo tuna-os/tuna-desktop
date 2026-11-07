@@ -460,6 +460,29 @@ or a still-missing module fails setup, and package installation errors are
 fatal. Module loading and the real vkms device and presentation assertions
 remain mandatory in the smoke test.
 
+Private colord startup failures in `D-COLORD` retain `colord-startup.txt`:
+the intended user/group, private bus and binary identity, boundary markers
+before namespace creation, tmpfs mount, privilege drop and daemon exec, the
+actual mounted store ownership/mode, and wrapper/supervisor/child PIDs.
+When the wrapper has exited (its world-readable `/proc` entry is gone or a
+zombie; never an unprivileged `kill -0`, which a live root-owned sudo wrapper
+answers with EPERM), the harness waits once and retains its exact shell
+status separately from the supervisor's observed child status. A status
+above 128 includes a possible signal mapping, not an assertion of cause.
+Otherwise readiness still fails at the unchanged 30-second deadline, after
+writing the same receipt.
+`colord.log` contains only the daemon's original stdout/stderr;
+`colord-launch.log` contains launcher errors. Failure receipts also include
+bounded raw kernel journal/ring-buffer output with reader statuses (including
+permission/unavailability errors). These records do not diagnose an OOM or
+authentication failure by themselves; ring-buffer output can predate startup.
+The real private-bus readiness assertion remains mandatory, without restart,
+store permission changes or an authentication bypass.
+
+The startup boundary regression tests use fake sudo/unshare/mount/setpriv
+and daemon commands, not a real privileged mount:
+`python3 -m unittest discover -s scripts/tests -p test_colord_startup.py`.
+
 ## GNOME Core applications: installed-image evidence
 
 `tuna-app-content` qualifies nested Chromium content, not the 28 Core
