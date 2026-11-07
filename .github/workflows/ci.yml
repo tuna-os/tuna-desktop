@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+    # ready_for_review: draft pull requests run only select-lanes and check
+    # (see "Select proof lanes"); marking one ready starts the proof lanes.
+    types: [opened, synchronize, reopened, ready_for_review]
   # Nightly full run, so drift in archlinux:latest, the Marlin base image
   # and runner images surfaces even on days nothing merges.
   schedule:
@@ -32,6 +35,7 @@ jobs:
     runs-on: &runner-24 ${{ vars.CI_RUNNERS != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-24.04' || 'ubuntu-latest' }}
     outputs:
       lanes: ${{ steps.lanes.outputs.lanes }}
+      vm_matrix: ${{ steps.lanes.outputs.vm_matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -50,13 +54,35 @@ jobs:
         env:
           CI_ROUND_ROBIN_SIZE: ${{ vars.CI_ROUND_ROBIN_SIZE }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DRAFT: ${{ github.event.pull_request.draft }}
         run: |
-          if [ -n "$BASE_SHA" ]; then
+          # Draft pull requests: check only. Their proof lanes run when the
+          # pull request is marked ready for review.
+          if [ "$DRAFT" = true ]; then
+            echo 'lanes=[]' >> "$GITHUB_OUTPUT"
+          elif [ -n "$BASE_SHA" ]; then
             git fetch --no-tags --quiet origin "$BASE_SHA"
-            git diff --name-only "$BASE_SHA...HEAD" | scripts/ci-select-lanes --changed - >> "$GITHUB_OUTPUT"
+            git diff --name-only "$BASE_SHA...HEAD" | scripts/ci-select-lanes --changed - --base "$BASE_SHA" >> "$GITHUB_OUTPUT"
           else
             scripts/ci-select-lanes >> "$GITHUB_OUTPUT"
           fi
+          # marlin-vm legs: a pull request runs the primary lifecycle leg only,
+          # plus the native Core consumer when the change touches its source,
+          # guest observers or image transport; the Orca 51 leg and the paired
+          # GNOME/Tuna references run on main, schedule and dispatch (each leg
+          # rebuilds the image and boots a VM for ~30 hosted minutes).
+          primary='{"profile":"lifecycle","orca":"distribution","artifact":"marlin-vm"}'
+          core='{"profile":"core-apps","orca":"distribution","artifact":"native-core-apps"}'
+          extra='{"profile":"lifecycle","orca":"upstream51","artifact":"marlin-vm-orca51"},{"profile":"gnome-reference","session":"gnome","orca":"distribution","artifact":"native-gnome51-reference"},{"profile":"tuna-reference","session":"tuna","orca":"distribution","artifact":"native-tuna-reference"}'
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            legs="$primary"
+            if git diff --name-only "$BASE_SHA...HEAD" | grep -Eq '^(scripts/lib/(core_apps|vm_native_desktop|vm_guest_agent|vm_strip_)|scripts/tuna-vm-strip-image|packaging/marlin/vm-lane/(core-apps|tuna-core-apps-install|tuna-native-session|Containerfile))'; then
+              legs="$legs,$core"
+            fi
+          else
+            legs="$primary,$core,$extra"
+          fi
+          echo "vm_matrix={\"include\":[$legs]}" >> "$GITHUB_OUTPUT"
 
   check:
     # Typically 10 min, slowest seen 16; a hung test must not hold a runner 6 h.
@@ -78,6 +104,12 @@ jobs:
       - name: Record the checked source revision
         id: checked-source
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # The structural test-strategy rules need no build, so fail on them
+      # first; this replaces the separate validate-test-strategy workflow
+      # (320 hosted runs/week). The executed-inventory pass below adds the
+      # test list after the workspace tests pass.
+      - name: Validate test strategy structure
+        run: scripts/tuna-test-strategy --report "$RUNNER_TEMP/test-strategy-static-report.md"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
@@ -374,7 +406,7 @@ jobs:
   journey:
     # Same choice as select-lanes' runs-on, on the Ubuntu 26.04 runners.
     runs-on: &runner-26 ${{ vars.CI_RUNNERS != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-26.04' || 'ubuntu-26.04' }}
-    needs: [select-lanes]
+    needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'journey')
     timeout-minutes: 60
     steps:
@@ -500,7 +532,7 @@ jobs:
 
   app-content:
     runs-on: *runner-24
-    needs: [select-lanes]
+    needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'app-content')
     timeout-minutes: 25
     steps:
@@ -536,7 +568,7 @@ jobs:
 
   scroll-proof:
     runs-on: *runner-24
-    needs: [select-lanes]
+    needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'scroll-proof')
     timeout-minutes: 25
     steps:
@@ -575,7 +607,7 @@ jobs:
     # Needs headroom: the DRM/apt install (including any missing vkms
     # modules for the running kernel) can take ~20 min on a cold cache.
     runs-on: ubuntu-latest
-    needs: [select-lanes]
+    needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'drm-smoke')
     timeout-minutes: 40
     steps:
@@ -1067,7 +1099,7 @@ jobs:
     # against the nested session that owns the screen reader. Ubuntu
     # 24.04's Orca 46 predates GNOME's KeyboardMonitor.
     runs-on: *runner-26
-    needs: [select-lanes]
+    needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'orca-speech')
     timeout-minutes: 45
     steps:
@@ -1244,7 +1276,7 @@ jobs:
     # TunaOS Marlin is Arch-based: build, check, and install the Arch
     # package in a clean archlinux container (#69).
     runs-on: ubuntu-latest
-    needs: [select-lanes]
+    needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'arch-package')
     timeout-minutes: 40
     container: archlinux:latest
@@ -1304,7 +1336,7 @@ jobs:
     runs-on: ubuntu-latest
     # Do not publish a package image before the workspace check succeeds.
     needs: [select-lanes, check, arch-package]
-    if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-image')
+    if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-image') && github.event_name != 'pull_request'
     timeout-minutes: 40
     permissions:
       contents: read
@@ -1350,7 +1382,7 @@ jobs:
 
   gdm51-native-package:
     # Private fixture only: one exact-source native build shared by both VM profiles.
-    needs: [select-lanes]
+    needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm')
     runs-on: ubuntu-26.04
     timeout-minutes: 60
@@ -1579,25 +1611,7 @@ jobs:
     name: ${{ matrix.artifact }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - profile: lifecycle
-            orca: distribution
-            artifact: marlin-vm
-          - profile: lifecycle
-            orca: upstream51
-            artifact: marlin-vm-orca51
-          - profile: core-apps
-            orca: distribution
-            artifact: native-core-apps
-          - profile: gnome-reference
-            session: gnome
-            orca: distribution
-            artifact: native-gnome51-reference
-          - profile: tuna-reference
-            session: tuna
-            orca: distribution
-            artifact: native-tuna-reference
+      matrix: ${{ fromJSON(needs.select-lanes.outputs.vm_matrix) }}
     runs-on: ubuntu-26.04
     needs: [select-lanes, arch-package, gdm51-native-package]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm')
@@ -1966,7 +1980,9 @@ jobs:
     timeout-minutes: 10
     runs-on: *runner-24
     needs: [select-lanes, marlin-vm]
-    if: ${{ !cancelled() && contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm') }}
+    # The two reference members it downloads are not built on pull requests
+    # (select-lanes' vm_matrix).
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
