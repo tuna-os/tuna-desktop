@@ -3062,6 +3062,27 @@ class TourViewPredicates(unittest.TestCase):
                 Path(recorder.dir) / "f000000.png"))
             recorder.close()
 
+    def test_png_decode_budget_is_independent_of_the_view_window(self):
+        pixels = tour_frame(self.NAVY, self.SWITCHER)
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(
+                header + pixels if args["format"] == "ppm" else tour_png(pixels))
+        budgets = []
+        original = lane.Recorder._exact_pixels
+        def spy(self, card, deadline):
+            budgets.append(deadline - lane.time.monotonic())
+            return original(self, card, deadline)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(lane.Recorder, "_exact_pixels", spy):
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            # A window this short left the decode milliseconds before; the
+            # frame is retained inside it, so the decode keeps a full budget.
+            self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=0.3, settle=0))
+            self.assertGreater(budgets[0], 9.0)
+            self.assertTrue(recorder.still_confirmations["alt-tab"]["confirmed"])
+            recorder.close()
+
     def test_exact_overview_png_is_confirmed_without_changing_calibrated_floors(self):
         pixels = tour_frame(self.GREY, [(180, 108, 1100, 660, self.NAVY),
                                        (440, 420, 840, 670, self.WHITE)])

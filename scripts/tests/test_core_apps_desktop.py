@@ -22,6 +22,7 @@ class OpenDefaultCellSpellings(unittest.TestCase):
         desktop.start = lambda *a: {'pid': 1}
         desktop.keys = lambda *a: None
         desktop.type_ascii = lambda *a: None
+        desktop.enter_location = lambda *a, **k: None
         desktop.tree = lambda actor: tree
 
         def click_path(actor, path):
@@ -930,6 +931,44 @@ class StartSearchQuery(unittest.TestCase):
         actor = desktop.start('org.gnome.Papers', 'Document Viewer')
         desktop.type_ascii.assert_called_once_with('org.gnome.Papers')
         self.assertEqual(actor['search_name'], 'Document Viewer')
+
+
+class EnterLocationCompletion(unittest.TestCase):
+    """The location entry's inline completion must not leak into Return.
+
+    Run 42384050579: `<fixture>/` completed to `<fixture>/web/` after the
+    exact text was first read, and Return opened the empty web folder.
+    """
+    def rig(self, reads):
+        keys = []
+        desktop = core_apps.Desktop.__new__(core_apps.Desktop)
+        desktop.keys = lambda *names: keys.append(names)
+        desktop.type_ascii = lambda text: keys.append(('type', text))
+        iterator = iter(reads)
+        desktop.tree = lambda window: {'nodes': [{'focused': True, 'text': next(iterator)}]}
+        def await_state(label, read, predicate, timeout=10):
+            for _ in range(20):
+                value = read()
+                if predicate(value):
+                    return value
+            raise TimeoutError(label)
+        desktop.await_state = await_state
+        return desktop, keys
+
+    def test_completion_suffix_is_deleted_before_return(self):
+        base = '/fixture/run/'
+        desktop, keys = self.rig([base, base + 'web/', base, base, base])
+        desktop.enter_location({'id': 'picker'}, '/fixture/run')
+        self.assertEqual(keys, [('ctrl', 'l'), ('type', base), ('delete',), ('ret',)])
+
+    def test_return_waits_for_three_consecutive_exact_reads(self):
+        base = '/fixture/run/'
+        desktop, keys = self.rig([base, base, base])
+        desktop.enter_location({'id': 'picker'}, '/fixture/run/')
+        self.assertEqual(keys[-1], ('ret',))
+        desktop, _ = self.rig([base, base])
+        with self.assertRaises(StopIteration):
+            desktop.enter_location({'id': 'picker'}, '/fixture/run/')
 
 
 if __name__ == '__main__':

@@ -3480,14 +3480,20 @@ class Recorder:
                 break
         with self.lock:
             self.still(card)
+            # The view had to be on screen and its frame retained by the
+            # deadline; decoding the already-retained PNG is a separate,
+            # fixed budget. A view that appears in the last second of the
+            # window left ffmpeg only milliseconds and was refused with
+            # TimeoutExpired though the frame was good (runs 42337013327,
+            # 42384050579: alt-tab unconfirmed, tour sealing refused).
+            within = time.monotonic() <= deadline
             exact = None
             decode_error = None
-            if ready:
+            if ready and within:
                 try:
-                    exact = self._exact_pixels(card, deadline)
+                    exact = self._exact_pixels(card, time.monotonic() + 10)
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
                     decode_error = type(error).__name__
-            within = time.monotonic() <= deadline
             confirmed = ready and exact is not None and within and bool(predicate(exact))
             evidence = {"predicate": predicate.__name__, "exact_png": exact is not None,
                         "within_deadline": within}

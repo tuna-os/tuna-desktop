@@ -417,6 +417,32 @@ class Desktop(NativeDesktop):
                                 lambda: self.guest('desktop', 'picker', actor=actor),
                                 lambda value: value.get('pid') is not None)
 
+    def enter_location(self, window, directory, label='picker-exact-directory-location'):
+        """Open a directory through a native Files-style location entry.
+
+        The entry completes subdirectories inline, after the typed text first
+        reads back exact: with the fixture's `web/` directory present it
+        became `<fixture>/web/` and Return opened that empty folder (run
+        42384050579: Folder is Empty). Remove any selected completion suffix
+        and accept only text that stays exact across consecutive reads.
+        """
+        expected = str(directory).rstrip('/') + '/'
+        self.keys('ctrl', 'l')
+        self.type_ascii(expected)
+        exact = [0]
+        def location_settled(value):
+            typed = [node['text'] for node in value['nodes'] if node['focused']
+                     and isinstance(node['text'], str) and node['text'].startswith(expected)]
+            if typed == [expected]:
+                exact[0] += 1
+            else:
+                exact[0] = 0
+                if typed:
+                    self.keys('delete')
+            return exact[0] >= 3
+        self.await_state(label, lambda: self.tree(window), location_settled, timeout=30)
+        self.keys('ret')
+
     def _prepare_picker(self, actor, path, save=False):
         if not str(path).startswith(self.fixture + '/'):
             raise ValueError('normal picker must select owned actual fixture content')
@@ -427,12 +453,7 @@ class Desktop(NativeDesktop):
             raise ValueError('real Open content must exist before the caller operation')
         target = Path(path) if directory else Path(path).parent
         picker = self.file_picker(actor)
-        self.keys('ctrl', 'l')
-        self.type_ascii(str(target) + '/')
-        self.await_state('picker-exact-directory-location', lambda: self.tree(picker),
-                         lambda value: any(node['focused'] and node['text'] == str(target) + '/'
-                                           for node in value['nodes']))
-        self.keys('ret')
+        self.enter_location(picker, target)
         if save:
             self.replace(picker, 'File Name', Path(path).name)
         elif not directory:
@@ -551,9 +572,7 @@ class Desktop(NativeDesktop):
     def open_default(self, path):
         default = self.guest('desktop', 'default-handler', path=str(path))
         files = self.start('org.gnome.Nautilus', 'Files')
-        self.keys('ctrl', 'l')
-        self.type_ascii(str(Path(path).parent) + '/')
-        self.keys('ret')
+        self.enter_location(files, Path(path).parent, label='files-exact-directory-location')
         basename = Path(path).name
         # Nautilus exposes file cells as "<name>. File" (directories as
         # "<name>. Folder"); the bare name alone never matches. Same

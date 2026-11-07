@@ -113,9 +113,7 @@ def clip(desktop, expected, mime="text/plain;charset=utf-8"):
 
 def _location(desktop, actor, path):
     desktop.select(actor)
-    desktop.keys("ctrl", "l")
-    edit(desktop, actor, str(path).rstrip("/") + "/", focused=True)
-    desktop.keys("ret")
+    desktop.enter_location(actor, path, label="data-exact-directory-location")
 
 
 def _cell(desktop, actor, name, selected=False):
