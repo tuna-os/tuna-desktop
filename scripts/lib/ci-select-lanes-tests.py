@@ -2,6 +2,8 @@
 """ci-select-lanes picks real coverage and stays in step with ci.yml."""
 import importlib.machinery
 import importlib.util
+import json
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -100,6 +102,64 @@ class Selection(unittest.TestCase):
         # Control: other shipped runtime data still rotates journey.
         self.assertNotIn('journey', pr("share/applications/tuna-settings.desktop", run=1))
 
+    def test_tooling_of_other_workflows_runs_no_lane(self):
+        for path in ("justfile", "scripts/tuna-corral-journey", "scripts/lib/corral_raw.py",
+                     "scripts/tuna-variant-qualification", "scripts/lib/vm_release.py"):
+            self.assertEqual(pr(path, "docs/x.md", run=3), [], path)
+        # Control: a script that is not listed still rotates lanes.
+        self.assertIn("gtk-shell", pr("scripts/tuna-journey-helper", run=3))
+
+    def test_pull_requests_never_rotate_the_push_only_image_lane(self):
+        self.assertNotIn("marlin-image", m.ROTATION)
+        for run in range(len(m.ROTATION)):
+            self.assertNotIn("marlin-image", pr("crates/compositor/src/lib.rs", run=run))
+
+class WorkflowEdits(unittest.TestCase):
+    """An edit to ci.yml selects the lanes whose job changed, not every lane."""
+
+    BASE = """
+on: {pull_request: {}}
+x-runner: &runner ubuntu-latest
+jobs:
+  select-lanes: {runs-on: *runner, steps: [{run: a}]}
+  check: {runs-on: *runner, steps: [{run: a}]}
+  journey: {runs-on: *runner, steps: [{run: a}]}
+  drm-smoke: {runs-on: *runner, steps: [{run: a}]}
+  gdm51-native-package: {runs-on: *runner, steps: [{run: a}]}
+  ci-gate: {runs-on: *runner, steps: [{run: a}]}
+"""
+
+    def lanes(self, old, new):
+        return m.workflow_lanes(self.BASE, self.BASE.replace(old, new))
+
+    def test_lane_job_edit_selects_only_that_lane(self):
+        text = self.BASE.replace("  drm-smoke: {runs-on: *runner, steps: [{run: a}]}",
+                                 "  drm-smoke: {runs-on: *runner, steps: [{run: b}]}")
+        self.assertEqual(m.workflow_lanes(self.BASE, text), {"drm-smoke"})
+        self.assertEqual(m.select("pull_request", 0, 2, [m.WORKFLOW], {"drm-smoke"})[0], ["drm-smoke"])
+
+    def test_factory_job_belongs_to_the_marlin_vm_lane(self):
+        text = self.BASE.replace("  gdm51-native-package: {runs-on: *runner, steps: [{run: a}]}",
+                                 "  gdm51-native-package: {runs-on: *runner, steps: [{run: b}]}")
+        self.assertEqual(m.workflow_lanes(self.BASE, text), {"marlin-vm"})
+
+    def test_check_and_gate_edits_select_no_lane(self):
+        text = self.BASE.replace("  check: {runs-on: *runner, steps: [{run: a}]}",
+                                 "  check: {runs-on: *runner, steps: [{run: b}]}")
+        self.assertEqual(m.workflow_lanes(self.BASE, text), set())
+
+    def test_shared_edits_fall_back_to_every_lane(self):
+        # A changed anchor edits every aliasing job; triggers, select-lanes
+        # and unknown jobs are shared; so is anything unparseable.
+        self.assertIsNone(self.lanes("ubuntu-latest", "ubuntu-26.04"))
+        self.assertIsNone(self.lanes("on: {pull_request: {}}", "on: {push: {}}"))
+        self.assertIsNone(m.workflow_lanes(self.BASE, self.BASE.replace(
+            "  select-lanes: {runs-on: *runner, steps: [{run: a}]}",
+            "  select-lanes: {runs-on: *runner, steps: [{run: b}]}")))
+        self.assertIsNone(m.workflow_lanes(self.BASE, self.BASE + "  mystery: {runs-on: *runner}\n"))
+        self.assertIsNone(m.workflow_lanes("", self.BASE))
+        self.assertEqual(m.select("pull_request", 0, 2, [m.WORKFLOW], None)[0], m.LANES)
+
 
 class WorkflowSync(unittest.TestCase):
     def setUp(self):
@@ -121,6 +181,47 @@ class WorkflowSync(unittest.TestCase):
         gate = self.jobs["ci-gate"]
         self.assertEqual(gate.get("if"), "always()")
         self.assertEqual(set(self.needs(gate)), set(self.jobs) - {"ci-gate"})
+
+    def test_no_lane_scripts_are_not_run_by_a_lane(self):
+        # NO_LANE promises that editing a listed tool cannot change a lane's
+        # result. Follow every script name mentioned by a lane job (and,
+        # transitively, by the scripts it names; python modules by stem) and
+        # fail if one of them is a NO_LANE file.
+        lane_jobs = {name: job for name, job in self.jobs.items()
+                     if name not in ("check", "select-lanes", "ci-gate")}
+        tracked = subprocess.run(["git", "ls-files", "justfile", "scripts"], cwd=ROOT, check=True,
+                                 capture_output=True, text=True).stdout.split()
+        texts = {}
+        for path in tracked:
+            try:
+                texts[path] = (ROOT / path).read_text(errors="ignore")
+            except OSError:
+                pass
+
+        def mentioned(path, text):
+            names = {Path(path).name}
+            if path.endswith(".py"):
+                stem = Path(path).stem
+                names |= {stem, stem.replace("_", "-")}
+            return any(name in text for name in names)
+
+        reached, pending = set(), [json.dumps(lane_jobs)]
+        while pending:
+            text = pending.pop()
+            for path, body in texts.items():
+                if path not in reached and mentioned(path, text):
+                    reached.add(path)
+                    pending.append(body)
+        reached_no_lane = sorted(path for path in reached
+                                 if m.matches(path, m.NO_LANE) and path in texts
+                                 and not m.matches(path, ["scripts/tests/*", "scripts/lib/*-tests.py"]))
+        self.assertEqual(reached_no_lane, [])
+
+    def test_native_reference_artifacts_exist_only_off_pull_requests(self):
+        # A pull request builds the primary marlin-vm leg only; the two
+        # reference members that native-reference-context downloads are
+        # produced on the other events.
+        self.assertIn("pull_request", self.jobs["native-reference-context"]["if"])
 
 
 if __name__ == "__main__":
