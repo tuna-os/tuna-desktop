@@ -244,6 +244,10 @@ def _loupe(desktop):
     # do_action refused). The pill toggle stays keyboard-focusable while
     # hidden, so Tab reaches it by its real focus — observed from the
     # tree, never by pointer bounds — and Space opens its popover.
+    # Seat focus settles before the popover opens: ime skips its own
+    # select below, whose step-away would fire on the popover grab and
+    # dismiss the submenu it must type into (round-1004 ev27).
+    desktop.select(actor)
     attempts = 0
     while True:
         if attempts >= 25:
@@ -274,7 +278,8 @@ def _loupe(desktop):
     require(restorable and restorable.isascii(),
             'original numeric zoom cannot be restored by its ordinary native input')
     try:
-        evidence['ime'] = desktop.ime(actor, zoom_entry['name'], field_path=zoom_entry['path'])
+        evidence['ime'] = desktop.ime(actor, zoom_entry['name'], field_path=zoom_entry['path'],
+                                      select_first=False)
     finally:
         desktop.click_path(actor, zoom_entry['path'])
         desktop.keys('ctrl', 'a')

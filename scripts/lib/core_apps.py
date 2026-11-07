@@ -605,10 +605,14 @@ class Desktop(NativeDesktop):
                 raise RuntimeError('normal frontend restart changed installed code identity')
         return replacement
 
-    def ime(self, actor, field_name, expected='你好', *, field_path=None):
+    def ime(self, actor, field_name, expected='你好', *, field_path=None, select_first=True):
         if expected != '你好':
             raise ValueError('known genuine libpinyin consumer control required')
-        self.select(actor)
+        # A caller holding an open popover selects beforehand instead: the
+        # select step-away fires while a grab holds seat focus nowhere and
+        # its Alt+Tab cycle dismisses the popover (round-1004 ev27).
+        if select_first:
+            self.select(actor)
         if field_path is None:
             _, field = self._node(actor, field_name)
         else:
