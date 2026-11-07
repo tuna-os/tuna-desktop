@@ -10821,13 +10821,13 @@ sleep 0.5
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-boot-poweroff-alt.json" 20 ||
     { xdotool keyup Alt_L; fail G-END-SESSION-BOOT-OPTIONS "accessibility dump failed"; }
 xdotool keyup Alt_L
-button_showing "$ARTIFACTS/a11y-end-boot-poweroff-alt.json" "Power Off" &&
-    hidden "$ARTIFACTS/a11y-end-boot-poweroff-alt.json" "Boot Options" ||
+{ button_showing "$ARTIFACTS/a11y-end-boot-poweroff-alt.json" "Power Off" &&
+    hidden "$ARTIFACTS/a11y-end-boot-poweroff-alt.json" "Boot Options"; } ||
     fail G-END-SESSION-BOOT-OPTIONS "Alt on Power Off… offered Boot Options"
 end_cancel boot-poweroff || fail G-END-SESSION-BOOT-OPTIONS "could not cancel Power Off…"
 end_open boot "Restart…" 'any(.[]; .showing and (.name | test("will restart automatically in 60")))' ||
     fail G-END-SESSION-BOOT-OPTIONS "Restart… did not open"
-button_showing "$ARTIFACTS/a11y-end-boot.json" "Restart" && hidden "$ARTIFACTS/a11y-end-boot.json" "Boot Options" ||
+{ button_showing "$ARTIFACTS/a11y-end-boot.json" "Restart" && hidden "$ARTIFACTS/a11y-end-boot.json" "Boot Options"; } ||
     fail G-END-SESSION-BOOT-OPTIONS "Boot Options showed without Alt"
 xdotool keydown Alt_L
 end_dump_until end-boot-alt 'any(.[]; .showing and .name == "Boot Options")
@@ -10848,8 +10848,8 @@ xdotool keyup Alt_L
 end=$(($(date +%s) + 10))
 until tail -n +"$((power_mark + 1))" "$POWER_LOG" | grep -q "^Reboot True pid=$MANAGER_PID$" || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 boot_calls=$(tail -n +"$((power_mark + 1))" "$POWER_LOG")
-[ "$(printf '%s\n' "$boot_calls" | sed -n 1p)" = "SetRebootToBootLoaderMenu 60000000 pid=$(bus_pid "$END_SHELL")" ] &&
-    [ "$(printf '%s\n' "$boot_calls" | sed -n 2p)" = "Reboot True pid=$MANAGER_PID" ] ||
+{ [ "$(printf '%s\n' "$boot_calls" | sed -n 1p)" = "SetRebootToBootLoaderMenu 60000000 pid=$(bus_pid "$END_SHELL")" ] &&
+    [ "$(printf '%s\n' "$boot_calls" | sed -n 2p)" = "Reboot True pid=$MANAGER_PID" ]; } ||
     fail G-END-SESSION-BOOT-OPTIONS "Boot Options did not set the boot loader menu before the manager's Reboot: $boot_calls"
 end_bus signal ConfirmedReboot || fail G-END-SESSION-BOOT-OPTIONS "Boot Options emitted no ConfirmedReboot"
 pass G-END-SESSION-BOOT-OPTIONS "holding Alt swaps Restart for Boot Options (not on Power Off…), which sets logind's 60 s boot loader menu before the manager's Reboot(true)"

@@ -1465,7 +1465,7 @@ class PublicOrcaNavigation(unittest.TestCase):
         scope = {**vars(module), "nodes": [], "pending": [(app, 0, False)], "visited": 0,
                  "notification_frames": [], "notification_closes": [], "search_entries": [],
                  "target": {"showing": 0, "focused": 0, "present": 0}, "focused_roles": [],
-                 "controlled": False, "end_session": mode == "end-session",
+                 "controlled": False, "end_session": mode == "end-session", "logout_name": None,
                  "notification": mode == "notification-banner", "deadline": 8,
                  "time": SimpleNamespace(monotonic=lambda: 0), "unlocked": lambda: None,
                  "accessibility_query": lambda method, *args: method(*args),
