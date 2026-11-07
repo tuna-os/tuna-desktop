@@ -355,6 +355,125 @@ fn err(context: &str) -> impl Fn(String) -> DrmInitError + '_ {
     move |e| DrmInitError(format!("{context}: {e}"))
 }
 
+/// What primary-GPU selection knows about one seat GPU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GpuCandidate {
+    path: std::path::PathBuf,
+    /// udev tag `mutter-device-preferred-primary` (Mutter's 61-mutter.rules).
+    preferred: bool,
+    /// The PCI boot VGA device.
+    boot: bool,
+    /// The device has a DRM render node: its EGL device has a DRM node, so
+    /// linux-dmabuf main-device feedback and explicit sync can be offered.
+    render_node: bool,
+    /// At least one connector reports `connected`.
+    connected: bool,
+}
+
+/// Mutter's primary GPU order, extended for KMS-only boot GPUs: a udev
+/// preferred-primary tag wins; then a boot GPU that can render; then, when
+/// the boot GPU is KMS-only (bochs, simpledrm, a BMC VGA), a GPU that both
+/// renders and drives a connected output, so the session keeps an EGL
+/// device (GNOME's Mutter also ends up on virtio-gpu beside bochs); then
+/// the boot GPU, then the first GPU.
+fn choose_primary_gpu(gpus: &[GpuCandidate]) -> Option<&GpuCandidate> {
+    gpus.iter()
+        .find(|gpu| gpu.preferred)
+        .or_else(|| gpus.iter().find(|gpu| gpu.boot && gpu.render_node))
+        .or_else(|| gpus.iter().find(|gpu| gpu.render_node && gpu.connected))
+        .or_else(|| gpus.iter().find(|gpu| gpu.boot))
+        .or_else(|| gpus.first())
+}
+
+/// `/sys/class/drm/cardN` name of a `/dev/dri/cardN` path.
+fn card_name(path: &std::path::Path) -> Option<&str> {
+    path.file_name()?
+        .to_str()
+        .filter(|name| name.starts_with("card"))
+}
+
+fn has_render_node(path: &std::path::Path) -> bool {
+    let Some(card) = card_name(path) else {
+        return false;
+    };
+    std::fs::read_dir(format!("/sys/class/drm/{card}/device/drm")).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("renderD"))
+        })
+    })
+}
+
+fn has_connected_output(path: &std::path::Path) -> bool {
+    let Some(card) = card_name(path) else {
+        return false;
+    };
+    let prefix = format!("{card}-");
+    std::fs::read_dir("/sys/class/drm").is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+                && std::fs::read_to_string(entry.path().join("status"))
+                    .is_ok_and(|status| status.trim() == "connected")
+        })
+    })
+}
+
+/// Whether udev's database tags the node `mutter-device-preferred-primary`.
+fn has_preferred_primary_tag(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let rdev = meta.rdev();
+    let database = format!(
+        "/run/udev/data/c{}:{}",
+        libc::major(rdev),
+        libc::minor(rdev)
+    );
+    std::fs::read_to_string(database).is_ok_and(|text| {
+        text.lines()
+            .filter_map(|line| line.strip_prefix("G:").or_else(|| line.strip_prefix("Q:")))
+            .any(|tags| {
+                tags.split_whitespace()
+                    .any(|tag| tag == "mutter-device-preferred-primary")
+            })
+    })
+}
+
+/// The seat's primary GPU, or None with no GPU on the seat.
+fn select_primary_gpu(seat: &str) -> Option<std::path::PathBuf> {
+    let boot = smithay::backend::udev::primary_gpu(seat).ok().flatten();
+    let gpus: Vec<GpuCandidate> = smithay::backend::udev::all_gpus(seat)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| GpuCandidate {
+            preferred: has_preferred_primary_tag(&path),
+            boot: boot.as_deref() == Some(path.as_path()),
+            render_node: has_render_node(&path),
+            connected: has_connected_output(&path),
+            path,
+        })
+        .collect();
+    for gpu in &gpus {
+        eprintln!(
+            "tuna-compositor: drm: GPU {} preferred={} boot={} render-node={} connected={}",
+            gpu.path.display(),
+            gpu.preferred,
+            gpu.boot,
+            gpu.render_node,
+            gpu.connected
+        );
+    }
+    choose_primary_gpu(&gpus)
+        .map(|gpu| gpu.path.clone())
+        .or(boot)
+}
+
 // Evdev keycodes (backend keycodes minus the XKB offset of 8).
 const KEY_LEFTCTRL: u32 = 29;
 const KEY_RIGHTCTRL: u32 = 97;
@@ -607,14 +726,7 @@ impl DrmBackend {
         let seat = session.seat();
         let path = match std::env::var_os("TUNA_DRM_DEVICE") {
             Some(path) => std::path::PathBuf::from(path),
-            None => smithay::backend::udev::primary_gpu(&seat)
-                .ok()
-                .flatten()
-                .or_else(|| {
-                    smithay::backend::udev::all_gpus(&seat)
-                        .ok()
-                        .and_then(|gpus| gpus.into_iter().next())
-                })
+            None => select_primary_gpu(&seat)
                 .ok_or_else(|| DrmInitError(format!("no GPU on seat {seat}")))?,
         };
         let fd = session
@@ -1971,5 +2083,76 @@ mod tests {
         // Far left: onto the left edge of the first output.
         let left = clamp_to_outputs((-50.0, 10.0).into(), &outputs);
         assert_eq!(left, (0.0, 10.0).into());
+    }
+
+    fn gpu(
+        name: &str,
+        preferred: bool,
+        boot: bool,
+        render_node: bool,
+        connected: bool,
+    ) -> GpuCandidate {
+        GpuCandidate {
+            path: format!("/dev/dri/{name}").into(),
+            preferred,
+            boot,
+            render_node,
+            connected,
+        }
+    }
+
+    #[test]
+    fn primary_gpu_prefers_a_rendering_gpu_over_a_kms_only_boot_gpu() {
+        // QEMU std VGA (bochs, boot, no render node) beside virtio-gpu.
+        let gpus = [
+            gpu("card0", false, true, false, true),
+            gpu("card1", false, false, true, true),
+        ];
+        assert_eq!(
+            choose_primary_gpu(&gpus).map(|g| g.path.as_path()),
+            Some(std::path::Path::new("/dev/dri/card1"))
+        );
+    }
+
+    #[test]
+    fn primary_gpu_keeps_a_rendering_boot_gpu_and_honours_the_udev_tag() {
+        let gpus = [
+            gpu("card0", false, true, true, true),
+            gpu("card1", false, false, true, true),
+        ];
+        assert_eq!(
+            choose_primary_gpu(&gpus).map(|g| g.path.as_path()),
+            Some(std::path::Path::new("/dev/dri/card0"))
+        );
+        let tagged = [
+            gpu("card0", false, true, true, true),
+            gpu("card1", true, false, true, true),
+        ];
+        assert_eq!(
+            choose_primary_gpu(&tagged).map(|g| g.path.as_path()),
+            Some(std::path::Path::new("/dev/dri/card1"))
+        );
+    }
+
+    #[test]
+    fn primary_gpu_falls_back_to_the_boot_gpu_then_the_first() {
+        // The only renderer has nothing connected: stay on the boot GPU.
+        let gpus = [
+            gpu("card0", false, true, false, true),
+            gpu("card1", false, false, true, false),
+        ];
+        assert_eq!(
+            choose_primary_gpu(&gpus).map(|g| g.path.as_path()),
+            Some(std::path::Path::new("/dev/dri/card0"))
+        );
+        let none_boot = [
+            gpu("card0", false, false, false, true),
+            gpu("card1", false, false, false, true),
+        ];
+        assert_eq!(
+            choose_primary_gpu(&none_boot).map(|g| g.path.as_path()),
+            Some(std::path::Path::new("/dev/dri/card0"))
+        );
+        assert_eq!(choose_primary_gpu(&[]), None);
     }
 }

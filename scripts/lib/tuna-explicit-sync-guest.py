@@ -139,9 +139,25 @@ def load(directory):
 
 
 def backend(pid):
+    """Whether the process runs the DRM backend, as the compositor resolves it
+    (BackendChoice::resolve): an explicit drm/kms choice, or the default auto
+    with no host Wayland/X11 display in its exec-time environment. The
+    installed session (tuna-session) passes no --backend, so auto is the
+    production launch."""
     command = Path('/proc', str(pid), 'cmdline').read_bytes().split(b'\0')
-    return (any(command[i:i + 2] == [b'--backend', b'drm'] for i in range(len(command) - 1))
-            or b'--backend=drm' in command)
+    choice = b'auto'
+    for index, argument in enumerate(command):
+        if argument == b'--backend' and index + 1 < len(command):
+            choice = command[index + 1]
+        elif argument.startswith(b'--backend='):
+            choice = argument[len(b'--backend='):]
+    if choice in (b'drm', b'kms'):
+        return True
+    if choice != b'auto':
+        return False
+    environment = Path('/proc', str(pid), 'environ').read_bytes().split(b'\0')
+    return not any(entry.partition(b'=')[0] in (b'WAYLAND_DISPLAY', b'DISPLAY')
+                   and entry.partition(b'=')[2] for entry in environment)
 
 
 def original_alive(state, fd):

@@ -293,5 +293,43 @@ class HostTransportBoundaries(unittest.TestCase):
         self.assertNotIn('cleanup_failure', receipt)
 
 
+class CompositorBackendResolution(unittest.TestCase):
+    """The installed session launches tuna-compositor without --backend, so
+    the default auto resolves to DRM exactly when no host display is set."""
+
+    def backend(self, arguments, **environment):
+        env = {key: value for key, value in os.environ.items()
+               if key not in ('WAYLAND_DISPLAY', 'DISPLAY')}
+        env.update(environment)
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)', *arguments],
+                                 env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                # Wait for the exec to complete so /proc shows the final image.
+                if b'time.sleep' in Path('/proc', str(child.pid), 'cmdline').read_bytes():
+                    break
+                time.sleep(0.01)
+            return guest.backend(child.pid)
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_default_auto_is_drm_without_a_host_display(self):
+        self.assertTrue(self.backend([]))
+        self.assertTrue(self.backend(['--backend', 'auto']))
+        self.assertTrue(self.backend(['--backend=auto'], WAYLAND_DISPLAY=''))
+
+    def test_a_host_display_makes_auto_nested(self):
+        self.assertFalse(self.backend([], WAYLAND_DISPLAY='wayland-0'))
+        self.assertFalse(self.backend(['--backend', 'auto'], DISPLAY=':0'))
+
+    def test_explicit_choices_are_honoured(self):
+        self.assertTrue(self.backend(['--backend', 'drm'], WAYLAND_DISPLAY='wayland-0'))
+        self.assertTrue(self.backend(['--backend=kms'], DISPLAY=':0'))
+        self.assertFalse(self.backend(['--backend', 'winit']))
+        self.assertFalse(self.backend(['--backend=nested']))
+
+
 if __name__ == '__main__':
     unittest.main()
