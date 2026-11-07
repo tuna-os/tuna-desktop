@@ -50,6 +50,17 @@ impl Runtime {
     /// aids first. Remote-desktop input does not come this way: GNOME's
     /// aids serve the person at the keyboard and pointer.
     pub(super) fn on_backend_input(&mut self, input: ManagerInput) {
+        // Raw events delimit motion runs before aids can consume them.
+        // In particular, Mouse Keys keyup must deliver its last queued
+        // movement before stopping the aid, not leave it for a later frame.
+        for motion in self
+            .motion_queue
+            .before_backend_input(&input)
+            .into_iter()
+            .flatten()
+        {
+            self.dispatch_manager_input(motion);
+        }
         if !self.input_aids.engine.active() {
             self.route_pointer_aids(input);
             return;

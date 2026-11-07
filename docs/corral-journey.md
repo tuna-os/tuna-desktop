@@ -32,6 +32,9 @@ console frames for each step.
    background, quick settings and Night Light, the volume and brightness
    sliders, `notify-send` and a D-Bus `Notify`, the date menu, lock with
    Super+L, a refused wrong password, unlock, and log out back to GDM.
+   Native portal requesters also check frontend availability, actual Screenshot
+   delivery, and a ScreenCast PipeWire frame with caller isolation and bounded
+   withdrawal on the actual Super+L lock; no candidate desktop binaries are copied.
 5. Every step writes its frame, its guest-side checks, and the `tuna-*`
    journal lines it caused to `manifest.json` with timestamps. A step's
    result is `pass`, `fail` or `not-exercised` (with the reason). Then
@@ -46,9 +49,10 @@ person to look at the frame. Record that review next to the run.
 
 ## Running it
 
-You need `corral` with its bootc plugin (`corral doctor` must pass for
-the KubeVirt context) and Playwright for Python. The script does not use
-`kubectl` or `virtctl`:
+You need a qualified `corral` release with canonical-ID wait support and its
+bootc plugin, the selected KubeVirt context, `kubectl`, and Playwright for
+Python. `kubectl` reads only projected identity metadata and performs exact
+UID-preconditioned cleanup; it does not read Secret payloads or dump configuration:
 
 ```sh
 python3 -m venv ~/.cache/tuna-journey-venv
@@ -56,15 +60,81 @@ python3 -m venv ~/.cache/tuna-journey-venv
 ~/.cache/tuna-journey-venv/bin/python -m playwright install chromium
 ~/.cache/tuna-journey-venv/bin/python scripts/tuna-corral-journey \
   --image ghcr.io/tuna-os/marlin@sha256:<index digest> \
-  --node <node> --out docs/marlin/<date>-corral-journey
+  --node karnataka --vm tuna-q-variant-<unique-run> --out docs/marlin/<date>-corral-journey
 ```
 
 Pass the image by digest; resolve the tag first with
-`skopeo inspect docker://ghcr.io/tuna-os/marlin:tuna`. VM names must
-start with `tuna-q-` (the default is `tuna-q-<date>`), so the script
-cannot name somebody else's VM. `--reuse` restarts a VM that is already
-built from the same digest. The exit status is nonzero when any step
-fails.
+`skopeo inspect docker://ghcr.io/tuna-os/marlin:tuna`. VM names must start with
+`tuna-q-variant-` (default `tuna-q-variant-YYYYMMDD`) and fit the builder-label
+length bound. An explicit node is required. The selected Corral alias and actual
+Kubernetes context are retained before create. Existing exact resources cause
+create to fail closed.
+
+After create, every VM operation uses its unmodified canonical ID from actual
+Corral inventory, with backend/context/namespace/name, node and expected VM UID
+retained in `identity.json`. The UID is rechecked at lifecycle boundaries.
+No bare-name fallback or synthesized canonical ID is used. Cleanup deletes
+only this run's proven-created resources through exact Kubernetes API paths
+with UID preconditions, never Corral's broad derived-name/label purge. Raw DELETE
+responses are projected to safe identity/status fields before retention so
+Secret payloads and last-applied annotations cannot enter receipts.
+
+Use `--reuse --keep` to inspect a VM already built from the same digest:
+adopting an identity does not authorize deletion of resources created by a
+previous run. The exit status is nonzero when any step fails; successful code
+checks or a readiness probe alone are not image qualification.
+
+For the all-variant install/GDM/session/portal/lock/unlock/logout
+subset, use `--qualification-only`; it omits the wider app/Settings/notification
+tour and records `scope: qualification-core` in the manifest. The default
+remains the full daily-driver journey. See the
+[digest-pinned variant matrix](v1-variant-qualification.md) for sequential
+orchestration and the distinction between portal availability and functional
+capture/consent qualification.
+The native Screenshot requester remains connected until the actual portal
+Response and retains a returned PNG, without app-ID or consent bypass. Its
+request-time console frame requires visual review; a successful PNG response
+does not by itself prove a consent prompt, ScreenCast stream or revocation.
+The separate ScreenCast requester consumes the real remote PipeWire stream and
+holds it until the actual Super+L step. Its existing two-second withdrawal
+observer is armed before the key, never replaced with explicit Session.Close.
+The guest-side coordinator batches launch, ready/exit status and the initial
+ScreenSaver state into one SSH exchange. After the host retains the prompt,
+one further exchange checks that the same requester is still pending,
+activates only its expected control (Screenshot Allow or ScreenCast Share),
+and returns the helper tree, native status and response. For ScreenCast that
+same guest operation observes the native active marker, checks unlocked state
+and arms withdrawal. The very next host input is actual noVNC Super+L; PNGs
+and per-step journals are collected afterwards. There are no intervening
+SSH probes for exit, tree, active state, hashes or the revoke marker.
+The native 60-second request/30-second grant hold and two-second withdrawal
+bounds are unchanged, including arming the observer before the actual key.
+The coordinator is frozen with the native requester sources, and receipts
+retain their exact argv, source hashes, output and exit status. A failed or
+expired requester never authorizes clicking a stale picker from another kind
+of request; failure cleanup targets only its pinned, owned process group.
+
+Capture probes require `org.gnome.ScreenSaver.GetActive=false` before the
+request and after its response; both replies are retained in `session_state`.
+Real pointer motion between slow guest probes keeps an unlocked session
+active without changing any idle/lock setting or unlocking a locked session.
+The external-capture AT-SPI helper checks ScreenSaver again immediately before
+activating Allow/Share: a widget can report `STATE_SHOWING` while the compositor
+lock curtain covers it. A locked or unreadable state fails the precondition,
+not the capture-provider gate. No portal request, response or withdrawal
+deadline is increased.
+
+The [installed Yellowfin boundary receipts](variants/2026-10-31/unlocked-portals/README.md)
+show why this distinction matters: the unchanged published payload returns
+a real Screenshot URI and PipeWire frame when unlocked, but denies capture
+when locked. GNOME's backend translates the locked Shell Screenshot
+`(false, "")` into portal Response 0 with an empty URI; that is not an image
+delivery. AT-SPI activation behind the curtain is not visible user consent.
+
+Provisioning retains complete bootc builder stdout/stderr and exit status
+(including partial output on the unchanged outer timeout), rather than only a
+truncated exception. Console-start failure retains the complete Corral stderr;
+long-lived console output is backed by a file, not an undrained stderr pipe.
 
 ## Limits
 
