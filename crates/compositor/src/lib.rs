@@ -53,6 +53,31 @@ use smithay::{
     },
 };
 
+/// Writes a complete, newline-terminated stderr record with one `write_all`.
+///
+/// The nested proofs parse one log shared by the compositor, the shell, the
+/// IBus bridge and their helpers. `std::eprintln!` writes formatted pieces
+/// separately, so another process's piece can land inside a record (#922,
+/// G-LOCK-CURTAIN-CLOCK). Whole records up to `PIPE_BUF` bytes cannot split.
+#[doc(hidden)]
+pub fn stderr_record(record: &str) -> std::io::Result<()> {
+    std::io::Write::write_all(&mut std::io::stderr().lock(), record.as_bytes())
+}
+
+/// Shadows `std::eprintln!` here and in importing binaries: format one String
+/// including the newline, then write it whole. Ignore closed-stderr errors;
+/// diagnostics must not abort the session.
+#[macro_export]
+macro_rules! eprintln {
+    () => {
+        $crate::eprintln!("")
+    };
+    ($($arg:tt)*) => {{
+        let record = ::std::format!("{}\n", ::std::format_args!($($arg)*));
+        let _ = $crate::stderr_record(&record);
+    }};
+}
+
 pub mod a11y_keyboard;
 mod a11y_shadow;
 pub mod animation;
@@ -134,6 +159,7 @@ pub mod sleep;
 pub mod slideshow;
 pub mod spring;
 pub mod state;
+mod state_snapshot;
 pub mod supervise;
 pub mod tablet;
 pub mod tablet_actions;
@@ -183,6 +209,8 @@ pub(crate) struct OutputEntry {
 
 /// Compositor dispatch state: protocol states plus their handlers.
 pub struct State {
+    /// Surface commits/destruction invalidate the pointer's scene pick.
+    pub(crate) pointer_scene_dirty: bool,
     pub(crate) window_icons: window_icons::WindowIcons,
     compositor_state: CompositorState,
     shm_state: ShmState,
@@ -225,6 +253,9 @@ pub struct State {
     )>,
     /// Middle-click primary selection beside the clipboard.
     primary_selection_state: PrimarySelectionState,
+    /// RemoteDesktop sessions with the clipboard enabled, and who owns
+    /// the clipboard as they see it (mutter's MetaClipboardSession).
+    pub(crate) remote_clipboard: crate::mutter::remote_clipboard::Registry,
     pub(crate) panel_surfaces: Vec<layer::PanelSurface>,
     /// Ids of `wl_surface`s whose layer-shell role was destroyed.
     /// Smithay 0.7 keeps validating them on commit against reset
@@ -511,6 +542,7 @@ impl XdgShellHandler for State {
     }
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
+        self.pointer_scene_dirty = true;
         let before = self.popup_grab.len();
         self.popup_grab
             .retain(|p| p.wl_surface() != surface.wl_surface());
@@ -616,6 +648,7 @@ impl State {
 
 impl CompositorHandler for State {
     fn destroyed(&mut self, surface: &wl_surface::WlSurface) {
+        self.pointer_scene_dirty = true;
         self.initial_outputs.remove(surface);
         self.window_icons.remove(surface);
     }
@@ -666,6 +699,7 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &wl_surface::WlSurface) {
+        self.pointer_scene_dirty = true;
         on_commit_buffer_handler::<State>(surface);
         self.window_icons.commit(surface);
         self.popups.commit(surface);
@@ -690,11 +724,39 @@ impl OutputHandler for State {}
 /// Clipboard/drag-and-drop: advertised so toolkit clients accept the
 /// display. Client copy/paste and primary selection round-trip
 /// through the smithay selection state; both focuses mirror keyboard
-/// focus (see [`State::sync_selection_focus`]). Server-initiated
-/// selection content and drag-and-drop pointer grabs are not served
-/// yet.
+/// focus (see [`State::sync_selection_focus`]). The only
+/// compositor-provided selection is a RemoteDesktop session's
+/// (SetSelection); its user data is the session id. Drag-and-drop
+/// pointer grabs are not served yet.
 impl SelectionHandler for State {
-    type SelectionUserData = ();
+    type SelectionUserData = u64;
+
+    fn new_selection(
+        &mut self,
+        ty: smithay::wayland::selection::SelectionTarget,
+        source: Option<smithay::wayland::selection::SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        if ty == smithay::wayland::selection::SelectionTarget::Clipboard {
+            self.remote_clipboard
+                .client_selection(source.map(|source| source.mime_types()));
+        }
+    }
+
+    /// A client pastes a remote session's selection: mutter's
+    /// `meta_selection_source_remote_read_async`.
+    fn send_selection(
+        &mut self,
+        ty: smithay::wayland::selection::SelectionTarget,
+        mime_type: String,
+        fd: std::os::fd::OwnedFd,
+        _seat: Seat<Self>,
+        session_id: &u64,
+    ) {
+        if ty == smithay::wayland::selection::SelectionTarget::Clipboard {
+            self.remote_clipboard.transfer(*session_id, &mime_type, fd);
+        }
+    }
 }
 
 impl ClientDndGrabHandler for State {
@@ -1016,12 +1078,14 @@ impl State {
             tablet_cursor_images: std::collections::HashMap::new(),
             tablet_pads: Vec::new(),
             primary_selection_state: PrimarySelectionState::new::<State>(dh),
+            remote_clipboard: Default::default(),
             panel_surfaces: Vec::new(),
             dead_layer_surfaces: std::collections::HashSet::new(),
             popups: smithay::desktop::PopupManager::default(),
             popup_grab: Vec::new(),
             popup_refocus: false,
             window_origins: std::collections::HashMap::new(),
+            pointer_scene_dirty: true,
             initial_outputs: std::collections::HashMap::new(),
             outputs: Vec::new(),
             retired_output_globals: Vec::new(),
@@ -1117,7 +1181,9 @@ impl State {
     /// removal live; it stays bindable until the runtime destroys it
     /// ([`take_retired_output_globals`](Self::take_retired_output_globals)),
     /// so a client binding it as it goes is not disconnected. Virtual
-    /// entries just drop. Returns whether an entry was removed.
+    /// entries just drop. A lock surface on the output goes with it: the
+    /// output that next takes the name waits for one of its own.
+    /// Returns whether an entry was removed.
     pub fn remove_output(&mut self, name: &str) -> bool {
         let Some(index) = self.outputs.iter().position(|entry| entry.name == name) else {
             return false;
@@ -1128,6 +1194,7 @@ impl State {
             self.retired_output_globals.push(id);
         }
         self.outputs.remove(index);
+        self.forget_output_lock_surface(name);
         if was_primary {
             if let Some(first) = self.outputs.first_mut() {
                 first.primary = true;
@@ -1417,6 +1484,16 @@ impl TestCompositor {
         self.display
             .handle()
             .insert_client(stream, Arc::new(ClientState::default()))
+            .unwrap()
+    }
+
+    /// Attach the private server-owned input-method connection in native
+    /// protocol fixtures. Public clients must use `add_client`; executable
+    /// names, PIDs and application metadata do not grant this authority.
+    pub fn add_ime_bridge_client(&mut self, stream: UnixStream) -> Client {
+        self.display
+            .handle()
+            .insert_client(stream, Arc::new(ClientState::ime_bridge()))
             .unwrap()
     }
 

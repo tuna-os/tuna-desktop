@@ -108,10 +108,16 @@ impl SessionLockHandler for State {
             return;
         };
         let name = output.name();
-        let size = self
+        // The inventory's output by that name, and only if it is this one:
+        // a connector plugged in again is a new output, and the withdrawn
+        // wl_output of the old one is inert (Mutter's `make_output_inert`
+        // on `meta_wayland_compositor_update_outputs`).
+        let current = self
             .output_entries()
             .into_iter()
-            .find(|(entry, ..)| *entry == name)
+            .find(|(entry, out, ..)| *entry == name && *out == output);
+        let size = current
+            .as_ref()
             .and_then(|(_, out, ..)| out.current_mode().map(|m| (m, out.current_scale())))
             .map(|(mode, scale)| {
                 let s = scale.fractional_scale();
@@ -123,6 +129,12 @@ impl SessionLockHandler for State {
             .unwrap_or((1280, 800));
         surface.with_pending_state(|state| state.size = Some(size.into()));
         surface.send_configure();
+        // A lock surface made for a removed output (the locker had not yet
+        // heard of the removal) covers nothing, and never the output that
+        // later takes the connector's name.
+        if current.is_none() {
+            return;
+        }
         self.lock_protocol
             .surfaces
             .retain(|(existing_surface, existing)| {
@@ -212,6 +224,28 @@ impl State {
             .iter()
             .find(|(surface, name)| name == output && self.approved_lock_surface(surface))
             .map(|(surface, _)| surface.wl_surface().clone())
+    }
+
+    /// Inventory outputs the approved lock client covers, in inventory
+    /// order: the outputs that draw a lock surface rather than only the
+    /// lock background.
+    pub fn lock_surface_outputs(&self) -> Vec<String> {
+        self.outputs
+            .iter()
+            .filter(|entry| self.lock_surface_for(&entry.name).is_some())
+            .map(|entry| entry.name.clone())
+            .collect()
+    }
+
+    /// An output left the inventory: its lock surface goes with it, as
+    /// Mutter's per-output state does on `OUTPUT_DESTROYED`
+    /// (`make_output_inert`). The output that next takes the connector's
+    /// name shows the lock background until the locker gives it a surface
+    /// of its own, never this one, sized for an output that is gone.
+    pub(crate) fn forget_output_lock_surface(&mut self, name: &str) {
+        self.lock_protocol
+            .surfaces
+            .retain(|(_, output)| output != name);
     }
 
     /// Every live lock surface.

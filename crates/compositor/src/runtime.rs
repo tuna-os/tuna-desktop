@@ -609,6 +609,9 @@ struct RemoteHeld {
     grant: std::sync::Arc<std::sync::atomic::AtomicBool>,
     keys: std::collections::HashSet<u32>,
     buttons: std::collections::HashSet<u32>,
+    /// NotifyKeyboardKeysym presses: keysym to its key and the level
+    /// modifier this grant pressed around it (evdev).
+    keysyms: std::collections::HashMap<u32, (u32, Option<u32>)>,
 }
 
 struct PendingScreenshotReply {
@@ -851,9 +854,9 @@ pub struct Runtime {
     atspi_points: AtspiPoints,
     exit: bool,
     stats: RunStats,
-    /// `TUNA_COMPOSITOR_STATE` snapshot path (journeys only).
-    state_path: Option<std::path::PathBuf>,
-    state_last: String,
+    /// Owned, bounded-latest publisher for opt-in `TUNA_COMPOSITOR_STATE`.
+    /// Filesystem writes never run on the compositor thread.
+    state_publisher: Option<crate::state_snapshot::Publisher>,
     /// Opt-in synthetic touchpad phases for the nested proof harness.
     proof_swipe_last: String,
     /// The `sequence` of the last phase consumed, published in the state
@@ -1387,6 +1390,17 @@ impl Runtime {
         let privacy_screen_settings =
             hardware.then(|| crate::privacy_screen_settings::PrivacyScreenSettings::start(&wake));
         let loop_handle = event_loop.handle();
+        let state_path = std::env::var_os("TUNA_COMPOSITOR_STATE")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute());
+        let state_dir = state_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf);
+        let state_publisher = state_path
+            .map(crate::state_snapshot::Publisher::start)
+            .transpose()
+            .map_err(|error| RuntimeError::Loop(format!("state snapshot publisher: {error}")))?;
         let mut runtime = Runtime {
             display,
             state,
@@ -1508,17 +1522,14 @@ impl Runtime {
             atspi_points: AtspiPoints::default(),
             exit: false,
             stats: RunStats::default(),
-            state_path: std::env::var_os("TUNA_COMPOSITOR_STATE")
-                .map(std::path::PathBuf::from)
-                .filter(|p| p.is_absolute()),
-            state_last: String::new(),
+            state_publisher,
             proof_swipe_last: String::new(),
             proof_swipe_sequence: None,
             #[cfg(feature = "drm")]
             performance_trace: crate::performance_trace::Trace::from_env(),
         };
         runtime.animation_clock =
-            crate::animation_clock::AnimationClock::from_env(runtime.state_path.is_some());
+            crate::animation_clock::AnimationClock::from_env(runtime.state_publisher.is_some());
         runtime.wallpaper.set_wake(&runtime.wake);
         // Night Light (#339): D-Bus preview/clear/temp-disable
         // records ping the already-registered wake above; its no-op
@@ -1537,7 +1548,7 @@ impl Runtime {
         let started = runtime.animation_clock.now();
         runtime.overview_progress_at = started;
         runtime.strip_view_at = started;
-        runtime.proof_polling = runtime.state_path.is_some()
+        runtime.proof_polling = runtime.state_publisher.is_some()
             && [crate::animation_clock::CLOCK_ENV, "TUNA_PROOF_SWIPE_INPUT"]
                 .iter()
                 .any(|key| std::env::var_os(key).is_some());
@@ -1547,11 +1558,6 @@ impl Runtime {
         // tick itself rewrites there would wake the loop on its own
         // writes, so then the dir is not watched and the blank file is
         // read on every tick.
-        let state_dir = runtime
-            .state_path
-            .as_deref()
-            .and_then(std::path::Path::parent)
-            .map(std::path::Path::to_path_buf);
         if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|dir| state_dir.as_deref() != Some(std::path::Path::new(dir)))
         {
@@ -1730,7 +1736,8 @@ impl Runtime {
         self.control.cancel_pending_accelerators();
         self.cursor.on_lock();
         self.control.set_locked(true);
-        let remote_ids: Vec<_> = self.remote_held.keys().copied().collect();
+        let mut remote_ids: Vec<_> = self.remote_held.keys().copied().collect();
+        remote_ids.extend(self.state.remote_clipboard.sessions());
         for id in remote_ids {
             self.stop_remote_input(id);
         }
@@ -2457,11 +2464,11 @@ impl Runtime {
         Vec::new()
     }
 
-    /// Write the compositor-side state snapshot when it changed
-    /// (`TUNA_COMPOSITOR_STATE`, journeys only; #65). App ids and ids,
-    /// never titles.
+    /// Queue one coherent compositor-side state snapshot (`TUNA_COMPOSITOR_STATE`,
+    /// journeys only; #65). The owned writer atomically publishes the latest body
+    /// without making rendering wait on disk. App ids and ids, never titles.
     fn publish_state(&mut self) {
-        if self.state_path.is_none() {
+        if self.state_publisher.is_none() {
             return;
         }
         let mut keyboard = self.manager.keyboard_summary(&mut self.state);
@@ -2469,7 +2476,7 @@ impl Runtime {
             let saving = self.numlock.saving(self.manager.keyboard_num_lock());
             keyboard.insert("numlock_saving".into(), saving.into());
         }
-        let Some(path) = self.state_path.as_ref() else {
+        let Some(publisher) = self.state_publisher.as_ref() else {
             return;
         };
         let model = self.manager.model();
@@ -2697,6 +2704,9 @@ impl Runtime {
             .map(|(name, cost)| (name.clone(), cost.to_json()))
             .collect::<serde_json::Map<_, _>>()
             .into();
+        // The outputs whose lock surface the compositor draws while
+        // locked; the others show only the lock background.
+        doc["lock_outputs"] = self.state.lock_surface_outputs().into();
         // Windows whose frame callbacks run at the hidden rate.
         doc["throttled_windows"] = if self.overview_motion.progress() > 0.0
             || !self.switcher_thumbnails.is_empty()
@@ -2797,6 +2807,11 @@ impl Runtime {
             let pos = self.manager.pointer_pos();
             [pos.x, pos.y]
         }));
+        doc["interactive_move_window"] = serde_json::json!(if self.is_locked() {
+            None
+        } else {
+            self.manager.interactive_move_window()
+        });
         doc["input_aids"] = self.input_aids_summary();
         // What the on-screen keyboard follows (#349): the focused field's
         // content type only, never text; nothing while locked.
@@ -2847,13 +2862,7 @@ impl Runtime {
             doc["tablets"] = drm.tablets_introspect();
         }
         let doc = doc.to_string();
-        if doc == self.state_last {
-            return;
-        }
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &doc).is_ok() && std::fs::rename(&tmp, path).is_ok() {
-            self.state_last = doc;
-        }
+        publisher.publish(doc);
     }
 
     /// The overview at rest on the primary output (#54): the window
@@ -3097,7 +3106,7 @@ impl Runtime {
     /// Each atomically replaced JSON file is consumed once; ordinary sessions
     /// never read it because state instrumentation is also required.
     fn proof_swipe_input(&mut self) {
-        if self.state_path.is_none() {
+        if self.state_publisher.is_none() {
             return;
         }
         let Some(path) = std::env::var_os("TUNA_PROOF_SWIPE_INPUT")
@@ -3896,24 +3905,6 @@ impl Runtime {
             self.cast_grants.clear();
             return;
         }
-        // A cast window that closed ends its session, as in Mutter.
-        let manager = &self.manager;
-        self.casts.retain(|cast| {
-            let gone =
-                matches!(cast.target, CastTarget::Window(id) if manager.geometry(id).is_none());
-            if gone || cast.failed() {
-                if let Some(grant) = self.cast_grants.get(&cast.session_id) {
-                    grant.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-                cast.close();
-            }
-            !cast.failed()
-                && !gone
-                && !self
-                    .cast_grants
-                    .get(&cast.session_id)
-                    .is_none_or(|grant| grant.load(std::sync::atomic::Ordering::SeqCst))
-        });
         // Window casts follow their window's size.
         for index in 0..self.casts.len() {
             if let CastTarget::Window(id) = self.casts[index].target {
@@ -3922,6 +3913,30 @@ impl Runtime {
                 }
             }
         }
+        let guard = self.cast_outputs.lock().ok();
+        let outputs = guard.as_deref().map_or(&[][..], Vec::as_slice);
+        // A cast window that closed or a recorded monitor that left the
+        // layout ends its session, as in Mutter.
+        let manager = &self.manager;
+        crate::screencast::end_gone(&mut self.casts, &self.cast_grants, outputs, |id| {
+            manager.geometry(id).is_some()
+        });
+        // A kept monitor cast follows its monitor's mode (a scale switch
+        // that keeps the logical rect), as Mutter's monitor source does.
+        for cast in &mut self.casts {
+            let size = match (&cast.target, &cast.monitor) {
+                (CastTarget::Monitor(_), Some(recorded)) => {
+                    crate::mutter::monitor_after_change(recorded, outputs)
+                        .map(|o| (o.width, o.height))
+                }
+                _ => None,
+            };
+            if let Some((w, h)) = size {
+                cast.resize(w, h);
+            }
+        }
+        // An area cast with no output under it gets no frames
+        // (meta-stream-source-area.c watches only the views over it).
         let wanted: Vec<(usize, CastTarget, (i32, i32))> = self
             .casts
             .iter()
@@ -3931,6 +3946,7 @@ impl Runtime {
                     .map(|size| (i, cast.target.clone(), size))
             })
             .collect();
+        drop(guard);
         let xrgb = smithay::backend::allocator::Fourcc::Xrgb8888;
         for (index, target, size) in wanted {
             let frame = match &target {
@@ -3945,16 +3961,29 @@ impl Runtime {
                     };
                     self.render_pixels(output, xrgb)
                 }
-                CastTarget::Area(connector, area) => {
+                CastTarget::Area(logical) => {
+                    // Like meta-stream-source-area.c on_monitors_changed,
+                    // watch the current view over the fixed stage region,
+                    // not the connector that was there at RecordArea.
+                    let mapped = self
+                        .cast_outputs
+                        .lock()
+                        .ok()
+                        .and_then(|outputs| crate::mutter::area_on_output(&outputs, *logical));
+                    let Some((snapshot, area)) = mapped else {
+                        // No view covers it: keep the stream open and idle.
+                        continue;
+                    };
+                    self.casts[index].resize(area.2, area.3);
                     let output = match &self.backend {
                         Backend::Winit(_) => None,
                         #[cfg(feature = "drm")]
-                        Backend::Drm(_) => Some(connector.as_str()),
+                        Backend::Drm(_) => Some(snapshot.connector.as_str()),
                     };
                     #[cfg(not(feature = "drm"))]
-                    let _ = connector;
+                    let _ = snapshot;
                     self.render_pixels(output, xrgb).and_then(|(w, h, pixels)| {
-                        let cropped = crate::screencast::crop(&pixels, (w, h), *area);
+                        let cropped = crate::screencast::crop(&pixels, (w, h), area);
                         if cropped.is_none() {
                             eprintln!(
                                 "tuna-compositor: screen cast area {area:?} is not inside the {w}x{h} frame ({} bytes)",
@@ -3965,17 +3994,31 @@ impl Runtime {
                     })
                 }
             };
-            let Some((w, h, bgrx)) = frame else {
+            let Some(cast) = self.casts.get_mut(index) else {
                 continue;
             };
-            if let Some(cast) = self.casts.get_mut(index) {
-                cast.send_frame(w, h, &bgrx);
-            }
+            let Some((w, h, bgrx)) = frame else {
+                // Once per gap, so a cast of an output that cannot render
+                // shows in the log without flooding it.
+                if !cast.frameless {
+                    cast.frameless = true;
+                    if let CastTarget::Monitor(output) = &target {
+                        eprintln!(
+                            "tuna-compositor: screen cast {}: output {output} gave no frame",
+                            cast.session_id
+                        );
+                    }
+                }
+                continue;
+            };
+            cast.frameless = false;
+            cast.send_frame(w, h, &bgrx);
         }
     }
 
     /// One D-Bus screen-cast request.
     fn stop_remote_input(&mut self, session_id: u64) {
+        self.state.revoke_remote_clipboard(session_id);
         let Some(held) = self.remote_held.remove(&session_id) else {
             return;
         };
@@ -4017,6 +4060,11 @@ impl Runtime {
             return;
         }
         let time = self.lock_now_ms() as u32;
+        use crate::mutter::RemoteInput;
+        if let RemoteInput::Keysym { keysym, pressed } = input {
+            self.remote_keysym(session_id, grant, keysym, pressed);
+            return;
+        }
         let held = self
             .remote_held
             .entry(session_id)
@@ -4024,8 +4072,8 @@ impl Runtime {
                 grant,
                 keys: Default::default(),
                 buttons: Default::default(),
+                keysyms: Default::default(),
             });
-        use crate::mutter::RemoteInput;
         let input = match input {
             RemoteInput::Key { evdev, pressed } => {
                 // ManagerInput uses evdev; WindowManager adds the XKB offset
@@ -4042,6 +4090,7 @@ impl Runtime {
                     time,
                 }
             }
+            RemoteInput::Keysym { .. } => return,
             RemoteInput::Button { button, pressed } => {
                 if (pressed && !held.buttons.insert(button))
                     || (!pressed && !held.buttons.remove(&button))
@@ -4098,6 +4147,66 @@ impl Runtime {
         self.on_manager_input(input);
     }
 
+    /// mutter's `notify_keyval` (meta-virtual-input-device-native.c):
+    /// the keysym's first key in the effective layout, with Shift or
+    /// AltGr pressed before it for its level and released after it. A
+    /// keysym the layout lacks types nothing. Keys go through the grant's
+    /// held set, so Stop and lock release them like keycode input.
+    fn remote_keysym(
+        &mut self,
+        session_id: u64,
+        grant: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        keysym: u32,
+        pressed: bool,
+    ) {
+        use crate::mutter::RemoteInput;
+        let key = |evdev, pressed| RemoteInput::Key { evdev, pressed };
+        if !pressed {
+            let Some((code, modifier)) = self
+                .remote_held
+                .get_mut(&session_id)
+                .and_then(|held| held.keysyms.remove(&keysym))
+            else {
+                return;
+            };
+            self.remote_input(session_id, grant.clone(), key(code, false));
+            if let Some(modifier) = modifier {
+                self.remote_input(session_id, grant, key(modifier, false));
+            }
+            return;
+        }
+        let held = self.remote_held.get(&session_id);
+        if held.is_some_and(|held| held.keysyms.contains_key(&keysym)) {
+            return;
+        }
+        let Some((code, level)) = self.manager.keycode_for_keysym(&mut self.state, keysym) else {
+            eprintln!(
+                "tuna-compositor: remote: no keycode for keysym {keysym:#x} in the current layout"
+            );
+            return;
+        };
+        if crate::mutter::remote_desktop::valid_key(code).is_err() {
+            return;
+        }
+        // A level modifier the grant already holds stays the grant's.
+        let modifier = crate::osk::level_modifier(level)
+            .and_then(|modifier| self.manager.keycode_for_keysym(&mut self.state, modifier))
+            .map(|(modifier, _)| modifier)
+            .filter(|modifier| {
+                !self
+                    .remote_held
+                    .get(&session_id)
+                    .is_some_and(|held| held.keys.contains(modifier))
+            });
+        if let Some(modifier) = modifier {
+            self.remote_input(session_id, grant.clone(), key(modifier, true));
+        }
+        self.remote_input(session_id, grant, key(code, true));
+        if let Some(held) = self.remote_held.get_mut(&session_id) {
+            held.keysyms.insert(keysym, (code, modifier));
+        }
+    }
+
     fn on_screencast_request(&mut self, request: crate::mutter::ToLoop) {
         match request {
             crate::mutter::ToLoop::RemoteInput {
@@ -4110,6 +4219,10 @@ impl Runtime {
                 self.remote_input(session_id, grant, input);
             }
             crate::mutter::ToLoop::RemoteStop { session_id } => self.stop_remote_input(session_id),
+            crate::mutter::ToLoop::RemoteClipboard(request) => {
+                let locked = self.is_locked();
+                self.state.remote_clipboard_request(request, locked);
+            }
             crate::mutter::ToLoop::RemoteKeymap { reply } => {
                 let keymap = self
                     .state
@@ -4127,8 +4240,10 @@ impl Runtime {
             }
             crate::mutter::ToLoop::StartCast {
                 session_id,
+                stream_id,
                 grant,
                 target,
+                monitor,
                 signal,
             } => {
                 if self.is_locked() || grant.load(std::sync::atomic::Ordering::SeqCst) {
@@ -4146,25 +4261,40 @@ impl Runtime {
                     }
                 }
                 let size = match &target {
-                    crate::mutter::CastTarget::Monitor(connector) => self
-                        .cast_outputs
-                        .lock()
-                        .ok()
-                        .and_then(|o| o.iter().find(|o| &o.connector == connector).cloned())
-                        .map(|o| (o.width, o.height)),
+                    // A monitor that changed since RecordMonitor already
+                    // stopped its stream in Mutter (`on_monitors_changed`).
+                    crate::mutter::CastTarget::Monitor(connector) => {
+                        self.cast_outputs.lock().ok().and_then(|outputs| {
+                            match &monitor {
+                                Some(recorded) => {
+                                    crate::mutter::monitor_after_change(recorded, &outputs)
+                                }
+                                None => outputs.iter().find(|o| &o.connector == connector),
+                            }
+                            .map(|o| (o.width, o.height))
+                        })
+                    }
                     crate::mutter::CastTarget::Window(id) => {
                         self.window_pixel_size(*id).map(|(size, _)| size)
                     }
-                    crate::mutter::CastTarget::Area(_, (_, _, w, h)) => Some((*w, *h)),
+                    crate::mutter::CastTarget::Area(logical) => self
+                        .cast_outputs
+                        .lock()
+                        .ok()
+                        .and_then(|outputs| crate::mutter::area_on_output(&outputs, *logical))
+                        .map(|(_, (_, _, w, h))| (w, h)),
                 };
-                let Some((width, height)) = size else {
+                let Some(size) = size else {
+                    if let Some(grant) = self.cast_grants.get(&session_id) {
+                        grant.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     signal.session_closed(session_id);
                     return;
                 };
                 let Some(pw) = self.pipewire.as_ref() else {
                     return;
                 };
-                match pw.start_cast(session_id, target, width, height, signal) {
+                match pw.start_cast(session_id, stream_id, target, monitor, size, signal) {
                     Some(cast) => self.casts.push(cast),
                     None => eprintln!("tuna-compositor: screen cast: stream failed to start"),
                 }
@@ -4172,6 +4302,13 @@ impl Runtime {
             crate::mutter::ToLoop::StopCast { session_id } => {
                 self.casts.retain(|cast| cast.session_id != session_id);
                 self.cast_grants.remove(&session_id);
+            }
+            crate::mutter::ToLoop::StopStream {
+                session_id,
+                stream_id,
+            } => {
+                self.casts
+                    .retain(|cast| cast.session_id != session_id || cast.stream_id != stream_id);
             }
             crate::mutter::ToLoop::SensorSample {
                 present,
@@ -5152,14 +5289,11 @@ impl Runtime {
         // Send what this tick queued for the shell now, not at the next
         // wake, which may be far off (#503).
         self.control.flush(self.manager.model());
-        #[cfg(feature = "drm")]
-        if matches!(self.backend, Backend::Drm(_)) {
-            // Rendering queues callbacks only for a submitted scanout. Send
-            // those events now so a redraw need not wait for the next tick.
-            self.display
-                .flush_clients()
-                .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-        }
+        // Every backend queues render-produced callbacks. Send them before
+        // sleeping, without requiring another client request or render wake.
+        self.display
+            .flush_clients()
+            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         Ok(!self.exit)
     }
 
@@ -5983,7 +6117,11 @@ impl Runtime {
                         let _ = frame
                             .finish()
                             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-                        let cost = FrameCost::new(&drew, &elements.owners, &damage, size);
+                        let content_roots = roots.len()
+                            - usize::from(lock_surface.is_some())
+                            - usize::from(presented_cursor.is_some());
+                        let cost = FrameCost::new(&drew, &elements.owners, &damage, size)
+                            .with_roots(locked, lock_surface.is_some(), content_roots);
                         presented = Some((damage, cost, presented_cursor));
                     }
                 }
@@ -6391,6 +6529,10 @@ impl Runtime {
                     }
                     cursor_presented |= presented_cursor.is_some();
                     out.last_frame = Some(signature);
+                    let content_roots = mine.len()
+                        - usize::from(lock_surface.is_some())
+                        - usize::from(presented_cursor.is_some());
+                    let cost = cost.with_roots(locked, lock_surface.is_some(), content_roots);
                     self.frame_costs.insert(out.name.clone(), cost);
                     queued = true;
                 }

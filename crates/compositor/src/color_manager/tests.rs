@@ -802,6 +802,157 @@ fn colord_client_reuses_an_existing_device() {
 }
 
 #[test]
+fn update_devices_keeps_adds_and_removes_by_mutters_monitor_id() {
+    let edid = crate::edid::tests::sample_edid();
+    let monitor = |connector: &str, edid: Option<&[u8]>| ColordMonitor {
+        identity: MonitorIdentity::new(connector, edid, false, (0, 0), |_| None),
+        gamma_lut_size: 256,
+    };
+    let builtin = monitor("eDP-1", None);
+    let dell = monitor("DP-2", Some(&edid));
+    let hdmi = monitor("HDMI-A-1", None);
+    // generate_monitor_id: what exists of vendor, product, serial, connector.
+    assert_eq!(monitor_id(&builtin.identity), "c:eDP-1");
+    assert_eq!(
+        monitor_id(&dell.identity),
+        "v:DEL;p:DELL U2415;s:7MT0175A1B2L;c:DP-2"
+    );
+    // DP-2 plugged next to the panel: the panel keeps its device.
+    let update = update_devices(&[&builtin.identity], &[builtin.clone(), dell.clone()]);
+    assert_eq!(
+        update,
+        DeviceUpdate {
+            kept: vec![(0, 0)],
+            added: vec![1],
+            removed: vec![],
+        }
+    );
+    // DP-2 unplugged, HDMI plugged, in another order.
+    let update = update_devices(
+        &[&builtin.identity, &dell.identity],
+        &[hdmi.clone(), builtin.clone()],
+    );
+    assert_eq!(
+        update,
+        DeviceUpdate {
+            kept: vec![(0, 1)],
+            added: vec![0],
+            removed: vec![1],
+        }
+    );
+    // The same monitor on another connector is another monitor.
+    let moved = monitor("DP-3", Some(&edid));
+    let update = update_devices(&[&dell.identity], std::slice::from_ref(&moved));
+    assert_eq!(update.added, vec![0]);
+    assert_eq!(update.removed, vec![0]);
+    // Every monitor gone.
+    let update = update_devices(&[&builtin.identity], &[]);
+    assert_eq!(update.removed, vec![0]);
+}
+
+#[test]
+fn colord_devices_follow_hotplug_and_a_replug_keeps_the_device_id() {
+    let bus = TestBus::spawn();
+    let (fake, _conn) = serve_fake(&bus);
+    let icc_dir = tempfile::tempdir().unwrap();
+    let edid = crate::edid::tests::sample_edid();
+    let builtin = ColordMonitor {
+        identity: MonitorIdentity::new("eDP-1", None, true, (0, 0), |_| None),
+        gamma_lut_size: 256,
+    };
+    let dell = ColordMonitor {
+        identity: MonitorIdentity::new("DP-2", Some(&edid), false, (527, 296), |_| None),
+        gamma_lut_size: 256,
+    };
+    let share = Arc::new(ColorShare::default());
+    let client = ColordClient::start(
+        share.clone(),
+        vec![builtin.clone()],
+        Bus::Address(bus.address.clone()),
+        Some(icc_dir.path().to_owned()),
+    );
+    wait_for("the panel's device", || {
+        share.device("eDP-1").is_some_and(|d| d.ready)
+    });
+    let panel_path = share.device("eDP-1").unwrap().object_path.unwrap();
+    let device_ids = || -> Vec<String> {
+        let mut ids: Vec<String> = fake
+            .0
+            .lock()
+            .unwrap()
+            .devices
+            .iter()
+            .map(|d| d.0.clone())
+            .collect();
+        ids.sort();
+        ids
+    };
+    let dell_id = "xrandr-DEL-DELL U2415-7MT0175A1B2L".to_owned();
+    let expected_profile = format!("edid-{}.icc", crate::edid::md5_hex(&edid));
+
+    // Plug: a device for the new monitor, with its EDID profile.
+    client.monitors_changed(vec![builtin.clone(), dell.clone()]);
+    wait_for("DP-2's device", || {
+        share.device("DP-2").is_some_and(|d| d.ready)
+    });
+    assert_eq!(
+        device_ids(),
+        vec![dell_id.clone(), "xrandr-eDP-1".to_owned()]
+    );
+    let first = share.device("DP-2").unwrap();
+    assert_eq!(first.device_id, dell_id);
+    assert!(first
+        .device_profile
+        .as_ref()
+        .and_then(|p| p.filename.as_deref())
+        .is_some_and(|f| f.ends_with(&expected_profile)));
+    assert_eq!(
+        fake.0
+            .lock()
+            .unwrap()
+            .devices
+            .iter()
+            .find(|d| d.0 == dell_id)
+            .unwrap()
+            .2["XRANDR_name"],
+        "DP-2"
+    );
+    // The panel kept its device.
+    assert_eq!(
+        share.device("eDP-1").unwrap().object_path.as_deref(),
+        Some(panel_path.as_str())
+    );
+    let dell_path = first.object_path.clone().unwrap();
+
+    // Unplug: the device is deleted from colord.
+    client.monitors_changed(vec![builtin.clone()]);
+    wait_for("DP-2's device deleted", || {
+        fake.0.lock().unwrap().deleted.contains(&dell_path)
+    });
+    assert_eq!(device_ids(), vec!["xrandr-eDP-1".to_owned()]);
+    assert!(share.device("DP-2").is_none());
+    assert_eq!(share.devices().len(), 1);
+
+    // Replug: the same device id again, the panel untouched.
+    client.monitors_changed(vec![builtin.clone(), dell.clone()]);
+    wait_for("DP-2's device again", || {
+        share.device("DP-2").is_some_and(|d| d.ready)
+    });
+    assert_eq!(
+        device_ids(),
+        vec![dell_id.clone(), "xrandr-eDP-1".to_owned()]
+    );
+    assert_eq!(share.device("DP-2").unwrap().device_id, dell_id);
+    {
+        let s = fake.0.lock().unwrap();
+        assert_eq!(s.created_devices, 3, "panel once, DP-2 twice");
+        assert!(!s.deleted.contains(&panel_path), "{:?}", s.deleted);
+    }
+    client.shutdown();
+    assert!(device_ids().is_empty());
+}
+
+#[test]
 fn colord_absence_is_reported_not_fatal() {
     let bus = TestBus::spawn();
     let share = Arc::new(ColorShare::default());

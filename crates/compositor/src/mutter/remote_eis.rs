@@ -79,11 +79,23 @@ impl Worker {
                         capabilities,
                         |device| {
                             if let Some(keyboard) = device.interface::<eis::Keyboard>() {
-                                keyboard.keymap(
-                                    eis::keyboard::KeymapType::Xkb,
-                                    self.keymap_len,
-                                    self.keymap.as_fd(),
-                                );
+                                // A fresh read-only description at offset 0 for
+                                // every send: grd read()s the keymap
+                                // (grd-session.c setup_xkb_keymap) instead of
+                                // mapping it, and the writer left our offset at
+                                // the end.
+                                use std::os::fd::AsRawFd;
+                                let fresh = std::fs::File::open(format!(
+                                    "/proc/self/fd/{}",
+                                    self.keymap.as_raw_fd()
+                                ));
+                                if let Ok(fresh) = fresh {
+                                    keyboard.keymap(
+                                        eis::keyboard::KeymapType::Xkb,
+                                        self.keymap_len,
+                                        fresh.as_fd(),
+                                    );
+                                }
                             }
                             if device.has_capability(DeviceCapability::PointerAbsolute) {
                                 for output in &self.outputs {
@@ -93,6 +105,13 @@ impl Worker {
                                     let height =
                                         (f64::from(output.height) / output.scale).round().max(1.0)
                                             as u32;
+                                    // ei_device v2: the mapping id pairing this
+                                    // region with the linked monitor stream.
+                                    if device.device().version() >= 2 {
+                                        device.device().region_mapping_id(
+                                            &super::output_mapping_id(&output.connector),
+                                        );
+                                    }
                                     device.device().region(
                                         (output.x - self.origin.0) as u32,
                                         (output.y - self.origin.1) as u32,
@@ -177,7 +196,9 @@ impl Worker {
                     }
                     _ => None,
                 };
-                if let Some(input) = input {
+                // Mutter accepts ConnectToEIS before Start (grd connects
+                // first) and input reaches nothing until the session runs.
+                if let Some(input) = input.filter(|_| self.grant.started.load(Ordering::SeqCst)) {
                     if remote_desktop::queue_input(&self.grant, &self.to_loop, input).is_err() {
                         self.disconnected = true;
                         return calloop::PostAction::Remove;

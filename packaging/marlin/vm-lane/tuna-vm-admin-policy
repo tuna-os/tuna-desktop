@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Configure the shared VM image's installer-equivalent wheel role.
+
+This is image configuration, not an account-creation or guest-probe operation.
+The early explicit include preserves later command-specific update exceptions.
+The .conf suffix excludes the role from automatic @includedir traversal.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+
+WHEEL_ROLE = b"%wheel ALL=(ALL:ALL) PASSWD: ALL\n"
+
+
+def write_role(policy):
+    if policy.is_symlink():
+        raise ValueError("administrator policy must not be a symlink")
+    policy.write_bytes(WHEEL_ROLE)
+    policy.chmod(0o440)
+
+
+def parse_policy(path):
+    environment = dict(os.environ, LC_ALL="C")
+    subprocess.run(["visudo", "--check", "--file", str(path)], check=True,
+                   capture_output=True, text=True, timeout=30, env=environment)
+    converted = subprocess.run(["cvtsudoers", "--output-format=json", str(path)], check=True,
+                               capture_output=True, text=True, timeout=30, env=environment)
+    return json.loads(converted.stdout)
+
+
+def include_role(policy, sudoers):
+    """Prepend once, then prove one effective role before inherited user rules."""
+    directive = ("@include " + json.dumps(str(policy))).encode()
+    header = directive + b"\n"
+    original = sudoers.read_bytes()
+    if directive in original.splitlines():
+        if not original.startswith(header) or original.splitlines().count(directive) != 1:
+            raise ValueError("administrator include has unexpected order or duplicates")
+    else:
+        sudoers.write_bytes(header + original)
+    declared = parse_policy(policy).get("User_Specs", [])
+    effective = parse_policy(sudoers)
+    rules = effective.get("User_Specs", [])
+    # visudo deduplicates filename diagnostics, not rules. Inspect the actual
+    # parser tree to reject alternate-syntax and indirect effective duplicates.
+    if len(declared) != 1 or rules[:1] != declared or rules.count(declared[0]) != 1:
+        raise ValueError("effective administrator role must be first and unique")
+    return effective
+
+
+def record_policy(receipt, policy, sudoers):
+    """Append new image-policy entries without regenerating the shipped payload."""
+    existing = {}
+    for line in receipt.read_bytes().splitlines():
+        digest, name = line.split(b"  ", 1)
+        existing[name] = digest
+    additions = []
+    for path in (policy, sudoers):
+        name = str(path).encode()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest().encode()
+        if name in existing:
+            if existing[name] != digest:
+                raise ValueError("recorded administrator policy changed")
+        else:
+            additions.append(digest + b"  " + name + b"\n")
+    with receipt.open("ab") as stream:
+        stream.writelines(additions)
+    subprocess.run(["sha256sum", "--check", str(receipt)], check=True,
+                   capture_output=True, text=True, timeout=60)
+
+
+def main():
+    policy = Path("/etc/sudoers.d/00-tunaos-wheel.conf")
+    policy.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    write_role(policy)
+    os.chown(policy, 0, 0)
+    info = policy.lstat()
+    if not stat.S_ISREG(info.st_mode) or (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (0, 0, 0o440):
+        raise ValueError("administrator policy must be a root-owned regular file, mode 0440")
+    sudoers = Path("/etc/sudoers")
+    include_role(policy, sudoers)
+    record_policy(Path("/usr/share/tuna-vm/shipped-payload.sha256"), policy, sudoers)
+
+
+if __name__ == "__main__":
+    main()

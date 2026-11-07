@@ -198,6 +198,14 @@ pub(crate) struct FrameCost {
     /// Windows in the scene with every element under opaque elements
     /// above them.
     pub culled_windows: Vec<u64>,
+    /// The session was locked for this frame.
+    pub locked: bool,
+    /// The frame drew the output's lock surface (ext-session-lock).
+    pub lock_surface: bool,
+    /// Surface trees other than the lock surface and the pointer the
+    /// frame drew: windows, layers, popups, a drag icon. None while
+    /// locked (ext-session-lock-v1: only lock surfaces show).
+    pub content_roots: usize,
 }
 
 impl FrameCost {
@@ -233,6 +241,19 @@ impl FrameCost {
             output_area: i64::from(output.w.max(0)) * i64::from(output.h.max(0)),
             drawn_windows,
             culled_windows,
+            ..Self::default()
+        }
+    }
+
+    /// What the frame drew besides its scene elements' owners: whether
+    /// the session was locked, whether the output's lock surface was
+    /// among the drawn roots and how many other roots there were.
+    pub(crate) fn with_roots(self, locked: bool, lock_surface: bool, content_roots: usize) -> Self {
+        Self {
+            locked,
+            lock_surface,
+            content_roots,
+            ..self
         }
     }
 
@@ -245,6 +266,9 @@ impl FrameCost {
             "output_area": self.output_area,
             "drawn_windows": self.drawn_windows,
             "culled_windows": self.culled_windows,
+            "locked": self.locked,
+            "lock_surface": self.lock_surface,
+            "content_roots": self.content_roots,
         })
     }
 }
