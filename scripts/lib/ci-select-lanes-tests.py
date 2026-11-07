@@ -160,6 +160,89 @@ jobs:
         self.assertIsNone(m.workflow_lanes("", self.BASE))
         self.assertEqual(m.select("pull_request", 0, 2, [m.WORKFLOW], None)[0], m.LANES)
 
+    ARTIFACTS = """
+jobs:
+  select-lanes: {runs-on: x, steps: [{run: a}]}
+  check:
+    runs-on: x
+    steps: [{run: a}, {uses: actions/upload-artifact@v1, with: {name: test-list}}]
+  arch-package:
+    runs-on: x
+    needs: [select-lanes, check]
+    steps: [{run: a}, {uses: actions/upload-artifact@v1, with: {name: tuna-arch}}]
+  portal-security:
+    runs-on: x
+    needs: [select-lanes, arch-package]
+    steps: [{uses: actions/download-artifact@v1, with: {name: tuna-arch}}]
+  marlin-vm:
+    runs-on: x
+    needs: [select-lanes, arch-package]
+    steps:
+      - uses: actions/download-artifact@v1
+        with: {name: tuna-arch}
+      - uses: actions/upload-artifact@v1
+        with: {name: "${{ matrix.artifact }}"}
+  gtk-shell:
+    runs-on: x
+    needs: [select-lanes]
+    outputs: {proof_artifact_id: "${{ steps.up.outputs.artifact-id }}"}
+    steps: [{run: a}]
+  parity-ledger:
+    runs-on: x
+    needs: [select-lanes, check, gtk-shell, marlin-vm]
+    steps:
+      - uses: actions/download-artifact@v1
+        with: {name: test-list}
+      - uses: actions/download-artifact@v1
+        with: {artifact-ids: "${{ needs.gtk-shell.outputs.proof_artifact_id }}"}
+      - uses: actions/download-artifact@v1
+        with: {name: marlin-vm}
+  journey:
+    runs-on: x
+    needs: [select-lanes]
+    steps: [{run: a}]
+"""
+
+    def artifact_lanes(self, job):
+        text = self.ARTIFACTS.replace(f"  {job}:", f"  {job}:\n    env: {{X: '1'}}", 1)
+        return m.workflow_lanes(self.ARTIFACTS, text)
+
+    def test_producer_edit_selects_the_jobs_that_download_its_artifacts(self):
+        self.assertEqual(m.artifact_consumers(yaml.safe_load(self.ARTIFACTS)["jobs"])["arch-package"],
+                         {"portal-security", "marlin-vm"})
+        # arch-package -> portal-security and marlin-vm -> (matrix upload) parity-ledger.
+        self.assertEqual(self.artifact_lanes("arch-package"),
+                         {"arch-package", "portal-security", "marlin-vm", "parity-ledger"})
+        self.assertEqual(self.artifact_lanes("portal-security"), {"portal-security"})
+
+    def test_check_edit_selects_the_consumer_of_its_test_list(self):
+        self.assertEqual(self.artifact_lanes("check"), {"parity-ledger"})
+
+    def test_a_job_that_selects_an_artifact_by_output_id_is_a_consumer(self):
+        self.assertEqual(self.artifact_lanes("gtk-shell"), {"gtk-shell", "parity-ledger"})
+
+    def test_a_job_not_needing_the_producer_is_not_a_consumer(self):
+        # journey downloads nothing and needs nothing from the others.
+        self.assertEqual(self.artifact_lanes("journey"), {"journey"})
+        text = self.ARTIFACTS.replace("needs: [select-lanes, arch-package]\n    steps:\n      - uses",
+                                      "needs: [select-lanes]\n    steps:\n      - uses", 1)
+        self.assertEqual(m.artifact_consumers(yaml.safe_load(text)["jobs"])["arch-package"], {"portal-security"})
+
+    def test_real_workflow_boundaries(self):
+        base = (ROOT / ".github/workflows/ci.yml").read_text()
+
+        def lanes(job):
+            marker = base.index(f"\n  {job}:")
+            steps = base.index("\n    steps:", marker)
+            return m.workflow_lanes(base, base[:steps] + "\n    env:\n      X: '1'" + base[steps:])
+        self.assertEqual(lanes("arch-package"),
+                         {"arch-package", "portal-security", "remote-security", "niri-parity",
+                          "marlin-image", "marlin-vm", "parity-ledger"})
+        self.assertEqual(lanes("check"), {"parity-ledger"})
+        self.assertEqual(lanes("ci-gate"), set())
+        # The journey no longer waits for check, yet its shots still feed the ledger and docs.
+        self.assertEqual(lanes("journey"), {"journey", "parity-ledger", "docs-shots"})
+
 
 class WorkflowSync(unittest.TestCase):
     def setUp(self):
