@@ -95,6 +95,12 @@ jobs:
       - name: Record the checked source revision
         id: checked-source
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # The structural test-strategy rules need no build, so fail on them
+      # first; this replaces the separate validate-test-strategy workflow
+      # (320 hosted runs/week). The executed-inventory pass below adds the
+      # test list after the workspace tests pass.
+      - name: Validate test strategy structure
+        run: scripts/tuna-test-strategy --report "$RUNNER_TEMP/test-strategy-static-report.md"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
