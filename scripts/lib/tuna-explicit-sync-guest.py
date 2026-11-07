@@ -243,10 +243,17 @@ def worker(directory, case, attempt, gate, ready):
         deadline = min(state['deadline'], active['deadline'])
         def alive():
             original_alive(state, owner_fd)
-            if (child_fd is not None and 'client' in result
-                    and not select.select([child_fd], [], [], 0)[0]
-                    and not same_process(result['client'])):
-                raise RuntimeError('owned native client identity changed')
+            if child_fd is not None and 'client' in result:
+                try:
+                    unchanged = same_process(result['client'])
+                except OSError:
+                    unchanged = False
+                # Identity first, departure second: a client that exits in
+                # between is an unreaped zombie with no /proc/<pid>/exe (run
+                # 42379455963's destroy case), its pidfd readable and its pid
+                # not reusable, so only a live process can have changed.
+                if not unchanged and not select.select([child_fd], [], [], 0)[0]:
+                    raise RuntimeError('owned native client identity changed')
             if time.monotonic() >= deadline:
                 raise TimeoutError('native ioctl case/aggregate deadline: ' + case)
         alive()
