@@ -436,6 +436,11 @@ cannot satisfy the gate.
 
 `app-content` and `scroll-proof` download Playwright and Chromium into a
 temporary venv on every run, so they need network access.
+`scroll-proof` completes those downloads before launching its compositor:
+the normal five-minute idle lock remains enabled, so dependency latency is
+not part of the live input journey. Each mode change sends exactly one
+physical key chord and waits for the compositor's observed transition;
+silence fails rather than resending a toggle that could undo a slow change.
 
 **Start `tuna-gtk-shell-proof` from a fresh artifacts directory.** The
 script points `XDG_STATE_HOME` at `gtk-shell-artifacts/state`, and the
@@ -541,6 +546,82 @@ The run stopped when `karnataka` SSH/SFTP/legacy-SCP transport became
 unreachable; final beta3 qualification inputs had not been supplied.
 No timeout, lock policy, host capacity setting or qualification floor was
 relaxed.
+
+The recovered current-build producer payload lives in
+`scripts/lib/core_apps.py` and the typed installed observers under
+`packaging/marlin/vm-lane/core-apps/`. It uses the existing native
+QMP/QGA/GDM lifecycle, not a second VM producer. Its explicit CI-only
+`CORE_APPS=1` image installs the 28 original distro applications and retains
+the installed package delta. Only that layer changes the preboot UID 1000
+account from its actual standard-user group baseline to `wheel`, recording
+both group sets and the exact delta; it does not install authorization rules
+or replace stock polkit/consent. The two ordinary lifecycle rows keep their
+original standard-user role.
+
+The private `TUNA_COMPOSITOR_STATE` opt-in additionally exposes per-live-binding
+**server emission**, not application-consumption, counters at the actual
+`WlSurface::key` → `WlKeyboard.key` send path. The default does not count keys,
+allocate observer storage, or take observer snapshots. Evidence joins actual
+kernel-accepted or D-Bus-admitted original PID/UID with a live process pin,
+generational connection/resource identity, native window, and seat focus to
+the original installed process. Mutter ServiceChannel sockets are created
+by the compositor and passed to the admitted application; their raw
+`SO_PEERCRED` identifies the socket-pair creator, not the application.
+Both window and focus observer records therefore use the original pinned
+caller credentials already retained at connection admission. Missing
+credentials, missing UID/pin, and exited peers are unevaluable; there is no
+fallback to the compositor PID or a later numeric-PID lookup. Every app requires a fresh
+prelock positive delta, unchanged counters during locked negative input and
+unlock, and another fresh postunlock positive delta. Missing, recreated,
+retired, late-enabled or overflowing bindings are unevaluable, never zero
+passes. Independent application text/payload, frames, service outcomes,
+100%/150% scaling and restart persistence remain separate requirements.
+IME evidence is physical `nihao`/Space through installed libpinyin with visible
+preedit in the original packaged app, its exact commit and clipboard readback;
+a helper or file chooser cannot qualify the app's editable interface.
+
+This source payload is not a 28-app receipt. The fixture uses genuine packaged
+production Radicale inside the existing guest for authenticated CalDAV and
+CardDAV, original Calendar/Contacts UI and EDS consumption, independent DAV
+payload readback, wrong-password denial, and service/frontend persistence.
+Its owned loopback service is not an HTTP echo, host listener or shipping
+service. Software requires genuine signed previous/current Flathub objects
+for install/update/remove; maps, forecasts and reverse geocoding require
+their real providers. GeoClue's named New York static source is emulated
+input, not GPS.
+
+Normal image construction runs the packaged `tuna-geoclue-agent-policy`
+helper, which verifies the pristine packaged vendor main configuration and
+adds the real `tuna-shell` ID to its complete vendor agent list in an early
+fragment. It preserves later administrator overrides and refuses a modified
+administrator main configuration or a later policy that excludes Tuna.
+GeoClue's [whitelist replacement semantics](https://man.archlinux.org/man/geoclue.5.en.txt)
+require retaining that full list, not replacing it with only Tuna. The helper
+does not change application grants, vendor main bytes, or any live session.
+The qualification fixture only reads effective admission; it never spoofs
+`gnome-shell` or adds `allowed=true` for Maps/Weather. The actual shell logs
+successful `AddAgent` completion; absent errors alone do not prove acceptance.
+Automatic timezone
+requires the original active packaged `gsd-datetime` PID/UID and passive real
+service traffic through timedated, `/etc/localtime` and the panel, including
+both disabled controls and restoration. Absent inputs fail the full run;
+source coverage, counter tests and the old nine-operation archive cannot
+close #397 or #359.
+
+The [native Core job in CI run 41464650830](https://github.com/tuna-os/tuna-desktop/actions/runs/41464650830/job/125362607498)
+failed at `desktop.discover` (`guest.py:142`) before completing the matrix.
+Its retained `native-core-apps` artifact `13156997730`,
+`core-apps/00025-normal-launch-org.gnome.Nautilus.json`, records Nautilus
+window 2 with `client_pid=1935`; `session-owner.json` identifies PID 1935 as
+the original compositor. This exposed the observer's use of socket-pair
+creator credentials on the service connection. The correction preserves
+the strict app bus/PID/UID join and actual server-emission requirements.
+Socket regression controls cover the separate live admitted process,
+expired pins, and absent original credentials/pin/UID, but do not qualify
+Nautilus or any of the 28 applications. A fresh source-bound native Core
+matrix on the installed app/service/reference-GDM path is still required;
+the failed run is not a pass and must not be retried merely for green.
+
 
 ## Marlin VM lane
 

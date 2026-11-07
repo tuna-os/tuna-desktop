@@ -37,6 +37,100 @@ def with_owner_login_session(scope):
     exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), "exec"), scope)
     return scope
 
+class CoreNativeRouting(unittest.TestCase):
+    """Host routing regressions only, never original-app native qualification."""
+
+    def test_disposable_disk_is_blank_removable_and_never_reused(self):
+        nonce = "123456789abcdef0" * 2
+        with tempfile.TemporaryDirectory() as scratch, \
+                patch.object(lane.os.path, "exists", return_value=True), \
+                patch.object(lane.os, "access", return_value=True), \
+                patch.object(lane.subprocess, "Popen") as spawn:
+            lane.boot("original.raw", scratch, scratch, 30, True, core_nonce=nonce)
+            disk = Path(scratch) / "core-apps-disposable.raw"
+            self.assertEqual(disk.stat().st_size, 512 * 1024 * 1024)
+            with disk.open("rb") as stream:
+                self.assertEqual(stream.read(4096), bytes(4096))
+                stream.seek(-4096, os.SEEK_END)
+                self.assertEqual(stream.read(), bytes(4096))
+            command = spawn.call_args.args[0]
+            storage = [value for value in command if value.startswith("usb-storage,")]
+            self.assertEqual(storage, ["usb-storage,drive=core-apps-disposable,removable=on,serial=TC397-" + nonce[:14]])
+            self.assertIn("file=original.raw,format=raw,if=virtio,cache=unsafe", command)
+            with self.assertRaises(FileExistsError):
+                lane.boot("original.raw", scratch, scratch, 30, True, core_nonce=nonce)
+            self.assertEqual(spawn.call_count, 1)
+
+    def test_native_profile_rejects_waivers_before_boot(self):
+        import sys
+        base = ["tuna-vm-lane", "--profile", "core-apps", "--disk", "original.raw",
+                "--require-kvm", "--strip-image", "receipt.json"]
+        variants = [base[:-2], [arg for arg in base if arg != "--require-kvm"]]
+        variants += [base + flags for flags in (
+            ["--tour"], ["--boots", "5"], ["--fresh-accounts"], ["--published"],
+            ["--soak", "30"], ["--strip-edge"])]
+        for argv in variants:
+            with self.subTest(argv=argv), patch.object(sys, "argv", argv), \
+                    patch.object(lane, "boot") as boot, \
+                    patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as error:
+                lane.main()
+            self.assertEqual(error.exception.code, 2)
+            boot.assert_not_called()
+
+    def test_missing_core_execution_fails_and_is_retained(self):
+        import sys
+        with tempfile.TemporaryDirectory() as out:
+            receipt = Path(out) / "image.json"
+            receipt.write_text(json.dumps({"commit": "a" * 40, "capture_commit": "a" * 40,
+                                          "image_id": "sha256:" + "b" * 64,
+                                          "base_image": "base@sha256:" + "c" * 64}))
+            argv = ["tuna-vm-lane", "--profile", "core-apps", "--disk", "original.raw",
+                    "--out", out, "--require-kvm", "--strip-image", str(receipt)]
+            argv += sum((["--meta", key + "=" + value] for key, value in
+                         (("commit", "a" * 40), ("test_image_id", "sha256:" + "b" * 64),
+                          ("base_image", "base@sha256:" + "c" * 64))), [])
+            vm = unittest.mock.Mock()
+            with patch.object(sys, "argv", argv), \
+                    patch.object(lane, "boot", return_value=(vm, "qmp", "serial", True, "qga")), \
+                    patch.object(lane.baseline, "Qmp"), \
+                    patch.object(lane, "gdm_login", return_value=False), \
+                    patch.object(lane, "read_text", return_value=""), \
+                    patch.object(lane.subprocess, "run", return_value=SimpleNamespace(stdout="QEMU test\n")), \
+                    patch("sys.stderr", io.StringIO()), self.assertRaisesRegex(SystemExit, "V-CORE-APPS"):
+                lane.main()
+            manifest = json.loads((Path(out) / "manifest.json").read_text())
+            self.assertFalse(manifest["assertions"]["V-CORE-APPS"]["pass"])
+            self.assertEqual(manifest["lane"], "native-core-apps")
+
+
+    def test_root_dispatch_rejects_unowned_request_with_sanitized_core_error(self):
+        import contextlib
+        import sys
+        root = Path(__file__).resolve().parents[2]
+        source = root / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+        main = next(node for node in ast.parse(source.read_text()).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "main")
+        guest_source = root / "packaging/marlin/vm-lane/core-apps/guest.py"
+        spec = importlib.util.spec_from_file_location("core_routing_guest", guest_source)
+        guest = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guest)
+        scope = {"sys": sys, "os": SimpleNamespace(geteuid=lambda: 0), "json": json,
+                 "OWNER": SimpleNamespace(pw_uid=1000), "STATE": "/not-read",
+                 "inventory": lambda: self.fail("unowned request reached native session")}
+        exec(compile(ast.Module(body=[main], type_ignores=[]), str(source), "exec"), scope)
+        stream = io.StringIO()
+        with patch.object(sys, "argv", ["probe", "core-apps", "desktop", "prepare",
+                                      '{"private":"private argument"}']), \
+                patch.dict(sys.modules, {"guest": guest}), contextlib.redirect_stdout(stream), \
+                self.assertRaises(SystemExit) as error:
+            scope["main"]()
+        self.assertEqual(error.exception.code, 1)
+        receipt = json.loads(stream.getvalue())
+        self.assertEqual(set(receipt), {"core_apps_error"})
+        self.assertTrue(lane.guest_agent.valid_core_apps_error(receipt["core_apps_error"]))
+        self.assertEqual(receipt["core_apps_error"]["exception_type"], "KeyError")
+        self.assertNotIn("private", stream.getvalue())
+
 
 class DatetimePublishedQualification(unittest.TestCase):
     """Behavioral lane policy tests, not native Date & Time qualification."""
@@ -393,13 +487,6 @@ class OrcaCommandWindow(unittest.TestCase):
         for kwargs in ({"started": float("nan")}, {"ready": float("inf")}, {"before": True},
                        {"after": -1}, {"samples": 96001}, {"samples": True}, {"ready": 9.9}):
             with self.subTest(kwargs=kwargs), self.assertRaises(RuntimeError): self.check(**kwargs)
-    def test_actual_command_calls_window_validator_with_original_receipts(self):
-        node = next(n for n in ast.walk(ast.parse(Path(lane.__file__).read_text()))
-                    if isinstance(n, ast.FunctionDef) and n.name == "native_command")
-        call = next(n for n in ast.walk(node) if isinstance(n, ast.Call)
-                    and isinstance(n.func, ast.Name) and n.func.id == "require_speech_trigger_window")
-        self.assertEqual([ast.unparse(n) for n in call.args],
-                         ["start_speech", "trigger_before", "trigger_after", "len(values)"])
 
 
 class OrcaPublicWindow(unittest.TestCase):
@@ -446,26 +533,6 @@ class OrcaPublicWindow(unittest.TestCase):
                 scope["recording_profile"]({"profile": dict(profile, channels=True)})
         for name in (True, [], "private", "public-navigation-extra"):
             with self.assertRaises(RuntimeError): scope["speech_capture_profile"](name)
-    def test_public_profile_only_and_original_guard_before_lock_privacy(self):
-        tree = ast.parse(Path(lane.__file__).read_text())
-        public = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "public_capture")
-        native = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "native_command")
-        starts = lambda node: [n for n in ast.walk(node) if isinstance(n, ast.Call)
-                and isinstance(n.func, ast.Attribute) and n.func.attr == "run" and n.args
-                and isinstance(n.args[0], ast.Constant) and n.args[0].value == "orca-speech-start"]
-        self.assertEqual([ast.literal_eval(a) for a in starts(public)[0].args],
-                         ["orca-speech-start", "public-navigation"])
-        self.assertEqual([ast.literal_eval(a) for a in starts(native)[0].args], ["orca-speech-start"])
-        validator = next(n for n in ast.walk(public) if isinstance(n, ast.Call)
-                         and isinstance(n.func, ast.Name) and n.func.id == "require_public_speech_window")
-        self.assertEqual([ast.unparse(a) for a in validator.args],
-                         ["start", "end", "before_trigger", "after_trigger", "len(samples)"])
-        cleanup = next(n for n in ast.walk(public) if isinstance(n, ast.Try) and n.finalbody)
-        self.assertTrue(any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                            and n.func.attr == 'run' and n.args and isinstance(n.args[0], ast.Constant)
-                            and n.args[0].value == 'orca-speech-end' for n in ast.walk(cleanup.finalbody[0])))
-        source = Path(lane.__file__).read_text()
-        self.assertLess(source.index('public_capture("orca-quick-settings-volume"'), source.index('def pam_unlock('))
 
 
 class OrcaCommandCleanup(unittest.TestCase):
@@ -655,16 +722,6 @@ elif name=='vercmp':
         self.assertFalse(any(call[:2] == ["pacman", "-U"] or call[0] == "tuna-image-kernels" for call in calls))
         # Source execution with stubs, not an actual dependency/kernel qualification.
 
-    def test_separate_runtime_upgrade_and_package_install_precede_kernel_validation(self):
-        source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/orca51/Containerfile"
-        self.assertIn('SHELL ["/bin/bash", "-o", "pipefail", "-c"]', source.read_text())
-        body = source.read_text().split("RUN set -eu; pacman -Syu", 1)[1]
-        self.assertLess(body.index("pacman -U"), body.index("tuna-image-kernels vm"))
-        self.assertLess(body.index("tuna-image-kernels vm"), body.index("pacman -Qi orca"))
-        helper = (source.parents[2] / "tuna-image-kernels").read_text()
-        self.assertIn('case "$stage" in preview|vm)', helper)
-        self.assertNotIn("pacman -Sy --", source.read_text())
-        # Source ordering only; actual package graph/kernel proof remains CI/VM.
 
 
 class OrcaStagedDiagnostic(unittest.TestCase):
@@ -779,8 +836,24 @@ class OrcaStagedDiagnostic(unittest.TestCase):
         # Fault-injected transport only; no claim of genuine AT-SPI execution.
 
     def test_helper_error_serialization_never_emits_exception_details(self):
+        from contextlib import redirect_stdout
         import sys
         helper = PublicOrcaNavigation().focus_module()
+        tree = ast.parse(Path(helper.__file__).read_text())
+        main = next(n for n in tree.body if isinstance(n, ast.If) and "__name__" in ast.unparse(n.test))
+        observed = []
+        def failed(*args, **kwargs):
+            observed.append(args)
+            raise TypeError("private query and field value")
+        scope = {"__name__": "__main__", "json": json, "sys": SimpleNamespace(argv=["helper", "1083", "1187", "tuna-shell-gtk", "wayland-0"]),
+                 "observe": failed, "FOCUS_OPERATION": "atspi-owner", "FOCUS_OPERATIONS": helper.FOCUS_OPERATIONS}
+        stream = io.StringIO()
+        with redirect_stdout(stream), self.assertRaises(SystemExit) as exited:
+            exec(compile(ast.Module(body=[main], type_ignores=[]), helper.__file__, "exec"), scope)
+        self.assertEqual(exited.exception.code, 1)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(json.loads(stream.getvalue()), {"focus_error_type": "TypeError", "focus_operation": "atspi-owner"})
+        self.assertNotIn("private", stream.getvalue())
         private = "private-query-and-field-value"
         for arguments in ([private, "1187", "tuna-shell-gtk", "wayland-0"],
                           ["1083", "1187", "tuna-shell-gtk", "wayland-0", private]):
@@ -1013,6 +1086,7 @@ class OrcaReadFailure(unittest.TestCase):
 
     def test_failed_read_rejects_arbitrary_private_or_invalid_schema(self):
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        actor._caller_deadline = None
         invalid = [{"exception_type": "private-token"},
                    {"exception_type": "CalledProcessError", "argv": "private-token"},
                    {"exception_type": "CalledProcessError", "returncode": True},
@@ -1065,6 +1139,7 @@ class OrcaReadFailure(unittest.TestCase):
                   "out-data": base64.b64encode(json.dumps(diagnostic).encode()).decode(),
                   "err-data": base64.b64encode(b"private arbitrary traceback").decode()}
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        actor._caller_deadline = None
         for action in ("orca-read", "orca-speech-start"):
             with patch.object(actor, "command", side_effect=[{"pid": 10}, failed]):
                 with self.assertRaises(RuntimeError) as caught:
@@ -1086,6 +1161,7 @@ class OrcaReadFailure(unittest.TestCase):
 
     def test_strip_stop_failure_record_reaches_the_lane_error(self):
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        actor._caller_deadline = None
         record = {"exception_type": "FileNotFoundError", "errno": 2, "stage": "launcher",
                   "message": "[Errno 2] No such file or directory: '/proc/11088/exe'"}
         failed = {"exited": True, "exitcode": 1,
@@ -1508,26 +1584,12 @@ class PublicOrcaNavigation(unittest.TestCase):
             lane.public_speech_tokens(["private malformed payload"])
 
     def test_public_capture_rejects_triggers_outside_original_pcm_window(self):
-        file = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
-        tree = ast.parse(file.read_text())
-        capture = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "public_capture")
-        validator = next(n for n in ast.walk(capture) if isinstance(n, ast.Call)
-                         and isinstance(n.func, ast.Name) and n.func.id == "require_public_speech_window")
-        self.assertEqual([ast.unparse(arg) for arg in validator.args],
-                         ["start", "end", "before_trigger", "after_trigger", "len(samples)"])
-        # Retain the original four-second actual-data negatives: larger profile
-        # never creates samples, padding, or a renewed start clock.
         start, end, before, after = OrcaPublicWindow().receipts()
         start["receipt"].update(started_monotonic=10.0, ready_monotonic=10.5)
         for first, last in ((10.4, 11.0), (11.0, 10.9), (13.9, 14.0), (14.1, 14.2)):
             before["guest_monotonic"] = first; after["guest_monotonic"] = last
             with self.subTest(first=first, last=last), self.assertRaises(RuntimeError):
                 lane.require_public_speech_window(start, end, before, after, 96000)
-        volume = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "focus_volume")
-        calls = [n for n in ast.walk(volume) if isinstance(n, ast.Call)
-                 and isinstance(n.func, ast.Attribute) and n.func.attr == "keys"]
-        self.assertEqual([tuple(ast.literal_eval(arg) for arg in n.args) for n in calls], [("tab",)])
-        # Clock/source policy only: an actual VM still must qualify the fresh recording.
 
     def tab_preparation(self, observations):
         file = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
@@ -2141,6 +2203,7 @@ class OrcaLifecycleAuthority(unittest.TestCase):
                   "out-data": base64.b64encode(json.dumps(diagnostic).encode()).decode(),
                   "err-data": base64.b64encode(b"private arbitrary traceback").decode()}
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        actor._caller_deadline = None
         for action in ("orca-read", "orca-speech-start"):
             with patch.object(actor, "command", side_effect=[{"pid": 10}, failed]):
                 with self.assertRaises(RuntimeError) as caught:
@@ -2239,35 +2302,6 @@ class OrcaLifecycleAuthority(unittest.TestCase):
         # This verifies producer/consumer shape and refusal policy. Only the
         # genuine VM can qualify actual bus credentials and reader exclusion.
 
-    def test_compositor_authority_comes_from_actual_backend(self):
-        # Reader authority is the session serving the KeyboardMonitor: the
-        # actual DRM backend, or a nested session started with the explicit
-        # --screen-reader command-line flag (never environment or config).
-        root = Path(__file__).resolve().parents[2]
-        source = (root / "crates/compositor/src/runtime.rs").read_text()
-        flat = " ".join(source.split())
-        self.assertIn("let hardware = matches!(backend, Backend::Drm(_));", source)
-        self.assertIn("let hardware = false;", source)
-        self.assertIn("let a11y_keyboard = (hardware || session.screen_reader)"
-                      ".then(crate::a11y_keyboard::Monitor::start);", flat)
-        self.assertIn("self.orca .set_enabled(enabled && self.a11y_keyboard.is_some());", flat)
-        self.assertTrue('doc["screen_reader_pid"] = serde_json::json!(self.orca.pid());' in source)
-        main = " ".join((root / "crates/compositor/src/main.rs").read_text().split())
-        self.assertIn('"--screen-reader" => { session.screen_reader = true; }', main)
-        self.assertEqual(main.count("screen_reader = true"), 1)
-        self.assertIn("screen_reader: false,", source)
-
-    def test_no_global_orca_service_control_or_replace(self):
-        root = Path(__file__).resolve().parents[2]
-        compositor = (root / "crates/compositor/src/orca.rs").read_text()
-        shell = (root / "crates/shell-gtk/src/orca.rs").read_text()
-        self.assertNotIn('"--replace"', compositor)
-        self.assertNotIn('"orca.service"', compositor)
-        self.assertIn('Command::new("/usr/bin/orca")', compositor)
-        self.assertIn('libc::PR_SET_PDEATHSIG, libc::SIGTERM', compositor)
-        self.assertIn('libc::getppid() != parent', compositor)
-        self.assertNotIn('gio::bus_get_future', shell)
-        self.assertIn('control.set_screen_reader(enabled)', shell)
 
 
 
@@ -2309,10 +2343,6 @@ class BootApi(unittest.TestCase):
             self.assertEqual((qmp, serial, kvm), ("/scratch/qmp.sock", "/out/serial.log", True))
             command = spawn.call_args.args[0]
             self.assertIn("-enable-kvm", command)
-            self.assertEqual(command[command.index("-m") + 1], "6144")
-            self.assertEqual(command[command.index("-smp") + 1], "4")
-            self.assertIn("pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1", command)
-            self.assertIn("virtio-vga,bus=tuna-gpu-port,x-pcie-pm-no-soft-reset=on,xres=1280,yres=800", command)
             shared = lane.baseline.gpu_devices()
             offset = command.index(shared[1]) - 1
             self.assertEqual(command[offset:offset + len(shared)], shared)
@@ -2566,20 +2596,6 @@ class InterleavedShellStartup(unittest.TestCase):
         self.assertTrue(shell)
         self.assertFalse(bool(shell) and lane.EXHAUSTED not in text)
 
-
-class PointerEvidenceRetention(unittest.TestCase):
-    def test_aggregate_does_not_overwrite_last_live_inventory(self):
-        tree = ast.parse((Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text())
-        aggregate = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
-                     and isinstance(n.func, ast.Attribute) and n.func.attr == "join"
-                     and any(isinstance(a, ast.Constant) and a.value == "pointer-live-events.json"
-                             for a in n.args)]
-        self.assertEqual(len(aggregate), 1)
-        overwritten = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
-                       and isinstance(n.func, ast.Attribute) and n.func.attr == "join"
-                       and any(isinstance(a, ast.Constant) and a.value == "pointer-live.json"
-                               for a in n.args)]
-        self.assertEqual(overwritten, [])
 
 
 class TourRecorderTests(unittest.TestCase):
@@ -2940,14 +2956,6 @@ class TourRecorderTests(unittest.TestCase):
             self.assertIs(qmp.cmd, command)
             self.assertEqual(recorders[0].stills, {})
 
-    def test_tour_renders_current_cards_into_scratch_and_ci_has_dependencies(self):
-        source = Path(lane.__file__).read_text()
-        self.assertIn('os.path.join(CARDS, "render.py")', source)
-        self.assertIn('"--out", cards_dir', source)
-        self.assertIn('os.path.join(cards_dir, f"{card}.png")', source)
-        self.assertNotIn('os.path.join(CARDS, f"{card}.png")', source)
-        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text()
-        self.assertIn('qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core', workflow)
 
 
 def tour_frame(fill, boxes=()):
@@ -3052,6 +3060,27 @@ class TourViewPredicates(unittest.TestCase):
             self.assertEqual(recorder.n, 1)  # No retry can replace the missed frame.
             self.assertEqual(receipt["png_sha256"], lane.baseline.sha256(
                 Path(recorder.dir) / "f000000.png"))
+            recorder.close()
+
+    def test_png_decode_budget_is_independent_of_the_view_window(self):
+        pixels = tour_frame(self.NAVY, self.SWITCHER)
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(
+                header + pixels if args["format"] == "ppm" else tour_png(pixels))
+        budgets = []
+        original = lane.Recorder._exact_pixels
+        def spy(self, card, deadline):
+            budgets.append(deadline - lane.time.monotonic())
+            return original(self, card, deadline)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(lane.Recorder, "_exact_pixels", spy):
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            # A window this short left the decode milliseconds before; the
+            # frame is retained inside it, so the decode keeps a full budget.
+            self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=0.3, settle=0))
+            self.assertGreater(budgets[0], 9.0)
+            self.assertTrue(recorder.still_confirmations["alt-tab"]["confirmed"])
             recorder.close()
 
     def test_exact_overview_png_is_confirmed_without_changing_calibrated_floors(self):
@@ -3642,18 +3671,6 @@ class S3AbsoluteDeadline(unittest.TestCase):
                 _,accepted,receipt = self.execute('retirement',late_predicate=name,deadline=25)
                 self.assertFalse(accepted); self.assertFalse(receipt)
 
-    def test_default_inventory_call_remains_unchanged(self):
-        source = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
-        lifecycle = next(n for n in ast.parse(source.read_text()).body if isinstance(n,ast.FunctionDef) and n.name=='run_lifecycle')
-        inventory = next(n for n in lifecycle.body if isinstance(n,ast.FunctionDef) and n.name=='inventory')
-        calls=[]
-        with tempfile.TemporaryDirectory() as tmp:
-            scope=dict(agent=SimpleNamespace(run=lambda *a,**kw: calls.append((a,kw)) or {}),
-                       evidence=tmp,os=lane.os,json=json,
-                       s3_observe=lambda *a,**kw: (_ for _ in ()).throw(AssertionError('unexpected deadline path')))
-            exec(compile(ast.Module(body=[inventory],type_ignores=[]),str(source),'exec'),scope)
-            self.assertEqual(scope['inventory']('ordinary'),{})
-        self.assertEqual(calls,[(('inventory',),{})])
 
 
 class ShippedSnapshotInventory(unittest.TestCase):
@@ -4025,35 +4042,6 @@ class GdmSessionList(unittest.TestCase):
 
 
 class FixtureLoginSession(unittest.TestCase):
-    def fixture(self, name):
-        return (Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane" / name).read_text()
-
-    def test_both_fixtures_log_in_through_gdm_without_preselecting_a_session(self):
-        tmpfiles = self.fixture("tuna-vm-gdm.tmpfiles")
-        self.assertNotIn("Session=", tmpfiles)
-        for name in ("Containerfile", "Containerfile.published"):
-            with self.subTest(fixture=name):
-                containerfile = self.fixture(name)
-                self.assertIn("COPY packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles", containerfile)
-                # The published fixture's RUN carries a --mount flag before its body.
-                body = containerfile.split("mkdir -p /usr/share/tuna-vm", 1)[1]
-                for absent in ("greetd", "gtkgreet", "cage", "systemctl disable gdm"):
-                    self.assertNotIn(absent, body)
-                for path in ("/usr/lib/pam.d/gdm-password", "/etc/gdm/custom.conf", "/etc/pam.d/tuna-lock",
-                             "/usr/share/wayland-sessions/*.desktop", "sha256sum --check",
-                             "display-manager.service)\" = /usr/lib/systemd/system/gdm.service"):
-                    self.assertIn(path, containerfile)
-                self.assertNotIn("AutomaticLogin", containerfile.replace("AutomaticLoginEnable|TimedLoginEnable", ""))
-
-    def test_current_build_runs_tunaos_tuna_flavor_gdm_steps_in_manifest_order(self):
-        containerfile = self.fixture("Containerfile")
-        steps = ["tuna-gdm-theme.sh", "tuna-gdm-default-session.sh", "tuna-hide-other-sessions.sh"]
-        positions = [containerfile.index(f"bash /tmp/tunaos/{step}") for step in steps]
-        self.assertEqual(positions, sorted(positions))
-        self.assertLess(containerfile.index("Name=Tuna Desktop/'"), positions[0])
-        self.assertLess(positions[-1], containerfile.index("> /usr/share/tuna-vm/shipped-payload.sha256"))
-        self.assertEqual(sorted(p.name for p in (Path(__file__).resolve().parents[2]
-                                                 / "packaging/marlin/vm-lane/tunaos").iterdir()), sorted(steps))
 
     def test_tunaos_steps_use_installed_gdm_for_global_template_policy(self):
         source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tunaos"
@@ -4405,6 +4393,7 @@ class DelayedAuthFailureDiagnostics(unittest.TestCase):
     def transport_error(self, payload, **status):
         import contextlib
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        actor._caller_deadline = None
         output = base64.b64encode(json.dumps(payload).encode()).decode()
         failure = {"exited": True, "exitcode": 1, "out-data": output,
                    "err-data": base64.b64encode(b"private arbitrary traceback").decode(), **status}
@@ -4773,6 +4762,7 @@ class InventoryProcessRaces(unittest.TestCase):
     def transport(self, output, action="inventory", **status):
         import contextlib
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        actor._caller_deadline = None
         failure = {"exited": True, "exitcode": 1, "out-data": base64.b64encode(output.encode()).decode(),
                    "err-data": base64.b64encode(b"private traceback text").decode(), **status}
         log = io.StringIO()

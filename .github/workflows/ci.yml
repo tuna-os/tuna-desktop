@@ -66,13 +66,22 @@ jobs:
           else
             scripts/ci-select-lanes >> "$GITHUB_OUTPUT"
           fi
-          # marlin-vm legs: a pull request runs the primary lifecycle leg only;
-          # the Orca 51 leg and the paired GNOME/Tuna references run on
-          # main, schedule and dispatch (each leg rebuilds the image and boots
-          # a VM for ~30 hosted minutes).
+          # marlin-vm legs: a pull request runs the primary lifecycle leg only,
+          # plus the native Core consumer when the change touches its source,
+          # guest observers or image transport; the Orca 51 leg and the paired
+          # GNOME/Tuna references run on main, schedule and dispatch (each leg
+          # rebuilds the image and boots a VM for ~30 hosted minutes).
           primary='{"profile":"lifecycle","orca":"distribution","artifact":"marlin-vm"}'
+          core='{"profile":"core-apps","orca":"distribution","artifact":"native-core-apps"}'
           extra='{"profile":"lifecycle","orca":"upstream51","artifact":"marlin-vm-orca51"},{"profile":"gnome-reference","session":"gnome","orca":"distribution","artifact":"native-gnome51-reference"},{"profile":"tuna-reference","session":"tuna","orca":"distribution","artifact":"native-tuna-reference"}'
-          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then legs="$primary"; else legs="$primary,$extra"; fi
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            legs="$primary"
+            if git diff --name-only "$BASE_SHA...HEAD" | grep -Eq '^(scripts/lib/(core_apps|vm_native_desktop|vm_guest_agent|vm_strip_)|scripts/tuna-vm-strip-image|packaging/marlin/vm-lane/(core-apps|tuna-core-apps-install|tuna-native-session|Containerfile))'; then
+              legs="$legs,$core"
+            fi
+          else
+            legs="$primary,$core,$extra"
+          fi
           echo "vm_matrix={\"include\":[$legs]}" >> "$GITHUB_OUTPUT"
 
   check:
@@ -1635,11 +1644,14 @@ jobs:
           sudo mkdir -p /mnt/vm && sudo chown "$(id -u):$(id -g)" /mnt/vm
           df -h / /mnt
       - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core zstd
+      - name: Install host IME OCR for the core-apps leg
+        if: matrix.profile == 'core-apps'
+        run: sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-chi-sim
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v3.1.4
       - name: Resolve and verify the current native media base before product selection
-        if: matrix.profile == 'lifecycle'
+        if: matrix.profile == 'lifecycle' || matrix.profile == 'core-apps'
         run: |
           sudo apt-get install -y --no-install-recommends skopeo
           mkdir -p vm-lane-artifacts/native-base
@@ -1679,7 +1691,7 @@ jobs:
             --expected-base-platform "$(cat /mnt/vm/base-digest)" \
             --base-evidence vm-lane-artifacts/native-base --github-output "$GITHUB_OUTPUT"
       - name: Verify the original paired reference base before building or booting
-        if: matrix.profile != 'lifecycle'
+        if: matrix.profile != 'lifecycle' && matrix.profile != 'core-apps'
         run: |
           sudo apt-get install -y --no-install-recommends skopeo
           mkdir -p vm-lane-artifacts/reference-base
@@ -1701,7 +1713,7 @@ jobs:
           python3 scripts/lib/vm_gnome_reference.py verify-base --out vm-lane-artifacts/reference-base
           sudo podman pull --platform linux/amd64 "$platform"
       - name: Build the paired native reference fixture
-        if: matrix.profile != 'lifecycle'
+        if: matrix.profile != 'lifecycle' && matrix.profile != 'core-apps'
         env:
           REFERENCE_SESSION: ${{ matrix.session }}
         run: |
@@ -1714,12 +1726,16 @@ jobs:
           printf '%s\n' sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e8636e44c3f > /mnt/vm/base-digest
           sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id
       - name: Build the Marlin Tuna Desktop image and the VM test layer
-        if: matrix.profile == 'lifecycle' && steps.native-product.outputs.restored == 'false'
+        if: matrix.profile == 'core-apps' || (matrix.profile == 'lifecycle' && steps.native-product.outputs.restored == 'false')
         env:
           PRODUCT_PACKAGE: ${{ steps.native-product.outputs.package_path }}
         run: |
           sudo podman pull --platform linux/amd64 "ghcr.io/tuna-os/marlin@$(cat /mnt/vm/base-digest)"
-          cp "$PRODUCT_PACKAGE" ./tuna.pkg.tar.zst
+          if [[ -n "$PRODUCT_PACKAGE" ]]; then
+            cp "$PRODUCT_PACKAGE" ./tuna.pkg.tar.zst
+          else
+            cp arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst ./tuna.pkg.tar.zst
+          fi
           sudo podman build -f packaging/marlin/Containerfile \
             --build-arg "BASE_IMAGE=ghcr.io/tuna-os/marlin@$(cat /mnt/vm/base-digest)" \
             --build-arg TUNA_PKG=tuna.pkg.tar.zst \
@@ -1737,7 +1753,13 @@ jobs:
             sudo podman rm "$probe_container"
             sudo chown -R "$(id -u):$(id -g)" orca51-package-provenance
           fi
-          # Final overlay is deliberately after BOTH branches and every Syu.
+          if [[ '${{ matrix.profile }}' == core-apps ]]; then
+            sudo podman build -f packaging/marlin/vm-lane/Containerfile.core-apps \
+              --build-arg CORE_APPS=1 --build-arg "CORE_APPS_SOURCE_COMMIT=$GITHUB_SHA" \
+              -t localhost/marlin-tuna-vm-core-apps:ci .
+            sudo podman tag localhost/marlin-tuna-vm-core-apps:ci localhost/marlin-tuna-vm:ci
+          fi
+          # Final overlay follows every fixture branch and every Syu.
           # FROM receives an immutable prior image ID, never a mutable tag.
           mkdir -p vm-lane-artifacts/gdm51
           cp gdm51-artifacts/manifest.json gdm51-artifacts/build-provenance.json vm-lane-artifacts/gdm51/
@@ -1757,7 +1779,7 @@ jobs:
           trap - EXIT
           sudo chown -R "$(id -u):$(id -g)" vm-lane-artifacts/gdm51
       - name: Inspect the actual final native image without rebuilding it
-        if: matrix.profile == 'lifecycle'
+        if: matrix.profile == 'lifecycle' || matrix.profile == 'core-apps'
         run: |
           sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id-observed
           scripts/tuna-vm-strip-image --canonical-image-id "$(cat /mnt/vm/image-id-observed)" | tee /mnt/vm/image-id
@@ -1770,7 +1792,7 @@ jobs:
           sudo podman run --rm localhost/marlin-tuna-vm:ci sh -c 'bootc --version; ls -ld /home; ls /usr/lib/bootc/install/ && cat /usr/lib/bootc/install/*' || true
           df -h / /mnt
       - name: Bind installed acceptance to the original package and immutable final image
-        if: matrix.profile == 'lifecycle'
+        if: matrix.profile == 'lifecycle' || matrix.profile == 'core-apps'
         env:
           PRODUCT_PACKAGE: ${{ steps.native-product.outputs.package_path }}
           PRODUCT_COMMIT: ${{ steps.native-product.outputs.product_commit }}
@@ -1779,12 +1801,13 @@ jobs:
           image_id=$(cat /mnt/vm/image-id)
           owned_container="tuna-strip-inspect-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           trap 'sudo podman rm -f "$owned_container" >/dev/null 2>&1 || true' EXIT
-          scripts/tuna-vm-strip-image --inspection-program > /mnt/vm/strip-inspect.py
+          scripts/tuna-vm-strip-image --fixture '${{ matrix.profile }}' --inspection-program > /mnt/vm/strip-inspect.py
           timeout --kill-after=5s 60s sudo podman run --rm --name "$owned_container" -i \
             --entrypoint /usr/bin/python3 "$image_id" - "$image_id" \
             < /mnt/vm/strip-inspect.py > /mnt/vm/strip-image-observed.json
-          scripts/tuna-vm-strip-image --package "$PRODUCT_PACKAGE" \
-            --observed /mnt/vm/strip-image-observed.json --commit "$PRODUCT_COMMIT" \
+          scripts/tuna-vm-strip-image --fixture '${{ matrix.profile }}' \
+            --package "${PRODUCT_PACKAGE:-tuna.pkg.tar.zst}" \
+            --observed /mnt/vm/strip-image-observed.json --commit "${PRODUCT_COMMIT:-$GITHUB_SHA}" \
             --capture-commit "$(git rev-parse HEAD)" --product-origin "$PRODUCT_ORIGIN" \
             --image-id "$image_id" \
             --base-image "ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)" \
@@ -1834,13 +1857,23 @@ jobs:
           PRODUCT_PACKAGE_BASENAME: ${{ steps.native-product.outputs.package_basename }}
           PRODUCT_COMMIT: ${{ steps.native-product.outputs.product_commit }}
         run: >-
-          scripts/tuna-vm-lane --disk /mnt/vm/disk.raw --out vm-lane-artifacts --boots 5 --tour --orca-contract ${{ matrix.orca }}
+          scripts/tuna-vm-lane --profile lifecycle --disk /mnt/vm/disk.raw --out vm-lane-artifacts --boots 5 --tour --orca-contract ${{ matrix.orca }}
           --strip-image vm-lane-artifacts/strip-image.json --strip-edge
           --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "tuna_package=$PRODUCT_PACKAGE_BASENAME"
           --meta "commit=$PRODUCT_COMMIT"
           --meta "capture_commit=$(git rev-parse HEAD)"
+      - name: Complete required original native Core applications
+        if: matrix.profile == 'core-apps'
+        run: >-
+          scripts/tuna-vm-lane --profile core-apps --require-kvm --boots 1
+          --disk /mnt/vm/disk.raw --out vm-lane-artifacts
+          --strip-image vm-lane-artifacts/strip-image.json
+          --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
+          --meta "test_image_id=$(cat /mnt/vm/image-id)"
+          --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
+          --meta "commit=${{ github.sha }}"
       - name: Seal real native screenshots and video only after all five boots succeed
         if: matrix.profile == 'lifecycle'
         env:
@@ -1854,7 +1887,7 @@ jobs:
             --expect-image "$(cat /mnt/vm/image-id)" \
             --expect-package "$(sha256sum "$PRODUCT_PACKAGE" | cut -d' ' -f1)"
       - name: Observe the actual paired native switcher member
-        if: matrix.profile != 'lifecycle'
+        if: matrix.profile != 'lifecycle' && matrix.profile != 'core-apps'
         env:
           REFERENCE_PROFILE: ${{ matrix.profile }}
         run: >-

@@ -46,6 +46,101 @@ alone does not bring that newer desktop source into the published image.
 A replacement release needs its own source/package/image binding and actual
 panel-follow proof; changing a version allowlist is not a repair.
 
+## Actual automatic-timezone stage
+
+`scripts/lib/core_apps_autotz.py` is a separate stage of the existing Core-app
+hosted Marlin journey, not an eleventh gate in the legacy collector and not
+another VM producer. Its typed guest observer is
+`packaging/marlin/vm-lane/core-apps/autotz.py`. The shared dispatcher/profile and
+image integration belong to that journey. Adding these observers does not
+qualify automatic timezone or close #359: a current-build admitted image must
+actually run them, and retain its package, boot, original GDM user, service,
+input and screenshot receipts.
+
+`core_apps_autotz.run_native(qmp, agent_factory, out, metadata, nonce=...)`
+is the independent current-build native consumer. It uses shared
+`vm_native_desktop.NativeDesktop` bounded QGA transport and the installed
+`tuna-native-session/{native_session,autotz_guest}.py` original-session
+identity/AT-SPI primitives. It does not import or inventory the 28 applications,
+wait for their success, launch a substitute desktop, or change the account's
+role. The separate typed lifecycle action is `autotz DOMAIN OPERATION JSON`;
+the shared router owns its image/member admission and `V-AUTOTZ` result.
+Actual original-user policy failures remain failures, not root positives.
+
+The source is GeoClue's **named New York static-location emulation, not GPS**:
+its documented `static-source` reads latitude, longitude, altitude and accuracy
+from `/etc/geolocation`. See the upstream
+[GeoClue configuration manual](https://man.archlinux.org/man/geoclue.5).
+`geoclue_fixture.py` installs only a nonce-owned source configuration and that
+location file, preserves their original bytes/ownership/modes and the original
+service state, and restores them afterward. It never changes an application
+authorization or agent whitelist. Maps/Weather reuse the same typed fixture
+operations; the stage does not create a fake provider or private service bus.
+
+The normal image, not this fixture, must admit the real `tuna-shell` agent.
+The packaged `tuna-geoclue-agent-policy` image-construction helper checks the
+native package database's original vendor-config checksum, retains its complete
+agent list and adds Tuna in an early fragment. It leaves later administrator
+overrides and every application grant untouched, refusing changed administrator
+main policy or an effective whitelist that still excludes Tuna. GeoClue
+whitelists replace rather than append, so a Tuna-only replacement is incorrect.
+The stage retains the actual original shell's successful `AddAgent` completion
+record and its exported Agent object's bus PID/UID; an absence of errors is
+not registration proof. This package/production hook still requires normal
+qualified-source intake; the old beta.2 archive contains no such helper.
+
+For pacman, the helper reads the effective database location from
+`pacman-conf DBPath`; immutable Marlin relocates it beneath `/usr`, so assuming
+`/var/lib/pacman/local` rejects a genuine installed package. The configured
+database and its package metadata must still be root-owned and immutable,
+the real file owner must be `geoclue`, and the current configuration must
+match that package's recorded backup checksum. A missing or malformed
+configured database is a failure, never a default-path fallback. Its actual
+database path is retained in the policy receipt. The isolated native-database
+regressions use genuine pacman queries and declared synthetic control packages;
+they do not qualify a signed image or the GeoClue runtime.
+
+The observer requires the session's genuine packaged `gsd-datetime` and
+GeoClue. [GNOME 51.1's actual timezone consumer](https://github.com/GNOME/gnome-settings-daemon/blob/51.1/plugins/datetime/gsd-timezone-monitor.c)
+obtains a city-level GeoClue location, then performs real reverse geocoding
+before it calls timedate1. The
+[GeocodeNominatim GNOME backend](https://github.com/GNOME/geocode-glib/blob/master/geocode-glib/geocode-nominatim.c)
+uses `https://nominatim.gnome.org`; the observer identifies that default in the
+original daemon's mapped packaged ELF without redirecting it. This backend
+identity is not network or application proof. The real provider must be
+reachable and the daemon's actual outcome must follow: a location file alone
+cannot prove that a zone was applied. An unavailable lookup is a failure,
+not a hardware waiver.
+
+The ordinary original user seeds `Pacific/Auckland` only as a manual negative
+control. Automatic timezone with the location master off, and the location
+master on with automatic timezone off, must each preserve that zone and the
+actual `/etc/localtime` for an entire ten-second observation window. Then a
+ready, bounded system-bus observer records the real datetime daemon's
+`SetTimezone` sender PID/UID while both settings are enabled. Within the
+initially specified 30-second external-service budget, the original daemon
+must receive the real New York location and timedate1 plus `/etc/localtime`
+must agree on `America/New_York`. The original shell's owner-bound AT-SPI clock
+and captured frame must follow within the existing ten-second/120-second
+clock bounds and exclude the old Auckland reading.
+
+Root never sets the timezone as the automatic positive; its only timezone
+write is cleanup restoring the saved original state. Cleanup first disables
+automatic changes, restores the source files/service, then restores the
+original timezone and settings. A missing owner, wrong caller, changed daemon,
+failed service, unavailable policy or incomplete cleanup cannot be a pass.
+The standalone semantic-validator tests exercise those rejection predicates;
+they are not image, GeoClue, network or panel evidence.
+
+The Core-app profile calls the idempotent guest `save` before preparing this
+source or running Maps/Weather, then calls `run(desktop, manage_fixture=False)`
+for automatic timezone. That mode borrows the same nonce-owned source and
+leaves restoration to the profile's outer `finally`: disable both settings,
+restore the GeoClue fixture, then restore the original timezone/settings.
+Its receipt explicitly names the profile as restoration owner, and the
+whole profile cannot qualify without those actual restoration readbacks.
+The default standalone mode owns the same complete cleanup sequence itself.
+
 ## Running
 
 Unit tests (no VM, no privileges, no clock writes):
@@ -110,12 +205,14 @@ This is the published image, so it runs main's shell, not this change.
   & Time and makes Date & Time editable (`21-masked-panel-reopened.png`);
   timedated does not signal the change, so an open panel keeps its rows
   until reopened, as in GNOME.
-- Automatic time zone is unmeasured: the published session starts no
-  settings-daemon plugins (`geoclue-auto-tz.txt`), and gsd-datetime
-  started by hand cannot get a GeoClue client (`Failed to connect to
-  GeoClue2 service: Timeout was reached`, `AvailableAccuracyLevel 0`,
-  `geoclue-gsd-datetime-probe.txt`); the VM has no Wi-Fi, modem or GPS
-  source. Hardware with a location source was not available.
+- Automatic time zone was unmeasured in this historical run: the published
+  session started no settings-daemon plugins (`geoclue-auto-tz.txt`), and
+  gsd-datetime started by hand could not get a GeoClue client (`Failed to
+  connect to GeoClue2 service: Timeout was reached`, `AvailableAccuracyLevel 0`,
+  `geoclue-gsd-datetime-probe.txt`). That run supplied no usable location source.
+  This does not establish that a VM requires GPS: the supported static source
+  above provides a legitimate emulated input, whose actual service/UI outcome
+  still needs current-build qualification.
 
 ## Scope limits
 
@@ -123,6 +220,7 @@ This is the published image, so it runs main's shell, not this change.
   are parser-shape captures, not Marlin evidence.
 - RTC hardware accuracy is out of scope: the gate checks the UTC
   policy only.
-- Automatic time zone through Geoclue is unqualified (above).
+- Automatic time zone through GeoClue remains unqualified until the actual
+  standalone stage runs on an admitted current-build hosted image.
 - Reboot persistence is Corral evidence only; the VM lane gates run
   within one boot.

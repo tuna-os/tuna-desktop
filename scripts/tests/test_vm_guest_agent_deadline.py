@@ -1,4 +1,7 @@
 """Real socket deadline controls; no VM or installed-session qualification."""
+import base64
+import contextlib
+import io
 import json
 from pathlib import Path
 import socket
@@ -20,6 +23,7 @@ class Tests(unittest.TestCase):
         actor.buffer = bytearray()
         actor.poisoned = False
         actor.pending_guest_pid = None
+        actor._caller_deadline = None
         self.addCleanup(right.close)
         self.addCleanup(actor.close)
         return actor, right
@@ -341,6 +345,55 @@ class Tests(unittest.TestCase):
             actor.command('guest-ping')
         self.assertTrue(actor.poisoned)
 
+    def test_actual_silent_exec_obeys_original_caller_deadline(self):
+        actor, peer = self.actor()
+        actor._caller_deadline = time.monotonic() + .05
+        requests = []
+        def consume(peer, stop):
+            raw = bytearray()
+            while not raw.endswith(b'\n'):
+                raw.extend(peer.recv(4096))
+            requests.append(json.loads(raw))
+            stop.wait(.2)
+        self.server(peer, consume)
+        began = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            actor.run('inventory', timeout=30)
+        self.assertLess(time.monotonic() - began, .7)
+        self.assertEqual([value['execute'] for value in requests], ['guest-exec'])
+        self.assertEqual(actor.guest_exec_state, 'unknown')
+        self.assertTrue(actor.poisoned)
+
+    def test_actual_constructor_handshake_obeys_caller_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'qga.sock')
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(path)
+            listener.listen(1)
+            listener.settimeout(1)
+            stop = threading.Event()
+            errors = []
+            def stall():
+                try:
+                    with listener.accept()[0] as peer:
+                        peer.recv(4096)
+                        stop.wait(.2)
+                except BaseException as error:
+                    errors.append(error)
+            thread = threading.Thread(target=stall)
+            thread.start()
+            began = time.monotonic()
+            try:
+                with self.assertRaises(TimeoutError):
+                    GuestAgent(path, deadline=began + .05)
+                self.assertLess(time.monotonic() - began, .7)
+            finally:
+                stop.set()
+                listener.close()
+                thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+
     def test_constructor_resets_partial_prefix_at_fragmented_delimiter(self):
         for fragmented in (False, True):
             with self.subTest(fragmented=fragmented), tempfile.TemporaryDirectory() as directory:
@@ -383,6 +436,62 @@ class Tests(unittest.TestCase):
                     thread.join(2)
                 self.assertFalse(thread.is_alive())
                 self.assertEqual(errors, [])
+
+    def test_direct_command_cannot_outlive_original_factory_deadline(self):
+        actor, _ = self.actor()
+        actor._caller_deadline = time.monotonic() + .05
+        began = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            actor.command('guest-ping', deadline=began + 30)
+        self.assertLess(time.monotonic() - began, .7)
+        self.assertTrue(actor.poisoned)
+
+    def test_nonfinite_operation_timeout_is_rejected_before_exec(self):
+        for timeout in (float('inf'), float('nan'), True, 0, -1):
+            actor, _ = self.actor()
+            with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                actor.run('core-apps', 'desktop', 'prepare', '{}', timeout=timeout)
+            self.assertIsNone(actor.pending_guest_pid)
+            self.assertFalse(actor.poisoned)
+
+
+    def test_core_failure_transport_emits_only_bounded_sanitized_receipt(self):
+        diagnostic = {'domain': 'desktop', 'operation': 'prepare', 'exception_type': 'RuntimeError',
+                      'sites': [{'module': 'guest.py', 'function': 'desktop', 'line': 44}]}
+        valid = {'core_apps_error': diagnostic}
+        invalid = [
+            {**valid, 'private': 'private field'},
+            {'core_apps_error': {**diagnostic, 'domain': []}},
+            {'core_apps_error': {**diagnostic, 'operation': 'private field'}},
+            {'core_apps_error': {**diagnostic, 'message': 'private field'}},
+            {'core_apps_error': {**diagnostic, 'sites': diagnostic['sites'] * 5}}]
+        for record in [valid, *invalid]:
+            actor, peer = self.actor()
+            def reply(peer, stop):
+                for value in ({'pid': 51}, {'exited': True, 'exitcode': 1,
+                        'out-data': base64.b64encode(json.dumps(record).encode()).decode(),
+                        'err-data': base64.b64encode(b'private stderr').decode()}):
+                    request = bytearray()
+                    while not request.endswith(b'\n'):
+                        request.extend(peer.recv(4096))
+                    request = json.loads(request)
+                    peer.sendall(json.dumps({'return': value, 'id': request['id']}).encode() + b'\n')
+            self.server(peer, reply)
+            stream = io.StringIO()
+            with self.subTest(record=record), contextlib.redirect_stdout(stream), \
+                    self.assertRaises(RuntimeError) as error:
+                actor.run('core-apps', 'desktop', 'prepare', '{}')
+            public = str(error.exception) + stream.getvalue()
+            self.assertNotIn('private', public)
+            if record is valid:
+                self.assertIn('RuntimeError', public)
+                self.assertIn('guest.py', public)
+            else:
+                self.assertEqual(stream.getvalue(), '')
+                self.assertNotIn('sites', str(error.exception))
+            self.assertEqual(actor.guest_exec_state, 'none')
+            self.assertIsNone(actor.pending_guest_pid)
+
 
 
 if __name__ == '__main__':

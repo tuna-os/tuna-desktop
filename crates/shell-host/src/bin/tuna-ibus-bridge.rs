@@ -6,11 +6,15 @@
 //! app has a text field focused it grabs the keyboard and sends each
 //! key to an IBus input context (`ProcessKeyEvent`); IBus's preedit and
 //! commits go to the app, and keys IBus does not take go back through
-//! the virtual keyboard only this client is allowed. Without IBus it
-//! starts `ibus-daemon --panel disable`, as GNOME Shell does. The
-//! compositor starts ibus-x11 separately once its own XWayland is ready,
-//! so XIM never connects to the inherited host DISPLAY. One
-//! GLib main loop drives both the Wayland socket and IBus's bus.
+//! the virtual keyboard only this client is allowed. It joins the
+//! session daemon's bus when one is coming up, and only provides its
+//! own `ibus-daemon --panel disable` (GNOME Shell's fallback) once no
+//! daemon process of this user has appeared within the grace period,
+//! so the bus never splits and nested sessions still get a working
+//! bridge. The compositor starts ibus-x11 separately once its own
+//! XWayland is ready, so XIM never connects to the inherited host
+//! DISPLAY. One GLib main loop drives both the Wayland socket and
+//! IBus's bus.
 //!
 //! IBus also hears what GNOME Shell tells it about the field: the text
 //! around the cursor (`SetSurroundingText`, and the engine's
@@ -226,8 +230,69 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// The IBus bus, starting the daemon when none runs (GNOME Shell's
-/// `ibus-daemon --panel disable`).
+/// Whether an `ibus-daemon` of this user is currently running.
+///
+/// Used to tell a session daemon that is still starting (wait for its
+/// bus) from a session that manages none (provide the bus, GNOME
+/// Shell's fallback). Only the uid's own daemons count: another
+/// user's bus is never this bridge's bus.
+fn daemon_process_running() -> bool {
+    daemon_process_running_at(std::path::Path::new("/proc"))
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn daemon_process_running_at(root: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let me = std::process::id();
+    let euid = rustix::process::getuid().as_raw();
+    let Ok(dir) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Ok(pid) = name.to_str().unwrap_or("").parse::<u32>() else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let base = root.join(pid.to_string());
+        let owned = std::fs::metadata(base.join("exe"))
+            .map(|m| m.uid() == euid)
+            .unwrap_or(false);
+        if !owned {
+            continue;
+        }
+        if std::fs::read(base.join("comm"))
+            .map(|bytes| bytes.as_slice() == b"ibus-daemon\n")
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if std::fs::read_link(base.join("exe"))
+            .map(|target| target.as_os_str().as_bytes().ends_with(b"/ibus-daemon"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The session IBus bus: the session daemon's when one is coming up,
+/// a provided one otherwise.
+///
+/// The session must never split across two buses: engines selected
+/// through `ibus address`, bus observers, and this bridge's input
+/// context must all share one bus, or keys bypass the engine and no
+/// preedit ever arrives (round-1004: an eager `--daemonize` fork here
+/// raced the session unit, and the IME leg saw zero preedit rows with
+/// a healthy libpinyin engine). So a fork happens only once no daemon
+/// process of this user has appeared within the grace period — a
+/// session that manages its own daemon (GNOME's user unit) is always
+/// joined, while a nested session with none still gets a working
+/// bridge (its G-X11-DEMAND proof requires a live bridge process).
 fn ibus_connection() -> Result<gio::DBusConnection, Box<dyn std::error::Error>> {
     let connect = |address: &str| {
         gio::DBusConnection::for_address_sync(
@@ -238,24 +303,35 @@ fn ibus_connection() -> Result<gio::DBusConnection, Box<dyn std::error::Error>> 
             None::<&gio::Cancellable>,
         )
     };
-    if let Some(address) = ibus_address() {
-        if let Ok(bus) = connect(&address) {
-            return Ok(bus);
-        }
-    }
-    std::process::Command::new("ibus-daemon")
-        .args(["--panel", "disable", "--daemonize"])
-        .status()?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
+    let start = Instant::now();
+    let fork_after = Duration::from_secs(45);
+    let deadline = Duration::from_secs(120);
+    let mut forked = false;
+    loop {
         if let Some(address) = ibus_address() {
             if let Ok(bus) = connect(&address) {
                 return Ok(bus);
             }
         }
+        let elapsed = start.elapsed();
+        if !forked && elapsed >= fork_after && !daemon_process_running() {
+            // Re-checked immediately before spawning to narrow the
+            // race with a concurrently starting session daemon.
+            if daemon_process_running() {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            let _ = std::process::Command::new("ibus-daemon")
+                .args(["--panel", "disable", "--daemonize"])
+                .status();
+            forked = true;
+        }
+        if elapsed >= deadline {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
-    Err("ibus-daemon did not come up".into())
+    Err("session ibus-daemon did not come up".into())
 }
 
 /// The bridge's IBus input context.
@@ -929,6 +1005,67 @@ mod tests {
         // Terminal, and date (no IBus purpose).
         assert_eq!(ibus_content_type(0, 13), (10, 0));
         assert_eq!(ibus_content_type(0, 10), (0, 0));
+    }
+
+    fn fake_proc(entries: &[(&str, &str, Option<&str>)]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for (pid, comm, exe) in entries {
+            let dir = root.path().join(pid);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("comm"), format!("{comm}\n")).unwrap();
+            match exe {
+                // Point at an euid-owned file so the ownership check
+                // passes exactly as it would for a real daemon.
+                Some(name) => {
+                    let target = root.path().join(name);
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    std::fs::write(&target, b"placeholder").unwrap();
+                    std::os::unix::fs::symlink(&target, dir.join("exe")).unwrap();
+                }
+                None => {
+                    std::fs::write(dir.join("exe"), b"placeholder").unwrap();
+                }
+            }
+        }
+        root
+    }
+
+    #[test]
+    fn daemon_detected_by_comm_name() {
+        let root = fake_proc(&[("4242", "ibus-daemon", None)]);
+        assert!(daemon_process_running_at(root.path()));
+    }
+
+    #[test]
+    fn daemon_detected_by_exe_path() {
+        let root = fake_proc(&[("4242", "wrapped", Some("usr/bin/ibus-daemon"))]);
+        assert!(daemon_process_running_at(root.path()));
+    }
+
+    #[test]
+    fn other_processes_do_not_count_as_daemon() {
+        let root = fake_proc(&[
+            ("4242", "ibus-x11", Some("usr/lib/ibus/ibus-x11")),
+            ("4243", "ibus-engine-libpinyin", None),
+            ("self", "slot", None),
+        ]);
+        assert!(!daemon_process_running_at(root.path()));
+    }
+
+    #[test]
+    fn own_bridge_process_never_counts_as_daemon() {
+        let me = std::process::id().to_string();
+        let root = fake_proc(&[(me.as_str(), "ibus-daemon", None)]);
+        assert!(!daemon_process_running_at(root.path()));
+    }
+
+    #[test]
+    fn missing_proc_root_means_no_daemon() {
+        let missing = std::path::Path::new("/definitely/not/proc");
+        assert!(!missing.exists());
+        assert!(!daemon_process_running_at(missing));
     }
 
     #[test]

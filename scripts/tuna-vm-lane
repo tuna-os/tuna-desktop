@@ -55,6 +55,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -3479,14 +3480,20 @@ class Recorder:
                 break
         with self.lock:
             self.still(card)
+            # The view had to be on screen and its frame retained by the
+            # deadline; decoding the already-retained PNG is a separate,
+            # fixed budget. A view that appears in the last second of the
+            # window left ffmpeg only milliseconds and was refused with
+            # TimeoutExpired though the frame was good (runs 42337013327,
+            # 42384050579: alt-tab unconfirmed, tour sealing refused).
+            within = time.monotonic() <= deadline
             exact = None
             decode_error = None
-            if ready:
+            if ready and within:
                 try:
-                    exact = self._exact_pixels(card, deadline)
+                    exact = self._exact_pixels(card, time.monotonic() + 10)
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
                     decode_error = type(error).__name__
-            within = time.monotonic() <= deadline
             confirmed = ready and exact is not None and within and bool(predicate(exact))
             evidence = {"predicate": predicate.__name__, "exact_png": exact is not None,
                         "within_deadline": within}
@@ -3951,13 +3958,15 @@ def run_soak(qmp, vm, agent_path, out, record, seconds, warmup, interval, revisi
 
 
 def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, native_relative_mouse=False,
-         observer_records=None, credentials=()):
+         observer_records=None, credentials=(), core_nonce=None):
     ovmf = next((p for p in OVMF if os.path.exists(p)), None)
     if not ovmf:
         sys.exit("tuna-vm-lane: OVMF firmware not found (install ovmf)")
     kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
     if require_kvm and not kvm:
         sys.exit("tuna-vm-lane: KVM required but /dev/kvm is not accessible; refusing emulation")
+    if core_nonce is not None and re.fullmatch("[0-9a-f]{32}", core_nonce) is None:
+        raise ValueError("disposable Core disk requires the exact Core consumer nonce")
     qmp_path = os.path.join(scratch, "qmp.sock")
     agent_path = os.path.join(scratch, "qga.sock")
     serial = os.path.join(out, "serial.log")
@@ -3977,6 +3986,13 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
             "-nic", "user,model=virtio-net-pci"]
     if native_relative_mouse:
         qemu.extend(["-device", "virtio-mouse-pci,id=tuna-relative-mouse"])
+    if core_nonce is not None:
+        fixture_disk = os.path.join(scratch, "core-apps-disposable.raw")
+        with open(fixture_disk, "xb") as stream:
+            stream.truncate(512 * 1024 * 1024)
+        qemu.extend(["-drive", f"file={fixture_disk},format=raw,if=none,id=core-apps-disposable",
+                     "-device", "usb-storage,drive=core-apps-disposable,removable=on,"
+                                "serial=TC397-" + core_nonce[:14]])
     for credential in credentials:
         # systemd imports SMBIOS type 11 io.systemd.credential: strings as
         # system credentials (ConditionCredential=).
@@ -4229,8 +4245,8 @@ def repeat_boots(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--profile", choices=("lifecycle", "gnome-reference", "tuna-reference"), default="lifecycle",
-                    help="explicit paired DEV member; ordinary Tuna lifecycle remains the default")
+    ap.add_argument("--profile", choices=("lifecycle", "core-apps", "gnome-reference", "tuna-reference"), default="lifecycle",
+                    help="ordinary lifecycle (default), required complete native Core consumer, or explicit paired DEV member")
     ap.add_argument("--reference-base-evidence",
                     help="actual normal-CI raw index and successful platform cosign verification directory")
     ap.add_argument("--disk", required=True)
@@ -4264,9 +4280,13 @@ def main():
                     help="observe only the first tunastd login: bounded AccountsService call/reply headers "
                          "and pre-existing allowlisted worker markers; never enable GDM debug")
     a = ap.parse_args()
+    if a.profile == "core-apps":
+        if (not a.require_kvm or not a.strip_image or a.tour or a.boots != 1 or a.soak
+                or a.fresh_accounts or a.published or a.strip_edge):
+            ap.error("native Core requires KVM, exact installed image admission and one pristine boot")
     if a.fresh_gdm_trace and not a.fresh_accounts:
         ap.error("--fresh-gdm-trace requires --fresh-accounts")
-    if a.profile != "lifecycle":
+    if a.profile in ("gnome-reference", "tuna-reference"):
         if not a.reference_base_evidence:
             ap.error("the paired consumer requires --reference-base-evidence")
         if (not a.require_kvm or a.tour or a.boots != 1 or a.soak or a.fresh_accounts
@@ -4290,8 +4310,8 @@ def main():
     if a.strip_edge and not a.strip_image:
         ap.error("--strip-edge requires exact installed image admission")
     if a.strip_image:
-        if not a.tour:
-            ap.error("--strip-image requires --tour lifecycle")
+        if not a.tour and a.profile != "core-apps":
+            ap.error("--strip-image requires --tour lifecycle or the native Core consumer")
         with open(a.strip_image, "rb") as stream:
             raw = stream.read(1048577)
         if len(raw) > 1048576:
@@ -4321,7 +4341,10 @@ def main():
         results[test_id] = (ok, desc)
         log(f"{test_id} {'pass' if ok else 'FAIL'}: {desc}")
 
-    vm, qmp_path, serial_path, kvm, agent_path = boot(os.path.abspath(a.disk), out, scratch, a.timeout, a.require_kvm, guest_agent=True, native_relative_mouse=True)
+    core_nonce = secrets.token_hex(16) if a.profile == "core-apps" else None
+    vm, qmp_path, serial_path, kvm, agent_path = boot(
+        os.path.abspath(a.disk), out, scratch, a.timeout, a.require_kvm,
+        guest_agent=True, native_relative_mouse=True, core_nonce=core_nonce)
     start = time.time()
     drm = shell = None
     elapsed = 0.0
@@ -4417,6 +4440,20 @@ def main():
             finally:
                 if agent is not None:
                     agent.close()
+            if a.profile == "core-apps":
+                try:
+                    if not manager_ready:
+                        raise RuntimeError("original installed native session owner admission failed")
+                    from core_apps import Desktop
+                    factory = lambda *, deadline: guest_agent.GuestAgent(agent_path, deadline=deadline)
+                    Desktop(qmp, factory, os.path.join(out, "core-apps"), strip_image,
+                            select_corner_mouse, nonce=core_nonce,
+                            auth_records=lambda: session_records(read_text(serial_path)),
+                            auth_refusal=pam_refusal_observed).run()
+                    record("V-CORE-APPS", True,
+                           "complete original installed Core consumer; not signed-release qualification")
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                    record("V-CORE-APPS", False, str(error))
             if a.soak and manager_ready:
                 run_soak(qmp, vm, agent_path, out, record, a.soak, a.soak_warmup, a.soak_interval,
                          a.soak_revision)
@@ -4472,6 +4509,8 @@ def main():
     results.setdefault("V-PANEL", (False, "session never came up, no screendump checked"))
     if a.soak:
         results.setdefault("V-SOAK", (False, "the session never became ready, so the soak did not run"))
+    if a.profile == "core-apps":
+        results.setdefault("V-CORE-APPS", (False, "original native session never admitted its required Core consumer"))
     # GDM starting its greeter on the login VT takes DRM master from the
     # running session; say so instead of leaving a bare pixel failure.
     paused = "tuna-compositor: drm: session paused" in text
@@ -4504,7 +4543,7 @@ def main():
     qemu_version = subprocess.run(["qemu-system-x86_64", "--version"], capture_output=True,
                                   text=True).stdout.splitlines()[0]
     manifest = {
-        "lane": "marlin-vm",
+        "lane": "marlin-vm" if a.profile == "lifecycle" else "native-core-apps",
         "orca_contract": a.orca_contract,
         "session": ("published Tuna Desktop flavor" if a.published else "source-built Tuna Desktop")
                    + " via shipped GDM PAM login, DRM/KMS backend",

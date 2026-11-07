@@ -1,0 +1,182 @@
+#!/usr/bin/python3
+"""Install normal distro apps/tools only in the explicit CI Core-app layer."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+APPS = (
+    'decibels', 'gnome-calculator', 'gnome-calendar', 'snapshot', 'gnome-characters',
+    'gnome-clocks', 'gnome-connections', 'gnome-console', 'gnome-contacts', 'baobab',
+    'gnome-disk-utility', 'simple-scan', 'papers', 'nautilus', 'gnome-font-viewer',
+    'yelp', 'loupe', 'gnome-logs', 'gnome-maps', 'gnome-music', 'gnome-control-center',
+    'gnome-software', 'gnome-system-monitor', 'gnome-text-editor', 'gnome-tour',
+    'showtime', 'gnome-weather', 'epiphany',
+)
+TOOLS = (
+    'ffmpeg', 'libpulse', 'pipewire', 'pipewire-pulse', 'pipewire-audio', 'wireplumber',
+    'gst-plugins-base', 'gst-plugins-good', 'gst-plugin-gtk4', 'gst-plugin-pipewire',
+    'localsearch', 'tinysparql', 'grilo-plugins', 'sane', 'v4l-utils', 'poppler',
+    'python-pillow', 'python-gobject', 'xdg-user-dirs', 'xdg-desktop-portal',
+    'xdg-desktop-portal-gnome', 'xdg-desktop-portal-gtk', 'evolution-data-server',
+    'folks', 'gvfs', 'wl-clipboard', 'ibus', 'ibus-libpinyin', 'fontconfig',
+    'radicale', 'python-bcrypt',
+    'tesseract', 'tesseract-data-eng', 'tesseract-data-chi_sim', 'geoclue', 'libgweather-4', 'gweather-locations',
+    'geocode-glib', 'tzdata', 'gnome-settings-daemon', 'tigervnc', 'xterm', 'xclip',
+    'xorg-fonts-misc', 'xorg-xkbcomp', 'xkeyboard-config', 'dbus', 'gnome-keyring',
+    'libsecret', 'ostree', 'flatpak', 'udisks2', 'e2fsprogs', 'polkit', 'util-linux',
+    'iproute2', 'xdg-utils', 'coreutils', 'kmod', 'curl', 'ca-certificates', 'gnome-user-docs',
+)
+FONT_URL = ('https://raw.githubusercontent.com/notofonts/noto-cjk/'
+            'f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf')
+FONT_SHA256 = '68a3fc98800b2a27b371f2fb79991daf3633bd89309d4ffaa6946fd587f375b5'
+# System CJK coverage for real session processes (IME preedit, OCR): a
+# different face from the Fonts control above, so the Fonts proof keeps its
+# pristine precondition (fc-match 'Noto Sans CJK JP' must not resolve to the
+# control family before the user-install flow runs).
+SYSTEM_FONT_URL = ('https://raw.githubusercontent.com/notofonts/noto-cjk/'
+                   'f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf')
+SYSTEM_FONT_SHA256 = '2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b'
+
+
+def output(*argv):
+    return subprocess.check_output(argv, text=True, timeout=30)
+
+
+def sha256(path):
+    result = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(65536), b''):
+            result.update(chunk)
+    return result.hexdigest()
+
+
+def packages():
+    return dict(line.split(' ', 1) for line in output('pacman', '-Q').splitlines())
+
+
+def main():
+    if os.geteuid() != 0 or os.environ.get('TUNA_CI_ONLY') != '1' or len(sys.argv) != 1:
+        raise RuntimeError('explicit root CI image-build installation only')
+    commit = os.environ.get('TUNA_SOURCE_COMMIT', '')
+    if re.fullmatch('[0-9a-f]{40}', commit) is None:
+        raise RuntimeError('exact current source commit required for Core-only image installation')
+    root = Path('/usr/share/tuna-core-apps')
+    root.mkdir(parents=True, exist_ok=True)
+    before = packages()
+    original = output('pacman', '-Q', 'tuna-desktop').strip()
+    uid = int(output('id', '-u', 'tuna-test').strip())
+    account_groups_before = output('id', '-nG', 'tuna-test').split()
+    if uid != 1000 or 'wheel' in account_groups_before:
+        raise RuntimeError('Core-only preboot standard-user role baseline differs')
+    subprocess.run(['usermod', '--append', '--groups', 'wheel', 'tuna-test'], check=True)
+    account_groups_after = output('id', '-nG', 'tuna-test').split()
+    if (set(account_groups_after) - set(account_groups_before) != {'wheel'}
+            or set(account_groups_before) - set(account_groups_after)):
+        raise RuntimeError('Core-only preboot primary-admin role delta differs')
+    # Use the base/current fixture's existing sync databases. No extra -Sy,
+    # guessed mirror fallback, root PackageKit transaction or shipping default.
+    subprocess.run(['pacman', '-S', '--needed', '--noconfirm', *APPS, *TOOLS], check=True)
+    if output('pacman', '-Q', 'tuna-desktop').strip() != original:
+        raise RuntimeError('normal app fixture changed the original installed Tuna package')
+    subprocess.run(['sha256sum', '--check', '/usr/share/tuna-vm/shipped-payload.sha256'], check=True)
+    after = packages()
+    added = {name: version for name, version in after.items() if name not in before}
+    changed = {name: {'before': before[name], 'after': after[name]} for name in before.keys() & after.keys()
+               if before[name] != after[name]}
+    removed = {name: version for name, version in before.items() if name not in after}
+    archives = []
+    cache = Path('/var/cache/pacman/pkg')
+    for name in sorted(added.keys() | changed.keys()):
+        version = after[name].split(':', 1)[-1]
+        for archive in sorted(cache.glob(name + '-' + version + '-*.pkg.tar.zst')):
+            record = {'name': name, 'version': after[name], 'archive': archive.name,
+                      'sha256': sha256(archive)}
+            signature = archive.with_name(archive.name + '.sig')
+            if signature.is_file():
+                record['signature_sha256'] = sha256(signature)
+            archives.append(record)
+    font = root / 'NotoSansCJKjp-Regular.otf'
+    subprocess.run(['curl', '--fail', '--location', '--proto', '=https', '--tlsv1.2',
+                    '--output', str(font), FONT_URL], check=True)
+    if sha256(font) != FONT_SHA256:
+        raise RuntimeError('immutable official font payload bytes differ')
+    # The control payload doubles as the portal control document and must stay
+    # out of fontconfig's view: the Fonts proof requires fc-match
+    # 'Noto Sans CJK JP' to miss the control family until the user-install
+    # flow runs (round-1004: linking the control itself failed that gate).
+    # Real session processes still need CJK coverage from first boot
+    # (round-1004: preedit rendered as tofu with no resolvable CJK face), so
+    # install the Simplified Chinese face system-wide instead: it renders the
+    # IME preedit for OCR but never satisfies the JP-family precondition.
+    system_font = root / 'NotoSansCJKsc-Regular.otf'
+    subprocess.run(['curl', '--fail', '--location', '--proto', '=https', '--tlsv1.2',
+                    '--output', str(system_font), SYSTEM_FONT_URL], check=True)
+    if sha256(system_font) != SYSTEM_FONT_SHA256:
+        raise RuntimeError('immutable official system font payload bytes differ')
+    link = Path('/usr/share/fonts/NotoSansCJKsc-Regular.otf')
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(system_font)
+    subprocess.run(['fc-cache', '-f'], check=True)
+    # Standard per-user XDG directories are established by tmpfiles before GDM,
+    # not a replacement media indexer or a private product application launch.
+    (root / 'user-dirs.dirs').write_text(
+        'XDG_DESKTOP_DIR="$HOME/Desktop"\nXDG_DOWNLOAD_DIR="$HOME/Downloads"\n'
+        'XDG_TEMPLATES_DIR="$HOME/Templates"\nXDG_PUBLICSHARE_DIR="$HOME/Public"\n'
+        'XDG_DOCUMENTS_DIR="$HOME/Documents"\nXDG_MUSIC_DIR="$HOME/Music"\n'
+        'XDG_PICTURES_DIR="$HOME/Pictures"\nXDG_VIDEOS_DIR="$HOME/Videos"\n')
+    tmpfiles = Path('/usr/lib/tmpfiles.d/tuna-core-apps.conf')
+    tmpfiles.write_text(
+        'd /home/tuna-test/.config 0700 tuna-test tuna-test -\n'
+        'C /home/tuna-test/.config/user-dirs.dirs 0644 tuna-test tuna-test - /usr/share/tuna-core-apps/user-dirs.dirs\n'
+        + ''.join('d /home/tuna-test/' + directory + ' 0700 tuna-test tuna-test -\n'
+                  for directory in ('Desktop', 'Downloads', 'Templates', 'Public', 'Documents', 'Music', 'Pictures', 'Videos',
+                                    'tuna-core-apps', 'tuna-core-apps/media-sane')))
+    environment = Path('/usr/share/tuna-vm/environment.conf')
+    with environment.open('a') as stream:
+        stream.write('SANE_CONFIG_DIR=/home/tuna-test/tuna-core-apps/media-sane\n')
+    groups = output('id', '-nG', 'tuna-test').split()
+    if output('id', '-u', 'tuna-test').strip() != '1000' or 'wheel' not in groups:
+        raise RuntimeError('declared nonroot primary-admin fixture role differs')
+    policy_files = {}
+    for directory in (Path('/usr/share/polkit-1/rules.d'), Path('/etc/polkit-1/rules.d')):
+        if directory.is_dir():
+            policy_files.update({str(file): sha256(file) for file in sorted(directory.glob('*.rules')) if file.is_file()})
+    observer_files = [Path('/usr/libexec/tuna-core-apps') / (name + '.py') for name in
+                      ('guest', 'native', 'basic', 'data', 'media', 'system', 'web', 'autotz', 'geoclue_fixture')]
+    observer_files.extend(Path('/usr/libexec') / name
+                          for name in ('tuna-core-apps-install', 'tuna-vm-lifecycle'))
+    observer_files.append(Path('/usr/libexec/tuna-geoclue-agent-policy'))
+    observer_files.append(Path('/usr/libexec/tuna-native-session/native_session.py'))
+    observer_sha256 = {str(file): sha256(file) for file in observer_files}
+    receipt = {
+        'schema': 1, 'scope': 'explicit CI-only normal Arch app/tool installation, not default shipping image',
+        'source_commit': commit, 'observer_sha256': observer_sha256,
+        'original_tuna_package': original, 'requested_apps': list(APPS), 'requested_tools': list(TOOLS),
+        'before': before, 'after': after, 'added': added, 'changed': changed, 'removed': removed,
+        'cached_original_package_archives': archives,
+        'normal_sync_metadata': output('pacman', '-Si', *APPS, *TOOLS),
+        'font': {'url': FONT_URL, 'sha256': FONT_SHA256, 'bytes': font.stat().st_size,
+                 'control_only_not_installed': True},
+        'system_font': {'url': SYSTEM_FONT_URL, 'sha256': SYSTEM_FONT_SHA256,
+                        'bytes': system_font.stat().st_size, 'installed': str(link)},
+        'account': {'name': 'tuna-test', 'uid': uid, 'groups': groups,
+                    'groups_before': account_groups_before, 'groups_after': account_groups_after,
+                    'added_groups': sorted(set(account_groups_after) - set(account_groups_before)),
+                    'removed_groups': sorted(set(account_groups_before) - set(account_groups_after)),
+                    'role_change_before_boot': True, 'policy_authorization_bypassed': False,
+                    'scenario': 'ordinary-nonroot-primary-admin',
+                    'scope': 'explicit fixture; not GIS, sudo, standard-user or policy authorization proof'},
+        'stock_effective_polkit_rule_sha256': policy_files,
+        'installed_signed_release_qualified': False,
+    }
+    (root / 'installation.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    Path('/usr/share/tuna-vm/fixture-packages.txt').write_text(output('pacman', '-Q'))
+
+
+if __name__ == '__main__':
+    main()
