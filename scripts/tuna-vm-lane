@@ -3987,19 +3987,20 @@ def run_soak(qmp, vm, agent_path, out, record, seconds, warmup, interval, revisi
 
 def gpu_devices_for_receipt(explicit_sync=False):
     if explicit_sync:
-        # virtio-gpu-gl is the first graphics console (QMP screendump's
-        # default) and the session GPU; std VGA is added after it only to
-        # give the guest a boot VGA. Solo topologies cannot surface: with
-        # -vga none and no VGA at all the greeter never presents (run
-        # 41866163092). The compositor's primary GPU selection skips the
-        # KMS-only bochs boot GPU (run 42336367004: it opened card0, whose
-        # software EGL display has no device, so explicit sync and dmabuf
-        # feedback were off) for the rendering virtio-gpu.
-        return ["-vga", "none",
-                "-device", "pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1",
+        # Dual GPU: the default std VGA is the first graphics console, so
+        # QMP screendump (the independent capture) has a surface and the
+        # guest has a boot VGA; virtio-gpu-gl-pci is the rendering GPU.
+        # QEMU 10.2.1 gives a virgl console no screendump surface at all
+        # ("no surface", runs 41872623362 and 42342195558: virtio-gpu first
+        # or alone), and without any boot VGA the greeter never presents
+        # (run 41866163092). The session compositor now selects the
+        # rendering virtio-gpu over the KMS-only bochs boot GPU (run
+        # 42336367004: card0 bochs has no EGL device, so explicit sync and
+        # dmabuf feedback were off); presenting that output to the VGA
+        # console QMP can capture needs a secondary-GPU scanout copy.
+        return ["-device", "pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1",
                 "-device", "virtio-gpu-gl-pci,bus=tuna-gpu-port,"
-                           f"xres={WIDTH},yres={HEIGHT}",
-                "-device", "VGA"]
+                           f"xres={WIDTH},yres={HEIGHT}"]
     return baseline.gpu_devices()
 
 
@@ -4602,7 +4603,7 @@ def main():
         "resolution": f"{WIDTH}x{HEIGHT}",
         "kvm": kvm,
         "qemu": qemu_version,
-        "gpu_profile": "virtio-gl-first-console-plus-std-vga-v5" if a.explicit_sync else baseline.GPU_PROFILE,
+        "gpu_profile": "std-vga-plus-virtio-gl-render-v4" if a.explicit_sync else baseline.GPU_PROFILE,
         "gpu_devices": gpu_devices_for_receipt(a.explicit_sync),
         "gpu_display": "egl-headless" if a.explicit_sync else "none",
         "session_up_s": round(elapsed) if drm and shell else None,

@@ -2341,17 +2341,15 @@ class BootApi(unittest.TestCase):
             with self.assertRaises(ValueError):
                 lane.boot("disk.raw", "/out", "/scratch", 30, observer_records="/out/observer-records.log")
 
-    def test_explicit_sync_boot_orders_virtio_gl_before_the_boot_vga(self):
+    def test_explicit_sync_boot_keeps_std_vga_for_display_and_virgl_for_render(self):
         env = {"LIBGL_ALWAYS_SOFTWARE": "1", "GALLIUM_DRIVER": "llvmpipe"}
         with patch.object(lane.os.path, "exists", return_value=True), patch.object(lane.os, "access", return_value=True), patch.object(lane.subprocess, "Popen") as spawn, patch.dict(lane.os.environ, env, clear=False):
             lane.boot("disk.raw", "/out", "/scratch", 30, explicit_sync_gpu=True)
             command = spawn.call_args.args[0]
             self.assertEqual(command[command.index("-display") + 1], "egl-headless")
-            self.assertEqual(command[command.index("-vga") + 1], "none")
+            self.assertNotIn("-vga", command)
             self.assertIn("pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1", command)
-            virtio = command.index(f"virtio-gpu-gl-pci,bus=tuna-gpu-port,xres={lane.WIDTH},yres={lane.HEIGHT}")
-            # The first graphics console is QMP screendump's default.
-            self.assertLess(virtio, command.index("VGA"))
+            self.assertIn(f"virtio-gpu-gl-pci,bus=tuna-gpu-port,xres={lane.WIDTH},yres={lane.HEIGHT}", command)
             self.assertFalse(any("virtio-vga" in value for value in command))
 
     def test_explicit_sync_devices_match_the_receipt_launcher(self):
