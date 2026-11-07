@@ -35,9 +35,9 @@ schedule, dispatch or a pull request whose head repository is
 
 | Runner | Lanes |
 | --- | --- |
-| `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, parity-ledger, docs-shots, ci-gate |
+| `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, native-reference-context, parity-ledger, docs-shots, ci-gate |
 | `tuna-ci-26.04` | journey, orca-speech, portal-security, remote-security, niri-parity |
-| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (both matrix legs), marlin-image |
+| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (pull requests: the primary lifecycle leg only; push, schedule and dispatch add the Orca 51 leg and both paired reference members), marlin-image (push, schedule and dispatch only), gdm51-native-package |
 
 Why the always-hosted lanes stay hosted:
 
@@ -57,6 +57,12 @@ Why the always-hosted lanes stay hosted:
   so a compromised long-lived node (or its shared image store) can never
   sign or push a release image.
 
+The required `gdm51-native-package` factory remains GitHub-hosted and feeds
+only the ordinary lifecycle images' final GDM overlay and fresh-account
+admission. The paired GNOME/Tuna members keep their shared
+`Containerfile.reference`, original `104870` platform payload and stock GDM;
+they do not apply that overlay or relax the original byte inventory.
+
 journey once failed self-hosted in "Qualify disposable Debian lifecycle"
 (`end of file on stdin at conffile prompt`); that came from #899 changing
 the tuna-lock conffile, which fails hosted runs too, not from the runners
@@ -65,6 +71,28 @@ remote-security, niri-parity) use the pods' rootless podman.
 
 Other workflows (`stress`, `fuzz`, `baseline`, …) still use GitHub-hosted
 runners; the same aliases can move them.
+
+## Private GTK AT-SPI comparison dependency
+
+`grid-cancel-comparison` stages Ubuntu GTK `4.14.5+ds-0ubuntu0.10` with
+upstream commit `21d3eb76b68d6758122eddaf00b5823f9b2d7f34` using the existing
+workflow-owned `ci-tool` action. The installer checks both Ubuntu source
+archive hashes and the patch hash; it retains the license, Ubuntu patch
+series, build options, compiler identity and runtime ELF hash/build ID.
+The host GTK and runner image are not replaced. Only this job activates the
+private library through `LD_LIBRARY_PATH`, identically for the unchanged old
+and fixed product roles. Cache publication remains restricted to trusted main.
+
+Before either product role runs, `gtk-atspi-root-proof` uses separate private
+D-Bus/Xvfb sessions to require stock GTK's actual SIGSEGV negative control and
+the repaired runtime's real AT-SPI behavior: named visible children resolve,
+an invisible-tail index and an index with all windows hidden return remote
+InvalidArgument, and valid children remain queryable after remapping.
+The proof checks the mapped patched ELF against the source-build receipt.
+Its receipts and build provenance accompany the comparison artifact; core
+dumps are disabled for this dependency fixture. This toolkit regression proof
+is not product acceptance: the old-negative/fixed-positive Escape comparison
+and all selected exact-head lanes must still pass.
 
 ## Keep required checks on the workflow's tested source
 
@@ -122,6 +150,37 @@ distinguishes open-endpoint `WouldBlock` from actual shutdown/EOF, and
 requires terminal failed-redial I/O before judging native-output revocation.
 All eleven deliberate closure fixtures use that convention. No production
 state transition, polling interval, acceptance guard or test is removed.
+
+The maintained-media check additionally needs read-only Actions access to
+authenticate the exact uploaded source-artifact bytes before replaying
+receipts against proposed canonical media; dependency auditing remains
+tokenless and fatal. Its real recording tests require FFmpeg (including
+`ffprobe`) and Pillow in the check job, not just in a capture producer.
+The GDM 51 final overlay belongs to the lifecycle images after the
+distribution/Orca branches. The paired GNOME/Tuna reference rows retain
+their separately admitted immutable base, while lifecycle image receipts
+retain the verified native platform digest rather than rereading a mutable
+tag after the build. These are source and admission contracts, not a claim
+that this merge has runtime or current-image qualification.
+
+## What a pull request runs
+
+Hosted minutes are the scarce resource, so a pull request pays only for what
+it can affect:
+
+- `select-lanes` and `check` always run; a **draft** pull request runs nothing
+  else (marking it ready for review starts the proof lanes).
+- Every proof lane waits for `check` (`needs: check`, directly or through
+  `arch-package`), so a red `check` does not also burn the lanes.
+- `scripts/ci-select-lanes` picks the lanes: docs, other non-runtime files and
+  the tooling of other workflows (its `NO_LANE` list) pick none, a lane's own
+  proof script picks that lane, an edit confined to some lane jobs of `ci.yml`
+  picks those lanes, and any other code picks `gtk-shell` plus a rotating
+  slice. Shared CI inputs still pick every lane.
+- A newer push supersedes the older run (`concurrency` with
+  `cancel-in-progress`, except for `main`).
+- `marlin-tuna-nightly` qualifies the published image on schedule and
+  dispatch only; dispatch it on a branch to test a change to it.
 
 ## Queue supersession and closed pull requests
 

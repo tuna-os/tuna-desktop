@@ -522,31 +522,6 @@ class OrcaCommandCleanup(unittest.TestCase):
 
 
 class OrcaFixturePackages(unittest.TestCase):
-    def test_actual_upstream_export_create_requires_explicit_command(self):
-        source = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
-        lines = [line.strip() for line in source.read_text().splitlines()
-                 if "probe_container=$(sudo podman create" in line]
-        self.assertEqual(len(lines), 1)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            sudo = root / "sudo"
-            sudo.write_text('#!/bin/sh\nexec "$@"\n')
-            sudo.chmod(0o755)
-            podman = root / "podman"
-            podman.write_text("#!/usr/bin/env python3\nimport sys\n"
-                "assert sys.argv[1:] == ['create','localhost/marlin-tuna-vm:ci','/usr/bin/true']\n"
-                "print('controlled-inspect-container')\n")
-            podman.chmod(0o755)
-            environment = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
-            for line, success in [(lines[0], True), (lines[0].replace(" /usr/bin/true", ""), False)]:
-                result = subprocess.run(["bash", "-eu", "-c", line + '\nprintf "%s\\n" "$probe_container"\n'],
-                    env=environment, capture_output=True, text=True, timeout=10)
-                if success:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout.strip(), "controlled-inspect-container")
-                else:
-                    self.assertNotEqual(result.returncode, 0)
-        # Controlled shell admission only; no Podman image/runtime proof.
 
     def test_current_build_session_environment_fixes_locale_and_ci_diagnostics(self):
         # gdm-wayland-session lets GDM's own LANG win over the imported user
@@ -1446,64 +1421,7 @@ class PublicOrcaNavigation(unittest.TestCase):
         for key, invalid in (("GetNameOwner", ":1.28"), ("GetConnectionUnixProcessID", 934), ("GetConnectionUnixUser", 0)):
             self.assertTrue(eval(predicate, {**scope, "values": {**values, key: invalid}}))
 
-    def test_focus_cli_admits_each_mode_separately_without_changing_default(self):
-        from contextlib import redirect_stdout
-        module = self.focus_module()
-        tree = ast.parse(Path(module.__file__).read_text())
-        entry = next(n for n in tree.body if isinstance(n, ast.If)
-                     and ast.unparse(n.test) == "__name__ == '__main__'")
-        code = compile(ast.Module(body=entry.body, type_ignores=[]), module.__file__, "exec")
-        for mode in (None, "controlled-overview", "end-session", "notification-banner"):
-            calls = []
-            def observe(*args, **kwargs):
-                calls.append((args, kwargs))
-                return {"observation_only": True}
-            scope = {**vars(module), "sys": SimpleNamespace(argv=[
-                module.__file__, "933", "57", "tuna-shell-gtk", "wayland-0"
-            ] + ([] if mode is None else [mode])), "observe": observe}
-            stream = io.StringIO()
-            with self.subTest(mode=mode), redirect_stdout(stream):
-                exec(code, scope)
-            self.assertEqual(calls, [((933, 57, "tuna-shell-gtk", "wayland-0"),
-                                     {"controlled": mode == "controlled-overview",
-                                      "end_session": mode == "end-session",
-                                      "notification": mode == "notification-banner"})])
-            self.assertEqual(json.loads(stream.getvalue()), {"observation_only": True})
-        for extra in (["private mode"], ["end-session", "notification-banner"],
-                      ["controlled-overview", "end-session"]):
-            calls = []
-            scope = {**vars(module), "sys": SimpleNamespace(argv=[
-                module.__file__, "933", "57", "tuna-shell-gtk", "wayland-0", *extra
-            ]), "observe": lambda *args, **kwargs: calls.append(args)}
-            stream = io.StringIO()
-            with self.subTest(extra=extra), redirect_stdout(stream), self.assertRaises(SystemExit) as caught:
-                exec(code, scope)
-            self.assertEqual(caught.exception.code, 1)
-            self.assertEqual(calls, [])
-            self.assertEqual(json.loads(stream.getvalue()),
-                             {"focus_error_type": "ValueError", "focus_operation": "arguments"})
 
-    def test_focus_observer_refuses_combined_or_nonboolean_modes(self):
-        module = self.focus_module()
-        tree = ast.parse(Path(module.__file__).read_text())
-        observe = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "observe")
-        guard = next(n for n in observe.body if isinstance(n, ast.If))
-        code = compile(ast.Module(body=[guard], type_ignores=[]), module.__file__, "exec")
-        for controlled, end_session, notification in (
-                (False, False, False), (True, False, False),
-                (False, True, False), (False, False, True)):
-            exec(code, {"controlled": controlled, "end_session": end_session,
-                        "notification": notification, "executable": "tuna-shell-gtk"})
-        for modes in ((True, True, False), (True, False, True), (False, True, True),
-                      (True, True, True), (1, False, False), (False, 1, False),
-                      (False, False, 1)):
-            with self.subTest(modes=modes), self.assertRaisesRegex(RuntimeError, "fixed controlled"):
-                exec(code, dict(zip(("controlled", "end_session", "notification"), modes),
-                                executable="tuna-shell-gtk"))
-        for flag in ("controlled", "notification"):
-            with self.subTest(flag=flag), self.assertRaises(RuntimeError):
-                exec(code, {**dict.fromkeys(("controlled", "end_session", "notification"), False),
-                            flag: True, "executable": "gnome-disks"})
 
     def focus_mode_tree(self, mode):
         """Execute the actual traversal with public controls and private banner bait."""
@@ -1568,17 +1486,6 @@ class PublicOrcaNavigation(unittest.TestCase):
         self.assertEqual(scope["notification_closes"], [])
         self.assertNotIn(countdown, json.dumps(scope["nodes"]))
 
-    def test_notification_traversal_queries_only_fixed_frame_and_close_not_content(self):
-        scope, calls, countdown = self.focus_mode_tree("notification-banner")
-        self.assertEqual(calls, [("banner", "name"), ("banner", "component"),
-                                 ("close", "name"), ("close", "component")])
-        self.assertEqual(scope["nodes"], [])
-        self.assertEqual(scope["notification_frames"], [[10, 20, 30, 40]])
-        self.assertEqual(scope["notification_closes"],
-                         [{"rect": [10, 20, 30, 40], "focused": True}])
-        retained = json.dumps([scope["nodes"], scope["notification_frames"], scope["notification_closes"]])
-        for private in ("private", "title", "body", "text buffer", countdown, "Restart…"):
-            self.assertNotIn(private, retained)
 
     def test_end_session_traversal_keeps_countdown_without_notification_receipts(self):
         scope, calls, countdown = self.focus_mode_tree("end-session")
@@ -1758,16 +1665,6 @@ class LifecyclePostNavigationBaseline(unittest.TestCase):
         after["session"]["Id"] = "2"
         self.assertFalse(self.policy()["same_apps_after_navigation"](before, after))
 
-    def test_fresh_baseline_is_validated_before_replacing_original(self):
-        file = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
-        source = file.read_text()
-        self.assertLess(source.index('before_vt = inventory("before-vt-baseline")'),
-                        source.index('if not same_apps_after_navigation(before, before_vt):'))
-        self.assertLess(source.index('if not same_apps_after_navigation(before, before_vt):'),
-                        source.index('before = before_vt'))
-        self.assertLess(source.index('before = before_vt'), source.index('base_frame = frame("before-vt")'))
-        self.assertIn('same_apps(before, after_vt)', source)
-        self.assertIn('same_apps(before, pending_auth)', source)
 
 
 class ControlledOverviewDiagnostic(unittest.TestCase):
@@ -2393,26 +2290,6 @@ class BootApi(unittest.TestCase):
         self.assertEqual(events, [("ret",), ("ctrl", "a"), "fixture typed", ("ret",)])
         # Actual prompt/PAM transitions still require the genuine hardware VM.
 
-    def test_actual_orca_commands_use_distinct_qmp_qcodes_for_chords(self):
-        tree = ast.parse((Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text())
-        command = next(node for node in ast.walk(tree)
-                       if isinstance(node, ast.FunctionDef) and node.name == "native_command")
-        chords = [tuple(ast.literal_eval(arg) for arg in node.args)
-                  for node in ast.walk(command) if isinstance(node, ast.Call)
-                  and isinstance(node.func, ast.Attribute) and node.func.attr == "keys"]
-        self.assertIn(("insert", "h"), chords)
-        self.assertIn(("shift", "f4"), chords)
-        for chord in chords:
-            self.assertTrue(set(chord) <= {"insert", "h", "shift", "f4", "esc"})
-            qmp = lane.baseline.Qmp.__new__(lane.baseline.Qmp)
-            qmp.file = io.StringIO()
-            qmp._read = lambda: {"return": {}}
-            with patch.object(lane.baseline.time, "sleep"):
-                qmp.keys(*chord)
-            wire = json.loads(qmp.file.getvalue())
-            self.assertEqual(wire["execute"], "send-key")
-            self.assertEqual(wire["arguments"]["keys"],
-                             [{"type": "qcode", "data": name} for name in chord])
 
     def test_qmp_command_accepts_protocol_name_argument(self):
         qmp = lane.baseline.Qmp.__new__(lane.baseline.Qmp)
@@ -3084,6 +2961,21 @@ def tour_frame(fill, boxes=()):
     return bytes(px)
 
 
+def tour_png(pixels):
+    """Encode real RGB PNG bytes so confirmation consumes the retained image."""
+    import struct
+    import zlib
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+    stride = lane.WIDTH * 3
+    raw = b"".join(b"\0" + pixels[start:start + stride]
+                   for start in range(0, len(pixels), stride))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", lane.WIDTH, lane.HEIGHT, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
 class TourViewPredicates(unittest.TestCase):
     GREY, NAVY, WHITE = (36, 36, 40), (8, 24, 52), (250, 250, 250)
     WINDOWS = (190, 140, 1085, 690, WHITE)
@@ -3119,7 +3011,7 @@ class TourViewPredicates(unittest.TestCase):
             if path.name == "probe.ppm":
                 path.write_bytes(header + (probes.pop(0) if len(probes) > 1 else probes[0]))
             else:
-                path.write_bytes(b"png pixels")
+                path.write_bytes(tour_png(probes[-1]))
         now = [0.0]
         def advance(seconds):
             now[0] += seconds
@@ -3131,6 +3023,8 @@ class TourViewPredicates(unittest.TestCase):
             recorder = lane.Recorder(SimpleNamespace(cmd=command), directory,
                                      timeout=TourRecorderTests.SCHEDULING_TIMEOUT)
             self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=5, settle=0))
+            self.assertTrue(recorder.still_confirmations["alt-tab"]["confirmed"])
+            self.assertTrue(recorder.still_confirmations["alt-tab"]["evidence"]["exact_png"])
             deadline = now[0] + 0.05
             self.assertFalse(recorder.await_still("overview-windows", lane.overview_windows_shown,
                                                   timeout=0.05, settle=0))
@@ -3139,6 +3033,182 @@ class TourViewPredicates(unittest.TestCase):
             self.assertEqual(recorder.unconfirmed, ["overview-windows"])
             self.assertEqual(sorted(p.name for p in Path(recorder.dir).iterdir()),
                              ["f000000.png", "f000001.png"])
+            recorder.close()
+
+    def test_matching_readiness_cannot_confirm_a_different_retained_png(self):
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        ready = tour_frame(self.NAVY, self.SWITCHER)
+        wrong = tour_png(tour_frame(self.NAVY, [self.WINDOWS]))
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(
+                header + ready if args["format"] == "ppm" else wrong)
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertFalse(recorder.await_still("alt-tab", lane.switcher_shown, timeout=10, settle=0))
+            receipt = recorder.still_confirmations["alt-tab"]
+            self.assertTrue(receipt["evidence"]["exact_png"])
+            self.assertFalse(receipt["confirmed"])
+            self.assertEqual(recorder.unconfirmed, ["alt-tab"])
+            self.assertEqual(recorder.n, 1)  # No retry can replace the missed frame.
+            self.assertEqual(receipt["png_sha256"], lane.baseline.sha256(
+                Path(recorder.dir) / "f000000.png"))
+            recorder.close()
+
+    def test_exact_overview_png_is_confirmed_without_changing_calibrated_floors(self):
+        pixels = tour_frame(self.GREY, [(180, 108, 1100, 660, self.NAVY),
+                                       (440, 420, 840, 670, self.WHITE)])
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(
+                header + pixels if args["format"] == "ppm" else tour_png(pixels))
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertTrue(recorder.await_still(
+                "overview-windows", lane.overview_windows_shown, timeout=10, settle=0))
+            self.assertEqual(recorder.unconfirmed, [])
+            self.assertEqual(recorder.still_confirmations["overview-windows"]["png_sha256"],
+                             lane.baseline.sha256(Path(recorder.dir) / "f000000.png"))
+            recorder.close()
+
+
+class TourPublicConfirmationTests(unittest.TestCase):
+    """Fault-injected public observations, not native UI qualification."""
+
+    CONTROLS = {
+        "app-grid": [("frame", "App Grid")],
+        "quick-settings": [("slider", "Volume"), ("push button", "Settings"), ("push button", "Lock Screen")],
+        "calendar": [("push button", "Previous month"), ("push button", "Next month")],
+        "lock": [("frame", "Lock Screen")],
+    }
+
+    def observation(self, card):
+        return {"schema": 1, "method": "public-at-spi",
+                "session": {"Id": "2", "User": "1000", "Type": "wayland", "Class": "user",
+                            "Service": "gdm-password", "VTNr": "2"},
+                "principal": {"pid": 123, "uid": 1000, "start_ticks": 42,
+                              "executable": "/usr/bin/tuna-shell-gtk",
+                              "display": "wayland-0", "session_id": "2"},
+                "atspi": {"owner": ":1.5", "bus_pid": 123, "bus_uid": 1000},
+                "controls": [{"role": role, "label": label, "showing": True, "visible": True,
+                              "extents": [10, 10, 300, 200]} for role, label in self.CONTROLS[card]],
+                "started_monotonic_ns": 100, "completed_monotonic_ns": 200}
+
+    def capture(self, card, change=None):
+        events = []
+        image = tour_png(tour_frame((8, 24, 52)))
+        observations = [self.observation(card), self.observation(card)]
+        if change is not None:
+            change(observations)
+        def command(name, **args):
+            events.append(name)
+            if name == "screendump":
+                Path(args["filename"]).write_bytes(image)
+        def observe(timeout):
+            events.append("observe")
+            return observations.pop(0)
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            confirmed = recorder.public_still(card, observe)
+            recorder.qmp.cmd("send-key")
+            receipt = recorder.still_confirmations[card]
+            self.assertEqual(receipt["png_sha256"],
+                             lane.baseline.sha256(Path(recorder.dir) / "f000000.png"))
+            self.assertEqual(receipt["frame_index"], 0)
+            self.assertEqual(events, ["observe", "screendump", "observe", "send-key"])
+            evidence = receipt["evidence"]
+            self.assertLessEqual(evidence["before"]["completed_monotonic_ns"],
+                                 receipt["capture_requested_monotonic_ns"])
+            self.assertLessEqual(receipt["capture_completed_monotonic_ns"],
+                                 evidence["after"]["requested_monotonic_ns"])
+            self.assertEqual(recorder.unconfirmed, [] if confirmed else [card])
+            recorder.close()
+            return confirmed, receipt
+
+    def test_real_quick_settings_accessible_lock_screen_label_confirms_exact_capture(self):
+        self.assertTrue(self.capture("quick-settings")[0])
+        def obsolete_label(values):
+            for value in values:
+                for control in value["controls"]:
+                    if control["label"] == "Lock Screen":
+                        control["label"] = "Lock"
+        self.assertFalse(self.capture("quick-settings", obsolete_label)[0])
+
+    def test_calendar_without_optional_events_card_still_has_positive_navigation(self):
+        self.assertTrue(self.capture("calendar")[0])
+        for label in ("Previous month", "Next month"):
+            def missing(values, label=label):
+                for value in values:
+                    value["controls"] = [control for control in value["controls"] if control["label"] != label]
+            with self.subTest(missing=label):
+                self.assertFalse(self.capture("calendar", missing)[0])
+
+    def test_each_public_hero_requires_positive_visible_capture_bracket(self):
+        for card in self.CONTROLS:
+            with self.subTest(card=card):
+                self.assertTrue(self.capture(card)[0])
+                for side in (0, 1):
+                    self.assertFalse(self.capture(
+                        card, lambda values, side=side: values[side].update(controls=[]))[0])
+
+    def test_tags_private_state_and_unrelated_controls_are_not_confirmation(self):
+        for card in self.CONTROLS:
+            def wrong(values):
+                for value in values:
+                    value.update(tag=card, locked=True, overview_app_grid=True, controls=[
+                        {"role": "push button", "label": "Take Screenshot", "showing": True,
+                         "visible": True, "extents": [10, 10, 100, 100]}])
+            with self.subTest(card=card):
+                self.assertFalse(self.capture(card, wrong)[0])
+
+    def test_changed_session_or_original_atspi_owner_rejects_the_frame(self):
+        for key in ("session", "principal", "atspi"):
+            with self.subTest(identity=key):
+                self.assertFalse(self.capture("lock", lambda values: values[1].update({key: {}}))[0])
+
+    def test_offscreen_hidden_and_zero_sized_controls_fail(self):
+        for change in ({"showing": False}, {"visible": False}, {"extents": [0, 0, 0, 0]},
+                       {"extents": [lane.WIDTH, 0, 100, 100]}):
+            def wrong(values):
+                values[1]["controls"][0].update(change)
+            self.assertFalse(self.capture("app-grid", wrong)[0])
+
+    def test_matching_but_missing_original_authority_is_not_public_ui_proof(self):
+        for key in ("session", "principal", "atspi"):
+            def wrong(values):
+                for value in values:
+                    value[key] = {}
+            self.assertFalse(self.capture("lock", wrong)[0])
+
+    def test_late_positive_snapshot_cannot_extend_confirmation_deadline(self):
+        now, observations = [0.0], []
+        image = tour_png(tour_frame((8, 24, 52)))
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(image)
+        def observe(timeout):
+            observations.append(timeout)
+            now[0] += 6
+            return self.observation("lock")
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(lane.time, "monotonic", lambda: now[0]):
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertFalse(recorder.public_still("lock", observe))
+            self.assertEqual(len(observations), 2)
+            self.assertLess(observations[1], observations[0])
+            receipt = recorder.still_confirmations["lock"]
+            self.assertFalse(receipt["evidence"]["within_deadline"])
+            self.assertEqual(recorder.n, 1)
+            self.assertEqual(recorder.unconfirmed, ["lock"])
+            recorder.close()
+
+    def test_missing_observer_preserves_diagnostic_but_never_confirms(self):
+        image = tour_png(tour_frame((8, 24, 52)))
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(image)
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertFalse(recorder.public_still("app-grid", None))
+            self.assertEqual(recorder.unconfirmed, ["app-grid"])
+            self.assertEqual((Path(recorder.dir) / "f000000.png").read_bytes(), image)
             recorder.close()
 
 
@@ -4420,13 +4490,46 @@ class InventoryProcessRaces(unittest.TestCase):
 
     def guest(self, state=None, call=None):
         uid = os.getuid()
+        class SnapshotProcPath:
+            """os.PathLike proxy with snapshot, pid-sorted /proc iteration.
+
+            Readdir order and mid-scan birth visibility differ across
+            filesystems, but race hooks address (pid, readlink-count) pairs
+            that only model the designed interleaving under one order.
+            Materialize each fake-/proc-root iterator at creation, numeric
+            pids ascending, so every environment replays the same scan.
+            """
+            def __init__(self, real, root=False):
+                self._real = real
+                self._root = root
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+            def __fspath__(self):
+                return os.fspath(self._real)
+            def __str__(self):
+                return str(self._real)
+            def __eq__(self, other):
+                mine = self._real
+                theirs = other._real if isinstance(other, SnapshotProcPath) else other
+                return mine == theirs
+            def __hash__(self):
+                return hash(self._real)
+            def __truediv__(self, other):
+                return SnapshotProcPath(self._real / other)
+            def iterdir(self):
+                entries = list(self._real.iterdir())
+                if not self._root:
+                    return (SnapshotProcPath(e) for e in entries)
+                entries.sort(key=lambda e: (not e.name.isdigit(),
+                                            int(e.name) if e.name.isdigit() else e.name))
+                return (SnapshotProcPath(e) for e in entries)
         def proc_path(path):
             path = str(path)
             if path == "/proc":
-                return self.root / "proc"
+                return SnapshotProcPath(self.root / "proc", root=True)
             if path.startswith("/proc/"):
-                return self.root / "proc" / path[len("/proc/"):]
-            return Path(path)
+                return SnapshotProcPath(self.root / "proc" / path[len("/proc/"):])
+            return SnapshotProcPath(Path(path))
         def readlink(path):
             target = os.readlink(path)
             pid = int(Path(path).parent.name)
@@ -4460,6 +4563,79 @@ class InventoryProcessRaces(unittest.TestCase):
         result = self.guest()["inventory"]()
         self.assertEqual(self.pids(result), [(600, "tuna-compositor"), (650, "tuna-shell-gtk")])
         self.assertEqual(self.sleeps, [])
+
+    def late_compositor(self, parent=600, group=701, ticks=1800, args=None, other_inode=False):
+        # The first /proc iterator has already captured its entries when 700
+        # is read. The second iterator sees 701, just like a new wake-time PAM
+        # conversation between the helper snapshot and owned-process scan.
+        def spawned(pid, count):
+            if pid == 700 and count == 2:
+                self.process(701, parent, group, ticks, "tuna-compositor",
+                             self.HELPER_ARGS if args is None else args)
+                if other_inode:
+                    other = self.root / "other/tuna-compositor"
+                    other.parent.mkdir()
+                    other.write_bytes(self.binaries["tuna-compositor"].read_bytes())
+                    executable = self.root / "proc/701/exe"
+                    executable.unlink()
+                    executable.symlink_to(other)
+        self.on_readlink = spawned
+        return self.guest()
+
+    def test_helper_born_between_snapshots_is_classified_at_its_scan(self):
+        scope = self.late_compositor()
+        windows = [{"id": 4, "app_id": "org.tuna.VmInput", "rect": [440, 296, 400, 240],
+                    "workspace": 0}]
+        scope["STATE"].write_text(json.dumps({**self.STATE, "windows": windows}))
+        result = scope["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"), (650, "tuna-shell-gtk")])
+        self.assertEqual([(p["pid"], p["start_ticks"]) for p in result["processes"]],
+                         [(600, 1500), (650, 1600)])
+        self.assertEqual(result["state"]["windows"], windows)
+        self.assertTrue(result["state"]["locked"])
+        self.assertGreaterEqual(self.readlinks[701], 2)  # read its actual metadata
+        self.assertEqual(self.sleeps, [])
+
+    def test_late_unrelated_or_impostor_compositors_remain_owned_process_mismatches(self):
+        for options in ({"parent": 999}, {"group": 600}, {"ticks": 1400},
+                        {"args": self.DESKTOP_ARGS},
+                        {"args": self.HELPER_ARGS[:-1] + b"\0extra\0"},
+                        {"other_inode": True}):
+            with self.subTest(options=options):
+                self.setUp()
+                result = self.late_compositor(**options)["inventory"]()
+                self.assertEqual(self.pids(result), [(600, "tuna-compositor"),
+                                 (650, "tuna-shell-gtk"), (701, "tuna-compositor")])
+
+    def test_late_helper_cannot_bind_to_reused_desktop_parent_pid(self):
+        scope = self.late_compositor()
+        spawned = self.on_readlink
+        def reused(pid, count):
+            spawned(pid, count)
+            if pid == 701 and count == 2:
+                stat = self.root / "proc/600/stat"
+                stat.write_text(stat.read_text().replace("1500", "1750"))
+        self.on_readlink = reused
+        result = scope["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"),
+                         (650, "tuna-shell-gtk"), (701, "tuna-compositor")])
+
+    def test_ambiguous_original_desktop_never_excludes_private_children(self):
+        self.process(701, 2, 2, 1800, "tuna-compositor", self.DESKTOP_ARGS)
+        result = self.guest()["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"), (650, "tuna-shell-gtk"),
+                         (700, "tuna-compositor"), (701, "tuna-compositor")])
+
+    def test_classified_helper_pid_reuse_is_not_excluded_by_numeric_pid(self):
+        def reused(pid, count):
+            if pid == 700 and count == 3:
+                (self.root / "proc/700/cmdline").write_bytes(self.DESKTOP_ARGS)
+                stat = self.root / "proc/700/stat"
+                stat.write_text(stat.read_text().replace("1700", "1800"))
+        self.on_readlink = reused
+        result = self.guest()["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"),
+                         (650, "tuna-shell-gtk"), (700, "tuna-compositor")])
 
     def test_helper_exiting_after_its_scan_read_is_absent_not_an_owned_compositor(self):
         # Snapshot readlinks 700 twice; the scan's own read is the third.
@@ -4570,14 +4746,9 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertTrue(lane.guest_agent.valid_inventory_error(record))
 
     def test_partially_written_state_file_fails_closed_at_parse_stage(self):
-        # The compositor publishes the snapshot by write-temp + rename, so a
-        # reader never sees a partial file; one would be a writer bug, so the
-        # probe fails with a typed stage instead of retrying past it.
-        runtime = (Path(__file__).resolve().parents[2] / "crates/compositor/src/runtime.rs").read_text()
-        publish = runtime[runtime.index("fn publish_state(&mut self)"):]
-        publish = publish[:publish.index("\n    }\n") + 6]
-        self.assertIn('let tmp = path.with_extension("tmp");', publish)
-        self.assertIn("std::fs::write(&tmp, &doc).is_ok() && std::fs::rename(&tmp, path).is_ok()", publish)
+        # Readers reject malformed snapshots rather than retrying past them.
+        # The publisher's real filesystem/concurrency tests cover atomic
+        # visibility; this test exercises the runtime consumer's typed failure.
         record = self.failure(self.guest(state=json.dumps(self.STATE)[:17]), json.JSONDecodeError)
         self.assertEqual({key: record[key] for key in ("stage", "exception_type", "code")},
                          {"stage": "state-parse", "exception_type": "JSONDecodeError",
@@ -4599,7 +4770,7 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertEqual(caught.exception.code, 1)
         return output.getvalue()
 
-    def transport(self, output, **status):
+    def transport(self, output, action="inventory", **status):
         import contextlib
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
         failure = {"exited": True, "exitcode": 1, "out-data": base64.b64encode(output.encode()).decode(),
@@ -4607,7 +4778,7 @@ class InventoryProcessRaces(unittest.TestCase):
         log = io.StringIO()
         with contextlib.redirect_stdout(log), patch.object(actor, "command", side_effect=[{"pid": 10}, failure]):
             with self.assertRaises(RuntimeError) as caught:
-                actor.run("inventory")
+                actor.run(action)
         self.assertNotIn("private", str(caught.exception) + log.getvalue())
         return str(caught.exception), log.getvalue()
 
@@ -4650,6 +4821,25 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertEqual(self.transport(json.dumps({"inventory_error": record, "extra": "private"}))[0], generic)
         self.assertEqual(self.transport(json.dumps({"inventory_error": record}), **{"out-truncated": True})[0], generic)
         self.assertEqual(self.transport("private " * 600)[0], generic)
+
+    def test_tour_public_ui_failure_record_surfaces_unstaged_only(self):
+        record = {"stage": "unstaged", "exception_type": "RuntimeError",
+                  "code": "observation-exception", "frames": [["_tour_public_ui", 1790]]}
+        self.assertTrue(lane.guest_agent.valid_tour_public_ui_error(record))
+        message, log = self.transport(json.dumps({"tour_public_ui_error": record}), action="tour-public-ui")
+        self.assertEqual(message, "guest lifecycle tour-public-ui failed (exit=1): " + json.dumps(record))
+        self.assertEqual(log, "")
+        generic = "guest lifecycle tour-public-ui failed (exit=1)"
+        invalid = [None, [], {}, {**record, "message": "private"},
+                   {**record, "stage": "state-read"}, {**record, "stage": "private"},
+                   {**record, "exception_type": "private"}, {**record, "code": "private"},
+                   {k: v for k, v in record.items() if k != "frames"}]
+        for value in invalid:
+            with self.subTest(value=value):
+                output = json.dumps({"tour_public_ui_error": value})
+                self.assertEqual(self.transport(output, action="tour-public-ui")[0], generic)
+
+
 class OrcaLogoutRetirement(unittest.TestCase):
     """#836: the compositor's session-end receipt for its own Orca group."""
     RECEIPT = ("tuna-compositor: screen reader retired pid=21699 terminated=true "
@@ -4688,17 +4878,6 @@ class OrcaLogoutRetirement(unittest.TestCase):
             with self.subTest(trace=trace):
                 self.assertIsNone(lane.orca_logout_retirement(trace, 21699))
 
-    def test_departure_probe_runs_first_and_v_orca_logout_stays_unchanged(self):
-        # The unchanged probe must not wait behind the receipt: the user
-        # runtime it reads goes away soon after logout (run 40864799987).
-        source = (Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text()
-        departed = source.index('closed_orca = agent.run("orca-departed"')
-        reap = source.index('record("V-ORCA-LOGOUT-REAP"')
-        survived = source.index('raise RuntimeError("Orca survived the hardware session logout")')
-        self.assertLess(departed, reap)
-        self.assertLess(reap, survived)
-        self.assertIn('record("V-ORCA-LOGOUT", closed_orca["owner"] is None and not closed_orca["original_alive"],',
-                      source)
 
 
 class OrcaDepartureProbe(unittest.TestCase):

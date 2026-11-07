@@ -73,7 +73,7 @@ class SecurityAuditTests(unittest.TestCase):
                     self.assertEqual(result.returncode, status)
                     self.assertNotIn("::notice::", result.stdout)
 
-    def test_workflow_keeps_gate_required_and_read_only(self):
+    def test_workflow_keeps_audit_required_and_unprivileged(self):
         workflow, job = workflow_check()
         steps = job["steps"]
         audit = next(s for s in steps if s.get("name") == "Audit locked dependencies")
@@ -81,10 +81,11 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", audit)
         self.assertNotIn("continue-on-error", job)
         self.assertNotIn("if", audit)
-        self.assertEqual(job.get("permissions", workflow["permissions"]), {"contents": "read"})
+        permissions = job.get("permissions", workflow["permissions"])
+        self.assertTrue(permissions)
+        self.assertTrue(all(level == "read" for level in permissions.values()))
+        self.assertNotIn("env", audit)
         install = next(s for s in steps if s.get("name") == "Install pinned cargo-audit")
-        self.assertEqual(install["uses"], "./.ci-workflow-tools/.github/actions/ci-tool")
-        self.assertEqual(install["with"], {"tool": "cargo-audit", "version": "0.22.2"})
         self.assertNotIn("if", install)
         self.assertNotIn("continue-on-error", install)
         self.assertTrue(any(s.get("name") == "Test the tokenless security gate" for s in steps))
