@@ -130,6 +130,39 @@ attempt serial and lock epoch. See:
 - [Fingerprint prompt guards](security/fingerprint-prompt-guards.md)
 - [Authentication consumer foundation](security/auth-consumer-foundation.md)
 
+#### Unlock keyboard boundary (#939)
+
+The authoritative compositor unlock transition performs a one-shot
+`WindowManager::unlock_input` handoff. It restores seat keyboard focus through
+the normal no-raise focus policy, respecting overview ownership, exclusive
+layer surfaces and popup grabs rather than unconditionally focusing or raising
+the remembered application. Session input does not depend on a later pointer
+motion to recover focus.
+
+Before restoring focus, the compositor quarantines every physically held seat
+key and removes it from the forwarded pressed-key set. The new keyboard
+owner's enter event therefore excludes lock-held keys. Quarantine suppresses
+their repeats and eventual releases for ordinary session clients and shortcuts
+until genuine key-up; a fresh press can then route normally. Physical pressed
+state and XKB state remain intact, without synthetic modifier releases.
+
+This boundary does not hide password keys from the user's trusted assistive
+technology. The same-UID, unreaped compositor-owned Orca process must own
+`org.gnome.Orca.KeyboardMonitor`; delivery targets only its admitted unique bus
+owner. Its keyboard interception runs before ordinary-session filtering,
+including post-unlock quarantine, so it receives genuine presses and held-key
+releases while its watches and grabs remain effective across lock/unlock.
+Those events are not permission to forward input to ordinary session clients.
+
+The reference is [Mutter 51.1's
+`meta_a11y_manager_notify_clients`](https://github.com/GNOME/mutter/blob/9134e3a5869ce232bf95b77519005865747ba603/src/backends/meta-a11y-manager.c#L617-L681):
+it does not redact password key content or gate keyboard monitoring on lock
+state. [GNOME Shell 51.1's screen shield](https://github.com/GNOME/gnome-shell/blob/33da06854e229c256afd5872fedd83c28cbfa176/js/ui/screenShield.js#L199-L205)
+instead takes a lock-screen modal stage grab. Trusted AT visibility and
+ordinary-client isolation are separate policies; see
+[screen reader keys while locked](accessibility-shell.md#screen-reader-keys-while-locked-936).
+This describes the input boundary, not a new test or CI receipt.
+
 ### Capture, screenshots and remote desktop
 
 Only the supervised shell or the authenticated installed portal backend

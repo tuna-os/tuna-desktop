@@ -1008,8 +1008,9 @@ AT-SPI registry was already active. This is not evidence of bus startup
 failure.
 
 The missing route was committed masked input to speech, not raw-key
-delivery. The compositor intentionally suppresses raw KeyboardMonitor
-events while locked. In the installed [Orca 50.3 insertion classifier](https://raw.githubusercontent.com/GNOME/orca/50.3/src/orca/ax_utilities_event.py),
+delivery. The compositor then suppressed raw KeyboardMonitor events while
+locked; it no longer does (see below).
+In the installed [Orca 50.3 insertion classifier](https://raw.githubusercontent.com/GNOME/orca/50.3/src/orca/ax_utilities_event.py),
 `_get_insertion_text_key_reason` relies on a last printable key/space to
 classify password insertion as typing echo. Without that cue,
 `_get_insertion_fallback_reason` can return `UNKNOWN` or an unpresentable
@@ -1026,12 +1027,14 @@ masked-input speech failure is fixed. No shell-generated mask announcement
 or replacement for Orca's native text-event handling is included.
 
 `scripts/tuna-orca-speech-proof --artifacts orca-speech-artifacts` remains
-the end-to-end native nested proof: it physically types into the lock
-prompt, requires exactly one spoken mask per typed character, rejects
-plaintext speech, verifies that the locked raw-key event count does not
-advance, then unlocks through PAM. No injected Orca customization or
-relaxation of the bullet assertion is used. These changes still require a
-new native proof result; the failed run is not retroactively qualified.
+the end-to-end native nested proof: after a D-Bus lock and after an
+ordinary Super+L it physically types into the lock prompt, requires exactly
+one spoken mask per typed character, rejects plaintext speech, requires the
+owned trusted reader's KeyboardMonitor to receive the lock-screen keys as
+Mutter 51.1 does
+([screen reader keys while locked](accessibility-shell.md#screen-reader-keys-while-locked-936)),
+then unlocks through PAM. No injected Orca customization or relaxation of
+the bullet assertion is used. The failed run is not retroactively qualified.
 
 The native proof isolates `XDG_STATE_HOME` and `XDG_CACHE_HOME` under its
 artifact root as well as HOME/config/data. A local native attempt stopped
