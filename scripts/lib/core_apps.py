@@ -257,7 +257,13 @@ class Desktop(NativeDesktop):
             raise ValueError('app outside actual installed native Core inventory')
         before = self.state()
         self.keys('meta_l')
-        self.type_ascii(search_name)
+        # Overview search is an unranked substring match over name, id,
+        # generic name and keywords, so a display name hits whichever entry
+        # sorts first: "Document Viewer" launched the image's own Evince
+        # instead of Papers (run 42374827253). The desktop id is the one
+        # query only the intended entry matches; search_name stays the
+        # human label recorded on the actor.
+        self.type_ascii(app_id)
         self.await_state('desktop-search-' + app_id,
                          self.state, lambda value: value['overview_open'])
         self.keys('ret')

@@ -908,5 +908,29 @@ class DomainImeRegistration(unittest.TestCase):
         self.assertEqual(desktop._ime, {})
 
 
+class StartSearchQuery(unittest.TestCase):
+    """start() types the desktop id: names collide (Evince vs Papers)."""
+    def test_types_app_id_not_the_display_name(self):
+        from unittest import mock
+        desktop = core_apps.Desktop.__new__(core_apps.Desktop)
+        desktop.inventory = {'apps': {'org.gnome.Papers': {}}}
+        before = {'windows': [{'id': 2, 'app_id': 'org.gnome.Nautilus'}]}
+        after = {'overview_open': False, 'focused': 33, 'windows': [
+            {'id': 2, 'app_id': 'org.gnome.Nautilus'}, {'id': 33, 'app_id': 'org.gnome.Papers'}]}
+        desktop.state = mock.Mock(return_value=before)
+        desktop.keys = mock.Mock()
+        desktop.type_ascii = mock.Mock()
+        desktop.await_state = lambda name, read, predicate, **kwargs: (
+            after if name.startswith('normal-launch') else
+            None if name.startswith('desktop-search') else {'pid': 9})
+        desktop.guest = mock.Mock()
+        desktop.retain = mock.Mock()
+        desktop.observe = mock.Mock()
+        desktop._actors = {}
+        actor = desktop.start('org.gnome.Papers', 'Document Viewer')
+        desktop.type_ascii.assert_called_once_with('org.gnome.Papers')
+        self.assertEqual(actor['search_name'], 'Document Viewer')
+
+
 if __name__ == '__main__':
     unittest.main()
