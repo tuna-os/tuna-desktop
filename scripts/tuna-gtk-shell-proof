@@ -815,18 +815,6 @@ cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overvie
 . "$ROOT/scripts/lib/tuna-a11y-focus-proof.sh"
 . "$ROOT/scripts/lib/tuna-keyboard-routes-proof.sh"
 
-# Select the rendered icon through actual accessibility bounds, including
-# the descendant button; distribution app catalogs change grid allocation.
-grid_origin() {
-    grid_namespace="${1:-tuna-shell-appgrid}"
-    cstate ".layers | any(.namespace == \"$grid_namespace\")" "grid layer" || fail G-GRID-DRAG-PAGE "grid layer missing"
-    grid_origin_x="$(jq --arg namespace "$grid_namespace" '.layers[] | select(.namespace == $namespace) | .rect[0]' "$CSTATE")"
-    grid_origin_y="$(jq --arg namespace "$grid_namespace" '.layers[] | select(.namespace == $namespace) | .rect[1]' "$CSTATE")"
-}
-grid_point() {
-    jq -er --arg name "$2" --argjson ox "$grid_origin_x" --argjson oy "$grid_origin_y" --argjson edge "${3:--1}" '[.[] | select(.showing and (.role == "push button" or .role == "button") and .name == $name and (.bounds[2] > 0) and (.bounds[3] > 0))][0].bounds | select(length == 4) | "\((.[0] + $ox + (if $edge >= 0 then $edge else .[2] / 2 end)) | floor) \((.[1] + $oy + .[3] / 2) | floor)"' "$1"
-}
-
 folder_dnd_proof() {
 # GNOME's folder edits by drag: one app onto another makes a folder of
 # the two (org.gnome.desktop.app-folders); one dragged out of the
