@@ -352,6 +352,10 @@ pub(crate) mod tests {
             assert_eq!(parse_schedstat(bytes), None);
         }
         // The real compositor thread exposes populated counters on Linux.
+        // The kernel charges a running thread's runtime only when it is
+        // descheduled or ticked, so a fresh test thread can still read
+        // `0 0 1`; one sleep makes it a thread that has actually run.
+        std::thread::sleep(std::time::Duration::from_millis(1));
         assert!(thread_sched().is_some_and(|(run, _, slices)| run > 0 && slices > 0));
     }
 
