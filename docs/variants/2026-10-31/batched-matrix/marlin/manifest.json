@@ -1,0 +1,194 @@
+{
+  "schema": 2,
+  "started": "2026-11-01T00:22:46+00:00",
+  "runner": "scripts/tuna-corral-journey",
+  "runner_sha256": "1adc31768f0a9cfb8de4d68457bc5c948630e5092eed6552f7f63717d2ef4f48",
+  "scope": "qualification-core",
+  "corral": "corral v0.7.0+36.g76b6dd5 (commit 76b6dd52d35d, built 2026-10-30T08:31:57Z, go1.27.0)",
+  "image": {
+    "ref": "ghcr.io/tuna-os/marlin@sha256:5ccc023cc73296d5e4d17cfbe38526935a405abcfb0095aad43b3a28bff182e6",
+    "booted": "ghcr.io/tuna-os/marlin@sha256:5ccc023cc73296d5e4d17cfbe38526935a405abcfb0095aad43b3a28bff182e6",
+    "booted_manifest_digest": "sha256:8c7a952fd654c45a021bfb9318ce4027d7bb4b734a1a4f63fb1a5a294e4096f3"
+  },
+  "vm": {
+    "name": "tuna-q-variant-marlin-01002237",
+    "namespace": "corral-vms",
+    "backend": "kubevirt",
+    "requested": {
+      "cpu": 4,
+      "mem": "6G",
+      "disk": "40Gi",
+      "node": "karnataka"
+    },
+    "node": "karnataka",
+    "cpu": {
+      "vcpus": 4,
+      "sockets": 4,
+      "cores": 1,
+      "threads": 1,
+      "model": "host-passthrough",
+      "dedicatedCpuPlacement": false,
+      "isolateEmulatorThread": false
+    },
+    "memory": "6Gi",
+    "firmware": {
+      "type": "uefi",
+      "secureBoot": false,
+      "machine": "q35"
+    },
+    "inputs": [
+      {
+        "name": "tablet",
+        "type": "tablet",
+        "bus": "usb"
+      }
+    ],
+    "disks": [
+      {
+        "name": "rootdisk",
+        "type": "disk",
+        "bus": "virtio",
+        "source": "persistentVolumeClaim",
+        "claim": "tuna-q-variant-marlin-01002237-bootc-disk",
+        "size": "40Gi"
+      }
+    ],
+    "tagValues": {
+      "purpose": "tuna-corral-journey"
+    },
+    "image": "ghcr.io/tuna-os/marlin@sha256:5ccc023cc73296d5e4d17cfbe38526935a405abcfb0095aad43b3a28bff182e6"
+  },
+  "console": "corral console page (noVNC), Playwright Chromium, 1:1; frames are the canvas pixels",
+  "steps": [],
+  "provision": {
+    "argv": [
+      "corral",
+      "bootc",
+      "create",
+      "tuna-q-variant-marlin-01002237",
+      "--image",
+      "ghcr.io/tuna-os/marlin@sha256:5ccc023cc73296d5e4d17cfbe38526935a405abcfb0095aad43b3a28bff182e6",
+      "--cpu",
+      "4",
+      "--mem",
+      "6G",
+      "--disk",
+      "40Gi",
+      "-n",
+      "corral-vms",
+      "--user",
+      "tuna-test",
+      "--password-stdin",
+      "--tag",
+      "purpose=tuna-corral-journey",
+      "--node",
+      "karnataka"
+    ],
+    "exit": 0,
+    "stdout": "",
+    "stderr": "Building bootc disk from ghcr.io/tuna-os/marlin@sha256:5ccc023cc73296d5e4d17cfbe38526935a405abcfb0095aad43b3a28bff182e6\n  Disk:   pvc/tuna-q-variant-marlin-01002237-bootc-disk (40Gi, block mode)\n  Builder VM started \u2014 installing (this can take 20-40 min)...\n  Builder powered off cleanly; disk has 40960 MB of data \u2014 success.\n  Disk ready: pvc/tuna-q-variant-marlin-01002237-bootc-disk\nVM \"tuna-q-variant-marlin-01002237\" created in ns/corral-vms \u2014 start: corral start tuna-q-variant-marlin-01002237\n"
+  },
+  "ready": {
+    "vm": "tuna-q-variant-marlin-01002237",
+    "ready": true,
+    "elapsed_seconds": 278.3,
+    "boot_id": "8839cfac-a45e-4fd6-af39-c88e9fde68b8",
+    "conditions": [
+      {
+        "name": "running",
+        "ok": true,
+        "elapsed_seconds": 199.2,
+        "observed": "Running"
+      },
+      {
+        "name": "ssh",
+        "ok": true,
+        "elapsed_seconds": 201.9,
+        "observed": "boot 8839cfac-a45e-4fd6-af39-c88e9fde68b8"
+      },
+      {
+        "name": "boot-complete",
+        "ok": true,
+        "elapsed_seconds": 277.7,
+        "observed": "degraded"
+      },
+      {
+        "name": "unit:gdm.service",
+        "ok": true,
+        "elapsed_seconds": 277.9,
+        "observed": "active"
+      },
+      {
+        "name": "exec:loginctl list-sessions --no-legend | awk '$6==\"greeter\" && $4==\"seat0\"' | grep -q .",
+        "ok": true,
+        "elapsed_seconds": 278,
+        "observed": "exit status 0"
+      },
+      {
+        "name": "paint",
+        "ok": true,
+        "elapsed_seconds": 278.3,
+        "observed": "painted 1280x800 (deviation 0.0487)"
+      }
+    ]
+  },
+  "guest": {
+    "packages": [
+      "tuna-desktop 1.0.0beta.2-2",
+      "gdm 51.1.1-1",
+      "gnome-shell 1:51.1-1",
+      "gnome-control-center 51.1-1",
+      "nautilus 51.1-1"
+    ],
+    "tuna_payload_sha256": [
+      "c0cbf31288061099f4ceb7a475ab3dc3bcc6905252a5fc5db2af3b641594fdb4  /usr/bin/tuna-session",
+      "de2c70dfd556945e1b812b8caf5f61cd9f5e27a58d85f5183940f92357ad99c5  /usr/bin/tuna-compositor",
+      "c517b237d455e20f72940f85e555d02e5f3f85a7098cfc5defa1a12d1c58ba46  /usr/bin/tuna-shell-gtk",
+      "2767123fdc6723e532f6fff4f7100b242dea1128b397179a30c18dff19e077d8  /usr/bin/tuna-ibus-bridge"
+    ],
+    "kernel": "7.2.11-arch1-1",
+    "drm_driver": "bochs-drm",
+    "modes": [
+      "1280x800",
+      "1920x1440",
+      "2560x1080"
+    ],
+    "sessions_offered": [
+      "Name=Tuna Desktop"
+    ],
+    "gdm_custom_conf": [
+      "FallbackSession=tuna"
+    ],
+    "boot_id": "8839cfac-a45e-4fd6-af39-c88e9fde68b8",
+    "account": "tuna-test:x:1000:1000::/var/home/tuna-test:/bin/bash"
+  },
+  "account": {
+    "user": "tuna-test",
+    "password": "public fixture password (packaging/marlin/vm-lane)",
+    "provisioned": "corral bootc create --user --password-stdin; image unchanged"
+  },
+  "error": "RuntimeError: corral console exited 1 before it printed a URL; stderr: instance name \"tuna-q-variant-marlin-01002237\" is ambiguous; use one of the fully-scoped IDs shown by corral list\n",
+  "failure_capture": {
+    "exit": 0,
+    "stderr": "",
+    "frame": "failure-console.png",
+    "sha256": "98f39ad0799a9d746d431800d84416d1c05b13ce8d398b4d34c1a01b76f84389"
+  },
+  "cleanup": {
+    "deleted": true,
+    "result": [
+      {
+        "name": "tuna-q-variant-marlin-01002237",
+        "deleted": true,
+        "removed": [
+          "virtualmachine.kubevirt.io/tuna-q-variant-marlin-01002237",
+          "virtualmachineinstance.kubevirt.io/tuna-q-variant-marlin-01002237",
+          "persistentvolumeclaim/tuna-q-variant-marlin-01002237-bootc-disk"
+        ]
+      }
+    ],
+    "still_listed": [],
+    "failures": []
+  },
+  "finished": "2026-11-01T00:40:49+00:00"
+}
