@@ -245,14 +245,19 @@ def worker(directory, case, attempt, gate, ready):
             original_alive(state, owner_fd)
             if child_fd is not None and 'client' in result:
                 try:
-                    unchanged = same_process(result['client'])
+                    changed = not same_process(result['client'])
+                    settle = 0
                 except OSError:
-                    unchanged = False
-                # Identity first, departure second: a client that exits in
-                # between is an unreaped zombie with no /proc/<pid>/exe (run
-                # 42379455963's destroy case), its pidfd readable and its pid
-                # not reusable, so only a live process can have changed.
-                if not unchanged and not select.select([child_fd], [], [], 0)[0]:
+                    # An exiting client drops its mm, and /proc/<pid>/exe
+                    # with it, before the kernel reports the exit on the
+                    # pidfd (runs 42379455963 and 42386437300: the destroy
+                    # and conflicting-points clients exited between the
+                    # poll and the read); wait briefly for that report.
+                    changed = True
+                    settle = 2
+                # The unreaped child's pid cannot be reused, so only a
+                # process that is still running can have changed.
+                if changed and not select.select([child_fd], [], [], settle)[0]:
                     raise RuntimeError('owned native client identity changed')
             if time.monotonic() >= deadline:
                 raise TimeoutError('native ioctl case/aggregate deadline: ' + case)
