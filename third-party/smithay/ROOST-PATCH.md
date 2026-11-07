@@ -252,3 +252,23 @@ Such a late request receives a tracked inert child without metadata; its
 release and parent teardown cannot unset the compositor owner. The returned-
 key consumer exercises this race with actual standard requests and verifies
 continued physical-key delivery to the compositor grab.
+
+Issue #364 additionally changes src/wayland/text_input/mod.rs and
+text_input_handle.rs: zwp_text_input_manager_v3 is created at version 2, as
+Mutter 51 advertises it (META_ZWP_TEXT_INPUT_V3_VERSION), and text inputs
+take that version from their manager. Upstream reached unreachable!() on the
+three version 2 requests. set_available_actions is now checked before the
+focus and input-method gates, as Mutter's text_input_set_available_actions
+does: a none action, an unknown one or one listed twice posts
+invalid_action with Mutter's message. show_input_panel, hide_input_panel
+and a valid action set are accepted and go no further, since
+input-method-v2 carries neither; Roost reads the panel requests before
+Smithay dispatches them and sends input-panel ON or OFF to the shell's
+keyboard at commit (meta-wayland-text-input.c text_input_commit_state).
+Smithay never sends the version 2 action, language or preedit_hint events:
+Mutter sends no language, sends action only from an input method's
+trigger_action (which no GNOME Shell 51 code calls), and preedit hints only
+from IBus preedit attributes, which input-method-v2 cannot carry.
+Real-client tests in crates/compositor/tests/protocol_gaps.rs bind versions
+2 and 1. The isolated diff is retained in TEXT-INPUT-V3-V2-PATCH.diff; the
+pinned version stays 0.7.0.
