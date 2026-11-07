@@ -31,6 +31,12 @@ APP_PACKAGES = {
     'org.gnome.Tour': 'gnome-tour', 'org.gnome.Showtime': 'showtime',
     'org.gnome.Weather': 'gnome-weather', 'org.gnome.Epiphany': 'epiphany',
 }
+# Compositor window app_id where it differs from the application's bus/desktop
+# id: Papers 51 maps its toplevel as org.gnome.Evince (run 42342605584: the
+# Papers launch focused a window reporting org.gnome.Evince). Admission still
+# joins the surface to the original bus-name owner's PID via the kernel-attested
+# native keyboard peer below, so the alias adds no trust.
+WINDOW_APP_IDS = {'org.gnome.Papers': ('org.gnome.Papers', 'org.gnome.Evince')}
 DOMAINS = {'basic', 'data', 'media', 'system', 'web', 'autotz'}
 RUN_STATE = Path('/run/tuna-core-apps.json')
 MODULE = Path('/usr/libexec/tuna-core-apps/guest.py')
@@ -132,7 +138,8 @@ def desktop(operation, arguments, context):
             # socket peer cannot be squatted the way a bus name can.
             state = desktop('state', {}, context)
             surface = [row for row in state['windows']
-                       if row['id'] == arguments['window_id'] and row['app_id'] == app_id]
+                       if row['id'] == arguments['window_id']
+                       and row['app_id'] in WINDOW_APP_IDS.get(app_id, (app_id,))]
             native = [row for row in state['native_keyboard_windows']
                       if row['window_id'] == arguments['window_id']]
             if (len(surface) == 1 and not state['locked'] and len(native) == 1
@@ -151,7 +158,7 @@ def desktop(operation, arguments, context):
         actor = actual | inventory | {'id': app_id, 'kind': 'app',
                                       'session_bus': value['session_bus'], 'binding': binding}
         state = desktop('state', {}, context)
-        windows = [row for row in state['windows'] if row['app_id'] == app_id
+        windows = [row for row in state['windows'] if row['app_id'] in WINDOW_APP_IDS.get(app_id, (app_id,))
                    and (arguments.get('window_id') is None or row['id'] == arguments['window_id'])]
         focused = [row for row in windows if row['id'] == state['focused']]
         if focused:

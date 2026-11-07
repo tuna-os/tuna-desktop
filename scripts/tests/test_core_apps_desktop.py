@@ -908,5 +908,45 @@ class DomainImeRegistration(unittest.TestCase):
         self.assertEqual(desktop._ime, {})
 
 
+class WindowAppIdAlias(unittest.TestCase):
+    """Papers maps its toplevel as org.gnome.Evince (run 42342605584)."""
+    def guest_table(self):
+        import ast
+        source = (ROOT / 'packaging/marlin/vm-lane/core-apps/guest.py').read_text()
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(target, ast.Name) and target.id == 'WINDOW_APP_IDS' for target in node.targets):
+                return ast.literal_eval(node.value)
+        self.fail('guest WINDOW_APP_IDS missing')
+
+    def test_host_and_guest_tables_agree_and_cover_papers(self):
+        self.assertEqual(self.guest_table(), core_apps.WINDOW_APP_IDS)
+        self.assertIn('org.gnome.Evince', core_apps.WINDOW_APP_IDS['org.gnome.Papers'])
+
+    def test_start_selects_the_evince_window_for_papers(self):
+        from unittest import mock
+        desktop = core_apps.Desktop.__new__(core_apps.Desktop)
+        desktop.inventory = {'apps': {'org.gnome.Papers': {}}}
+        before = {'windows': [{'id': 2, 'app_id': 'org.gnome.Nautilus'}]}
+        after = {'overview_open': False, 'focused': 32, 'windows': [
+            {'id': 2, 'app_id': 'org.gnome.Nautilus'}, {'id': 32, 'app_id': 'org.gnome.Evince'}]}
+        desktop.state = mock.Mock(return_value=before)
+        desktop.keys = mock.Mock()
+        desktop.type_ascii = mock.Mock()
+        def await_state(name, read, predicate, **kwargs):
+            if name == 'normal-launch-org.gnome.Papers':
+                self.assertTrue(predicate(after))
+                return after
+            return None if name.startswith('desktop-search') else {'pid': 9}
+        desktop.await_state = await_state
+        desktop.guest = mock.Mock()
+        desktop.retain = mock.Mock()
+        desktop.observe = mock.Mock()
+        desktop._actors = {}
+        actor = desktop.start('org.gnome.Papers', 'Document Viewer')
+        self.assertEqual(actor['pid'], 9)
+        self.assertEqual(desktop._actors['org.gnome.Papers']['search_name'], 'Document Viewer')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -21,6 +21,9 @@ SHIFTED_KEYS = {'!': '1', '@': '2', '#': '3', '$': '4', '%': '5', '^': '6', '&':
                 '}': 'bracket_right', '|': 'backslash', ':': 'semicolon', '"': 'apostrophe',
                 '<': 'comma', '>': 'dot', '?': 'slash', '~': 'grave_accent'}
 GUEST_MODULES = ('guest', 'native', 'basic', 'data', 'media', 'system', 'web', 'autotz', 'geoclue_fixture')
+# Compositor window app_id where it differs from the app's bus/desktop id
+# (mirrors packaging/marlin/vm-lane/core-apps/guest.py WINDOW_APP_IDS).
+WINDOW_APP_IDS = {'org.gnome.Papers': ('org.gnome.Papers', 'org.gnome.Evince')}
 
 
 def _isolate_preedit_ink(crop):
@@ -261,10 +264,13 @@ class Desktop(NativeDesktop):
         self.await_state('desktop-search-' + app_id,
                          self.state, lambda value: value['overview_open'])
         self.keys('ret')
+        # Papers 51 maps its toplevel as org.gnome.Evince; the guest's
+        # discover joins the surface to the bus-name owner's PID regardless.
+        window_ids = WINDOW_APP_IDS.get(app_id, (app_id,))
         launched = self.await_state('normal-launch-' + app_id, self.state,
                                     lambda value: not value['overview_open'] and any(
-                                        row['app_id'] == app_id for row in value['windows']))
-        windows = [row for row in launched['windows'] if row['app_id'] == app_id]
+                                        row['app_id'] in window_ids for row in value['windows']))
+        windows = [row for row in launched['windows'] if row['app_id'] in window_ids]
         focused = [row for row in windows if row['id'] == launched['focused']]
         new = [row for row in windows if row['id'] not in {old['id'] for old in before['windows']}]
         selected = focused or new or windows
