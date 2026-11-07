@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "owned_vm": "tuna-q-variant-albacore-1031145321",
+  "interruption": "Outer matrix command reached its 3600-second deadline after the completed Yellowfin journey; Albacore runtime was interrupted and is not a qualification result.",
+  "original_cleanup": {
+    "command": "corral --json --backend kubevirt delete tuna-q-variant-albacore-1031145321 -f --wait --timeout 10m",
+    "deleted": false,
+    "error": "cluster unreachable (a recent kubectl call timed out; retrying in 15s)",
+    "scope": "VM/VMI/PVC and other API cleanup calls failed through the Corral circuit breaker; no guest crash inferred"
+  },
+  "safe_access_diagnostics": {
+    "tailscale": "karnataka replied through DERP; no direct connection established",
+    "ssh": "ssh -o BatchMode=yes -o ConnectTimeout=10 karnataka true succeeded",
+    "api_endpoint": "https://100.66.158.127:6443",
+    "unauthenticated_livez": "HTTP 401; listener reachable, not a credential test",
+    "authenticated_livez": "kubectl --request-timeout=30s get --raw=/livez returned ok",
+    "source_diagnosis": "Corral pkg/shell/fake.go reads CORRAL_KUBECTL_TIMEOUT, defaults read-only calls to 5s, and trips a 15s breaker after a read timeout. Management timeout is not a desktop acceptance threshold."
+  },
+  "successful_cleanup": {
+    "command": "env CORRAL_KUBECTL_TIMEOUT=30s corral --json --backend kubevirt delete tuna-q-variant-albacore-1031145321 -f --wait --timeout 10m",
+    "deleted": true,
+    "removed": [
+      "virtualmachine.kubevirt.io/tuna-q-variant-albacore-1031145321",
+      "virtualmachineinstance.kubevirt.io/tuna-q-variant-albacore-1031145321",
+      "persistentvolumeclaim/tuna-q-variant-albacore-1031145321-bootc-disk"
+    ],
+    "post_delete_command": "env CORRAL_KUBECTL_TIMEOUT=30s corral --json list --prefix tuna-q-variant-albacore-1031145321",
+    "post_delete_inventory": []
+  },
+  "untouched": ["punjab", "tuna-q-soak-20261031-r2"],
+  "cluster_restarted_or_reconfigured": false
+}
