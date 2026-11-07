@@ -6,9 +6,10 @@ githubConfigSecret: tuna-ci-github
 runnerGroup: tuna-desktop-karnataka
 runnerScaleSetName: tuna-ci-24.04
 minRunners: 1
-# Shares karnataka with long-lived KubeVirt VMs: 6 x 5Gi requests (14Gi
-# limits) plus the 26.04 set's 3 keep CI inside the node's free memory.
-maxRunners: 6
+# Shares karnataka with long-lived KubeVirt VMs. Measured under full load
+# (2026-11-07): runners use 0.3-2 GiB each and the node sat at ~51% CPU, so
+# 10 + 4 fits; the tuna-ci ResourceQuota (14 pods) is the hard ceiling.
+maxRunners: 10
 
 controllerServiceAccount:
   namespace: arc-systems

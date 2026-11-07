@@ -6,7 +6,7 @@ githubConfigSecret: tuna-ci-github
 runnerGroup: tuna-desktop-karnataka
 runnerScaleSetName: tuna-ci-26.04
 minRunners: 0
-maxRunners: 3
+maxRunners: 4
 
 controllerServiceAccount:
   namespace: arc-systems
