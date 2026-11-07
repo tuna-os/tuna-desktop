@@ -42,9 +42,9 @@ CLOCK = 'guest CLOCK_MONOTONIC'
 
 
 class Deadline:
-    def __init__(self, seconds):
-        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or not 0 < seconds <= 25:
-            raise ValueError('budget_s must be finite, positive and <=25')
+    def __init__(self, seconds, cap=25):
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or not 0 < seconds <= cap:
+            raise ValueError('budget_s must be finite, positive and <=%s' % cap)
         self.end = time.monotonic() + seconds
 
     def remaining(self):
@@ -85,10 +85,10 @@ def wayland_basename(value):
     return value
 
 def payload(operation, value):
-    if operation not in ('admit', 'prepare', 'observe', 'file', 'stop') or not isinstance(value, dict):
+    if operation not in ('admit', 'prepare', 'observe', 'file', 'stop', 'overview') or not isinstance(value, dict):
         raise ValueError('fixed operation and JSON object required')
     allowed = {'budget_s', 'nonce', 'name', 'offset', 'limit'} if operation == 'file' else {'profile', 'budget_s'}
-    if operation in ('prepare', 'observe', 'stop'):
+    if operation in ('prepare', 'observe', 'stop', 'overview'):
         allowed.add('nonce')
     if set(value) - allowed:
         raise ValueError('unexpected operation arguments')
@@ -100,7 +100,14 @@ def payload(operation, value):
         if not allowed_receipt(value.get('name')):
             raise ValueError('receipt name is not allowlisted')
         file_range(value.get('offset', 0), value.get('limit', MAX_CHUNK_BYTES))
-    return Deadline(value.get('budget_s', 20))
+    # Prepare alone gets headroom (round-18: GNOME Settings stayed absent
+    # from every poll walk for 107s then mapped fully seconds after polling
+    # stopped, so 240s tests slow-registration against poll-suppression):
+    # fixture startup needs air between readiness samples, and launches
+    # alone burn ~8s. Observe/file/stop stay at 25s so a hung walk still
+    # fails fast.
+    cap = 240 if operation == 'prepare' else 25
+    return Deadline(value.get('budget_s', 20), cap)
 
 
 def run(argv, deadline):
@@ -440,11 +447,26 @@ def admission(profile, deadline, cache):
         for greeter in actual:
             if greeter.get('Class') != 'greeter':
                 continue
+            if greeter.get('State') == 'closing':
+                # Teardown already in flight: logind still lists the session
+                # while its shell is gone. Only greeters logind considers
+                # alive carry input/session state worth validating; a live
+                # session with no shell still fails below.
+                continue
             uid = int(greeter['User'])
             if uid == 0 or greeter.get('Type') != 'wayland' or greeter.get('Remote') != 'no' or greeter.get('Service') != 'gdm-launch-environment':
                 raise RuntimeError('foreign/non-native GDM greeter session')
             shells = process_candidates(('/usr/bin/gnome-shell',), uid, deadline)
             if len(shells) != 1:
+                if candidates and not shells:
+                    # Post-login teardown residue: logind still lists the
+                    # greeter session (not yet 'closing') after its shell
+                    # exited. The user session is up, so this entry carries
+                    # no input/session state worth validating; skip it the
+                    # way 'closing' sessions are skipped. Multiple shells
+                    # stay fatal (ambiguous principal), as does a missing
+                    # shell before any user session started.
+                    continue
                 observed = sorted((shell['pid'], shell.get('start_ticks')) for shell in shells)
                 raise RuntimeError('original GDM greeter shell is not unique: '
                                    f'{len(shells)} under uid {uid} pid/start {observed}')
@@ -1106,6 +1128,9 @@ def session_observe(args, deadline, channel):
 
     print('observe start', file=sys.stderr, flush=True)
     roots = call(bus, registry_name, '/org/a11y/atspi/accessible/root', 'org.a11y.atspi.Accessible', 'GetChildren')[0]
+    if args.get('only_exes') is not None:
+        roots = admit_roots_by_owner(roots, owners, peers, set(args['only_exes']),
+                                     lambda name: owner(bus, name))
     trees = [tree(name, path) for name, path in roots]
     print('observe walk-complete nodes=%d elapsed_ms=%d owners=%d' % (
         count, (time.monotonic() - walk_start) * 1000, len(owners)), file=sys.stderr, flush=True)
@@ -1119,17 +1144,56 @@ def session_observe(args, deadline, channel):
         'trees': trees, 'observed_monotonic_ns': time.monotonic_ns(), 'clock_domain': CLOCK})
 
 
+def admit_roots_by_owner(roots, owners, peers, only_exes, resolve):
+    """Pre-filter AT-SPI roots by owner exe, resolving owners once.
+
+    `resolve(bus_name)` returns (unique, principal); resolutions are cached in
+    `owners`/`peers` exactly as the tree walk does, so descending later reuses
+    them. Roots outside `only_exes` are dropped before any subtree walk: the
+    failure census only needs fixture exes, and skipping the giant shell tree
+    keeps it fast under saturation.
+    """
+    admitted = []
+    for name, path in roots:
+        if name not in owners:
+            unique, principal = resolve(name)
+            owners[name] = (unique, principal)
+            peers[principal['pid']] = principal
+        if owners[name][1]['exe'] in only_exes:
+            admitted.append((name, path))
+    return admitted
+
+
 def flatten(nodes):
     for node in nodes:
         yield node
         yield from flatten(node['children'])
 
 
+def fixture_node_summary(trees):
+    """Compact per-node census of every fixture-exe node, any role or states.
+
+    On inventory failure this separates truly-absent (no node) from
+    present-but-filtered (wrong role, hidden states): the inventory only
+    admits visible frame/window/dialog, so a splash/utility/hidden Settings
+    node is silently skipped there but shows up here.
+    """
+    summary = []
+    for node in flatten(trees):
+        if node['process']['exe'] in APPS:
+            summary.append({'exe': node['process']['exe'], 'pid': node['process']['pid'],
+                            'role': node['role_name'], 'name': node['name'][:60],
+                            'states': sorted(set(node['states']) & {1, 12, 23, 25, 30})})
+    return summary
+
+
 def network_panel_evidence(window):
     evidence = []
     keys = ('atspi', 'name', 'role_name', 'states', 'process')
+    # GNOME 51 exposes Settings sidebar categories as buttons, older shells
+    # as list items/tabs: both carry the selected Network identity.
     for selected in flatten(window['children']):
-        if selected['role_name'] not in ('list item', 'page tab', 'tree item', 'radio button') or not {23, 25, 30} <= set(selected['states']):
+        if selected['role_name'] not in ('list item', 'page tab', 'tree item', 'radio button', 'button') or not {23, 25, 30} <= set(selected['states']):
             continue
         labels = [node for node in flatten([selected]) if node['name'].strip().casefold() == 'network'
                   and {25, 30} <= set(node['states'])]
@@ -1143,7 +1207,7 @@ def network_panel_evidence(window):
     if not evidence:
         tabs = [(n['role_name'], n['name'][:40], sorted(set(n['states']) & {1, 23, 25, 30}))
                 for n in flatten(window['children'])
-                if n['role_name'] in ('list item', 'page tab', 'tree item', 'radio button')][:12]
+                if n['role_name'] in ('list item', 'page tab', 'tree item', 'radio button', 'button')][:12]
         full = [(n['role_name'], n['name'][:30], sorted(set(n['states']) & {1, 23, 25, 30}))
                 for n in flatten(window['children'])][:60]
         raise FixtureNotReady('original Settings descendants do not expose selected visible Network panel; '
@@ -1151,12 +1215,13 @@ def network_panel_evidence(window):
     return evidence
 
 
-def window_context(trees, fixture, shell):
+def window_context(trees, fixture, shell, require_shell=True):
     windows = []
     shell_trees = [node for node in trees if node['process']['pid'] == shell['pid']]
-    if len(shell_trees) != 1:
+    if require_shell and len(shell_trees) != 1:
         raise RuntimeError('original Shell public AT-SPI application tree unavailable or ambiguous')
-    same_process(shell, shell_trees[0]['process'])
+    if require_shell:
+        same_process(shell, shell_trees[0]['process'])
     principals = {p['pid']: p for p in fixture['processes']}
     for node in flatten(trees):
         principal = node['process']
@@ -1190,9 +1255,15 @@ def window_context(trees, fixture, shell):
     if len(set(ids)) != 3:
         raise RuntimeError('fixture windows do not have distinct actual AT-SPI identities')
     active = [w for w in windows if 1 in w['states']]
-    if not active:
-        raise FixtureNotReady('actual active application window is not yet exposed')
-    if len(active) != 1:
+    # No active fixture window is an observable member-flow state, not a
+    # fatal one (round-23: the app switcher holds a shell grab while Super
+    # is held, so every held-phase observation legitimately sees three
+    # visible-but-inactive windows; a post-commit gap looks the same). The
+    # inventory above is intact, and the selection below carries the same
+    # window states plus shell focused/selected evidence the old raise
+    # formatted, so return it and let the host predicates judge readiness.
+    # Prepare still requires active Settings via snapshot_until_ready.
+    if len(active) > 1:
         raise RuntimeError('actual active application window is unavailable or ambiguous')
     shell_nodes = [n for n in flatten(shell_trees) if n['process']['pid'] == shell['pid']]
     leaf = lambda n: {k: n[k] for k in ('atspi', 'name', 'role_name', 'states', 'process')}
@@ -1201,6 +1272,34 @@ def window_context(trees, fixture, shell):
                  'focused': [leaf(n) for n in shell_nodes if 12 in n['states']],
                  'active_windows': active}
     return windows, selection
+
+
+def light_readiness(claim, admitted, environment, deadline):
+    """Cheap fixture-only readiness gate for prepare's retry loop.
+
+    Walks fixture applications only (no Shell tree, no identity
+    re-validation): a full public_observation burst on every retry starves
+    GNOME Control Center's slow session registration — CI rounds measured
+    Settings mapping only after polling stopped — so the heavy walk runs
+    once, only after this light gate passes. Raises FixtureNotReady with
+    the real fixture inventory until ready; returns the light
+    (windows, selection) on success. Full snapshot validation is unchanged
+    and still runs on every attempt that passes this gate.
+    """
+    observation = public_observation(environment, admitted, deadline, only_exes=set(APPS))
+    return window_context(observation['trees'], claim['fixture'], admitted['session']['shell'],
+                          require_shell=False)
+
+
+def readiness_probe(args, claim, admitted, environment, deadline, cache):
+    """Two-stage prepare attempt: light gate, then one full snapshot confirm.
+
+    Full validation is never skipped: the returned result is a genuine full
+    snapshot. The light gate only decides whether the heavy walk is worth
+    one attempt yet, keeping retry traffic off g-c-c's registration path.
+    """
+    light_readiness(claim, admitted, environment, deadline)
+    return snapshot(args, claim, admitted, environment, deadline, cache)
 
 
 def drain_worker_streams(worker, streams):
@@ -1242,8 +1341,10 @@ def check_worker_status(returncode, stderr_text):
         raise RuntimeError('finite UID1000 public observation failed: ' + stderr_text[:3000])
 
 
-def public_observation(environment, admitted, deadline):
+def public_observation(environment, admitted, deadline, only_exes=None):
     worker_args = {'compositor': admitted['session']['compositor']}
+    if only_exes is not None:
+        worker_args['only_exes'] = sorted(only_exes)
     owner = pwd.getpwnam('tuna-test')
     observer = IdentityObserver(admitted, deadline)
     controller, child_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -1406,6 +1507,260 @@ def cleanup(args, claim, directory, deadline):
     return receipt
 
 
+class StderrDrain(threading.Thread):
+    """Continuously drain one fixture launcher's stderr into a bounded tail.
+
+    A launcher that outlives its pipe buffer must never wedge on a full
+    pipe: the parent always reads, keeping only the last 64 KiB for
+    failure diagnostics. Daemon thread; exits on launcher EOF/exit.
+    """
+    KEEP = 65536
+
+    def __init__(self, stream):
+        super().__init__(daemon=True)
+        self.stream = stream
+        self.tail = bytearray()
+
+    def run(self):
+        try:
+            while True:
+                data = self.stream.read(65536)
+                if not data:
+                    break
+                self.tail += data
+                del self.tail[:-self.KEEP]
+        except (OSError, ValueError):
+            pass
+
+    def text(self, limit=2048):
+        return bytes(self.tail[-limit:]).decode('utf-8', errors='replace')
+
+
+NAUTILUS_BUS_NAME = 'org.gnome.Nautilus'
+SETTINGS_BUS_NAME = 'org.gnome.Settings'
+
+
+def bus_name_owned(name, environment, owner_gid, deadline):
+    """Whether a session-bus name already has an owner (single check, no wait)."""
+    argv = ['/usr/bin/gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
+           '--object-path', '/org/freedesktop/DBus',
+           '--method', 'org.freedesktop.DBus.NameHasOwner', name]
+    completed = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=deadline.remaining(), env=environment,
+                               user=UID, group=owner_gid, extra_groups=[],
+                               start_new_session=True)
+    if completed.returncode:
+        raise RuntimeError('session bus name query failed: '
+                           + completed.stderr.decode(errors='replace')[:500])
+    return completed.stdout.decode(errors='replace').strip() == '(true,)'
+
+
+def bus_name_owner_probe(name, environment, owner_gid):
+    """Best-effort owner of a session-bus name: pid, exe, ppid. Never raises.
+
+    On failure returns None when the name is unowned, else a dict describing
+    the query error. A fast silent launcher exit with a foreign owner here is
+    a handoff to a session-restored zombie, not a broken launch.
+    """
+    def query(method, value):
+        completed = subprocess.run(
+            ['/usr/bin/gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
+             '--object-path', '/org/freedesktop/DBus', '--method',
+             'org.freedesktop.DBus.' + method, "'%s'" % value],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=10, env=environment, user=UID, group=owner_gid, extra_groups=[],
+            start_new_session=True)
+        if completed.returncode:
+            return None, completed.stderr.decode(errors='replace')
+        return completed.stdout.decode(errors='replace').strip(), ''
+    try:
+        unique, err = query('GetNameOwner', name)
+        if unique is None:
+            if 'NameHasNoOwner' in err:
+                return None
+            return {'name': name, 'error': err[:200]}
+        unique_name = re.search(r':[\d.]+', unique).group(0)
+        pid_text, err = query('GetConnectionUnixProcessID', unique_name)
+        if pid_text is None:
+            return {'name': name, 'error': err[:200]}
+        pid = int(re.search(r'uint32\s+(\d+)', pid_text).group(1))
+        try:
+            exe = os.readlink('/proc/%d/exe' % pid)
+            ppid = int(open('/proc/%d/stat' % pid).read().rsplit(') ', 1)[1].split()[1])
+        except OSError as missing:
+            return {'name': name, 'pid': pid, 'error': 'owner vanished: %s' % missing}
+        return {'name': name, 'pid': pid, 'exe': exe, 'ppid': ppid}
+    except Exception as failed:
+        return {'name': name, 'error': '%s: %s' % (type(failed).__name__, failed)}
+
+
+TRACKER_SCHEMA = 'org.freedesktop.Tracker3.Miner.Files'
+TRACKER_INDEX_KEYS = ('index-recursive-directories', 'index-single-directories')
+
+
+def _cmdline_pids(pattern, uid):
+    """PIDs of `uid` processes whose command line matches (covers renames)."""
+    found = []
+    for directory in Path('/proc').iterdir():
+        if not directory.name.isdigit():
+            continue
+        try:
+            if directory.stat().st_uid != uid:
+                continue
+            cmdline = (directory / 'cmdline').read_bytes().replace(b'\0', b' ').decode(errors='replace')
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if re.search(pattern, cmdline):
+            found.append(int(directory.name))
+    return found
+
+
+def _gsettings(environment, owner_gid, deadline, *argv):
+    completed = subprocess.run(['/usr/bin/gsettings', *argv], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=deadline.remaining(), env=environment,
+                               user=UID, group=owner_gid, extra_groups=[], start_new_session=True)
+    if completed.returncode:
+        raise RuntimeError('gsettings %s failed: %s' % (
+            ' '.join(argv), completed.stderr.decode(errors='replace')[:500]))
+    return completed.stdout.decode(errors='replace')
+
+
+def quiet_indexers(environment, owner_gid, deadline):
+    """Idle Tracker miners so the fixture runs quiet on both legs.
+
+    Walks slow monotonically within a run (2.6s to 5s) while our own gaps
+    widen, and Nautilus reports connecting to the file miner every round:
+    the fresh-user first-index ramps exogenous bus/disk/CPU load that stalls
+    fixture startup (measured 46s Settings stall) and starves observations.
+    Emptying the miner's indexed directories (user-scoped dconf on the
+    discarded test VM) idles it without breaking activation: Nautilus keeps
+    connecting successfully to an idle miner instead of retrying a masked
+    one. Miners already mid-index are reset with SIGTERM so they restart
+    idle; survivors fail loudly rather than run loud. Indexing affects
+    search only, never the window listing or focus under reference.
+    """
+    schemas = _gsettings(environment, owner_gid, deadline, 'list-schemas')
+    if TRACKER_SCHEMA not in schemas.split():
+        return {'miners': 'absent'}
+    keys = _gsettings(environment, owner_gid, deadline, 'list-keys', TRACKER_SCHEMA).split()
+    missing = [key for key in TRACKER_INDEX_KEYS if key not in keys]
+    if missing:
+        raise RuntimeError('tracker schema drift, refusing silent skip: missing %s' % ','.join(missing))
+    for key in TRACKER_INDEX_KEYS:
+        _gsettings(environment, owner_gid, deadline, 'set', TRACKER_SCHEMA, key, '[]')
+    readback = {key: _gsettings(environment, owner_gid, deadline, 'get', TRACKER_SCHEMA, key).strip()
+                for key in TRACKER_INDEX_KEYS}
+    if any(value not in ('[]', '@as []') for value in readback.values()):
+        raise RuntimeError('tracker index dirs did not land: %r' % (readback,))
+    targets = _cmdline_pids(r'tracker|localsearch', UID)
+    for pid in targets:
+        os.kill(pid, signal.SIGTERM)
+    while True:
+        survivors = _cmdline_pids(r'tracker|localsearch', UID)
+        if not survivors:
+            break
+        if deadline.remaining() < 0.2:
+            raise RuntimeError('tracker miners survived SIGTERM: %r' % (survivors,))
+        time.sleep(0.1)
+    return {'miners': 'idled', 'index_dirs': [], 'killed': sorted(targets)}
+
+
+def precheck_bus_names(environment, owner_gid, deadline):
+    """Refuse fixture launch when a GApplication name is already owned.
+
+    A session-restored instance owns the bus name without a recorded fixture
+    process; launching into that hands off (exit 0, no owned window) and the
+    inventory can never complete. Failing here names the race instead.
+    """
+    for bus_name in (NAUTILUS_BUS_NAME, SETTINGS_BUS_NAME):
+        if bus_name_owned(bus_name, environment, owner_gid, deadline):
+            raise RuntimeError('preexisting %s bus-name owner refused; session-restore race?' % bus_name)
+
+
+def format_child_status(children, plan):
+    """Per-role launcher liveness for failure retention: exit status plus live exe.
+
+    Distinguishes windowless-but-running (status None, original exe) from a
+    handoff exit (status 0) and from PID reuse (status None, foreign exe).
+    Live processes also report scheduler state and wait channel: D-state is a
+    disk stall, S-state on a socket/futex a peer stall, R-state live work.
+    """
+    statuses = {}
+    for (argv, role), child in zip(plan, children):
+        status = child.poll()
+        try:
+            exe = os.readlink('/proc/%d/exe' % child.pid)
+        except OSError:
+            exe = '<exited>'
+        record = {'pid': child.pid, 'status': status, 'exe': exe, 'argv0': argv[0]}
+        if status is None and exe != '<exited>':
+            try:
+                state_line = next(line for line in
+                                  open('/proc/%d/status' % child.pid).read().splitlines()
+                                  if line.startswith('State:'))
+                record['state'] = state_line.split()[1]
+            except (OSError, StopIteration):
+                record['state'] = '?'
+            try:
+                record['wchan'] = open('/proc/%d/wchan' % child.pid).read().strip() or '?'
+            except OSError:
+                record['wchan'] = '?'
+        statuses[role] = record
+    return statuses
+
+
+def wait_bus_name(name, environment, owner_gid, deadline):
+    """Wait until a GApplication owns its session-bus name.
+
+    A full accessibility-tree walk costs seconds under load; name
+    ownership is the actual second-launch forward precondition and
+    answers in milliseconds over the session bus.
+    """
+    argv = ['/usr/bin/gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
+           '--object-path', '/org/freedesktop/DBus',
+           '--method', 'org.freedesktop.DBus.NameHasOwner', name]
+    while True:
+        budget = deadline.remaining()
+        completed = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=budget, env=environment,
+                                   user=UID, group=owner_gid, extra_groups=[],
+                                   start_new_session=True)
+        if completed.returncode:
+            raise RuntimeError('session bus name query failed: '
+                               + completed.stderr.decode(errors='replace')[:500])
+        if completed.stdout.decode(errors='replace').strip() == '(true,)':
+            return
+        time.sleep(min(0.05, max(0.0, deadline.end - time.monotonic())))
+
+
+def fixture_launch_plan(directories):
+    """Ordered (argv, role) fixture launches; Settings last.
+
+    The last mapped window owns focus on both reference shells, so
+    Settings launches after both Nautilus invocations: no background
+    controller can activate an already-mapped window (focus-stealing
+    prevention denies token-less present requests), making mapping
+    order the only robust focus primitive. The first Nautilus still
+    primes its GApplication name on the session bus before the second
+    forwards; roles are stable.
+    """
+    if len(directories) != 2:
+        raise ValueError('fixture requires exactly two owned directories')
+    return [([APPS[0], '--new-window', directories[0]], 'files-first'),
+            ([APPS[0], '--new-window', directories[1]], 'files-second'),
+            ([APPS[1], 'network'], 'settings')]
+
+
+# Gap between readiness samples. A full AT-SPI walk is a 2.6s solid call burst
+# on the session bus the fixture needs to start; tight gaps keep the bus
+# saturated (observer effect - every startup call queues behind our bursts),
+# stretching startup past the deadline. 10s gaps drop our duty cycle to ~20%,
+# letting startup progress between samples; the first sample is immediate so
+# the fast path pays nothing.
+READINESS_POLL_GAP_S = 10.0
+
+
 def snapshot_until_ready(snapshot_fn, children, deadline):
     """Poll one full observation until the fixture is ready or time runs out.
 
@@ -1418,22 +1773,45 @@ def snapshot_until_ready(snapshot_fn, children, deadline):
     verification under load) reports the same way: the budget is gone
     so there is nothing to retry, but the retained first state is still
     the cause — never a naked deadline.
+    Attempt counts and per-attempt milliseconds ride along so a red run
+    also reports whether the budget went to many fast attempts or a few
+    slow walks. The per-attempt outcome sequence (error type plus message
+    head) rides along too, so a red run shows whether every attempt saw
+    the same not-ready state or the fixture moved mid-budget.
     """
     first_state_error = None
+    attempt_ms = []
+    outcomes = []
+
+    def record(error):
+        attempt_ms.append(int((time.monotonic() - started) * 1000))
+        outcomes.append(('%s: %s' % (type(error).__name__, error))[:100].replace('|', '/'))
 
     def unready(error):
         detail = 'last: %s: %s' % (type(error).__name__, error)
         if first_state_error is not None and first_state_error is not error:
             detail = 'first: %s: %s; %s' % (type(first_state_error).__name__, first_state_error, detail)
+        detail += '; attempts=%d attempt_ms=%s outcomes=[%s]' % (
+            len(attempt_ms), attempt_ms, '|'.join(outcomes))
         return RuntimeError('actual fixture observation never became ready: ' + detail)
 
     while True:
+        started = time.monotonic()
         try:
             result = snapshot_fn()
-            if result['selection']['active_windows'][0]['role'] != 'settings':
-                raise FixtureNotReady('original Settings Network window is not actually active')
+            seen = result['selection']['active_windows']
+            owner = seen[0] if seen else {}
+            if owner.get('role') != 'settings':
+                # Error-path introspection must never mask the verdict:
+                # defensive gets, since a malformed active record is still
+                # "Settings is not active".
+                identity = (owner.get('role'), owner.get('name'),
+                            (owner.get('process') or {}).get('pid'))
+                raise FixtureNotReady('original Settings Network window is not actually active; active='
+                                      + repr(identity))
             return result
         except FixtureNotReady as error:
+            record(error)
             if not isinstance(error, ObservationTimeout) and first_state_error is None:
                 first_state_error = error
             for child in children:
@@ -1448,8 +1826,9 @@ def snapshot_until_ready(snapshot_fn, children, deadline):
                         child.args[0] if child.args else '<unknown>', status, tail)) from error
             if deadline.end - time.monotonic() < 0.2:
                 raise unready(error) from error
-            time.sleep(min(0.1, max(0.0, deadline.end - time.monotonic())))
+            time.sleep(min(READINESS_POLL_GAP_S, max(0.0, deadline.end - time.monotonic())))
         except TimeoutError as error:
+            record(error)
             raise unready(error) from error
 
 
@@ -1459,6 +1838,8 @@ def prepare(args, directory, deadline, cache):
         raise RuntimeError('cannot prepare unadmitted native session: ' + '; '.join(admitted['missing']))
     if process_candidates(APPS, UID, deadline):
         raise RuntimeError('preexisting Files/Settings process refused; no unrelated process will be killed')
+    precheck_bus_names(environment, pwd.getpwnam('tuna-test').pw_gid, deadline)
+    indexers_quiet = quiet_indexers(environment, pwd.getpwnam('tuna-test').pw_gid, deadline)
     # Also inspect public inventory before launching, not just Linux process names.
     before = public_observation(environment, admitted, deadline)
     shell_roots = [node for node in before['trees'] if node['process']['pid'] == admitted['session']['shell']['pid']]
@@ -1475,6 +1856,7 @@ def prepare(args, directory, deadline, cache):
     fixture = claim['fixture']
     fixture['directories'] = [str(base / 'first'), str(base / 'second')]
     fixture['launchers'] = []
+    fixture['indexers_quiet'] = indexers_quiet
     claim['admission'] = admitted
     claim['settings'] = before['settings']
     save(directory, 'claim.json', claim)
@@ -1487,28 +1869,45 @@ def prepare(args, directory, deadline, cache):
     owner = pwd.getpwnam('tuna-test')
     environment = dict(environment, GDK_BACKEND='wayland')
     children = []
-    for argv in ([APPS[0], '--new-window', fixture['directories'][0]],
-                 [APPS[0], '--new-window', fixture['directories'][1]],
-                 [APPS[1], 'network']):
+    drains = {}
+    fixture['launches'] = []
+    nautilus_primed = False
+    for argv, role in fixture_launch_plan(fixture['directories']):
         deadline.remaining()
         child_env = environment
         if argv[0] == APPS[1]:
-            # gnome-control-center refuses to start unless the session
-            # advertises GNOME or Unity. The Tuna session lists GNOME as a
-            # compatible desktop for this fixture (same precedent as the GTK
-            # portal proofs); the observed Settings window is unaffected.
-            child_env = dict(environment, XDG_CURRENT_DESKTOP='Tuna:GNOME')
+            # gnome-control-center refuses to start unless the desktop
+            # advertises GNOME or Unity ("Running gnome-control-center is
+            # only supported under GNOME and Unity", exit 1). The session
+            # environment carries no XDG_CURRENT_DESKTOP at all (proven by
+            # retained null launch desktops), so the fixture must supply
+            # it: genuine GNOME on the GNOME leg, GNOME-compatible on Tuna
+            # (same precedent as the GTK portal proofs).
+            desktop = 'GNOME' if args['profile'] == 'gnome' else 'Tuna:GNOME'
+            child_env = dict(environment, XDG_CURRENT_DESKTOP=desktop)
+            if args['profile'] == 'gnome':
+                # Diagnostic until the GNOME-leg first-map stall is root-caused:
+                # GApplication lifecycle lines (register/activate/open) with
+                # timestamps localize the stall to a phase boundary.
+                child_env['G_MESSAGES_DEBUG'] = 'GApplication'
         child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.PIPE, env=child_env, user=UID,
                                  group=owner.pw_gid, extra_groups=[], start_new_session=True)
         children.append(child)
-        secondary = argv == [APPS[0], '--new-window', fixture['directories'][1]]
+        drain = StderrDrain(child.stderr)
+        drains[role] = drain
+        drain.start()
+        secondary = role == 'files-second'
+        launched_ns = time.monotonic_ns()
         try:
             identity = proc_identity(child.pid, UID)
             if identity['exe'] != argv[0]:
                 raise RuntimeError('fixture launcher did not enter original application ELF')
             bucket = fixture['launchers'] if secondary else fixture['processes']
             bucket.append(identity)
+            fixture['launches'].append({'role': role, 'pid': child.pid,
+                                        'launched_monotonic_ns': launched_ns,
+                                        'desktop': child_env.get('XDG_CURRENT_DESKTOP')})
             save(directory, 'claim.json', claim)
             bucket[-1] = packaged(identity, deadline, cache)
             save(directory, 'claim.json', claim)
@@ -1518,18 +1917,41 @@ def prepare(args, directory, deadline, cache):
         if secondary:
             if child.wait(timeout=deadline.remaining()) != 0:
                 raise RuntimeError('second Nautilus invocation failed to forward its window')
-        # First Nautilus must own its GApplication name before second launch.
-        if argv[0] == APPS[0] and len(children) == 1:
+            # The forward exiting does not mean the second window mapped:
+            # Settings launches next and must map strictly last to own
+            # focus, so wait for the forwarded window first.
             while True:
-                obs = public_observation(environment, admitted, deadline)
-                matching = [n for n in flatten(obs['trees']) if n['process']['pid'] == child.pid and n['role_name'] in ('frame', 'window') and 25 in n['states']]
-                if matching:
+                obs = public_observation(environment, admitted, deadline, only_exes=set(APPS))
+                forwarded = [n for n in flatten(obs['trees'])
+                             if os.path.basename(fixture['directories'][1]) in n['name']
+                             and n['role_name'] in ('frame', 'window') and 25 in n['states']]
+                if forwarded:
                     break
-                time.sleep(min(0.1, deadline.remaining()))
+                time.sleep(min(READINESS_POLL_GAP_S, deadline.remaining()))
+        # First Nautilus must own its GApplication name before second launch.
+        if argv[0] == APPS[0] and not nautilus_primed:
+            nautilus_primed = True
+            wait_bus_name(NAUTILUS_BUS_NAME, environment, owner.pw_gid, deadline)
     # Existing app process descendants must be the recorded original principals;
     # no process discovered by a name-only scan gains cleanup ownership.
-    result = snapshot_until_ready(
-        lambda: snapshot(args, claim, admitted, environment, deadline, cache), children, deadline)
+    try:
+        result = snapshot_until_ready(
+            lambda: readiness_probe(args, claim, admitted, environment, deadline, cache),
+            children, deadline)
+    except Exception as error:
+        tails = {role: drain.text() for role, drain in drains.items()}
+        statuses = format_child_status(children, fixture_launch_plan(fixture['directories']))
+        owners = {bus_name: bus_name_owner_probe(bus_name, environment, owner.pw_gid)
+                  for bus_name in (NAUTILUS_BUS_NAME, SETTINGS_BUS_NAME)}
+        try:
+            final = public_observation(environment, admitted, Deadline(10), only_exes=set(APPS))
+            census = fixture_node_summary(final['trees'])
+        except Exception as census_error:
+            census = 'unavailable: %s: %s' % (type(census_error).__name__, census_error)
+        raise RuntimeError('%s; launches=%s; stderr_tails=%s; child_status=%s; bus_owners=%s; fixture_census=%s' % (
+            error, json.dumps(fixture['launches'], sort_keys=True),
+            json.dumps(tails, sort_keys=True), json.dumps(statuses, sort_keys=True),
+            json.dumps(owners, sort_keys=True), json.dumps(census, sort_keys=True))) from error
     result['files'] = retained_files(directory, ('snapshot.json',))
     save(directory, 'snapshot.json', result)
     response = {'schema': 1, 'nonce': args['nonce'], 'profile': args['profile'], 'ready': True,
@@ -1539,11 +1961,38 @@ def prepare(args, directory, deadline, cache):
     return response
 
 
+def overview_state(args, deadline, cache):
+    """Claim-free shell overview visibility for the pre-prepare dismiss.
+
+    No fixture exists yet, so there is no claim to load and no window
+    inventory to validate: admit the session, walk the admitted session
+    shell's tree only, and report whether a visible overview search entry
+    is present. The pid filter keeps greeter-residue shells (same exe,
+    other uid) out of the verdict. Read-only; never launches, never
+    mutates.
+    """
+    admitted, environment = admission(args['profile'], deadline, cache)
+    if not admitted['ready']:
+        raise RuntimeError('cannot read overview of unadmitted native session: '
+                           + '; '.join(admitted['missing']))
+    shell = admitted['session']['shell']
+    observation = public_observation(environment, admitted, deadline, only_exes={shell['exe']})
+    trees = [node for node in observation['trees'] if node['process']['pid'] == shell['pid']]
+    found = any(node['role_name'] in ('search box', 'entry') and 25 in node['states'] and 30 in node['states']
+                for node in flatten(trees))
+    return {'schema': 1, 'ready': True, 'operation': 'overview', 'profile': args['profile'],
+            'nonce': args['nonce'], 'overview_open': found, 'shell_pid': shell['pid'],
+            'observed_monotonic_ns': time.monotonic_ns(), 'clock_domain': CLOCK}
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == '_observe':
         value = json.loads(sys.stdin.buffer.read(65537))
-        if set(value) != {'compositor', 'budget_s'}:
+        if set(value) - {'compositor', 'budget_s', 'only_exes'} or 'compositor' not in value or 'budget_s' not in value:
             raise ValueError('fixed observation arguments required')
+        if 'only_exes' in value and (not isinstance(value['only_exes'], list)
+                                     or not all(isinstance(item, str) for item in value['only_exes'])):
+            raise ValueError('only_exes must be a list of strings')
         try:
             with socket.socket(fileno=int(sys.argv[2])) as channel:
                 result = session_observe(value, Deadline(value['budget_s']), channel)
@@ -1581,6 +2030,8 @@ def main():
                 if deadline.end - time.monotonic() < 1.0:
                     break
                 time.sleep(0.5)
+        elif operation == 'overview':
+            result = overview_state(args, deadline, cache)
         else:
             directory = ROOT / args['nonce']
             if operation == 'prepare':

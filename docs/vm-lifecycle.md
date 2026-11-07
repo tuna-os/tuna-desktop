@@ -70,6 +70,9 @@ This uses the same original package producer and VM image recipe, with
 stock GDM and the original non-root standard account, unchanged default GPU,
 and no disposable disk or full Core application installer/inventory.
 There is no dispatch, secret or repository-variable waiver.
+The leg never reuses a retained native product: that capsule's receipt binds
+only the lifecycle members, so this image is always built fresh from the
+same run's package and checkout.
 
 The final immutable image receipt binds the exact executing source commit,
 original package hash and original installed ELF hashes, lifecycle helper,

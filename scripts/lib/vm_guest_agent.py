@@ -168,6 +168,14 @@ def valid_inventory_error(value):
         and type(frame[1]) is int and 0 < frame[1] <= 1000000 for frame in frames)
 
 
+def valid_tour_public_ui_error(value):
+    """The tour observer's bounded crash record: same shape as inventory's,
+    but the observer sets no stage, so only unstaged records validate."""
+    if type(value) is not dict or value.get("stage") != "unstaged":
+        return False
+    return valid_inventory_error(value)
+
+
 # Lifecycle actions whose failure prints one bounded, validated record on
 # stdout; any other action's output (and every stderr) stays private.
 def valid_autotz_error(value):
@@ -205,7 +213,8 @@ FAILURE_RECORDS = {"orca-read": ("orca_read_error", valid_orca_read_error),
                    "strip-stop": ("strip_stop_error", valid_strip_stop_error),
                    "delayed-auth-state": ("delayed_auth_error", valid_delayed_auth_error),
                    "inventory": ("inventory_error", valid_inventory_error),
-                   "autotz": ("autotz_error", valid_autotz_error)}
+                   "autotz": ("autotz_error", valid_autotz_error),
+                   "tour-public-ui": ("tour_public_ui_error", valid_tour_public_ui_error)}
 # Records that must be the whole output and are logged before raising, so a
 # caller's cleanup failure cannot hide them.
 LOGGED_FAILURE_RECORDS = {"delayed-auth-state", "inventory", "autotz"}
@@ -412,9 +421,14 @@ class GuestAgent:
         path = "/usr/libexec/tuna-vm-lifecycle"
         argv = [action, *map(str, arguments)]
         if action == "gnome-reference":
-            if (len(arguments) != 2 or arguments[0] not in {"admit", "prepare", "observe", "file", "stop"}
-                    or type(arguments[1]) is not str or not 0 < timeout <= 30):
-                raise ValueError("reference action requires one finite operation, JSON and at most 30 seconds")
+            # Prepare alone gets headroom (240s guest budget: round-18 showed
+            # GNOME Settings absent from every poll walk for 107s); all other
+            # ops keep the 30s transport cap.
+            timeout_cap = 250 if arguments[:1] == ("prepare",) else 30
+            if (len(arguments) != 2 or arguments[0] not in {"admit", "prepare", "observe", "file", "stop", "overview"}
+                    or type(arguments[1]) is not str or not 0 < timeout <= timeout_cap):
+                raise ValueError("reference action requires one finite operation, JSON and at most %d seconds"
+                                 % timeout_cap)
             payload = json.loads(arguments[1])
             if type(payload) is not dict:
                 raise ValueError("reference payload must be a JSON object")

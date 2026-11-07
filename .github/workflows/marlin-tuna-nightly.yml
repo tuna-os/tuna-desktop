@@ -9,22 +9,11 @@ on:
         description: 'sha256 digest of ghcr.io/tuna-os/marlin to qualify (empty: newest marlin:tuna)'
         required: false
         default: ''
-  pull_request:
-    paths:
-      - .github/workflows/marlin-tuna-nightly.yml
-      - packaging/marlin/vm-lane/Containerfile.published
-      - packaging/marlin/vm-lane/tuna-vm-published-pacman
-      - packaging/marlin/vm-lane/tuna-vm-lifecycle
-      - packaging/marlin/vm-lane/tuna-vm-health
-      - packaging/marlin/vm-lane/tuna-vm-constraints.c
-      - packaging/marlin/vm-lane/tuna-vm-constraints-build
-      - packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles
-      - scripts/tuna-vm-lane
-      - scripts/tuna-vm-soak
-      - scripts/tuna-frame-pacer-build
-      - scripts/lib/tuna-frame-pacer.c
-      - scripts/lib/endurance_presentation.py
-      - scripts/lib/soak_report.py
+  # No pull_request trigger: this lane qualifies the *published* image, 179 of
+  # its 193 PR runs in the 2026-10-31..11-06 week failed (6.5k hosted
+  # minutes) and ci.yml's marlin-vm lane already boots the same scripts. To
+  # test a change here, dispatch it on the branch:
+  #   gh workflow run marlin-tuna-nightly.yml --ref <branch>
 
 permissions:
   contents: read

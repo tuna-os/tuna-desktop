@@ -37,7 +37,7 @@ schedule, dispatch or a pull request whose head repository is
 | --- | --- |
 | `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, native-reference-context, parity-ledger, docs-shots, ci-gate |
 | `tuna-ci-26.04` | journey, orca-speech, portal-security, remote-security, niri-parity |
-| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (both lifecycle legs and both paired reference members), marlin-image, gdm51-native-package |
+| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (pull requests: the primary lifecycle leg only; push, schedule and dispatch add the Orca 51 leg and both paired reference members), marlin-image (push, schedule and dispatch only), gdm51-native-package |
 
 Why the always-hosted lanes stay hosted:
 
@@ -150,6 +150,37 @@ distinguishes open-endpoint `WouldBlock` from actual shutdown/EOF, and
 requires terminal failed-redial I/O before judging native-output revocation.
 All eleven deliberate closure fixtures use that convention. No production
 state transition, polling interval, acceptance guard or test is removed.
+
+The maintained-media check additionally needs read-only Actions access to
+authenticate the exact uploaded source-artifact bytes before replaying
+receipts against proposed canonical media; dependency auditing remains
+tokenless and fatal. Its real recording tests require FFmpeg (including
+`ffprobe`) and Pillow in the check job, not just in a capture producer.
+The GDM 51 final overlay belongs to the lifecycle images after the
+distribution/Orca branches. The paired GNOME/Tuna reference rows retain
+their separately admitted immutable base, while lifecycle image receipts
+retain the verified native platform digest rather than rereading a mutable
+tag after the build. These are source and admission contracts, not a claim
+that this merge has runtime or current-image qualification.
+
+## What a pull request runs
+
+Hosted minutes are the scarce resource, so a pull request pays only for what
+it can affect:
+
+- `select-lanes` and `check` always run; a **draft** pull request runs nothing
+  else (marking it ready for review starts the proof lanes).
+- Every proof lane waits for `check` (`needs: check`, directly or through
+  `arch-package`), so a red `check` does not also burn the lanes.
+- `scripts/ci-select-lanes` picks the lanes: docs, other non-runtime files and
+  the tooling of other workflows (its `NO_LANE` list) pick none, a lane's own
+  proof script picks that lane, an edit confined to some lane jobs of `ci.yml`
+  picks those lanes, and any other code picks `gtk-shell` plus a rotating
+  slice. Shared CI inputs still pick every lane.
+- A newer push supersedes the older run (`concurrency` with
+  `cancel-in-progress`, except for `main`).
+- `marlin-tuna-nightly` qualifies the published image on schedule and
+  dispatch only; dispatch it on a branch to test a change to it.
 
 ## Queue supersession and closed pull requests
 
