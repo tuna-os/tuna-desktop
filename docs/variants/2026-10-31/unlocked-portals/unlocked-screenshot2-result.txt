@@ -1,0 +1,1 @@
+(0, '(false,)\nrequester_exit=0\nactual portal picker: Allow\nactual Screenshot consent delivered 1280x800 pixels\n{\n  "response": 0,\n  "results": {\n    "uri": "file:///var/home/tuna-test/Pictures/Screenshots/Screenshot%20From%202026-10-31%2020-39-11.png"\n  }\n}(false,)', '')

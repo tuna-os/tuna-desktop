@@ -845,6 +845,90 @@ fn stationary_pointer_press_enters_a_newly_mapped_window_before_delivery() {
     );
 }
 
+/// #425: Mutter repicks when the scene changes under a stationary
+/// pointer, so a freshly mapped window gets `wl_pointer.enter` on its
+/// own, before any press, and the first click then lands on it. The
+/// runtime runs this repick every tick after dispatching clients.
+#[test]
+fn window_mapped_under_a_stationary_pointer_is_entered_before_any_press() {
+    let mut f = fixture();
+    let at = (geometry(&f).loc + Point::from((100, 100))).to_f64();
+    f.manager.pointer_motion(&mut f.comp.state, at, 1);
+    sync(&mut f);
+    assert_eq!(
+        f.client.pointer_entered.last().copied(),
+        Some(f._toplevel_surface.id().protocol_id())
+    );
+    // Nothing changed under the pointer: the repick sends nothing.
+    let entered = f.client.pointer_entered.len();
+    f.manager.repick_pointer_window(&mut f.comp.state);
+    sync(&mut f);
+    assert_eq!(f.client.pointer_entered.len(), entered);
+
+    let qh = f.queue.handle();
+    let surface = f
+        .client
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_surface(&qh, ());
+    let xdg = f
+        .client
+        .xdg_base
+        .as_ref()
+        .unwrap()
+        .get_xdg_surface(&surface, &qh, surface.clone());
+    let toplevel = xdg.get_toplevel(&qh, ());
+    toplevel.set_title("repicked-under-stationary-pointer".into());
+    surface.commit();
+    sync(&mut f);
+    sync(&mut f);
+    let new_id = f
+        .manager
+        .model()
+        .windows()
+        .map(|window| window.id)
+        .max()
+        .unwrap();
+    assert!(f.manager.geometry(new_id).unwrap().to_f64().contains(at));
+
+    // No motion and no press: the scene repick alone enters the new
+    // topmost surface.
+    f.manager.repick_pointer_window(&mut f.comp.state);
+    sync(&mut f);
+    assert_eq!(f.client.pointer_entered.len(), entered + 1);
+    assert_eq!(
+        f.client.pointer_entered.last().copied(),
+        Some(surface.id().protocol_id())
+    );
+    assert_eq!(f.client.presses, 0);
+
+    // The first click lands on the new window without a second enter.
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, true, 2);
+    sync(&mut f);
+    assert_eq!(f.client.pointer_entered.len(), entered + 1);
+    assert_eq!(f.client.presses, 1);
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 3);
+    sync(&mut f);
+    assert_eq!(f.client.releases, 1);
+
+    // The window closes under the still pointer: the window beneath is
+    // entered again.
+    toplevel.destroy();
+    xdg.destroy();
+    surface.destroy();
+    sync(&mut f);
+    sync(&mut f);
+    f.manager.repick_pointer_window(&mut f.comp.state);
+    sync(&mut f);
+    assert_eq!(
+        f.client.pointer_entered.last().copied(),
+        Some(f._toplevel_surface.id().protocol_id())
+    );
+}
+
 /// `edge-tiling` off (mutter 51 `meta-window-drag.c` only tiles under
 /// `meta_prefs_get_edge_tiling`): the left edge shows no preview and the
 /// release leaves the window floating where it was dropped; the top edge

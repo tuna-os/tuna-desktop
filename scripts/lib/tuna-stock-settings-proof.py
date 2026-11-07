@@ -194,10 +194,13 @@ def toggle(process, original, desired, label):
     # The corner result below, rather than this delay, is the acceptance proof.
     time.sleep(1)
     guard(process, original)
-    persisted = OUT / 'config/glib-2.0/settings/keyfile'
+    # Stock Settings and the shell are independent writers. The session's
+    # private dconf service merges their keys instead of replacing a stale
+    # whole-file keyfile snapshot when the shell seeds first-run folders.
+    persisted = OUT / 'config/dconf/user'
     if not persisted.is_file():
-        raise RuntimeError('shared keyfile backend did not persist the UI setting')
-    (OUT / f'{label}-settings-keyfile.txt').write_bytes(persisted.read_bytes())
+        raise RuntimeError('shared dconf backend did not persist the UI setting')
+    (OUT / f'{label}-settings.dconf').write_bytes(persisted.read_bytes())
     corner(desired, label)
     steps.append({'label': label, 'identity': original, 'enabled': desired,
                   'setting_changed_by': 'actual AT-SPI Hot Corner switch action'})

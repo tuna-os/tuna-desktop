@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "/home/ubuntu/.cache/tuna-journey-venv/bin/python",
+    "/tmp/tuna-variant-unlocked-20261031/harness/tuna-corral-journey",
+    "--image",
+    "ghcr.io/tuna-os/bonito@sha256:dd2bc06ea05ea73fc06c7f208ac3ea2c7107cc4125024362a7d4a9ddfe18c2b3",
+    "--vm",
+    "tuna-q-variant-bonito-rawhide-31215908",
+    "--node",
+    "karnataka",
+    "--out",
+    "/tmp/tuna-variant-unlocked-20261031/bonito-rawhide",
+    "--qualification-only"
+  ],
+  "exit": 1,
+  "stdout": "",
+  "stderr": "Traceback (most recent call last):\n  File \"/tmp/tuna-variant-unlocked-20261031/harness/tuna-corral-journey\", line 833, in <module>\n    sys.exit(main())\n             ~~~~^^\n  File \"/tmp/tuna-variant-unlocked-20261031/harness/tuna-corral-journey\", line 780, in main\n    console_proc, endpoint = start_console(args.vm)\n                             ~~~~~~~~~~~~~^^^^^^^^^\n  File \"/tmp/tuna-variant-unlocked-20261031/harness/tuna-corral-journey\", line 198, in start_console\n    raise RuntimeError(f'corral console exited {proc.returncode} before it printed a URL')\nRuntimeError: corral console exited 1 before it printed a URL\n"
+}
