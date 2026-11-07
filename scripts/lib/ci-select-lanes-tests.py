@@ -100,6 +100,53 @@ class Selection(unittest.TestCase):
         # Control: other shipped runtime data still rotates journey.
         self.assertNotIn('journey', pr("share/applications/tuna-settings.desktop", run=1))
 
+class WorkflowEdits(unittest.TestCase):
+    """An edit to ci.yml selects the lanes whose job changed, not every lane."""
+
+    BASE = """
+on: {pull_request: {}}
+x-runner: &runner ubuntu-latest
+jobs:
+  select-lanes: {runs-on: *runner, steps: [{run: a}]}
+  check: {runs-on: *runner, steps: [{run: a}]}
+  journey: {runs-on: *runner, steps: [{run: a}]}
+  drm-smoke: {runs-on: *runner, steps: [{run: a}]}
+  gdm51-native-package: {runs-on: *runner, steps: [{run: a}]}
+  ci-gate: {runs-on: *runner, steps: [{run: a}]}
+"""
+
+    def lanes(self, old, new):
+        return m.workflow_lanes(self.BASE, self.BASE.replace(old, new))
+
+    def test_lane_job_edit_selects_only_that_lane(self):
+        text = self.BASE.replace("  drm-smoke: {runs-on: *runner, steps: [{run: a}]}",
+                                 "  drm-smoke: {runs-on: *runner, steps: [{run: b}]}")
+        self.assertEqual(m.workflow_lanes(self.BASE, text), {"drm-smoke"})
+        self.assertEqual(m.select("pull_request", 0, 2, [m.WORKFLOW], {"drm-smoke"})[0], ["drm-smoke"])
+
+    def test_factory_job_belongs_to_the_marlin_vm_lane(self):
+        text = self.BASE.replace("  gdm51-native-package: {runs-on: *runner, steps: [{run: a}]}",
+                                 "  gdm51-native-package: {runs-on: *runner, steps: [{run: b}]}")
+        self.assertEqual(m.workflow_lanes(self.BASE, text), {"marlin-vm"})
+
+    def test_check_and_gate_edits_select_no_lane(self):
+        text = self.BASE.replace("  check: {runs-on: *runner, steps: [{run: a}]}",
+                                 "  check: {runs-on: *runner, steps: [{run: b}]}")
+        self.assertEqual(m.workflow_lanes(self.BASE, text), set())
+
+    def test_shared_edits_fall_back_to_every_lane(self):
+        # A changed anchor edits every aliasing job; triggers, select-lanes
+        # and unknown jobs are shared; so is anything unparseable.
+        self.assertIsNone(self.lanes("ubuntu-latest", "ubuntu-26.04"))
+        self.assertIsNone(self.lanes("on: {pull_request: {}}", "on: {push: {}}"))
+        self.assertIsNone(m.workflow_lanes(self.BASE, self.BASE.replace(
+            "  select-lanes: {runs-on: *runner, steps: [{run: a}]}",
+            "  select-lanes: {runs-on: *runner, steps: [{run: b}]}")))
+        self.assertIsNone(m.workflow_lanes(self.BASE, self.BASE + "  mystery: {runs-on: *runner}\n"))
+        self.assertIsNone(m.workflow_lanes("", self.BASE))
+        self.assertEqual(m.select("pull_request", 0, 2, [m.WORKFLOW], None)[0], m.LANES)
+
+
 
 class WorkflowSync(unittest.TestCase):
     def setUp(self):
