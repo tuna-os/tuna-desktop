@@ -9,6 +9,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 import unittest
@@ -3087,8 +3088,17 @@ class TourViewPredicates(unittest.TestCase):
             else:
                 path.write_bytes(tour_png(probes[-1]))
         now = [0.0]
+        real_sleep = lane.time.sleep
         def advance(seconds):
-            now[0] += seconds
+            # Patching lane.time patches the process-wide time module. Only
+            # the lane's own polling advances the fake clock; library waits,
+            # such as Python 3.12 subprocess.wait() reaping ffmpeg in a
+            # time.sleep() loop, sleep for real. Otherwise a slow ffmpeg exit
+            # spins that loop and burns the whole fake await_still deadline.
+            if sys._getframe(1).f_globals is vars(lane):
+                now[0] += seconds
+            else:
+                real_sleep(seconds)
         # Polling time advances only at sleep boundaries, not while the host
         # writes a synthetic frame or schedules the test process.
         with tempfile.TemporaryDirectory() as directory, \
