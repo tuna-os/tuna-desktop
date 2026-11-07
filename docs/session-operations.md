@@ -149,7 +149,7 @@ output for one area at a time.
 | Text console | Wherever you redirected it |
 
 To read the current boot's Tuna Desktop lines from the journal, as the Corral
-journey does (`scripts/tuna-corral-journey:113-116`):
+journey does (`scripts/tuna-corral-journey`, `Guest.journal`):
 
 ```sh
 journalctl -b _UID=$(id -u) -o cat --no-pager | grep -E '^tuna-'

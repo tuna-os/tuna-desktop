@@ -406,13 +406,6 @@ session_cleanup() {
     if [ -n "$SYSBUS_PID" ]; then kill "$SYSBUS_PID" 2>/dev/null || true; fi
 }
 
-pick_display() {
-    for d in $(seq 96 119); do
-        [ -e "/tmp/.X${d}-lock" ] || { echo ":$d"; return 0; }
-    done
-    return 1
-}
-
 # session_start <artifacts>; sets WID, SOCKET_NAME, CSTATE, LOG. Returns
 # nonzero (without exiting) when the session never comes up.
 session_start() {
@@ -430,10 +423,15 @@ session_start() {
     if [ -n "$DISPLAY_ARG" ]; then
         DISPLAY="$DISPLAY_ARG"; export DISPLAY
     else
-        DISPLAY="$(pick_display)" || return 1
-        export DISPLAY
-        Xvfb "$DISPLAY" -screen 0 "${WIDTH}x${HEIGHT}x24" >"$ARTIFACTS/xvfb.log" 2>&1 &
+        # tuna-xvfb picks a free display and locks it, so concurrent captures never collide.
+        rm -f "$ARTIFACTS/xvfb-display"
+        "$ROOT/scripts/lib/tuna-xvfb" -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp \
+            3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
         OWNED_XVFB=$!
+        for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 1; done
+        [ -s "$ARTIFACTS/xvfb-display" ] || return 1
+        DISPLAY=":$(cat "$ARTIFACTS/xvfb-display")"
+        export DISPLAY
         ok=0
         for _ in $(seq 1 30); do
             if xdotool getdisplaygeometry >/dev/null 2>&1; then ok=1; break; fi

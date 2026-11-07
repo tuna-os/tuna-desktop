@@ -6,7 +6,11 @@ overview mode compares only the known five-character fixture query in scratch
 memory; no buffer is retained. The explicit end-session mode adds the power
 menu and end-session dialog controls. Personalized Log Out labels are compared
 with AccountsService in scratch memory and canonicalized before recording; no
-user name is retained. Native QMP input performs every action.
+user name is retained. The separate notification-banner mode names only the
+fixed Notifications frame and its Close control, never banner content.
+Native QMP input performs every action.
+The explicit notification-banner-fixture mode additionally compares only the
+known fixture title in scratch memory and returns a boolean, never content.
 Primary API: https://gnome.pages.gitlab.gnome.org/at-spi2-core/libatspi/
 """
 import json
@@ -171,28 +175,40 @@ def catalog_receipt(pid, uid, ticks):
             "sample_scope":"original-show-results","authentication_boundary":False}
 
 
-def observe(pid, ticks, executable, display, controlled=False, end_session=False):
+def observe(pid, ticks, executable, display, controlled=False, end_session=False,
+            notification=False, fixture_control=False):
     global FOCUS_OPERATION
     FOCUS_OPERATION = "imports"
     import gi
     gi.require_version("Atspi", "2.0")
     from gi.repository import Atspi, Gio, GLib
     uid = os.getuid()
-    if type(controlled) is not bool or (controlled and executable != "tuna-shell-gtk"):
-        raise RuntimeError("fixed controlled overview mode required")
+    if (type(controlled) is not bool or type(end_session) is not bool or type(notification) is not bool
+            or type(fixture_control) is not bool or (fixture_control and not notification)
+            or ((controlled or end_session or notification) and executable != "tuna-shell-gtk")
+            or sum((controlled, end_session, notification)) > 1):
+        raise RuntimeError("fixed controlled observation mode required")
     if uid == 0 or executable not in {"tuna-shell-gtk", "gnome-disks"}:
         raise RuntimeError("probe requires the original non-root session principal")
     state = pathlib.Path(f"/run/user/{uid}/tuna-vm-state.json")
     if json.loads(state.read_text())["locked"]:
         raise RuntimeError("locked accessibility trees are never queried")
+    def unlocked():
+        snapshot = json.loads(state.read_text())
+        if snapshot["locked"]:
+            raise RuntimeError("locked accessibility trees are never queried")
+        if notification and (snapshot["overview_open"] or any(
+                layer.get("namespace") not in {"tuna-panel", "tuna-shell-banners"}
+                for layer in snapshot["layers"])):
+            raise RuntimeError("notification observation crossed an unexpected shell overlay")
+    unlocked()
     FOCUS_OPERATION = "process-identity"
     original = process_identity(pid, uid, ticks, executable, display)
     FOCUS_OPERATION = "atspi-timeout"
     Atspi.set_timeout(500, 500)
-    deadline = time.monotonic() + 8
+    deadline = time.monotonic() + (3 if fixture_control else 8)
     def remaining_budget():
-        if json.loads(state.read_text())["locked"]:
-            raise RuntimeError("locked accessibility trees are never queried")
+        unlocked()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeError("accessibility principal observation deadline exceeded")
@@ -271,15 +287,16 @@ def observe(pid, ticks, executable, display, controlled=False, end_session=False
         return values
     FOCUS_OPERATION = "bus-credentials"
     before = credentials()
-    nodes, pending, visited = [], [(app, 0)], 0
+    nodes, pending, visited = [], [(app, 0, False)], 0
+    notification_frames, notification_closes = [], []
     search_entries, target = [], {"showing":0,"focused":0,"present":0}
     focused_roles = []
+    fixture_visible = False
     while pending:
-        if json.loads(state.read_text())["locked"]:
-            raise RuntimeError("locked accessibility trees are never queried")
+        unlocked()
         if time.monotonic() >= deadline or visited >= 512:
             raise RuntimeError("accessibility focus observation exceeds bound")
-        node, depth = pending.pop()
+        node, depth, in_notification = pending.pop()
         visited += 1
         if depth > 32:
             raise RuntimeError("accessibility focus tree depth exceeds bound")
@@ -293,7 +310,29 @@ def observe(pid, ticks, executable, display, controlled=False, end_session=False
             continue
         FOCUS_OPERATION = "tree-role"
         role = canonical_role(accessibility_query(node.get_role_name))
-        if role in PUBLIC_ROLES or (end_session and role == "label"):
+        if notification:
+            # Only the source-owned fixed Notifications frame and its Close
+            # control are named. Never query notification titles/body/text.
+            if role == "frame":
+                FOCUS_OPERATION = "tree-name"
+                in_notification = accessibility_query(node.get_name) == "Notifications"
+                if not in_notification:
+                    continue
+            if fixture_control and in_notification and role in {"alert", "notification"}:
+                FOCUS_OPERATION = "tree-name"
+                fixture_visible |= accessibility_query(node.get_name) == "Installed strip framebuffer control"
+            if role == "frame" or (in_notification and role == "push button"
+                    and accessibility_query(node.get_name) == "Close"):
+                component = accessibility_query(node.get_component_iface)
+                rect = accessibility_query(Atspi.Component.get_extents, component, Atspi.CoordType.WINDOW)
+                bounds = [rect.x, rect.y, rect.width, rect.height]
+                if any(type(value) is not int for value in bounds) or min(bounds[2:]) <= 0:
+                    raise RuntimeError("notification control has invalid bounds")
+                if role == "frame":
+                    notification_frames.append(bounds)
+                elif states.contains(Atspi.StateType.SENSITIVE):
+                    notification_closes.append({"rect": bounds, "focused": states.contains(Atspi.StateType.FOCUSED)})
+        elif role in PUBLIC_ROLES or (end_session and role == "label"):
             FOCUS_OPERATION = "tree-name"
             name = accessibility_query(node.get_name)
             FOCUS_OPERATION = "tree-state-flags"
@@ -323,7 +362,7 @@ def observe(pid, ticks, executable, display, controlled=False, end_session=False
         for index in range(children):
             child = accessibility_query(node.get_child_at_index, index)
             if child is not None:
-                pending.append((child, depth + 1))
+                pending.append((child, depth + 1, in_notification))
     diagnostic = None
     if controlled:
         FOCUS_OPERATION = "controlled-query"
@@ -352,16 +391,25 @@ def observe(pid, ticks, executable, display, controlled=False, end_session=False
         if json.loads(state.read_text())["locked"]:
             raise RuntimeError("locked accessibility trees are never queried")
         result["controlled_overview_diagnostic"] = diagnostic
+    if notification:
+        unlocked()
+        result["notification_banner"] = {"frames": notification_frames, "close_controls": notification_closes}
+        if fixture_control:
+            result["notification_banner"]["control_visible"] = bool(fixture_visible)
+        result["observer_sha256"] = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()
     return result
 
 
 if __name__ == "__main__":
     try:
-        modes = {"controlled-overview": (True, False), "end-session": (False, True)}
-        if len(sys.argv) not in (5,6) or (len(sys.argv)==6 and sys.argv[5] not in modes):
+        modes = {"controlled-overview", "end-session", "notification-banner", "notification-banner-fixture"}
+        if len(sys.argv) not in (5, 6) or (len(sys.argv) == 6 and sys.argv[5] not in modes):
             raise ValueError("fixed observation mode")
-        controlled, end_session = modes[sys.argv[5]] if len(sys.argv) == 6 else (False, False)
-        receipt = observe(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4], controlled, end_session)
+        mode = sys.argv[5] if len(sys.argv) == 6 else None
+        receipt = observe(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4],
+                          controlled=mode == "controlled-overview", end_session=mode == "end-session",
+                          notification=mode in {"notification-banner", "notification-banner-fixture"},
+                          fixture_control=mode == "notification-banner-fixture")
         FOCUS_OPERATION = "serialization"
         print(json.dumps(receipt))
     except Exception as error:
