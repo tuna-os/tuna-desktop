@@ -12,7 +12,8 @@
 //! - **Outputs**: every connected connector with its preferred mode and
 //!   a free CRTC, tiled left to right in the same order the output
 //!   inventory uses. Each output renders when its previous page flip
-//!   completed (vblank), so frames are paced by the display.
+//!   completed (vblank), so frames are paced by the display. Connectors
+//!   for lease (non-desktop ones, [`lease`]) stay off the desktop.
 //! - **Input**: libinput on the session's seat. Relative pointer motion
 //!   is accumulated here and clamped to the output union, so the window
 //!   manager keeps receiving absolute positions like the nested backend.
@@ -46,6 +47,7 @@ use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size};
 use crate::windows::ManagerInput;
 
 pub mod color;
+pub mod lease;
 pub mod libinput;
 pub mod libwacom;
 pub mod privacy;
@@ -310,6 +312,7 @@ pub struct DrmBackend {
     gbm: GbmDevice<DrmDeviceFd>,
     render_formats: smithay::backend::allocator::format::FormatSet,
     native_device: Option<u64>,
+    lease_names: Vec<String>,
 }
 
 /// Connectors a hotplug rescan found connected or gone, by name.
@@ -439,6 +442,7 @@ impl Lighting<'_> {
         handle: connector::Handle,
         info: &connector::Info,
         used: &[crtc::Handle],
+        name: String,
     ) -> Option<DrmOutput> {
         // Mutter's monitor modes (#340): every connector mode,
         // deduplicated and sorted; the output starts in the preferred
@@ -463,7 +467,6 @@ impl Lighting<'_> {
             .collect();
         let preferred_mode = listed.preferred;
         let mode = modes[preferred_mode].1;
-        let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
         let Some(crtc) = info
             .encoders()
             .iter()
@@ -579,6 +582,32 @@ impl DrmBackend {
             .collect()
     }
 
+    /// The CRTCs and primary planes the desktop outputs own, which the
+    /// lease device never leases.
+    pub fn desktop_resources(&self) -> (Vec<crtc::Handle>, Vec<control::plane::Handle>) {
+        (
+            self.outputs.iter().map(|o| o.crtc).collect(),
+            self.outputs.iter().map(|o| o.surface.plane()).collect(),
+        )
+    }
+
+    /// The `wp_drm_lease_device_v1` global for this device (Mutter's
+    /// native backend only); it never leases the desktop's CRTCs and
+    /// primary planes.
+    pub fn lease_device(
+        &self,
+        dh: &smithay::reexports::wayland_server::DisplayHandle,
+    ) -> Result<lease::LeaseDevice, String> {
+        let (crtcs, planes) = self.desktop_resources();
+        lease::LeaseDevice::new(
+            dh,
+            &self.drm,
+            crtcs,
+            planes,
+            lease::debug_lease_connectors(),
+        )
+    }
+
     /// Open the seat, the primary GPU, every connected output, and
     /// libinput. Fails with a readable reason (no seat daemon, no GPU,
     /// nothing connected) so the launcher can report it.
@@ -625,7 +654,10 @@ impl DrmBackend {
         let native_device = crate::native_output::device(drm.device_fd().as_fd())
             .ok()
             .filter(|device| *device == drm.device_id());
+        let mut used: Vec<crtc::Handle> = Vec::new();
         let mut outputs: Vec<DrmOutput> = Vec::new();
+        let lease_names = lease::debug_lease_connectors();
+        let mut for_lease = 0usize;
         for handle in resources.connectors() {
             let Ok(info) = drm.get_connector(*handle, false) else {
                 continue;
@@ -633,18 +665,29 @@ impl DrmBackend {
             if info.state() != connector::State::Connected {
                 continue;
             }
-            let used: Vec<crtc::Handle> = outputs.iter().map(|o| o.crtc).collect();
+            let name = lease::connector_name(&info);
+            // Connectors for lease never join the desktop (Mutter's
+            // meta_gpu_kms_read_current skips non-desktop ones).
+            if lease::is_for_lease(&name, lease::non_desktop(&drm, *handle), &lease_names) {
+                eprintln!("tuna-compositor: drm: connector {name} is for lease, not the desktop");
+                for_lease += 1;
+                continue;
+            }
             let lighting = Lighting {
                 gbm: &gbm,
                 render_formats: &render_formats,
                 native_device,
                 resources: &resources,
             };
-            if let Some(out) = lighting.open(&mut drm, *handle, &info, &used) {
+            if let Some(out) = lighting.open(&mut drm, *handle, &info, &used, name) {
+                used.push(out.crtc);
                 outputs.push(out);
             }
         }
-        if outputs.is_empty() {
+        // Mutter runs with no monitor at all; a device whose connected
+        // connectors are all for lease (a headset alone) still starts, so
+        // the lease device can offer them. Nothing connected stays an error.
+        if outputs.is_empty() && for_lease == 0 {
             return Err(DrmInitError(format!(
                 "no connected output on {}",
                 path.display()
@@ -694,8 +737,12 @@ impl DrmBackend {
             gbm,
             render_formats,
             native_device,
+            lease_names,
         };
-        if let Err(error) = backend.apply_layout(&layouts) {
+        // With every connector for lease there is no layout to apply.
+        if backend.outputs.is_empty() {
+            eprintln!("tuna-compositor: drm: no desktop output; every connector is for lease");
+        } else if let Err(error) = backend.apply_layout(&layouts) {
             // A stored mode the kernel refused: Mutter falls back to its
             // default configuration the same way.
             eprintln!("tuna-compositor: drm: stored display configuration not applied: {error}");
@@ -705,13 +752,14 @@ impl DrmBackend {
                 .map_err(|e| DrmInitError(format!("output layout: {e}")))?;
         }
         backend.log_outputs();
-        let (first_w, first_h) = backend.outputs[0].logical_size();
-        let first_loc = backend.outputs[0].loc;
-        backend.pointer = (
-            f64::from(first_loc.0) + f64::from(first_w) / 2.0,
-            f64::from(first_loc.1) + f64::from(first_h) / 2.0,
-        )
-            .into();
+        if let Some(first) = backend.outputs.first() {
+            let (first_w, first_h) = first.logical_size();
+            backend.pointer = (
+                f64::from(first.loc.0) + f64::from(first_w) / 2.0,
+                f64::from(first.loc.1) + f64::from(first_h) / 2.0,
+            )
+                .into();
+        }
         // Connector hotplug arrives as a udev change of the DRM device,
         // as Mutter's MetaUdev reports it (`hotplug` signal).
         let udev = match smithay::backend::udev::UdevBackend::new(&seat) {
@@ -780,10 +828,11 @@ impl DrmBackend {
     /// udev's change event): every connector is probed again; outputs
     /// whose connector went away are dropped (queued frames discarded,
     /// their CRTC switched off and free again) and newly connected
-    /// connectors are lit at their preferred mode. The runtime then
+    /// connectors are lit at their preferred mode on a CRTC neither the
+    /// desktop nor a lease (`leased_crtcs`) holds. The runtime then
     /// configures the new monitor set. Nothing is probed off-seat:
     /// activation rescans.
-    pub fn rescan_connectors(&mut self) -> ConnectorChanges {
+    pub fn rescan_connectors(&mut self, leased_crtcs: &[crtc::Handle]) -> ConnectorChanges {
         let mut changes = ConnectorChanges::default();
         if !self.active || !self.drm.is_active() {
             return changes;
@@ -800,7 +849,14 @@ impl DrmBackend {
             let connected = self
                 .drm
                 .get_connector(self.outputs[index].connector, true)
-                .is_ok_and(|info| info.state() == connector::State::Connected);
+                .is_ok_and(|info| {
+                    info.state() == connector::State::Connected
+                        && !lease::is_for_lease(
+                            &self.outputs[index].name,
+                            lease::non_desktop(&self.drm, self.outputs[index].connector),
+                            &self.lease_names,
+                        )
+                });
             if connected {
                 index += 1;
                 continue;
@@ -811,6 +867,12 @@ impl DrmBackend {
             }
             changes.removed.push(gone.name.clone());
         }
+        let mut used: Vec<crtc::Handle> = self
+            .outputs
+            .iter()
+            .map(|o| o.crtc)
+            .chain(leased_crtcs.iter().copied())
+            .collect();
         for handle in resources.connectors() {
             if self.outputs.iter().any(|o| o.connector == *handle) {
                 continue;
@@ -821,14 +883,22 @@ impl DrmBackend {
             if info.state() != connector::State::Connected {
                 continue;
             }
-            let used: Vec<crtc::Handle> = self.outputs.iter().map(|o| o.crtc).collect();
+            let name = lease::connector_name(&info);
+            if lease::is_for_lease(
+                &name,
+                lease::non_desktop(&self.drm, *handle),
+                &self.lease_names,
+            ) {
+                continue;
+            }
             let lighting = Lighting {
                 gbm: &self.gbm,
                 render_formats: &self.render_formats,
                 native_device: self.native_device,
                 resources: &resources,
             };
-            if let Some(out) = lighting.open(&mut self.drm, *handle, &info, &used) {
+            if let Some(out) = lighting.open(&mut self.drm, *handle, &info, &used, name) {
+                used.push(out.crtc);
                 changes.added.push(out.name.clone());
                 self.outputs.push(out);
             }
