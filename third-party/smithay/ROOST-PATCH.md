@@ -140,6 +140,18 @@ nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
 
+Issue #353 changes Cargo.toml (the xwayland feature enables x11rb's xkb
+protocol) and src/xwayland/xwm/mod.rs, additively. X11Wm::select_bell_events
+does what Mutter 51's init_x11_bell does (src/x11/meta-x11-display.c): select
+XkbBellNotify on the core keyboard and turn off its AudibleBell control, so
+X11 bells reach the new XwmHandler::bell callback (default: ignore) with the
+window the client named and the X server time, and Xwayland never rings them
+itself. X11Wm::release_xsettings_selection gives up the _XSETTINGS_S0
+selection start_wm takes: Mutter never owns XSETTINGS, and
+gnome-settings-daemon's xsettings plugin exits while another manager holds
+it. The isolated diff is retained in XKB-BELL-XSETTINGS-API-PATCH.diff; the
+pinned version stays 0.7.0.
+
 Issue #364 additionally changes `src/wayland/input_method/{mod.rs,
 input_method_handle.rs,input_method_keyboard_grab.rs}`. Registry visibility
 and forced binds both enforce the compositor's input-method admission

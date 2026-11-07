@@ -870,6 +870,7 @@ struct AudioUi {
     last_unclassified_video_sources: RefCell<Vec<u64>>,
     queue: RefCell<crate::privacy::ActionQueue>,
     drain_pending: Cell<bool>,
+    feedback: RefCell<logic::VolumeFeedback>,
 }
 
 /// Dispatch budget per enforcement tick. Graphs are small; on a
@@ -928,6 +929,24 @@ impl AudioUi {
                 .set_value(if muted { 0.0 } else { percent });
         }
         self.syncing.set(false);
+    }
+
+    /// The output slider's drag ended: GNOME's `_notifyVolumeChange`.
+    fn volume_drag_end(&self) {
+        if self.feedback.borrow_mut().drag_end() {
+            if let Some((_, muted)) = self.last.borrow().sink {
+                crate::sound_feedback::volume(false, true, muted);
+            }
+        }
+    }
+
+    /// One slider write to the sink landed (`muted`: the sink's state read
+    /// back, None when a step failed).
+    fn sink_write_landed(&self, in_drag: bool, changed: bool, muted: Option<bool>) {
+        let play = self.feedback.borrow_mut().write_finished(in_drag, changed);
+        if let (true, Some(muted)) = (play, muted) {
+            crate::sound_feedback::volume(false, true, muted);
+        }
     }
 
     fn update(self: &Rc<Self>, snapshot: crate::audio_state::Snapshot) {
@@ -1270,6 +1289,7 @@ fn audio(w: &Rc<Widgets>) {
         last_unclassified_video_sources: RefCell::default(),
         queue: RefCell::default(),
         drain_pending: Cell::new(false),
+        feedback: RefCell::default(),
     });
     if let Some(privacy) = ui.privacy.as_ref() {
         let weak = Rc::downgrade(&ui);
@@ -1299,6 +1319,8 @@ fn audio(w: &Rc<Widgets>) {
                     .sink
                     .is_some_and(|(old, _)| (old - value).abs() > 0.01);
                 let muted = value <= 0.0;
+                let in_drag = (node == SINK).then(|| ui.feedback.borrow_mut().write_started());
+                let ui = ui.clone();
                 crate::media_keys::wpctl(
                     &[
                         "set-volume",
@@ -1313,30 +1335,67 @@ fn audio(w: &Rc<Widgets>) {
                         },
                     ],
                     move |result| {
-                        if node == SINK && result.is_some() {
-                            crate::media_keys::wpctl(
-                                &["set-mute", SINK, if muted { "1" } else { "0" }],
-                                move |result| {
-                                    if result.is_some() {
-                                        crate::media_keys::wpctl(
-                                            &["get-volume", SINK],
-                                            move |result| {
-                                                if let Some((_, muted)) = result
-                                                    .as_deref()
-                                                    .and_then(crate::media_keys::parse_volume)
-                                                {
-                                                    crate::sound_feedback::volume(
-                                                        false, changed, muted,
-                                                    );
-                                                }
-                                            },
-                                        );
-                                    }
-                                },
-                            );
+                        let Some(in_drag) = in_drag else {
+                            return;
+                        };
+                        let landed = move |muted: Option<bool>| {
+                            ui.sink_write_landed(in_drag, changed, muted);
+                        };
+                        if result.is_none() {
+                            landed(None);
+                            return;
                         }
+                        crate::media_keys::wpctl(
+                            &["set-mute", SINK, if muted { "1" } else { "0" }],
+                            move |result| {
+                                if result.is_none() {
+                                    landed(None);
+                                    return;
+                                }
+                                crate::media_keys::wpctl(&["get-volume", SINK], move |result| {
+                                    landed(
+                                        result
+                                            .as_deref()
+                                            .and_then(crate::media_keys::parse_volume)
+                                            .map(|(_, muted)| muted),
+                                    );
+                                });
+                            },
+                        );
                     },
                 );
+            }
+        });
+    }
+    // GNOME's slider emits drag-begin when the press is recognised, before
+    // the handle moves (js/ui/slider.js `_onPanBegin`); GtkRange moves the
+    // value from its own click gesture first, so the press is seen here in
+    // the capture phase.
+    {
+        let drag = gtk::EventControllerLegacy::new();
+        drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(&ui);
+        drag.connect_event(move |_, event| {
+            if let Some(ui) = weak.upgrade() {
+                match event.event_type() {
+                    gtk::gdk::EventType::ButtonPress | gtk::gdk::EventType::TouchBegin => {
+                        ui.feedback.borrow_mut().drag_begin();
+                    }
+                    gtk::gdk::EventType::ButtonRelease
+                    | gtk::gdk::EventType::TouchEnd
+                    | gtk::gdk::EventType::TouchCancel => ui.volume_drag_end(),
+                    _ => {}
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        w.volume.add_controller(drag);
+        // A drag the menu's closing cuts short still ends (slider.js ends
+        // its pan on a broken grab too).
+        let weak = Rc::downgrade(&ui);
+        w.volume.connect_unmap(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.volume_drag_end();
             }
         });
     }

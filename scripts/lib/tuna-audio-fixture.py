@@ -23,21 +23,30 @@ def number(name, fallback):
         return fallback
 
 
-def node(ident, name, cls, volume, muted=False, **props):
+def node(ident, name, cls, volume, muted=False, state='running', **props):
     return {'id': ident, 'type': 'PipeWire:Interface:Node', 'info': {
-        'state': 'running', 'props': {'node.name': name, 'node.description': name,
-                                    'media.class': cls, **props},
+        'state': state, 'props': {'node.name': name, 'node.description': name,
+                                  'media.class': cls, **props},
         'params': {'Props': [{'mute': muted, 'channelVolumes': [volume ** 3]}]}}}
+
+
+def sink_state():
+    # The proof idles the built-in sink to admit volume feedback, as
+    # PipeWire suspends a sink nothing plays to.
+    try:
+        return (root / 'sink-state').read_text().strip() or 'running'
+    except OSError:
+        return 'running'
 
 
 def emit():
     selected = int(number('default-sink', 48))
     route = int(number('audio-route', 1))
-    batch = [node(48, 'Built-in Audio Analog Stereo', 'Audio/Sink', number('volume', .8), (root / 'volume-muted').exists(),
-                  **{'device.id': 40, 'card.profile.device': 0}),
+    batch = [node(48, 'Built-in Audio Analog Stereo', 'Audio/Sink', number('volume', .8), number('volume-muted', 0) >= 1,
+                  state=sink_state(), **{'device.id': 40, 'card.profile.device': 0}),
              node(52, 'Tuna Desktop HDMI Output', 'Audio/Sink', 1),
              node(49, 'Microphone', 'Audio/Source', number('mic-volume', .5),
-                  (root / 'mic-muted').exists()),
+                  number('mic-muted', 0) >= 1),
              {'id': 40, 'type': 'PipeWire:Interface:Device', 'info': {'params': {
                  'EnumRoute': [{'index': 1, 'direction': 'Output', 'description': 'Speakers',
                                 'available': 'yes', 'devices': [0]},
