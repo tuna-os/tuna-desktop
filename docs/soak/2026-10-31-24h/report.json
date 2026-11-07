@@ -1,0 +1,84 @@
+{
+  "complete": false,
+  "samples": 107,
+  "scope": "24-hour qualification candidate",
+  "limitations": [
+    "Frame pacing is real native client feedback; no GPU memory or input latency measurement.",
+    "PSS scope is the session UID; root services and kernel memory are excluded.",
+    "This observes process stability and service responsiveness, without service fault injection.",
+    "The source revision is supplied by the deployment record; binary hashes are measured."
+  ],
+  "presentation": {
+    "interval_ms": {
+      "count": 5040,
+      "p50": 13.334,
+      "p95": 13.335,
+      "p99": 13.335,
+      "min": 13.334,
+      "max": 13.335,
+      "mean": 13.334425992063492
+    },
+    "frames": 5040,
+    "total_frames": 496320,
+    "batches": 2068,
+    "complete": false,
+    "flags": {
+      "vsync": 5040,
+      "hw_clock": 5040,
+      "hw_completion": 5040,
+      "zero_copy": 0
+    },
+    "unknown_refresh": 0,
+    "elapsed_s": 6620.153541
+  },
+  "baseline": {
+    "pss_kib": 559110,
+    "rss_kib": 944716,
+    "fds": 705,
+    "processes": 35,
+    "critical": {
+      "tuna-compositor": [
+        [
+          2525,
+          18966
+        ]
+      ],
+      "tuna-shell-gtk": [
+        [
+          2556,
+          18992
+        ]
+      ]
+    },
+    "presentation": {
+      "interval_ms": {
+        "count": 4560,
+        "p50": 13.334,
+        "p95": 13.335,
+        "p99": 13.335,
+        "min": 13.334,
+        "max": 13.335,
+        "mean": 13.334425877192983
+      },
+      "frames": 4560,
+      "total_frames": 45120,
+      "batches": 188,
+      "complete": false,
+      "flags": {
+        "vsync": 4560,
+        "hw_clock": 4560,
+        "hw_completion": 4560,
+        "zero_copy": 0
+      },
+      "unknown_refresh": 0,
+      "elapsed_s": 601.887123
+    },
+    "lock_reply": "(false,)",
+    "calendar_reply": "()",
+    "portal_reply": "(<<uint32 0>>,)",
+    "portal_gnome_reply": "()",
+    "elapsed_s": 602.241
+  },
+  "failure": "health helper exceeded its deadline",
+  "elapsed_s": 6643.713748159999
+}

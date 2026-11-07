@@ -18,7 +18,8 @@ v4), `gh` logged in as an org admin, and `ssh karnataka` with sudo.
 | Scale set `tuna-ci-26.04` | namespace `tuna-ci`, release `tuna-ci-26-04` | [values](../.github/runners/values-26.04.yaml); jobs that use `ubuntu-26.04` on GitHub |
 | Runner image | node-local containerd, `localhost/tuna-ci-runner:<ubuntu>-<runner>-<stamp>` | [Containerfile](../.github/runners/image/Containerfile), built by [build-image](../.github/runners/build-image) |
 | Guard rails | [cluster.yaml](../.github/runners/cluster.yaml) | namespace, admission policy, NetworkPolicy, quota, priority class |
-| Scripts | [.github/runners](../.github/runners) | `build-image` (images), `deploy` (guard rails + Helm releases) |
+| Scratch storage | namespace `tuna-ci-storage`, StorageClass `tuna-ci-scratch` | [storage.yaml](../.github/runners/storage.yaml); helper-free static local volume pool on `vg1/tuna_ci_scratch` (nvme1n1) |
+| Scripts | [.github/runners](../.github/runners) | `build-image` (images), `deploy` (guard rails + scratch provisioner + Helm releases) |
 | GitHub side | org `tuna-os` | runner group `tuna-desktop-karnataka` (only repository: `tuna-os/tuna-desktop`), secret `tuna-ci-github` in `tuna-ci` |
 
 Both chart releases use the same chart version (0.15.1 at install).
@@ -34,9 +35,9 @@ schedule, dispatch or a pull request whose head repository is
 
 | Runner | Lanes |
 | --- | --- |
-| `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, parity-ledger, docs-shots, ci-gate |
+| `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, native-reference-context, parity-ledger, docs-shots, ci-gate |
 | `tuna-ci-26.04` | journey, orca-speech, portal-security, remote-security, niri-parity |
-| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (both matrix legs), marlin-image |
+| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (pull requests: the primary lifecycle leg only; push, schedule and dispatch add the Orca 51 leg and both paired reference members), marlin-image (push, schedule and dispatch only), gdm51-native-package |
 
 Why the always-hosted lanes stay hosted:
 
@@ -56,6 +57,12 @@ Why the always-hosted lanes stay hosted:
   so a compromised long-lived node (or its shared image store) can never
   sign or push a release image.
 
+The required `gdm51-native-package` factory remains GitHub-hosted and feeds
+only the ordinary lifecycle images' final GDM overlay and fresh-account
+admission. The paired GNOME/Tuna members keep their shared
+`Containerfile.reference`, original `104870` platform payload and stock GDM;
+they do not apply that overlay or relax the original byte inventory.
+
 journey once failed self-hosted in "Qualify disposable Debian lifecycle"
 (`end of file on stdin at conffile prompt`); that came from #899 changing
 the tuna-lock conffile, which fails hosted runs too, not from the runners
@@ -64,6 +71,116 @@ remote-security, niri-parity) use the pods' rootless podman.
 
 Other workflows (`stress`, `fuzz`, `baseline`, …) still use GitHub-hosted
 runners; the same aliases can move them.
+
+## Private GTK AT-SPI comparison dependency
+
+`grid-cancel-comparison` stages Ubuntu GTK `4.14.5+ds-0ubuntu0.10` with
+upstream commit `21d3eb76b68d6758122eddaf00b5823f9b2d7f34` using the existing
+workflow-owned `ci-tool` action. The installer checks both Ubuntu source
+archive hashes and the patch hash; it retains the license, Ubuntu patch
+series, build options, compiler identity and runtime ELF hash/build ID.
+The host GTK and runner image are not replaced. Only this job activates the
+private library through `LD_LIBRARY_PATH`, identically for the unchanged old
+and fixed product roles. Cache publication remains restricted to trusted main.
+
+Before either product role runs, `gtk-atspi-root-proof` uses separate private
+D-Bus/Xvfb sessions to require stock GTK's actual SIGSEGV negative control and
+the repaired runtime's real AT-SPI behavior: named visible children resolve,
+an invisible-tail index and an index with all windows hidden return remote
+InvalidArgument, and valid children remain queryable after remapping.
+The proof checks the mapped patched ELF against the source-build receipt.
+Its receipts and build provenance accompany the comparison artifact; core
+dumps are disabled for this dependency fixture. This toolkit regression proof
+is not product acceptance: the old-negative/fixed-positive Escape comparison
+and all selected exact-head lanes must still pass.
+
+## Keep required checks on the workflow's tested source
+
+The `check` job uses `actions/checkout`'s default PR merge ref, like the
+native DRM and VM lanes. Its workflow and required test scripts must come
+from that same tree. In run
+[`41274593021`](https://github.com/tuna-os/tuna-desktop/actions/runs/41274593021),
+the merge-ref workflow invoked `scripts/lib/a11y-focus-proof-tests.py`,
+but the explicit older head checkout lacked it, so `check` stopped with
+`[Errno 2] No such file or directory`. Checking out the merge ref preserves
+the real predicate suite instead of adding a placeholder or making it
+optional. The check job exports its actual checked commit as `tested_sha`;
+the authentication, fingerprint and grid comparison proofs check out that
+exact output. Their admission receipts bind it to the checkout and commit
+tree separately from the API's triggering `head_sha` (the PR head, not its
+merge tree). Lane selection remains head-only because it computes the PR
+diff. Record the actual tested commit in evidence, never interchange it with
+the triggering head.
+
+The same run's `drm-smoke` passed output, shell, idle, frame pacing, scale
+and monitor-mode gates, then failed `D-COLORD` before its private colour
+service became ready; `colord.log` was empty. That does not establish a
+compositor colour regression or a passing colour gate. Readiness is judged
+by the real private-bus `GetDevices` reply within the unchanged 30 seconds,
+not by unprivileged `kill -0` of a potentially root-owned sudo launcher
+(which can return EPERM for a live process). There is no unbounded wait.
+The private bus and every colour, gamma and restart assertion remain required.
+
+The changed-source hosted run
+[`41390839901`](https://github.com/tuna-os/tuna-desktop/actions/runs/41390839901)
+subsequently passed all 19 DRM assertions, including the actual colord,
+gamma, calibration and restart gates. It exposed two separate prerequisite
+defects: `check` reached its real strip-capture tests but lacked Pillow
+(`ModuleNotFoundError: PIL`), and the pinned Orca factory entry point was
+invoked as an executable despite its non-executable source mode
+(`Permission denied`, exit 126). Declare `python3-pil` in the check job's
+existing apt dependencies and run that consumer with `/usr/bin/python3`.
+Invoke the unchanged pinned factory through Bash, like the GDM native
+factory. Neither a self-hosted preinstalled dependency nor a cache hit is a
+dependency declaration; do not skip the consumer or replace the pinned build.
+
+In [CI 41395937699](https://github.com/tuna-os/tuna-desktop/actions/runs/41395937699),
+both native profiles passed all 32 fresh-account gates and 14 strip cases,
+and the real typed slideshow/SVG and pinned Orca journeys passed. The
+required check still failed
+`control::tests::native_outputs_cleared_on_failed_redial_and_transport_loss`:
+the fixture merely dropped one peer descriptor, then treated any polling
+error as proof of transport loss. An open duplicate instead means transient
+`WouldBlock`, for which retaining the current inventory is correct.
+
+Deliberate peer-loss fixtures must use the file's existing `shutdown(Both)`
+convention before dropping the descriptor: a concurrent fork can retain a
+copy until exec. The regression now deliberately retains a duplicate,
+distinguishes open-endpoint `WouldBlock` from actual shutdown/EOF, and
+requires terminal failed-redial I/O before judging native-output revocation.
+All eleven deliberate closure fixtures use that convention. No production
+state transition, polling interval, acceptance guard or test is removed.
+
+The maintained-media check additionally needs read-only Actions access to
+authenticate the exact uploaded source-artifact bytes before replaying
+receipts against proposed canonical media; dependency auditing remains
+tokenless and fatal. Its real recording tests require FFmpeg (including
+`ffprobe`) and Pillow in the check job, not just in a capture producer.
+The GDM 51 final overlay belongs to the lifecycle images after the
+distribution/Orca branches. The paired GNOME/Tuna reference rows retain
+their separately admitted immutable base, while lifecycle image receipts
+retain the verified native platform digest rather than rereading a mutable
+tag after the build. These are source and admission contracts, not a claim
+that this merge has runtime or current-image qualification.
+
+## What a pull request runs
+
+Hosted minutes are the scarce resource, so a pull request pays only for what
+it can affect:
+
+- `select-lanes` and `check` always run; a **draft** pull request runs nothing
+  else (marking it ready for review starts the proof lanes).
+- Every proof lane waits for `check` (`needs: check`, directly or through
+  `arch-package`), so a red `check` does not also burn the lanes.
+- `scripts/ci-select-lanes` picks the lanes: docs, other non-runtime files and
+  the tooling of other workflows (its `NO_LANE` list) pick none, a lane's own
+  proof script picks that lane, an edit confined to some lane jobs of `ci.yml`
+  picks those lanes, and any other code picks `gtk-shell` plus a rotating
+  slice. Shared CI inputs still pick every lane.
+- A newer push supersedes the older run (`concurrency` with
+  `cancel-in-progress`, except for `main`).
+- `marlin-tuna-nightly` qualifies the published image on schedule and
+  dispatch only; dispatch it on a branch to test a change to it.
 
 ## Queue supersession and closed pull requests
 
@@ -146,14 +263,21 @@ code as root inside its pod.
      workflows run for **all** outside contributors' pull requests
      (Settings → Actions → General → "Require approval for all external
      contributors").
-2. **One job per pod, nothing persists.** ARC registers each pod as an
-   ephemeral just-in-time runner; the runner exits after one job and the pod,
-   with its emptyDir volumes, is deleted. There is no shared cache volume.
+2. **One job per pod, no state persists between jobs.** ARC registers each pod
+   as an ephemeral just-in-time runner; the runner exits after one job and the
+   pod is deleted. Kubernetes owns its generic ephemeral PVCs and deletes them
+   with the pod. The scratch StorageClass's `Delete` reclaim policy makes
+   the static provisioner wipe every entry (including dotfiles) from the
+   released slot, delete the old PV, and only then offer a new PV for it.
+   Cleanup failure keeps the slot unavailable. No shared writable cache exists.
 3. **The pod cannot become the node.** The admission policy
    `tuna-ci-runner-pods` rejects any pod in `tuna-ci` that is not in its own
    user namespace (`hostUsers: false`), is privileged, shares host
-   namespaces, binds host ports, mounts anything but emptyDir, mounts a
-   service account token, or adds a capability other than `SYS_ADMIN`. Root
+   namespaces, binds host ports, mounts anything but emptyDir or fresh generic
+   ephemeral `tuna-ci-scratch` volumes, mounts a service account token, or
+   adds a capability other than `SYS_ADMIN`. Existing PVC references,
+   hostPath, other storage classes, pre-bound volumes and data sources are
+   forbidden. Root
    and `CAP_SYS_ADMIN` in the pod (needed for `sudo apt-get` and rootless
    podman's nested user namespace) map to an unprivileged 65536-uid range on
    the node. No host paths are mounted; `/dev/net/tun` (podman's network)
@@ -168,9 +292,11 @@ code as root inside its pod.
    56 CPU / 196 GiB limits, 28 CPU / 82 GiB requests: up to 14 runners
    run at once (karnataka: 28 CPU / 125 GiB allocatable; punjab is sized at
    12 cores / 24 GiB). Each runner asks for
-   1.5 CPU / 5 GiB and is limited to 4 CPU / 14 GiB / 45 GiB disk. Runner pods
-   use PriorityClass `tuna-ci-runner` (-100, never preempts): new VMs and
-   cluster services preempt them, and the kubelet evicts them first under
+   1.5 CPU / 5 GiB and is limited to 4 CPU / 14 GiB. The 45 GiB
+   ephemeral-storage limit covers the container writable layer/logs, **not**
+   the separate scratch PVCs (see below). Runner pods use PriorityClass
+   `tuna-ci-runner` (-100, never preempts): new VMs and cluster services
+   preempt them, and the kubelet evicts them first under
    memory pressure.
    All 14 new pods reserve 21 CPU / 70 GiB together; the request quota allows
    older pods during rollout. The scheduler also accounts for VM reservations.
@@ -181,6 +307,105 @@ code as root inside its pod.
 The ARC listener uses the GitHub credential in secret `tuna-ci-github`
 (`tuna-ci` namespace, copied by the controller to `arc-systems`). Runner
 pods never mount it and cannot reach the API to read it.
+
+### Dedicated runner scratch (nvme1n1)
+
+`/home/runner/work` (including Cargo targets and rust-cache restore),
+`/var/lib/containers`, and `/home/runner/.local/share/containers` are three
+fresh generic ephemeral volumes per runner, requesting 40 / 10 / 10 GiB.
+`/dev/shm` remains a 2 GiB memory emptyDir. All 14 runners request 840 GiB
+on the 900 GiB ext4 LV `vg1/tuna_ci_scratch`, mounted at
+`/var/lib/tuna-ci-scratch` on nvme1n1; nvme0n1 still holds the unchanged
+kubelet/containerd roots and unrelated workloads.
+
+The upstream `sig-storage-local-static-provisioner` v2.10.0 discovers 42
+pre-created bind-mounted slots (three per runner). It cleans released
+filesystem volumes **inside its long-running process**, not helper pods or
+Jobs, before recreating the PVs. The StorageClass uses
+`kubernetes.io/no-provisioner` and `WaitForFirstConsumer`. Each slot reports
+the shared filesystem's total capacity, not its requested 40/10 GiB, and
+**neither requests nor advertised PV capacities are enforced write quotas**.
+The 900 GiB LV is shared physical capacity, not 42 independent 900 GiB disks.
+Monitor `df -h /var/lib/tuna-ci-scratch`; allow headroom for filesystem
+overhead and asynchronous wipe, and reduce concurrency before it fills.
+There is no persistent compiler cache and no extra access from runner pods.
+Only the provisioner in `tuna-ci-storage` mounts the host pool. The
+k3s-managed `local-path` addon and existing PVCs are unchanged.
+
+On this bootc/ostree host, install the persistent mount unit in writable
+`/etc`, not a modified OS image. Initial setup (only for the confirmed empty
+VG on nvme1n1; never format an existing LV):
+
+```sh
+ssh karnataka 'sudo pvs; sudo vgs; sudo lvs; sudo lsblk -f'
+ssh karnataka 'sudo lvcreate -L 900G -n tuna_ci_scratch vg1 &&
+  sudo mkfs.ext4 -m 0 -L tuna-ci-scratch /dev/vg1/tuna_ci_scratch &&
+  sudo mkdir -p /var/lib/tuna-ci-scratch'
+scp .github/runners/scratch.mount karnataka:/tmp/tuna-ci-scratch.mount
+ssh karnataka 'unit=$(systemd-escape --path --suffix=mount /var/lib/tuna-ci-scratch) &&
+  sudo install -m 0644 /tmp/tuna-ci-scratch.mount "/etc/systemd/system/$unit" &&
+  sudo systemctl daemon-reload &&
+  sudo systemctl enable --now "$unit" &&
+  sudo restorecon /var/lib/tuna-ci-scratch &&
+  sudo touch /var/lib/tuna-ci-scratch/.nvme-scratch'
+scp .github/runners/prepare-scratch-pool .github/runners/scratch-pool.service karnataka:/tmp/
+ssh karnataka 'sudo mkdir -p /etc/tuna-ci &&
+  sudo install -m 0755 /tmp/prepare-scratch-pool /etc/tuna-ci/prepare-scratch-pool &&
+  sudo install -m 0644 /tmp/scratch-pool.service /etc/systemd/system/tuna-ci-scratch-pool.service &&
+  sudo systemctl daemon-reload &&
+  sudo systemctl enable --now tuna-ci-scratch-pool.service'
+ssh karnataka 'findmnt /var/lib/tuna-ci-scratch; sudo lvs -o lv_name,vg_name,devices'
+.github/runners/deploy --sets-only
+```
+
+The mount and pool service are ordered before k3s on future boots; **do not
+restart k3s, containerd, kubelet or unrelated pods** to deploy them. Pool
+preparation verifies the mounted LV and `.nvme-scratch` marker before making
+slots. Never create that marker on the underlying unmounted directory.
+The provisioner's hostPath requires an existing pool (`Directory`, not
+`DirectoryOrCreate`); an absent LV/pool fails closed instead of provisioning
+on nvme0n1. Both deploy modes apply guard rails and storage before updating
+runner templates. Running jobs keep their old volumes until completion.
+
+To verify a rollout, inspect a newly created runner's PVC ownerReferences,
+its PV's `local.path`, and `findmnt -T /home/runner/work` inside that pod.
+Compare pod `metadata.creationTimestamp` with the runner container's
+`state.running.startedAt` before/after, including provisioning time; observe
+both disks' `/sys/block/nvme*n1/stat` counters over the same interval while
+a real CI `check` job runs. Check that deleted pods' PVCs disappear and their
+released slots are wiped before a new PV is offered, and that shared pods
+retain their UIDs/restart counts.
+
+For storage rollback, first use the hosted-runner switch below and drain
+the scale sets. Do not delete the provisioner while slots still need reclaim:
+wait for all `tuna-ci-scratch` claims to disappear and all 42 slots/PVs to be
+empty/Available, then
+`kubectl --context karnataka-k3s delete -f .github/runners/storage.yaml`.
+Delete the now-unclaimed pool PVs before any future reinstall so they cannot
+be bound while cleanup is disabled. Only then stop/disable the pool service,
+unmount its 42 bind mounts, and disable/unmount the filesystem if needed.
+Leave the LV intact until explicitly deciding to destroy its data. A Helm
+rollback to pre-scratch values restores the old per-pod writable-layer/
+emptyDir paths for new jobs without restarting shared workloads, but
+restores nvme0n1 contention.
+
+#### Runtime maintenance: short-lived helper completion
+
+The first rollout used local-path-provisioner v0.0.37. On this host's
+containerd `v2.3.4-k3s1.36`, some short-lived helpers created their directory
+but remained `Running`; `failed to get task: context deadline exceeded`,
+`FailedKillPod`, and 120-second `ProvisioningFailed` timeouts prevented PVCs
+from binding. The same symptom affected the pre-existing default provisioner
+and old runner cleanup before this change. Runner templates were rolled back
+to emptyDir, restoring 3–6-second starts, before switching to this helper-free
+pool. No shared runtime/service or workload was restarted.
+
+This is a maintenance-window runtime investigation, not a confirmed fixed
+bug: containerd [v2.3.5](https://github.com/containerd/containerd/releases/tag/v2.3.5)
+includes CRI I/O-stream deadlock fixes, but no captured stack proves that
+they explain this host's failure. Do not restart/upgrade k3s or containerd
+during shared-host CI recovery. Preserve shim/task evidence and qualify an
+upgrade separately in a maintenance window.
 
 ### Node prerequisite: NetworkPolicy enforcement
 
@@ -209,6 +434,7 @@ ssh karnataka "sudo journalctl -u k3s --since -10min | grep -c 'Aborting sync'" 
 
 ```
 # 1. Guard rails (namespace, admission policy, NetworkPolicy, quota, priority).
+#    Prepare the dedicated scratch LV/mount as above before deploying runners.
 kubectl --context karnataka-k3s apply -f .github/runners/cluster.yaml
 
 # 2. GitHub runner group restricted to this repository.
@@ -380,11 +606,26 @@ Every job evaluated afterwards uses its original GitHub-hosted label
 Re-run queued runs as in [Drain](#drain-maintenance-on-karnataka).
 `gh variable delete CI_RUNNERS -R tuna-os/tuna-desktop` switches back.
 
+On 2026-11-02, the five `tuna-ci-26.04` jobs in PR #985's run
+`41274593021` remained queued without an assigned runner. Read-only ARC
+inspection found all four existing 26.04 runner pods in `ErrImageNeverPull`
+for approximately 24 hours: their `imagePullPolicy: Never` image
+`localhost/tuna-ci-runner:26.04-2.338.2-202610310435` was absent on
+`karnataka`. This is a runner-image provisioning failure, not evidence that
+the queued journey, Orca, portal, remote or niri gates passed or failed.
+The existing `CI_RUNNERS=hosted` rollback switch was enabled for newly
+evaluated jobs, without creating runners, loading images or changing gate
+coverage. That switch does not repair ARC or move already queued jobs.
+The reviewed source correction must get a new changed-head run; retain its
+predecessor's actual VM receipts before retiring only that obsolete PR run.
+
 Full removal:
 
 ```
 helm --kube-context karnataka-k3s uninstall tuna-ci-24-04 tuna-ci-26-04 -n tuna-ci
 helm --kube-context karnataka-k3s uninstall arc -n arc-systems
+# After all scratch claims/PVs have reclaimed (keep the provisioner until then):
+kubectl --context karnataka-k3s delete -f .github/runners/storage.yaml
 kubectl --context karnataka-k3s delete -f .github/runners/cluster.yaml
 kubectl --context karnataka-k3s delete namespace arc-systems
 gh api -X DELETE orgs/tuna-os/actions/runner-groups/<id>
@@ -417,5 +658,6 @@ across branches.
 | Pod rejected | `kubectl -n tuna-ci get events` (admission policy message names the rule) |
 | `refused this job` in "Set up job" | the job-started hook: fork, foreign repository or disallowed event |
 | A step misses a tool GitHub's image has | add it to the Containerfile's package list, rebuild, roll |
-| Nested podman/docker errors | needs `/dev/net/tun` (tun resource), the emptyDir storage mounts and `SYS_ADMIN`, all in the values files |
+| Nested podman/docker errors | needs `/dev/net/tun` (tun resource), the ephemeral scratch storage mounts and `SYS_ADMIN`, all in the values files |
 | Controller cannot get a registration token | credential expired or lacks org runner permission; replace the secret |
+| Scratch PVC stays Pending | `kubectl -n tuna-ci-storage logs daemonset/tuna-ci-scratch-provisioner`; check pool service/mounts, Available PV count and free space; do not fall back to the OS disk |

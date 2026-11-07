@@ -1,0 +1,638 @@
+Queued start job for default target default.target.
+Created slice app.slice - User Application Slice.
+Started podman-auto-update.timer - Podman auto-update timer.
+Started systemd-tmpfiles-clean.timer - Daily Cleanup of User's Temporary Directories.
+Reached target paths.target - Paths.
+Reached target timers.target - Timers.
+Starting dbus.socket - D-Bus User Message Bus Socket...
+Listening on pipewire-pulse.socket - PipeWire PulseAudio.
+Listening on pipewire.socket - PipeWire Multimedia System Sockets.
+Starting systemd-tmpfiles-setup.service - Create User Files and Directories...
+Finished systemd-tmpfiles-setup.service - Create User Files and Directories.
+Listening on dbus.socket - D-Bus User Message Bus Socket.
+Reached target sockets.target - Sockets.
+Reached target basic.target - Basic System.
+Reached target default.target - Main User Target.
+Startup finished in 127ms.
+Created slice session.slice - User Core Session Slice.
+Starting dbus-broker.service - D-Bus User Message Bus...
+Policy to allow eavesdropping in /usr/share/dbus-1/session.conf +31: Eavesdropping is deprecated and ignored
+Policy to allow eavesdropping in /usr/share/dbus-1/session.conf +33: Eavesdropping is deprecated and ignored
+Started dbus-broker.service - D-Bus User Message Bus.
+Ready
+tuna-compositor: nested session on tuna-nested-3341 (1280x800)
+pci id for fd 11: 1234:1111, driver (null)
+pci id for fd 10: 1234:1111, driver (null)
+pci id for fd 12: 1234:1111, driver (null)
+pci id for fd 10: 1234:1111, driver (null)
+pci id for fd 12: 1234:1111, driver (null)
+tuna-compositor: drm: output Virtual-1 1280x800 at 0,0 scale 1 transform 0
+tuna-compositor: linux-dmabuf v3 with 106 formats
+tuna-compositor: serving org.gnome.Mutter.DisplayConfig
+tuna-compositor: screenshot service on org.gnome.Shell.Screenshot
+tuna-compositor: serving org.gnome.Shell.Introspect
+tuna-compositor: serving org.gnome.Mutter.ScreenCast
+tuna-compositor: serving org.gnome.Mutter.RemoteDesktop
+tuna-compositor: serving org.gnome.Mutter.ServiceChannel
+tuna-compositor: serving org.gnome.SettingsDaemon.Color
+tuna-compositor: cursor theme "Adwaita" size 24 (themes ["Adwaita", "hicolor", "default"])
+tuna-compositor: serving org.gnome.Mutter.IdleMonitor
+tuna-compositor: serving org.gnome.SessionManager (inhibitors, session activity)
+tuna-compositor: session services: display environment imported (systemd=true bus=true)
+Starting gnome-session-monitor.service - Monitor Session leader for GNOME Session...
+Starting tunaos-dms-wallpaper.service - Set the variant wallpaper in DankMaterialShell on first login (no-op without dms)...
+Started ublue-user-setup.service - Configure system for current user.
+Starting xdg-user-dirs.service - User folders update...
+tuna-compositor: ime: IBus bridge started
+Finished xdg-user-dirs.service - User folders update.
+Finished tunaos-dms-wallpaper.service - Set the variant wallpaper in DankMaterialShell on first login (no-op without dms).
+Reached target graphical-session-pre.target - Session services which should run early before the graphical session is brought up.
+Started gnome-session-monitor.service - Monitor Session leader for GNOME Session.
+tuna-compositor: session services: holding the session leader FIFO
+Reached target gnome-session-pre.target - Tasks to be run before GNOME Session starts.
+Reached target gnome-session-initialized.target - GNOME Session is initialized.
+Starting gnome-session-signal-init.service - Signal initialization done to GNOME Session Manager...
+Starting org.freedesktop.IBus.session.GNOME.service - IBus Daemon for GNOME...
+Starting org.gnome.SettingsDaemon.Datetime.service - GNOME date & time service...
+/usr/lib/ublue/setup-services/libsetup.sh: line 55: /var/home/tuna-test/.local/share/ublue/setup_versioning.json.lock: No such file or directory
+Starting org.gnome.SettingsDaemon.Housekeeping.service - GNOME maintenance of expirable data service...
+Starting org.gnome.SettingsDaemon.Keyboard.service - GNOME keyboard configuration service...
+Starting org.gnome.SettingsDaemon.MediaKeys.service - GNOME keyboard shortcuts service...
+Starting org.gnome.SettingsDaemon.Power.service - GNOME power management service...
+Starting org.gnome.SettingsDaemon.PrintNotifications.service - GNOME printer notifications service...
+Failed to call signal initialization: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'Initialized'
+Starting org.gnome.SettingsDaemon.Rfkill.service - GNOME RFKill support service...
+Starting org.gnome.SettingsDaemon.ScreensaverProxy.service - GNOME FreeDesktop screensaver service...
+Starting org.gnome.SettingsDaemon.Sharing.service - GNOME file sharing service...
+Starting org.gnome.SettingsDaemon.Smartcard.service - GNOME smartcard service...
+Starting org.gnome.SettingsDaemon.Sound.service - GNOME sound sample caching service...
+Starting org.gnome.SettingsDaemon.UsbProtection.service - GNOME USB protection service...
+Starting org.gnome.SettingsDaemon.Wwan.service - GNOME WWan support service...
+Finished gnome-session-signal-init.service - Signal initialization done to GNOME Session Manager.
+Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Started org.gnome.SettingsDaemon.Datetime.service - GNOME date & time service.
+Reached target org.gnome.SettingsDaemon.Datetime.target - GNOME date & time target.
+Running all privileged units
+Starting gvfs-daemon.service - Virtual filesystem service...
+Started org.gnome.SettingsDaemon.ScreensaverProxy.service - GNOME FreeDesktop screensaver service.
+Reached target org.gnome.SettingsDaemon.ScreensaverProxy.target - GNOME FreeDesktop screensaver target.
+Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Started org.gnome.SettingsDaemon.Smartcard.service - GNOME smartcard service.
+Reached target org.gnome.SettingsDaemon.Smartcard.target - GNOME smartcard target.
+Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Error accessing /usr/libexec/ublue-privileged-setup: No such file or directory
+Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+ublue-user-setup.service: Main process exited, code=exited, status=127/n/a
+ublue-user-setup.service: Failed with result 'exit-code'.
+Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Started org.gnome.SettingsDaemon.Sharing.service - GNOME file sharing service.
+Started org.gnome.SettingsDaemon.Wwan.service - GNOME WWan support service.
+Started org.gnome.SettingsDaemon.UsbProtection.service - GNOME USB protection service.
+Reached target org.gnome.SettingsDaemon.Sharing.target - GNOME file sharing target.
+Reached target org.gnome.SettingsDaemon.UsbProtection.target - GNOME USB protection target.
+Reached target org.gnome.SettingsDaemon.Wwan.target - GNOME WWan support target.
+Created slice app-dbus\x2d:1.2\x2dorg.gnome.ScreenSaver.slice - Slice /app/dbus-:1.2-org.gnome.ScreenSaver.
+Started dbus-:1.2-org.gnome.ScreenSaver@0.service.
+Started gvfs-daemon.service - Virtual filesystem service.
+Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Started org.gnome.SettingsDaemon.PrintNotifications.service - GNOME printer notifications service.
+Started org.gnome.SettingsDaemon.Housekeeping.service - GNOME maintenance of expirable data service.
+Reached target org.gnome.SettingsDaemon.Housekeeping.target - GNOME maintenance of expirable data target.
+Reached target org.gnome.SettingsDaemon.PrintNotifications.target - GNOME printer notifications target.
+Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Started org.freedesktop.IBus.session.GNOME.service - IBus Daemon for GNOME.
+Started org.gnome.SettingsDaemon.Sound.service - GNOME sound sample caching service.
+Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Started org.gnome.SettingsDaemon.Rfkill.service - GNOME RFKill support service.
+Created slice app-dbus\x2d:1.2\x2dorg.freedesktop.portal.IBus.slice - Slice /app/dbus-:1.2-org.freedesktop.portal.IBus.
+Reached target org.gnome.SettingsDaemon.Rfkill.target - GNOME RFKill support target.
+Reached target org.gnome.SettingsDaemon.Sound.target - GNOME sound sample caching target.
+Started dbus-:1.2-org.freedesktop.portal.IBus@0.service.
+GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+tuna-ibus-bridge: input context /org/freedesktop/IBus/InputContext_2
+Failed to get screen saver status: GDBus.Error:org.freedesktop.DBus.Error.NoReply: Remote peer disconnected
+Failed to fetch USBGuard parameters: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The name is not activatable
+tuna-ibus-bridge: ready
+Starting at-spi-dbus-bus.service - Accessibility services bus...
+Started at-spi-dbus-bus.service - Accessibility services bus.
+Failed to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Ready
+Started org.gnome.SettingsDaemon.Keyboard.service - GNOME keyboard configuration service.
+Reached target org.gnome.SettingsDaemon.Keyboard.target - GNOME keyboard configuration target.
+Created slice app-dbus\x2d:1.40\x2dorg.a11y.atspi.Registry.slice - Slice /app/dbus-:1.40-org.a11y.atspi.Registry.
+Started dbus-:1.40-org.a11y.atspi.Registry@0.service.
+Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+SpiRegistry daemon is running with well-known name - org.a11y.atspi.Registry
+Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Started org.gnome.SettingsDaemon.MediaKeys.service - GNOME keyboard shortcuts service.
+Reached target org.gnome.SettingsDaemon.MediaKeys.target - GNOME keyboard shortcuts target.
+Started pipewire.service - PipeWire Multimedia Service.
+Started wireplumber.service - Multimedia Service Session Manager.
+Started pipewire-pulse.service - PipeWire PulseAudio.
+tuna-shell-gtk: OpenGL is llvmpipe (LLVM 22.1.8, 256 bits); drawing with cairo
+Started dbus-:1.2-org.gnome.ScreenSaver@1.service.
+spa.bluez5: BlueZ system service is not available
+wp-device: SPA handle 'api.libcamera.enum.manager' could not be loaded; is it installed?
+s-monitors-libcamera: PipeWire's libcamera SPA plugin is missing or broken. Some camera types may not be supported.
+Starting dconf.service - User preferences database...
+Started dconf.service - User preferences database.
+tuna-compositor: switcher keys: 12 chords, cycle-group Some(SwitcherKey { keysym: 65475, mods: 8, kind: CycleGroup }), cycle-windows Some(SwitcherKey { keysym: 65307, mods: 8, kind: CycleWindows })
+tuna-shell-gtk: keybindings: 69 grabs, maximize on ["<Super>Up"]
+Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'RegisterClient'
+Started org.gnome.SettingsDaemon.Power.service - GNOME power management service.
+Reached target org.gnome.SettingsDaemon.Power.target - GNOME power management target.
+Reached target gnome-session.target - GNOME Session.
+Reached target graphical-session.target - Current graphical user session.
+Reached target tuna-session.target - Tuna Desktop graphical user session.
+tuna-compositor: session services: graphical target active
+Starting xdg-desktop-portal.service - Portal service...
+tuna-compositor: overview focus parked
+tuna-compositor: session services: portals refreshed
+tuna-shell-gtk: search providers: org.gnome.Settings.desktop, org.gnome.Nautilus.desktop
+Created slice app-dbus\x2d:1.2\x2dorg.gnome.Shell.CalendarServer.slice - Slice /app/dbus-:1.2-org.gnome.Shell.CalendarServer.
+Started dbus-:1.2-org.gnome.Shell.CalendarServer@0.service.
+tuna-compositor: wallpaper decoded for 1280x800 in 93 ms
+Starting xdg-permission-store.service - sandboxed app permission store...
+Starting evolution-source-registry.service - Evolution source registry...
+Started xdg-permission-store.service - sandboxed app permission store.
+Starting xdg-document-portal.service - flatpak document portal service...
+tuna-shell-gtk: media keys: gsd-media-keys owns the media-keys bindings
+tuna-shell-gtk: keybindings: 69 grabs, maximize on ["<Super>Up"]
+tuna-shell-gtk: IBus panel: owns org.freedesktop.IBus.Panel on the IBus bus
+tuna-shell-gtk: polkit agent registered
+tuna-compositor: switcher keys: 12 chords, cycle-group Some(SwitcherKey { keysym: 65475, mods: 8, kind: CycleGroup }), cycle-windows Some(SwitcherKey { keysym: 65307, mods: 8, kind: CycleWindows })
+tuna-ibus-bridge: text field focused
+Started xdg-document-portal.service - flatpak document portal service.
+tuna-shell-gtk: network agent registered
+Starting xdg-desktop-portal-gnome.service - Portal service (GNOME implementation)...
+Created slice app-dbus\x2d:1.2\x2dorg.gnome.OnlineAccounts.slice - Slice /app/dbus-:1.2-org.gnome.OnlineAccounts.
+Started dbus-:1.2-org.gnome.OnlineAccounts@0.service.
+goa-daemon version 3.52.8 starting
+Started evolution-source-registry.service - Evolution source registry.
+Created slice app-dbus\x2d:1.2\x2dorg.gnome.Identity.slice - Slice /app/dbus-:1.2-org.gnome.Identity.
+Started dbus-:1.2-org.gnome.Identity@0.service.
+Starting evolution-calendar-factory.service - Evolution calendar service...
+Started xdg-desktop-portal-gnome.service - Portal service (GNOME implementation).
+Starting xdg-desktop-portal-gtk.service - Portal service (GTK/GNOME implementation)...
+Started evolution-calendar-factory.service - Evolution calendar service.
+Started xdg-desktop-portal-gtk.service - Portal service (GTK/GNOME implementation).
+Starting evolution-addressbook-factory.service - Evolution address book service...
+e_cal_client_set_default_timezone: assertion 'zone != NULL' failed
+Starting gvfs-metadata.service - Virtual filesystem metadata service...
+Started gvfs-metadata.service - Virtual filesystem metadata service.
+Choosing gnome-keyring.portal for org.freedesktop.impl.portal.Secret via the deprecated UseIn key
+The preferred method to match portal implementations to desktop environments is to use the portals.conf(5) configuration file
+e_cal_client_set_default_timezone: assertion 'zone != NULL' failed
+Created slice app-dbus\x2d:1.2\x2dorg.freedesktop.secrets.slice - Slice /app/dbus-:1.2-org.freedesktop.secrets.
+Started dbus-:1.2-org.freedesktop.secrets@0.service.
+Started evolution-addressbook-factory.service - Evolution address book service.
+discover_other_daemon: 1
+Started xdg-desktop-portal.service - Portal service.
+tuna-compositor: libinput: scroll-wheel emulation button rejected for QEMU QEMU USB Tablet: Unsupported
+Unhandled parent window type 
+
+Failed to associate portal window with parent window 
+tuna-ibus-bridge: text field left
+Failed to show access dialog: Timeout was reached
+tuna-compositor: window 1 unmapped
+===BUS===
+signal time=1793479026.222467 sender=org.freedesktop.DBus -> destination=:1.76 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.76"
+signal time=1793479026.222571 sender=org.freedesktop.DBus -> destination=:1.76 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.76"
+method call time=1793479026.311210 sender=:1.77 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479026.311230 sender=org.freedesktop.DBus -> destination=:1.77 serial=4294967295 reply_serial=1
+   string ":1.77"
+signal time=1793479026.311234 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.77"
+   string ""
+   string ":1.77"
+signal time=1793479026.311238 sender=org.freedesktop.DBus -> destination=:1.77 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.77"
+method call time=1793479026.311817 sender=:1.77 -> destination=org.freedesktop.DBus serial=2 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=AddMatch
+   string "type='signal',interface='org.freedesktop.portal.Request',member='Response'"
+method return time=1793479026.311828 sender=org.freedesktop.DBus -> destination=:1.77 serial=4294967295 reply_serial=2
+method call time=1793479026.312299 sender=:1.77 -> destination=org.freedesktop.portal.Desktop serial=3 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.portal.Screenshot; member=Screenshot
+   string ""
+   array [
+      dict entry(
+         string "handle_token"
+         variant             string "shotproof"
+      )
+      dict entry(
+         string "interactive"
+         variant             boolean false
+      )
+   ]
+method call time=1793479026.312896 sender=:1.56 -> destination=org.freedesktop.DBus serial=143 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=GetConnectionCredentials
+   string ":1.77"
+method return time=1793479026.312903 sender=org.freedesktop.DBus -> destination=:1.56 serial=4294967295 reply_serial=143
+   array [
+      dict entry(
+         string "UnixUserID"
+         variant             uint32 1000
+      )
+      dict entry(
+         string "ProcessID"
+         variant             uint32 4358
+      )
+      dict entry(
+         string "UnixGroupIDs"
+         variant             array [
+               uint32 1000
+               uint32 1000
+            ]
+      )
+      dict entry(
+         string "LinuxSecurityLabel"
+         variant             array of bytes "unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023" + \0
+      )
+      dict entry(
+         string "ProcessFD"
+         variant             file descriptor
+                  inode: 4359
+                  type:       )
+   ]
+method return time=1793479026.315474 sender=:1.56 -> destination=:1.77 serial=144 reply_serial=3
+   object path "/org/freedesktop/portal/desktop/request/1_77/shotproof"
+method call time=1793479026.315483 sender=:1.56 -> destination=:1.58 serial=145 path=/org/freedesktop/impl/portal/PermissionStore; interface=org.freedesktop.impl.portal.PermissionStore; member=Lookup
+   string "screenshot"
+   string "screenshot"
+error time=1793479026.316249 sender=:1.58 -> destination=:1.56 error_name=org.freedesktop.portal.Error.NotFound reply_serial=145
+   string "No entry for screenshot"
+method call time=1793479026.316452 sender=:1.56 -> destination=:1.66 serial=146 path=/org/freedesktop/portal/desktop; interface=org.freedesktop.impl.portal.Access; member=AccessDialog
+   object path "/org/freedesktop/portal/desktop/request/1_77/shotproof"
+   string ""
+   string ""
+   string "Allow Applications to Take Screenshots?"
+   string "An application wants to be able to take screenshots at any time."
+   string "This permission can be changed at any time from the privacy settings."
+   array [
+      dict entry(
+         string "deny_label"
+         variant             string "Deny"
+      )
+      dict entry(
+         string "grant_label"
+         variant             string "Allow"
+      )
+      dict entry(
+         string "icon"
+         variant             string "applets-screenshooter-symbolic"
+      )
+      dict entry(
+         string "modal"
+         variant             boolean true
+      )
+   ]
+signal time=1793479026.347551 sender=:1.3 -> destination=(null destination) serial=293 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=WindowsChanged
+signal time=1793479026.347569 sender=:1.3 -> destination=(null destination) serial=294 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=RunningApplicationsChanged
+signal time=1793479026.368223 sender=:1.3 -> destination=(null destination) serial=295 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=WindowsChanged
+method call time=1793479028.087967 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=187 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479028.088307 sender=:1.7 -> destination=:1.24 serial=303 reply_serial=187
+   uint64 21994
+method call time=1793479030.088867 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=188 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479030.089137 sender=:1.7 -> destination=:1.24 serial=304 reply_serial=188
+   uint64 23994
+method call time=1793479032.090283 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=189 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479032.090528 sender=:1.7 -> destination=:1.24 serial=312 reply_serial=189
+   uint64 25996
+method call time=1793479034.091592 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=190 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479034.091818 sender=:1.7 -> destination=:1.24 serial=313 reply_serial=190
+   uint64 27997
+method call time=1793479036.092269 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=191 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479036.092526 sender=:1.7 -> destination=:1.24 serial=314 reply_serial=191
+   uint64 29998
+method call time=1793479038.093037 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=192 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479038.093399 sender=:1.7 -> destination=:1.24 serial=322 reply_serial=192
+   uint64 31999
+method call time=1793479040.093761 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=193 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479040.093993 sender=:1.7 -> destination=:1.24 serial=323 reply_serial=193
+   uint64 33999
+method call time=1793479042.094497 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=194 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479042.094733 sender=:1.7 -> destination=:1.24 serial=331 reply_serial=194
+   uint64 36000
+method call time=1793479042.205030 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=195 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479042.205213 sender=:1.7 -> destination=:1.24 serial=332 reply_serial=195
+   uint64 36110
+method call time=1793479044.094927 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=196 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479044.095198 sender=:1.7 -> destination=:1.24 serial=333 reply_serial=196
+   uint64 38000
+method call time=1793479046.096047 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=197 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479046.096289 sender=:1.7 -> destination=:1.24 serial=334 reply_serial=197
+   uint64 40002
+method call time=1793479048.096946 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=198 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479048.097064 sender=:1.7 -> destination=:1.24 serial=342 reply_serial=198
+   uint64 42002
+method call time=1793479050.097384 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=199 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479050.097619 sender=:1.7 -> destination=:1.24 serial=343 reply_serial=199
+   uint64 44003
+signal time=1793479051.324742 sender=:1.56 -> destination=:1.77 serial=147 path=/org/freedesktop/portal/desktop/request/1_77/shotproof; interface=org.freedesktop.portal.Request; member=Response
+   uint32 2
+   array [
+   ]
+signal time=1793479051.354827 sender=org.freedesktop.DBus -> destination=:1.77 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.77"
+signal time=1793479051.354844 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.77"
+   string ":1.77"
+   string ""
+method call time=1793479052.098705 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=200 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479052.099106 sender=:1.7 -> destination=:1.24 serial=351 reply_serial=200
+   uint64 46004
+method call time=1793479054.099317 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=201 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479054.099548 sender=:1.7 -> destination=:1.24 serial=352 reply_serial=201
+   uint64 48005
+method call time=1793479056.100729 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=202 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479056.100916 sender=:1.7 -> destination=:1.24 serial=353 reply_serial=202
+   uint64 50006
+method call time=1793479058.101571 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=203 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479058.101793 sender=:1.7 -> destination=:1.24 serial=361 reply_serial=203
+   uint64 52007
+method call time=1793479060.102405 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=204 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479060.102661 sender=:1.7 -> destination=:1.24 serial=362 reply_serial=204
+   uint64 54008
+method call time=1793479062.103199 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=205 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479062.103641 sender=:1.7 -> destination=:1.24 serial=370 reply_serial=205
+   uint64 56009
+method call time=1793479064.103933 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=206 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479064.104164 sender=:1.7 -> destination=:1.24 serial=371 reply_serial=206
+   uint64 58009
+method call time=1793479066.104469 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=207 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479066.104692 sender=:1.7 -> destination=:1.24 serial=372 reply_serial=207
+   uint64 60010
+method call time=1793479068.104984 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=208 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479068.105124 sender=:1.7 -> destination=:1.24 serial=380 reply_serial=208
+   uint64 62010
+method call time=1793479070.106319 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=209 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479070.106597 sender=:1.7 -> destination=:1.24 serial=381 reply_serial=209
+   uint64 64012
+method call time=1793479072.107215 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=210 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479072.107478 sender=:1.7 -> destination=:1.24 serial=389 reply_serial=210
+   uint64 66013
+method call time=1793479072.206658 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=211 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479072.206883 sender=:1.7 -> destination=:1.24 serial=390 reply_serial=211
+   uint64 66112
+method call time=1793479074.108048 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=212 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479074.108291 sender=:1.7 -> destination=:1.24 serial=391 reply_serial=212
+   uint64 68014
+method call time=1793479076.108613 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=213 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479076.108817 sender=:1.7 -> destination=:1.24 serial=392 reply_serial=213
+   uint64 70014
+method call time=1793479078.109603 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=214 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479078.109811 sender=:1.7 -> destination=:1.24 serial=400 reply_serial=214
+   uint64 72015
+method call time=1793479080.110525 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=215 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479080.110702 sender=:1.7 -> destination=:1.24 serial=401 reply_serial=215
+   uint64 74016
+method call time=1793479082.111847 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=216 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479082.112062 sender=:1.7 -> destination=:1.24 serial=409 reply_serial=216
+   uint64 76017
+method call time=1793479083.224824 sender=:1.78 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479083.224842 sender=org.freedesktop.DBus -> destination=:1.78 serial=4294967295 reply_serial=1
+   string ":1.78"
+signal time=1793479083.224845 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.78"
+   string ""
+   string ":1.78"
+signal time=1793479083.224847 sender=org.freedesktop.DBus -> destination=:1.78 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.78"
+method call time=1793479083.225304 sender=:1.78 -> destination=org.gnome.ScreenSaver serial=2 path=/org/gnome/ScreenSaver; interface=org.freedesktop.DBus.Introspectable; member=Introspect
+method return time=1793479083.225663 sender=:1.24 -> destination=:1.78 serial=217 reply_serial=2
+   string "<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+                      "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- GDBus 2.80.4 -->
+<node>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="GetAll">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="a{sv}" name="properties" direction="out"/>
+    </method>
+    <method name="Set">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="in"/>
+    </method>
+    <signal name="PropertiesChanged">
+      <arg type="s" name="interface_name"/>
+      <arg type="a{sv}" name="changed_properties"/>
+      <arg type="as" name="invalidated_properties"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg type="s" name="xml_data" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer">
+    <method name="Ping"/>
+    <method name="GetMachineId">
+      <arg type="s" name="machine_uuid" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.gnome.ScreenSaver">
+    <method name="Lock">
+    </method>
+    <method name="GetActive">
+      <arg type="b" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <method name="SetActive">
+      <arg type="b" name="arg_0" direction="in">
+      </arg>
+    </method>
+    <method name="GetActiveTime">
+      <arg type="u" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <signal name="ActiveChanged">
+      <arg type="b" name="arg_0">
+      </arg>
+    </signal>
+  </interface>
+</node>
+"
+method call time=1793479083.225919 sender=:1.78 -> destination=org.gnome.ScreenSaver serial=3 path=/org/gnome/ScreenSaver; interface=org.gnome.ScreenSaver; member=GetActive
+method return time=1793479083.226074 sender=:1.24 -> destination=:1.78 serial=218 reply_serial=3
+   boolean false
+signal time=1793479083.226251 sender=org.freedesktop.DBus -> destination=:1.78 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.78"
+signal time=1793479083.226257 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.78"
+   string ":1.78"
+   string ""
+method call time=1793479083.506152 sender=:1.79 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479083.506169 sender=org.freedesktop.DBus -> destination=:1.79 serial=4294967295 reply_serial=1
+   string ":1.79"
+signal time=1793479083.506173 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.79"
+   string ""
+   string ":1.79"
+signal time=1793479083.506175 sender=org.freedesktop.DBus -> destination=:1.79 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.79"
+method call time=1793479083.506382 sender=:1.79 -> destination=org.a11y.Bus serial=2 path=/org/a11y/bus; interface=org.a11y.Bus; member=GetAddress
+method return time=1793479083.506825 sender=:1.39 -> destination=:1.79 serial=17 reply_serial=2
+   string "unix:path=/run/user/1000/at-spi/bus"
+method return time=1793479083.522263 sender=:1.66 -> destination=:1.56 serial=47 reply_serial=146
+   uint32 0
+   array [
+   ]
+signal time=1793479083.524272 sender=:1.3 -> destination=(null destination) serial=410 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=WindowsChanged
+signal time=1793479083.524279 sender=:1.3 -> destination=(null destination) serial=411 path=/org/gnome/Shell/Introspect; interface=org.gnome.Shell.Introspect; member=RunningApplicationsChanged
+signal time=1793479083.531842 sender=org.freedesktop.DBus -> destination=:1.79 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.79"
+signal time=1793479083.531863 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.79"
+   string ":1.79"
+   string ""
+method call time=1793479084.113181 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=219 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479084.113484 sender=:1.7 -> destination=:1.24 serial=412 reply_serial=219
+   uint64 78019
+method call time=1793479085.537039 sender=:1.80 -> destination=org.freedesktop.DBus serial=1 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=Hello
+method return time=1793479085.537054 sender=org.freedesktop.DBus -> destination=:1.80 serial=4294967295 reply_serial=1
+   string ":1.80"
+signal time=1793479085.537057 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.80"
+   string ""
+   string ":1.80"
+signal time=1793479085.537060 sender=org.freedesktop.DBus -> destination=:1.80 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.80"
+method call time=1793479085.537626 sender=:1.80 -> destination=org.gnome.ScreenSaver serial=2 path=/org/gnome/ScreenSaver; interface=org.freedesktop.DBus.Introspectable; member=Introspect
+method return time=1793479085.537814 sender=:1.24 -> destination=:1.80 serial=220 reply_serial=2
+   string "<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+                      "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- GDBus 2.80.4 -->
+<node>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="GetAll">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="a{sv}" name="properties" direction="out"/>
+    </method>
+    <method name="Set">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="in"/>
+    </method>
+    <signal name="PropertiesChanged">
+      <arg type="s" name="interface_name"/>
+      <arg type="a{sv}" name="changed_properties"/>
+      <arg type="as" name="invalidated_properties"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg type="s" name="xml_data" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.DBus.Peer">
+    <method name="Ping"/>
+    <method name="GetMachineId">
+      <arg type="s" name="machine_uuid" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.gnome.ScreenSaver">
+    <method name="Lock">
+    </method>
+    <method name="GetActive">
+      <arg type="b" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <method name="SetActive">
+      <arg type="b" name="arg_0" direction="in">
+      </arg>
+    </method>
+    <method name="GetActiveTime">
+      <arg type="u" name="arg_0" direction="out">
+      </arg>
+    </method>
+    <signal name="ActiveChanged">
+      <arg type="b" name="arg_0">
+      </arg>
+    </signal>
+  </interface>
+</node>
+"
+method call time=1793479085.538034 sender=:1.80 -> destination=org.gnome.ScreenSaver serial=3 path=/org/gnome/ScreenSaver; interface=org.gnome.ScreenSaver; member=GetActive
+method return time=1793479085.538206 sender=:1.24 -> destination=:1.80 serial=221 reply_serial=3
+   boolean false
+signal time=1793479085.538704 sender=org.freedesktop.DBus -> destination=:1.80 serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.80"
+signal time=1793479085.538715 sender=org.freedesktop.DBus -> destination=(null destination) serial=4294967295 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameOwnerChanged
+   string ":1.80"
+   string ":1.80"
+   string ""
+method call time=1793479086.114236 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=222 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479086.114460 sender=:1.7 -> destination=:1.24 serial=413 reply_serial=222
+   uint64 80020
+method call time=1793479088.115091 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=223 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479088.115340 sender=:1.7 -> destination=:1.24 serial=421 reply_serial=223
+   uint64 82021
+method call time=1793479090.115416 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=224 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479090.115656 sender=:1.7 -> destination=:1.24 serial=422 reply_serial=224
+   uint64 84021
+method call time=1793479092.116751 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=225 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479092.116973 sender=:1.7 -> destination=:1.24 serial=430 reply_serial=225
+   uint64 86022
+method call time=1793479094.117374 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=226 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479094.117641 sender=:1.7 -> destination=:1.24 serial=431 reply_serial=226
+   uint64 88023
+method call time=1793479096.118253 sender=:1.24 -> destination=org.gnome.Mutter.IdleMonitor serial=227 path=/org/gnome/Mutter/IdleMonitor/Core; interface=org.gnome.Mutter.IdleMonitor; member=GetIdletime
+method return time=1793479096.118491 sender=:1.7 -> destination=:1.24 serial=432 reply_serial=227
+   uint64 90024
+===ENV===
+DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+DESKTOP_SESSION=tuna
+GDMSESSION=tuna
+GDM_LANG=C.UTF-8
+HOME=/var/home/tuna-test
+KWIN_COMPOSE=Q
+LANG=C.UTF-8
+LIBGL_ALWAYS_SOFTWARE=1
+LOGNAME=tuna-test
+PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin
+PWD=/var/home/tuna-test
+SHELL=/bin/bash
+USER=tuna-test
+USERNAME=tuna-test
+WLR_RENDERER=pixman
+XDG_CURRENT_DESKTOP=Tuna:GNOME
+XDG_DATA_DIRS=/var/home/tuna-test/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share/:/usr/share/
+XDG_RUNTIME_DIR=/run/user/1000
+XDG_SEAT=seat0
+XDG_SESSION_CLASS=user
+XDG_SESSION_DESKTOP=tuna
+XDG_SESSION_ID=4
+XDG_SESSION_TYPE=wayland
+XDG_VTNR=2
+===DIRS===
+drwx------. 13 tuna-test tuna-test 4096 Oct 31 20:35 /var/home/tuna-test
+drwxr-xr-x.  8 tuna-test tuna-test  174 Oct 31 20:35 /var/home/tuna-test/.config
+drwxr-xr-x.  2 tuna-test tuna-test    6 Oct 31 20:35 /var/home/tuna-test/Pictures
+# This file is written by xdg-user-dirs-update
+# If you want to change or add directories, just edit the line you're
+# interested in. All local changes will be retained on the next run.
+# Format is XDG_xxx_DIR="$HOME/yyy", where yyy is a shell-escaped
+# homedir-relative path, or XDG_xxx_DIR="/yyy", where /yyy is an
+# absolute path. No other format is supported.
+# 
+XDG_DESKTOP_DIR="$HOME/Desktop"
+XDG_DOWNLOAD_DIR="$HOME/Downloads"
+XDG_TEMPLATES_DIR="$HOME/Templates"
+XDG_PUBLICSHARE_DIR="$HOME/Public"
+XDG_DOCUMENTS_DIR="$HOME/Documents"
+XDG_MUSIC_DIR="$HOME/Music"
+XDG_PICTURES_DIR="$HOME/Pictures"
+XDG_VIDEOS_DIR="$HOME/Videos"
+STDERR

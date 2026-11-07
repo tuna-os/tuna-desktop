@@ -257,7 +257,7 @@ def main():
             'session_bus': env['DBUS_SESSION_BUS_ADDRESS'], 'accessibility_bus': address,
         }
         display_read, display_write = os.pipe()
-        spawn(['Xvfb', '-displayfd', str(display_write), '-screen', '0', '1280x800x24', '-nolisten', 'tcp', '-noreset'],
+        spawn([str(Path(__file__).resolve().with_name('tuna-xvfb')), '-displayfd', str(display_write), '-screen', '0', '1280x800x24', '-nolisten', 'tcp', '-noreset'],
               'xvfb', pass_fds=(display_write,))
         os.close(display_write)
         display_number = b''

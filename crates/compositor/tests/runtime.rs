@@ -28,6 +28,31 @@ fn compositor_bin() -> std::path::PathBuf {
     dir.join("tuna-compositor")
 }
 
+/// Keep real child launches independent of the invoking user's migration state.
+/// Retain the owner until the child exits so its private roots remain available.
+fn private_launch_env(command: &mut Command) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("private launch root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private launch root permissions");
+    for (key, name) in [
+        ("HOME", "home"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_STATE_HOME", "state"),
+        ("XDG_RUNTIME_DIR", "runtime"),
+    ] {
+        let path = root.path().join(name);
+        std::fs::create_dir(&path).expect("private launch directory");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("private launch directory permissions");
+        command.env(key, path);
+    }
+    root
+}
+
 /// Env hygiene in ONE test, run sequentially: process env is global, so
 /// splitting set/restore across tests would race with each other.
 /// `apply_nested_env` points `WAYLAND_DISPLAY` at our socket and returns
@@ -110,7 +135,9 @@ fn launch_smoke_binds_private_socket_or_skips_without_backend() {
         "missing sibling binary {}; run `cargo build -p tuna-compositor --bins` first",
         bin.display()
     );
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    let private_root = private_launch_env(&mut command);
+    let mut child = command
         .args([
             "--socket",
             &socket_name,
@@ -125,10 +152,7 @@ fn launch_smoke_binds_private_socket_or_skips_without_backend() {
         .expect("spawn nested compositor");
 
     // `ListeningSocketSource::with_name` binds under `XDG_RUNTIME_DIR`.
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let socket_path = runtime_dir.join(&socket_name);
+    let socket_path = private_root.path().join("runtime").join(&socket_name);
     let mut bound = false;
     let mut exited = None;
     for _ in 0..RETRY_ROUNDS {
@@ -211,7 +235,9 @@ fn sighup_ends_the_session_through_teardown() {
         .unwrap()
         .as_nanos();
     let socket_name = format!("tuna-hup-{}-{nanos}", std::process::id());
-    let mut child = Command::new(compositor_bin())
+    let mut command = Command::new(compositor_bin());
+    let private_root = private_launch_env(&mut command);
+    let mut child = command
         .args([
             "--socket",
             &socket_name,
@@ -224,10 +250,7 @@ fn sighup_ends_the_session_through_teardown() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn nested compositor");
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let socket_path = runtime_dir.join(&socket_name);
+    let socket_path = private_root.path().join("runtime").join(&socket_name);
     let mut bound = false;
     for _ in 0..RETRY_ROUNDS {
         if socket_path.exists() {

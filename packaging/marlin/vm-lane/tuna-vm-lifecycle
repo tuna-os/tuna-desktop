@@ -12,7 +12,9 @@ import sys
 import time
 import hashlib
 import hashlib
+import re
 import shlex
+import shutil
 import time
 import uuid
 import base64
@@ -41,6 +43,15 @@ COMPOSITOR_COMM = COMPOSITOR[:15]  # /proc/<pid>/comm keeps 15 bytes.
 SHELL_GTK = f"{PREFIX}-shell-gtk"
 NESTED = f"{PREFIX}-nested-"
 LOCK_PAM = f"/etc/pam.d/{PREFIX}-lock"
+
+
+def desktop_package_version():
+    """Read the installed package through Marlin's native package manager."""
+    package = subprocess.run(["pacman", "-Q", PACKAGE],
+                             capture_output=True, text=True, timeout=10)
+    fields = package.stdout.split()
+    return (fields[1] if package.returncode == 0 and len(fields) == 2
+            and fields[0] == PACKAGE else None)
 
 
 # Both fixtures log in through stock GDM (tunaOS#3438): its PAM service is
@@ -448,8 +459,7 @@ def inventory():
         stage = "state-parse"
         state = json.loads(text)
         stage = "pam-snapshot"
-        _, helpers = classify_pam_helpers(pam_process_snapshot())
-        helper_identities = {row["pid"]: public_auth_identity(row) for row in helpers}
+        desktop, _ = classify_pam_helpers(pam_process_snapshot())
         stage = "process-scan"
         processes = []
         for path in pathlib.Path("/proc").iterdir():
@@ -458,13 +468,22 @@ def inventory():
             try:
                 uid = path.stat().st_uid
                 executable = pathlib.Path(os.readlink(path / "exe")).name
-                if int(path.name) in helper_identities:
-                    observed_helper = auth_process(int(path.name))
-                    # The exact private helper this scan classified, still
-                    # itself or since departed, is never an owned compositor.
-                    if observed_helper is None or (observed_helper["_private"]
-                            and public_auth_identity(observed_helper) == helper_identities[int(path.name)]):
+                if executable == COMPOSITOR and desktop is not None:
+                    observed = auth_process(int(path.name))
+                    if observed is None:
                         continue
+                    # A fresh lock conversation can spawn after pam-snapshot.
+                    # Classify this scan's row, not an earlier list of helper
+                    # PIDs, and bind its parent to the still-live original
+                    # desktop (including start time and executable inode).
+                    if observed["_private"]:
+                        parent = auth_process(desktop["pid"])
+                        if (parent is not None and not parent["_marked"]
+                                and public_auth_identity(parent) == public_auth_identity(desktop)
+                                and classify_pam_helpers([parent, observed])[1]):
+                            continue
+                    uid = observed["uid"]
+                    executable = observed["executable"]
                 if uid != OWNER.pw_uid or executable not in {
                     COMPOSITOR, SHELL_GTK, "gnome-disks",
                     "gnome-system-monitor", "nautilus",
@@ -559,27 +578,31 @@ POWER_BUTTON_SYSTEM_LOG = pathlib.Path("/run/tuna-vm-power-button-system.log")
 POWER_BUTTON_LOG_BOUND = 64 << 20
 MEDIA_KEYS = "org.gnome.SettingsDaemon.MediaKeys"
 # gsd-media-keys' GrabAccelerators/AcceleratorActivated exchange with the
-# org.gnome.Shell key grabber, gnome-session's Shutdown entry point and the
+# org.gnome.Shell key grabber, gnome-session's Shutdown entry point (and the
+# power menu's Reboot and Logout, GNOME Shell 51 systemActions.js) and the
 # shell's EndSessionDialog. Method returns are matched to their calls by
 # (destination, reply_serial) because the replier's unique name is not
 # known when the monitor starts.
+END_SESSION_METHODS = ("Reboot", "Shutdown", "Logout")
 POWER_BUTTON_SESSION_RULES = (
     "type='method_call',interface='org.gnome.Shell',member='GrabAccelerators'",
     "type='method_return'",
     "type='error'",
     "type='signal',interface='org.gnome.Shell',member='AcceleratorActivated'",
-    "type='method_call',interface='org.gnome.SessionManager',member='Shutdown'",
+    *(f"type='method_call',interface='org.gnome.SessionManager',member='{member}'"
+      for member in END_SESSION_METHODS),
     "type='method_call',interface='org.gnome.SessionManager.EndSessionDialog'",
     "type='signal',interface='org.gnome.SessionManager.EndSessionDialog'")
 # logind power requests, their error replies and logind's own announcement
 # that it is about to act (gsd-media-keys' logind_power_action:
-# PowerOffWithFlags/SuspendWithFlags/HibernateWithFlags). gsd passes no reply
+# PowerOffWithFlags/SuspendWithFlags/HibernateWithFlags; the session
+# manager's Reboot/PowerOff once a dialog is confirmed). gsd passes no reply
 # callback, so GDBus sends these calls NO_REPLY_EXPECTED and logind answers
 # nothing, not even a refusal: a refused request shows as a call that
 # PrepareForShutdown/PrepareForSleep never follows while PreparingForShutdown
 # stays false.
-POWER_BUTTON_LOGIND_CALLS = ("PowerOff", "PowerOffWithFlags", "Suspend", "SuspendWithFlags",
-                             "Hibernate", "HibernateWithFlags")
+POWER_BUTTON_LOGIND_CALLS = ("PowerOff", "PowerOffWithFlags", "Reboot", "RebootWithFlags", "Suspend",
+                             "SuspendWithFlags", "Hibernate", "HibernateWithFlags")
 POWER_BUTTON_LOGIND_PREPARE = ("PrepareForShutdown", "PrepareForSleep")
 POWER_BUTTON_SYSTEM_RULES = tuple(
     f"type='method_call',interface='org.freedesktop.login1.Manager',member='{member}'"
@@ -798,10 +821,11 @@ def power_button_observe():
                     "action": int(m["args"][0].split()[1])}
                    for m in session if m["type"] == "signal" and m["member"] == "AcceleratorActivated"
                    and m["args"][:1] and m["args"][0].startswith("uint32 ")]
-    shutdowns = [{"index": m["index"], "sender": m["sender"], "destination": m["destination"],
-                  "reply": reply_of(session_replies, m)}
-                 for m in session if m["type"] == "method call"
-                 and m["interface"] == "org.gnome.SessionManager" and m["member"] == "Shutdown"]
+    end_session = [{"index": m["index"], "sender": m["sender"], "destination": m["destination"],
+                    "member": m["member"], "args": m["args"][:1], "reply": reply_of(session_replies, m)}
+                   for m in session if m["type"] == "method call"
+                   and m["interface"] == "org.gnome.SessionManager" and m["member"] in END_SESSION_METHODS]
+    shutdowns = [request for request in end_session if request["member"] == "Shutdown"]
     dialog = [{"index": m["index"], "type": m["type"], "sender": m["sender"], "destination": m["destination"],
                "member": m["member"], "args": m["args"][:3]}
               for m in session if m["interface"] == "org.gnome.SessionManager.EndSessionDialog"
@@ -815,7 +839,8 @@ def power_button_observe():
     saved = json.loads(POWER_BUTTON_STATE.read_text())
     layers = json.loads(STATE.read_text()).get("layers")
     return {"session_count": len(session), "system_count": len(system), "grabs": grabs,
-            "activations": activations, "shutdowns": shutdowns, "dialog": dialog, "system": power_calls,
+            "activations": activations, "end_session": end_session, "shutdowns": shutdowns, "dialog": dialog,
+            "system": power_calls,
             "media_keys": gsd_plugin_row("MediaKeys"), "inhibitors": logind_inhibitors(),
             "prepare": [{"index": m["index"], "member": m["member"], "args": m["args"][:1]}
                         for m in system if m["type"] == "signal"
@@ -1650,6 +1675,211 @@ def shell_navigation_focus(kind, original_pid=None, original_ticks=None, control
         raise SystemExit(1) from None
 
 
+def shell_controls():
+    """The running shell's public controls from its own AT-SPI tree: the
+    power menu rows, the end-session dialog's buttons and its countdown
+    (#589). Observation only; QMP keys perform every action. Unlike the Orca
+    navigation receipts this needs no screen reader: GTK publishes the tree
+    to the session's accessibility bus by itself."""
+    if json.loads(STATE.read_text())["locked"]:
+        raise RuntimeError("locked accessibility trees are never queried")
+    shells = [p for p in inventory()["processes"]
+              if p["executable"] == "tuna-shell-gtk" and p["uid"] == OWNER.pw_uid]
+    if len(shells) != 1:
+        raise RuntimeError("one original shell is required")
+    shell = shells[0]
+    with open(f"/proc/{shell['pid']}/environ", "rb") as stream:
+        raw = stream.read(128 * 1024 + 1)
+    displays = [entry.split(b"=", 1)[1].decode() for entry in raw.split(b"\0")
+                if entry.startswith(b"WAYLAND_DISPLAY=")]
+    if len(raw) > 128 * 1024 or len(displays) != 1:
+        raise RuntimeError("the shell's Wayland display is not one bounded value")
+    receipt = json.loads(call("/usr/libexec/tuna-vm-shell-focus", str(shell["pid"]), str(shell["start_ticks"]),
+                              "tuna-shell-gtk", displays[0], "end-session", user=True))
+    return {"shell": {"pid": shell["pid"], "start_ticks": shell["start_ticks"]},
+            "public_controls": receipt["public_controls"]}
+
+
+def _tour_shell_candidates(owner_uid, proc_root=pathlib.Path("/proc")):
+    """Owned tuna-shell-gtk processes with readable display identity.
+
+    The observer runs unprivileged, so setuid/non-dumpable processes owned
+    by the session user (bubblewrap, helpers) expose no exe link: skipping
+    them is safe because an unverifiable process can never count as the
+    shell, and a genuinely missing shell still fails the uniqueness check.
+    """
+    candidates = []
+    for path in proc_root.glob("[0-9]*"):
+        try:
+            if path.stat().st_uid != owner_uid:
+                continue
+            executable = os.readlink(path / "exe")
+            if executable != "/usr/bin/tuna-shell-gtk":
+                continue
+            fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
+            with (path / "environ").open("rb") as stream:
+                raw = stream.read(131073)
+            displays = [entry.split(b"=", 1)[1].decode() for entry in raw.split(b"\0")
+                        if entry.startswith(b"WAYLAND_DISPLAY=")]
+            session_ids = [entry.split(b"=", 1)[1].decode() for entry in raw.split(b"\0")
+                           if entry.startswith(b"XDG_SESSION_ID=")]
+            if len(raw) > 131072 or len(displays) != 1 or len(session_ids) != 1:
+                raise RuntimeError("tour shell display identity exceeds bound")
+            candidates.append({"pid": int(path.name), "uid": owner_uid,
+                               "start_ticks": int(fields[19]), "executable": executable,
+                               "display": displays[0], "session_id": session_ids[0]})
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+    return candidates
+
+
+def tour_public_ui():
+    """One finite read-only AT-SPI observation, including the lock frame only.
+
+    No compositor snapshot, debug property, text/value API or accessibility
+    action participates. Object paths below are explicitly AT-SPI identities.
+
+    Failures print one bounded record (vm_guest_agent.FAILURE_RECORDS);
+    the traceback text itself never leaves the guest.
+    """
+    try:
+        return _tour_public_ui()
+    except Exception as error:
+        print(json.dumps({"tour_public_ui_error": inventory_error(error)}))
+        raise SystemExit(1) from None
+
+
+def _tour_public_ui():
+    if os.geteuid() == 0:
+        session = owner_login_session()
+        if (session.get("User") != str(OWNER.pw_uid) or session.get("Type") != "wayland"
+                or session.get("Class") != "user" or session.get("Service") != LOGIN_SERVICE):
+            raise RuntimeError("tour requires the original GDM Wayland session")
+        try:
+            observed = json.loads(call(sys.executable, __file__, "tour-public-ui", user=True))
+        except subprocess.CalledProcessError as error:
+            # Forward the user-context record (with its own crash frames)
+            # instead of reporting the re-exec line.
+            try:
+                forwarded = json.loads((error.stdout or "").strip() or "{}")
+            except ValueError:
+                forwarded = {}
+            if type(forwarded) is dict and set(forwarded) == {"tour_public_ui_error"}:
+                print(json.dumps(forwarded))
+                raise SystemExit(1) from None
+            raise
+        if observed["principal"]["session_id"] != session["Id"]:
+            raise RuntimeError("tour shell is not in the original GDM session")
+        if session != owner_login_session():
+            raise RuntimeError("tour public observation crossed a session change")
+        observed["session"] = session
+        return observed
+    if os.geteuid() != OWNER.pw_uid:
+        raise RuntimeError("tour observer requires the ordinary session owner")
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi, Gio, GLib
+    started = time.monotonic_ns()
+    deadline = time.monotonic() + 8
+
+    def remaining():
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError("tour public observation deadline")
+        return max(1, min(500, int(value * 1000)))
+
+    def query(method, *args):
+        Atspi.set_timeout(remaining(), remaining())
+        result = method(*args)
+        remaining()
+        return result
+
+    def principal():
+        candidates = _tour_shell_candidates(OWNER.pw_uid)
+        if len(candidates) != 1:
+            raise RuntimeError("one original tour shell is required")
+        return candidates[0]
+
+    original = principal()
+    desktop = query(Atspi.get_desktop, 0)
+    count = query(desktop.get_child_count)
+    if not 0 <= count <= 64:
+        raise RuntimeError("tour accessibility desktop exceeds bound")
+    apps = []
+    for index in range(count):
+        app = query(desktop.get_child_at_index, index)
+        if app is not None and query(app.get_process_id) == original["pid"]:
+            apps.append(app)
+    if len(apps) != 1:
+        raise RuntimeError("one original tour AT-SPI application is required")
+    app = apps[0]
+    owner = app.app.bus_name
+    import re
+    if type(owner) is not str or re.fullmatch(r":\d+\.\d+", owner) is None:
+        raise RuntimeError("tour AT-SPI owner must be unique")
+    session_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+    def bus_call(bus, destination, path, interface, method, parameters):
+        result = bus.call_sync(destination, path, interface, method, parameters, None,
+                               Gio.DBusCallFlags.NONE, remaining(), None)
+        remaining()
+        return result.unpack()[0]
+
+    address = bus_call(session_bus, "org.a11y.Bus", "/org/a11y/bus",
+                       "org.a11y.Bus", "GetAddress", None)
+    bus = Gio.DBusConnection.new_for_address_sync(address,
+        Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+        None, None)
+
+    def credentials():
+        values = [bus_call(bus, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                           "org.freedesktop.DBus", method, GLib.Variant("(s)", (owner,)))
+                  for method in ("GetNameOwner", "GetConnectionUnixProcessID", "GetConnectionUnixUser")]
+        if values != [owner, original["pid"], original["uid"]]:
+            raise RuntimeError("tour original AT-SPI owner credentials disagree")
+        return {"owner": owner, "bus_pid": values[1], "bus_uid": values[2]}
+
+    authority = credentials()
+    allowed = {("frame", "App Grid"), ("frame", "Lock Screen"), ("slider", "Volume"),
+               ("push button", "Settings"), ("push button", "Lock Screen"),
+               ("push button", "Previous month"), ("push button", "Next month")}
+    controls, pending, visited = [], [(app, 0)], 0
+    while pending:
+        node, depth = pending.pop()
+        remaining()
+        visited += 1
+        if visited > 1024 or depth > 32:
+            raise RuntimeError("tour public tree exceeds bound")
+        query(node.clear_cache)
+        states = query(node.get_state_set)
+        showing, visible = states.contains(Atspi.StateType.SHOWING), states.contains(Atspi.StateType.VISIBLE)
+        if depth > 0 and not (showing and visible):
+            continue
+        role = query(node.get_role_name)
+        role = "push button" if role == "button" else role
+        name = query(node.get_name) if role in {"frame", "slider", "push button"} else None
+        if showing and visible and (role, name) in allowed:
+            component = query(node.get_component_iface)
+            rect = query(Atspi.Component.get_extents, component, Atspi.CoordType.SCREEN)
+            controls.append({"label": name, "role": role, "showing": True, "visible": True,
+                             "extents": [rect.x, rect.y, rect.width, rect.height]})
+        # Never query lock descendants (passwords, user labels or auth messages).
+        if role == "frame" and name == "Lock Screen":
+            continue
+        children = query(node.get_child_count)
+        if not 0 <= children <= 1024 or visited + len(pending) + children > 1024:
+            raise RuntimeError("tour public children exceed bound")
+        for index in range(children):
+            child = query(node.get_child_at_index, index)
+            if child is not None:
+                pending.append((child, depth + 1))
+    if original != principal() or authority != credentials():
+        raise RuntimeError("tour original public UI principal changed")
+    return {"schema": 1, "method": "public-at-spi", "principal": original,
+            "atspi": authority, "controls": controls,
+            "started_monotonic_ns": started, "completed_monotonic_ns": time.monotonic_ns()}
+
+
 def speech_capture_profile(name):
     # Fixed CI-only real recorder profiles, never production reader settings.
     if type(name) is not str or name not in {"native-command", "public-navigation"}:
@@ -1895,6 +2125,47 @@ def strip_stop_identity(original, uid, deadline):
         os.close(fd)
 
 
+def strip_notification_ui(summary, owner, *, observe_control=False, fixture_control=False):
+    """Fixed public layer roles and a read-only original-shell Close control."""
+    layers = summary.get("layers")
+    if type(layers) is not list or len(layers) > 32:
+        raise RuntimeError("bounded actual strip layer observation missing")
+    public = []
+    for layer in layers:
+        rect = layer.get("rect")
+        if (type(rect) is not list or len(rect) != 4
+                or any(type(value) is not int or abs(value) > 16384 for value in rect)
+                or min(rect[2:]) <= 0):
+            raise RuntimeError("invalid actual strip layer geometry")
+        namespace = layer.get("namespace")
+        public.append({"namespace": namespace if namespace in {"tuna-panel", "tuna-shell-banners"} else "other",
+                       "rect": rect})
+    result = {"layers": public, "control": None}
+    if not observe_control:
+        return result
+    if (summary["locked"] or summary["overview_open"]
+            or any(layer["namespace"] == "other" for layer in public)
+            or sum(layer["namespace"] == "tuna-shell-banners" for layer in public) != 1):
+        raise RuntimeError("notification Close requires one unambiguous unlocked banner")
+    shell = owner["core"]["tuna-shell-gtk"]
+    observer = pathlib.Path("/usr/libexec/tuna-vm-shell-focus")
+    observer_sha = strip_sha(observer)
+    mode = "notification-banner-fixture" if fixture_control else "notification-banner"
+    raw = call(str(observer), str(shell["pid"]), str(shell["start_ticks"]), "tuna-shell-gtk",
+               f"tuna-nested-{owner['core']['tuna-compositor']['pid']}", mode, user=True)
+    if len(raw.encode()) > 8192:
+        raise RuntimeError("notification control observation exceeds byte bound")
+    control = json.loads(raw)
+    if (control.get("observer_sha256") != observer_sha or strip_sha(observer) != observer_sha
+            or strip_core(inventory()) != owner["core"]):
+        raise RuntimeError("original notification observer/shell identity changed")
+    after = strip_json(STATE, OWNER.pw_uid)
+    if after["locked"] or after["overview_open"] or strip_notification_ui(after, owner)["layers"] != public:
+        raise RuntimeError("notification layers changed during control observation")
+    result["control"] = control
+    return result
+
+
 def strip_client(action, nonce):
     nonce = strip_nonce(nonce)
     receipt_path = pathlib.Path(RUNTIME, f"tuna-vm-strip-{nonce}.json")
@@ -1953,7 +2224,7 @@ def strip_client(action, nonce):
             raise RuntimeError("unknown fixture launch prevents confirmed cleanup")
         return {"nonce": nonce, "boot_id": owner["boot_id"], "owned_processes": records,
                 "cleanup_confirmed": True, "descendant_group_retirement_qualified": False}
-    if action != "state" or owner.get("launch_state") != "known":
+    if action not in ("state", "notification-create", "notification-control", "notification-fixture") or owner.get("launch_state") != "known":
         raise RuntimeError("strip fixture ownership not admitted")
     fixture = strip_json(receipt_path, OWNER.pw_uid)
     if strip_validate_client(fixture, nonce, owner["launcher"], mode) != owner["client"]:
@@ -1961,6 +2232,20 @@ def strip_client(action, nonce):
     current = inventory()
     if strip_core(current) != owner["core"]:
         raise RuntimeError("native compositor/shell identity changed since original fixture admission")
+    if action == "notification-create":
+        if current["state"]["locked"]:
+            raise RuntimeError("notification control requires the original unlocked session")
+        fields = call("busctl", "--user", "call", "org.freedesktop.Notifications",
+                      "/org/freedesktop/Notifications", "org.freedesktop.Notifications", "Notify",
+                      "susssasa{sv}i", "Tuna VM Strip", "0", "", "Installed strip framebuffer control",
+                      "Controlled critical notification for native framebuffer recovery. "
+                      "Close this public fixture with its original shell button.",
+                      "0", "1", "urgency", "y", "2", "0", user=True).split()
+        if len(fields) != 2 or fields[0] != "u" or not fields[1].isdigit() or int(fields[1]) == 0:
+            raise RuntimeError("notification service did not return a real control ID")
+        if strip_core(inventory()) != owner["core"]:
+            raise RuntimeError("original native pair changed during notification control")
+        return {"owner": owner, "notification_id": int(fields[1])}
     summary = strip_json(STATE, OWNER.pw_uid)
     current["state"].update({key: summary.get(key) for key in
                            ("session_mode", "strip_offset", "strip_view", "strip_animating", "rendered_frames", "tile_preview",
@@ -1968,6 +2253,9 @@ def strip_client(action, nonce):
     # Native window->PID kernel credentials are not in the current summary.
     # Nonce app IDs/new-map sets are checked by the host; never fabricate that join.
     return {"owner": owner, "fixture": fixture, "inventory": current,
+            "notification_ui": strip_notification_ui(
+                summary, owner, observe_control=action in ("notification-control", "notification-fixture"),
+                fixture_control=action == "notification-fixture"),
             "native_window_kernel_pid_join_qualified": False}
 
 
@@ -2091,9 +2379,351 @@ def soak_read(name, offset):
     return {"name": name, "offset": offset, "size": size, "data": base64.b64encode(data).decode()}
 
 
+# tunaOS#4092 fresh-account fixtures (tuna-vm-fresh-accounts): public names,
+# public password "tuna". tunaseeded is the negative control: its
+# AccountsService record is written before GDM starts.
+FRESH_USERS = ("tunastd", "tunaadmin", "tunaseeded")
+ACCOUNTS_RECORD_DIR = pathlib.Path("/var/lib/AccountsService/users")
+GDM_CUSTOM_CONF = pathlib.Path("/etc/gdm/custom.conf")
+# Read-only diagnostics of the GDM 51 template policy (tunaOS#4092). They
+# never gate: the physical record above stays the only persistence proof.
+# Global templates in the canonical check's precedence; only these [User]
+# keys leave the guest (never Icon or other template content).
+ACCOUNTS_TEMPLATE_DIRS = ("/run", "/etc", "/usr/local/share", "/usr/share")
+ACCOUNTS_TEMPLATE_KINDS = ("standard", "administrator")
+ACCOUNTS_TEMPLATE_KEYS = ("Session", "SessionType", "XSession", "SystemAccount")
+ACCOUNTS_TEMPLATE_BOUND = 16384
+# Read-only org.freedesktop.Accounts.User properties (accountsservice
+# 26.27.3 data/org.freedesktop.Accounts.User.xml) and their D-Bus types.
+ACCOUNTS_PROPERTIES = {"Session": "s", "SessionType": "s", "Saved": "b", "LocalAccount": "b"}
+ACCOUNTS_TIMEOUT_MS = 3000
+GDM_POLICY_PACKAGES = ("gdm", "libgdm", "accountsservice")
+DIAGNOSTIC_OUTPUT_BOUND = 256
+# tuna-gdm-default-session.sh's bash ERE; [[:space:]] is the C locale's set.
+GDM_VERSION = re.compile(r"[Gg][Dd][Mm]3?[ \t\n\v\f\r]+([0-9]+)\.[0-9]+([.-][0-9A-Za-z.-]+)?[ \t\n\v\f\r]*")
+FRESH_DESKTOP = ("tuna-session", COMPOSITOR_COMM, SHELL_GTK[:15], "gnome-shell", "gnome-session-b",
+                 "gnome-session-s")
+
+
+def record_presence(path):
+    """Presence of the fixed physical record path, without reading it."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return {"present": False}
+    except OSError as error:
+        return {"error": type(error).__name__}
+    return {"present": True, "regular": stat.S_ISREG(info.st_mode)}
+
+
+def template_observation(kind):
+    """The global `kind` template: each candidate's presence, the winning
+    path and every occurrence of the allowlisted [User] keys in file order,
+    parsed as the helper's awk does ([] = missing, [""] = explicit empty)."""
+    candidates = [pathlib.Path(directory, "accountsservice/user-templates", kind)
+                  for directory in ACCOUNTS_TEMPLATE_DIRS]
+    present = [path.is_file() for path in candidates]
+    result = {"candidates": [{"path": str(path), "present": flag} for path, flag in zip(candidates, present)],
+              "winner": None}
+    if True not in present:
+        return result
+    winner = candidates[present.index(True)]
+    result["winner"] = str(winner)
+    try:
+        with winner.open("rb") as stream:
+            data = stream.read(ACCOUNTS_TEMPLATE_BOUND + 1)
+    except OSError as error:
+        result["error"] = type(error).__name__
+        return result
+    keys = {key: [] for key in ACCOUNTS_TEMPLATE_KEYS}
+    groups, in_user = 0, False
+    for line in data[:ACCOUNTS_TEMPLATE_BOUND].decode(errors="replace").split("\n"):
+        if line.startswith("["):
+            in_user = line == "[User]"
+            groups += in_user
+        elif in_user and "=" in line:
+            key, value = line.split("=", 1)
+            if key in keys:
+                keys[key].append(value)
+    result |= {"truncated": len(data) > ACCOUNTS_TEMPLATE_BOUND, "user_groups": groups, "keys": keys}
+    return result
+
+
+def accounts_get(bus, path, name):
+    """One Properties.Get without D-Bus activation: {"value": v}, or
+    {"error": id} with the remote D-Bus error name, never its message."""
+    from gi.repository import Gio, GLib
+    try:
+        reply = bus.call_sync("org.freedesktop.Accounts", path, "org.freedesktop.DBus.Properties", "Get",
+                              GLib.Variant("(ss)", ("org.freedesktop.Accounts.User", name)),
+                              GLib.VariantType("(v)"), Gio.DBusCallFlags.NO_AUTO_START,
+                              ACCOUNTS_TIMEOUT_MS, None)
+        value = reply.get_child_value(0).get_variant()
+        signature = value.get_type_string()
+        if signature != ACCOUNTS_PROPERTIES[name]:
+            return {"error": "unexpected-type", "type": signature[:16]}
+        return {"value": value.unpack()}
+    except GLib.Error as error:
+        return {"error": (Gio.DBusError.get_remote_error(error) or f"{error.domain}:{error.code}")[:128]}
+    except Exception as error:
+        return {"error": type(error).__name__}
+
+
+def accounts_properties(uid):
+    """Effective AccountsService state of /org/freedesktop/Accounts/User<uid>:
+    exactly the fixed read-only properties, each a value or an explicit error."""
+    path = f"/org/freedesktop/Accounts/User{uid}"
+    try:
+        from gi.repository import Gio
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    except Exception as error:
+        return {"object": path, "properties": {name: {"error": f"bus:{type(error).__name__}"}
+                                               for name in ACCOUNTS_PROPERTIES}}
+    return {"object": path, "properties": {name: accounts_get(bus, path, name) for name in ACCOUNTS_PROPERTIES}}
+
+
+def bounded_command(argv, timeout=10):
+    """(record, stdout): exit status and bounded stdout; stderr is discarded."""
+    try:
+        run = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"error": type(error).__name__}, b""
+    return ({"returncode": run.returncode,
+             "stdout": run.stdout[:DIAGNOSTIC_OUTPUT_BOUND].decode(errors="replace"),
+             "truncated": len(run.stdout) > DIAGNOSTIC_OUTPUT_BOUND}, run.stdout)
+
+
+def gdm_version_major(stdout, returncode):
+    """The helper's parse: bash $(...) drops NULs and trailing newlines, and
+    a failed --version reads as empty."""
+    text = stdout.replace(b"\0", b"").rstrip(b"\n").decode(errors="surrogateescape") if returncode == 0 else ""
+    match = GDM_VERSION.fullmatch(text)
+    return int(match.group(1)) if match else None
+
+
+def gdm_policy(search_path=None):
+    """What tuna-gdm-default-session.sh selects on this root: the binary it
+    resolves, its bounded --version result and parse, the exact literal
+    probe, the derived template policy, package provenance and templates."""
+    binary = shutil.which("gdm", path=search_path) or shutil.which("gdm3", path=search_path)
+    result = {"binary": binary, "realpath": os.path.realpath(binary) if binary else None}
+    if binary is None:
+        version, stdout, probe = {"error": "no-binary"}, b"", {"error": "no-binary"}
+    else:
+        version, stdout = bounded_command([binary, "--version"])
+        probe = bounded_command(["grep", "-aFq", "daemon/FallbackSession", binary])[0]
+    major = gdm_version_major(stdout, version.get("returncode"))
+    result |= {"version": version, "version_major": major, "fallback_literal": probe,
+               "policy": "empty" if major is not None and major >= 51 and probe.get("returncode") == 0
+               else "legacy",
+               "packages": {name: bounded_command(["pacman", "-Q", name])[0] for name in GDM_POLICY_PACKAGES},
+               "owner": (bounded_command(["pacman", "-Qo", result["realpath"]])[0] if binary
+                         else {"error": "no-binary"}),
+               "templates": {kind: template_observation(kind) for kind in ACCOUNTS_TEMPLATE_KINDS}}
+    return result
+
+
+def fresh_state(name):
+    """Read physical record state before any AccountsService property reads.
+
+    FindUserByName loads effective settings without CacheUser or a setter.
+    The diagnostic block retains templates, nonactivating public properties
+    and a final physical presence observation; neither query creates proof
+    of the native first-session record requirement.
+    """
+    try:
+        entry = pwd.getpwnam(name)
+    except KeyError:
+        return {"user": name, "exists": False}
+    record = ACCOUNTS_RECORD_DIR / name
+    before = record_presence(record)
+    try:
+        text = record.read_text(errors="replace")[:4096]
+    except FileNotFoundError:
+        text = None
+    templates = {kind: template_observation(kind) for kind in ACCOUNTS_TEMPLATE_KINDS}
+    effective = accounts_properties(entry.pw_uid)
+    account = json.loads(call("busctl", "--system", "--json=short", "call",
+                              "org.freedesktop.Accounts", "/org/freedesktop/Accounts",
+                              "org.freedesktop.Accounts", "FindUserByName", "s", name))["data"][0]
+    session = json.loads(call("busctl", "--system", "--json=short", "get-property",
+                              "org.freedesktop.Accounts", account,
+                              "org.freedesktop.Accounts.User", "Session"))["data"]
+    after = record_presence(record)
+    return {"user": name, "exists": True, "uid": entry.pw_uid,
+            "groups": call("id", "-nG", name).split(),
+            "home": entry.pw_dir, "home_exists": os.path.isdir(entry.pw_dir),
+            "record": text,
+            "effective_session": session,
+            "custom_conf": GDM_CUSTOM_CONF.read_text(errors="replace")[:8192],
+            "accounts": {"record_path": str(record), "record_before": before, "templates": templates,
+                         "effective": effective, "record_after": after}}
+
+
+def fresh_session(name):
+    """The account's gdm-password sessions on a VT and the desktop processes
+    it runs, by fixed process name only."""
+    uid = pwd.getpwnam(name).pw_uid
+    sessions = []
+    for line in call("loginctl", "list-sessions", "--no-legend", "--no-pager").splitlines():
+        fields = line.split()
+        if len(fields) < 2 or fields[1] != str(uid):
+            continue
+        description = call("loginctl", "show-session", fields[0], "--property=Id", "--property=VTNr",
+                           "--property=User", "--property=Type", "--property=Service",
+                           "--property=Class", "--property=State", check=False)
+        properties = dict(item.split("=", 1) for item in description.splitlines() if "=" in item)
+        if properties.get("Class", "").startswith("manager"):
+            continue
+        sessions.append(properties)
+    return {"user": name, "uid": uid, "sessions": sessions,
+            "desktop": [proc for proc in FRESH_DESKTOP
+                        if call("pgrep", "-u", str(uid), "-x", proc, check=False)]}
+
+
+def fresh_sudo(name):
+    """Real sudo authentication as the account with its public password.
+    Only the exit status and a fixed policy-denial flag leave the guest."""
+    run = subprocess.run(["runuser", "-u", name, "--", "sudo", "-S", "-k", "-p", "", "/usr/bin/true"],
+                         input="tuna\n", capture_output=True, text=True, timeout=30, check=False)
+    denied = any(marker in run.stderr for marker in ("is not in the sudoers file", "is not allowed to run sudo",
+                                                     "may not run sudo"))
+    return {"user": name, "returncode": run.returncode, "policy_denied": denied,
+            "sudo_present": pathlib.Path("/usr/bin/sudo").exists()}
+
+
+def fresh_logout(name):
+    """Log the account out through logind, as the shell's Log Out falls back to."""
+    ended = []
+    for session in fresh_session(name)["sessions"]:
+        if session.get("Service") == LOGIN_SERVICE:
+            call("loginctl", "terminate-session", session["Id"])
+            ended.append(session["Id"])
+    return {"user": name, "terminated": ended}
+
+
+def greeter_prompt_entries(app, Atspi, query):
+    """Inspect only the showing greeter scene, not its hidden actor trees."""
+    pending, visited, entries = [(app, 0)], 0, []
+    while pending:
+        node, depth = pending.pop()
+        visited += 1
+        if visited > 512 or depth > 32:
+            raise RuntimeError("greeter accessibility tree exceeds bound")
+        query(node.clear_cache)
+        states = query(node.get_state_set)
+        # The application is metadata, not a showing component. All other
+        # nodes must belong to the showing scene: AT-SPI SHOWING includes
+        # ancestor visibility, so a hidden branch cannot contain the prompt.
+        if depth and not states.contains(Atspi.StateType.SHOWING):
+            continue
+        role = query(node.get_role)
+        if (role in (Atspi.Role.TEXT, Atspi.Role.ENTRY, Atspi.Role.PASSWORD_TEXT)
+                and all(states.contains(flag) for flag in
+                        (Atspi.StateType.FOCUSED, Atspi.StateType.SHOWING,
+                         Atspi.StateType.VISIBLE, Atspi.StateType.EDITABLE,
+                         Atspi.StateType.SENSITIVE, Atspi.StateType.ENABLED))):
+            entries.append("password" if role == Atspi.Role.PASSWORD_TEXT else "username")
+        count = query(node.get_child_count)
+        if not 0 <= count <= 512:
+            raise RuntimeError("greeter accessibility children exceed bound")
+        pending.extend((child, depth + 1) for index in range(count)
+                       if (child := query(node.get_child_at_index, index)) is not None)
+    return entries
+
+
+def greeter_prompt_user(pid, ticks):
+    """Read only role/state from the original greeter's focused entry.
+
+    Never query entry names, values, text, or perform accessibility actions.
+    Passwords still travel only through the real QMP keyboard and GDM PAM.
+    """
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi, Gio, GLib
+
+    uid = os.geteuid()
+    def principal():
+        process = pathlib.Path(f"/proc/{pid}")
+        return (process.stat().st_uid,
+                int((process / "stat").read_text().rsplit(")", 1)[1].split()[19]),
+                (process / "comm").read_text().strip())
+    expected = (uid, ticks, "gnome-shell")
+    if uid == 0 or principal() != expected:
+        raise RuntimeError("original non-root greeter principal required")
+    deadline = time.monotonic() + 3
+    Atspi.set_timeout(250, 250)
+    def query(method, *args):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("greeter prompt observation deadline exceeded")
+        return method(*args)
+    desktop = query(Atspi.get_desktop, 0)
+    count = query(desktop.get_child_count)
+    if not 0 <= count <= 64:
+        raise RuntimeError("greeter accessibility desktop exceeds bound")
+    apps = [query(desktop.get_child_at_index, index) for index in range(count)]
+    apps = [app for app in apps if app is not None and query(app.get_process_id) == pid]
+    if len(apps) != 1:
+        raise RuntimeError("original greeter accessibility application not ready")
+    app = apps[0]
+    owner = app.app.bus_name
+    if not isinstance(owner, str) or not owner.startswith(":"):
+        raise RuntimeError("greeter accessibility owner must be unique")
+    session = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    address = session.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress",
+                               None, GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 500, None).unpack()[0]
+    bus = Gio.DBusConnection.new_for_address_sync(address,
+        Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+    def credentials():
+        return [query(bus.call_sync, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                      "org.freedesktop.DBus", method, GLib.Variant("(s)", (owner,)),
+                      None, Gio.DBusCallFlags.NONE, 500, None).unpack()[0]
+                for method in ("GetConnectionUnixProcessID", "GetConnectionUnixUser")]
+    if credentials() != [pid, uid]:
+        raise RuntimeError("greeter accessibility bus credentials disagree")
+    entries = greeter_prompt_entries(app, Atspi, query)
+    if credentials() != [pid, uid] or principal() != expected:
+        raise RuntimeError("original greeter changed during prompt observation")
+    return {"pid": pid, "uid": uid, "start_ticks": ticks, "atspi_owner": owner,
+            "prompt": entries[0] if len(entries) == 1 else None}
+
+
+def greeter_prompt():
+    greeter = json.loads(call(sys.executable, __file__, "greeter"))
+    pids = greeter["greeter_pids"]
+    active = [s for s in greeter["greeter_sessions"] if s.get("Active") == "yes"
+              and s.get("Service") == "gdm-launch-environment"]
+    if len(pids) != 1 or len(active) != 1:
+        raise RuntimeError("one active GDM greeter required")
+    pid = int(pids[0])
+    process = pathlib.Path(f"/proc/{pid}")
+    uid = process.stat().st_uid
+    if uid == 0 or str(uid) != active[0].get("User"):
+        raise RuntimeError("active greeter owner disagrees")
+    ticks = int((process / "stat").read_text().rsplit(")", 1)[1].split()[19])
+    raw = call("runuser", "-u", pwd.getpwuid(uid).pw_name, "--", "env",
+               f"XDG_RUNTIME_DIR=/run/user/{uid}",
+               f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+               sys.executable, __file__, "greeter-prompt-user", str(pid), str(ticks))
+    return json.loads(raw)
+
+
+FRESH_ACTIONS = {"fresh-state": fresh_state, "fresh-session": fresh_session,
+                 "fresh-sudo": fresh_sudo, "fresh-logout": fresh_logout}
+
+
 def main():
+    if sys.argv[1] == "greeter-prompt-user":
+        print(json.dumps(greeter_prompt_user(int(sys.argv[2]), int(sys.argv[3]))))
+        return
     if sys.argv[1] == "background-user-diagnostics":
         print(json.dumps(background_user_diagnostics()))
+        return
+    if sys.argv[1] == "tour-public-ui" and os.geteuid() == OWNER.pw_uid and OWNER.pw_uid != 0:
+        if len(sys.argv) != 2:
+            raise ValueError("tour public observation takes no arguments")
+        print(json.dumps(tour_public_ui()))
         return
     if os.geteuid() != 0 or OWNER.pw_uid == 0:
         raise RuntimeError("probe must be root and session owner must not be root")
@@ -2102,6 +2732,9 @@ def main():
     # guest agent only ever executes this lifecycle path.
     if action.startswith("app-"):
         os.execv("/usr/libexec/tuna-vm-app-integration", ["tuna-vm-app-integration", *sys.argv[1:]])
+    if action == "greeter-prompt":
+        print(json.dumps(greeter_prompt()))
+        return
     if action == "background-diagnostics":
         inventory()  # Verify the original actual login owner before re-exec.
         result = json.loads(call(sys.executable, __file__, "background-user-diagnostics", user=True))
@@ -2127,7 +2760,8 @@ def main():
         if len(sys.argv) != 4:
             raise ValueError("soak-read takes a file name and offset")
         result = soak_read(sys.argv[2], int(sys.argv[3]))
-    elif action in ("strip-start", "strip-edge-start", "strip-state", "strip-stop"):
+    elif action in ("strip-start", "strip-edge-start", "strip-state", "strip-notification-create",
+                    "strip-notification-control", "strip-notification-fixture", "strip-stop"):
         if len(sys.argv) != 3:
             raise ValueError("strip action requires exactly one nonce")
         try:
@@ -2652,6 +3286,7 @@ print(json.dumps(result))
         with open(evidence, encoding="utf-8") as stream:
             result = {"evidence": json.load(stream),
                       "assertions": checked.stdout.splitlines()}
+        result["evidence"]["desktop_package_version"] = desktop_package_version()
     elif action == "gsd-power-idle-start":
         # Watch gsd-power's own calls, then shorten GNOME's idle delay. The
         # harness's last input preceded this; nothing touches input until wake.
@@ -2697,10 +3332,12 @@ print(json.dumps(result))
         result = {"power-button-chassis": power_button_chassis, "power-button-action": power_button_action,
                   "power-button-block": power_button_block}[action](sys.argv[2])
     elif action == "logout":
-        # The product's Log Out: the compositor's org.gnome.SessionManager
+        # The published lane's Log Out: the compositor's org.gnome.SessionManager
         # Logout(1), no confirmation, which ends the compositor (the session
         # leader) as gnome-session ends a GNOME session. A guest predating
         # that manager logs out as its shell's Log Out did, through logind.
+        # The current build logs out through the shell's power menu, by
+        # physical keys (the lane's V-LOGOUT, #589).
         owned = call("gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
                      "--object-path", "/org/freedesktop/DBus",
                      "--method", "org.freedesktop.DBus.NameHasOwner", "org.gnome.SessionManager",
@@ -2713,6 +3350,12 @@ print(json.dumps(result))
         else:
             call("loginctl", "terminate-session", inventory()["session"]["Id"])
         result = {"requested": "session manager logout" if owned else "terminate session"}
+    elif action == "shell-controls":
+        result = shell_controls()
+    elif action == "tour-public-ui":
+        if len(sys.argv) != 2:
+            raise ValueError("tour public observation takes no arguments")
+        result = tour_public_ui()
     elif action == "login-session":
         # Before Tuna Desktop writes its state snapshot: which desktop the
         # login actually started, by fixed process name only.
@@ -2724,6 +3367,7 @@ print(json.dumps(result))
         # GDM's greeter is gnome-shell in a logind greeter-class session of
         # its own (dynamic) non-root user.
         result = {"manager": DISPLAY_MANAGER.resolve().stem,
+                  "boot_id": pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                   "manager_active": call("systemctl", "is-active", "gdm.service",
                                          check=False) == "active",
                   "probe_uid": os.geteuid(),
@@ -2747,6 +3391,23 @@ print(json.dumps(result))
                    "fallback_session": gdm_fallback_session(),
                    "greeter_pids": greeter_pids,
                    "greeter_uids": [pathlib.Path(f"/proc/{pid}").stat().st_uid for pid in greeter_pids]}
+    elif action == "gdm-policy":
+        # Build-time GDM template policy diagnostic (Containerfile); read-only.
+        if len(sys.argv) != 2:
+            raise ValueError("gdm-policy takes no arguments")
+        result = gdm_policy()
+    elif action in ("fresh-trace-start", "fresh-trace-stop"):
+        if len(sys.argv) != 2:
+            raise ValueError("fresh trace takes no arguments")
+        result = json.loads(call(sys.executable, "/usr/libexec/tuna-vm-gdm-trace",
+                                 action.removeprefix("fresh-trace-")))
+    elif action in FRESH_ACTIONS:
+        # tunaOS#4092: record-free accounts made by tuna-vm-fresh-accounts.
+        # Only the fixed public fixture names are accepted.
+        if len(sys.argv) != 3 or sys.argv[2] not in FRESH_USERS:
+            raise ValueError("fresh-account action takes one fixture account name")
+        result = FRESH_ACTIONS[action](sys.argv[2])
+
     elif action == "payload":
         payload = pathlib.Path("/usr/share/tuna-vm/shipped-payload.sha256")
         call("sha256sum", "--check", str(payload))
