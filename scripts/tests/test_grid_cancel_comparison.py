@@ -2,10 +2,12 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).parents[2]
 spec = importlib.util.spec_from_file_location("comparison", ROOT / "scripts/lib/grid_cancel_comparison.py")
@@ -31,10 +33,53 @@ class Identity(unittest.TestCase):
     def validate(self, run=None, jobs=None, commit=None):
         return contract.validate_identity(self.run if run is None else run,
             self.jobs if jobs is None else jobs, self.commit if commit is None else commit,
-            self.sha, 100, 1, "workflow_dispatch")
+            self.sha, 100, 1, "workflow_dispatch", self.sha, self.sha)
 
     def test_running_own_job_is_admitted_without_fabricated_terminal_success(self):
         self.assertEqual(self.validate()["job_id"], 200)
+
+    def test_pr_merge_source_is_distinct_from_api_event_head(self):
+        event_head = "c" * 40
+        run = dict(self.run, event="pull_request", head_sha=event_head)
+        jobs = [dict(job, head_sha=event_head) for job in self.jobs]
+        for status in ("in_progress", "queued"):
+            result = contract.validate_identity(dict(run, status=status), jobs, self.commit,
+                self.sha, 100, 1, "pull_request", event_head, self.sha)
+            self.assertEqual(result["head"], self.sha)
+            self.assertEqual(result["event_head"], event_head)
+            self.assertEqual(result["tree"], self.commit["tree"]["sha"])
+            self.assertEqual((result["job_id"], result["check_job_id"]), (200, 201))
+
+    def test_pr_merge_rejects_checked_checkout_commit_and_api_head_mismatches(self):
+        event_head = "c" * 40
+        run = dict(self.run, event="pull_request", head_sha=event_head)
+        jobs = [dict(job, head_sha=event_head) for job in self.jobs]
+        cases = [
+            (run, jobs, self.commit, self.sha, event_head),
+            (run, jobs, self.commit, event_head, self.sha),
+            (run, jobs, dict(self.commit, sha=event_head), self.sha, self.sha),
+            (dict(run, head_sha=self.sha), jobs, self.commit, self.sha, self.sha),
+        ]
+        for index in range(2):
+            wrong_jobs = copy.deepcopy(jobs)
+            wrong_jobs[index]["head_sha"] = self.sha
+            cases.append((run, wrong_jobs, self.commit, self.sha, self.sha))
+        for bad_run, bad_jobs, commit, checkout, checked in cases:
+            with self.subTest(run=bad_run, jobs=bad_jobs, checkout=checkout, checked=checked), self.assertRaises(ValueError):
+                contract.validate_identity(bad_run, bad_jobs, commit, checkout, 100, 1,
+                    "pull_request", event_head, checked)
+        with self.assertRaises(ValueError):
+            contract.validate_identity(run, jobs, self.commit, self.sha, 100, 1,
+                "pull_request", self.sha, self.sha)
+
+    def test_event_and_checked_shas_are_explicit_full_hex_values(self):
+        for bad in (None, "", "a" * 39, "a" * 41, "g" * 40, 100):
+            for event_head, checked in ((bad, self.sha), (self.sha, bad)):
+                with self.subTest(event_head=event_head, checked=checked), self.assertRaises(ValueError):
+                    contract.validate_identity(self.run, self.jobs, self.commit, self.sha, 100, 1,
+                        "workflow_dispatch", event_head, checked)
+        with self.assertRaises(TypeError):
+            contract.validate_identity(self.run, self.jobs, self.commit, self.sha, 100, 1, "workflow_dispatch")
 
     def test_queued_run_requires_exact_running_job_and_green_check(self):
         run = dict(self.run, status="queued")
@@ -66,12 +111,12 @@ class Identity(unittest.TestCase):
 
     def test_schedule_event_admitted(self):
         run = dict(self.run, event="schedule")
-        self.assertEqual(contract.validate_identity(run, self.jobs, self.commit, self.sha, 100, 1, "schedule")["job_id"], 200)
+        self.assertEqual(contract.validate_identity(run, self.jobs, self.commit, self.sha, 100, 1, "schedule", self.sha, self.sha)["job_id"], 200)
 
     def test_unsupported_event_rejected(self):
         run = dict(self.run, event="fork")
         with self.assertRaises(ValueError):
-            contract.validate_identity(run, self.jobs, self.commit, self.sha, 100, 1, "fork")
+            contract.validate_identity(run, self.jobs, self.commit, self.sha, 100, 1, "fork", self.sha, self.sha)
 
     def test_jobs_fail_closed(self):
         for index, key, value in ((0, "name", "foreign"), (0, "status", "queued"),
@@ -99,6 +144,68 @@ class Identity(unittest.TestCase):
         self.assertEqual(receipt["observed"]["head_sha"], self.sha)
         self.assertEqual(receipt["observed"]["commit_sha"], self.sha)
         self.assertNotIn("private_payload", receipt["observed"])
+
+    def test_current_identity_admits_exact_checked_merge_and_api_event_head(self):
+        event_head = "c" * 40
+        source = dict(sha=self.sha, tree=self.commit["tree"]["sha"], lock_sha256="lock")
+        run = dict(self.run, event="pull_request", head_sha=event_head)
+        jobs = [dict(job, head_sha=event_head) for job in self.jobs]
+        environment = dict(GITHUB_REPOSITORY=contract.REPO, GITHUB_JOB=contract.JOB,
+            GITHUB_RUN_ID="100", GITHUB_RUN_ATTEMPT="1", GITHUB_EVENT_NAME="pull_request",
+            GITHUB_SHA=self.sha, TUNA_CI_EVENT_HEAD_SHA=event_head, TUNA_CI_CHECKED_SHA=self.sha)
+        responses = {
+            "actions/runs/100/attempts/1/jobs?per_page=100": dict(total_count=2, jobs=jobs),
+            "actions/runs/100": run,
+            f"git/commits/{self.sha}": self.commit,
+        }
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(contract, "source_tuple", return_value=source), \
+                patch.object(contract, "api", side_effect=responses.__getitem__):
+            result = contract.current_identity(ROOT)
+        self.assertEqual((result["head"], result["event_head"]), (self.sha, event_head))
+
+    def test_current_identity_requires_both_env_shas_and_matching_checkout_tree(self):
+        source = dict(sha=self.sha, tree=self.commit["tree"]["sha"], lock_sha256="lock")
+        environment = dict(GITHUB_REPOSITORY=contract.REPO, GITHUB_JOB=contract.JOB,
+            GITHUB_RUN_ID="100", GITHUB_RUN_ATTEMPT="1", GITHUB_EVENT_NAME="workflow_dispatch",
+            GITHUB_SHA=self.sha, TUNA_CI_EVENT_HEAD_SHA=self.sha, TUNA_CI_CHECKED_SHA=self.sha)
+        responses = {
+            "actions/runs/100/attempts/1/jobs?per_page=100": dict(total_count=2, jobs=self.jobs),
+            "actions/runs/100": self.run,
+            f"git/commits/{self.sha}": self.commit,
+        }
+        for name in ("TUNA_CI_EVENT_HEAD_SHA", "TUNA_CI_CHECKED_SHA", "GITHUB_SHA"):
+            missing = dict(environment)
+            del missing[name]
+            with self.subTest(missing=name), patch.dict(os.environ, missing, clear=True), \
+                    patch.object(contract, "source_tuple", return_value=source), \
+                    patch.object(contract, "api") as api, self.assertRaises(KeyError):
+                contract.current_identity(ROOT)
+            api.assert_not_called()
+        for name in ("GITHUB_SHA", "TUNA_CI_CHECKED_SHA"):
+            mismatched = dict(environment, **{name: "c" * 40})
+            with self.subTest(mismatched=name), patch.dict(os.environ, mismatched, clear=True), \
+                    patch.object(contract, "source_tuple", return_value=source), \
+                    patch.object(contract, "api") as api, self.assertRaises(ValueError):
+                contract.current_identity(ROOT)
+            api.assert_not_called()
+        for checkout in (dict(source, sha="c" * 40), dict(source, tree="c" * 40)):
+            current_responses = dict(responses)
+            current_responses[f"git/commits/{checkout['sha']}"] = self.commit
+            with self.subTest(checkout=checkout), patch.dict(os.environ, environment, clear=True), \
+                    patch.object(contract, "source_tuple", return_value=checkout), \
+                    patch.object(contract, "api", side_effect=current_responses.__getitem__), self.assertRaises(ValueError):
+                contract.current_identity(ROOT)
+
+    def test_current_identity_refuses_incomplete_bounded_job_page(self):
+        environment = dict(GITHUB_REPOSITORY=contract.REPO, GITHUB_JOB=contract.JOB,
+            GITHUB_RUN_ID="100", GITHUB_RUN_ATTEMPT="1", GITHUB_EVENT_NAME="workflow_dispatch",
+            GITHUB_SHA=self.sha, TUNA_CI_EVENT_HEAD_SHA=self.sha, TUNA_CI_CHECKED_SHA=self.sha)
+        for page in (dict(total_count=101, jobs=self.jobs), dict(jobs=self.jobs)):
+            with self.subTest(page=page), patch.dict(os.environ, environment, clear=True), \
+                    patch.object(contract, "source_tuple", return_value=dict(sha=self.sha)), \
+                    patch.object(contract, "api", return_value=page), self.assertRaises(ValueError):
+                contract.current_identity(ROOT)
 
 
 class BuildRoles(unittest.TestCase):
