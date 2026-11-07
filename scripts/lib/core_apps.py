@@ -605,7 +605,8 @@ class Desktop(NativeDesktop):
                 raise RuntimeError('normal frontend restart changed installed code identity')
         return replacement
 
-    def ime(self, actor, field_name, expected='你好', *, field_path=None, select_first=True):
+    def ime(self, actor, field_name, expected='你好', *, field_path=None, select_first=True,
+            click_to_focus=True):
         if expected != '你好':
             raise ValueError('known genuine libpinyin consumer control required')
         # A caller holding an open popover selects beforehand instead: the
@@ -627,7 +628,12 @@ class Desktop(NativeDesktop):
         engine = self.guest('desktop', 'ime-engine', select=True)
         monitor_started = False
         try:
-            self.click_path(actor, field['path'])
+            # A caller that keyboard-focused the field beforehand skips
+            # the pointer click: on popover-held entries a missed click
+            # dismisses the popover (round-1004 ev27-28). The focus gate
+            # below still proves the field holds focus either way.
+            if click_to_focus:
+                self.click_path(actor, field['path'])
             # Keys typed before focus lands never reach the engine: no
             # preedit rows, and the engine idles while the await burns the
             # budget (run 41865506509 attempts 1-2). Settle the

@@ -266,9 +266,21 @@ def _loupe(desktop):
             break
         desktop.keys('tab')
     desktop.keys('spc')
+    # Ground truth for the popover geometry, whatever happens next: the
+    # entry's reported bounds are trusted only once its pixels prove it.
+    desktop.observe('loupe-open-zoom-submenu', actor)
     zoom_entry = unique(desktop.tree(actor),
         lambda node: node['showing'] and node['editable'] and node['name'] == 'Custom Zoom Level',
         'original Image Viewer custom zoom entry')
+    for _ in range(12):
+        submenu = desktop.tree(actor)
+        if any(node.get('focused') and node.get('name') == 'Custom Zoom Level'
+               and node.get('editable') for node in nodes(submenu)):
+            break
+        desktop.keys('tab')
+    else:
+        desktop.keys('esc')
+        require(False, 'actual Image Viewer custom zoom entry never took keyboard focus')
     original_zoom = zoom_entry['text']
     # Loupe renders the percent with a narrow no-break space the physical
     # ASCII typer cannot emit (round-1004 ev26: '71.88\u202f%'); the
@@ -279,9 +291,16 @@ def _loupe(desktop):
             'original numeric zoom cannot be restored by its ordinary native input')
     try:
         evidence['ime'] = desktop.ime(actor, zoom_entry['name'], field_path=zoom_entry['path'],
-                                      select_first=False)
+                                      select_first=False, click_to_focus=False)
     finally:
-        desktop.click_path(actor, zoom_entry['path'])
+        # The entry holds focus from the keyboard walk and ime's own
+        # focus gates; a pointer click is best-effort refocus only when
+        # focus was actually lost, since a missed click dismisses the
+        # submenu it must type into (round-1004 ev27-28).
+        current = desktop.tree(actor)
+        if not any(node.get('path') == zoom_entry['path'] and node.get('focused')
+                   for node in nodes(current)):
+            desktop.click_path(actor, zoom_entry['path'])
         desktop.keys('ctrl', 'a')
         desktop.keys('backspace')
         desktop.type_ascii(restorable)
