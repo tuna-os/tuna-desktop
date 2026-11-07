@@ -479,7 +479,7 @@ cd_call() {
 end=$(($(date +%s) + 30))
 until cd_call --object-path /org/freedesktop/ColorManager \
     --method org.freedesktop.ColorManager.GetDevices >/dev/null 2>&1; do
-    if ! kill -0 "$COLORD_PID" 2>/dev/null; then
+    if colord_wrapper_exited; then
         colord_reap
         colord_failure_receipt
         fail D-COLORD "colord wrapper exited with status $COLORD_WAIT_STATUS; see colord-startup.txt, colord-launch.log and colord.log"

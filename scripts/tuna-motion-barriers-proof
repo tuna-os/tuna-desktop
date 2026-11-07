@@ -1,0 +1,181 @@
+#!/usr/bin/python3
+"""Prove raw input barriers before accessibility filtering on real nested input.
+
+Run `just build -p tuna-compositor -p tuna-shell-gtk` first, then
+`just proof motion-barriers-proof`. --bin-dir can select an old build for
+an unchanged negative control: it must fail the same strict wire assertion.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+POINTER = re.compile(r"wl_pointer[@#]\d+\.(motion|enter|frame)\(([^\n]*)")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--artifacts", type=Path, default=Path("motion-barriers-artifacts"))
+    parser.add_argument("--bin-dir", type=Path, default=ROOT / "target/debug")
+    args = parser.parse_args()
+    if not os.environ.get("TUNA_MOTION_PRIVATE_BUS"):
+        os.execvpe("dbus-run-session", ["dbus-run-session", "--", sys.executable,
+                     str(Path(__file__).resolve()), *sys.argv[1:]],
+                  os.environ | {"TUNA_MOTION_PRIVATE_BUS": "1"})
+    args.artifacts.mkdir(parents=True, exist_ok=True)
+    processes, logs = [], []
+    compositor = None
+    signal.signal(signal.SIGTERM, lambda signum, _frame: sys.exit(128 + signum))
+    with tempfile.TemporaryDirectory(prefix="tuna-motion-barriers-") as private:
+        private = Path(private)
+        env = dict(os.environ)
+        for key, name in [("HOME", "home"), ("XDG_CONFIG_HOME", "config"),
+                          ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data"),
+                          ("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "runtime")]:
+            path = private / name
+            path.mkdir(mode=0o700)
+            env[key] = str(path)
+        env.update(GSETTINGS_BACKEND="keyfile", GSK_RENDERER="cairo",
+                   WINIT_UNIX_BACKEND="x11", TUNA_COMPOSITOR_STATE=str(
+                       args.artifacts.resolve() / "compositor-state.json"))
+        env.pop("WAYLAND_DISPLAY", None)
+        state_path = Path(env["TUNA_COMPOSITOR_STATE"])
+
+        def launch(command, name, child_env=env):
+            log = (args.artifacts / f"{name}.log").open("w")
+            logs.append(log)
+            process = subprocess.Popen(command, env=child_env, stdout=log, stderr=log,
+                                       start_new_session=True)
+            processes.append(process)
+            return process
+
+        def wait_for(predicate, description, seconds=20):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                if compositor is not None and compositor.poll() is not None:
+                    raise AssertionError("compositor exited during " + description)
+                value = predicate()
+                if value:
+                    return value
+                time.sleep(0.02)
+            raise AssertionError("timed out waiting for " + description)
+
+        def state():
+            try:
+                return json.loads(state_path.read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                return {}
+
+        def xdo(*commands):
+            return subprocess.check_output(["xdotool", *commands], env=env,
+                                           timeout=10, text=True).strip()
+
+        def wire():
+            events = []
+            for kind, arguments in POINTER.findall((args.artifacts / "client.log").read_text()):
+                if kind == "frame":
+                    events.append((kind,))
+                else:
+                    fields = arguments.rstrip(")").split(", ")
+                    events.append((kind, float(fields[-2]), float(fields[-1])))
+            return events
+
+        try:
+            # -displayfd picks a free display without sharing other proofs' X servers.
+            display_path = private / "display"
+            with display_path.open("w") as display:
+                # The descriptor is explicitly inherited only by Xvfb.
+                log = (args.artifacts / "xvfb.log").open("w")
+                logs.append(log)
+                xvfb = subprocess.Popen(["Xvfb", "-displayfd", str(display.fileno()), "-screen",
+                                         "0", "1280x800x24", "-nolisten", "tcp"],
+                                        pass_fds=(display.fileno(),), stdout=log, stderr=log,
+                                        start_new_session=True)
+                processes.append(xvfb)
+            wait_for(lambda: display_path.read_text().strip(), "private X display")
+            env["DISPLAY"] = ":" + display_path.read_text().strip()
+            compositor = launch([str(args.bin_dir / "tuna-compositor"), "--backend", "winit",
+                                 "--socket", "tuna-motion-barriers", "--shell-bin",
+                                 str(args.bin_dir / "tuna-shell-gtk")], "compositor")
+            wait_for(lambda: any(layer["namespace"] == "tuna-panel"
+                                 for layer in state().get("layers", [])), "shell panel", 60)
+            wid = xdo("search", "--name", "Smithay").splitlines()[0]
+            xdo("windowfocus", "--sync", wid, "key", "Escape")
+            wait_for(lambda: state().get("overview_open") is False, "closed overview")
+            client_env = env | {"WAYLAND_DISPLAY": "tuna-motion-barriers", "GDK_BACKEND": "wayland",
+                                "WAYLAND_DEBUG": "client"}
+            client_env.pop("DISPLAY", None)
+            recorder = args.artifacts.resolve() / "input.json"
+            launch([sys.executable, str(ROOT / "scripts/lib/tuna-a11y-input-window.py"),
+                    str(recorder)], "client", client_env)
+            wait_for(lambda: state().get("focused_app_id") == "org.tuna.A11yInputProof",
+                     "recording client focus")
+            for setting, value in [("mousekeys-init-delay", "0"), ("mousekeys-enable", "true")]:
+                subprocess.run(["gsettings", "set", "org.gnome.desktop.a11y.keyboard", setting, value],
+                               env=env, timeout=10, check=True)
+            wait_for(lambda: state().get("input_aids", {}).get("mouse"), "Mouse Keys enabled")
+            x, y, width, height = state()["focused_rect"]
+            x, y = x + width // 2, y + height // 2
+            xdo("mousemove", "--window", wid, str(x), str(y))
+            wait_for(lambda: state().get("pointer_position") == [x, y], "initial pointer position")
+            start = wait_for(lambda: [event for event in wire() if event[0] != "frame"],
+                             "initial client pointer event")[-1][1:]
+
+            def batch(commands, final):
+                before = len(wire())
+                os.kill(compositor.pid, signal.SIGSTOP)
+                try:
+                    # Wait until stopped, not merely until SIGSTOP was sent:
+                    # every queued event must reach the same backend dispatch.
+                    wait_for(lambda: Path(f"/proc/{compositor.pid}/status").read_text().split(
+                        "State:", 1)[1].lstrip().startswith("T"), "stopped compositor")
+                    xdo(*commands)
+                finally:
+                    os.kill(compositor.pid, signal.SIGCONT)
+                wait_for(lambda: state().get("pointer_position") == final, "batch final position")
+                wait_for(lambda: len(wire()) > before and wire()[-1][0] == "frame", "wire frame")
+                return wire()[before:]
+
+            events = batch(["mousemove", "--window", wid, str(x + 2), str(y),
+                            "keydown", "KP_Right", "keyup", "KP_Right",
+                            "mousemove", "--window", wid, str(x + 15), str(y)], [x + 15, y])
+            expected = [("motion", start[0] + dx, start[1]) for dx in (2, 3, 15)]
+            expected = [item for motion in expected for item in (motion, ("frame",))]
+            result = {"backend_barriers": events, "expected": expected,
+                      "pointer": state()["pointer_position"]}
+            (args.artifacts / "barriers.json").write_text(json.dumps(result, indent=2))
+            assert events == expected, result
+            recorded = json.loads(recorder.read_text())
+            assert recorded["presses"] == [] and recorded["releases"] == [], recorded
+            print("motion-barriers: consumed KP_Right release delivered its pending +1 motion first", flush=True)
+
+            commands = []
+            for dx in range(16, 41):
+                commands += ["mousemove", "--window", wid, str(x + dx), str(y)]
+            events = batch(commands, [x + 40, y])
+            assert events == [("motion", start[0] + 40, start[1]), ("frame",)], events
+            print("motion-barriers: 25 consecutive backend motions still yield one motion + frame", flush=True)
+        finally:
+            if compositor is not None and compositor.poll() is None:
+                os.kill(compositor.pid, signal.SIGCONT)
+            for process in reversed(processes):
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=5)
+            for log in logs:
+                log.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -94,7 +94,17 @@ colord_start() {
     printf 'wrapper_pid=%s\n' "$COLORD_PID" >>"$COLORD_RECEIPT"
 }
 
-# Call only after kill -0 reports death. Reap the actual shell child once;
+# Unprivileged kill -0 of the root-owned sudo wrapper can fail with EPERM
+# while it is alive. /proc/<pid>/stat is world-readable: the wrapper has
+# exited once its entry is gone or it is a zombie awaiting our wait.
+colord_wrapper_exited() {
+    [ -n "$COLORD_PID" ] || return 1
+    IFS= read -r colord_wrapper_stat 2>/dev/null <"/proc/$COLORD_PID/stat" || return 0
+    colord_wrapper_state=${colord_wrapper_stat##*) }
+    [ "${colord_wrapper_state%% *}" = Z ]
+}
+
+# Call only after colord_wrapper_exited. Reap the actual shell child once;
 # status 127 from a second wait must never overwrite the original receipt.
 colord_reap() {
     if [ "$COLORD_REAPED" -eq 0 ]; then
@@ -141,7 +151,7 @@ colord_stop() {
     colord_stop_end=$(($(date +%s) + 3))
     while colord_identity_alive "$colord_owned_child" ||
         colord_identity_alive "$colord_owned_supervisor" ||
-        { [ -n "$COLORD_PID" ] && kill -0 "$COLORD_PID" 2>/dev/null; }; do
+        { [ -n "$COLORD_PID" ] && ! colord_wrapper_exited; }; do
         if [ "$(date +%s)" -ge "$colord_stop_end" ]; then
             colord_signal_owned "$colord_owned_child" KILL
             colord_signal_owned "$colord_owned_supervisor" KILL
@@ -154,6 +164,6 @@ colord_stop() {
     done
     if [ -n "$COLORD_PID" ]; then
         # Bound even an uninterruptible wrapper: only wait once it is dead.
-        if ! kill -0 "$COLORD_PID" 2>/dev/null; then colord_reap; fi
+        if colord_wrapper_exited; then colord_reap; fi
     fi
 }

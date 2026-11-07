@@ -1,0 +1,297 @@
+schema: 1
+name: tuna-desktop
+# The upstream release tag minus its v, with a prerelease's `-` written `~`
+# (tag v1.2.3-beta.4 -> 1.2.3~beta.4). RPM and Debian take this form as-is and
+# sort it before the final release; Tideforge renders pacman's pkgver without
+# the `~` (1.2.3beta.4), the value upstream's packaging/arch/PKGBUILD derives.
+version: "1.0.0~beta.2"
+release: 2
+summary: "Tuna Desktop: GNOME-style Wayland desktop session in Rust (v1 beta)"
+description: >-
+  Tuna Desktop (formerly Roost) is a Smithay-based Wayland desktop that aims
+  at GNOME 51 parity: a supervised compositor with a GNOME-style GTK shell,
+  optional scrollable tiling and an IBus bridge; login is through GDM. This
+  package ships the six session binaries, the wayland-sessions entry, the
+  lock-screen PAM service, the session target, the Lockdown portal backend
+  and a private cursor fallback, plus the retained session and PAM bridge for
+  the former `roost` name, mirroring upstream's own
+  packaging/arch/PKGBUILD. Built for TunaOS Marlin (tuna-os/tuna-desktop#69,
+  renamed in tuna-os/tuna-desktop#536).
+license: GPL-3.0-or-later
+# The package's former name (tuna-os/tuna-desktop#505). Upstream's PKGBUILD
+# also declares replaces=('roost') and conflicts=('roost'); the recipe schema
+# models only `provides`, so those two are not rendered yet (see the PR that
+# added this recipe for the proposed schema change).
+provides: [roost]
+# Upstream release tag. Bump `version`, source, the vendor asset below,
+# TUNA_VERSION and the verify smoke's want= together, and reset `release`,
+# with scripts/prepare-tuna-desktop-release.py
+# (docs/packaging/tuna-desktop-release.md).
+source:
+  url: https://github.com/tuna-os/tuna-desktop/archive/refs/tags/v1.0.0-beta.2.tar.gz
+  sha256: "1e8abf38f4959a171007c3c61865057b76deaeb92aa7cbb79bcade830ec999b3"
+  directory: tuna-desktop-1.0.0-beta.2
+# Vendored crates.io closure (`cargo vendor --locked --versioned-dirs` from the
+# exact tag above, deterministic tar, verified with `cargo metadata
+# --locked --offline`), shipped as an immutable release asset like xfwl4 so
+# the build never fetches crates. Cargo.lock has no git dependencies
+# (third-party/ crates are in-tree path dependencies), so the config needs
+# only the crates-io replacement.
+sources:
+  - url: https://github.com/tuna-os/tunaos-packages/releases/download/tuna-desktop-vendor-v1.0.0-beta.2/tuna-desktop-vendor.tar.gz
+    sha256: "a428059d900ab8019314c302370d071c2bdd372343e584300129f078fa3eb8ad"
+    filename: tuna-desktop-vendor.tar.gz
+    destination: .
+    strip_components: 0
+  # trixie only: a PRIVATE gtk4-layer-shell 1.3.0 (#836). Trixie ships 1.0.4
+  # and tuna-desktop needs >= 1.1 (gtk4-session-lock-sys v1_1). Replacing
+  # Debian's libgtk4-layer-shell0 from the factory repo would swap a system
+  # library under every consumer on flounder, so the coordinator ruled it
+  # out: the library is built here, installed under
+  # /usr/lib/<multiarch>/tuna-desktop/ and found through a RUNPATH on the
+  # binaries that link it. Same pinned tag and bytes as
+  # packages/gtk4-layer-shell (el10).
+  - url: https://github.com/wmww/gtk4-layer-shell/archive/refs/tags/v1.3.0.tar.gz
+    sha256: "1ebb01ab14e98afd1727f68f64981c37bd23305b1f131f5667c02b94cf593192"
+    filename: gtk4-layer-shell-1.3.0.tar.gz
+    destination: private/gtk4-layer-shell
+    targets: [trixie]
+# custom, not cargo: the cargo renderer builds and installs one binary, and
+# the session is six binaries from four workspace crates (tuna-session ships
+# in tuna-compositor, tuna-ibus-bridge in tuna-shell-host).
+build_system: custom
+build:
+  environment:
+    # Every binary reports this (minus the leading v) from --version: the
+    # upstream tag, exactly as upstream's PKGBUILD stamps v${_semver}. It is
+    # `version` above with `~` written as the tag's `-`.
+    # Read at compile time; the old ROOST_VERSION is no longer consulted.
+    TUNA_VERSION: v1.0.0-beta.2
+  # The toolchain floor (see dependencies.build). The rpm/deb lists spell it
+  # in their own relations; the gentoo ebuild takes it as RUST_MIN_VER.
+  rust_version: "1.92"
+  cargo_config: |
+    [source.crates-io]
+    replace-with = "vendored-sources"
+
+    [source.vendored-sources]
+    directory = "vendor"
+
+    [net]
+    offline = true
+  # Run before `commands`, in the same shell. Builds the private
+  # gtk4-layer-shell (see `sources`) into a stage, then points pkg-config at
+  # the staged .pc so the -sys crates link it instead of looking for
+  # Debian's. Only the library is built: no introspection, Vala, docs or
+  # examples, which nothing here consumes.
+  targets:
+    trixie:
+      commands:
+        - private="/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/tuna-desktop"
+        - stage="$PWD/.gtk4-layer-shell-stage"
+        - >-
+          meson setup .gtk4-layer-shell-build private/gtk4-layer-shell
+          --prefix=/usr --libdir="${private#/usr/}" --buildtype=release
+          -Dtests=false -Dsmoke-tests=false -Dexamples=false -Ddocs=false
+          -Dintrospection=false -Dvapi=false
+        - meson compile -C .gtk4-layer-shell-build
+        - DESTDIR="$stage" meson install -C .gtk4-layer-shell-build
+        - sed -i "s|^prefix=.*|prefix=$stage/usr|" "$stage$private/pkgconfig/gtk4-layer-shell-0.pc"
+        - export PKG_CONFIG_PATH="$stage$private/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+  commands:
+    # makepkg builds with LTO on; the pipewire crate compiles C through cc
+    # (libspa-sys), whose thin-LTO bitcode loses its symbols at the Rust link.
+    # Fat LTO objects keep real code beside the bitcode -- the same flag the
+    # cargo renderer applies for niri. Upstream's PKGBUILD sets !lto instead,
+    # which the recipe schema cannot express.
+    - export CFLAGS="${CFLAGS:-} -ffat-lto-objects"
+    # The ELN builder is a bootc image: /root links to a missing
+    # /var/roothome, so cargo cannot create ~/.cargo. Keep its home in the
+    # build tree on every target.
+    - export CARGO_HOME="$PWD/.cargo-home"
+    - cargo build --release --locked --offline -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-host -p tuna-shell-gtk
+dependencies:
+  build:
+    capabilities: [rust, c-compiler, pkg-config]
+    targets:
+      # Arch ships headers in the library packages; every one consumed at
+      # build time is listed here, not only in depends (#118). clang is for
+      # bindgen (pipewire/libspa, xkbcommon-adjacent sys crates).
+      arch: [clang, dbus, glib2, gdk-pixbuf2, gtk4, gtk4-layer-shell, libadwaita, libdrm, libinput, libsecret, libxkbcommon, libxkbcommon-x11, mesa, pipewire, seatd, systemd-libs, wayland]
+      # The same Arch list as pkg-config names, which resolve identically on
+      # Fedora 44, Rawhide, ELN and EL10 (mesa -> gbm + egl, seatd -> libseat,
+      # systemd-libs -> libsystemd + libudev, wayland -> client + server).
+      # clang-devel supplies libclang for bindgen. The floors: GTK 4.12,
+      # gtk4-layer-shell 1.1 (gtk4-session-lock-sys v1_1) and Rust 1.92, the
+      # rollout's build floor (no crate declares an MSRV, so cargo cannot
+      # enforce it). On el10, gtk4-layer-shell-devel
+      # and libseat-devel are factory products (packages/gtk4-layer-shell,
+      # packages/libseat) resolved from the target's published_index.
+      fedora: [clang-devel, rust >= 1.92, "pkgconfig(dbus-1)", "pkgconfig(glib-2.0)", "pkgconfig(gdk-pixbuf-2.0)", "pkgconfig(gtk4) >= 4.12", "pkgconfig(gtk4-layer-shell-0) >= 1.1", "pkgconfig(libadwaita-1)", "pkgconfig(libdrm)", "pkgconfig(libinput)", "pkgconfig(libsecret-1)", "pkgconfig(xkbcommon)", "pkgconfig(xkbcommon-x11)", "pkgconfig(gbm)", "pkgconfig(egl)", "pkgconfig(libpipewire-0.3)", "pkgconfig(libseat)", "pkgconfig(libsystemd)", "pkgconfig(libudev)", "pkgconfig(wayland-client)", "pkgconfig(wayland-server)"]
+      rawhide: [clang-devel, rust >= 1.92, "pkgconfig(dbus-1)", "pkgconfig(glib-2.0)", "pkgconfig(gdk-pixbuf-2.0)", "pkgconfig(gtk4) >= 4.12", "pkgconfig(gtk4-layer-shell-0) >= 1.1", "pkgconfig(libadwaita-1)", "pkgconfig(libdrm)", "pkgconfig(libinput)", "pkgconfig(libsecret-1)", "pkgconfig(xkbcommon)", "pkgconfig(xkbcommon-x11)", "pkgconfig(gbm)", "pkgconfig(egl)", "pkgconfig(libpipewire-0.3)", "pkgconfig(libseat)", "pkgconfig(libsystemd)", "pkgconfig(libudev)", "pkgconfig(wayland-client)", "pkgconfig(wayland-server)"]
+      eln: [clang-devel, rust >= 1.92, "pkgconfig(dbus-1)", "pkgconfig(glib-2.0)", "pkgconfig(gdk-pixbuf-2.0)", "pkgconfig(gtk4) >= 4.12", "pkgconfig(gtk4-layer-shell-0) >= 1.1", "pkgconfig(libadwaita-1)", "pkgconfig(libdrm)", "pkgconfig(libinput)", "pkgconfig(libsecret-1)", "pkgconfig(xkbcommon)", "pkgconfig(xkbcommon-x11)", "pkgconfig(gbm)", "pkgconfig(egl)", "pkgconfig(libpipewire-0.3)", "pkgconfig(libseat)", "pkgconfig(libsystemd)", "pkgconfig(libudev)", "pkgconfig(wayland-client)", "pkgconfig(wayland-server)"]
+      el10: [clang-devel, rust >= 1.92, "pkgconfig(dbus-1)", "pkgconfig(glib-2.0)", "pkgconfig(gdk-pixbuf-2.0)", "pkgconfig(gtk4) >= 4.12", "pkgconfig(gtk4-layer-shell-0) >= 1.1", "pkgconfig(libadwaita-1)", "pkgconfig(libdrm)", "pkgconfig(libinput)", "pkgconfig(libsecret-1)", "pkgconfig(xkbcommon)", "pkgconfig(xkbcommon-x11)", "pkgconfig(gbm)", "pkgconfig(egl)", "pkgconfig(libpipewire-0.3)", "pkgconfig(libseat)", "pkgconfig(libsystemd)", "pkgconfig(libudev)", "pkgconfig(wayland-client)", "pkgconfig(wayland-server)"]
+      # The same list in Debian/Ubuntu -dev names (identical on resolute and
+      # sid; libwayland-dev carries client and server, libegl-dev and
+      # libgbm-dev the Mesa half). libclang-dev is bindgen's libclang. The
+      # same floors as Fedora; the rust capability renders bare rustc and
+      # cargo, these entries add the 1.92 floor (resolute ships 1.93, sid 1.97).
+      ubuntu: [clang, libclang-dev, "rustc (>= 1.92)", "cargo (>= 1.92)", libdbus-1-dev, libglib2.0-dev, libgdk-pixbuf-2.0-dev, "libgtk-4-dev (>= 4.12)", "libgtk4-layer-shell-dev (>= 1.1)", libadwaita-1-dev, libdrm-dev, libinput-dev, libsecret-1-dev, libxkbcommon-dev, libxkbcommon-x11-dev, libgbm-dev, libegl-dev, libpipewire-0.3-dev, libseat-dev, libsystemd-dev, libudev-dev, libwayland-dev]
+      debian: [clang, libclang-dev, "rustc (>= 1.92)", "cargo (>= 1.92)", libdbus-1-dev, libglib2.0-dev, libgdk-pixbuf-2.0-dev, "libgtk-4-dev (>= 4.12)", "libgtk4-layer-shell-dev (>= 1.1)", libadwaita-1-dev, libdrm-dev, libinput-dev, libsecret-1-dev, libxkbcommon-dev, libxkbcommon-x11-dev, libgbm-dev, libegl-dev, libpipewire-0.3-dev, libseat-dev, libsystemd-dev, libudev-dev, libwayland-dev]
+      # Tumbleweed resolves the same pkgconfig() names as Fedora (zypper
+      # installs by capability). clang-devel is bindgen's libclang; `rust` is
+      # the toolchain metapackage (1.99 when this was added), so the 1.92
+      # floor reads as on Fedora. gtk4-layer-shell 1.3 and libseat are in
+      # Tumbleweed's own repositories, not the factory overlay.
+      opensuse-tumbleweed: [clang-devel, rust >= 1.92, cargo >= 1.92, "pkgconfig(dbus-1)", "pkgconfig(glib-2.0)", "pkgconfig(gdk-pixbuf-2.0)", "pkgconfig(gtk4) >= 4.12", "pkgconfig(gtk4-layer-shell-0) >= 1.1", "pkgconfig(libadwaita-1)", "pkgconfig(libdrm)", "pkgconfig(libinput)", "pkgconfig(libsecret-1)", "pkgconfig(xkbcommon)", "pkgconfig(xkbcommon-x11)", "pkgconfig(gbm)", "pkgconfig(egl)", "pkgconfig(libpipewire-0.3)", "pkgconfig(libseat)", "pkgconfig(libsystemd)", "pkgconfig(libudev)", "pkgconfig(wayland-client)", "pkgconfig(wayland-server)"]
+      # Debian 13: the sid list without libgtk4-layer-shell-dev (trixie's is
+      # 1.0.4; the private 1.3.0 is built from `sources`), plus that build's
+      # meson, ninja and wayland-protocols, and patchelf for its RUNPATH. The
+      # rust capability names rustc-web/cargo-web 1.96 (trixie main), as
+      # trixie's own rustc is 1.85.
+      trixie: [clang, libclang-dev, "rustc-web (>= 1.92)", "cargo-web (>= 1.92)", meson, ninja-build, wayland-protocols, patchelf, libdbus-1-dev, libglib2.0-dev, libgdk-pixbuf-2.0-dev, "libgtk-4-dev (>= 4.12)", libadwaita-1-dev, libdrm-dev, libinput-dev, libsecret-1-dev, libxkbcommon-dev, libxkbcommon-x11-dev, libgbm-dev, libegl-dev, libpipewire-0.3-dev, libseat-dev, libsystemd-dev, libudev-dev, libwayland-dev]
+      # Gentoo atoms for the same list. The rust capability is cargo.eclass's
+      # RUST_DEPEND at build.rust_version; clang is bindgen's libclang. gtk
+      # needs its wayland backend (gtk4-layer-shell does too), and
+      # xkbcommon-x11 is libxkbcommon[X]. libudev comes from systemd here.
+      gentoo: [llvm-core/clang, sys-apps/dbus, "dev-libs/glib:2", "x11-libs/gdk-pixbuf:2", ">=gui-libs/gtk-4.12:4[wayland]", ">=gui-libs/gtk4-layer-shell-1.1", "gui-libs/libadwaita:1", x11-libs/libdrm, dev-libs/libinput, app-crypt/libsecret, "x11-libs/libxkbcommon[X]", media-libs/mesa, media-video/pipewire, sys-auth/seatd, virtual/libudev, dev-libs/wayland]
+  runtime:
+    targets:
+      # Upstream packaging/arch/PKGBUILD depends=(): the libraries, the GNOME 51
+      # settings-daemon plugins and session targets tuna-session.target pulls
+      # in (tuna-os/tuna-desktop#820), the SVG wallpaper helper's
+      # gdk-pixbuf/librsvg/glycin/fontconfig/adwaita-fonts stack (#458) and the
+      # event-sound stack. Optional integrations (xorg-xwayland, ibus,
+      # xdg-desktop-portal-gnome, orca, ...) are optdepends upstream; the
+      # recipe schema has no optdepends, so the Marlin image installs them
+      # itself.
+      arch: [dbus, glib2, gnome-settings-daemon, gnome-session, gdk-pixbuf2, librsvg, glycin, fontconfig, adwaita-fonts, gtk4, gtk4-layer-shell, libadwaita, libcanberra, libdrm, libinput, libsecret, libxkbcommon, libxkbcommon-x11, mesa, pipewire, seatd, sound-theme-freedesktop, systemd-libs, wayland]
+      # The same depends in Fedora/EL package names. RPM derives the ELF
+      # library requirements itself; listing them keeps the version floors
+      # and the packages it cannot see: libpam is dlopen()ed by the lock
+      # screen (crates/compositor/src/pam.rs), libsecret is reached over
+      # D-Bus, the dbus and pipewire daemons are services, not links, and the
+      # settings-daemon plugins, session targets, SVG loader and sound theme
+      # are started or loaded at run time, as in the Arch list.
+      fedora: [dbus, glib2, gnome-settings-daemon, gnome-session, gdk-pixbuf2, librsvg2, fontconfig, gtk4 >= 4.12, gtk4-layer-shell >= 1.1, libadwaita, libcanberra, libdrm, libinput, libsecret, libxkbcommon, libxkbcommon-x11, mesa-libEGL, mesa-libgbm, pipewire, libseat, sound-theme-freedesktop, systemd-libs, libwayland-client, libwayland-server, pam]
+      rawhide: [dbus, glib2, gnome-settings-daemon, gnome-session, gdk-pixbuf2, librsvg2, fontconfig, gtk4 >= 4.12, gtk4-layer-shell >= 1.1, libadwaita, libcanberra, libdrm, libinput, libsecret, libxkbcommon, libxkbcommon-x11, mesa-libEGL, mesa-libgbm, pipewire, libseat, sound-theme-freedesktop, systemd-libs, libwayland-client, libwayland-server, pam]
+      eln: [dbus, glib2, gnome-settings-daemon, gnome-session, gdk-pixbuf2, librsvg2, fontconfig, gtk4 >= 4.12, gtk4-layer-shell >= 1.1, libadwaita, libcanberra, libdrm, libinput, libsecret, libxkbcommon, libxkbcommon-x11, mesa-libEGL, mesa-libgbm, pipewire, libseat, sound-theme-freedesktop, systemd-libs, libwayland-client, libwayland-server, pam]
+      el10: [dbus, glib2, gnome-settings-daemon, gnome-session, gdk-pixbuf2, librsvg2, fontconfig, gtk4 >= 4.12, gtk4-layer-shell >= 1.1, libadwaita, libcanberra, libdrm, libinput, libsecret, libxkbcommon, libxkbcommon-x11, mesa-libEGL, mesa-libgbm, pipewire, libseat, sound-theme-freedesktop, systemd-libs, libwayland-client, libwayland-server, pam]
+      # Upstream's own .deb Depends (scripts/tuna-release at the tag), beside
+      # the ${shlibs:Depends} ELF closure debhelper computes: the GTK 4.12 and
+      # gtk4-layer-shell 1.1 floors, the dlopen()ed libpam, the event-sound
+      # stack, the SVG pixbuf loader (librsvg2-common), gsettings and
+      # settings-daemon schemas and secret-tool. dbus-bin is gone:
+      # tuna-os/tuna-desktop#691 dropped the session's
+      # dbus-update-activation-environment call.
+      ubuntu: [gnome-session-canberra, libcanberra-pulse, sound-theme-freedesktop, librsvg2-common, "libgtk4-layer-shell0 (>= 1.1)", "libgtk-4-1 (>= 4.12)", "libadwaita-1-0 (>= 1.0)", libpam0g, gsettings-desktop-schemas, gnome-settings-daemon-common, libsecret-tools, libxkbcommon0, libxkbcommon-x11-0, libegl1, libgl1, libgbm1, libseat1, libinput10, libudev1, libdrm2, libpipewire-0.3-0t64, libglib2.0-0t64]
+      debian: [gnome-session-canberra, libcanberra-pulse, sound-theme-freedesktop, librsvg2-common, "libgtk4-layer-shell0 (>= 1.1)", "libgtk-4-1 (>= 4.12)", "libadwaita-1-0 (>= 1.0)", libpam0g, gsettings-desktop-schemas, gnome-settings-daemon-common, libsecret-tools, libxkbcommon0, libxkbcommon-x11-0, libegl1, libgl1, libgbm1, libseat1, libinput10, libudev1, libdrm2, libpipewire-0.3-0t64, libglib2.0-0t64]
+      # The Fedora list in openSUSE's shared-library package names (glib2 ->
+      # libglib-2_0-0, mesa-libEGL -> Mesa-libEGL1, systemd-libs ->
+      # libsystemd0 + libudev1, librsvg2 -> gdk-pixbuf-loader-rsvg), for the
+      # same reasons: the floors, the dlopen()ed pam, and the services.
+      opensuse-tumbleweed: [dbus-1, libglib-2_0-0, gnome-settings-daemon, gnome-session-core, gdk-pixbuf-loader-rsvg, fontconfig, libgtk-4-1 >= 4.12, libgtk4-layer-shell0 >= 1.1, libadwaita-1-0, libcanberra0, libdrm2, libinput10, libsecret-1-0, libxkbcommon0, libxkbcommon-x11-0, Mesa-libEGL1, libgbm1, pipewire, libseat1, sound-theme-freedesktop, libsystemd0, libudev1, libwayland-client0, libwayland-server0, pam]
+      # The sid list without libgtk4-layer-shell0: the private copy ships in
+      # this package, and its own ELF needs (libgtk-4-1, libwayland-client0)
+      # come through ${shlibs:Depends}.
+      trixie: [gnome-session-canberra, libcanberra-pulse, sound-theme-freedesktop, librsvg2-common, "libgtk-4-1 (>= 4.12)", "libadwaita-1-0 (>= 1.0)", libpam0g, gsettings-desktop-schemas, gnome-settings-daemon-common, libsecret-tools, libxkbcommon0, libxkbcommon-x11-0, libegl1, libgl1, libgbm1, libseat1, libinput10, libudev1, libdrm2, libpipewire-0.3-0t64, libglib2.0-0t64]
+      # The Fedora list in Gentoo atoms, with the same floors and the
+      # dlopen()ed pam.
+      gentoo: [sys-apps/dbus, "dev-libs/glib:2", gnome-base/gnome-settings-daemon, gnome-base/gnome-session, "x11-libs/gdk-pixbuf:2", "gnome-base/librsvg:2", media-libs/fontconfig, ">=gui-libs/gtk-4.12:4[wayland]", ">=gui-libs/gtk4-layer-shell-1.1", "gui-libs/libadwaita:1", media-libs/libcanberra, x11-libs/libdrm, dev-libs/libinput, app-crypt/libsecret, "x11-libs/libxkbcommon[X]", media-libs/mesa, media-video/pipewire, sys-auth/seatd, x11-themes/sound-theme-freedesktop, virtual/libudev, dev-libs/wayland, sys-libs/pam]
+install:
+  commands:
+    - install -Dm0755 target/release/tuna-compositor {destdir}/usr/bin/tuna-compositor
+    - install -Dm0755 target/release/tuna-session {destdir}/usr/bin/tuna-session
+    - install -Dm0755 target/release/tuna-shell-host {destdir}/usr/bin/tuna-shell-host
+    - install -Dm0755 target/release/tuna-shell-gtk {destdir}/usr/bin/tuna-shell-gtk
+    - install -Dm0755 target/release/tuna-ibus-bridge {destdir}/usr/bin/tuna-ibus-bridge
+    - install -Dm0755 target/release/tuna-wallpaper-svg {destdir}/usr/bin/tuna-wallpaper-svg
+    # Private GNOME 51 scalable cursor fallback (upstream
+    # share/tuna-desktop/icons), installed as upstream's PKGBUILD does.
+    - install -d {destdir}/usr/share/tuna-desktop/icons
+    - cp -a share/tuna-desktop/icons/. {destdir}/usr/share/tuna-desktop/icons/
+  # Run after `commands`. Ships the private gtk4-layer-shell runtime (the
+  # .so.0 link and the library, no headers, .pc or preload shim) and its MIT
+  # license, then sets the RUNPATH on exactly the binaries that link it and
+  # fails if none does. Paths carry the build's multiarch triplet, so they
+  # are not in `files.common`.
+  targets:
+    trixie:
+      commands:
+        - private="/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/tuna-desktop"
+        - install -d "{destdir}$private"
+        - cp -P ".gtk4-layer-shell-stage$private/libgtk4-layer-shell.so.0" ".gtk4-layer-shell-stage$private/libgtk4-layer-shell.so.1.3.0" "{destdir}$private/"
+        - install -Dm0644 private/gtk4-layer-shell/LICENSE {destdir}/usr/share/licenses/tuna-desktop/gtk4-layer-shell/LICENSE
+        - >-
+          linked=0;
+          for binary in {destdir}/usr/bin/tuna-*; do
+          if readelf -d "$binary" | grep -q 'NEEDED.*\[libgtk4-layer-shell\.so\.0\]'; then
+          patchelf --set-rpath "$private" "$binary"; linked=$((linked + 1)); echo "RUNPATH $private: $binary";
+          fi; done;
+          test "$linked" -gt 0
+  files:
+    - {source: share/wayland-sessions/tuna.desktop, destination: usr/share/wayland-sessions/tuna.desktop}
+    - {source: share/systemd/user/tuna-session.target, destination: usr/lib/systemd/user/tuna-session.target}
+    # The shell's Lockdown portal backend and the session's portal
+    # preferences (tuna-os/tuna-desktop#604, #821).
+    - {source: share/xdg-desktop-portal/portals/tuna.portal, destination: usr/share/xdg-desktop-portal/portals/tuna.portal}
+    - {source: packaging/marlin/tuna-portals.conf, destination: usr/share/xdg-desktop-portal/tuna-portals.conf}
+    # Lock-screen PAM service (tuna-desktop#62): the compositor's unlock.
+    - {source: share/pam.d/tuna-lock, destination: etc/pam.d/tuna-lock}
+    # Retained legacy bridge (tuna-os/tuna-desktop#780): the hidden
+    # roost.desktop keeps a session GDM remembers as "roost" starting Tuna
+    # Desktop, and roost-lock serves a session started before the upgrade.
+    # The roost-* binary links went with #775, as upstream.
+    - {source: share/compat/wayland-sessions/roost.desktop, destination: usr/share/wayland-sessions/roost.desktop}
+    - {source: share/compat/pam.d/roost-lock, destination: etc/pam.d/roost-lock}
+    - {source: LICENSE, destination: usr/share/licenses/tuna-desktop/LICENSE}
+    - {source: docs/nested-session.md, destination: usr/share/doc/tuna-desktop/nested-session.md}
+files:
+  common:
+    - usr/bin/tuna-compositor
+    - usr/bin/tuna-session
+    - usr/bin/tuna-shell-host
+    - usr/bin/tuna-shell-gtk
+    - usr/bin/tuna-ibus-bridge
+    - usr/bin/tuna-wallpaper-svg
+    - usr/share/tuna-desktop/icons
+    - usr/share/wayland-sessions/tuna.desktop
+    - usr/share/wayland-sessions/roost.desktop
+    - usr/lib/systemd/user/tuna-session.target
+    - usr/share/xdg-desktop-portal/portals/tuna.portal
+    - usr/share/xdg-desktop-portal/tuna-portals.conf
+    - etc/pam.d/tuna-lock
+    - etc/pam.d/roost-lock
+    - usr/share/licenses/tuna-desktop/LICENSE
+    - usr/share/doc/tuna-desktop/nested-session.md
+verify:
+  # The real session contract, not just "a binary exists": every one of the
+  # six binaries runs and reports the upstream tag minus its v (want=, kept
+  # equal to TUNA_VERSION); no roost-* binary remains; the visible session
+  # entry launches the session supervisor (not the compositor directly) as
+  # desktop Tuna; the hidden compat entry launches the same supervisor; both
+  # lock-screen PAM services, the session target, the portal backend and the
+  # cursor fallback are installed. The version is the last word of
+  # --version, cut with shell expansion: the Tumbleweed image has no awk.
+  smoke: >-
+    want=1.0.0-beta.2;
+    for b in compositor session shell-host shell-gtk ibus-bridge wallpaper-svg;
+    do v="$(tuna-$b --version)"; v="${v##* }";
+    if [ "$v" != "$want" ]; then echo "tuna-$b --version reports '$v', expected $want" >&2; exit 1; fi;
+    if [ -e "/usr/bin/roost-$b" ] || [ -L "/usr/bin/roost-$b" ]; then echo "/usr/bin/roost-$b still installed" >&2; exit 1; fi;
+    done
+    && grep -qx 'Exec=tuna-session' /usr/share/wayland-sessions/tuna.desktop
+    && grep -qx 'DesktopNames=Tuna;GNOME;' /usr/share/wayland-sessions/tuna.desktop
+    && grep -qx 'Exec=tuna-session' /usr/share/wayland-sessions/roost.desktop
+    && grep -qx 'NoDisplay=true' /usr/share/wayland-sessions/roost.desktop
+    && test -f /etc/pam.d/tuna-lock
+    && test -f /etc/pam.d/roost-lock
+    && test -f /usr/lib/systemd/user/tuna-session.target
+    && grep -qx 'Interfaces=org.freedesktop.impl.portal.Lockdown;' /usr/share/xdg-desktop-portal/portals/tuna.portal
+    && grep -qx 'org.freedesktop.impl.portal.Lockdown=tuna;' /usr/share/xdg-desktop-portal/tuna-portals.conf
+    && test -f /usr/share/tuna-desktop/icons/Adwaita/index.theme
+# The ebuild's category in the tunaos overlay: gui-wm/tuna-desktop.
+outputs:
+  gpkg:
+    category: gui-wm
+targets: [arch, fedora, rawhide, eln, el10, ubuntu, debian, trixie, opensuse-tumbleweed, gentoo]

@@ -62,7 +62,7 @@ colord_stop
             else:
                 command += '''
 i=0
-while kill -0 "$COLORD_PID" 2>/dev/null; do
+until colord_wrapper_exited; do
     i=$((i+1)); [ "$i" -lt 100 ]; sleep 0.02
 done
 colord_reap
@@ -140,6 +140,31 @@ printf 'observed=%s\\n' "$COLORD_WAIT_STATUS"
                 finally:
                     unrelated.terminate()
                     unrelated.wait(timeout=5)
+
+    def test_wrapper_exit_is_observed_without_signal_permission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = '''
+set -eu
+. "$1"
+# A live root-owned sudo wrapper answers unprivileged kill -0 with EPERM.
+kill() { return 1; }
+COLORD_PID=1
+if colord_wrapper_exited; then echo "live wrapper reported exited"; exit 1; fi
+/bin/sh -c 'exit 3' &
+COLORD_PID=$!
+i=0
+until colord_wrapper_exited; do
+    i=$((i+1)); [ "$i" -lt 100 ]; /bin/sleep 0.02
+done
+COLORD_RECEIPT="$2"
+COLORD_REAPED=0
+colord_reap
+[ "$COLORD_WAIT_STATUS" = 3 ]
+'''
+            result = subprocess.run(["sh", "-c", script, "sh", str(HELPER), str(Path(tmp) / "receipt")],
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("wrapper_status=3", (Path(tmp) / "receipt").read_text())
 
 
 if __name__ == "__main__":

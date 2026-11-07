@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "/home/ubuntu/.cache/tuna-journey-venv/bin/python",
+    "/tmp/tuna-variant-batched-20261101/harness/tuna-corral-journey",
+    "--image",
+    "ghcr.io/tuna-os/marlin@sha256:5ccc023cc73296d5e4d17cfbe38526935a405abcfb0095aad43b3a28bff182e6",
+    "--vm",
+    "tuna-q-variant-marlin-01002237",
+    "--node",
+    "karnataka",
+    "--out",
+    "/tmp/tuna-variant-batched-20261101/marlin",
+    "--qualification-only"
+  ],
+  "exit": 1,
+  "stdout": "",
+  "stderr": "Traceback (most recent call last):\n  File \"/tmp/tuna-variant-batched-20261101/harness/tuna-corral-journey\", line 826, in <module>\n    sys.exit(main())\n             ~~~~^^\n  File \"/tmp/tuna-variant-batched-20261101/harness/tuna-corral-journey\", line 773, in main\n    console_proc, endpoint = start_console(args.vm)\n                             ~~~~~~~~~~~~~^^^^^^^^^\n  File \"/tmp/tuna-variant-batched-20261101/harness/tuna-corral-journey\", line 203, in start_console\n    raise RuntimeError(f'corral console exited {proc.returncode} before it printed a URL; '\n                       f'stderr: {errors.read()}')\nRuntimeError: corral console exited 1 before it printed a URL; stderr: instance name \"tuna-q-variant-marlin-01002237\" is ambiguous; use one of the fully-scoped IDs shown by corral list\n\n"
+}
