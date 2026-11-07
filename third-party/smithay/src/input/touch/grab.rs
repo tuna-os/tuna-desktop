@@ -108,6 +108,15 @@ pub trait TouchGrab<D: SeatHandler>: Send + Downcast {
     /// The data about the event that started the grab.
     fn start_data(&self) -> &GrabStartData<D>;
 
+    /// The start data of the touch sequence whose down carried `serial`,
+    /// for a grab tracking several sequences (the grab's own serial is
+    /// matched by [`TouchHandle::sequence_start_data`] already).
+    ///
+    /// [`TouchHandle::sequence_start_data`]: super::TouchHandle::sequence_start_data
+    fn sequence_start_data(&self, _serial: Serial) -> Option<GrabStartData<D>> {
+        None
+    }
+
     /// The grab has been unset or replaced with another grab.
     fn unset(&mut self, data: &mut D);
 }
