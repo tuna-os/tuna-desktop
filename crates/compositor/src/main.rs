@@ -7,6 +7,7 @@
 
 use std::process::ExitCode;
 
+use tuna_compositor::eprintln;
 use tuna_compositor::runtime::{run, BackendChoice, NestedSession};
 
 /// `tuna-compositor [--socket NAME] [--width W] [--height H] [--shell-bin PATH] [--xwayland]`.

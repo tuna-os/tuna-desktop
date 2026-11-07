@@ -1,0 +1,1 @@
+(0, '(true,)\nrequester_exit=0\nactual portal picker: Share\nlocked denied with response 2\n{\n  "mode": "locked",\n  "response": 2,\n  "results": {}\n}(true,)', '')
