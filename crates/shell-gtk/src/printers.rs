@@ -3663,6 +3663,28 @@ mod tests {
         )
     }
 
+    /// A loopback port that provably refuses connections right now. A bare
+    /// bind-then-drop is not enough: a parallel test can recycle the freed
+    /// ephemeral port before we connect, turning refusal into a confusing
+    /// mid-exchange failure.
+    fn closed_loopback_port() -> u16 {
+        for _ in 0..32 {
+            let stray = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stray");
+            let port = stray.local_addr().expect("port").port();
+            drop(stray);
+            match std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                std::time::Duration::from_millis(200),
+            ) {
+                Ok(live) => {
+                    drop(live);
+                }
+                Err(_) => return port,
+            }
+        }
+        panic!("no closed 127.0.0.1 port after 32 tries");
+    }
+
     /// Serve `responses` (complete HTTP replies) in connection order,
     /// recording each raw request. Returns the endpoint, the recorded
     /// requests and the server thread.
@@ -3824,14 +3846,21 @@ mod tests {
 
     #[test]
     fn client_reports_no_print_service() {
-        let stray = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stray");
-        let port = stray.local_addr().expect("port").port();
-        drop(stray);
-        let err = CupsClient::single(Endpoint::Tcp("127.0.0.1".to_string(), port))
-            .printers()
-            .expect_err("refused");
-        assert_eq!(err.kind, CupsErrorKind::NoPrintService);
-        assert_eq!(err.title(), "No Print Service");
+        // A refused connection must map to NoPrintService. If the probed
+        // port is recycled between the probe and the client dial, the
+        // exchange fails mid-stream as Transport instead: retry with a
+        // fresh closed port rather than asserting on the collision.
+        for _ in 0..8 {
+            let port = closed_loopback_port();
+            let err = CupsClient::single(Endpoint::Tcp("127.0.0.1".to_string(), port))
+                .printers()
+                .expect_err("refused");
+            if err.kind == CupsErrorKind::NoPrintService {
+                assert_eq!(err.title(), "No Print Service");
+                return;
+            }
+        }
+        panic!("no stable refused connection after 8 tries");
     }
 
     #[test]
@@ -4204,9 +4233,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("lpoptions");
         std::fs::write(&path, "Dest Office\nDefault Local\n").expect("write lpoptions");
-        let stray = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stray");
-        let port = stray.local_addr().expect("port").port();
-        drop(stray);
+        let port = closed_loopback_port();
         let client = CupsClient::single(Endpoint::Tcp("127.0.0.1".to_string(), port))
             .with_lpoptions_file(Some(path));
         let name = client.default_name_with_budget(

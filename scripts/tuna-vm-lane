@@ -74,6 +74,9 @@ _guest_spec = importlib.util.spec_from_loader("vm_guest_agent", _guest_loader)
 guest_agent = importlib.util.module_from_spec(_guest_spec)
 _guest_loader.exec_module(guest_agent)
 import soak_report  # noqa: E402  (scripts/lib, on sys.path above)
+import fresh_accounts  # noqa: E402  (scripts/lib, on sys.path above)
+from tour_media import (TOUR_PUBLIC_CONTROLS, desktop_shown, grey_share,
+                        overview_windows_shown, switcher_shown, tour_public_view)
 
 WIDTH, HEIGHT = baseline.WIDTH, baseline.HEIGHT
 DRM_RE = re.compile(r"tuna-compositor: drm: output (\S+) (\d+)x(\d+)")
@@ -370,6 +373,204 @@ def orca_logout_retirement(trace, pid):
     return found[0]
 
 
+# The power menu's session-ending rows on the installed image (#589). As
+# GNOME Shell 51's systemActions.js, Restart…, Power Off… and Log Out… ask
+# org.gnome.SessionManager for Reboot, Shutdown and Logout(0); the session
+# manager (the compositor here, gnome-session in GNOME) opens the shell's
+# EndSessionDialog with Open(type, 0, 60, inhibitors) (gsm-shell.c), whose
+# countdown shows 60 and then steps by ten (endSessionDialog.js). Physical
+# QMP keys drive the menu and the dialog; the shell's own AT-SPI tree, the
+# session and system buses and the compositor's layers only observe.
+END_SESSION_LAYER = "tuna-shell-end-session"
+END_SESSION_ROWS = ("Suspend", "Restart…", "Power Off…", "Log Out…")
+END_SESSION_CASES = {
+    "restart": {"row": "Restart…", "method": "Reboot", "args": [], "type": 2,
+                "countdown": "The system will restart automatically in {} seconds"},
+    "power-off": {"row": "Power Off…", "method": "Shutdown", "args": [], "type": 1,
+                  "countdown": "The system will power off automatically in {} seconds"},
+    "log-out": {"row": "Log Out…", "method": "Logout", "args": ["uint32 0"], "type": 0,
+                "countdown": "You will be logged out automatically in {} seconds"},
+}
+# gnome-session fails a cancelled request with G_IO_ERROR_CANCELLED, which
+# GDBus sends unmapped.
+END_SESSION_CANCELLED = "org.gtk.GDBus.UnmappedGError.Quark._g_2dio_2derror_2dquark.Code19"
+
+
+def shell_control(controls, label, role="push button"):
+    return next((node for node in controls if node["label"] == label and node["role"] == role), None)
+
+
+def await_shell_controls(agent, predicate, timeout, what):
+    """The shell's public controls once `predicate` holds, bounded."""
+    deadline = time.monotonic() + timeout
+    while True:
+        controls = agent.run("shell-controls")["public_controls"]
+        if predicate(controls):
+            return controls
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"the shell never showed {what}")
+        time.sleep(0.25)
+
+
+def press_shell_control(qmp, agent, label, limit=32):
+    """Physical Tab until the shell's own tree has `label` focused, then
+    physical Return: no guessed focus order."""
+    for _ in range(limit):
+        node = shell_control(agent.run("shell-controls")["public_controls"], label)
+        if node is not None and node["focused"]:
+            qmp.keys("ret")
+            return
+        qmp.keys("tab")
+    raise RuntimeError(f"bounded physical Tab did not focus {label}")
+
+
+def open_power_menu_row(qmp, agent, row):
+    """Super+S opens quick settings, Return on its Power Off Menu button
+    opens the power menu and Return on `row` chooses it."""
+    qmp.keys("meta_l", "s")
+    await_shell_controls(agent, lambda controls: shell_control(controls, "Power Off Menu") is not None,
+                         10, "quick settings")
+    press_shell_control(qmp, agent, "Power Off Menu")
+    await_shell_controls(agent, lambda controls: all(shell_control(controls, label) for label in END_SESSION_ROWS),
+                         10, "the power menu's rows")
+    press_shell_control(qmp, agent, row)
+
+
+def countdown_showing(controls, case, seconds):
+    return shell_control(controls, case["countdown"].format(seconds), "label") is not None
+
+
+def end_session_opened(observed, mark, case, compositor_pid):
+    """The shell's one request for `case` on org.gnome.SessionManager since
+    `mark`, which the compositor's manager answered with the shell's
+    Open(type, 0, 60, …) while the dialog layer is up; else None."""
+    shell, manager = observed["owners"]["shell"], observed["owners"]["session_manager"]
+    if shell is None or manager is None or manager[1] != compositor_pid or shell[1] == compositor_pid:
+        return None
+    requests = [request for request in observed["end_session"]
+                if request["index"] >= mark["session_count"] and request["member"] == case["method"]
+                and request["sender"] == shell[0] and request["args"] == case["args"]]
+    if len(requests) != 1:
+        return None
+    opened = [item for item in observed["dialog"]
+              if item["index"] > requests[0]["index"] and item["type"] == "method call"
+              and item["member"] == "Open" and item["sender"] == manager[0]
+              and item["destination"] in (shell[0], "org.gnome.Shell")
+              and item["args"] == [f"uint32 {case['type']}", "uint32 0", "uint32 60"]]
+    if not opened or END_SESSION_LAYER not in (observed["layers"] or []):
+        return None
+    return {"request": requests[0], "open": opened[0]}
+
+
+def end_session_reply(observed, opened):
+    """The manager's current reply to the opened request, else None."""
+    return next((request["reply"] for request in observed["end_session"]
+                 if request["index"] == opened["request"]["index"]), None)
+
+
+def logind_untouched(observed, mark):
+    """No logind power request or announcement since `mark`."""
+    return (not [request for request in observed["system"] if request["index"] >= mark["system_count"]]
+            and not [announced for announced in observed["prepare"] if announced["index"] >= mark["system_count"]]
+            and observed["preparing_for_shutdown"] is False)
+
+
+def end_session_menu_case(qmp, agent, name, identity, frame):
+    """Choose `name` from the shell's power menu by physical keys and judge
+    the end-session dialog it opens. Restart and Power Off are held past the
+    countdown's first step with the VM, session and logind untouched, then
+    cancelled by Return on the focused Cancel. Log Out is left to its
+    countdown; the caller awaits the greeter. Raises on any failure, after
+    Escape so no countdown is left running. Needs the power button fixture's
+    bus monitors."""
+    case = END_SESSION_CASES[name]
+    before = identity()
+    if len(before["compositor"]) != 1:
+        raise RuntimeError("one original compositor is required")
+    compositor_pid = before["compositor"][0][0]
+    mark = agent.run("power-button-observe")
+    if END_SESSION_LAYER in (mark["layers"] or []) or qmp.cmd("query-status")["status"] != "running":
+        raise RuntimeError(f"{case['row']} did not start from the plain running desktop")
+    result = {"case": name}
+    settled = False
+    try:
+        open_power_menu_row(qmp, agent, case["row"])
+        pressed = time.monotonic()
+        deadline = pressed + 15
+        while True:
+            observed = agent.run("power-button-observe")
+            opened = end_session_opened(observed, mark, case, compositor_pid)
+            if opened is not None:
+                break
+            if time.monotonic() >= deadline:
+                result["last"] = observed
+                raise RuntimeError(f"{case['row']} did not open the session manager's 60 s end-session dialog")
+            time.sleep(0.2)
+        result.update(opened=opened, opened_at=time.monotonic(), shown_after=round(time.monotonic() - pressed, 1))
+        # GNOME's countdown starts at 60 and Cancel holds the focus.
+        await_shell_controls(agent, lambda controls: countdown_showing(controls, case, 60)
+                             and (shell_control(controls, "Cancel") or {}).get("focused"),
+                             5, f"{case['row']}'s 60 s countdown with Cancel focused")
+        frame(f"end-session-{name}-dialog")
+        if name == "log-out":
+            # Logout(0) is answered once the dialog is up; its countdown, not
+            # the request, ends the session.
+            deadline = time.monotonic() + 5
+            while True:
+                reply = end_session_reply(agent.run("power-button-observe"), opened)
+                if reply is not None:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Logout(0) was not answered once the dialog opened")
+                time.sleep(0.2)
+            if reply["type"] != "method return":
+                raise RuntimeError(f"Logout(0) failed: {reply}")
+            if identity() != before:
+                raise RuntimeError("Log Out… ended the session before its countdown")
+            result["reply"] = reply
+            settled = True
+            return result
+        # Ten seconds on, the countdown steps to 50 and nothing has ended.
+        controls = await_shell_controls(agent, lambda controls: countdown_showing(controls, case, 50), 20,
+                                        f"{case['row']}'s countdown stepping to 50 seconds")
+        held = agent.run("power-button-observe")
+        result["held_after"] = round(time.monotonic() - pressed, 1)
+        if (qmp.cmd("query-status")["status"] != "running" or END_SESSION_LAYER not in (held["layers"] or [])
+                or not logind_untouched(held, mark) or end_session_reply(held, opened) is not None
+                or identity() != before):
+            raise RuntimeError(f"the {case['row']} dialog did not hold the running session")
+        if not (shell_control(controls, "Cancel") or {}).get("focused"):
+            raise RuntimeError(f"Cancel lost the focus in the {case['row']} dialog")
+        frame(f"end-session-{name}-held")
+        qmp.keys("ret")
+        settled = True
+    finally:
+        if not settled:
+            qmp.keys("esc")
+    deadline = time.monotonic() + 10
+    while True:
+        observed = agent.run("power-button-observe")
+        shell = observed["owners"]["shell"]
+        canceled = shell is not None and any(
+            item["type"] == "signal" and item["member"] == "Canceled" and item["sender"] == shell[0]
+            and item["index"] > opened["open"]["index"] for item in observed["dialog"])
+        reply = end_session_reply(observed, opened)
+        if (canceled and reply is not None and reply["type"] == "error"
+                and reply["error_name"] == END_SESSION_CANCELLED
+                and END_SESSION_LAYER not in (observed["layers"] or [])):
+            break
+        if time.monotonic() >= deadline:
+            result["last"] = observed
+            raise RuntimeError(f"Cancel did not cancel the {case['row']} request")
+        time.sleep(0.2)
+    frame(f"end-session-{name}-cancelled")
+    if (qmp.cmd("query-status")["status"] != "running" or not logind_untouched(observed, mark)
+            or identity() != before):
+        raise RuntimeError(f"cancelling the {case['row']} dialog disturbed the session")
+    result["reply"] = reply
+    return result
+
+
 def safe_navigation_diagnostic(value):
     """Finite failure summary only; full original FD/catalog receipts stay separate."""
     if type(value) is not dict or set(value) not in ({"known_query_matches","Disks_result","focused_role_classes"},
@@ -514,6 +715,22 @@ def guest_role(executable):
         if executable.startswith(prefix):
             return "tuna-" + executable[len(prefix):]
     return executable
+
+
+def record_datetime_gates(result, published, record):
+    """Record actual Date & Time verdicts; unsupported panel proofs still fail."""
+    failed = []
+    for line in result["assertions"]:
+        gate, verdict, detail = (line.split(" ", 2) + ["", ""])[:3]
+        if (published and verdict != "pass"
+                and gate in ("G-DATETIME-CLOCK-TZ", "G-DATETIME-CLOCK-SET")):
+            detail = ("published panel capability unqualified/unsupported; an image that predates "
+                      "clock-change monitoring is not a pass: " + detail)
+        record(gate, verdict == "pass", detail)
+        if verdict != "pass":
+            failed.append(gate)
+    if not result["assertions"] or failed:
+        raise RuntimeError(f"Date & Time gates failed: {', '.join(failed) or 'no assertions'}")
 
 
 def predates_newer_snapshot(state):
@@ -1106,18 +1323,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     datetime_result = agent.run("datetime", timeout=300)
     with open(os.path.join(evidence, "datetime-evidence.json"), "w") as stream:
         json.dump(datetime_result["evidence"], stream, indent=2)
-    datetime_failed = []
-    for line in datetime_result["assertions"]:
-        gate, verdict, detail = (line.split(" ", 2) + ["", ""])[:3]
-        if published and gate == "G-DATETIME-CLOCK-TZ" and verdict != "pass":
-            record(gate, True, "published guest predates the panel clock's /etc/localtime monitor; "
-                               "proven by the current-build marlin-vm lane")
-            continue
-        record(gate, verdict == "pass", detail)
-        if verdict != "pass":
-            datetime_failed.append(gate)
-    if not datetime_result["assertions"] or datetime_failed:
-        raise RuntimeError(f"Date & Time gates failed: {', '.join(datetime_failed) or 'no assertions'}")
+    record_datetime_gates(datetime_result, published, record)
 
     # GNOME 51 settings daemon plugins (#355): the installed session starts
     # them through GNOME's own user units, and gsd-power drives the
@@ -2691,6 +2897,45 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                f"dialog up after {power_button['cases']['interactive']['shown_after']} s, VM, compositor and session "
                f"unchanged at 5 s, Escape -> Canceled; nothing -> AcceleratorActivated only; image vm chassis -> "
                f"gsd PowerOffWithFlags(0) refused by a fixture block inhibitor; chassis and setting restored")
+    # Restart… and Power Off… from the shell's power menu by physical keys
+    # (#589): each opens the session manager's 60 s end-session dialog,
+    # which holds the running session until Cancel. Log Out… runs at logout
+    # below. The published build's shell predates the session manager.
+    menu_session = not published and not older_guest
+    menu_identities = []
+
+    def menu_identity():
+        value = inventory(f"end-session-identity-{len(menu_identities)}")
+        menu_identities.append(value["session"]["Id"])
+        return {"session": value["session"]["Id"],
+                "compositor": [(p["pid"], p["start_ticks"]) for p in value["processes"]
+                               if guest_role(p["executable"]) == "tuna-compositor"]}
+
+    if not menu_session:
+        for gate in ("V-RESTART-DIALOG", "V-POWER-OFF-DIALOG"):
+            record(gate, True, "guest predates the shell's session manager power menu; "
+                               "proven by the current-build marlin-vm lane")
+    else:
+        menu = {}
+        agent.run("power-button-start")
+        try:
+            for name, gate in (("restart", "V-RESTART-DIALOG"), ("power-off", "V-POWER-OFF-DIALOG")):
+                case = END_SESSION_CASES[name]
+                try:
+                    menu[name] = end_session_menu_case(qmp, agent, name, menu_identity, frame)
+                except RuntimeError as error:
+                    record(gate, False, f"shell menu {case['row']}: {error}")
+                    raise
+                record(gate, True,
+                       f"physical Super+S/Tab/Return on {case['row']}: the shell asks org.gnome.SessionManager."
+                       f"{case['method']}, the compositor's manager opens EndSessionDialog Open({case['type']}, 0, 60) "
+                       f"after {menu[name]['shown_after']} s, the dialog counts down from 60 with Cancel focused and "
+                       f"steps to 50 with VM, compositor and session unchanged and logind untouched; Return on "
+                       f"Cancel -> Canceled, {case['method']} failed as cancelled, dialog gone, logind untouched")
+        finally:
+            menu["stop"] = agent.run("power-button-stop")
+            with open(os.path.join(evidence, "end-session-menu.json"), "w") as stream:
+                json.dump(menu, stream, indent=2)
     if older_guest:
         departing_orca = None
         with open(os.path.join(evidence, "orca-before-logout.json"), "w") as stream:
@@ -2705,11 +2950,31 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         with open(os.path.join(evidence, "orca-before-logout.json"), "w") as stream:
             json.dump(departing_orca, stream, indent=2)
     logout_offset, logout_started = len(read_text(serial_path)), time.monotonic()
-    # The product's own Log Out; the published build predates the session
-    # manager and logs out through logind, as its shell did.
-    requested = agent.run("logout")["requested"]
-    product_logout = published or requested == "session manager logout"
-    deadline = time.monotonic() + 30
+    # The product's own Log Out. The current build logs out from its shell's
+    # power menu by physical keys (#589): Log Out… asks the session manager
+    # for Logout(0), whose 60 s end-session dialog confirms by counting down,
+    # so the session must outlive the countdown and then end. The published
+    # build predates the session manager and logs out through logind, as its
+    # shell did.
+    menu_logout = None
+    if menu_session:
+        agent.run("power-button-start")
+        try:
+            menu_logout = end_session_menu_case(qmp, agent, "log-out", menu_identity, frame)
+        except RuntimeError as error:
+            record("V-LOGOUT", False, f"shell menu Log Out…: {error}")
+            raise
+        finally:
+            stopped = agent.run("power-button-stop")
+            with open(os.path.join(evidence, "logout-menu.json"), "w") as stream:
+                json.dump({"case": menu_logout, "stop": stopped}, stream, indent=2)
+        # The countdown runs from the dialog's opening.
+        logout_started = menu_logout["opened_at"]
+        requested = "power menu Log Out…"
+    else:
+        requested = agent.run("logout")["requested"]
+        product_logout = published or requested == "session manager logout"
+    deadline = logout_started + (90 if menu_session else 30)
     greeter = {}
     greeter_visible = False
     # Both lanes keep the GDM greeter frame that preceded login. tunaOS's
@@ -2733,10 +2998,22 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     if not greeter_visible:
         frame("logout-timeout")
     greeter["logout_request"] = requested
+    greeter["greeter_after"] = round(time.monotonic() - logout_started, 1)
+    if menu_session:
+        greeter["dialog_shown_after"] = menu_logout["shown_after"]
+        # GNOME's countdown, not the request, ended the session.
+        product_logout = greeter["greeter_after"] >= 55
     with open(os.path.join(evidence, "greeter.json"), "w") as stream:
         json.dump(greeter, stream, indent=2)
+    if menu_session:
+        logout_how = (f"physical Super+S/Tab/Return on Log Out…: the shell asks org.gnome.SessionManager.Logout(0), "
+                      f"Open(0, 0, 60) after {menu_logout['shown_after']} s, the dialog counts down from 60 with "
+                      f"Cancel focused and its countdown confirms, greeter {greeter['greeter_after']} s after the "
+                      f"dialog opened")
+    else:
+        logout_how = requested
     record("V-LOGOUT", greeter_visible and product_logout,
-           f"product Log Out ({requested}) ends the session and returns to a painted GDM greeter surface "
+           f"product Log Out ({logout_how}) ends the session and returns to a painted GDM greeter surface "
            "under active GDM, with no original compositor")
     if older_guest:
         with open(os.path.join(evidence, "orca-after-logout.json"), "w") as stream:
@@ -2863,20 +3140,46 @@ def await_login(agent, deadline):
     return False, login
 
 
-def gdm_login(qmp, agent_path, out, record):
-    """Drive the shipped GDM greeter's user list and password prompt; never
-    an autologin, initial or preselected session."""
+def await_reference_login(agent, deadline, *, profile):
+    """Only the independent observer admits paired native session principals."""
+    from vm_gnome_reference import session_status
+    observed = None
+    while time.monotonic() < deadline:
+        observed = session_status(agent, profile=profile)
+        if observed["ready"]:
+            return True, observed
+        # logind appears before the compositor, user bus and DRM device are
+        # ready. Keep observing this same PAM login without typing again.
+        time.sleep(1)
+    return False, observed if observed and observed["session"]["started"] else None
+
+
+def gdm_login(qmp, agent_path, out, record, *, reference_profile=None):
+    """Drive the original stock GDM user list and password prompt.
+
+    Paired DEV fixtures alone save a session choice; normal Tuna fixtures
+    still prove the shipped fallback without preselection.
+    """
+    if reference_profile not in (None, "tuna", "gnome"):
+        raise ValueError("unknown native login profile")
+    if reference_profile is not None:
+        from vm_gnome_reference import session_status
     agent = None
     deadline = time.monotonic() + 120
     greeter = {}
+    greeter_error = None
     while time.monotonic() < deadline:
         try:
             if agent is None:
                 agent = guest_agent.GuestAgent(agent_path)
-            greeter = agent.run("greeter")
-            if greeter_ready(greeter):
+            greeter = (session_status(agent, profile=reference_profile) if reference_profile is not None
+                       else agent.run("greeter"))
+            greeter_error = None
+            ready = greeter["gdm"]["ready"] if reference_profile is not None else greeter_ready(greeter)
+            if ready:
                 break
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, ValueError) as error:
+            greeter_error = str(error)
             if agent is not None:
                 agent.close()
                 agent = None
@@ -2884,9 +3187,11 @@ def gdm_login(qmp, agent_path, out, record):
     else:
         if agent is not None:
             agent.close()
+        with open(os.path.join(out, "greeter-before-login.json"), "w") as stream:
+            json.dump({"last_observation": greeter, "last_error": greeter_error}, stream, indent=2)
         raise RuntimeError("shipped GDM greeter did not become ready")
     try:
-        provenance = agent.run("payload")
+        provenance = greeter if reference_profile is not None else agent.run("payload")
         with open(os.path.join(out, "shipped-payload.json"), "w") as stream:
             json.dump(provenance, stream, indent=2)
         with open(os.path.join(out, "greeter-before-login.json"), "w") as stream:
@@ -2895,10 +3200,14 @@ def gdm_login(qmp, agent_path, out, record):
         qmp.frame(os.path.join(out, "V-GDM-GREETER.png"))
         # The logout check compares the repainted greeter with this frame.
         qmp.cmd("screendump", filename=os.path.join(out, "greeter-before-login.ppm"), format="ppm")
-        ok, detail = greeter_list_ok(greeter)
-        record("V-GREETER-LIST", ok, detail)
-        ok, detail = fallback_session_ok(greeter)
-        record("V-GDM-FALLBACK", ok, detail)
+        if reference_profile is not None:
+            record("V-REFERENCE-STOCK-GDM", greeter["gdm"]["ready"],
+                   "original packaged stock GDM greeter admitted by the independent reference observer")
+        else:
+            ok, detail = greeter_list_ok(greeter)
+            record("V-GREETER-LIST", ok, detail)
+            ok, detail = fallback_session_ok(greeter)
+            record("V-GDM-FALLBACK", ok, detail)
         # gnome-shell 51.0 js/gdm/loginDialog.js: _showUserList() gives the
         # user list key focus, which moves to its first item, and activating
         # that item begins password verification. tunaOS's GDM login gate
@@ -2920,59 +3229,26 @@ def gdm_login(qmp, agent_path, out, record):
             qmp.frame(os.path.join(out, f"gdm-attempt-{attempt}.png"))
             qmp.type_text("tuna")
             qmp.keys("ret")
-            started, login = await_login(agent, time.monotonic() + 60)
+            if reference_profile is not None:
+                started, login = await_reference_login(agent, time.monotonic() + 60, profile=reference_profile)
+            else:
+                started, login = await_login(agent, time.monotonic() + 60)
             if started:
                 record("V-GDM-LOGIN", True,
                        f"shipped non-root GDM greeter → user list (selection attempt {attempt}) → password PAM "
-                       "login → real non-root gdm-password Tuna Desktop session; payload hashes unchanged")
+                       f"login → real non-root gdm-password {'stock GNOME 51.1' if reference_profile == 'gnome' else 'Tuna Desktop'} "
+                       "session; original payload identities verified")
                 return True
             if login is not None:
-                # A session started without the Tuna Desktop compositor; never type into it.
+                # A real session started but failed admission; never type into it.
                 with open(os.path.join(out, "gdm-login-session.json"), "w") as stream:
                     json.dump(login, stream, indent=2)
-                raise RuntimeError(f"GDM PAM login started a {login['session'].get('Service')} session "
-                                   f"running {login['desktop']} instead of Tuna Desktop "
-                                   f"(GDM fallback session {greeter.get('fallback_session')!r})")
-        raise RuntimeError("graphical GDM PAM login did not produce a Tuna Desktop session")
+                raise RuntimeError(f"GDM PAM login started a session that did not admit {reference_profile or 'tuna'}; "
+                                   "see gdm-login-session.json")
+        raise RuntimeError(f"graphical GDM PAM login did not produce an admitted {reference_profile or 'tuna'} session")
     finally:
         agent.close()
 
-
-def grey_share(px, rect, step=6):
-    """Share of sampled pixels in rect (WIDTH x HEIGHT RGB bytes) that are
-    the shell's dark neutral grey; the Marlin wallpaper's dark areas are
-    saturated navy, and windows are light, so neither counts."""
-    x0, y0, x1, y1 = rect
-    total = grey = 0
-    for y in range(y0, y1, step):
-        for x in range(x0, x1, step):
-            i = (y * WIDTH + x) * 3
-            r, g, b = px[i], px[i + 1], px[i + 2]
-            total += 1
-            grey += max(r, g, b) - min(r, g, b) < 14 and 45 < r + g + b < 225
-    return grey / total if total else 0.0
-
-
-# Calibrated on Marlin VM frames (runs 37937493915, 38878636595 and
-# 38887426688): the overview backdrop fills the bottom-left corner, where
-# the desktop shows wallpaper; window previews keep the centre off-grey,
-# unlike the search and app-grid views. The Alt+Tab popup is a dark grey
-# island whose top and bottom padding span a full row over the windows.
-CORNER, CENTRE = (0, 690, 170, 780), (340, 250, 940, 550)
-
-
-def overview_windows_shown(px):
-    return grey_share(px, CORNER) > 0.85 and grey_share(px, CENTRE) < 0.5
-
-
-def switcher_shown(px):
-    return (grey_share(px, CORNER) < 0.2 and grey_share(px, CENTRE) < 0.6
-            and any(grey_share(px, (380, y, 900, y + 1), step=4) >= 0.9
-                    for y in range(280, 520, 2)))
-
-
-def desktop_shown(px):
-    return grey_share(px, CORNER) < 0.2 and not switcher_shown(px)
 
 
 def ppm_pixels(path):
@@ -2985,11 +3261,13 @@ def ppm_pixels(path):
     return data[len(header):]
 
 
+
+
 class Recorder:
     """Serialize input and completed screendumps, including their frame indices.
 
-    A failed/timed-out transport aborts the tour; a still records pixels only,
-    not proof that the application reached a requested semantic state.
+    Failed/timed-out captures abort the tour. Maintained heroes additionally
+    retain positive exact-frame framebuffer or bracketed public AT-SPI proof.
     """
 
     def __init__(self, qmp, out, timeout=10.0):
@@ -2997,6 +3275,7 @@ class Recorder:
         os.makedirs(self.dir, exist_ok=False)
         self.lock, self.stop = threading.RLock(), threading.Event()
         self.n, self.marks, self.stills, self.unconfirmed = 0, [], {}, []
+        self.still_confirmations = {}
         self.frames = []
         self.timeout, self.error = timeout, None
         self.original_cmd = qmp.cmd
@@ -3138,6 +3417,72 @@ class Recorder:
         time.sleep(delay)
         self.stills[card] = self._capture(mode="still")
 
+    def _confirmation(self, card, method, confirmed, evidence):
+        index = self.stills[card]
+        frame = self.frames[index]
+        self.still_confirmations[card] = {
+            "schema": 1, "tag": card, "frame_index": index, "png_sha256": frame["sha256"],
+            "method": method, "confirmed": confirmed,
+            "capture_requested_monotonic_ns": frame["requested_monotonic_ns"],
+            "capture_completed_monotonic_ns": frame["completed_monotonic_ns"], "evidence": evidence}
+        if not confirmed:
+            log(f"tour: the {card} exact capture is unconfirmed")
+            if card not in self.unconfirmed:
+                self.unconfirmed.append(card)
+        return confirmed
+
+    def public_still(self, card, observe):
+        """One observation on each side of the PNG, with no intervening input.
+
+        No polling/retry or extra settling wait is permitted. A missing public
+        tree or changed original session remains a diagnostic, not hero proof.
+        """
+        deadline = time.monotonic() + self.timeout
+        if not self.lock.acquire(timeout=self.timeout):
+            raise TimeoutError("tour public capture lock deadline expired")
+        try:
+            def snapshot():
+                requested = time.monotonic_ns()
+                try:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("tour public confirmation deadline expired")
+                    value = observe(remaining) if observe is not None else None
+                    result = {"observation": value}
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                    result = {"observation_error": type(error).__name__,
+                              "observation_error_detail": str(error)}
+                return {"requested_monotonic_ns": requested,
+                        "completed_monotonic_ns": time.monotonic_ns(), **result}
+
+            before = snapshot()
+            self.still(card)
+            after = snapshot()
+            left, right = before.get("observation"), after.get("observation")
+            same = (type(left) is dict and type(right) is dict
+                    and all(left.get(key) is not None and left.get(key) == right.get(key)
+                            for key in ("session", "principal", "atspi")))
+            within = time.monotonic() <= deadline
+            confirmed = (same and within and tour_public_view(card, left) and tour_public_view(card, right))
+            return self._confirmation(card, "public-at-spi", confirmed,
+                                      {"before": before, "after": after,
+                                       "same_original_session": same, "within_deadline": within})
+        finally:
+            self.lock.release()
+
+    def _exact_pixels(self, card, deadline):
+        path = os.path.join(self.dir, f"f{self.stills[card]:06d}.png")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        decoded = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", path, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+            check=True, capture_output=True, timeout=remaining).stdout
+        if (len(decoded) != WIDTH * HEIGHT * 3
+                or baseline.sha256(path) != self.frames[self.stills[card]]["sha256"]):
+            return None
+        return decoded
+
     def view(self):
         """Pixels on screen now, from an uncompressed probe screendump that
         is not a tour frame; None until QEMU has written all of it."""
@@ -3161,23 +3506,37 @@ class Recorder:
         return False
 
     def await_still(self, card, predicate, timeout, settle=0.5):
-        """Keep this section's still once predicate holds and still holds
-        settle seconds later, so the view has finished animating in. If it
-        never does, keep the current frame and list the card as unconfirmed
-        so nothing presents that still as the view."""
+        """Await the calibrated view, then evaluate the EXACT retained PNG.
+
+        A prior probe is only a readiness hint. A mismatched final frame never
+        triggers another capture or extends this view's existing deadline.
+        """
         deadline = time.monotonic() + timeout
-        confirmed = False
-        while self.await_view(predicate, deadline - time.monotonic()):
+        ready = False
+        while self.await_view(predicate, max(0.0, deadline - time.monotonic())):
+            if time.monotonic() + settle >= deadline:
+                break
             time.sleep(settle)
             pixels = self.view()
             if pixels is not None and predicate(pixels):
-                confirmed = True
+                ready = True
                 break
-        if not confirmed:
-            log(f"tour: the {card} view never appeared; its still is unconfirmed")
-            self.unconfirmed.append(card)
-        self.still(card)
-        return confirmed
+        with self.lock:
+            self.still(card)
+            exact = None
+            decode_error = None
+            if ready:
+                try:
+                    exact = self._exact_pixels(card, deadline)
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                    decode_error = type(error).__name__
+            within = time.monotonic() <= deadline
+            confirmed = ready and exact is not None and within and bool(predicate(exact))
+            evidence = {"predicate": predicate.__name__, "exact_png": exact is not None,
+                        "within_deadline": within}
+            if decode_error is not None:
+                evidence["decode_error"] = decode_error
+            return self._confirmation(card, "calibrated-framebuffer", confirmed, evidence)
 
     def close(self):
         self.stop.set()
@@ -3215,7 +3574,7 @@ def lock_chord_hold_ms(older_guest):
     return 1500 if older_guest else 80
 
 
-def run_tour(qmp, out, serial_path, older_guest=False):
+def run_tour(qmp, out, serial_path, older_guest=False, public_ui_observer=None):
     """Scripted feature tour through QMP input, recorded to a WebM with a
     title card per section. Returns a manifest entry. `older_guest` marks a
     guest that predates the newer snapshot keys (predates_newer_snapshot)."""
@@ -3260,7 +3619,7 @@ def run_tour(qmp, out, serial_path, older_guest=False):
         rec.mark("app-grid")
         keys("meta_l", "a")
         wait(4)
-        rec.still("app-grid")
+        rec.public_still("app-grid", public_ui_observer)
         keys("esc")
         wait(1)
         keys("esc")
@@ -3275,13 +3634,13 @@ def run_tour(qmp, out, serial_path, older_guest=False):
         rec.mark("quick-settings")
         qmp.click(WIDTH - 40, 12)
         wait(4)
-        rec.still("quick-settings")
+        rec.public_still("quick-settings", public_ui_observer)
         keys("esc")
         wait(2)
         rec.mark("calendar")
         qmp.click(WIDTH // 2, 12)
         wait(4)
-        rec.still("calendar")
+        rec.public_still("calendar", public_ui_observer)
         keys("esc")
         wait(2)
         # Apps the Marlin GNOME image ships (its app grid has no Text
@@ -3324,7 +3683,7 @@ def run_tour(qmp, out, serial_path, older_guest=False):
         rec.mark("lock")
         keys("meta_l", "l", hold_ms=lock_chord_hold_ms(older_guest))
         wait(5)
-        rec.still("lock")
+        rec.public_still("lock", public_ui_observer)
         # Shift alone intentionally leaves GNOME's curtain in place.
         # Return reveals the focused prompt without adding a character.
         keys("ret")
@@ -3366,6 +3725,7 @@ def run_tour(qmp, out, serial_path, older_guest=False):
         json.dump({"schema": 1, "periodic_target_fps": TOUR_FPS,
                    "uniform_capture_intervals": False, "frames": rec.frames,
                    "stills": rec.stills, "unconfirmed_stills": rec.unconfirmed,
+                   "still_confirmations": rec.still_confirmations,
                    "title_marks": rec.marks,
                    "lane_source_sha256": baseline.sha256(__file__),
                    "card_source_sha256": baseline.sha256(os.path.join(CARDS, "render.py")),
@@ -3635,7 +3995,7 @@ def run_soak(qmp, vm, agent_path, out, record, seconds, warmup, interval, revisi
 
 
 def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, native_relative_mouse=False,
-         observer_records=None):
+         observer_records=None, credentials=()):
     ovmf = next((p for p in OVMF if os.path.exists(p)), None)
     if not ovmf:
         sys.exit("tuna-vm-lane: OVMF firmware not found (install ovmf)")
@@ -3661,6 +4021,10 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
             "-nic", "user,model=virtio-net-pci"]
     if native_relative_mouse:
         qemu.extend(["-device", "virtio-mouse-pci,id=tuna-relative-mouse"])
+    for credential in credentials:
+        # systemd imports SMBIOS type 11 io.systemd.credential: strings as
+        # system credentials (ConditionCredential=).
+        qemu.extend(["-smbios", f"type=11,value=io.systemd.credential:{credential}"])
     if guest_agent:
         qemu.extend(["-device", "virtio-serial-pci",
                      "-chardev", f"socket,path={agent_path},server=on,wait=off,id=tuna-qga",
@@ -3678,6 +4042,168 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
     log(f"booting {disk} (kvm={kvm})")
     result = subprocess.Popen(qemu), qmp_path, serial, kvm
     return (*result, agent_path) if guest_agent else result
+
+
+def native_media_source(out, image, owner):
+    """Bind real current-source tour media to its original admitted session."""
+    root = os.path.dirname(HERE)
+    from maintained_media import git_source, required_source_inputs
+    from vm_strip_image import validate_base_origin, validate_product_origin
+    def git(*arguments):
+        return subprocess.check_output(["git", "-C", root, *arguments], text=True, timeout=5).strip()
+    head, tree = git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
+    if (head != image.get("capture_commit") or head != os.environ.get("GITHUB_SHA")
+            or not re.fullmatch("[0-9a-f]{40}", head) or not re.fullmatch("[0-9a-f]{40}", tree)
+            or git("diff", "HEAD", "--")):
+        raise RuntimeError("tour source/image differs from the actual clean workflow checkout")
+    product = git_source(root, image.get("commit"))
+    if (image.get("built_tree") != product["tree"] or image.get("capture_tree") != tree
+            or image.get("required_source_inputs_sha256") != product["required_source_inputs_sha256"]
+            or required_source_inputs(root) != product["required_source_inputs_sha256"]):
+        raise RuntimeError("actual product and current capture Git source inputs differ")
+    origin = image.get("product_origin")
+    if origin is not None or image["commit"] != head:
+        validate_product_origin(origin, image, root)
+    run_id, attempt = os.environ.get("GITHUB_RUN_ID", ""), os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    if not all(re.fullmatch("[1-9][0-9]*", value) for value in (run_id, attempt)):
+        raise RuntimeError("actual workflow run and attempt required for maintained native media")
+    if (not isinstance(owner, dict) or owner.get("session_uid", 0) == 0
+            or owner.get("session", {}).get("Service") != LOGIN_SERVICE):
+        raise RuntimeError("maintained media requires the original admitted nonroot GDM session")
+    with open(os.path.join(out, "native-base", "index.json"), "rb") as stream:
+        index_bytes = stream.read()
+    members = [member for member in json.loads(index_bytes)["manifests"]
+               if member.get("platform", {}).get("os") == "linux"
+               and member.get("platform", {}).get("architecture") == "amd64"]
+    if len(members) != 1 or image["base_image"] != "ghcr.io/tuna-os/marlin:gnome@" + members[0]["digest"]:
+        raise RuntimeError("native media image does not match the actual original base index/platform")
+    base = {"index": "ghcr.io/tuna-os/marlin@sha256:" + hashlib.sha256(index_bytes).hexdigest(),
+            "platform": "ghcr.io/tuna-os/marlin@" + members[0]["digest"]}
+    if origin is not None:
+        validate_base_origin(origin, image["base_image"], index_bytes)
+    with open(os.path.join(out, "media-source.json"), "x") as stream:
+        json.dump({"merged_commit": head, "capture_commit": head, "capture_tree": tree,
+                   "built_commit": product["commit"], "built_tree": product["tree"],
+                   "product_origin": origin,
+                   "run_id": run_id, "run_attempt": attempt, "environment": "installed-vm",
+                   "tracked_source_clean": True, "original_session": owner, "base": base,
+                   "required_source_inputs_sha256": product["required_source_inputs_sha256"]}, stream, indent=2)
+
+
+def run_wm_reference(qmp, agent, out, record, *, profile, provenance, base_evidence_dir):
+    """Retain the genuine paired consumer's actual member receipt."""
+    from vm_gnome_reference import run
+    target = os.path.join(out, "wm-reference")
+    os.makedirs(target, exist_ok=True)
+    run(qmp, agent, target, record, profile=profile, provenance=provenance,
+        base_evidence_dir=base_evidence_dir)
+    record("V-WM-REFERENCE", True,
+           "genuine native switcher consumer completed; individual observed phase gates remain mandatory")
+
+
+def native_reference_lane(args):
+    """Run either paired member through the same native producer and observer."""
+    profile = "gnome" if args.profile == "gnome-reference" else "tuna"
+    out = os.path.abspath(args.out)
+    scratch = os.path.join(out, ".scratch")
+    os.makedirs(scratch, exist_ok=True)
+    results = {}
+
+    def record(test_id, ok, desc):
+        results[test_id] = (ok, desc)
+        log(f"{test_id} {'pass' if ok else 'FAIL'}: {desc}")
+
+    provenance = dict(value.split("=", 1) for value in args.meta)
+    vm, qmp_path, serial_path, kvm, agent_path = boot(
+        os.path.abspath(args.disk), out, scratch, args.timeout, True, guest_agent=True)
+    provenance.update({"profile": args.profile, "kvm": kvm,
+                       "resolution": f"{WIDTH}x{HEIGHT}",
+                       "gpu_profile": baseline.GPU_PROFILE,
+                       "gpu_devices": baseline.gpu_devices()})
+    agent = None
+    try:
+        qmp = baseline.Qmp(qmp_path)
+        gdm_login(qmp, agent_path, out, record, reference_profile=profile)
+        agent = guest_agent.GuestAgent(agent_path)
+        run_wm_reference(qmp, agent, out, record, profile=profile, provenance=provenance,
+                         base_evidence_dir=args.reference_base_evidence)
+        qmp.cmd("quit")
+    except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        record("V-NATIVE-REFERENCE", False, str(error))
+    finally:
+        if agent is not None:
+            agent.close()
+        if vm.poll() is None:
+            vm.terminate()
+        try:
+            vm.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            vm.kill()
+            vm.wait(timeout=10)
+        with open(os.path.join(out, "assertions.txt"), "w") as stream:
+            for test_id, (ok, desc) in results.items():
+                stream.write(f"{test_id} {'pass' if ok else 'fail'} {desc}\n")
+        with open(os.path.join(out, "manifest.json"), "w") as stream:
+            json.dump({"lane": f"native-{'gnome51' if profile == 'gnome' else 'tuna'}-reference", **provenance,
+                       "disk": os.path.basename(args.disk),
+                       "captured_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                       "assertions": {key: {"pass": value[0], "detail": value[1]}
+                                      for key, value in results.items()}}, stream, indent=2)
+        shutil.rmtree(scratch, ignore_errors=True)
+    if any(not ok for ok, _ in results.values()):
+        sys.exit("tuna-vm-lane: paired native reference consumer failed")
+
+
+def fresh_accounts_lane(args):
+    """tunaOS#4092: one boot (with an in-guest reboot) of the record-free
+    standard/admin account journey; distinct from the default lane's
+    session-less tuna-test fixture. -snapshot keeps the disk pristine for
+    the other lanes while guest reboots keep this run's state."""
+    out = os.path.abspath(args.out)
+    scratch = os.path.join(out, ".scratch")
+    os.makedirs(scratch, exist_ok=True)
+    results = {}
+
+    def record(test_id, ok, desc):
+        results[test_id] = (ok, desc)
+        log(f"{test_id} {'pass' if ok else 'FAIL'}: {desc}")
+
+    vm, qmp_path, serial_path, kvm, agent_path = boot(
+        os.path.abspath(args.disk), out, scratch, args.timeout, args.require_kvm, guest_agent=True,
+        credentials=("tuna.vm.fresh-accounts=1",))
+    try:
+        qmp = baseline.Qmp(qmp_path)
+        journey = fresh_accounts.Journey(qmp, lambda: guest_agent.GuestAgent(agent_path), greeter_ready,
+                                         out, record, gdm_trace=args.fresh_gdm_trace)
+        try:
+            journey.run()
+        except (OSError, RuntimeError, ValueError, KeyError) as error:
+            record("V-FRESH-JOURNEY", False, str(error))
+    finally:
+        vm.terminate()
+        try:
+            vm.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            vm.kill()
+    if "V-FRESH-JOURNEY" not in results:
+        record("V-FRESH-JOURNEY", all(ok for ok, _ in results.values()) and "V-FRESH-LOGOUT-tunaadmin-reboot" in results,
+               "first login, logout, second login and post-reboot login for tunastd and tunaadmin")
+    with open(os.path.join(out, "assertions.txt"), "w") as fh:
+        for test_id, (ok, desc) in results.items():
+            fh.write(f"{test_id} {'pass' if ok else 'fail'} {desc}\n")
+    manifest = {"lane": "marlin-vm-fresh-accounts", "kvm": kvm, "disk": os.path.basename(args.disk),
+                "captured_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "assertions": {k: {"pass": v[0], "detail": v[1]} for k, v in results.items()}}
+    for kv in args.meta:
+        key, _, value = kv.partition("=")
+        manifest[key] = value
+    with open(os.path.join(out, "manifest.json"), "w") as fh:
+        json.dump(manifest, fh, indent=2)
+    shutil.rmtree(scratch, ignore_errors=True)
+    failed = sorted(k for k, (ok, _) in results.items() if not ok)
+    if failed:
+        sys.exit(f"tuna-vm-lane: FAILED {', '.join(failed)}")
+    log(f"OK: record-free fresh-account journey passed; artifacts in {out}")
 
 
 def repeat_boots(args):
@@ -3747,6 +4273,10 @@ def repeat_boots(args):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--profile", choices=("lifecycle", "gnome-reference", "tuna-reference"), default="lifecycle",
+                    help="explicit paired DEV member; ordinary Tuna lifecycle remains the default")
+    ap.add_argument("--reference-base-evidence",
+                    help="actual normal-CI raw index and successful platform cosign verification directory")
     ap.add_argument("--disk", required=True)
     ap.add_argument("--out", default="vm-lane-artifacts")
     ap.add_argument("--timeout", type=int, default=900)
@@ -3771,7 +4301,28 @@ def main():
     ap.add_argument("--soak-interval", type=int, default=60, metavar="SECONDS")
     ap.add_argument("--soak-revision", metavar="COMMIT",
                     help="the shipped payload's exact 40-digit source commit (deployment record)")
+    ap.add_argument("--fresh-accounts", action="store_true",
+                    help="tunaOS#4092: run only the record-free standard/admin account GDM journey "
+                         "(first login, logout, login, reboot, login), not the tuna-test lane")
+    ap.add_argument("--fresh-gdm-trace", action="store_true",
+                    help="observe only the first tunastd login: bounded AccountsService call/reply headers "
+                         "and pre-existing allowlisted worker markers; never enable GDM debug")
     a = ap.parse_args()
+    if a.fresh_gdm_trace and not a.fresh_accounts:
+        ap.error("--fresh-gdm-trace requires --fresh-accounts")
+    if a.profile != "lifecycle":
+        if not a.reference_base_evidence:
+            ap.error("the paired consumer requires --reference-base-evidence")
+        if (not a.require_kvm or a.tour or a.boots != 1 or a.soak or a.fresh_accounts
+                or a.published or a.strip_image or a.strip_edge):
+            ap.error("paired reference profiles require KVM and their own single pristine boot")
+        native_reference_lane(a)
+        return
+    if a.fresh_accounts:
+        if a.tour or a.boots != 1 or a.soak or a.strip_image or a.published:
+            ap.error("--fresh-accounts is its own single current-build boot")
+        fresh_accounts_lane(a)
+        return
     if a.soak:
         if a.tour or a.boots != 1:
             ap.error("--soak is its own single pristine boot, without --tour")
@@ -3794,6 +4345,12 @@ def main():
         if any(strip_image.get(field) != metadata.get(meta) for field, meta in
                (("commit", "commit"), ("image_id", "test_image_id"), ("base_image", "base_image"))):
             ap.error("strip receipt differs from actual VM image/source metadata")
+        if (strip_image.get("product_origin") is not None or
+                strip_image.get("commit") != strip_image.get("capture_commit")):
+            if strip_image.get("capture_commit") != metadata.get("capture_commit"):
+                ap.error("strip receipt differs from actual current capture metadata")
+            from vm_strip_image import validate_product_origin
+            validate_product_origin(strip_image.get("product_origin"), strip_image, os.path.dirname(HERE))
     if not 1 <= a.boots <= 10:
         ap.error("--boots must be between 1 and 10")
     if a.boots > 1:
@@ -3909,8 +4466,12 @@ def main():
                          a.soak_revision)
             if a.tour:
                 try:
+                    if strip_image is not None and os.environ.get("GITHUB_RUN_ID"):
+                        native_media_source(out, strip_image, owner)
                     older_guest = bool(owner and owner.get("state")) and predates_newer_snapshot(owner["state"])
-                    tour_info = run_tour(qmp, out, serial_path, older_guest)
+                    tour_info = run_tour(qmp, out, serial_path, older_guest,
+                                         public_ui_observer=lambda timeout: soak_call(
+                                             agent_path, "tour-public-ui", timeout=timeout))
                     tour_serial_end = len(read_text(serial_path))
                     agent = guest_agent.GuestAgent(agent_path)
                     try:

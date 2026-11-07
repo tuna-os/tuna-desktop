@@ -73,9 +73,11 @@ HOME_PRIV="$ARTIFACTS/home"
 RUN_PRIV="$(mktemp -d /tmp/tuna-orca.XXXXXX)"
 CONF_PRIV="$ARTIFACTS/config"
 DATA_PRIV="$ARTIFACTS/data"
+CACHE_PRIV="$ARTIFACTS/cache"
+STATE_PRIV="$ARTIFACTS/state"
 mkdir -p "$HOME_PRIV" "$RUN_PRIV" "$CONF_PRIV/speech-dispatcher/modules" \
-    "$DATA_PRIV/applications" "$ARTIFACTS/speechd"
-chmod 700 "$RUN_PRIV"
+    "$DATA_PRIV/applications" "$ARTIFACTS/speechd" "$CACHE_PRIV" "$STATE_PRIV"
+chmod 700 "$RUN_PRIV" "$HOME_PRIV" "$CONF_PRIV" "$DATA_PRIV" "$CACHE_PRIV" "$STATE_PRIV"
 ORIG_HOME="$HOME"
 TUNA_COMPOSITOR_STATE="$CSTATE"
 XDG_RUNTIME_DIR="$RUN_PRIV"
@@ -84,7 +86,13 @@ HOME="$HOME_PRIV"
 GSETTINGS_BACKEND=keyfile
 XDG_CONFIG_HOME="$CONF_PRIV"
 XDG_DATA_HOME="$DATA_PRIV"
+# Absolute inherited XDG state/cache roots take precedence over HOME in
+# the compositor's settings upgrade and shell state readers. Override
+# both rather than touching user state or bypassing migration checks.
+XDG_CACHE_HOME="$CACHE_PRIV"
+XDG_STATE_HOME="$STATE_PRIV"
 export TUNA_COMPOSITOR_STATE XDG_RUNTIME_DIR HOME GSETTINGS_BACKEND XDG_CONFIG_HOME XDG_DATA_HOME
+export XDG_CACHE_HOME XDG_STATE_HOME
 PY=/usr/bin/python3
 [ -x "$PY" ] || PY=python3
 BIN_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
@@ -239,7 +247,7 @@ else
 fi
 [ -n "$DISPLAY_ARG" ] && DISPLAY="$DISPLAY_ARG" && export DISPLAY
 if ! xdotool getdisplaygeometry >/dev/null 2>&1; then
-    Xvfb -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" \
+    "$ROOT/scripts/lib/tuna-xvfb" -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" \
         3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
     OWNED_XVFB=$!
     for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 1; done
