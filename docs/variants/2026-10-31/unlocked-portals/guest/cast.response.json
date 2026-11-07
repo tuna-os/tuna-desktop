@@ -1,0 +1,23 @@
+{
+  "mode": "allow",
+  "response": 0,
+  "results": {
+    "streams": [
+      [
+        58,
+        {
+          "id": "0",
+          "source_type": 1,
+          "position": [
+            0,
+            0
+          ],
+          "size": [
+            1280,
+            800
+          ]
+        }
+      ]
+    ]
+  }
+}
