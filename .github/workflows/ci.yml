@@ -1947,7 +1947,9 @@ jobs:
     timeout-minutes: 10
     runs-on: *runner-24
     needs: [select-lanes, marlin-vm]
-    if: ${{ !cancelled() && contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm') }}
+    # The two reference members it downloads are not built on pull requests
+    # (select-lanes' vm_matrix).
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
