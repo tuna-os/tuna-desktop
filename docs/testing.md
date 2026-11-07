@@ -11,6 +11,22 @@ and on GitHub-hosted runners for forks; the steps and assertions are the
 same on both. See [CI runners](ci-runners.md) for what runs where and the
 switch back to GitHub-hosted runners.
 
+## Slideshow paint identities
+
+`/usr/bin/python3 scripts/tests/test_stock_slideshow_proof.py` exercises the
+stock slideshow proof's deadline and receipt boundaries. Paint receipts
+carry structured file identities: canonical path, device/inode/size,
+mtime/ctime pairs and the cached 32-byte SHA-256 digest. The consumer
+checks live regular-file metadata and content, including metadata before
+and after reading and the path's final identity. It does not parse Rust
+`Debug` output or accept metadata-only identity after the bytes change.
+
+The real `portal-security` slideshow journey remains required: original
+session ownership, the independent GNOME reference, naturally advancing
+static/blend phases, cycle wrap, restart, and every timing and pixel
+threshold are unchanged. Boundary tests are not graphical qualification.
+
+
 ## Which lanes a pull request runs
 
 Every push to `main`, the nightly schedule and `workflow_dispatch` run
@@ -54,13 +70,20 @@ skipped. To run every lane on a branch, dispatch `ci` on it.
 The `orca-speech` CI job builds Ubuntu Orca with Tuna's package-owned password
 feedback correction before running the unchanged `scripts/tuna-orca-speech-proof`.
 It uses the canonical `tuna-os/tunaos-packages` factory at immutable commit
-`c0998b94bd7b4fbc67360c239e439de6debf539b`, in a fresh `RUNNER_TEMP` checkout
+`01d74f3c354fe8219ccf21acd4122273b6984588`, in a fresh `RUNNER_TEMP` checkout
 with full history for the recipe's `SOURCE_DATE_EPOCH`. Native APT installs the
 built `orca_50.3-0ubuntu0.1+tuna1_all.deb`; there is no published-package fallback.
 The existing `orca-speech` artifact retains `native-orca-factory.log` and
 `native-orca-package.txt` (factory commit, source epoch, DEB SHA-256, installed
 version and application-script package ownership). This is nested speech-proof
 evidence, not package or image qualification.
+
+This factory revision includes the executable-mode fix from
+[`tunaos-packages#960`](https://github.com/tuna-os/tunaos-packages/pull/960).
+The workflow executes the runner directly through `env`; the factory tracks
+that entry point as `100755` and tests direct execution with Bats.
+The previous pin, `c0998b94bd7b4fbc67360c239e439de6debf539b`, tracked it as
+`100644`, so native builds stopped with exit 126 before any speech proof.
 
 ## Dependency caches
 
@@ -151,6 +174,26 @@ settings local builds need (`just` lists the recipes):
 | `just ci-artifacts <run> [name]` | downloads a CI run's artifacts and prints the directory |
 | `just clean` / `just gc` | deletes this worktree's target / frees disk (below) |
 | `just disk-guard [--watch [s]]` | frees disk now, or keeps checking every `s` seconds (below) |
+
+The real-client native DnD regressions in
+`crates/compositor/tests/data_device.rs` run with
+`cargo test -p tuna-compositor --test data_device native_`. They cover a valid
+press serial followed by held-button motion to another client before
+`start_drag`, plus same-surface and source-less starts. With no subsequent input
+motion, protocol barriers must already deliver target-local Enter/Motion and,
+when a source exists, its MIME offer and actions. Wrong-client events, invalid
+serial acceptance, and cross-client source-less offers are rejected; the initial
+offer must still negotiate a valid drop and Finish. Existing cancellation,
+source/icon lifetime, and touch controls remain in the same test target.
+This matches Mutter 51's initial-focus path:
+[attaching the drag handler immediately invalidates focus](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-input.c#L288-L325),
+and [drag focus sends the destination its offer while restricting source-less drags to the origin client](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-data-device.c#L337-L397).
+
+`scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts DIR` runs the same
+held-button hover and persisted reorder assertions as the full GTK proof,
+without the unrelated earlier gates. It adds no target motion or timing
+relaxation. CI runs this slice with its freshly built compositor and shell;
+the no-post-start-motion wire tests establish the precise protocol ordering.
 
 Every build uses its own checkout's `target/` (an inherited
 `CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one) and no
@@ -294,6 +337,11 @@ Clippy runs with `-D warnings`, so any warning fails CI.
 `cargo test --workspace` includes the 100-run shell fault harness
 (`hundred_fault_runs_keep_apps_alive_and_resync` in
 `crates/compositor/tests/recovery.rs`) and needs no display or GPU.
+
+After rendering, every backend flushes queued Wayland events before sleeping.
+A frame callback must not wait for an unrelated client request or another loop
+wake to reach its client. This delivery flush does not schedule another render;
+actual presentation and animation cadence still require graphical proof.
 
 The real Wayland-wire pointer tests in `crates/compositor/tests/move_resize.rs`
 cover a window mapping beneath a stationary pointer (#425). The scene repick
@@ -502,6 +550,15 @@ hardware session. A CI-only guest service probes the calendar and portal
 on the test user bus; the runner reads the serial log and takes QMP
 screendumps from outside.
 
+The paired native GNOME/Tuna reference consumers separately bind the original
+compositor's open DRM character devices to their actual PCI ancestor and QMP
+topology. The graphics driver's name comes from the read-only kernel
+`DRM_IOCTL_VERSION` query on that same character device, not from its sysfs
+parent's `driver` link: the latter can correctly name the `virtio-pci` bus
+driver rather than the DRM `virtio_gpu` driver. Missing, changed, non-DRM or
+malformed device observations fail admission; the required virtio GPU,
+connected output and preserved PCI checks remain unchanged.
+
 1. It builds `packaging/marlin/Containerfile` (Marlin GNOME 51 plus the
    Tuna Desktop Arch package from `arch-package`) with rootful podman. On top of
    that it builds the CI-only layer `packaging/marlin/vm-lane/Containerfile`.
@@ -665,6 +722,28 @@ samples them at 0, 50 and 100 ms of the thumbnails' fade in and 50 ms into
 the fade out (Alt+Escape, which cancels without moving focus), where GNOME's
 ease-out quad gives 0, 191/255 and 1, then 64/255. The grid-cancel comparison
 slice skips the sampling: its old binaries predate the published alphas.
+
+The native grid cancellation proof admits its held drag only after the
+neighboring-page preview is showing **and** the normal page arrows have
+disappeared. GTK creates the preview before its arrow fade finishes, so
+preview presence alone is not a settled first-page tree. This transition
+uses the existing 10-second preview budget; the owner-bound geometry,
+neutral pointer, unchanged page contents and pre-release cancellation
+checks remain mandatory. A gap chosen before the drag is provisional:
+the proof selects again from the live preview allocation, moves the held
+pointer there within the same budget, then validates a fresh tree. This
+also covers old comparison binaries whose preview occupies more than
+the nominal edge width; no guessed hint clipping is accepted.
+
+The edge-tiling-off restore gesture waits for the native move owner,
+`interactive_move_window`, and delivery of its seed motion before sending
+the restore motions. This excludes a stale grab from the preceding drag.
+GTK must request the move while the pointer button is held; physical
+pointer delivery alone does not establish the client round trip. The
+admission snapshot is retained, and the final target is derived from its
+pointer and window geometry. Admission, final pointer delivery, button
+release and work-area restoration share the original 20-second restore
+budget. The owner observation is null while locked.
 
 ## Frame cost
 

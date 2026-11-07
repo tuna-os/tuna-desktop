@@ -31,6 +31,46 @@ macro_rules! eprintln {
     }};
 }
 
+/// Serializes tests that share GLib's process-global dispatch state.
+///
+/// GSettings `changed` delivery and default-`MainContext` ownership interact:
+/// another thread iterating or holding the default context while this thread
+/// emits a settings change can defer the synchronous `changed` delivery the
+/// folders tests rely on, so the reader observes the backend cache before its
+/// change dispatch. Every test on either side holds this guard: the mutex
+/// excludes the other long holders, and owning the default context keeps the
+/// short main-loop pumps in unrelated tests from interleaving mid-emission.
+#[cfg(test)]
+pub(crate) struct TestDispatchGuard {
+    _mutex: std::sync::MutexGuard<'static, ()>,
+    _acquired: glib::MainContextAcquireGuard<'static>,
+}
+
+#[cfg(test)]
+pub(crate) fn test_dispatch_guard() -> TestDispatchGuard {
+    static MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static CONTEXT: std::sync::OnceLock<glib::MainContext> = std::sync::OnceLock::new();
+    let mutex = MUTEX.lock().unwrap_or_else(|poison| poison.into_inner());
+    let context = CONTEXT.get_or_init(glib::MainContext::default);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let acquired = loop {
+        match context.acquire() {
+            Ok(guard) => break guard,
+            Err(_) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "default main context never free"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    };
+    TestDispatchGuard {
+        _mutex: mutex,
+        _acquired: acquired,
+    }
+}
+
 mod accessibility;
 mod anim_clock;
 mod audio_selection;
@@ -486,25 +526,32 @@ impl shell_dbus::ShellActions for GnomeShellDbus {
             .is_some_and(|c| c.model().is_overview_open())
     }
 
-    fn set_accelerator_grabs(&self, grabs: Vec<tuna_shell_control::AcceleratorGrab>) {
-        if let Some(control) = self.shell.borrow_mut().control.as_mut() {
-            let locked = control.locked();
-            let subset = media_keys::trace_enabled().then(|| {
-                let accelerators: Vec<_> = grabs.iter().map(|g| g.accelerator).collect();
-                media_keys::media_subset(&accelerators)
-            });
-            let result = control.set_accelerator_grabs(grabs);
-            if let Some(subset) = subset {
-                media_keys::trace(
-                    "accelerators-send",
-                    serde_json::json!({
-                        "request_id": result.as_ref().ok(), "write_ok": result.is_ok(),
-                        "media": subset,
-                    }),
-                    locked,
-                );
-            }
+    fn set_accelerator_grabs(
+        &self,
+        grabs: Vec<tuna_shell_control::AcceleratorGrab>,
+    ) -> Option<shell_dbus::AcceleratorRequest> {
+        let mut shell = self.shell.borrow_mut();
+        let control = shell.control.as_mut()?;
+        let locked = control.locked();
+        let subset = media_keys::trace_enabled().then(|| {
+            let accelerators: Vec<_> = grabs.iter().map(|g| g.accelerator).collect();
+            media_keys::media_subset(&accelerators)
+        });
+        let result = control.set_accelerator_grabs(grabs);
+        if let Some(subset) = subset {
+            media_keys::trace(
+                "accelerators-send",
+                serde_json::json!({
+                    "request_id": result.as_ref().ok(), "write_ok": result.is_ok(),
+                    "media": subset,
+                }),
+                locked,
+            );
         }
+        result.ok().map(|id| shell_dbus::AcceleratorRequest {
+            generation: control.connection_generation(),
+            id,
+        })
     }
 }
 
@@ -3908,6 +3955,7 @@ fn build(app: &adw::Application) {
             let (osd_ui, pad_osd_ui, pad_osd_service) =
                 (osd_ui.clone(), pad_osd_ui.clone(), pad_osd_service.clone());
             let resync_after = resync_after.clone();
+            let gnome_shell = gnome_shell.clone();
             Rc::new(move |drained: Drained| {
                 let Drained {
                     results,
@@ -4073,6 +4121,8 @@ fn build(app: &adw::Application) {
                     );
                     lock_ui.command_result(id, applied);
                     pad_osd_service.command_result(id, applied);
+                    // The compositor installs a grab table before it answers.
+                    gnome_shell.command_result(id, applied);
                 }
                 // The bar goes see-through and Activities shows as checked
                 // while the overview is open, as GNOME draws them; it is a
@@ -4168,7 +4218,12 @@ fn build(app: &adw::Application) {
         sync(Drained::default());
         // Every frame the socket holds, then what the connection is now.
         let pump = {
-            let (shell, notify, sync) = (shell_rc.clone(), notify.clone(), sync.clone());
+            let (shell, notify, sync, gnome_shell) = (
+                shell_rc.clone(),
+                notify.clone(),
+                sync.clone(),
+                gnome_shell.clone(),
+            );
             move || {
                 let mut drained = Drained::default();
                 let mut shell = shell.borrow_mut();
@@ -4191,6 +4246,12 @@ fn build(app: &adw::Application) {
                 drop(shell);
                 // A hang-up or a redial changes what the views may trust
                 // (lock authority, input-method admission) without a frame.
+                if closed {
+                    gnome_shell.release_replies();
+                } else {
+                    // A send may have redialed between pump calls already.
+                    gnome_shell.control_changed(Some(generation));
+                }
                 if handled || generation != before || closed != was_closed {
                     sync(drained);
                 }

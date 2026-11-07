@@ -106,13 +106,14 @@ No implementation or test is considered complete because a test command exits su
 
 ## 7. Automated structural compliance
 
-`validate-test-strategy.yml` runs `scripts/tuna-test-strategy` for crate,
-strategy and validator changes. It rejects crates with no named executable
+The `check` job in `ci.yml` runs `scripts/tuna-test-strategy` twice. It first
+runs before any build, to reject crates with no named executable
 test functions, invalid or duplicated stable test IDs, and removal of the
-registered control, supervised-shell identity and locked-session cases. The main CI check supplies its test
-list after the workspace tests pass, so registered cases must also appear
-in that executed inventory. Both jobs retain a source-stamped compliance
-report, including the remaining traceability and boundary-case gaps.
+registered control, supervised-shell identity and locked-session cases. It
+runs again with the executed test list after the workspace tests pass, so
+registered cases must also appear in that executed inventory. The second pass
+retains a source-stamped compliance report, including the remaining
+traceability and boundary-case gaps.
 
 This inventory is a structural regression gate. It does not measure line
 or branch coverage, certify a security boundary, or satisfy the release

@@ -13,12 +13,52 @@ No autologin or initial session exists: the lane drives GDM's user list and
 types the fixture password exactly as the published-flavor nightly does
 (`V-GREETER-LIST`, `V-GDM-FALLBACK`, `V-GDM-LOGIN`;
 `docs/marlin-tuna-nightly.md`), from the same `scripts/tuna-vm-lane` code.
-Logout must return to that GDM greeter. This changes neither the shipped
-preview image nor the number of CI VM profiles. GDM's session worker opens a
-journal stream for `gdm-wayland-session`, which the fixture forwards to the
+Logout must return to that GDM greeter. These ordinary lifecycle fixtures do
+not change the shipped preview image; the independent paired DEV profiles
+below are separate members of the same existing VM producer. GDM's session
+worker opens a journal stream for `gdm-wayland-session`, forwarded to the
 serial port. The fixture's session environment comes from `environment.d`,
 which gdm-wayland-session imports from the user manager; the per-login Orca
 test secret comes from a user environment generator.
+The ordinary CLI profile is `--profile lifecycle` (the default); its two
+matrix members keep their original distribution/upstream51 Orca contracts
+and `marlin-vm`/`marlin-vm-orca51` artifact identities.
+
+The speech lane invokes the pinned package factory through `bash`; the
+factory checkout's script execute bit is not an admission prerequisite.
+Its actual native package build and all speech gates remain required.
+
+## Installed strip captures
+
+The strip probe binds the original native processes and all three installed
+fixture helpers to the selected package, source and final image. Both PNG and
+PPM acquisitions must pass all 25 original body-color samples; the captures
+remain separate acquisitions, not presentation-latency proof.
+
+A real notification can cover those pixels. Before acquiring a frame, the
+probe may acknowledge its visible banner through ordinary QMP input:
+Super+N, Tab, then Return only after the original shell's public Close
+button is observed focused and sensitive. The read-only AT-SPI observer
+binds the control's bounds to original process/bus identities, never
+notification content. Every pixel check and the existing 10-second capture
+and 120-second phase deadlines remain unchanged. No updater service,
+notification policy or failure log is disabled; acknowledging a banner does
+not qualify the update operation that produced it.
+
+The column-height capture also submits a real critical notification through
+the session's public notification service. It cannot pass until the original
+shell shows the fixed public fixture title, its sensitive Close button receives
+the actual QMP Return action, and the banner disappears. Only a boolean title
+comparison is retained. This control exercises the recovery path even when
+the updater happens to show no banner; it shares the same capture deadline
+and still requires every original PNG and PPM color sample afterward.
+
+Close readiness uses GTK4's actual AT-SPI state mapping: an interactive
+control advertises `SENSITIVE`, the inverse of its `DISABLED` accessibility
+state. GTK4 does not advertise `ENABLED`; requiring that additional bit
+would reject a genuinely focused, interactive button. Both observed bits
+remain in the receipt, but disabled controls remain ineligible. See the
+[GTK4 state mapping](https://github.com/GNOME/gtk/blob/main/gtk/a11y/gtkatspicontext.c).
 
 ## Record-free fresh accounts (tunaOS#4092)
 
@@ -41,20 +81,64 @@ version must not opt into the empty-template policy. Neither policy edits
 existing per-user records or replaces a valid saved session choice.
 
 For the general credential-only fixture, GDM's own
-`org.gnome.login-screen disable-user-list=true` in the `gdm` dconf database
-asks directly for the user name. In run 41230684089 the old Tab count to
-"Not listed?" selected the listed `tunaseeded` instead. The private native
-candidate image retains the normal user list and the separately proven
-bounded navigation reset: the native package repair must qualify the
-ordinary greeter, not that fixture shortcut. The native image's installed
-manifest controls only this setup choice; strict candidate and installed-pair
-admission is still required before any native persistence gate.
+`org.gnome.login-screen disable-user-list=true` asks directly for the user name.
+The fixture inserts its `tuna-vm-fresh-accounts` dconf database ahead of the
+preserved vendor profile and requires an actual `gsettings get` readback of
+`true`. The vendor profile need not contain `system-db:gdm`; writing `gdm.d`
+alone did not apply the setting in run 41234017707. In run 41230684089 the old
+Tab count to "Not listed?" selected the listed `tunaseeded` instead.
+The private native candidate retains the normal user list and the separately
+proven bounded navigation reset: its package repair must qualify the ordinary
+greeter, not that fixture shortcut. The installed manifest controls only this
+setup choice; strict candidate and installed-pair admission is still required
+before any native persistence gate.
+
+The process/logind greeter predicate is not an input-readiness predicate.
+In [run 41248530233](https://github.com/tuna-os/tuna-desktop/actions/runs/41248530233),
+artifact `marlin-vm-orca51` (ID `13061267386`, SHA-256
+`1de554a272722c7640b767cde1f75cfa7603910bd7c0c3cda4b4895f38d79af2`)
+retains a black `fresh-accounts/fresh-greeter.png`; its
+`tunastd-first-password.png` still shows **Username**, not Password, when
+the old driver sends the password. The serial journal records
+`pam_faillock(gdm-password:auth): User unknown` at 19.270579 seconds and no
+user session. The standard counterpart reaches a visible Password prompt
+and authenticates both accounts; its later admin sudo failure is separate.
+The run's PR source is `df05bde92cd4392871db9d36d3d3a21ce43b846b`;
+workflow checkout/manifest metadata is the synthetic merge
+`b4d42581e7299323fd6ead9f76dcd94862990f1c`. Both use published Marlin
+base `sha256:6c1e25b1fa9ddc07d7e71f767456839676333d3ebdc332b642a467f56c8ff71b`;
+the Orca test-layer image ID is
+`sha256:0e3b49a6df3ee644fb9ec4f1dc5b0971da0e6d67b4aedbbc0bedcb5ff116b2e8`.
+
+The general credential-only driver waits for the actual greeter's focused,
+visible, showing, editable, sensitive and enabled AT-SPI entry before
+typing each credential. The probe runs as the active non-root greeter UID,
+binds the accessibility bus PID/UID to the original `gnome-shell` process
+and start time, and distinguishes text from password-text roles without
+reading names or entry contents or invoking accessibility actions.
+Prompt receipts and pre-input frames are retained. Service/greeter readiness
+uses the existing greeter deadline; name, password and session readiness share
+one existing login deadline. There is one credential pair per general-mode
+login, no fixed-sleep increase and no authentication retry. The admitted native
+candidate retains its existing bounded stock-user-list attempts. This fixes
+wrong-phase input in the general fixture; old receipts alone do not identify
+which input was lost during startup.
+
+The first native observer run found 1267 distinct GNOME greeter actors,
+exceeding the unchanged 512-node observation budget when hidden actors were
+enumerated. This was not a cycle (maximum depth 15, no duplicate objects).
+The actual focused username entry had all required flags, and every
+non-root ancestor was SHOWING/VISIBLE. Pruning non-SHOWING branches visits
+131 nodes instead, including hidden branch roots, without changing the
+node/depth/time limits. The application metadata root is exempt from this
+prune because it is not a visible component. This follows the existing
+shell-focus observer's SHOWING traversal rule.
 
 | Gate | Actual operation and evidence |
 | --- | --- |
 | V-FRESH-RECORD-FREE-<user> | Before any login: account exists with a home, no `/var/lib/AccountsService/users/<user>`, no GDM automatic/timed login, `wheel` only for the admin |
 | V-FRESH-CONTROL | The same probe classifies the pre-seeded `tunaseeded` as NOT record-free |
-| V-FRESH-LOGIN-<user>-{first,second,reboot} | GDM's user-name prompt, then the password, typed through QMP; exactly one `gdm-password` VT session of that account runs `tuna-compositor` and no `gnome-shell`/`gnome-session` |
+| V-FRESH-LOGIN-<user>-{first,second,reboot} | General fixture: owner-bound focused editable GDM text and password-text prompts precede QMP credentials. Explicitly admitted native candidate: existing bounded stock-user-list navigation. Both require exactly one `gdm-password` VT session of that account running `tuna-compositor` and no `gnome-shell`/`gnome-session` |
 | V-FRESH-SESSION-<user>-{first,second,reboot} | Read AccountsService's effective `Session` over the system bus: it must be `tuna`; if a cache record exists, any saved `Session` must also be `tuna` |
 | V-FRESH-RECORD-CREATED-<user> | Verified private native candidate only: a physical AccountsService record must exist during the first logged-in session; any saved `Session` must be `tuna` |
 | V-FRESH-SUDO-<user> | `sudo -S -k true` as the account with its password: admin succeeds, standard is refused by sudo policy |
@@ -564,7 +648,6 @@ It does not regenerate the existing GDM payload entries.
 Later Orca and GDM layers must preserve that complete receipt.
 These source and parser checks do not qualify the runtime gates.
 
-
 ### Why a first login need not create a cache file
 
 PR #931 incorrectly required a physical cache file after the first login.
@@ -643,6 +726,95 @@ The Python lane.boot API keeps its original four-value return and original
 VM device profile by default. Lifecycle callers explicitly request
 `guest_agent=True` to add the QGA transport and receive its socket as a fifth
 value; existing performance callers keep working without a guest agent.
+
+## Paired stock-GNOME switcher reference (P-WM01)
+
+The independent DEV profiles `--profile gnome-reference` and
+`--profile tuna-reference` use the existing `scripts/tuna-vm-lane.boot()`,
+raw-disk installer, QMP/QGA transport, native KVM requirement and unchanged
+1280×800 GPU topology. They do not replace either ordinary five-boot Tuna
+lifecycle/Orca row, its tour, fresh-account journey or any existing gate.
+Whenever lane selection includes `marlin-vm`, both paired DEV members and
+their artifact-context consumer are required by the normal aggregate gate.
+There is no dispatch-only, repository-variable or credential skip for them.
+Neither profile is a shipping image or a performance-lane substitute.
+
+`packaging/marlin/vm-lane/Containerfile.reference` derives both members from
+the actual published GNOME 51.1 amd64 manifest
+`sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e8636e44c3f`,
+which belongs to index
+`sha256:29097ba660d6f9f7c35c2063b83cf7bbe830202a497852b9b1869bb84dfd6aa5`
+(tunaOS publication 41254872557, source
+`07022c9fb853fcd36aa27098d50c38a8be0d18ac`). Both add the same current-source
+Tuna package and fixture dependencies using the image's retained package
+databases, never a rolling repository refresh. The build retains the
+original package inventory and GNOME/GDM/session/PAM/application file hashes,
+then refuses any original package-version or file-byte change. Only the
+CI fixture's `tuna-test` UID 1000 AccountsService session selection differs:
+`gnome` versus `tuna`. No automatic login, GNOME keybinding write, GDM theme
+replacement, hidden-session rewrite or Shell.Eval admission is involved.
+
+Before either image build or boot, the normal CI path must verify the exact
+platform digest under the existing TunaOS cosign subject/issuer policy and
+retain its real `platform-cosign.json` output, actual
+`platform-verification.json` process witness and exact `index.json` bytes,
+including the unique linux/amd64 membership. The witness binds the pinned
+Cosign 3.1.4 executable/version, exact subject/issuer-constrained argv, actual
+exit status, command bounds, stderr and original stdout hash. Its successful
+cryptographic invocation remains mandatory; the consumer never treats copied
+JSON as signature verification. Modern Sigstore output names the exact
+repository-at-platform digest and `https://sigstore.dev/cosign/sign/v1`;
+its empty optional object is not fabricated into extracted certificate claims.
+Supply all three files as `--reference-base-evidence`. The published
+wheel-policy receipt identifies the image but does not itself contain a
+signature-verification result.
+CI acquires the pinned cosign binary through the existing Sigstore installer
+action; it does not assume Go is installed on the native runner.
+
+The ordinary platform path uses the same verifier via
+`scripts/lib/vm_gnome_reference.py verify-platform --platform-digest sha256:… --out DIR`:
+it retains the two platform files for the supplied strict digest in
+`ghcr.io/tuna-os/marlin`, with one actual verification invocation and the same
+certificate policy. The shared `validate_platform_verification` consumer binds
+that modern envelope to its process witness without imposing the stock index.
+In contrast, `verify-base --out DIR` and `validate_base_bytes` remain strict
+stock-reference operations: they additionally require exact index29097 bytes
+and unique platform104870 linux/amd64 membership. A different ordinary platform
+witness cannot qualify the paired stock reference.
+
+The fixed route
+`GuestAgent.run("gnome-reference", OP, JSON)` executes only
+`/usr/libexec/tuna-vm-gnome-reference OP JSON`; `OP` is one of `admit`,
+`prepare`, `observe`, `file` or `stop`, with the existing transport deadline
+capped at 30 seconds. Original stock-GDM and logind/native session admission
+comes from this observer. The GNOME path branches before all Tuna DRM-log
+and `TUNA_COMPOSITOR_STATE` readiness loops, without a Tuna fallback.
+After password submission it waits for the same session's actual compositor,
+bus and DRM admission within the existing login deadline. A partially
+started session never causes another password to be typed into the desktop.
+If that unchanged greeter deadline expires, `greeter-before-login.json`
+retains the last actual admission observation and latest transport error,
+including missing original-principal or payload-integrity prerequisites.
+The diagnostic is failure evidence, never admission or a deadline extension.
+The observer queries each logind session property with its own `--property=`
+option, as the existing lifecycle probe does. `loginctl` treats a comma-joined
+value as one property name and returns no properties; it is not `systemctl`'s
+multi-property syntax. Original active-VT, native package and session-owner
+admission stay required; an empty observation is never accepted.
+
+The paired consumer owns its real two Files windows and one Settings window,
+original process/ELF identities, read-only settings, public AT-SPI snapshots,
+physical QMP held-key/Down actions and bracketed framebuffer captures.
+`wm-reference/member.json` and the paired context receipt describe those
+actual observations. AT-SPI bus/object identities are not WM or kernel
+window identities. Context readiness is not a visual-parity verdict and
+does not close P-WM01; the actual paired visual assessment remains required.
+Source changes and controlled transport tests establish no native runtime
+pass. Missing admission, evidence, held-phase observations or strict owned
+cleanup must fail rather than silently skip a member.
+
+
+## Native lifecycle observations
 
 QEMU's guest agent executes a fixed probe with a root UID, while the
 compositor, shell and application clients must belong to the non-root
@@ -759,6 +931,48 @@ input/repaint and unchanged application identity remain mandatory. The prior
 native lifecycle qualification (#265) separately demonstrated locking from
 an unlocked session and two real suspend cycles on the preserved-resource VM
 profile; that evidence does not certify a later candidate automatically.
+
+#### Wake-time process inventory classification
+
+Run `41490837174`, job `125453770508`, on candidate `b8feffef` reached real
+S3 and fresh host GPU resource creation, backing attachment and nonzero
+scanout, but failed `V-SUSPEND`. Original artifact `13170520388` has SHA256
+`a30fbd6ab110c3a863fa92ec079bf47c38a11646f9062ea5b989bb17299f6206`.
+Its `lifecycle/first-resume.json` is already locked and preserves the ordered
+window records and all five original compositor/shell/application process
+identities. The failing identity comparison instead sees one additional
+`tuna-compositor` process, PID `33679`, start ticks `60527`; that process is
+absent from the later repaint inventory. The exact retained PPM body changes
+are `800742/942080` pixels on first resume and `800653/942080` on the last
+locked frame, both above the unchanged 25% fail-closed threshold.
+
+The probe formerly classified private PAM helpers in one `/proc` enumeration
+and then enumerated owned processes separately. A helper born between those
+enumerations could therefore be counted as another desktop compositor.
+**[INFERENCE]** The transient PID is a fresh wake-time PAM helper: the serial
+trace records new password/fingerprint conversations in that interval, but
+the failed artifact does not retain that PID's exact helper flag, parent,
+process group or executable inode. It cannot prove that classification
+retrospectively.
+
+Inventory now reads each scanned compositor's fixed private-helper metadata.
+Exclusion requires the exact private argument shape, live helper state,
+original user's UID, direct parent, own process group, start-time ordering
+and matching executable device/inode. Its parent is reread and must still
+match the unique initial desktop identity, including start ticks; neither a
+numeric PID match nor a reused parent PID is sufficient. Unrelated or
+impostor compositor processes remain identity mismatches. Controlled `/proc`
+regressions cover a helper born between enumerations, unrelated parent/group,
+older start time, wrong arguments/inode, ambiguous desktop identity and PID
+reuse. No application/window comparison, frame threshold, GPU requirement,
+suspend deadline or first-resume lock requirement changes.
+
+The failed run remains failed. A fresh owner-authorized native qualification
+with the corrected installed lifecycle probe must still demonstrate the
+actual first locked wake, exact application geometry/process preservation,
+fresh GPU uploads, stale-auth retirement, fresh authentication and client
+repaint; fixture regressions alone cannot qualify suspend.
+
 
 ### Date & Time restoration and published capability failures
 
