@@ -16,7 +16,8 @@ commit, or --changed) can affect:
   third-party crates, the nested-session launcher, and a ci.yml edit
   outside the lane jobs or to a job that is not a lane) run every lane; with
   --base a ci.yml edit to lane jobs runs only those lanes;
-- docs and other non-runtime files add no lane;
+- docs and other non-runtime files (including tooling of other workflows,
+  see NO_LANE) add no lane;
 - a lane's own proof script, fixtures or packaging runs that lane, and a
   packaged conffile (share/pam.d/) runs journey's lifecycle and every
   package consumer;
@@ -49,10 +50,12 @@ LANES = [
 CORE = ["fprint-phase-proof", "grid-cancel-comparison", "gtk-shell"]
 
 # Interchangeable end-to-end coverage of the same build, rotated per run.
+# marlin-image is not here: ci.yml runs it on push, schedule and dispatch
+# only (it rebuilds what marlin-vm builds), so a pull request rotating it
+# would pay for arch-package and run nothing.
 ROTATION = [
     "journey", "app-content", "scroll-proof", "drm-smoke", "orca-speech",
-    "portal-security", "remote-security", "niri-parity", "marlin-image",
-    "marlin-vm",
+    "portal-security", "remote-security", "niri-parity", "marlin-vm",
 ]
 
 # Lanes that download other lanes' artifacts.
@@ -141,6 +144,23 @@ NO_LANE = [
     "fuzz/*",
     "scripts/tests/*",
     "scripts/lib/*-tests.py",
+    # Products and workflows of their own, never run by a ci.yml lane
+    # (WorkflowSync.test_no_lane_scripts_are_not_run_by_a_lane keeps this
+    # true): corral installed-image tooling, variant qualification, hero
+    # media, the stress, coverage and VM-release workflows, and the
+    # contributor-facing try script and justfile. Each is covered by the
+    # always-on check job and by its own workflow's path filter.
+    "justfile",
+    "scripts/try-tuna-desktop*",
+    "scripts/tuna-corral-*",
+    "scripts/lib/corral_*.py",
+    "scripts/tuna-variant-qualification",
+    "scripts/tuna-hero-media",
+    "scripts/tuna-coverage-report",
+    "scripts/tuna-stress",
+    "scripts/tuna-hotplug-stress",
+    "scripts/lib/vm_release*",
+    "scripts/lib/vm_firstboot_diagnosis.py",
 ]
 
 
