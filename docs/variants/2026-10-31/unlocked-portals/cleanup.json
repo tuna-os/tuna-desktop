@@ -1,0 +1,11 @@
+{
+  "vm": "tuna-q-isg-yf1",
+  "node": "karnataka",
+  "management_environment": {"CORRAL_KUBECTL_TIMEOUT": "30s"},
+  "delete_command": ["corral", "--json", "delete", "tuna-q-isg-yf1", "-f", "--wait", "--timeout", "10m"],
+  "delete_exit": 0,
+  "result": [{"name": "tuna-q-isg-yf1", "deleted": true, "removed": ["virtualmachine.kubevirt.io/tuna-q-isg-yf1", "virtualmachineinstance.kubevirt.io/tuna-q-isg-yf1", "persistentvolumeclaim/tuna-q-isg-yf1-bootc-disk"]}],
+  "post_delete_command": ["corral", "--json", "list", "--prefix", "tuna-q-isg-yf1"],
+  "post_delete_exit": 0,
+  "still_listed": []
+}

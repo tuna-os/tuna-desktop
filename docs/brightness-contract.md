@@ -61,6 +61,14 @@ shell owner PID/UID/start identity, requiring empty inventory, false capability,
 unsupported positive operations and successful harmless resets. Neither proves
 real panel luminance or physical logind permissions.
 
+At the controlled post-`idle-brightness` restore boundary, sysfs readback can
+precede completion of the owned asynchronous logind transaction. The proof
+retries only the exact side-effect-free `brightness update already pending`
+refusal, pacing attempts by up to 50ms within the same five-second absolute
+deadline and 100-attempt cap. Every attempt keeps principal/signal verification
+and its receipt; unrelated errors fail immediately and accepted operations are
+never repeated. This admission pacing changes no device policy or assertion.
+
 Display power saving is the compositor's: DisplayConfig `PowerSaveMode`
 follows Mutter 51 (`crates/compositor/src/power_save.rs`). gsd's blank (3)
 stops scanout and turns every CRTC off on hardware; its unblank (0) repaints

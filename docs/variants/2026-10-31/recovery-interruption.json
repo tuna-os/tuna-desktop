@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "interrupted_matrix": "/tmp/tuna-variant-corrected-20261031/matrix.json",
+  "started": "2026-10-31T19:51:44.876722+00:00",
+  "cause": "Original coordinator stopped on provider authentication/rate-limit failures; no live harness/Corral build process remained when VariantRecover resumed ownership.",
+  "completed_journeys": ["albacore", "skipjack"],
+  "interrupted_variant": "wahoo",
+  "subject": "ghcr.io/tuna-os/wahoo@sha256:865ec5320f25ae368316f07b4d3b49b5e0600308e5bc50b973ace90a5b53a46d",
+  "runtime_verdict": "not-qualified; stopped builder is not a guest runtime failure",
+  "deleted": [
+    "virtualmachine.kubevirt.io/tuna-q-variant-wahoo-31195144-bootc-builder",
+    "secret/tuna-q-variant-wahoo-31195144-bootc-builder-cloudinit",
+    "persistentvolumeclaim/tuna-q-variant-wahoo-31195144-bootc-disk"
+  ],
+  "post_delete_corral_list_prefix_tuna_q_variant": [],
+  "scope": "Only exact owned interrupted builder/base names deleted. Other prefixes, punjab and soak untouched.",
+  "next_run_prerequisite": "InstallSessionGaps unlocked-precondition/timely-consent harness repair; do not reinterpret earlier locked-denial responses as product capture failures."
+}

@@ -1,0 +1,583 @@
+#!/usr/bin/python3
+"""Output hotplug and scale storm on real DRM (#203).
+
+Usage:
+  scripts/tuna-hotplug-stress [--rounds N] [--out DIR]
+
+A vkms configfs instance (Linux 6.19+) with three CRTC/connector pipes is
+the hardware: connector 0 (A) stays connected, B and C are plugged and
+unplugged by writing their configfs `status`, which emits a real udev
+HOTPLUG change on the card. tuna-compositor runs `--backend drm` on it
+under a private seatd with the GTK shell, three real GTK 4 clients (one
+placed on each output by moving a uinput mouse there) and a uinput
+keyboard. Each round plugs B and C, applies a DisplayConfig
+ApplyMonitorsConfig scale and arrangement change (method 1, temporary),
+sometimes unplugs the primary, sometimes rewrites monitors.xml with a
+stored configuration for the next replug, then unplugs C and B. After
+every step it gates on the compositor state (TUNA_COMPOSITOR_STATE):
+  H-OUTPUTS  wl_outputs and DisplayConfig monitors are the connected set
+  H-REHOME   every window is on a live output: its own when connected,
+             else the primary (Mutter's update_for_monitors_changed)
+  H-CLIENTS  every client process lives and keeps getting frames
+  H-SCALE    the applied scale and arrangement reach the outputs
+  H-STORED   a monitors.xml written mid-session configures the replug
+  H-INPUT    Super opens and Escape closes the overview every round
+  H-GROWTH   compositor+shell PSS and fds stay bounded over the storm
+  H-LIVE     the compositor never exits or panics, the shell never exits
+Needs root (sudo) for modprobe, configfs, seatd and uinput.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+CONFIGFS = Path("/sys/kernel/config/vkms")
+INSTANCE = "tuna-hotplug"
+SOCKET = "tuna-hotplug"
+PIPES = 3
+APP_PREFIX = "org.tuna.HotplugStress."
+
+
+def client_worker(name):
+    """A real GTK 4 window that animates every frame and reports, four
+    times a second, how many frames it drew and the monitor GDK places
+    it on."""
+    os.environ.setdefault("GSK_RENDERER", "cairo")
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gdk, Gio, GLib, Gtk
+
+    frames = [0]
+    app = Gtk.Application(application_id=APP_PREFIX + name,
+                          flags=Gio.ApplicationFlags.NON_UNIQUE)
+
+    def activate(app):
+        window = Gtk.ApplicationWindow(application=app, title=f"Hotplug {name}")
+        window.set_default_size(480, 320)
+        area = Gtk.DrawingArea()
+
+        def draw(_area, cr, _width, _height):
+            shade = (frames[0] % 60) / 60
+            cr.set_source_rgb(shade, 0.4, 1 - shade)
+            cr.paint()
+
+        def tick(widget, _clock):
+            frames[0] += 1
+            widget.queue_draw()
+            return GLib.SOURCE_CONTINUE
+
+        area.set_draw_func(draw)
+        area.add_tick_callback(tick)
+        window.set_child(area)
+        window.present()
+
+        def beat():
+            surface = window.get_surface()
+            monitor = surface and Gdk.Display.get_default().get_monitor_at_surface(surface)
+            print(json.dumps({"t": time.monotonic(), "frames": frames[0],
+                              "monitor": monitor.get_connector() if monitor else None}),
+                  flush=True)
+            return GLib.SOURCE_CONTINUE
+
+        GLib.timeout_add(250, beat)
+
+    app.connect("activate", activate)
+    app.run([])
+
+
+def seat_worker():
+    """uinput keyboard and relative mouse (root): one command per stdin
+    line, `key NAME` or `move DX DY`, each answered with `ok`."""
+    from evdev import UInput, ecodes as e
+    keyboard = UInput({e.EV_KEY: list(range(e.KEY_ESC, e.KEY_MICMUTE + 1))},
+                      name="Tuna hotplug keyboard", bustype=e.BUS_VIRTUAL)
+    mouse = UInput({e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
+                    e.EV_REL: [e.REL_X, e.REL_Y]},
+                   name="Tuna hotplug mouse", bustype=e.BUS_VIRTUAL)
+    print("ready", flush=True)
+    for line in sys.stdin:
+        words = line.split()
+        if not words:
+            continue
+        if words[0] == "key":
+            code = getattr(e, words[1])
+            for value in (1, 0):
+                keyboard.write(e.EV_KEY, code, value)
+                keyboard.syn()
+                time.sleep(0.03)
+        elif words[0] == "move":
+            mouse.write(e.EV_REL, e.REL_X, int(words[1]))
+            mouse.write(e.EV_REL, e.REL_Y, int(words[2]))
+            mouse.syn()
+            time.sleep(0.02)
+        else:
+            print(f"error unknown command {words[0]}", flush=True)
+            continue
+        print("ok", flush=True)
+    keyboard.close()
+    mouse.close()
+
+
+def metrics(root_pid):
+    """PSS, RSS and fds of a process and all its descendants."""
+    pairs = subprocess.check_output(["ps", "-eo", "pid=,ppid="], text=True)
+    edges = [tuple(map(int, line.split())) for line in pairs.splitlines()]
+    tree = {root_pid}
+    while True:
+        grown = tree | {pid for pid, parent in edges if parent in tree}
+        if grown == tree:
+            break
+        tree = grown
+    pss, rss, fds = 0, 0, 0
+    for pid in tree:
+        proc = Path(f"/proc/{pid}")
+        try:
+            for line in (proc / "smaps_rollup").read_text().splitlines():
+                parts = line.split()
+                if parts[0] == "Pss:":
+                    pss += int(parts[1])
+                elif parts[0] == "Rss:":
+                    rss += int(parts[1])
+            fds += len(list((proc / "fd").iterdir()))
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            pass
+    return {"pss_kib": pss, "rss_kib": rss, "fds": fds, "processes": len(tree)}
+
+
+def sudo_sh(script):
+    subprocess.run(["sudo", "sh", "-eu", "-c", script], check=True)
+
+
+class Vkms:
+    """The configfs vkms instance: PIPES planes, CRTCs, encoders and
+    connectors, connector 0 connected."""
+
+    def __init__(self):
+        self.path = CONFIGFS / INSTANCE
+        self.card = None
+        self.names = []
+
+    def create(self):
+        subprocess.run(["sudo", "modprobe", "vkms", "create_default_dev=0"], check=True)
+        if not CONFIGFS.is_dir():
+            raise RuntimeError(f"{CONFIGFS} is missing: vkms configfs needs Linux 6.19 or newer "
+                               f"(running {os.uname().release})")
+        lines = [f"C={self.path}", 'mkdir "$C"']
+        for i in range(PIPES):
+            lines += [
+                f'mkdir "$C/planes/plane{i}" "$C/crtcs/crtc{i}" "$C/encoders/encoder{i}" "$C/connectors/connector{i}"',
+                f'echo 1 > "$C/planes/plane{i}/type"',
+                f'ln -s "$C/crtcs/crtc{i}" "$C/planes/plane{i}/possible_crtcs"',
+                f'ln -s "$C/crtcs/crtc{i}" "$C/encoders/encoder{i}/possible_crtcs"',
+                f'ln -s "$C/encoders/encoder{i}" "$C/connectors/connector{i}/possible_encoders"',
+                f'echo {1 if i == 0 else 2} > "$C/connectors/connector{i}/status"',
+            ]
+        lines.append('echo 1 > "$C/enabled"')
+        sudo_sh("\n".join(lines))
+        deadline = time.monotonic() + 10
+        while self.card is None:
+            for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
+                if "-" not in card.name and os.path.realpath(card / "device").endswith(f"/faux/{INSTANCE}"):
+                    self.card = card.name
+            if time.monotonic() > deadline:
+                raise RuntimeError("the vkms configfs instance never appeared as a DRM card")
+            time.sleep(0.1)
+        connectors = sorted(Path("/sys/class/drm").glob(f"{self.card}-*"),
+                            key=lambda p: int(p.name.rsplit("-", 1)[1]))
+        self.names = [p.name.split("-", 1)[1] for p in connectors]
+        if len(self.names) != PIPES:
+            raise RuntimeError(f"expected {PIPES} connectors, found {self.names}")
+        expected = ["connected"] + ["disconnected"] * (PIPES - 1)
+        if [self.sysfs_status(i) for i in range(PIPES)] != expected:
+            raise RuntimeError("connector statuses do not follow configfs order")
+
+    def sysfs_status(self, index):
+        return (Path("/sys/class/drm") / f"{self.card}-{self.names[index]}" / "status").read_text().strip()
+
+    def plug(self, index, connected):
+        sudo_sh(f'echo {1 if connected else 2} > "{self.path}/connectors/connector{index}/status"')
+
+    def destroy(self):
+        if not self.path.exists():
+            return
+        sudo_sh(f"""C={self.path}
+echo 0 > "$C/enabled" || true
+rm -f "$C"/planes/*/possible_crtcs/* "$C"/encoders/*/possible_crtcs/* "$C"/connectors/*/possible_encoders/*
+rmdir "$C"/planes/* "$C"/crtcs/* "$C"/encoders/* "$C"/connectors/* "$C"
+""")
+
+
+def run(args):
+    out = Path(args.out).resolve()
+    if out.exists() and any(out.iterdir()):
+        raise RuntimeError("hotplug artifacts must be a fresh empty directory")
+    out.mkdir(parents=True, exist_ok=True)
+    private = out / "private"
+    private.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(private, 0o700)
+    config = out / "config"
+    config.mkdir()
+    state_path = out / "state.json"
+    env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
+    env.update(XDG_RUNTIME_DIR=str(private), GSK_RENDERER="cairo", GSETTINGS_BACKEND="memory",
+               ADW_DISABLE_PORTAL="1", LIBSEAT_BACKEND="seatd",
+               TUNA_COMPOSITOR_STATE=str(state_path), XDG_CONFIG_HOME=str(config),
+               XDG_STATE_HOME=str(private / "state"), XDG_DATA_HOME=str(private / "data"))
+    logs, processes, samples, steps = [], [], [], []
+    assertions = {}
+    counts = {"hotplugs": 0, "scale_changes": 0, "stored_replugs": 0, "primary_unplugs": 0,
+              "overview_toggles": 0}
+    vkms = Vkms()
+    system_seatd = subprocess.run(["systemctl", "is-active", "--quiet", "seatd"]).returncode == 0
+    seatd = dbus_pid = seat = compositor = None
+    start = time.monotonic()
+
+    def launch(command, name, child_env=None, **kwargs):
+        log = (out / f"{name}.log").open("w")
+        logs.append(log)
+        process = subprocess.Popen(command, env=child_env or env, stdout=kwargs.pop("stdout", log),
+                                   stderr=log, start_new_session=True, **kwargs)
+        processes.append(process)
+        return process
+
+    def state():
+        try:
+            return json.loads(state_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def alive():
+        if compositor is not None and compositor.poll() is not None:
+            raise RuntimeError(f"compositor exited with {compositor.returncode}")
+
+    def wait_for(what, predicate, timeout=15):
+        deadline = time.monotonic() + timeout
+        while True:
+            alive()
+            value = predicate()
+            if value:
+                return value
+            if time.monotonic() > deadline:
+                if state_path.exists():
+                    shutil.copy(state_path, out / "failure-state.json")
+                raise RuntimeError(f"timed out after {timeout}s: {what}")
+            time.sleep(0.1)
+
+    try:
+        vkms.create()
+        A, B, C = vkms.names
+        card = f"/dev/dri/{vkms.card}"
+        print(f"tuna-hotplug-stress: vkms {INSTANCE} at {card}, connectors {vkms.names}")
+
+        if system_seatd:
+            subprocess.run(["sudo", "systemctl", "stop", "seatd"], check=True)
+        seatd = launch(["sudo", "seatd", "-u", os.environ.get("USER") or subprocess.check_output(["id", "-un"], text=True).strip(),
+                        "-g", subprocess.check_output(["id", "-gn"], text=True).strip()], "seatd")
+        wait_for("seatd socket", lambda: Path("/run/seatd.sock").exists(), 10)
+        bus = subprocess.check_output(["dbus-daemon", "--session", "--fork", "--print-address=1",
+                                       "--print-pid=1"], text=True).splitlines()
+        env["DBUS_SESSION_BUS_ADDRESS"], dbus_pid = bus[0], int(bus[1])
+
+        compositor = launch([str(ROOT / "target/debug/tuna-compositor"), "--backend", "drm",
+                             "--socket", SOCKET, "--shell-bin", str(ROOT / "target/debug/tuna-shell-gtk")],
+                            "compositor", env | {"TUNA_DRM_DEVICE": card})
+        log_path = out / "compositor.log"
+        wait_for("the GTK shell's panel on the output",
+                 lambda: any(layer.get("namespace") == "tuna-panel" for layer in state().get("layers", [])), 60)
+        wait_for("DisplayConfig on the session bus",
+                 lambda: "serving org.gnome.Mutter.DisplayConfig" in log_path.read_text(), 30)
+
+        seat = subprocess.Popen(["sudo", sys.executable, str(Path(__file__).resolve()), "--seat"],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=(out / "seat.log").open("w"), text=True, bufsize=1)
+        if seat.stdout.readline().strip() != "ready":
+            raise RuntimeError("the uinput seat did not start; see seat.log")
+
+        def send(command):
+            seat.stdin.write(command + "\n")
+            answer = seat.stdout.readline().strip()
+            if answer != "ok":
+                raise RuntimeError(f"uinput seat answered {answer!r} to {command!r}")
+
+        wait_for("libinput to add the uinput mouse",
+                 lambda: any("Tuna hotplug mouse" in json.dumps(d) for d in state().get("input_devices", [])), 15)
+
+        from gi.repository import Gio, GLib
+        dbus = Gio.DBusConnection.new_for_address_sync(
+            env["DBUS_SESSION_BUS_ADDRESS"],
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+            None, None)
+
+        def display_call(method, args=None, reply=None):
+            return dbus.call_sync("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+                                  "org.gnome.Mutter.DisplayConfig", method, args,
+                                  GLib.VariantType.new(reply) if reply else None,
+                                  Gio.DBusCallFlags.NONE, 10000, None)
+
+        def outputs():
+            return {o["name"]: o for o in state().get("outputs", [])}
+
+        def max_scale(connector):
+            serial, monitors, _logical, _props = display_call(
+                "GetCurrentState", None, "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})").unpack()
+            for spec, modes, _ in monitors:
+                if spec[0] == connector:
+                    current = next(m for m in modes if m[6].get("is-current"))
+                    return current[0], current[1], current[2], max(current[5])
+            raise RuntimeError(f"{connector} is not in GetCurrentState")
+
+        def apply(logical):
+            """ApplyMonitorsConfig method 1: [(connector, x, scale, primary)]."""
+            serial = display_call("GetCurrentState", None,
+                                  "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})").unpack()[0]
+            config = [(x, 0, scale, 0, primary, [(name, max_scale(name)[0], {})])
+                      for name, x, scale, primary in logical]
+            display_call("ApplyMonitorsConfig",
+                         GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})", (serial, 1, config, {})))
+            counts["scale_changes"] += 1
+
+        # Clients, each placed on its own output by the pointer (Mutter
+        # places new windows on the pointer's monitor).
+        clients = {}
+        client_env = env | {"WAYLAND_DISPLAY": SOCKET, "GDK_BACKEND": "wayland"}
+
+        def beats(name):
+            path = out / f"client-{name}.jsonl"
+            rows = []
+            for line in path.read_text().splitlines():
+                if line.startswith("{"):
+                    rows.append(json.loads(line))
+            return rows
+
+        def window(name):
+            return next((w for w in state().get("windows", []) if w.get("app_id") == APP_PREFIX + name), None)
+
+        def point_into(name):
+            def inside():
+                rect = outputs().get(name, {}).get("rect")
+                pos = state().get("pointer_position")
+                if not rect or not pos:
+                    return False
+                cx, cy = rect[0] + rect[2] / 2, rect[1] + rect[3] / 2
+                if abs(pos[0] - cx) < rect[2] / 4 and abs(pos[1] - cy) < rect[3] / 4:
+                    return True
+                send(f"move {max(-60, min(60, int((cx - pos[0]) / 3)))} {max(-60, min(60, int((cy - pos[1]) / 3)))}")
+                return False
+            wait_for(f"the pointer on {name}", inside, 30)
+
+        def open_client(name, on):
+            point_into(on)
+            heartbeat = (out / f"client-{name}.jsonl").open("w")
+            logs.append(heartbeat)
+            clients[name] = (on, launch([sys.executable, str(Path(__file__).resolve()), "--client", name],
+                                        f"client-{name}", client_env, stdout=heartbeat))
+            wait_for(f"client {name} mapped on {on}", lambda: home_ok(name), 30)
+
+        def contains(rect, w):
+            x, y = w["rect"][0] + w["rect"][2] / 2, w["rect"][1] + w["rect"][3] / 2
+            return rect[0] <= x < rect[0] + rect[2] and rect[1] <= y < rect[1] + rect[3]
+
+        def home_ok(name):
+            """The window is on its output when connected, else on the primary."""
+            home = clients[name][0]
+            w = window(name)
+            outs = outputs()
+            primary = next((n for n, o in outs.items() if o["primary"]), None)
+            target = home if home in outs else primary
+            return bool(w and target and contains(outs[target]["rect"], w))
+
+        def check(label, connected, extra=None):
+            """Gate one storm step."""
+            alive()
+            want = sorted(connected)
+            wait_for(f"{label}: wl_outputs are {want}", lambda: sorted(outputs()) == want)
+            wait_for(f"{label}: DisplayConfig lists {want}",
+                     lambda: sorted(m["connector"] for m in state().get("display_config", {}).get("monitors", [])) == want)
+            if extra:
+                wait_for(f"{label}: {extra[0]}", extra[1])
+            for name in clients:
+                wait_for(f"{label}: client {name} on a live output ({clients[name][0]} when connected, "
+                         f"else the primary)", lambda: home_ok(name))
+                prefers = state().get("window_outputs", {}).get(str(window(name)["id"]))
+                if prefers != clients[name][0]:
+                    raise RuntimeError(f"{label}: client {name} now prefers {prefers}, not {clients[name][0]}")
+            marks = {name: (beats(name) or [{"frames": 0}])[-1]["frames"] for name in clients}
+            for name, (_, process) in clients.items():
+                if process.poll() is not None:
+                    raise RuntimeError(f"{label}: client {name} exited with {process.returncode}")
+                wait_for(f"{label}: client {name} keeps drawing frames",
+                         lambda: (beats(name) or [{"frames": 0}])[-1]["frames"] > marks[name] + 2, 10)
+            snapshot = state()
+            steps.append({"step": label, "elapsed_s": round(time.monotonic() - start, 3),
+                          "outputs": snapshot.get("outputs"),
+                          "windows": {n: window(n)["rect"] for n in clients},
+                          "gdk_monitors": {n: (beats(n) or [{}])[-1].get("monitor") for n in clients}})
+
+        def plug(index, connected_after, label):
+            vkms.plug(index, index in connected_after)
+            counts["hotplugs"] += 1
+            check(label, [vkms.names[i] for i in sorted(connected_after)])
+
+        def overview():
+            send("key KEY_LEFTMETA")
+            wait_for("Super opens the overview", lambda: state().get("overview_open") is True)
+            send("key KEY_ESC")
+            wait_for("Escape closes the overview", lambda: state().get("overview_open") is False)
+            counts["overview_toggles"] += 1
+
+        def write_monitors_xml(logical):
+            body = "".join(
+                f"<logicalmonitor><x>{x}</x><y>0</y><scale>{scale!r}</scale>"
+                f"<primary>{'yes' if primary else 'no'}</primary>"
+                f"<monitor><monitorspec><connector>{name}</connector></monitorspec></monitor>"
+                f"</logicalmonitor>" for name, x, scale, primary in logical)
+            (config / "monitors.xml").write_text(
+                f'<monitors version="2"><configuration>{body}</configuration></monitors>\n')
+
+        check("start", [A])
+        open_client("A", A)
+        baseline = None
+        for r in range(args.rounds):
+            plug(1, {0, 1}, f"round {r}: plug {B}")
+            if r == 0:
+                open_client("B", B)
+            plug(2, {0, 1, 2}, f"round {r}: plug {C}")
+            if r == 0:
+                open_client("C", C)
+            # Scale and arrangement: B moves to the end, at its largest
+            # supported scale on even rounds; A takes it on odd ones.
+            _, width, height, top = max_scale(B)
+            scaled = A if r % 2 else B
+            scale = {A: 1.0, B: 1.0, C: 1.0} | {scaled: top}
+            wa = round(width / scale[A])
+            apply([(A, 0, scale[A], True), (C, wa, 1.0, False), (B, wa + width, scale[B], False)])
+            check(f"round {r}: {scaled} at scale {top:g}, {B} after {C}", [A, B, C],
+                  (f"{scaled} {round(width / top)}x{round(height / top)} logical and {B} at x={wa + width}",
+                   lambda: outputs().get(scaled, {}).get("rect", [0, 0, 0])[2:] == [round(width / top), round(height / top)]
+                   and outputs().get(B, {}).get("rect", [0])[0] == wa + width))
+            overview()
+            if r % 3 == 2:
+                plug(0, {1, 2}, f"round {r}: unplug the primary {A}")
+                counts["primary_unplugs"] += 1
+                plug(0, {0, 1, 2}, f"round {r}: replug {A}")
+            plug(2, {0, 1}, f"round {r}: unplug {C}")
+            if r % 2 == 1:
+                # A configuration GNOME Settings kept for A+B: B left of A,
+                # scaled. The next replug of B must use it.
+                bw = round(width / top)
+                write_monitors_xml([(B, 0, top, False), (A, bw, 1.0, True)])
+                plug(1, {0}, f"round {r}: unplug {B} with a stored configuration")
+                plug(1, {0, 1}, f"round {r}: replug {B} into the stored configuration")
+                check(f"round {r}: stored configuration applied", [A, B],
+                      (f"{B} at 0 scale {top:g}, {A} primary at {bw}",
+                       lambda: outputs().get(B, {}).get("rect") == [0, 0, bw, round(height / top)]
+                       and outputs().get(A, {}).get("rect", [0])[0] == bw and outputs()[A]["primary"]))
+                counts["stored_replugs"] += 1
+                (config / "monitors.xml").unlink()
+            plug(1, {0}, f"round {r}: unplug {B}")
+            alive()
+            value = metrics(compositor.pid)
+            value.update(round=r, elapsed_s=round(time.monotonic() - start, 3))
+            samples.append(value)
+            with (out / "metrics.jsonl").open("a") as stream:
+                stream.write(json.dumps(value) + "\n")
+            if r == 0:
+                baseline = value
+            print(f"tuna-hotplug-stress: round {r + 1}/{args.rounds} passed "
+                  f"(PSS {value['pss_kib']} KiB, {value['fds']} fds)", flush=True)
+
+        assertions["H-OUTPUTS"] = [True, f"{counts['hotplugs']} hotplugs; wl_outputs and DisplayConfig matched the connected set after each"]
+        assertions["H-REHOME"] = [True, f"{len(clients)} windows on their own output when connected, else the primary, after every step"]
+        assertions["H-CLIENTS"] = [True, f"{len(clients)} GTK 4 clients alive and drawing after every step"]
+        assertions["H-SCALE"] = [True, f"{counts['scale_changes']} ApplyMonitorsConfig scale/arrangement changes applied"]
+        assertions["H-STORED"] = [counts["stored_replugs"] > 0 or args.rounds < 2,
+                                  f"{counts['stored_replugs']} replugs configured by a rewritten monitors.xml"]
+        assertions["H-INPUT"] = [True, f"{counts['overview_toggles']} uinput overview toggles"]
+        final = samples[-1]
+        # Diagnostic limits for a bounded storm, as tuna-stress's.
+        pss_limit = baseline["pss_kib"] * 1.25 + 65536
+        fd_limit = baseline["fds"] + 32
+        assertions["H-GROWTH"] = [final["pss_kib"] <= pss_limit and final["fds"] <= fd_limit,
+                                  f"PSS {final['pss_kib']}/{int(pss_limit)} KiB; fds {final['fds']}/{fd_limit}"]
+        text = (out / "compositor.log").read_text()
+        assertions["H-LIVE"] = [compositor.poll() is None and "panicked" not in text
+                                and "ShellExited" not in text,
+                                "compositor alive without panic; the shell never exited"]
+    except Exception as error:
+        assertions["H-HARNESS"] = [False, f"{type(error).__name__}: {error}"]
+    finally:
+        if seat is not None:
+            seat.stdin.close()
+            try:
+                seat.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                subprocess.run(["sudo", "kill", str(seat.pid)])
+        for process in reversed(processes):
+            if process is seatd:
+                continue
+            if process.poll() is None:
+                os.killpg(process.pid, 15)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, 9)
+                    process.wait()
+        if seatd is not None:
+            subprocess.run(["sudo", "pkill", "-P", str(seatd.pid)])
+            seatd.wait(timeout=5)
+        if system_seatd:
+            subprocess.run(["sudo", "systemctl", "start", "seatd"])
+        if dbus_pid:
+            try:
+                os.kill(dbus_pid, 15)
+            except ProcessLookupError:
+                pass
+        for log in logs:
+            log.close()
+        try:
+            vkms.destroy()
+        except subprocess.CalledProcessError as error:
+            print(f"tuna-hotplug-stress: vkms teardown: {error}", file=sys.stderr)
+        (out / "assertions.txt").write_text("".join(
+            f"{name} {'pass' if value[0] else 'fail'} {value[1]}\n" for name, value in assertions.items()))
+        (out / "report.json").write_text(json.dumps({
+            "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+            "rounds": args.rounds, "kernel": os.uname().release, "connectors": vkms.names,
+            "counts": counts, "samples": samples, "steps": steps, "assertions": assertions,
+            "growth_limit": "round-0 PSS * 1.25 + 64 MiB; round-0 fd count + 32",
+            "scope": "vkms connector hotplug, DisplayConfig scale/arrangement and monitors.xml; "
+                     "real panels, EDIDs and multi-GPU are not covered",
+        }, indent=2))
+    if not assertions or not all(value[0] for value in assertions.values()):
+        failures = [f"{name}: {value[1]}" for name, value in assertions.items() if not value[0]]
+        detail = "; ".join(failures) if failures else "no assertions were recorded"
+        raise SystemExit(f"tuna-hotplug-stress: hotplug gate failed: {detail}; evidence: "
+                         f"{out / 'assertions.txt'}, {out / 'report.json'}, {out / 'compositor.log'}")
+    print("tuna-hotplug-stress: hotplug, rehoming, scale, stored-configuration, input and growth gates passed")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--out", default="hotplug-artifacts")
+    parser.add_argument("--client", help=argparse.SUPPRESS)
+    parser.add_argument("--seat", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.client:
+        client_worker(args.client)
+    elif args.seat:
+        seat_worker()
+    else:
+        if args.rounds < 1:
+            parser.error("--rounds must be at least 1")
+        run(args)
+
+
+if __name__ == "__main__":
+    main()

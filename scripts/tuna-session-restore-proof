@@ -178,7 +178,7 @@ try:
     wait(bus.exists, "session bus")
     env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
     r, w = os.pipe()
-    spawn(["Xvfb", "-displayfd", str(w), "-screen", "0", f"{WIDTH}x{HEIGHT}x24", "-nolisten", "tcp", "-noreset"],
+    spawn([str(ROOT / "scripts/lib/tuna-xvfb"), "-displayfd", str(w), "-screen", "0", f"{WIDTH}x{HEIGHT}x24", "-nolisten", "tcp", "-noreset"],
           "xvfb", pass_fds=(w,))
     os.close(w)
     number = b""

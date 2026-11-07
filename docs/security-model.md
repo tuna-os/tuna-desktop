@@ -173,6 +173,53 @@ Each interface checks its caller itself. The main policies:
 Neither `UNRESTRICTED` variable is set by the packaged session
 (`share/wayland-sessions/tuna.desktop`, `crates/compositor/src/bin/tuna-session.rs`).
 
+### Native CI reference observer (not product authority)
+
+`packaging/marlin/vm-lane/tuna-vm-gnome-reference` is a fixed, finite CI
+fixture, not a capture grant or a product authorization mechanism. Its root
+controller owns `/proc` executable/start-generation observations and private
+receipts. Its UID1000 child reads existing public Gio settings and AT-SPI
+objects only. Same-UID access to `/proc/<pid>/exe` is **not** assumed:
+an actual bus daemon can be non-dumpable without invalidating that daemon.
+The fixture does not change dumpability, ptrace policy, proc mounts or bus
+security policy.
+
+The child inherits one private packet socketpair, with no listener or host
+service. Each request is bound to the spawned child's kernel
+`SCM_CREDENTIALS` and independently pinned process generation; socketpair
+`SO_PEERCRED` identifies its creator and is not used as sender identity.
+Requests cannot supply a PID, executable, command or arbitrary bus address.
+Only the existing admitted session bus and the accessibility address
+independently read from its pinned `org.a11y.Bus` owner are eligible.
+Session-bus owner queries are limited to that launcher and Mutter
+DisplayConfig. Accessibility owner queries are limited to the registry and
+unique application names in its actual root inventory, refreshed for later
+fixture launches.
+
+For a socket observation the child transfers exactly one connected Gio FD.
+The controller only inspects its address and kernel `SO_PEERCRED`; it never
+reads, authenticates or issues D-Bus calls on the child's stream. It compares
+that peer with its own independently connected fixed bus and original
+process/socket pins. Separate root-owned read-only, no-autostart connections
+resolve exact bus owners to UID/PID and `/proc` executable/hash/start/boot
+identities before and after observation. Returned child receipts must match
+those independent identities. Truncated packets, foreign senders, extra or
+missing FDs, changed peers and unobserved owners fail closed; received FDs
+are closed on success and failure. Packets are bounded to 64 KiB, requests
+to 12010, trees to 6000 nodes, and all work shares the existing at-most-25s
+operation deadline, including connection authentication.
+
+The first terminal operation failure is retained through stop and missing
+file probes; the host retrieves it before probing other receipts. This
+preserves cause, not a pass: run `41490837174`'s Tuna reference artifact
+`13168047462` recorded the UID1000 `/proc/1789/exe` permission failure.
+The GNOME artifact `13166824093` retained only a later missing
+`snapshot.json` file error after its original prepare failure was
+overwritten. Its original cause cannot be recovered from the retained
+member, serial command trace or job log. Controlled semantic regressions
+are not native qualification; fresh actual reference evidence and physical
+UI classification remain required for both legs.
+
 ## Current state compared with the target
 
 | Area | Today on `main` | Target |

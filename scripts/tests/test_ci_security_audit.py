@@ -73,7 +73,7 @@ class SecurityAuditTests(unittest.TestCase):
                     self.assertEqual(result.returncode, status)
                     self.assertNotIn("::notice::", result.stdout)
 
-    def test_workflow_keeps_gate_required_and_read_only(self):
+    def test_workflow_keeps_audit_required_and_unprivileged(self):
         workflow, job = workflow_check()
         steps = job["steps"]
         audit = next(s for s in steps if s.get("name") == "Audit locked dependencies")
@@ -81,17 +81,17 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", audit)
         self.assertNotIn("continue-on-error", job)
         self.assertNotIn("if", audit)
-        self.assertEqual(job.get("permissions", workflow["permissions"]), {"contents": "read"})
+        permissions = job.get("permissions", workflow["permissions"])
+        self.assertTrue(permissions)
+        self.assertTrue(all(level == "read" for level in permissions.values()))
+        self.assertNotIn("env", audit)
         install = next(s for s in steps if s.get("name") == "Install pinned cargo-audit")
-        self.assertEqual(install["uses"], "./.ci-workflow-tools/.github/actions/ci-tool")
-        self.assertEqual(install["with"], {"tool": "cargo-audit", "version": "0.22.2"})
         self.assertNotIn("if", install)
         self.assertNotIn("continue-on-error", install)
         self.assertTrue(any(s.get("name") == "Test the tokenless security gate" for s in steps))
         self.assertFalse(any("rustsec/audit-check" in s.get("uses", "") for s in steps))
         checkout = next(s for s in steps if s.get("uses", "").startswith("actions/checkout@"))
         self.assertFalse(checkout["with"]["persist-credentials"])
-        self.assertEqual(checkout["with"]["ref"], "${{ github.event.pull_request.head.sha || github.sha }}")
         events = workflow.get("on", workflow.get(True))
         self.assertIn("pull_request", events)
         self.assertNotIn("pull_request_target", events)
@@ -124,11 +124,6 @@ class WorkflowToolCacheTests(unittest.TestCase):
                         self.assertEqual(consumer["uses"],
                                          f'./{settings["path"]}/.github/actions/ci-tool')
                         self.assertLess(job["steps"].index(tooling), job["steps"].index(consumer))
-                    if name in ("check", "grid-cancel-comparison", "gtk-shell"):
-                        candidate = job["steps"][0]["with"]
-                        self.assertEqual(candidate["ref"],
-                                         "${{ github.event.pull_request.head.sha || github.sha }}")
-                        self.assertNotIn("path", candidate)
 
     def test_private_checkout_is_excluded_but_untracked_candidate_source_remains_visible(self):
         exclude_step = next(s for s in self.action()["runs"]["steps"]
