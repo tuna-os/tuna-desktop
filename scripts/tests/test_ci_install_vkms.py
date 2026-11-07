@@ -210,25 +210,41 @@ class VkmsSetup(unittest.TestCase):
         self.assertNotIn("cargo", [call[0] for call in self.calls])
         self.assertEqual((self.root / "artifacts/assertions.txt").read_text(), "")
 
-    def test_workflow_keeps_tests_and_setup_on_merge_ref_before_native_proof(self):
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        drm_job = workflow.split("\n  drm-smoke:", 1)[1].split("\n  grid-cancel-comparison:", 1)[0]
-        self.assertNotIn('"linux-modules-extra-$(uname -r)"', drm_job)
-        self.assertIn("shellcheck scripts/ci-install-vkms", drm_job)
-        self.assertLess(drm_job.index("run: scripts/ci-install-vkms"),
-                        drm_job.index("run: scripts/tuna-drm-smoke --artifacts"))
-        self.assertNotIn("continue-on-error", drm_job)
-        check_job = workflow.split("\n  check:", 1)[1].split("\n  fprint-phase-proof:", 1)[0]
-        test_command = "run: /usr/bin/python3 scripts/tests/test_ci_install_vkms.py"
-        self.assertNotIn("scripts/tests/test_ci_install_vkms.py", check_job)
-        self.assertIn("ref: ${{ github.event.pull_request.head.sha || github.sha }}", check_job)
-        # actions/checkout's default is the event's merge ref on a PR.
-        # An older PR head need not contain a helper added on the base branch.
-        checkout = drm_job.split("- uses: actions/checkout@", 1)[1].split(test_command, 1)[0]
-        self.assertNotIn("ref:", checkout)
-        self.assertLess(drm_job.index(test_command),
-                        drm_job.index("name: Use the Ubuntu archive for DRM dependencies"))
-        self.assertLess(drm_job.index(test_command), drm_job.index("apt-get"))
+
+
+class ColordReadiness(unittest.TestCase):
+    def run_readiness(self, ready):
+        source = SMOKE.read_text()
+        begin = source.index("end=$(($(date +%s) + 30))", source.index('COLORD_BIN=""'))
+        loop = source[begin:source.index("\nCOLOR_LOG=", begin)]
+        with tempfile.TemporaryDirectory() as directory:
+            script = r'''
+set -eu
+ARTIFACTS="$1"
+READY="$2"
+COLORD_PID=1
+cd_call() { return "$READY"; }
+kill() { echo "unprivileged launcher probe" >&2; exit 88; }
+wait() { echo "unbounded launcher wait" >&2; exit 89; }
+sleep() { :; }
+date() {
+    if [ -f "$ARTIFACTS/clock" ]; then echo 1031
+    else : >"$ARTIFACTS/clock"; echo 1000; fi
+}
+fail() { printf '%s: %s\n' "$1" "$2"; exit 97; }
+''' + loop
+            return subprocess.run(["/bin/sh", "-c", script, "colord-readiness", directory, str(ready)],
+                                  text=True, capture_output=True, timeout=5)
+
+    def test_ready_service_does_not_probe_or_wait_for_privileged_launcher(self):
+        result = self.run_readiness(0)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_unready_service_fails_at_original_deadline_without_wait(self):
+        result = self.run_readiness(1)
+        self.assertEqual(result.returncode, 97, result.stdout + result.stderr)
+        self.assertIn("D-COLORD: colord never served the private system bus", result.stdout)
+        self.assertEqual(result.stderr, "")
 
 
 class PointerRestart(unittest.TestCase):

@@ -6,6 +6,7 @@ import importlib.util
 import io
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -65,6 +66,7 @@ class Rules(unittest.TestCase):
         ("cargo test --lib roost_transport_bounds", "cargo test --lib roost_transport_bounds"),
         ("See third-party/reis/ROOST-PATCH.md.", "See third-party/reis/ROOST-PATCH.md."),
         ("see docs/perf/2026-10-06-417b77a/roost/report.json", "see docs/perf/2026-10-06-417b77a/roost/report.json"),
+        ("see docs/variants/2026-10-31/roost/payload.json", "see docs/variants/2026-10-31/roost/payload.json"),
         ("Tuna Desktop was previously named Roost.", "Tuna Desktop was previously named Roost."),
         ("Formerly **Roost**. Binaries", "Formerly **Roost**. Binaries"),
         ("# Arch package for Tuna Desktop (formerly Roost).", "# Arch package for Tuna Desktop (formerly Roost)."),
@@ -95,11 +97,14 @@ class Rules(unittest.TestCase):
         self.assertEqual(R.rename_path("share/wayland-sessions/roost.desktop"), "share/wayland-sessions/tuna.desktop")
         for kept in ("docs/perf/2026-10-04-x/roost-report.json", "third-party/smithay/ROOST-PATCH.md",
                      ".spektacular/x/roost.md", "crates/shell-gtk/osk-layouts/emoji.json",
+                     "docs/variants/2026-10-31/yellowfin/tunaos.toml",
                      "tests/protocols/marlin-roost-wayland-info.txt", "scripts/rename-to-tuna"):
             self.assertTrue(R.kept_path(kept), kept)
         self.assertFalse(R.kept_path("docs/perfect.md"))
         self.assertFalse(R.kept_path("docs/perf/README.md"))
         self.assertFalse(R.kept_path("docs/niri-parity.md"))
+        self.assertFalse(R.kept_path("docs/variants/README.md"))
+        self.assertFalse(R.kept_path("docs/v1-variant-qualification.md"))
 
 
     def test_only_two_exact_bridge_filenames_survive_rename(self):
@@ -229,6 +234,33 @@ class Checkout(unittest.TestCase):
         self.assertEqual(self.run_script("--check")[0], 0)
         self.assertEqual(self.run_script()[0], 0)
         self.assertEqual(tree_digest(self.root), after, "a second run must change nothing")
+
+    def test_cli_preserves_dated_variant_bytes_but_checks_living_docs(self):
+        historical = {
+            "docs/variants/2026-10-31/tunaos.toml": b'id = "roost"\n',
+            "docs/variants/2026-10-31/roost-payload.json": b'{"path":"etc/pam.d/roost-lock"}\n',
+        }
+        living = ("docs/variants/README.md", "docs/v1-variant-qualification.md")
+        for rel, data in historical.items():
+            path = self.root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        for rel in living:
+            (self.root / rel).write_text("Run Roost.\n")
+        hashes = {rel: hashlib.sha256(data).hexdigest() for rel, data in historical.items()}
+        command = [sys.executable, str(SCRIPT), "--root", str(self.root), "--no-cargo"]
+        checked = subprocess.run(command + ["--check"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(checked.returncode, 1)
+        for rel in living:
+            self.assertIn("would rewrite " + rel, checked.stdout)
+        for rel in historical:
+            self.assertNotIn(rel, checked.stdout)
+        renamed = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        self.assertEqual(renamed.returncode, 0, renamed.stdout + renamed.stderr)
+        for rel in historical:
+            self.assertEqual(hashlib.sha256((self.root / rel).read_bytes()).hexdigest(), hashes[rel])
+        for rel in living:
+            self.assertEqual(self.read(rel), "Run Tuna Desktop.\n")
 
     def test_existing_destination_is_reported_not_clobbered(self):
         (self.root / "scripts/tuna-journey").write_text("mine\n")
