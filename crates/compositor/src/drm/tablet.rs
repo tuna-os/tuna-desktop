@@ -26,7 +26,6 @@
 //! (`events.c`'s `current_pad_osd`).
 
 use std::collections::BTreeSet;
-use std::ffi::CStr;
 
 use smithay::backend::input::TabletToolDescriptor;
 use smithay::reexports::input as li;
@@ -46,6 +45,7 @@ use tuna_shell_control::{
     PadOsd, PadOsdButton, PadOsdEvent, PadOsdLabels, PadOsdPad, PadOsdTarget,
 };
 
+use super::libinput::libinput_symbol;
 use super::libwacom::{Libwacom, WacomInfo};
 use crate::tablet::{
     map_tool_button, stylus_pressure, stylus_settings_path, tablet_settings_path, ButtonAction,
@@ -211,15 +211,6 @@ fn pad_descriptor(device: &li::Device) -> TabletPadDescriptor {
 /// The evdev node libwacom and GNOME Settings name a device by.
 fn devnode(device: &li::Device) -> String {
     format!("/dev/input/{}", device.sysname())
-}
-
-/// A libinput function newer than the pinned bindings, from the libinput
-/// this process runs against.
-fn libinput_symbol(name: &CStr) -> Option<*mut libc::c_void> {
-    // SAFETY: dlsym with RTLD_DEFAULT and a NUL-terminated name only looks
-    // the symbol up in the already loaded objects.
-    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
-    (!symbol.is_null()).then_some(symbol)
 }
 
 type PressureRangeSet = unsafe extern "C" fn(*mut li::ffi::libinput_tablet_tool, f64, f64) -> u32;
