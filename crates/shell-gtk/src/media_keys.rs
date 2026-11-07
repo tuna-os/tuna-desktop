@@ -2,7 +2,6 @@
 //! Mutations are serialized and each external call has a five-second bound.
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::io::Write;
 use std::rc::{Rc, Weak};
 
 use gio::prelude::*;
@@ -38,8 +37,7 @@ pub(crate) fn trace(stage: &str, details: serde_json::Value, locked: bool) {
     });
     #[cfg(test)]
     DIAGNOSTIC_ROWS.with_borrow_mut(|rows| rows.push(record.clone()));
-    let line = format!("tuna-media-diagnostic: {record}\n");
-    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+    eprintln!("tuna-media-diagnostic: {record}");
 }
 
 pub(crate) fn trace_enabled() -> bool {
@@ -500,7 +498,7 @@ mod tests {
 #[cfg(test)]
 mod completion_tests {
     use super::*;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};

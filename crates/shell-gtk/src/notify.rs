@@ -480,7 +480,8 @@ struct Card {
 /// NotificationMessage): a header with the source icon, app name, time
 /// and close button, then the title and body. Banner and list cards
 /// alike carry GNOME's message role (`Atk.Role.NOTIFICATION`, GTK's
-/// alert).
+/// alert). Delete or BackSpace with the keyboard focus on the card
+/// presses Close, as GNOME's Message binds them (`_closeIfAllowed`).
 fn card(n: &Notification) -> Card {
     let card = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -542,6 +543,20 @@ fn card(n: &Notification) -> Card {
     if !n.body().is_empty() {
         card.update_property(&[gtk::accessible::Property::Description(n.body())]);
     }
+    let keys = gtk::EventControllerKey::new();
+    {
+        let close = close.downgrade();
+        keys.connect_key_pressed(move |_, key, _, state| match close.upgrade() {
+            Some(close)
+                if closes_message(key, state) && close.is_visible() && close.is_sensitive() =>
+            {
+                close.emit_clicked();
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        });
+    }
+    card.add_controller(keys);
     Card {
         widget: card,
         close,
@@ -564,6 +579,18 @@ pub fn announcement(source: &str, summary: &str, body: &str) -> String {
     text
 }
 
+/// messageList.js's Message key bindings: BackSpace and Delete, without
+/// modifiers, close the focused message.
+pub fn closes_message(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
+    use gtk::gdk::{Key, ModifierType};
+    let mods = state
+        & (ModifierType::SHIFT_MASK
+            | ModifierType::CONTROL_MASK
+            | ModifierType::ALT_MASK
+            | ModifierType::SUPER_MASK);
+    mods.is_empty() && matches!(key, Key::Delete | Key::KP_Delete | Key::BackSpace)
+}
+
 /// A notification's source name and icon: the app's own when its
 /// desktop entry is known, else the sender's name and app_icon
 /// (notificationDaemon.js).
@@ -578,7 +605,7 @@ fn source_of(n: &Notification) -> (String, Option<gio::Icon>) {
 }
 
 /// The installed app a `desktop-entry` hint names, if any.
-fn desktop_app(id: &str) -> Option<tuna_shell_host::apps::AppEntry> {
+pub(crate) fn desktop_app(id: &str) -> Option<tuna_shell_host::apps::AppEntry> {
     tuna_shell_host::apps::default_app_dirs()
         .into_iter()
         .map(|dir| dir.join(format!("{id}.desktop")))
@@ -588,7 +615,7 @@ fn desktop_app(id: &str) -> Option<tuna_shell_host::apps::AppEntry> {
 
 /// A `Notify` app_icon as GNOME reads it: a file URI, an absolute path,
 /// or an icon name.
-fn source_icon(icon: &str) -> Option<gio::Icon> {
+pub(crate) fn source_icon(icon: &str) -> Option<gio::Icon> {
     if icon.is_empty() {
         None
     } else if icon.starts_with("file://") {
@@ -647,19 +674,6 @@ impl NotifyUi {
             banner_window.set_margin(Edge::Top, 0);
             banner_window.set_keyboard_mode(KeyboardMode::None);
         }
-        let keys = gtk::EventControllerKey::new();
-        let banner_weak = banner_window.downgrade();
-        keys.connect_key_pressed(move |_, key, _, _| {
-            if key == gtk::gdk::Key::Escape {
-                if let Some(window) = banner_weak.upgrade() {
-                    window.set_keyboard_mode(KeyboardMode::None);
-                }
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
-            }
-        });
-        banner_window.add_controller(keys);
         banner_window.set_title(Some("Notifications"));
         let banner_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
         let banner_bin = crate::transient::MotionBin::new(&banner_box);
@@ -752,6 +766,23 @@ impl NotifyUi {
                     ui.update();
                 }
             });
+        }
+        {
+            // Escape on the focused banner (messageTray.js binds it on the
+            // tray): release the keyboard and expire the banner, which
+            // slides out and stays in the list (`_expireNotification`).
+            let keys = gtk::EventControllerKey::new();
+            let weak = Rc::downgrade(&ui);
+            keys.connect_key_pressed(move |_, key, _, _| {
+                if key != gtk::gdk::Key::Escape {
+                    return glib::Propagation::Proceed;
+                }
+                if let Some(me) = weak.upgrade() {
+                    me.expire_banner();
+                }
+                glib::Propagation::Stop
+            });
+            ui.banner_window.add_controller(keys);
         }
         {
             let me = ui.clone();
@@ -1061,6 +1092,40 @@ impl NotifyUi {
         self.update();
     }
 
+    /// Escape on the focused banner (messageTray.js's `close` binding,
+    /// `_expireNotification`): the keyboard goes back and the banner on
+    /// screen expires as its timeout would, critical or not, sliding out
+    /// and staying in the list.
+    fn expire_banner(self: &Rc<Self>) {
+        if self.banner_window.is_layer_window() {
+            self.banner_window.set_keyboard_mode(KeyboardMode::None);
+        }
+        if let (TrayState::Showing | TrayState::Shown, Some(id)) =
+            (self.tray.get(), self.showing.get())
+        {
+            self.expire(id);
+        }
+        self.update();
+    }
+
+    /// Expire the banner `id`: it leaves the banner queue as timed out.
+    fn expire(self: &Rc<Self>, id: u64) {
+        self.expired.set(Some(id));
+        let _ = self.bus.borrow().dismiss_banner(id as u32, REASON_EXPIRED);
+        self.retire_local_actions(id);
+    }
+
+    /// Escape in the date menu while a group is expanded collapses it and
+    /// keeps the menu open (calendar.js's message list key controller).
+    /// Returns whether a group collapsed.
+    pub fn collapse_expanded(self: &Rc<Self>) -> bool {
+        let keys: Vec<String> = self.expanded.borrow().iter().cloned().collect();
+        for key in &keys {
+            self.set_expanded(key, false);
+        }
+        !keys.is_empty()
+    }
+
     /// Claim the bus (retrying every [`BUS_RETRY`] while it is not
     /// ours), expire the banner on screen, redraw on change, and arm the
     /// next wake: its deadline, or an away user's return. Runs on every
@@ -1068,9 +1133,7 @@ impl NotifyUi {
     fn update(self: &Rc<Self>) {
         self.ensure_bus();
         for id in self.banner_due().expired {
-            self.expired.set(Some(id));
-            let _ = self.bus.borrow().dismiss_banner(id as u32, REASON_EXPIRED);
-            self.retire_local_actions(id);
+            self.expire(id);
         }
         self.refresh();
         // After the refresh, which can bring the next banner on.
@@ -1863,6 +1926,19 @@ impl NotifyUi {
             members.iter().map(|n| n.id).collect::<Vec<_>>(),
         );
         close.connect_clicked(move |_| me.remove(&ids));
+        // The collapsed group's focus is the group itself; Delete closes
+        // its top message, which closes the whole collapsed group
+        // (messageList.js NotificationMessageGroup's `close` handler).
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            if closes_message(key, state) {
+                close.emit_clicked();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        group.add_controller(keys);
         group
     }
 
@@ -1920,6 +1996,28 @@ mod group_tests {
             announcement("Tuna Proof", "Build finished", ""),
             "Notification, Tuna Proof, Build finished"
         );
+    }
+
+    #[test]
+    fn delete_and_backspace_close_messages_without_modifiers() {
+        use gtk::gdk::{Key, ModifierType};
+        let none = ModifierType::empty();
+        for key in [Key::Delete, Key::KP_Delete, Key::BackSpace] {
+            assert!(closes_message(key, none), "{key:?}");
+            // Lock state is not a modifier binding (Num Lock, Caps Lock).
+            assert!(closes_message(key, ModifierType::LOCK_MASK), "{key:?}");
+            for held in [
+                ModifierType::SHIFT_MASK,
+                ModifierType::CONTROL_MASK,
+                ModifierType::ALT_MASK,
+                ModifierType::SUPER_MASK,
+            ] {
+                assert!(!closes_message(key, held), "{key:?} {held:?}");
+            }
+        }
+        for key in [Key::Return, Key::space, Key::Escape, Key::d] {
+            assert!(!closes_message(key, none), "{key:?}");
+        }
     }
 
     #[test]

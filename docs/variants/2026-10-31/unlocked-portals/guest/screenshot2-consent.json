@@ -1,0 +1,77 @@
+[
+  {
+    "role": "application",
+    "name": "xdg-desktop-portal-gtk",
+    "showing": false
+  },
+  {
+    "role": "alert",
+    "name": "Question",
+    "showing": true
+  },
+  {
+    "role": "filler",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "label",
+    "name": "",
+    "showing": false
+  },
+  {
+    "role": "filler",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "filler",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "icon",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "filler",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "label",
+    "name": "Allow Applications to Take Screenshots?",
+    "showing": true
+  },
+  {
+    "role": "label",
+    "name": "An application wants to be able to take screenshots at any time.",
+    "showing": true
+  },
+  {
+    "role": "label",
+    "name": "This permission can be changed at any time from the privacy settings.",
+    "showing": true
+  },
+  {
+    "role": "filler",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "filler",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "button",
+    "name": "Deny",
+    "showing": true
+  },
+  {
+    "role": "button",
+    "name": "Allow",
+    "showing": true
+  }
+]
