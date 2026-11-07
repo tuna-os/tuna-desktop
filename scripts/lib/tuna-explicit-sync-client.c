@@ -432,10 +432,18 @@ static void buffer_destroy(struct buffer *b) {
     glDeleteFramebuffers(1, &b->fb); glDeleteRenderbuffers(1, &b->rb);
     destroy_image(egl_display, b->image); gbm_bo_destroy(b->bo);
 }
-static void expect_error(const char *interface, uint32_t code) {
+/* `destroyed`: the client already destroyed the object the error targets.
+ * libwayland-client then reports it as a destroyed object (no interface,
+ * id 0), so only the error code identifies it. */
+static void expect_error(const char *interface, uint32_t code, bool destroyed) {
     REQUIRE(!dispatch_for(DEADLINE_MS, NULL), "invalid request did not disconnect real client");
     const struct wl_interface *actual = NULL; uint32_t id = 0;
     uint32_t actual_code = wl_display_get_protocol_error(display, &actual, &id);
+    if (destroyed) {
+        REQUIRE(!actual && id == 0 && actual_code == code, "wrong actual protocol error on the destroyed object");
+        printf("{\"event\":\"protocol-error\",\"destroyed_interface\":\"%s\",\"code\":%u}\n", interface, actual_code);
+        return;
+    }
     REQUIRE(actual && !strcmp(actual->name, interface) && actual_code == code, "wrong actual protocol error interface/code");
     printf("{\"event\":\"protocol-error\",\"interface\":\"%s\",\"code\":%u,\"object_id\":%u}\n", actual->name, actual_code, id);
 }
@@ -512,7 +520,7 @@ int main(int argc, char **argv) {
     printf("{\"event\":\"selected-format\",\"fourcc\":%u,\"modifier\":%" PRIu64 "}\n", format.fourcc, format.modifier);
     buffer_new(&a, format, !strcmp(scenario, "legacy-v3") ? legacy_dmabuf : dmabuf);
     if (strcmp(scenario, "ordering")) {
-        const char *interface = "wp_linux_drm_syncobj_surface_v1"; uint32_t error = 0;
+        const char *interface = "wp_linux_drm_syncobj_surface_v1"; uint32_t error = 0; bool destroyed = false;
         if (!strcmp(scenario, "mixed-modifiers-v5") || !strcmp(scenario, "mixed-modifiers-v3")) {
             REQUIRE(wl_display_roundtrip(display) >= 0, "actual offered DMA-BUF import prerequisite");
             bool modern = !strcmp(scenario, "mixed-modifiers-v5");
@@ -522,7 +530,7 @@ int main(int argc, char **argv) {
             uint32_t stride = gbm_bo_get_stride_for_plane(a.bo, 0);
             zwp_linux_buffer_params_v1_add(params, fd, 0, 0, stride, format.modifier >> 32, format.modifier);
             zwp_linux_buffer_params_v1_add(params, fd, 1, 0, stride, different >> 32, different); close(fd);
-            if (modern) expect_error("zwp_linux_buffer_params_v1", ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_FORMAT);
+            if (modern) expect_error("zwp_linux_buffer_params_v1", ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_FORMAT, false);
             else {
                 REQUIRE(wl_display_roundtrip(display) >= 0, "v3 must not impose the v5 add-time modifier equality rule");
                 zwp_linux_buffer_params_v1_destroy(params);
@@ -587,7 +595,9 @@ int main(int argc, char **argv) {
             struct zwp_linux_buffer_params_v1 *params = regular_fd_params(&a, format);
             struct wl_buffer *invalid = zwp_linux_buffer_params_v1_create_immed(params, SIDE, SIDE, format.fourcc, 0);
             wl_buffer_add_listener(invalid, &buffer_listener, NULL);
-            if (!strcmp(scenario, "invalid-dmabuf-destroy-params")) zwp_linux_buffer_params_v1_destroy(params);
+            if (!strcmp(scenario, "invalid-dmabuf-destroy-params")) {
+                zwp_linux_buffer_params_v1_destroy(params); destroyed = true;
+            }
             interface = "zwp_linux_buffer_params_v1";
             error = ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_WL_BUFFER;
         } else if (!strcmp(scenario, "surface-exists")) {
@@ -613,7 +623,7 @@ int main(int argc, char **argv) {
             wl_buffer_add_listener(unsupported, &buffer_listener, NULL);
             wl_surface_attach(surface, unsupported, 0, 0); wl_surface_commit(surface); error = 2;
         } else fail("unknown case");
-        REQUIRE(wl_display_flush(display) >= 0, "flush invalid request"); expect_error(interface, error);
+        REQUIRE(wl_display_flush(display) >= 0, "flush invalid request"); expect_error(interface, error, destroyed);
         printf("{\"event\":\"case-pass\",\"case\":\"%s\"}\n", scenario); return 0;
     }
     buffer_new(&b, format, dmabuf); xdg = xdg_wm_base_get_xdg_surface(wm, surface);
