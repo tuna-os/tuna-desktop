@@ -77,13 +77,9 @@ impl Host for AuthPort {
     }
 }
 
-/// One trace line in a single write: the proof reads stderr shared with
-/// the compositor, where pieces of separate writes interleave.
 fn trace(line: &str) {
     if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
-        use std::io::Write;
-        let line = format!("tuna-shell-gtk: {line}\n");
-        let _ = std::io::stderr().lock().write_all(line.as_bytes());
+        eprintln!("tuna-shell-gtk: {line}");
     }
 }
 

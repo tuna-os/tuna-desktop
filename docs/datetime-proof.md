@@ -29,6 +29,23 @@ A gate with missing inputs fails as unevaluable; missing evidence is
 never a pass. A probe that fails halfway keeps its partial record, and
 the gate's detail carries the probe error.
 
+The published-flavor lane reads the installed `tuna-desktop` package version
+with Marlin's native `pacman -Q` into `desktop_package_version` in that evidence
+bundle. This is provenance, not a capability exemption: every gate records
+its actual verdict, including **G-DATETIME-CLOCK-TZ** and
+**G-DATETIME-CLOCK-SET**. Unsupported or unevaluable panel-follow results
+remain failures even for known older packages. Current-build success does
+not replace qualification of the published binary, and the original
+measurements and partial failures remain in the evidence.
+
+The known beta.2-2 package rebuilds immutable tag `v1.0.0-beta.2`, source
+`1e6ce28f4d5dfd7918ac7340bd93454a9fcc211c`. Its `wall_clock.rs` lacks
+the `/etc/localtime` monitor; #886's merge
+`414e358eff9bbfc871637696b9382e6578f396ae` is later. A package-recipe revision
+alone does not bring that newer desktop source into the published image.
+A replacement release needs its own source/package/image binding and actual
+panel-follow proof; changing a version allowlist is not a repair.
+
 ## Running
 
 Unit tests (no VM, no privileges, no clock writes):

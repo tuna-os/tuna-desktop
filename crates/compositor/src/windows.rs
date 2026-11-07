@@ -28,18 +28,14 @@ pub(crate) fn trace_media(stage: &str, details: serde_json::Value, locked: bool)
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
         return;
     }
-    // One write per record, like the shell's: eprintln! of a JSON value
-    // issues many small writes that the shell's records on the same pipe
-    // can split (journey 38757056152 failed G-MEDIA-VOLUME on that).
-    let line = format!(
-        "tuna-media-diagnostic: {}\n",
+    eprintln!(
+        "tuna-media-diagnostic: {}",
         serde_json::json!({
             "actor": "compositor", "pid": std::process::id(), "stage": stage,
             "monotonic_ns": now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64,
             "details": details,
         })
     );
-    let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
 }
 
 fn media_trace_enabled() -> bool {
@@ -533,6 +529,9 @@ pub struct WindowManager {
     /// Mutter's `pointer_window` at the last crossing (`Some(None)`: no
     /// window, i.e. the desktop or shell chrome); `None` before the first.
     pointer_window: Option<Option<u64>>,
+    /// Window-model and scene changes since the last completed pointer repick.
+    pointer_scene_revision: u64,
+    pointer_scene_dirty: std::cell::Cell<bool>,
     sticky_focus: Option<StickyFocus>,
     pointer_rest: Option<PointerRest>,
     /// Pending auto-raise `(window, due)`.
@@ -770,6 +769,8 @@ impl WindowManager {
             icon_geometries: Default::default(),
             focus_policy: Default::default(),
             pointer_window: None,
+            pointer_scene_revision: u64::MAX,
+            pointer_scene_dirty: std::cell::Cell::new(true),
             sticky_focus: None,
             pointer_rest: None,
             auto_raise: None,
@@ -781,6 +782,9 @@ impl WindowManager {
     /// after polling control). The next [`reconcile`](Self::reconcile)
     /// steers focus.
     pub fn set_overview_open(&mut self, open: bool) {
+        if self.overview_open != open {
+            self.pointer_scene_dirty.set(true);
+        }
         self.overview_open = open;
     }
 
@@ -2682,6 +2686,7 @@ impl WindowManager {
     /// flag, and presentation state. X11 windows take the toolkit's
     /// X11 configure path with the same geometry and activation.
     fn configure(&self, id: u64, activated: bool) {
+        self.pointer_scene_dirty.set(true);
         let Some(window) = self.windows.get(&id) else {
             return;
         };
@@ -3260,6 +3265,15 @@ impl WindowManager {
         self.grab.is_some()
     }
 
+    /// The window owning a native move, not a pending client request or resize.
+    pub(crate) fn interactive_move_window(&self) -> Option<u64> {
+        match self.grab? {
+            PointerGrab::Move { id, .. } => Some(id),
+            PointerGrab::StripMove { owner, .. } => Some(owner.id),
+            _ => None,
+        }
+    }
+
     /// The pointer cursor of an interactive grab (#342): move, or
     /// resize from these xdg edges.
     pub fn grab_cursor(&self) -> Option<smithay::input::pointer::CursorIcon> {
@@ -3593,71 +3607,58 @@ impl WindowManager {
             return;
         }
         self.sticky_motion(state, travelled);
-        // Popups paint over everything they hang off: they win first.
+        let (target, crossing) = self.pointer_pick(state, pos);
+        if let Some(pointer) = self.pointer.clone() {
+            pointer.motion(
+                state,
+                target,
+                &MotionEvent {
+                    location: pos,
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                },
+            );
+            // wl_seat v5+: clients act on pointer events only at a frame
+            // boundary (GTK4 drops unframed clicks).
+            pointer.frame(state);
+        }
+        if let Some(under) = crossing {
+            self.pointer_crossing(state, under);
+        }
+    }
+
+    /// The surface the pointer at `pos` belongs to, with its origin, and
+    /// the window crossing it means (`None`: no crossing to report).
+    /// Popups paint over everything they hang off, so they win first;
+    /// layer-shell surfaces (panel, banners) paint over windows, so they
+    /// come next. Shell chrome is no window: GNOME's stage actors leave
+    /// Mutter's pointer window NULL. In the overview, windows are
+    /// previews the compositor draws: they never take pointer focus.
+    #[allow(clippy::type_complexity)]
+    fn pointer_pick(
+        &self,
+        state: &State,
+        pos: Point<f64, Logical>,
+    ) -> (
+        Option<(WlSurface, Point<f64, Logical>)>,
+        Option<Option<u64>>,
+    ) {
         if let Some(popup) = self.popup_at(state, pos) {
-            if let Some(pointer) = self.pointer.clone() {
-                pointer.motion(
-                    state,
-                    Some((popup.surface, popup.origin.to_f64())),
-                    &MotionEvent {
-                        location: pos,
-                        serial: SERIAL_COUNTER.next_serial(),
-                        time,
-                    },
-                );
-                // wl_seat v5+: clients act on pointer events only at a
-                // frame boundary (GTK4 drops unframed clicks).
-                pointer.frame(state);
-            }
-            return;
+            return (Some((popup.surface, popup.origin.to_f64())), None);
         }
         if let Some((surface, (ox, oy))) =
             crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
         {
-            if let Some(pointer) = self.pointer.clone() {
-                // Focus point is the surface origin: smithay reports
-                // surface-local coordinates as event minus focus.
-                pointer.motion(
-                    state,
-                    Some((surface, (ox as f64, oy as f64).into())),
-                    &MotionEvent {
-                        location: pos,
-                        serial: SERIAL_COUNTER.next_serial(),
-                        time,
-                    },
-                );
-                // wl_seat v5+: clients act on pointer events only at a
-                // frame boundary (GTK4 drops unframed clicks).
-                pointer.frame(state);
-            }
-            // Shell chrome is no window: GNOME's stage actors (panel,
-            // banners) leave Mutter's pointer window NULL.
-            self.pointer_crossing(state, None);
-            return;
+            // Focus point is the surface origin: smithay reports
+            // surface-local coordinates as event minus focus.
+            return (Some((surface, (ox as f64, oy as f64).into())), Some(None));
         }
-        // In the overview, windows are previews the compositor draws:
-        // they never take pointer focus or events (GNOME shape).
         if self.overview_open {
-            if let Some(pointer) = self.pointer.clone() {
-                pointer.motion(
-                    state,
-                    None,
-                    &MotionEvent {
-                        location: pos,
-                        serial: SERIAL_COUNTER.next_serial(),
-                        time,
-                    },
-                );
-                pointer.frame(state);
-            }
-            return;
+            return (None, None);
         }
         // Pointer focus is the window under the pointer, or nothing over
         // the bare desktop. Keyboard focus follows it only in GNOME's
         // sloppy and mouse modes (pointer_crossing).
-        let Some(pointer) = self.pointer.clone() else {
-            return;
-        };
         let under = self.window_at(pos);
         let target = under
             // An attached modal dialog blocks pointer input to its parent,
@@ -3666,13 +3667,50 @@ impl WindowManager {
             .and_then(|id| self.windows.get(&id))
             .and_then(|window| {
                 let surface = window.surface.wl_surface()?.into_owned();
-                // Focus point is the surface origin: smithay reports
-                // surface-local coordinates as event minus focus. The
-                // window rect is its xdg geometry; the surface origin
+                // The window rect is its xdg geometry; the surface origin
                 // sits up-left of it by the client-side shadow.
                 let origin = crate::popup::surface_origin(&surface, window.geometry.loc);
                 Some((surface, (origin.x as f64, origin.y as f64).into()))
             });
+        (target, Some(under))
+    }
+
+    /// Clutter's repick of the pointer actor after the scene changed
+    /// under a stationary pointer (a window mapped, closed or restacked):
+    /// the surface now beneath it gets `wl_pointer.enter` without any
+    /// motion, as Mutter's meta_wayland_pointer_update does on the
+    /// repick, so a first click on a freshly mapped window lands there
+    /// (#425). An interactive move/resize, pointer constraint or a seat
+    /// grab (an implicit button press, drag-and-drop) keeps its focus.
+    fn repick_pointer_surface(&mut self, state: &mut State) {
+        // Picking builds the popup/layer presentation. Do not rebuild an
+        // unchanged scene on every idle tick, especially in click-focus
+        // mode. Buffer commits conservatively invalidate the pick too.
+        if !self.pointer_scene_dirty.get()
+            && !state.pointer_scene_dirty
+            && self.pointer_scene_revision == self.model.revision()
+            && !self.strip_animating()
+        {
+            return;
+        }
+        if self.grab.is_some() || self.pointer_constraint_owns_motion(state) {
+            return;
+        }
+        let Some(pointer) = self.pointer.clone() else {
+            return;
+        };
+        if pointer.is_grabbed() {
+            return;
+        }
+        self.pointer_scene_dirty.set(false);
+        state.pointer_scene_dirty = false;
+        self.pointer_scene_revision = self.model.revision();
+        let pos = self.pointer_pos;
+        let (target, _) = self.pointer_pick(state, pos);
+        if pointer.current_focus().as_ref() == target.as_ref().map(|(surface, _)| surface) {
+            return;
+        }
+        let time = std::time::Duration::from(state.presentation_now()).as_millis() as u32;
         pointer.motion(
             state,
             target,
@@ -3682,10 +3720,7 @@ impl WindowManager {
                 time,
             },
         );
-        // wl_seat v5+: clients act on pointer events only at a frame
-        // boundary (GTK4 drops unframed clicks).
         pointer.frame(state);
-        self.pointer_crossing(state, under);
     }
 
     /// GNOME's focus policy, as last read from its settings.
@@ -3827,8 +3862,10 @@ impl WindowManager {
 
     /// Clutter's repick after the scene changed under a stationary
     /// pointer (a window mapped, closed, restacked or the workspace
-    /// switched): a crossing without motion. Only pointer focus needs it.
+    /// switched): the surface beneath gets pointer enter, and in sloppy
+    /// or mouse focus mode the window crossing moves keyboard focus.
     pub fn repick_pointer_window(&mut self, state: &mut State) {
+        self.repick_pointer_surface(state);
         if !self.pointer_focus_active(state) {
             return;
         }
@@ -4540,6 +4577,7 @@ impl WindowManager {
     /// Always on Top windows stay above every other window: a stable
     /// partition of the stacking order.
     fn keep_above_on_top(&mut self) {
+        self.pointer_scene_dirty.set(true);
         let flags = self
             .windows
             .iter()
