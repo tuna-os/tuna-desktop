@@ -14,8 +14,8 @@ metadata:
 # Every pod in tuna-ci must be a contained runner: its own user namespace
 # (root and CAP_SYS_ADMIN in the pod are an unprivileged uid range on the
 # node), no privileged containers, no host namespaces, ports or paths, only
-# emptyDir volumes, no service account token, no capability beyond
-# SYS_ADMIN. Devices come only from device plugins (KubeVirt's tun).
+# emptyDir or job-owned scratch volumes, no service account token, no
+# capability beyond SYS_ADMIN. Devices come only from device plugins (KubeVirt's tun).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -47,8 +47,16 @@ spec:
       message: runner pods must not share host namespaces
     - expression: has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false
       message: runner pods must not mount a service account token
-    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir))"
-      message: runner pods may only use emptyDir volumes
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(v,
+          has(v.emptyDir) ||
+          (has(v.ephemeral) && has(v.ephemeral.volumeClaimTemplate)
+           && has(v.ephemeral.volumeClaimTemplate.spec.storageClassName)
+           && v.ephemeral.volumeClaimTemplate.spec.storageClassName == 'tuna-ci-scratch'
+           && !has(v.ephemeral.volumeClaimTemplate.spec.dataSource)
+           && !has(v.ephemeral.volumeClaimTemplate.spec.dataSourceRef)
+           && !has(v.ephemeral.volumeClaimTemplate.spec.volumeName)))
+      message: runner pods may only use emptyDir or fresh generic ephemeral tuna-ci-scratch volumes
     - expression: >-
         variables.containers.all(c,
           !(has(c.securityContext) && has(c.securityContext.privileged) && c.securityContext.privileged)
@@ -114,9 +122,10 @@ spec:
 ---
 # Hard ceiling for all runner pods together, whatever the scale sets ask
 # for. karnataka has 28 CPU / 125 GiB allocatable; punjab is sized at
-# 12 cores / 24 GiB. Requests stop at 12 runners x 2 CPU / 6 GiB (24 CPU),
-# so the 14 pods the scale sets may ask for (10 + 4) never all schedule and
-# punjab and KubeVirt keep their room; they also preempt runners (below).
+# 12 cores / 24 GiB. All 14 configured runners request 21 CPU / 70 GiB
+# together. The 28 CPU / 82 GiB request quota also permits old 2 CPU / 6 GiB
+# pods during rollout; the node scheduler still accounts for VM reservations.
+# Aggregate limits are overcommitted, not reserved memory. VMs preempt runners.
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -125,12 +134,12 @@ metadata:
 spec:
   hard:
     pods: "14"
-    requests.cpu: "24"
-    limits.cpu: "48"
-    requests.memory: 72Gi
-    limits.memory: 168Gi
-    requests.ephemeral-storage: 240Gi
-    limits.ephemeral-storage: 540Gi
+    requests.cpu: "28"
+    limits.cpu: "56"
+    requests.memory: 82Gi
+    limits.memory: 196Gi
+    requests.ephemeral-storage: 280Gi
+    limits.ephemeral-storage: 630Gi
 ---
 # Runner pods yield to everything else: new KubeVirt VMs (punjab) and
 # cluster services preempt them; they never preempt anything.

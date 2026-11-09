@@ -327,13 +327,14 @@ def round_trip_target(run_command, original, target=None):
     return target
 
 
-def collect_timezone_round_trip(run_command, target=None, observe=None, record=None):
+def collect_timezone_round_trip(run_command, target=None, observe=None, record=None,
+                                observe_revert=None):
     """Set a new zone through timedate1, verify, revert, verify the revert.
 
     `observe(record)`, when given, runs while the new zone is in force
     (the panel clock follow-up). The revert runs in a finally block: a
-    failed verification still restores the original zone, and the
-    evidence says whether the restoration itself was observed.
+    failed verification still restores the original zone. `observe_revert`
+    must verify the restored panel before any later clock-write probe.
     """
     original = timedate1_timezone(run_command)
     target = round_trip_target(run_command, original, target)
@@ -364,8 +365,10 @@ def collect_timezone_round_trip(run_command, target=None, observe=None, record=N
                 record["revert_verified"] = record["reverted"]
             except ValueError as error:
                 record["revert_error"] = str(error)
-    if not record["revert_verified"]:
-        raise ValueError(f"timezone-revert-unverified: {record['revert_error']}")
+            if record["revert_verified"] and observe_revert is not None:
+                observe_revert(record)
+        if not record["revert_verified"]:
+            raise ValueError(f"timezone-revert-unverified: {record['revert_error']}")
     return record
 
 
@@ -750,9 +753,13 @@ def evaluate(evidence, clock_tolerance=CLOCK_TOLERANCE_SECONDS):
                             f"panel {label!r} vs system epoch {clock['system_epoch']} "
                             f"({clock['timezone']}): delta {delta:.0f}s, tolerance {clock_tolerance}s"))
     baseline = results[-1][1]
-    results.append(evaluate_clock_follow(
+    timezone_follow = evaluate_clock_follow(
         "G-DATETIME-CLOCK-TZ", trip.get("panel"), clock_tolerance,
-        lambda: f"{trip.get('original')} -> {trip.get('target')}", baseline))
+        lambda: f"{trip.get('original')} -> {trip.get('target')}", baseline)
+    if trip.get("panel_revert_verified") is not True:
+        timezone_follow = (timezone_follow[0], False,
+                           timezone_follow[2] + "; original-zone panel repaint unverified")
+    results.append(timezone_follow)
     manual = evidence.get("manual_time") or {}
     results.append(evaluate_manual(manual))
     results.append(evaluate_clock_follow(
@@ -918,16 +925,31 @@ def collect(run_command=run, *, target_tz=None, desktop_user=None,
             record[shift_key] if shift_key else 0,
             tolerance=clock_tolerance, monotonic=monotonic))
 
+    def restored_panel(record):
+        record["panel_revert_verified"] = False
+        record["panel_revert"] = follow_panel(
+            dump, record["original"], record["target"],
+            tolerance=clock_tolerance, monotonic=monotonic)
+        record["panel_revert_verified"] = followed(record["panel_revert"][-1], clock_tolerance)
+        if not record["panel_revert_verified"]:
+            raise ValueError("timezone-panel-revert-unverified: "
+                             + json.dumps(record["panel_revert"][-1], sort_keys=True))
+
     probe("timezone_round_trip", lambda record: collect_timezone_round_trip(
-        run_command, target=target_tz, observe=follow("target", "original"), record=record))
+        run_command, target=target_tz, observe=follow("target", "original"), record=record,
+        observe_revert=restored_panel if dump is not None else None))
     probe("timezone_rejection", lambda record: record.update(
         collect_timezone_rejection(run_command)))
+    trip = evidence["timezone_round_trip"]
+    if not trip.get("revert_verified") or (dump is not None and not trip.get("panel_revert_verified")):
+        evidence["errors"]["manual_time"] = "not exercised: original timezone/panel restoration unverified"
+    else:
+        probe("manual_time", lambda record: collect_manual_time(
+            run_command, monotonic=monotonic, observe=follow("zone", "zone", "offset"),
+            record=record))
     if desktop_user is not None:
         probe("polkit", lambda record: collect_polkit(
             run_command, desktop_user, target=target_tz, record=record))
-    probe("manual_time", lambda record: collect_manual_time(
-        run_command, monotonic=monotonic, observe=follow("zone", "zone", "offset"),
-        record=record))
     probe("ntp_absent", lambda record: collect_ntp_absent(run_command, record=record))
     return evidence
 

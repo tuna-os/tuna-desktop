@@ -202,14 +202,15 @@ impl WiredMenu {
                 } else {
                     format!("{DEVICE_NAME} ({})", dev.interface)
                 };
-                let submenu = gtk::Expander::builder().label(&label).build();
-                submenu.update_property(&[gtk::accessible::Property::Label(&label)]);
-                submenu.add_css_class("nm-wired-submenu");
                 let rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
                 for row in dev.menu(DEVICE_NAME) {
                     rows.append(&self.row(dev, &row, connectivity));
                 }
-                submenu.set_child(Some(&rows));
+                // GNOME's PopupSubMenuMenuItem (`network.js:243`,
+                // NMSectionItem): the submenu grows open, its arrow turns.
+                let submenu = crate::transient::PopupSubmenu::new(&label, &rows);
+                submenu.add_css_class("nm-wired-submenu");
+                submenu.header().add_css_class("qs-menu-item");
                 self.list.append(&submenu);
             } else {
                 for row in dev.menu(DEVICE_NAME) {

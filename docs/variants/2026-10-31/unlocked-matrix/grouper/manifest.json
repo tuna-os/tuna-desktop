@@ -1,0 +1,166 @@
+{
+  "schema": 2,
+  "started": "2026-11-01T00:08:31+00:00",
+  "runner": "scripts/tuna-corral-journey",
+  "runner_sha256": "97721d7a15781fb2f46ebd3f034715de616a9371bb1ed40f0747da628ab7c1a9",
+  "scope": "qualification-core",
+  "corral": "corral v0.7.0+36.g76b6dd5 (commit 76b6dd52d35d, built 2026-10-30T08:31:57Z, go1.27.0)",
+  "image": {
+    "ref": "ghcr.io/tuna-os/grouper@sha256:8cebaff1fbfe7d8f5076b0d09c7988cce804bbe193b12af733180f2eee3ef6fa",
+    "booted": "ghcr.io/tuna-os/grouper@sha256:8cebaff1fbfe7d8f5076b0d09c7988cce804bbe193b12af733180f2eee3ef6fa",
+    "booted_manifest_digest": "sha256:fc5ee2161e5bf2ebf46e753fd9a52132ba210b9f1720a3d996889f14c23d9b33"
+  },
+  "vm": {
+    "name": "tuna-q-variant-grouper-31215908",
+    "namespace": "corral-vms",
+    "backend": "kubevirt",
+    "requested": {
+      "cpu": 4,
+      "mem": "6G",
+      "disk": "40Gi",
+      "node": "karnataka"
+    },
+    "node": "karnataka",
+    "cpu": {
+      "vcpus": 4,
+      "sockets": 4,
+      "cores": 1,
+      "threads": 1,
+      "model": "host-passthrough",
+      "dedicatedCpuPlacement": false,
+      "isolateEmulatorThread": false
+    },
+    "memory": "6Gi",
+    "firmware": {
+      "type": "uefi",
+      "secureBoot": false,
+      "machine": "q35"
+    },
+    "inputs": [
+      {
+        "name": "tablet",
+        "type": "tablet",
+        "bus": "usb"
+      }
+    ],
+    "disks": [
+      {
+        "name": "rootdisk",
+        "type": "disk",
+        "bus": "virtio",
+        "source": "persistentVolumeClaim",
+        "claim": "tuna-q-variant-grouper-31215908-bootc-disk",
+        "size": "40Gi"
+      }
+    ],
+    "tagValues": {
+      "purpose": "tuna-corral-journey"
+    },
+    "image": "ghcr.io/tuna-os/grouper@sha256:8cebaff1fbfe7d8f5076b0d09c7988cce804bbe193b12af733180f2eee3ef6fa"
+  },
+  "console": "corral console page (noVNC), Playwright Chromium, 1:1; frames are the canvas pixels",
+  "steps": [],
+  "ready": {
+    "vm": "tuna-q-variant-grouper-31215908",
+    "ready": true,
+    "elapsed_seconds": 20.7,
+    "boot_id": "ead0f134-5a40-4115-9a40-fdbe26ee5303",
+    "conditions": [
+      {
+        "name": "running",
+        "ok": true,
+        "elapsed_seconds": 10.4,
+        "observed": "Running"
+      },
+      {
+        "name": "ssh",
+        "ok": true,
+        "elapsed_seconds": 15.8,
+        "observed": "boot ead0f134-5a40-4115-9a40-fdbe26ee5303"
+      },
+      {
+        "name": "boot-complete",
+        "ok": true,
+        "elapsed_seconds": 17.6,
+        "observed": "running"
+      },
+      {
+        "name": "unit:gdm.service",
+        "ok": true,
+        "elapsed_seconds": 17.8,
+        "observed": "active"
+      },
+      {
+        "name": "exec:loginctl list-sessions --no-legend | awk '$6==\"greeter\" && $4==\"seat0\"' | grep -q .",
+        "ok": true,
+        "elapsed_seconds": 18.3,
+        "observed": "exit status 0"
+      },
+      {
+        "name": "paint",
+        "ok": true,
+        "elapsed_seconds": 20.7,
+        "observed": "painted 1280x800 (deviation 0.1026)"
+      }
+    ]
+  },
+  "guest": {
+    "packages": [
+      "gdm3\t50.1-0ubuntu0.1",
+      "gnome-control-center\t1:50.3-0ubuntu0.2",
+      "gnome-shell\t50.1-0ubuntu1.4",
+      "nautilus\t1:50.2.2-0ubuntu0.2",
+      "tuna-desktop\t1.0.0~beta.1-1"
+    ],
+    "tuna_payload_sha256": [
+      "80fefab0fb20fa451c228fe51ffdd006981c1c3ba7a5dc8352a0150c263880b0  /usr/bin/tuna-session",
+      "91bf1ec8587cd95e5b54a2251caf476a0bc762b2f4cf29607b3028f1c1926750  /usr/bin/tuna-compositor",
+      "cad5cb6b1377b92ba4fe41dffc1041d2c85b26406ce0cfc6e8ba7ee3ec325cc3  /usr/bin/tuna-shell-gtk",
+      "dc2d5500609d90bc453cd6f174012825fef838c456553cf202beaa123cd71cfb  /usr/bin/tuna-ibus-bridge"
+    ],
+    "kernel": "7.0.0-42-generic",
+    "drm_driver": "bochs-drm",
+    "modes": [
+      "1280x800",
+      "1920x1440",
+      "2560x1080"
+    ],
+    "sessions_offered": [
+      "Name=Tuna Desktop"
+    ],
+    "gdm_custom_conf": [],
+    "boot_id": "ead0f134-5a40-4115-9a40-fdbe26ee5303",
+    "account": "tuna-test:x:1000:1000::/var/home/tuna-test:/bin/bash"
+  },
+  "account": {
+    "user": "tuna-test",
+    "password": "public fixture password (packaging/marlin/vm-lane)",
+    "provisioned": "corral bootc create --user --password-stdin; image unchanged"
+  },
+  "error": "RuntimeError: corral console exited 1 before it printed a URL",
+  "failure_capture": {
+    "exit": 0,
+    "stderr": "",
+    "frame": "failure-console.png",
+    "sha256": "0d627090538b687e46fffd1521d7fa24a151a6f6268ef0e789d1a5fb78dac7a7"
+  },
+  "cleanup": {
+    "deleted": false,
+    "result": [
+      {
+        "name": "tuna-q-variant-grouper-31215908",
+        "deleted": false,
+        "removed": [],
+        "error": "delete vm: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete vm: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete vmi: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete datavolume: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete pvc: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\nlist datavolume: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\nlist pvc: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete secret: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete configmap: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete pod: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete deployment: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete service: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete serviceaccount: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete role: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete rolebinding: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete cronjob: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete service,deployment,serviceaccount: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete vmsnapshot: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete vmrestore: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete vmclone: cluster unreachable (a recent kubectl call timed out; retrying in 15s)"
+      }
+    ],
+    "still_listed": [],
+    "failures": [
+      {
+        "name": "tuna-q-variant-grouper-31215908",
+        "stderr": "out; retrying in 15s)\ndelete service,deployment,serviceaccount: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete vmsnapshot: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete vmrestore: cluster unreachable (a recent kubectl call timed out; retrying in 15s)\ndelete vmclone: cluster unreachable (a recent kubectl call timed out; retrying in 15s)"
+      }
+    ]
+  },
+  "finished": "2026-11-01T00:21:25+00:00"
+}
