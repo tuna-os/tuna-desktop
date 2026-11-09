@@ -1750,12 +1750,7 @@ impl Runtime {
         // it cancelled, so its overview or workspace slide never resumes
         // (GNOME's trackers interrupt outside their allowed action modes,
         // swipeTracker.js `_updateTouchpadGesture`/`_endTouchpadGesture`).
-        if self.shell_swipe.is_some() {
-            self.shell_swipe_input(&ManagerInput::SwipeEnd {
-                cancelled: true,
-                time: crate::state::system_millis() as u32,
-            });
-        }
+        self.interrupt_shell_swipe(crate::state::system_millis() as u32);
         self.control.set_overview(false);
         // The shield covers GNOME's switcher popup and its window clones;
         // no window image may draw over the lock.
