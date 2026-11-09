@@ -24,6 +24,9 @@ pub(super) struct RuntimeOsk {
     held: Vec<Held>,
 }
 
+/// gnome-shell 51 keyboard.js `KEYBOARD_ANIMATION_TIME`.
+const KEYBOARD_ANIMATION_TIME_MS: f64 = 150.0;
+
 impl Runtime {
     /// Hand the shell what its keyboard follows: the focused field (none
     /// while locked, so nothing about the session leaks to the lock
@@ -49,6 +52,63 @@ impl Runtime {
             touch_auto = drm.touch_mode().auto();
         }
         self.control.set_on_screen_keyboard(field, show, touch_auto);
+        self.slide_window_for_keyboard(focus.as_ref(), locked);
+    }
+
+    /// gnome-shell 51 `Keyboard.setCursorLocation`: the session keyboard
+    /// (the mapped `tuna-osk` layer surface, `keyboardBox`) moves the
+    /// focused field's window up when the field's cursor would sit under
+    /// it, easing over `KEYBOARD_ANIMATION_TIME`.
+    fn slide_window_for_keyboard(
+        &mut self,
+        focus: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+        locked: bool,
+    ) {
+        let keyboard = if locked {
+            None
+        } else {
+            self.session_keyboard_box()
+        };
+        let cursor = focus.and_then(|surface| {
+            let rect = self
+                .state
+                .protocols
+                .text_inputs
+                .cursor_rectangle(Some(surface))?;
+            self.manager.field_cursor(surface, rect)
+        });
+        let duration = std::time::Duration::from_secs_f64(
+            self.input_settings
+                .motion
+                .adjust_ms(KEYBOARD_ANIMATION_TIME_MS)
+                .max(0.0)
+                / 1000.0,
+        );
+        let now = self.animation_clock.now();
+        self.manager.osk_slide(keyboard, cursor, now, duration);
+        self.manager.step_osk_slide(now);
+    }
+
+    /// The session keyboard's top edge and height while it is mapped.
+    fn session_keyboard_box(&self) -> Option<crate::osk::KeyboardBox> {
+        let surface = self
+            .state
+            .panel_surfaces()
+            .into_iter()
+            .find(|record| record.namespace == tuna_shell_control::OSK_NAMESPACE)?
+            .surface;
+        let (_, (_, top), _) = crate::layer::layer_layout(&self.state)
+            .into_iter()
+            .find(|(placed, _, _)| *placed == surface)?;
+        let height = self
+            .state
+            .layer_surfaces()
+            .into_iter()
+            .find(|layer| layer.wl_surface() == &surface)?
+            .current_state()
+            .size?
+            .h;
+        (height > 0).then_some(crate::osk::KeyboardBox { top, height })
     }
 
     /// Type one action from the shell's keyboard. The hub refuses these

@@ -10,19 +10,24 @@
 //!   strings, with Mutter's exact mapping to output transforms.
 //! - Transform helpers: the wire values 0-7 shared by Mutter, the
 //!   Wayland protocol and Smithay.
-//! - [`OrientationPolicy`]: orientation lock plus the sensor sample,
-//!   deciding the effective transform per output.
+//! - [`OrientationPolicy`]: Mutter's `PanelOrientationManaged`, tracking
+//!   inhibition and the orientation change handler.
 //! - [`SensorPoller`]: a blocking iio-sensor-proxy client for the
 //!   Mutter D-Bus thread, with graceful absent-service handling and
 //!   hotplug retry.
 //!
 //! Baseline: mutter 51.0 `src/backends/meta-orientation-manager.c`
 //! (sensor strings, claim discipline, the settings-daemon
-//! `orientation-lock` key) and `src/backends/meta-monitor-config-store.c`
-//! (monitors.xml rotation names). Sensor mapping: `normal`→0,
-//! `bottom-up`→180, `left-up`→90, `right-up`→270.
+//! `orientation-lock` key inhibiting tracking),
+//! `src/backends/meta-monitor-manager.c` (`update_panel_orientation_managed`,
+//! `sync_orientation_unmanaged_inhibit`, `orientation_changed`,
+//! `handle_initial_orientation_change`, `handle_orientation_change`) and
+//! `src/backends/meta-monitor-config-store.c` (monitors.xml rotation
+//! names). Sensor mapping: `normal`→0, `bottom-up`→180, `left-up`→90,
+//! `right-up`→270.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 /// GSettings schema holding the orientation-lock key (mutter 51.0
@@ -43,12 +48,25 @@ pub const SENSOR_INTERFACE: &str = "net.hadess.SensorProxy";
 /// tries the system bus again (hotplug without a reconnect storm).
 const SENSOR_RETRY: Duration = Duration::from_secs(5);
 
-/// Mutter's built-in panel test (its DisplayConfig "Built-in display"):
-/// the sensor drives these connectors only.
+/// Proof hook: with the compositor state file set (a proof session),
+/// this connector counts as the built-in panel, so an emulated
+/// accelerometer can drive vkms's virtual connector.
+pub const PROOF_BUILTIN_ENV: &str = "TUNA_PROOF_BUILTIN_CONNECTOR";
+
+static PROOF_BUILTIN: LazyLock<Option<String>> = LazyLock::new(|| {
+    std::env::var_os("TUNA_COMPOSITOR_STATE")
+        .and_then(|_| std::env::var(PROOF_BUILTIN_ENV).ok())
+        .filter(|connector| !connector.is_empty())
+});
+
+/// Mutter's built-in panel test (`meta_output_is_laptop`: eDP, LVDS and
+/// DSI connectors; DisplayConfig's "Built-in display"): the sensor drives
+/// these connectors only and touchscreens fall back to them.
 pub fn is_builtin_panel(connector: &str) -> bool {
     ["eDP-", "LVDS-", "DSI-"]
         .iter()
         .any(|p| connector.starts_with(p))
+        || PROOF_BUILTIN.as_deref() == Some(connector)
 }
 
 /// A Mutter DisplayConfig transform (0-7) the backend can apply.
@@ -112,49 +130,6 @@ pub fn logical_extent(width: i32, height: i32, scale: f64, transform: u32) -> (i
     }
 }
 
-/// Map a point in an unrotated `width`×`height` frame to the frame the
-/// transform produces, in pixel indices. This is Smithay
-/// `Transform::transform_point_in` (vendored
-/// `third-party/smithay/src/utils/geometry.rs`) adjusted from its
-/// logical-edge convention to pixel centers: each `area - point` edge
-/// becomes `size - 1 - point`. Directions built on it: [`touch_point`]
-/// maps panel pixels back to logical, and the scanout/capture remaps
-/// use Smithay's continuous rect mapping for the same direction
-/// (`native_repaint` and `mutter`).
-///
-/// Inputs clamp to the frame first, so `i32` extremes and zero or
-/// negative sizes can neither panic nor wrap: every result lands
-/// inside the produced frame.
-pub fn transform_point(width: i32, height: i32, transform: u32, x: i32, y: i32) -> (i32, i32) {
-    let (w, h) = (width.max(1), height.max(1));
-    let (x, y) = (x.clamp(0, w - 1), y.clamp(0, h - 1));
-    match transform {
-        1 => (h - 1 - y, x),
-        2 => (w - 1 - x, h - 1 - y),
-        3 => (y, w - 1 - x),
-        4 => (w - 1 - x, y),
-        5 => (y, x),
-        6 => (x, h - 1 - y),
-        7 => (h - 1 - y, w - 1 - x),
-        _ => (x, y),
-    }
-}
-
-/// A panel-native touch/absolute-pointer pixel to the logical pixel
-/// shown under it: buffer space back to logical space, which inverts
-/// the transform (Smithay `Point<Buffer>::to_logical` inverts the
-/// same way). The hardware input path remaps primary-output touch
-/// through this; unknown transforms stay identity.
-pub fn touch_point(width: i32, height: i32, transform: u32, x: i32, y: i32) -> (i32, i32) {
-    transform_point(
-        width,
-        height,
-        transform_from_smithay(smithay_transform(transform).invert()),
-        x,
-        y,
-    )
-}
-
 /// iio-sensor-proxy accelerometer orientation (mutter 51.0
 /// `orientation_from_string`; `undefined` and unknown strings parse to
 /// `None`, never to a rotation).
@@ -195,48 +170,74 @@ pub struct SensorSample {
     /// The service answered and reports an accelerometer.
     pub present: bool,
     /// Current orientation, when the service reports a known one.
+    /// Frozen while tracking is inhibited: Mutter ignores the sensor
+    /// while it does not hold the claim.
     pub orientation: Option<SensorOrientation>,
+    /// The accelerometer was claimed in this poll (Mutter's
+    /// `::sensor-active`, after which the orientation is applied).
+    pub claimed: bool,
 }
 
 impl SensorSample {
     pub const ABSENT: Self = Self {
         present: false,
         orientation: None,
+        claimed: false,
     };
 }
 
-/// Orientation lock plus the latest sensor sample: the effective
-/// transform per output. Mirrors mutter: the sensor drives built-in
-/// panels only, and only while unlocked.
+/// Mutter 51's panel-orientation state: whether the sensor manages the
+/// built-in panel, whether tracking is inhibited, and what an
+/// orientation change does.
 #[derive(Debug, Clone, Default)]
 pub struct OrientationPolicy {
     /// `orientation-lock` from the shell's input settings.
     pub lock: bool,
     /// The sensor service reports an accelerometer.
     pub sensor_present: bool,
-    /// Latest known sensor orientation.
+    /// Latest known sensor orientation (`None`: undefined).
     pub sensor: Option<SensorOrientation>,
+    /// The seat's touch-mode (`clutter_seat_get_touch_mode`).
+    pub touch_mode: bool,
+    /// The seat has a touchscreen (`clutter_seat_has_touchscreen`).
+    pub has_touchscreen: bool,
+    /// `initial_orient_change_done`.
+    pub initial_done: bool,
 }
 
 impl OrientationPolicy {
-    /// Whether the sensor currently drives a panel: present, unlocked,
-    /// and at least one built-in output exists. Feeds Mutter's
-    /// `PanelOrientationManaged`.
-    pub fn managed(&self, has_builtin_output: bool) -> bool {
-        self.sensor_present && !self.lock && has_builtin_output
+    /// `update_panel_orientation_managed`: touch mode, an accelerometer
+    /// and a built-in panel. The lock does not unmanage the panel (the
+    /// Auto Rotate toggle stays to unlock it).
+    pub fn managed(&self, has_builtin: bool) -> bool {
+        self.touch_mode && self.sensor_present && has_builtin
     }
 
-    /// The transform `connector` should show: the sensor's for
-    /// unlocked built-in panels, else the configured `manual` one. An
-    /// unknown sensor reading keeps the manual transform.
-    pub fn effective(&self, connector: &str, manual: u32) -> u32 {
-        if !self.lock && self.sensor_present && is_builtin_panel(connector) {
-            self.sensor
-                .map(SensorOrientation::transform)
-                .unwrap_or(manual)
-        } else {
-            manual
+    /// Whether orientation tracking is inhibited: the lock
+    /// (`orientation_lock_changed`), or an unmanaged panel once the
+    /// initial orientation was read (`sync_orientation_unmanaged_inhibit`).
+    /// The display power-save inhibition is the D-Bus thread's.
+    pub fn inhibited(&self, has_builtin: bool) -> bool {
+        self.lock || (!self.managed(has_builtin) && self.initial_done)
+    }
+
+    /// `orientation_changed`: the transform the built-in panel takes for
+    /// the current reading, if any. `builtin_portrait` is whether the
+    /// built-in panel's preferred mode is portrait, `None` without one.
+    /// The first change applies to a portrait panel with a touchscreen
+    /// even outside touch mode (`handle_initial_orientation_change`);
+    /// afterwards only a managed panel follows. An undefined reading
+    /// means the normal transform (`meta_orientation_to_transform`).
+    pub fn orientation_changed(&mut self, builtin_portrait: Option<bool>) -> Option<u32> {
+        let transform = self.sensor.map_or(0, SensorOrientation::transform);
+        if !self.initial_done {
+            self.initial_done = true;
+            if self.has_touchscreen && self.sensor_present && builtin_portrait == Some(true) {
+                return Some(transform);
+            }
         }
+        self.managed(builtin_portrait.is_some())
+            .then_some(transform)
     }
 }
 
@@ -246,9 +247,8 @@ pub struct OrientationShare {
     /// The event loop sets this from [`OrientationPolicy::managed`];
     /// DisplayConfig's `PanelOrientationManaged` reads it.
     pub managed: AtomicBool,
-    /// The event loop sets this from `orientation-lock`; the sensor
-    /// poller releases its claim while set (mutter inhibits tracking
-    /// on lock).
+    /// The event loop sets this from [`OrientationPolicy::inhibited`];
+    /// the sensor poller releases its claim while set.
     pub inhibited: AtomicBool,
 }
 
@@ -362,23 +362,33 @@ impl SensorPoller {
             self.drop_connection(now);
             return SensorSample::ABSENT;
         };
+        let mut claimed = false;
         if inhibited {
             self.release();
         } else if present && !self.claimed {
             match self.with_proxy(|proxy| proxy.call_method("ClaimAccelerometer", &())) {
-                Some(_) => self.claimed = true,
+                Some(_) => {
+                    self.claimed = true;
+                    claimed = true;
+                }
                 None => eprintln!("tuna-compositor: orientation: claim failed"),
             }
         }
-        let orientation = if present {
+        // Mutter reads the orientation only while it holds the claim
+        // (`iio_properties_changed_idle`); an unclaimed sensor keeps the
+        // last reading, and a lost accelerometer is undefined.
+        let orientation = if !present {
+            None
+        } else if self.claimed {
             self.with_proxy(|proxy| proxy.get_property::<String>("AccelerometerOrientation"))
                 .and_then(|value| SensorOrientation::parse(&value))
         } else {
-            None
+            self.last.and_then(|last| last.orientation)
         };
         SensorSample {
             present,
             orientation,
+            claimed,
         }
     }
 }
@@ -448,158 +458,6 @@ mod tests {
     }
 
     #[test]
-    fn transformed_points_stay_in_frame() {
-        // Corners map onto corners of the (possibly swapped) frame.
-        assert_eq!(transform_point(4, 2, 0, 1, 1), (1, 1));
-        assert_eq!(transform_point(4, 2, 1, 0, 0), (1, 0));
-        assert_eq!(transform_point(4, 2, 2, 0, 0), (3, 1));
-        assert_eq!(transform_point(4, 2, 3, 0, 0), (0, 3));
-        // 180° and the single-axis flips are involutions.
-        for t in [2u32, 4, 6] {
-            for x in 0..4 {
-                for y in 0..2 {
-                    let (x2, y2) = transform_point(4, 2, t, x, y);
-                    assert_eq!(transform_point(4, 2, t, x2, y2), (x, y));
-                }
-            }
-        }
-        // Every mapped point lands inside the produced frame.
-        for t in 0..=7u32 {
-            let (w, h) = if transform_swaps_dimensions(t) {
-                (2, 4)
-            } else {
-                (4, 2)
-            };
-            for x in 0..4 {
-                for y in 0..2 {
-                    let (mx, my) = transform_point(4, 2, t, x, y);
-                    assert!(mx >= 0 && mx < w && my >= 0 && my < h, "t={t}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn flipped_transforms_match_smithay_pixel_centers() {
-        // Smithay `transform_point_in` on a 4x2 frame, adjusted to
-        // pixel centers: Flipped mirrors x (not y), Flipped180
-        // mirrors y (not x). Each is pinned at three points so a
-        // wrong-axis regression fails loudly.
-        assert_eq!(transform_point(4, 2, 4, 0, 0), (3, 0));
-        assert_eq!(transform_point(4, 2, 4, 3, 1), (0, 1));
-        assert_eq!(transform_point(4, 2, 4, 1, 0), (2, 0));
-        assert_eq!(transform_point(4, 2, 5, 0, 0), (0, 0));
-        assert_eq!(transform_point(4, 2, 5, 3, 1), (1, 3));
-        assert_eq!(transform_point(4, 2, 5, 1, 0), (0, 1));
-        assert_eq!(transform_point(4, 2, 6, 0, 0), (0, 1));
-        assert_eq!(transform_point(4, 2, 6, 3, 1), (3, 0));
-        assert_eq!(transform_point(4, 2, 6, 3, 0), (3, 1));
-        assert_eq!(transform_point(4, 2, 7, 0, 0), (1, 3));
-        assert_eq!(transform_point(4, 2, 7, 3, 1), (0, 0));
-        assert_eq!(transform_point(4, 2, 7, 1, 0), (1, 2));
-        // The plain rotations, for the same strictness.
-        assert_eq!(transform_point(4, 2, 1, 3, 1), (0, 3));
-        assert_eq!(transform_point(4, 2, 2, 1, 0), (2, 1));
-        assert_eq!(transform_point(4, 2, 3, 3, 1), (1, 0));
-        // Unknown transforms stay a clamped identity.
-        assert_eq!(transform_point(4, 2, 9, 7, -3), (3, 0));
-    }
-
-    #[test]
-    fn transform_point_matches_smithay_on_every_pixel() {
-        // Strict correspondence with the vendored Smithay
-        // `transform_point_in`: pixel centers map in doubled space
-        // (`2x+1`), where Smithay's logical-edge formulas apply
-        // exactly, and `(result - 1) / 2` maps back.
-        for &(w, h) in &[(4, 2), (2, 4), (1, 1), (5, 3), (3, 5)] {
-            for t in 0..=7u32 {
-                let smithay = smithay_transform(t);
-                for x in 0..w {
-                    for y in 0..h {
-                        let doubled = smithay::utils::Point::<i64, smithay::utils::Logical>::from(
-                            (2 * i64::from(x) + 1, 2 * i64::from(y) + 1),
-                        );
-                        let area = smithay::utils::Size::<i64, smithay::utils::Logical>::from((
-                            2 * i64::from(w),
-                            2 * i64::from(h),
-                        ));
-                        let mapped = smithay.transform_point_in(doubled, &area);
-                        let expected = (((mapped.x - 1) / 2) as i32, ((mapped.y - 1) / 2) as i32);
-                        assert_eq!(
-                            transform_point(w, h, t, x, y),
-                            expected,
-                            "t={t} ({x},{y}) on {w}x{h}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn transform_point_never_panics_or_wraps_on_extremes() {
-        // `i32` extremes, zero and negative sizes, every transform
-        // including unknown ones: clamping keeps every subtraction
-        // in range, so the test completing is the overflow proof,
-        // and every result lands inside the produced frame.
-        let extremes = [i32::MIN, -1, 0, 1, 2, 4, 1080, 1920, i32::MAX];
-        for &w in &extremes {
-            for &h in &extremes {
-                for t in 0..=9u32 {
-                    let (cw, ch) = (w.max(1), h.max(1));
-                    let (fw, fh) = if transform_swaps_dimensions(t) {
-                        (ch, cw)
-                    } else {
-                        (cw, ch)
-                    };
-                    for &x in &extremes {
-                        for &y in &extremes {
-                            let (mx, my) = transform_point(w, h, t, x, y);
-                            assert!(
-                                mx >= 0 && mx < fw && my >= 0 && my < fh,
-                                "t={t} ({x},{y}) on {w}x{h} -> ({mx},{my})"
-                            );
-                            let (tx, ty) = touch_point(w, h, t, x, y);
-                            assert!(
-                                tx >= 0 && tx < fw && ty >= 0 && ty < fh,
-                                "touch t={t} ({x},{y}) on {w}x{h} -> ({tx},{ty})"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn touch_points_invert_the_panel_to_logical() {
-        // Panel pixel back to the logical pixel shown there: the
-        // inverse mapping, pinned per transform on a 4x2 panel.
-        assert_eq!(touch_point(4, 2, 0, 3, 1), (3, 1));
-        assert_eq!(touch_point(4, 2, 1, 3, 0), (0, 0));
-        assert_eq!(touch_point(4, 2, 2, 3, 1), (0, 0));
-        assert_eq!(touch_point(4, 2, 3, 3, 0), (1, 3));
-        assert_eq!(touch_point(4, 2, 4, 3, 0), (0, 0));
-        assert_eq!(touch_point(4, 2, 5, 3, 1), (0, 0));
-        assert_eq!(touch_point(4, 2, 6, 3, 0), (3, 1));
-        assert_eq!(touch_point(4, 2, 7, 3, 1), (1, 3));
-        assert_eq!(touch_point(4, 2, 9, 7, -3), (3, 0));
-        // Touch is exactly the inverted-wire forward map, everywhere.
-        for t in 0..=7u32 {
-            let inverted = transform_from_smithay(smithay_transform(t).invert());
-            for x in 0..4 {
-                for y in 0..2 {
-                    assert_eq!(
-                        touch_point(4, 2, t, x, y),
-                        transform_point(4, 2, inverted, x, y),
-                        "t={t} ({x},{y})"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn render_transforms_follow_smithay_damage_tracker() {
         // The frame renders inverted, exactly as Smithay's
         // `render_output` inverts the tracker's output transform.
@@ -620,40 +478,80 @@ mod tests {
     }
 
     #[test]
-    fn policy_drives_unlocked_builtin_panels_only() {
-        let policy = OrientationPolicy {
-            lock: false,
+    fn panel_orientation_is_managed_in_touch_mode_and_survives_the_lock() {
+        let mut policy = OrientationPolicy {
             sensor_present: true,
             sensor: Some(SensorOrientation::LeftUp),
+            touch_mode: true,
+            has_touchscreen: true,
+            ..OrientationPolicy::default()
         };
+        // update_panel_orientation_managed: touch mode, an accelerometer
+        // and a built-in panel.
         assert!(policy.managed(true));
         assert!(!policy.managed(false));
-        assert_eq!(policy.effective("eDP-1", 0), 1);
-        assert_eq!(policy.effective("HDMI-A-1", 0), 0);
-        let locked = OrientationPolicy {
-            lock: true,
-            ..policy.clone()
-        };
-        assert!(!locked.managed(true));
-        assert_eq!(locked.effective("eDP-1", 2), 2);
-        let absent = OrientationPolicy {
-            sensor_present: false,
-            sensor: None,
-            ..policy.clone()
-        };
-        assert!(!absent.managed(true));
-        assert_eq!(absent.effective("eDP-1", 2), 2);
-        // An unknown sensor reading keeps the configured transform.
-        let unknown = OrientationPolicy {
-            sensor: None,
-            ..policy.clone()
-        };
-        assert_eq!(unknown.effective("eDP-1", 2), 2);
+        // The lock inhibits tracking but leaves the panel managed, so
+        // GNOME Shell's Auto Rotate toggle stays to unlock it.
+        policy.lock = true;
+        assert!(policy.managed(true));
+        assert!(policy.inhibited(true));
+        policy.lock = false;
+        assert!(!policy.inhibited(true));
+        // A laptop out of touch mode is unmanaged; tracking stops only
+        // after the initial orientation was read.
+        policy.touch_mode = false;
+        assert!(!policy.managed(true));
+        assert!(!policy.inhibited(true));
+        policy.initial_done = true;
+        assert!(policy.inhibited(true));
+        policy.touch_mode = true;
+        policy.sensor_present = false;
+        assert!(!policy.managed(true));
         assert!(is_builtin_panel("eDP-1"));
         assert!(is_builtin_panel("LVDS-1"));
         assert!(is_builtin_panel("DSI-1"));
         assert!(!is_builtin_panel("HDMI-A-1"));
         assert!(!is_builtin_panel("tuna-0"));
+    }
+
+    #[test]
+    fn orientation_changes_rotate_only_a_managed_builtin_panel() {
+        let tablet = OrientationPolicy {
+            sensor_present: true,
+            sensor: Some(SensorOrientation::RightUp),
+            touch_mode: true,
+            has_touchscreen: true,
+            ..OrientationPolicy::default()
+        };
+        let mut policy = tablet.clone();
+        assert_eq!(policy.orientation_changed(Some(false)), Some(3));
+        assert!(policy.initial_done);
+        // Undefined is the normal transform (meta_orientation_to_transform).
+        policy.sensor = None;
+        assert_eq!(policy.orientation_changed(Some(false)), Some(0));
+        // No built-in panel: nothing to rotate.
+        assert_eq!(tablet.clone().orientation_changed(None), None);
+        // A docked laptop (no touch mode) ignores the sensor ...
+        let mut docked = OrientationPolicy {
+            touch_mode: false,
+            ..tablet.clone()
+        };
+        assert_eq!(docked.orientation_changed(Some(false)), None);
+        assert_eq!(docked.orientation_changed(Some(true)), None);
+        // ... except a native-portrait panel's first reading
+        // (handle_initial_orientation_change).
+        let mut portrait = OrientationPolicy {
+            touch_mode: false,
+            ..tablet.clone()
+        };
+        assert_eq!(portrait.orientation_changed(Some(true)), Some(3));
+        assert_eq!(portrait.orientation_changed(Some(true)), None);
+        let mut no_touchscreen = OrientationPolicy {
+            touch_mode: false,
+            has_touchscreen: false,
+            ..tablet
+        };
+        assert_eq!(no_touchscreen.orientation_changed(Some(true)), None);
     }
 
     #[test]

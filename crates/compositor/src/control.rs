@@ -611,7 +611,8 @@ impl<'a> Session<'a> {
 
     /// Ask the shell to draw GNOME's window menu.
     /// Peers older than 0.42 cannot decode `ConfirmDisplayChange`, nor
-    /// older than 0.45 the tablet OSD messages, and receive nothing.
+    /// older than 0.45 the tablet OSD messages, nor older than 0.48
+    /// `OskGesture`, and receive nothing.
     pub fn send_window_menu(&mut self, menu: &Message) -> Result<(), ControlError> {
         if matches!(menu, Message::ConfirmDisplayChange { .. }) && self.peer_minor < 42 {
             return Ok(());
@@ -625,6 +626,9 @@ impl<'a> Session<'a> {
                 | Message::ClosePadOsd { .. }
         );
         if tablet && self.peer_minor < 45 {
+            return Ok(());
+        }
+        if matches!(menu, Message::OskGesture { .. }) && self.peer_minor < 48 {
             return Ok(());
         }
         self.conn.write_frame(menu)
@@ -1290,6 +1294,7 @@ impl<'a> Session<'a> {
             | Message::PadOsdInput { .. }
             | Message::ClosePadOsd { .. }
             | Message::SeatTouchMode { .. }
+            | Message::OskGesture { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
                     kind: ErrorKind::UnknownCommand,
@@ -1349,6 +1354,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::PadOsdInput { .. } => "PadOsdInput",
         Message::ClosePadOsd { .. } => "ClosePadOsd",
         Message::SeatTouchMode { .. } => "SeatTouchMode",
+        Message::OskGesture { .. } => "OskGesture",
     }
 }
 
@@ -2297,6 +2303,12 @@ impl ControlHub {
 
     pub fn queue_message(&mut self, message: Message) {
         self.menu_queue.push(message);
+    }
+
+    /// Tell the shell how GNOME's bottom-edge OSK drag goes (wire 0.48;
+    /// older peers receive nothing).
+    pub fn queue_osk_gesture(&mut self, phase: tuna_shell_control::OskGesturePhase) {
+        self.queue_message(Message::OskGesture { phase });
     }
 
     /// Report a grabbed accelerator's press to the shell on the next poll.
