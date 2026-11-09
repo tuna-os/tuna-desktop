@@ -11,7 +11,7 @@
 //! `TUNA_SHELL_DBUS_UNRESTRICTED=1`, GNOME's unsafe mode.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
 use gtk4::gio;
@@ -74,8 +74,18 @@ pub trait ShellActions {
     fn focus_search(&self);
     fn show_applications(&self);
     fn overview_active(&self) -> bool;
-    /// Hand the compositor the full set of grabs with their flags.
-    fn set_accelerator_grabs(&self, grabs: Vec<tuna_shell_control::AcceleratorGrab>);
+    /// Hand the compositor the full set of grabs with their flags: its
+    /// connection generation and request id, or `None` if nothing was sent.
+    fn set_accelerator_grabs(
+        &self,
+        grabs: Vec<tuna_shell_control::AcceleratorGrab>,
+    ) -> Option<AcceleratorRequest>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcceleratorRequest {
+    pub generation: u64,
+    pub id: u64,
 }
 
 /// Parse a GNOME accelerator string (`<Super>p`, `XF86AudioRaiseVolume`)
@@ -190,6 +200,7 @@ impl Grabs {
     }
 
     /// Release `sender`'s grab of `action`.
+    #[cfg(test)]
     fn ungrab(&mut self, sender: &str, action: u32) -> bool {
         match self.by_action.get(&action) {
             Some(g) if g.sender == sender => {
@@ -206,6 +217,7 @@ impl Grabs {
         before != self.by_action.len()
     }
 
+    #[cfg(test)]
     fn list(&self) -> Vec<tuna_shell_control::Accelerator> {
         self.by_action
             .iter()
@@ -231,37 +243,356 @@ pub const INTERNAL_BASE: u32 = 0x4000_0000;
 pub struct Service {
     conn: RefCell<Option<gio::DBusConnection>>,
     grabs: RefCell<Grabs>,
-    /// The shell's own keybindings, ids from [`INTERNAL_BASE`], with
-    /// their GNOME grab flags.
-    internal: RefCell<Vec<tuna_shell_control::AcceleratorGrab>>,
+    /// The desired shell generation and the one last acknowledged by the
+    /// compositor. Every outbound full table snapshots the desired Rc,
+    /// including tables sent for external callers.
+    internal: RefCell<Option<Rc<InternalGeneration>>>,
+    installed_internal: RefCell<Option<PendingInternal>>,
     /// Monotonic action identities; retired generations are never reused.
     next_internal: Cell<u32>,
-    internal_indices: RefCell<BTreeMap<u32, usize>>,
-    /// Runs an internal binding by its index.
-    on_internal: RefCell<Option<InternalRun>>,
+    /// Replacements sent but not yet acknowledged. Until then an event
+    /// may name either the installed table or one just applied remotely.
+    pending_internal: RefCell<VecDeque<PendingInternal>>,
     actions: Rc<dyn ShellActions>,
     /// NameOwnerChanged, to drop a departed caller's grabs.
     watch: RefCell<Option<gio::SignalSubscription>>,
+    /// External mutations are serialized and committed only on their own
+    /// compositor acknowledgement. Later tables never contain a failed call.
+    calls: RefCell<VecDeque<GrabCall>>,
+    pending_call: RefCell<Option<PendingCall>>,
+    push_deferred: Cell<bool>,
     /// `/org/gnome/Shell/Introspect`, relayed to the compositor.
     introspect: RefCell<Option<crate::introspect_forward::Relay>>,
 }
 
+type GrabReply = Box<dyn FnOnce(Result<glib::Variant, ()>)>;
+
+enum GrabOperation {
+    Grab(String, u32, u32),
+    GrabMany(Vec<(String, u32, u32)>),
+    Ungrab(u32),
+    UngrabMany(Vec<u32>),
+}
+
+struct GrabCall {
+    sender: String,
+    operation: GrabOperation,
+    reply: GrabReply,
+}
+
+enum GrabChange {
+    Add(BTreeMap<u32, Grab>),
+    Remove(Vec<u32>),
+}
+
+struct PendingCall {
+    request: AcceleratorRequest,
+    sender: String,
+    change: GrabChange,
+    answer: glib::Variant,
+    reply: GrabReply,
+    cancelled: bool,
+}
+
+struct InternalGeneration {
+    grabs: Vec<tuna_shell_control::AcceleratorGrab>,
+    indices: BTreeMap<u32, usize>,
+    run: InternalRun,
+}
+
+struct PendingInternal {
+    request: AcceleratorRequest,
+    generation: Option<Rc<InternalGeneration>>,
+}
+
 impl Service {
-    /// Hand the compositor every grab: callers' (with their GNOME flags)
-    /// and the shell's own.
-    fn push(&self) {
+    fn send_table(&self, change: Option<&GrabChange>) -> Option<AcceleratorRequest> {
         let grabs = self.grabs.borrow();
-        let mut typed: Vec<_> = grabs
-            .list()
-            .into_iter()
-            .map(|accelerator| tuna_shell_control::AcceleratorGrab {
-                flags: grabs.by_action[&accelerator.action].flags,
-                accelerator,
-            })
-            .collect();
-        drop(grabs);
-        typed.extend(self.internal.borrow().iter().copied());
-        self.actions.set_accelerator_grabs(typed);
+        let internal = self.internal.borrow().clone();
+        let additions = match change {
+            Some(GrabChange::Add(additions)) => additions.len(),
+            _ => 0,
+        };
+        let internal_len = internal
+            .as_ref()
+            .map_or(0, |generation| generation.grabs.len());
+        let removed = match change {
+            Some(GrabChange::Remove(ids)) => ids.len(),
+            _ => 0,
+        };
+        let mut typed =
+            Vec::with_capacity(grabs.by_action.len() - removed + additions + internal_len);
+        let mut append = |action, grab: &Grab| {
+            typed.push(tuna_shell_control::AcceleratorGrab {
+                accelerator: tuna_shell_control::Accelerator {
+                    action,
+                    keysym: grab.keysym,
+                    mods: grab.mods,
+                    modes: grab.modes,
+                },
+                flags: grab.flags,
+            });
+        };
+        for (action, grab) in &grabs.by_action {
+            if !matches!(change, Some(GrabChange::Remove(ids)) if ids.binary_search(action).is_ok())
+            {
+                append(*action, grab);
+            }
+        }
+        if let Some(GrabChange::Add(additions)) = change {
+            for (action, grab) in additions {
+                append(*action, grab);
+            }
+        }
+        if let Some(generation) = internal.as_ref() {
+            typed.extend(generation.grabs.iter().copied());
+        }
+        let request = self.actions.set_accelerator_grabs(typed)?;
+        // A send can itself redial the control client. This path sends only
+        // without an external call in flight; retain no old-link callbacks.
+        self.pending_internal
+            .borrow_mut()
+            .retain(|table| table.request.generation == request.generation);
+        if self
+            .installed_internal
+            .borrow()
+            .as_ref()
+            .is_some_and(|table| table.request.generation != request.generation)
+        {
+            self.installed_internal.borrow_mut().take();
+        }
+        self.pending_internal
+            .borrow_mut()
+            .push_back(PendingInternal {
+                request,
+                generation: internal,
+            });
+        Some(request)
+    }
+
+    /// Do not let an internal refresh overwrite an in-flight external
+    /// proposal, or include it in a later table before its admission.
+    fn push(&self) -> Option<AcceleratorRequest> {
+        if self.pending_call.borrow().is_some() {
+            self.push_deferred.set(true);
+            return None;
+        }
+        self.send_table(None)
+    }
+
+    fn prepare(&self, sender: &str, operation: GrabOperation) -> (GrabChange, glib::Variant) {
+        let mut grabs = self.grabs.borrow_mut();
+        let before = grabs.next;
+        let answer = match operation {
+            GrabOperation::Grab(accel, modes, flags) => {
+                (grabs.grab_with_flags(sender, &accel, modes, flags),).to_variant()
+            }
+            GrabOperation::GrabMany(list) => {
+                let actions: Vec<u32> = list
+                    .iter()
+                    .map(|(accel, modes, flags)| {
+                        grabs.grab_with_flags(sender, accel, *modes, *flags)
+                    })
+                    .collect();
+                (actions,).to_variant()
+            }
+            GrabOperation::Ungrab(action) => {
+                let ok = grabs
+                    .by_action
+                    .get(&action)
+                    .is_some_and(|g| g.sender == sender);
+                return (
+                    GrabChange::Remove(if ok { vec![action] } else { Vec::new() }),
+                    (ok,).to_variant(),
+                );
+            }
+            GrabOperation::UngrabMany(mut actions) => {
+                let original_len = actions.len();
+                actions.sort_unstable();
+                actions.dedup();
+                let mut ok = actions.len() == original_len;
+                actions.retain(|action| {
+                    let owned = grabs
+                        .by_action
+                        .get(action)
+                        .is_some_and(|g| g.sender == sender);
+                    ok &= owned;
+                    owned
+                });
+                return (GrabChange::Remove(actions), (ok,).to_variant());
+            }
+        };
+        // Reserve monotonic action ids, but detach the proposal from the
+        // committed model until its exact request is acknowledged.
+        let additions = grabs.by_action.split_off(&before.saturating_add(1));
+        (GrabChange::Add(additions), answer)
+    }
+
+    fn queue_call(&self, sender: String, operation: GrabOperation, reply: GrabReply) {
+        self.calls.borrow_mut().push_back(GrabCall {
+            sender,
+            operation,
+            reply,
+        });
+        self.start_next_call();
+    }
+
+    fn start_next_call(&self) {
+        while self.pending_call.borrow().is_none() {
+            let Some(call) = self.calls.borrow_mut().pop_front() else {
+                break;
+            };
+            let (change, answer) = self.prepare(&call.sender, call.operation);
+            if let Some(request) = self.send_table(Some(&change)) {
+                *self.pending_call.borrow_mut() = Some(PendingCall {
+                    request,
+                    sender: call.sender,
+                    change,
+                    answer,
+                    reply: call.reply,
+                    cancelled: false,
+                });
+            } else {
+                (call.reply)(Err(()));
+            }
+        }
+    }
+
+    fn flush_deferred(&self) {
+        if !self.push_deferred.replace(false) {
+            return;
+        }
+        let _ = self.push();
+    }
+
+    /// Match only this request's answer. An unrelated later success must
+    /// not admit a denied, unanswered, or old-link table.
+    /// The compositor handles/writes results in request order on one socket.
+    /// Main dispatches a drain's accelerator events before its ordered
+    /// results, so both installed and pending snapshots remain resolvable
+    /// for those events until their own result retires the old generation.
+    pub fn command_result(&self, id: u64, applied: bool) {
+        let internal = {
+            let mut pending = self.pending_internal.borrow_mut();
+            pending
+                .iter()
+                .position(|table| table.request.id == id)
+                .and_then(|i| pending.remove(i))
+        };
+        if let Some(table) = internal.filter(|_| applied) {
+            *self.installed_internal.borrow_mut() = Some(table);
+        }
+        let call = {
+            let mut pending = self.pending_call.borrow_mut();
+            if pending.as_ref().is_some_and(|call| call.request.id == id) {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        if let Some(call) = call {
+            if applied && !call.cancelled {
+                let mut grabs = self.grabs.borrow_mut();
+                match call.change {
+                    GrabChange::Add(mut additions) => grabs.by_action.append(&mut additions),
+                    GrabChange::Remove(actions) => {
+                        for action in actions {
+                            grabs.by_action.remove(&action);
+                        }
+                    }
+                }
+                drop(grabs);
+                (call.reply)(Ok(call.answer));
+            } else {
+                (call.reply)(Err(()));
+            }
+            self.flush_deferred();
+            self.start_next_call();
+        }
+    }
+
+    fn forget_sender(&self, sender: &str) {
+        let changed = self.grabs.borrow_mut().forget(sender);
+        let mut cancelled = false;
+        if let Some(call) = self.pending_call.borrow_mut().as_mut() {
+            if call.sender == sender {
+                call.cancelled = true;
+                cancelled = true;
+            }
+        }
+        loop {
+            let call = {
+                let mut calls = self.calls.borrow_mut();
+                calls
+                    .iter()
+                    .position(|call| call.sender == sender)
+                    .and_then(|i| calls.remove(i))
+            };
+            let Some(call) = call else { break };
+            (call.reply)(Err(()));
+        }
+        if changed || cancelled {
+            self.push_deferred.set(true);
+            if self.pending_call.borrow().is_none() {
+                self.flush_deferred();
+            }
+        }
+    }
+
+    /// Observe the live stream on every pump, not only a generation change
+    /// within `poll`: an intervening write can already have redialed it.
+    /// New-link admissions survive; old-link proposals fail without commit.
+    pub fn control_changed(&self, generation: Option<u64>) {
+        let mut interrupted = false;
+        {
+            let mut pending = self.pending_internal.borrow_mut();
+            let before = pending.len();
+            pending.retain(|table| Some(table.request.generation) == generation);
+            interrupted |= before != pending.len();
+        }
+        {
+            let mut installed = self.installed_internal.borrow_mut();
+            if installed
+                .as_ref()
+                .is_some_and(|table| Some(table.request.generation) != generation)
+            {
+                installed.take();
+                interrupted = true;
+            }
+        }
+        let call = {
+            let mut pending = self.pending_call.borrow_mut();
+            if pending
+                .as_ref()
+                .is_some_and(|call| Some(call.request.generation) != generation)
+            {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        if let Some(call) = call {
+            interrupted = true;
+            (call.reply)(Err(()));
+        }
+        if generation.is_none() {
+            loop {
+                let call = self.calls.borrow_mut().pop_front();
+                let Some(call) = call else { break };
+                (call.reply)(Err(()));
+            }
+            self.push_deferred.set(false);
+        } else if interrupted {
+            self.push_deferred.set(true);
+            if self.pending_call.borrow().is_none() {
+                self.flush_deferred();
+                self.start_next_call();
+            }
+        }
+    }
+
+    pub fn release_replies(&self) {
+        self.control_changed(None);
     }
 
     /// Bind the shell's own keys: `accelerators[i]` (accelerator, modes,
@@ -292,10 +623,12 @@ impl Service {
             }
         }
         self.grabs.borrow_mut().reserved = reserved;
-        *self.internal.borrow_mut() = list;
-        *self.internal_indices.borrow_mut() = indices;
-        *self.on_internal.borrow_mut() = Some(run);
-        self.push();
+        *self.internal.borrow_mut() = Some(Rc::new(InternalGeneration {
+            grabs: list,
+            indices,
+            run,
+        }));
+        let _ = self.push();
     }
 
     /// A grabbed accelerator fired: one of the shell's own runs here;
@@ -317,9 +650,24 @@ impl Service {
             if released {
                 return;
             }
-            let index = self.internal_indices.borrow().get(&action).copied();
-            let run = self.on_internal.borrow().clone();
-            if let (Some(index), Some(run)) = (index, run) {
+            let find = |generation: &InternalGeneration| {
+                generation
+                    .indices
+                    .get(&action)
+                    .map(|index| (*index, generation.run.clone()))
+            };
+            let handler = self
+                .installed_internal
+                .borrow()
+                .as_ref()
+                .and_then(|table| table.generation.as_deref().and_then(find))
+                .or_else(|| {
+                    self.pending_internal
+                        .borrow()
+                        .iter()
+                        .find_map(|table| table.generation.as_deref().and_then(find))
+                });
+            if let Some((index, run)) = handler {
                 run(index, mode);
             }
             return;
@@ -405,12 +753,15 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
     let service = Rc::new(Service {
         conn: RefCell::new(None),
         grabs: RefCell::new(Grabs::default()),
-        internal: RefCell::new(Vec::new()),
+        internal: RefCell::new(None),
         next_internal: Cell::new(INTERNAL_BASE),
-        internal_indices: RefCell::new(BTreeMap::new()),
-        on_internal: RefCell::new(None),
+        installed_internal: RefCell::new(None),
+        pending_internal: RefCell::new(VecDeque::new()),
         actions: actions.clone(),
         watch: RefCell::new(None),
+        calls: RefCell::new(VecDeque::new()),
+        pending_call: RefCell::new(None),
+        push_deferred: Cell::new(false),
         introspect: RefCell::new(None),
     });
     let node = match gio::DBusNodeInfo::for_xml(XML) {
@@ -444,6 +795,7 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                         return;
                     }
                     let sender = sender.unwrap_or_default().to_owned();
+                    let mut operation = None;
                     let reply = match method {
                         "ShowOSD" => {
                             let request = params
@@ -470,12 +822,8 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                                 );
                                 return;
                             };
-                            let action = grabs_svc
-                                .grabs
-                                .borrow_mut()
-                                .grab_with_flags(&sender, &accel, modes, flags);
-                            grabs_svc.push();
-                            Some((action,).to_variant())
+                            operation = Some(GrabOperation::Grab(accel, modes, flags));
+                            None
                         }
                         "GrabAccelerators" => {
                             let Some((list,)) = params.get::<(Vec<(String, u32, u32)>,)>() else {
@@ -485,41 +833,21 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                                 );
                                 return;
                             };
-                            let actions: Vec<u32> = {
-                                let mut grabs = grabs_svc.grabs.borrow_mut();
-                                list.iter()
-                                    .map(|(accel, modes, flags)| {
-                                        grabs.grab_with_flags(&sender, accel, *modes, *flags)
-                                    })
-                                    .collect()
-                            };
-                            grabs_svc.push();
-                            Some((actions,).to_variant())
+                            operation = Some(GrabOperation::GrabMany(list));
+                            None
                         }
                         "UngrabAccelerator" => {
                             let action = params.get::<(u32,)>().map(|(a,)| a).unwrap_or(0);
-                            let ok = grabs_svc.grabs.borrow_mut().ungrab(&sender, action);
-                            grabs_svc.push();
-                            Some((ok,).to_variant())
+                            operation = Some(GrabOperation::Ungrab(action));
+                            None
                         }
                         "UngrabAccelerators" => {
                             let list = params
                                 .get::<(Vec<u32>,)>()
                                 .map(|(l,)| l)
                                 .unwrap_or_default();
-                            let ok = {
-                                let mut grabs = grabs_svc.grabs.borrow_mut();
-                                {
-                                    // Every action is released even after a miss.
-                                    let mut ok = true;
-                                    for action in &list {
-                                        ok &= grabs.ungrab(&sender, *action);
-                                    }
-                                    ok
-                                }
-                            };
-                            grabs_svc.push();
-                            Some((ok,).to_variant())
+                            operation = Some(GrabOperation::UngrabMany(list));
+                            None
                         }
                         _ => {
                             invocation.return_dbus_error(
@@ -529,7 +857,21 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                             return;
                         }
                     };
-                    invocation.return_value(reply.as_ref());
+                    if let Some(operation) = operation {
+                        grabs_svc.queue_call(
+                            sender,
+                            operation,
+                            Box::new(move |result| match result {
+                                Ok(reply) => invocation.return_value(Some(&reply)),
+                                Err(()) => invocation.return_dbus_error(
+                                    "org.gnome.Shell.Error.Failed",
+                                    "The compositor did not install the accelerator table",
+                                ),
+                            }),
+                        );
+                    } else {
+                        invocation.return_value(reply.as_ref());
+                    }
                 })
                 .property(move |_, _, _, _, property| match property {
                     "Mode" => "user".to_variant(),
@@ -556,8 +898,8 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                     if let Some((name, _, new_owner)) =
                         signal.parameters.get::<(String, String, String)>()
                     {
-                        if new_owner.is_empty() && svc.grabs.borrow_mut().forget(&name) {
-                            svc.push();
+                        if new_owner.is_empty() {
+                            svc.forget_sender(&name);
                         }
                     }
                 },
@@ -660,8 +1002,15 @@ mod tests {
         assert_eq!(grabs.grab(":1.6", "XF86AudioMute", 0), 0);
     }
 
+    /// Records the last table sent and numbers each send like the
+    /// control client's request ids.
     #[derive(Default)]
-    struct RecordedActions(RefCell<Vec<tuna_shell_control::Accelerator>>);
+    struct RecordedActions(
+        RefCell<Vec<tuna_shell_control::Accelerator>>,
+        Cell<u64>,
+        Cell<bool>,
+        Cell<u64>,
+    );
 
     impl ShellActions for RecordedActions {
         fn show_osd(&self, _: &OsdRequest) {}
@@ -670,8 +1019,19 @@ mod tests {
         fn overview_active(&self) -> bool {
             false
         }
-        fn set_accelerator_grabs(&self, grabs: Vec<tuna_shell_control::AcceleratorGrab>) {
+        fn set_accelerator_grabs(
+            &self,
+            grabs: Vec<tuna_shell_control::AcceleratorGrab>,
+        ) -> Option<AcceleratorRequest> {
+            self.1.set(self.1.get() + 1);
+            if self.2.get() {
+                return None;
+            }
             *self.0.borrow_mut() = grabs.into_iter().map(|g| g.accelerator).collect();
+            Some(AcceleratorRequest {
+                generation: self.3.get(),
+                id: self.1.get(),
+            })
         }
     }
 
@@ -679,14 +1039,379 @@ mod tests {
         Service {
             conn: RefCell::new(None),
             grabs: RefCell::new(Grabs::default()),
-            internal: RefCell::new(Vec::new()),
+            internal: RefCell::new(None),
             next_internal: Cell::new(INTERNAL_BASE),
-            internal_indices: RefCell::new(BTreeMap::new()),
-            on_internal: RefCell::new(None),
+            installed_internal: RefCell::new(None),
+            pending_internal: RefCell::new(VecDeque::new()),
             actions,
             watch: RefCell::new(None),
+            calls: RefCell::new(VecDeque::new()),
+            pending_call: RefCell::new(None),
+            push_deferred: Cell::new(false),
             introspect: RefCell::new(None),
         }
+    }
+
+    type CallResult = Rc<RefCell<Option<Result<glib::Variant, ()>>>>;
+
+    fn queued(service: &Service, operation: GrabOperation) -> CallResult {
+        let result = Rc::new(RefCell::new(None));
+        let reply = result.clone();
+        service.queue_call(
+            ":1.5".into(),
+            operation,
+            Box::new(move |r| {
+                assert!(
+                    reply.borrow_mut().replace(r).is_none(),
+                    "call answered twice"
+                );
+            }),
+        );
+        result
+    }
+
+    fn play_grab() -> GrabOperation {
+        GrabOperation::Grab("XF86AudioPlay".into(), tuna_shell_control::MODE_NORMAL, 0)
+    }
+
+    #[test]
+    fn grab_replies_wait_for_their_own_ack_and_do_not_leak_denied_mutations() {
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions.clone());
+        let first = queued(&service, play_grab());
+        let second = queued(&service, GrabOperation::Grab("XF86AudioNext".into(), 1, 0));
+        assert!(first.borrow().is_none());
+        assert!(second.borrow().is_none());
+        assert_eq!(
+            actions.1.get(),
+            1,
+            "second proposal must wait for the first"
+        );
+        assert!(
+            service.grabs.borrow().by_action.is_empty(),
+            "unacknowledged model was committed"
+        );
+        service.command_result(99, true);
+        assert!(
+            first.borrow().is_none(),
+            "unrelated later success admitted the grab"
+        );
+        service.command_result(1, true);
+        assert_eq!(
+            first
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get::<(u32,)>(),
+            Some((1,))
+        );
+        assert_eq!(actions.1.get(), 2);
+        service.command_result(2, false);
+        assert!(second.borrow().as_ref().unwrap().is_err());
+        assert_eq!(service.grabs.borrow().by_action.len(), 1);
+        assert!(
+            !service.grabs.borrow().by_action.contains_key(&2),
+            "denied action still has an activation recipient"
+        );
+        let _ = service.push();
+        assert_eq!(
+            actions.0.borrow().len(),
+            1,
+            "a later table installed a failed grab"
+        );
+        assert_eq!(actions.0.borrow()[0].action, 1);
+    }
+
+    #[test]
+    fn lost_or_unsent_grabs_fail_and_cannot_reappear_in_later_tables() {
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions.clone());
+        actions.2.set(true);
+        let unsent = queued(&service, play_grab());
+        assert!(unsent.borrow().as_ref().unwrap().is_err());
+        actions.2.set(false);
+        let pending = queued(&service, play_grab());
+        let waiting = queued(&service, GrabOperation::Grab("XF86AudioNext".into(), 1, 0));
+        service.release_replies();
+        assert!(pending.borrow().as_ref().unwrap().is_err());
+        assert!(waiting.borrow().as_ref().unwrap().is_err());
+        service.command_result(2, true);
+        let _ = service.push();
+        assert!(
+            actions.0.borrow().is_empty(),
+            "old-link or unsent actions leaked into a later push"
+        );
+        assert!(service.grabs.borrow().by_action.is_empty());
+        let retry = queued(&service, play_grab());
+        let request = actions.1.get();
+        service.command_result(request, true);
+        assert_eq!(
+            retry
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get::<(u32,)>(),
+            Some((3,)),
+            "a failed admission must not recycle its action identity"
+        );
+    }
+
+    #[test]
+    fn denied_ungrab_preserves_its_installed_model_and_later_activation_recipient() {
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions.clone());
+        let grab = queued(&service, play_grab());
+        service.command_result(1, true);
+        assert!(grab.borrow().as_ref().unwrap().is_ok());
+        let ungrab = queued(&service, GrabOperation::Ungrab(1));
+        assert!(ungrab.borrow().is_none());
+        assert!(service.grabs.borrow().by_action.contains_key(&1));
+        service.command_result(2, false);
+        assert!(ungrab.borrow().as_ref().unwrap().is_err());
+        let _ = service.push();
+        assert_eq!(actions.0.borrow()[0].action, 1);
+        assert_eq!(service.grabs.borrow().by_action[&1].sender, ":1.5");
+        let ungrab = queued(&service, GrabOperation::UngrabMany(vec![1]));
+        service.command_result(actions.1.get(), true);
+        assert_eq!(
+            ungrab
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get::<(bool,)>(),
+            Some((true,))
+        );
+        let _ = service.push();
+        assert!(actions.0.borrow().is_empty());
+        assert!(service.grabs.borrow().by_action.is_empty());
+    }
+
+    #[test]
+    fn internal_refresh_during_a_denied_external_grab_never_publishes_the_proposal() {
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions.clone());
+        let grab = queued(&service, play_grab());
+        service.set_internal(
+            &[("<Super>n".into(), tuna_shell_control::MODE_NORMAL, 0)],
+            Rc::new(|_, _| {}),
+        );
+        assert_eq!(
+            actions.1.get(),
+            1,
+            "internal refresh overwrote a pending external admission"
+        );
+        service.command_result(1, false);
+        assert!(grab.borrow().as_ref().unwrap().is_err());
+        assert_eq!(actions.1.get(), 2);
+        assert_eq!(actions.0.borrow().len(), 1);
+        assert!(actions.0.borrow()[0].action >= INTERNAL_BASE);
+        assert!(service.grabs.borrow().by_action.is_empty());
+    }
+
+    #[test]
+    fn external_table_snapshots_a_previously_denied_or_unsent_internal_generation() {
+        for unsent in [false, true] {
+            let actions = Rc::new(RecordedActions::default());
+            let service = test_service(actions.clone());
+            let old_calls = Rc::new(Cell::new(0));
+            let calls = old_calls.clone();
+            service.set_internal(
+                &[("<Super>n".into(), tuna_shell_control::MODE_NORMAL, 0)],
+                Rc::new(move |_, _| calls.set(calls.get() + 1)),
+            );
+            service.command_result(1, true);
+            let old = actions.0.borrow()[0].action;
+            let new_calls = Rc::new(Cell::new(0));
+            let calls = new_calls.clone();
+            actions.2.set(unsent);
+            service.set_internal(
+                &[("<Super>n".into(), tuna_shell_control::MODE_NORMAL, 0)],
+                Rc::new(move |_, _| calls.set(calls.get() + 1)),
+            );
+            if !unsent {
+                service.command_result(2, false);
+            }
+            actions.2.set(false);
+            let grab = queued(&service, play_grab());
+            assert!(grab.borrow().is_none());
+            let new = actions
+                .0
+                .borrow()
+                .iter()
+                .find(|a| a.action >= INTERNAL_BASE)
+                .unwrap()
+                .action;
+            // Control events are grouped before results in Drained, including
+            // an event from the just-applied table in the same socket drain.
+            service.accelerator_activated(new, 1, tuna_shell_control::MODE_NORMAL);
+            assert_eq!(
+                new_calls.get(),
+                1,
+                "new internal identity had no callback before its own ack (unsent={unsent})"
+            );
+            service.accelerator_activated(old, 2, tuna_shell_control::MODE_NORMAL);
+            assert_eq!(old_calls.get(), 1);
+            service.command_result(3, true);
+            assert!(grab.borrow().as_ref().unwrap().is_ok());
+            service.accelerator_activated(old, 3, tuna_shell_control::MODE_NORMAL);
+            assert_eq!(
+                old_calls.get(),
+                1,
+                "acknowledged replacement retained the old callback"
+            );
+            service.accelerator_activated(new, 4, tuna_shell_control::MODE_NORMAL);
+            assert_eq!(new_calls.get(), 2);
+        }
+    }
+
+    #[test]
+    fn departed_caller_cannot_acquire_a_pending_grab() {
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions.clone());
+        let grab = queued(&service, play_grab());
+        let waiting = queued(&service, play_grab());
+        service.forget_sender(":1.5");
+        assert!(waiting.borrow().as_ref().unwrap().is_err());
+        service.command_result(1, true);
+        assert!(grab.borrow().as_ref().unwrap().is_err());
+        assert!(
+            actions.0.borrow().is_empty(),
+            "departed owner's remote proposal was not retired"
+        );
+        assert!(service.grabs.borrow().by_action.is_empty());
+    }
+
+    #[test]
+    fn redial_between_pumps_fails_old_admission_but_preserves_new_link_calls() {
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions.clone());
+        service.set_internal(
+            &[("<Super>n".into(), tuna_shell_control::MODE_NORMAL, 0)],
+            Rc::new(|_, _| {}),
+        );
+        service.command_result(1, true);
+        let old_call = queued(&service, play_grab()); // request 2, generation 0
+        let new_call = queued(&service, GrabOperation::Grab("XF86AudioNext".into(), 1, 0));
+        // Another control command redials between pumps. The pump sees an
+        // already-new generation both before and after draining.
+        actions.3.set(1);
+        service.control_changed(Some(1));
+        assert!(old_call.borrow().as_ref().unwrap().is_err());
+        assert!(new_call.borrow().is_none());
+        let new_request = service.pending_call.borrow().as_ref().unwrap().request;
+        assert_eq!(
+            new_request,
+            AcceleratorRequest {
+                generation: 1,
+                id: 4
+            }
+        );
+        service.control_changed(Some(1));
+        assert!(
+            new_call.borrow().is_none(),
+            "new-link request was cancelled with the old one"
+        );
+        service.command_result(2, true);
+        assert!(
+            new_call.borrow().is_none(),
+            "old-link ack admitted the new request"
+        );
+        service.command_result(3, true); // internal restoration, not the external call
+        assert!(new_call.borrow().is_none());
+        service.command_result(4, true);
+        assert_eq!(
+            new_call
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get::<(u32,)>(),
+            Some((2,))
+        );
+        assert!(!service.grabs.borrow().by_action.contains_key(&1));
+        assert!(service.grabs.borrow().by_action.contains_key(&2));
+    }
+
+    #[test]
+    fn a_send_that_redials_snapshots_the_new_stream_before_the_next_pump() {
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions.clone());
+        service.set_internal(
+            &[("<Super>n".into(), tuna_shell_control::MODE_NORMAL, 0)],
+            Rc::new(|_, _| {}),
+        );
+        service.command_result(1, true);
+        let calls = Rc::new(Cell::new(0));
+        let fired = calls.clone();
+        actions.3.set(1);
+        service.set_internal(
+            &[("<Super>n".into(), tuna_shell_control::MODE_NORMAL, 0)],
+            Rc::new(move |_, _| fired.set(fired.get() + 1)),
+        );
+        let new = actions.0.borrow()[0].action;
+        service.control_changed(Some(1));
+        assert_eq!(
+            actions.1.get(),
+            2,
+            "new-link snapshot was needlessly replayed"
+        );
+        service.accelerator_activated(new, 1, tuna_shell_control::MODE_NORMAL);
+        assert_eq!(
+            calls.get(),
+            1,
+            "new snapshot was cancelled before its own ack"
+        );
+        service.command_result(2, true);
+        service.accelerator_activated(new, 2, tuna_shell_control::MODE_NORMAL);
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn internal_rebind_keeps_installed_actions_until_replacement_is_applied() {
+        let actions = Rc::new(RecordedActions::default());
+        let service = test_service(actions.clone());
+        let old_calls = Rc::new(Cell::new(0));
+        let calls = old_calls.clone();
+        service.set_internal(
+            &[("<Super>n".into(), tuna_shell_control::MODE_NORMAL, 0)],
+            Rc::new(move |_, _| calls.set(calls.get() + 1)),
+        );
+        service.command_result(1, true);
+        let old = actions.0.borrow()[0].action;
+        let new_calls = Rc::new(Cell::new(0));
+        let calls = new_calls.clone();
+        service.set_internal(
+            &[("<Super>n".into(), tuna_shell_control::MODE_NORMAL, 0)],
+            Rc::new(move |_, _| calls.set(calls.get() + 1)),
+        );
+        let new = actions.0.borrow()[0].action;
+        // The control frame is queued: input still meets the old table.
+        service.accelerator_activated(old, 1, tuna_shell_control::MODE_NORMAL);
+        assert_eq!(
+            old_calls.get(),
+            1,
+            "the installed binding disappeared before acknowledgement"
+        );
+        // Applied and an activation can be read in one drain. Main dispatches
+        // activations before results, so the new identity must also resolve.
+        service.accelerator_activated(new, 2, tuna_shell_control::MODE_NORMAL);
+        assert_eq!(new_calls.get(), 1);
+        service.command_result(2, true);
+        service.accelerator_activated(old, 3, tuna_shell_control::MODE_NORMAL);
+        assert_eq!(
+            old_calls.get(),
+            1,
+            "retired identity survived its acknowledged replacement"
+        );
+        service.accelerator_activated(new, 4, tuna_shell_control::MODE_NORMAL);
+        assert_eq!(new_calls.get(), 2);
     }
 
     #[test]
@@ -703,6 +1428,7 @@ mod tests {
             )],
             Rc::new(move |index, mode| calls.borrow_mut().push((index, mode))),
         );
+        service.command_result(1, true);
         let retired = actions.0.borrow()[0].action;
         service.accelerator_activated(retired, 1, tuna_shell_control::MODE_NORMAL);
         assert_eq!(old_calls.borrow().len(), 1);
@@ -718,6 +1444,7 @@ mod tests {
         );
         let current = actions.0.borrow()[0].action;
         assert_ne!(retired, current);
+        service.command_result(2, true);
         service.accelerator_activated(retired, 2, tuna_shell_control::MODE_NORMAL);
         service.accelerator_activated(u32::MAX, 3, tuna_shell_control::MODE_NORMAL);
         assert!(new_calls.borrow().is_empty());
@@ -726,6 +1453,7 @@ mod tests {
         assert_eq!(*new_calls.borrow(), [(1, tuna_shell_control::MODE_NORMAL)]);
 
         service.set_internal(&[], Rc::new(|_, _| panic!("disabled binding ran")));
+        service.command_result(3, true);
         service.accelerator_activated(current, 5, tuna_shell_control::MODE_NORMAL);
         assert!(actions.0.borrow().is_empty());
     }
@@ -753,6 +1481,7 @@ mod tests {
             Rc::new(|_, _| panic!("exhausted binding ran")),
         );
         assert!(actions.0.borrow().is_empty());
+        service.command_result(2, true);
         service.accelerator_activated(u32::MAX - 1, 1, tuna_shell_control::MODE_NORMAL);
     }
 }

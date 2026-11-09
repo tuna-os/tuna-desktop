@@ -1,0 +1,399 @@
+{
+  "vm": "tuna-q-isg-mar1",
+  "image": "ghcr.io/tuna-os/marlin@sha256:d0e65bce0ac55cb6c58bcf3739e30d6372fe4be978e6ea7c0c1310b3962bdfa5",
+  "source_head": "7a623e10b856ca663343271de6528f87e82dc75b",
+  "phase_interpretation": {
+    "published": "Events and frames 01-04 are the unmodified published Marlin beta2-2 Tuna session.",
+    "reference": "Frames 08-14 and events named candidate running binaries and session, candidate notification introspection, candidate GetServerInformation, candidate notify-send are GNOME Shell 51.1, NOT Tuna. Initial GDM selection did not select Tuna; failed /proc//exe probes are retained as negative evidence.",
+    "candidate": "Only events beginning Tuna candidate and frames 16-22 qualify the real Tuna GDM session on the exact 7a623e10 CI image.",
+    "frames_05_to_07_and_15": "GDM input and session selection evidence; not product qualification."
+  },
+  "events": [
+    {
+      "frame": "01-published-gdm.png",
+      "time": "2026-10-31T20:35:45+00:00",
+      "sha256": "a741bfec91645b263bc7a3f39e3847e62197463a5839d05556da213f44b13186"
+    },
+    {
+      "name": "published provenance",
+      "time": "2026-10-31T20:35:54+00:00",
+      "command": "pacman -Q tuna-desktop gdm gnome-shell libnotify; pacman -Qi tuna-desktop; sha256sum /usr/bin/tuna-session /usr/bin/tuna-compositor /usr/bin/tuna-shell-gtk; bootc status --format json; loginctl list-sessions --no-legend",
+      "user": "root",
+      "exit": 0,
+      "stdout": "tuna-desktop 1.0.0beta.2-2\ngdm 51.1.1-1\ngnome-shell 1:51.1-1\nlibnotify 0.8.9-1\nName            : tuna-desktop\nVersion         : 1.0.0beta.2-2\nDescription     : Tuna Desktop: GNOME-style Wayland desktop session in Rust (v1 beta)\nArchitecture    : x86_64\nURL             : https://github.com/tuna-os/tuna-desktop/archive/refs/tags/v1.0.0-beta.2.tar.gz\nLicenses        : GPL-3.0-or-later\nGroups          : None\nProvides        : roost\nDepends On      : dbus  glib2  gnome-settings-daemon  gnome-session  gdk-pixbuf2  librsvg  glycin  fontconfig  adwaita-fonts  gtk4  gtk4-layer-shell  libadwaita  libcanberra  libdrm  libinput  libsecret  libxkbcommon  libxkbcommon-x11  mesa  pipewire  seatd  sound-theme-freedesktop  systemd-libs  wayland\nOptional Deps   : None\nRequired By     : None\nOptional For    : None\nConflicts With  : None\nReplaces        : None\nInstalled Size  : 48.43 MiB\nPackager        : Unknown Packager\nBuild Date      : Fri Oct 30 23:30:12 2026\nInstall Date    : Sat Oct 31 09:50:29 2026\nInstall Reason  : Explicitly installed\nInstall Script  : No\nValidated By    : SHA-256 Sum  Signature\n\nc0cbf31288061099f4ceb7a475ab3dc3bcc6905252a5fc5db2af3b641594fdb4  /usr/bin/tuna-session\nde2c70dfd556945e1b812b8caf5f61cd9f5e27a58d85f5183940f92357ad99c5  /usr/bin/tuna-compositor\nc517b237d455e20f72940f85e555d02e5f3f85a7098cfc5defa1a12d1c58ba46  /usr/bin/tuna-shell-gtk\n{\"apiVersion\":\"org.containers.bootc/v1\",\"kind\":\"BootcHost\",\"metadata\":{\"name\":\"host\"},\"spec\":{\"bootOrder\":\"default\",\"image\":{\"image\":\"ghcr.io/tuna-os/marlin@sha256:d0e65bce0ac55cb6c58bcf3739e30d6372fe4be978e6ea7c0c1310b3962bdfa5\",\"transport\":\"registry\"}},\"status\":{\"booted\":{\"cachedUpdate\":null,\"composefs\":{\"bootDigest\":\"4de5bc540e35ecf451563838a5f2b5053aedb3ef1c6ee4d892c91c04ce9f3b47\",\"bootType\":\"Bls\",\"bootloader\":\"systemd\",\"missingVerityAllowed\":false,\"verity\":\"0bbcb73ab688d95667eaf7c506f1463235683ecfa118613a80a168b568b16f9d2a821c2333eb58e95901b02cb6c01f8b4e9e34f0cdfa3fa1eb7f049aef551671\"},\"downloadOnly\":false,\"image\":{\"architecture\":\"amd64\",\"image\":{\"image\":\"ghcr.io/tuna-os/marlin@sha256:d0e65bce0ac55cb6c58bcf3739e30d6372fe4be978e6ea7c0c1310b3962bdfa5\",\"transport\":\"registry\"},\"imageDigest\":\"sha256:9706311b7850d4dfcbf312b996a98793f9f0581d200fbe08c1c344924d49b691\",\"timestamp\":\"2026-10-31T09:55:45.753372452Z\",\"version\":null},\"incompatible\":false,\"ostree\":null,\"pinned\":false,\"softRebootCapable\":false,\"store\":null},\"readOnly\":false,\"rollback\":null,\"rollbackQueued\":false,\"staged\":null,\"type\":null,\"usrOverlay\":null}}1 60578 gdm-greeter seat0 776 greeter       tty1 no -\n2 60578 gdm-greeter -     842 manager-early -    no -\n3     0 root        -     900 user          -    no -\n4     0 root        -     940 manager-early -    no -",
+      "stderr": ""
+    },
+    {
+      "frame": "02-published-session.png",
+      "time": "2026-10-31T20:36:20+00:00",
+      "sha256": "d3210bdbd5b88ffd85c60d12fd2dff3d6694f1352b5296839c238229cb6074d6"
+    },
+    {
+      "name": "published session",
+      "time": "2026-10-31T20:36:35+00:00",
+      "command": "loginctl list-sessions --no-legend; for s in $(loginctl list-sessions --no-legend | cut -d \" \" -f 1); do loginctl show-session \"$s\" -p Name -p Service -p Type -p Class -p State -p LockedHint -p Desktop; done; ps -u tuna-test -o pid,comm,args; sha256sum /proc/$(pgrep -u tuna-test -x tuna-compositor)/exe /proc/$(pgrep -u tuna-test -x tuna-shell-gtk)/exe",
+      "user": "root",
+      "exit": 0,
+      "stdout": "3    0 root      -     900  user          -    no -\n4    0 root      -     940  manager-early -    no -\n5 1000 tuna-test seat0 2003 user          tty2 no -\n6 1000 tuna-test -     2095 manager       -    no -\nName=root\nService=sshd\nDesktop=\nType=tty\nClass=user\nState=active\nLockedHint=no\nName=root\nService=systemd-user\nDesktop=\nType=unspecified\nClass=manager-early\nState=active\nLockedHint=no\nName=tuna-test\nService=gdm-password\nDesktop=\nType=wayland\nClass=user\nState=active\nLockedHint=no\nName=tuna-test\nService=systemd-user\nDesktop=\nType=unspecified\nClass=manager\nState=active\nLockedHint=no\n    PID COMMAND         COMMAND\n   2095 systemd         /usr/lib/systemd/systemd --user\n   2097 (sd-pam)        (sd-pam)\n   2113 gnome-keyring-d /usr/bin/gnome-keyring-daemon --foreground --components=pkcs11,secrets --control-directory=/run/user/1000/keyring\n   2118 dbus-broker-lau /usr/bin/dbus-broker-launch --scope user\n   2119 dbus-broker     dbus-broker --log 10 --controller 9 --machine-id 300bf044761d465297427892aaf37e8a --max-bytes 100000000000000 --max-fds 25000000000000 --max-matches 5000000000\n   2123 gdm-wayland-ses /usr/lib/gdm-wayland-session tuna-session\n   2138 tuna-compositor /usr/bin/tuna-compositor --shell-bin /usr/bin/tuna-shell-gtk --startup-overview\n   2154 gvfsd           /usr/lib/gvfsd\n   2160 gvfsd-fuse      /usr/lib/gvfsd-fuse /run/user/1000/gvfs -f\n   2214 gnome-session-c /usr/lib/gnome-session-ctl --monitor\n   2222 tuna-shell-gtk  /usr/bin/tuna-shell-gtk\n   2223 tuna-ibus-bridg /usr/bin/tuna-ibus-bridge\n   2231 gsd-datetime    /usr/lib/gsd-datetime\n   2232 gsd-housekeepin /usr/lib/gsd-housekeeping\n   2233 gsd-keyboard    /usr/lib/gsd-keyboard\n   2234 ibus-daemon     ibus-daemon --panel disable --daemonize\n   2237 gsd-media-keys  /usr/lib/gsd-media-keys\n   2243 gsd-power       /usr/lib/gsd-power\n   2247 gsd-print-notif /usr/lib/gsd-print-notifications\n   2252 gsd-rfkill      /usr/lib/gsd-rfkill\n   2255 gsd-screensaver /usr/lib/gsd-screensaver-proxy\n   2257 gsd-sharing     /usr/lib/gsd-sharing\n   2258 gsd-smartcard   /usr/lib/gsd-smartcard\n   2265 gsd-sound       /usr/lib/gsd-sound\n   2266 gsd-usb-protect /usr/lib/gsd-usb-protection\n   2267 gsd-wwan        /usr/lib/gsd-wwan\n   2283 ibus-dconf      /usr/lib/ibus/ibus-dconf\n   2304 ibus-portal     /usr/lib/ibus/ibus-portal\n   2322 gsd-printer     /usr/lib/gsd-printer\n   2350 pipewire        /usr/bin/pipewire\n   2353 wireplumber     /usr/bin/wireplumber\n   2355 pipewire-pulse  /usr/bin/pipewire-pulse\n   2397 dconf-service   /usr/lib/dconf-service\n   2408 xdg-desktop-por /usr/lib/xdg-desktop-portal\n   2431 xdg-permission- /usr/lib/xdg-permission-store\n   2449 xdg-document-po /usr/lib/xdg-document-portal\n   2458 xdg-desktop-por /usr/lib/xdg-desktop-portal-gnome\n   2485 gnome-control-c /usr/lib/gnome-control-center-global-shortcuts-provider\n   2486 at-spi-bus-laun /usr/lib/at-spi-bus-launcher\n   2492 dbus-broker-lau /usr/bin/dbus-broker-launch --config-file=/usr/share/defaults/at-spi2/accessibility.conf --scope user\n   2493 dbus-broker     dbus-broker --log 10 --controller 9 --machine-id 300bf044761d465297427892aaf37e8a --max-bytes 100000000000000 --max-fds 6400000 --max-matches 5000000000\n   2502 pw-dump         pw-dump --monitor --no-colors\n   2520 xdg-desktop-por /usr/lib/xdg-desktop-portal-gtk\n   2531 at-spi2-registr /usr/lib/at-spi2-registryd --use-gnome-session\n   2563 gnome-shell-cal /usr/lib/gnome-shell-calendar-server\n   2574 evolution-sourc /usr/lib/evolution-source-registry\n   2637 goa-daemon      /usr/lib/goa-daemon\n   2651 goa-identity-se /usr/lib/goa-identity-service\n   2652 evolution-calen /usr/lib/evolution-calendar-factory\n   2704 gvfsd-metadata  /usr/lib/gvfsd-metadata\n   2722 evolution-addre /usr/lib/evolution-addressbook-factory\nde2c70dfd556945e1b812b8caf5f61cd9f5e27a58d85f5183940f92357ad99c5  /proc/2138/exe\nc517b237d455e20f72940f85e555d02e5f3f85a7098cfc5defa1a12d1c58ba46  /proc/2222/exe",
+      "stderr": ""
+    },
+    {
+      "name": "published notification introspection",
+      "time": "2026-10-31T20:36:41+00:00",
+      "command": "gdbus introspect --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "node /org/freedesktop/Notifications {\n  interface org.freedesktop.DBus.Introspectable {\n    methods:\n      Introspect(out s arg_0);\n    signals:\n    properties:\n  };\n  interface org.freedesktop.DBus.Peer {\n    methods:\n      Ping();\n      GetMachineId(out s arg_0);\n    signals:\n    properties:\n  };\n  interface org.freedesktop.DBus.Properties {\n    methods:\n      Get(in  s interface_name,\n          in  s property_name,\n          out v arg_2);\n      Set(in  s interface_name,\n          in  s property_name,\n          in  v value);\n      GetAll(in  s interface_name,\n             out a{sv} arg_1);\n    signals:\n      PropertiesChanged(s interface_name,\n                        a{sv} changed_properties,\n                        as invalidated_properties);\n    properties:\n  };\n  interface org.freedesktop.Notifications {\n    methods:\n      Notify(in  s app_name,\n             in  u replaces_id,\n             in  s app_icon,\n             in  s summary,\n             in  s body,\n             in  as actions,\n             in  a{sv} hints,\n             in  i _expire_timeout,\n             out u arg_8);\n      CloseNotification(in  u id);\n      GetCapabilities(out as arg_0);\n    signals:\n      ActionInvoked(u id,\n                    s action_key);\n      NotificationClosed(u id,\n                         u reason);\n    properties:\n  };\n};",
+      "stderr": ""
+    },
+    {
+      "name": "published GetServerInformation",
+      "time": "2026-10-31T20:36:48+00:00",
+      "command": "gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.GetServerInformation",
+      "user": "tuna-test",
+      "exit": 1,
+      "stdout": "",
+      "stderr": "Error: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'GetServerInformation'"
+    },
+    {
+      "name": "published notify-send",
+      "time": "2026-10-31T20:37:12+00:00",
+      "command": "notify-send -a 'Installed session qualification' 'Published Marlin' 'libnotify compatibility proof'",
+      "user": "tuna-test",
+      "exit": 1,
+      "stdout": "",
+      "stderr": "Failed to show notification: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'GetServerInformation'"
+    },
+    {
+      "frame": "03-published-super-l-lock.png",
+      "time": "2026-10-31T20:37:18+00:00",
+      "sha256": "165fbe2c0d3f54aba59e4e43f532b3f76caed17c0c9d224cd002209b8895aa0d"
+    },
+    {
+      "name": "published locked state",
+      "time": "2026-10-31T20:37:37+00:00",
+      "command": "loginctl show-session $(loginctl list-sessions --no-legend | awk '$3==\"tuna-test\" && $4==\"seat0\"{print $1}') -p Name -p Service -p Type -p Class -p State -p LockedHint; gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "Name=tuna-test\nService=gdm-password\nType=wayland\nClass=user\nState=active\nLockedHint=no\n(true,)",
+      "stderr": ""
+    },
+    {
+      "frame": "04-published-unlock.png",
+      "time": "2026-10-31T20:37:44+00:00",
+      "sha256": "bdbb9d05723922631d208ad0d4a9e2e5e4519d62c378c04d4d5e2d51899264d2"
+    },
+    {
+      "name": "published unlocked state",
+      "time": "2026-10-31T20:37:56+00:00",
+      "command": "loginctl show-session $(loginctl list-sessions --no-legend | awk '$3==\"tuna-test\" && $4==\"seat0\"{print $1}') -p LockedHint -p Service -p Type; gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "Service=gdm-password\nType=wayland\nLockedHint=no\n(false,)",
+      "stderr": ""
+    },
+    {
+      "name": "candidate installed image provenance",
+      "time": "2026-10-31T21:56:55+00:00",
+      "command": "bootc status --format json; pacman -Q tuna-desktop gdm gnome-shell libnotify; sha256sum /usr/bin/tuna-session /usr/bin/tuna-compositor /usr/bin/tuna-shell-gtk; loginctl list-sessions --no-legend; cat /usr/share/wayland-sessions/tuna.desktop",
+      "user": "root",
+      "exit": 0,
+      "stdout": "{\"apiVersion\":\"org.containers.bootc/v1\",\"kind\":\"BootcHost\",\"metadata\":{\"name\":\"host\"},\"spec\":{\"bootOrder\":\"default\",\"image\":{\"image\":\"ghcr.io/tuna-os/tuna-desktop/marlin-tuna-preview@sha256:fd982116d87a978e795f462e412d7acab0d3d7d3af035285002979033a8e92a8\",\"transport\":\"registry\"}},\"status\":{\"booted\":{\"cachedUpdate\":null,\"composefs\":{\"bootDigest\":\"95776a68887088ae1e739b0112fc103692e6b51fff0f17f12c9203b4697b5e79\",\"bootType\":\"Bls\",\"bootloader\":\"systemd\",\"missingVerityAllowed\":false,\"verity\":\"9c3f9326b090494592f6ad8dbb9e2f2d8d6ddb20318af892b703898a56600d7335cc9d8747ed5be0fcc24ca1718e04d305b1260b143f218a57d9685265c820d5\"},\"downloadOnly\":false,\"image\":{\"architecture\":\"amd64\",\"image\":{\"image\":\"ghcr.io/tuna-os/tuna-desktop/marlin-tuna-preview@sha256:fd982116d87a978e795f462e412d7acab0d3d7d3af035285002979033a8e92a8\",\"transport\":\"registry\"},\"imageDigest\":\"sha256:fd982116d87a978e795f462e412d7acab0d3d7d3af035285002979033a8e92a8\",\"timestamp\":\"2026-10-31T18:56:11.850649116Z\",\"version\":null},\"incompatible\":false,\"ostree\":null,\"pinned\":false,\"softRebootCapable\":false,\"store\":null},\"readOnly\":false,\"rollback\":null,\"rollbackQueued\":false,\"staged\":null,\"type\":null,\"usrOverlay\":null}}tuna-desktop 1.0.0beta.2-1\ngdm 51.1.1-1\ngnome-shell 1:51.1-1\nlibnotify 0.8.9-1\nd9a612ef48108826b5efcad82505c38c46b0c35503c8705b4be7a0218c4eeb2d  /usr/bin/tuna-session\n975c5b677d2196e586d78074f1ea289206fe3a67bbfdb25b9349015079bb6520  /usr/bin/tuna-compositor\n4e995fd2c0e598c0546c211c5de0fefdf9b60d388edf1e1b1c3ce5f0832866e1  /usr/bin/tuna-shell-gtk\n1 60578 gdm-greeter seat0 827  greeter       tty1 yes 1h 3min ago\n2 60578 gdm-greeter -     863  manager-early -    no  -\n3     0 root        -     2440 user          -    no  -\n4     0 root        -     2447 manager-early -    no  -\n[Desktop Entry]\nName=Tuna Desktop (preview)\nComment=Tuna Desktop (GNOME-style shell with optional scrollable tiling)\nExec=tuna-session\nTryExec=tuna-session\nType=Application\nDesktopNames=Tuna;GNOME;\nX-GDM-SessionRegisters=true",
+      "stderr": "Warning: Permanently added 'vm.tuna-q-isg-mar1.corral-vms' (ED25519) to the list of known hosts."
+    },
+    {
+      "frame": "05-candidate-gdm.png",
+      "time": "2026-10-31T21:56:55+00:00",
+      "sha256": "44681fa74932e759c007ac6dc62ae73172a079ba6fc5e8b7b398add4849d04a3"
+    },
+    {
+      "frame": "06-candidate-gdm-password.png",
+      "time": "2026-10-31T21:56:56+00:00",
+      "sha256": "4c7fb351f58f806389db32f086c5825dcc010eeaaf9597369154a31178b3768d"
+    },
+    {
+      "frame": "07-candidate-session-chooser.png",
+      "time": "2026-10-31T21:57:08+00:00",
+      "sha256": "ae2cd8c86d15c6b28405b324002f2d62f6fcf5d080b1fc08839baf8d3fdeaede"
+    },
+    {
+      "frame": "10-candidate-login-observation.png",
+      "time": "2026-10-31T21:59:15+00:00",
+      "sha256": "866e4c694296597c87a984f1c2db8b8e1288fbfefe314395bc16285e728566e1"
+    },
+    {
+      "name": "candidate login observation",
+      "time": "2026-10-31T21:59:20+00:00",
+      "command": "loginctl list-sessions --no-legend; journalctl -b -u gdm.service --no-pager -n 35; ps -ef | tail -35",
+      "user": "root",
+      "exit": 0,
+      "stdout": "1 60578 gdm-greeter seat0 827  greeter       tty1 no -\n2 60578 gdm-greeter -     863  manager-early -    no -\n3     0 root        -     2440 user          -    no -\n4     0 root        -     2447 manager-early -    no -\nOct 31 20:48:01 archlinux systemd[1]: Starting GNOME Display Manager...\nOct 31 20:48:01 archlinux systemd[1]: Started GNOME Display Manager.\nOct 31 21:57:20 tuna-q-isg-mar1 gdm-password][2517]: pam_unix(gdm-password:auth): authentication failure; logname= uid=0 euid=0 tty=/dev/tty1 ruser= rhost=  user=tuna-test\ngdm-gre+    1762     863  0 20:48 ?        00:00:00 /usr/bin/gnome-keyring-daemon --start --foreground --components=secrets\ngdm-gre+    1764     863  0 20:48 ?        00:00:00 /usr/bin/gnome-keyring-daemon --foreground --components=pkcs11,secrets --control-directory=/run/user/60578/keyring\nroot        1965       1  0 20:50 ?        00:00:00 /usr/lib/power-profiles-daemon\nroot        1994       2  0 20:51 ?        00:00:00 [kworker/u65:4-flush-254:0]\nroot        2329       2  0 21:02 ?        00:00:00 [kworker/3:0]\nroot        2330       2  0 21:02 ?        00:00:00 [kworker/2:0-cgroup_free]\nroot        2351       2  0 21:12 ?        00:00:00 [kworker/u66:1-events_power_efficient]\nroot        2358       2  0 21:13 ?        00:00:00 [kworker/u65:2-events_unbound]\nroot        2381       2  0 21:26 ?        00:00:00 [kworker/u68:1-events_power_efficient]\nroot        2400       2  0 21:37 ?        00:00:00 [kworker/u65:0-flush-254:0]\nroot        2429       2  0 21:49 ?        00:00:00 [kworker/u67:2-events_unbound]\nroot        2435     577  0 21:54 ?        00:00:00 systemd-userwork: waiting...\nroot        2437     577  0 21:54 ?        00:00:00 systemd-userwork: waiting...\nroot        2439       2  0 21:56 ?        00:00:00 [kworker/u67:1-events_unbound]\nroot        2440     764  0 21:56 ?        00:00:00 sshd-session: root [postauth]\nroot        2441       2  0 21:56 ?        00:00:00 [kworker/1:0H-kblockd]\nroot        2443       2  0 21:56 ?        00:00:00 [kworker/2:0H-kblockd]\nroot        2447       1  0 21:56 ?        00:00:00 /usr/lib/systemd/systemd --user\nroot        2449    2447  0 21:56 ?        00:00:00 (sd-pam)\nroot        2450       2  0 21:56 ?        00:00:00 [kworker/1:0]\nroot        2463       2  0 21:56 ?        00:00:00 [psimon]\nroot        2466    2440  0 21:56 ?        00:00:00 sshd-session: root@notty\nroot        2482       2  0 21:56 ?        00:00:00 [kworker/0:0H-fsverity_read_queue]\nroot        2483       2  0 21:56 ?        00:00:00 [kworker/0:2H]\nroot        2641       2  0 21:57 ?        00:00:00 [kworker/0:0-events]\nroot        2662     779  0 21:57 ?        00:00:00 gdm-session-worker [pam/gdm-password]\nroot        2683       2  0 21:58 ?        00:00:00 [kworker/u66:0-events_unbound]\nroot        2690     584  0 21:58 ?        00:00:00 systemd-nsresourcework: waiting...\nroot        2691     584  0 21:58 ?        00:00:00 systemd-nsresourcework: waiting...\nroot        2692     584  0 21:58 ?        00:00:00 systemd-nsresourcework: waiting...\nroot        2693     584  0 21:58 ?        00:00:00 systemd-nsresourcework: waiting...\nroot        2697     584  0 21:59 ?        00:00:00 systemd-nsresourcework: waiting...\nroot        2701    2466  0 21:59 ?        00:00:00 bash -c loginctl list-sessions --no-legend; journalctl -b -u gdm.service --no-pager -n 35; ps -ef | tail -35\nroot        2704    2701  0 21:59 ?        00:00:00 ps -ef\nroot        2705    2701  0 21:59 ?        00:00:00 tail -35",
+      "stderr": ""
+    },
+    {
+      "frame": "11-candidate-password-entered.png",
+      "time": "2026-10-31T21:59:31+00:00",
+      "sha256": "24a3e4236c4f287b2e17aecb573b43c660c5fad42a6c2781aedeecaa2be9e9db"
+    },
+    {
+      "frame": "12-candidate-after-password.png",
+      "time": "2026-10-31T22:00:10+00:00",
+      "sha256": "ff1d714beb6dd20d0fcd59a694e44719fba8a3f984203b32b3de69376f061878"
+    },
+    {
+      "name": "candidate running binaries and session",
+      "time": "2026-10-31T22:00:22+00:00",
+      "command": "loginctl list-sessions --no-legend; loginctl show-session $(loginctl list-sessions --no-legend | awk '$3==\"tuna-test\" && $4==\"seat0\"{print $1}') -p Name -p Service -p Type -p Class -p State -p LockedHint -p Desktop; sha256sum /proc/$(pgrep -u tuna-test -x tuna-compositor)/exe /proc/$(pgrep -u tuna-test -x tuna-shell-gtk)/exe; tr \"\\0\" \"\\n\" < /proc/$(pgrep -u tuna-test -x tuna-compositor)/environ | sort; pacman -Qi tuna-desktop",
+      "user": "root",
+      "exit": 0,
+      "stdout": "3    0 root      -     2440 user          -    no -\n4    0 root      -     2447 manager-early -    no -\n5 1000 tuna-test seat0 2662 user          tty2 no -\n6 1000 tuna-test -     2714 manager       -    no -\nName=tuna-test\nService=gdm-password\nDesktop=\nType=wayland\nClass=user\nState=active\nLockedHint=no\nName            : tuna-desktop\nVersion         : 1.0.0beta.2-1\nDescription     : Tuna Desktop: GNOME-style Wayland desktop session in Rust (v1 beta)\nArchitecture    : x86_64\nURL             : https://github.com/tuna-os/tuna-desktop\nLicenses        : GPL-3.0-or-later\nGroups          : None\nProvides        : roost\nDepends On      : dbus  glib2  gnome-settings-daemon  gnome-session  gdk-pixbuf2  librsvg  glycin  fontconfig  adwaita-fonts  gtk4  gtk4-layer-shell  libadwaita  libcanberra  libdrm  libinput  libsecret  libxkbcommon  libxkbcommon-x11  mesa  pipewire  seatd  sound-theme-freedesktop  systemd-libs  wayland\nOptional Deps   : orca: GNOME Screen Reader activation and speech [installed]\n                  gnome-keyring: user network secret storage [installed]\n                  xdg-desktop-portal-gnome: screenshots and screen sharing for apps [installed]\n                  xorg-xwayland: X11 application support [installed]\n                  ibus: input methods (tuna-ibus-bridge, as GNOME uses IBus) [installed]\n                  gst-plugin-pipewire: screen recording from the screenshot UI [installed]\n                  gst-plugins-good: screen recording (VP8 and WebM) [installed]\nRequired By     : None\nOptional For    : None\nConflicts With  : roost\nReplaces        : roost\nInstalled Size  : 53.85 MiB\nPackager        : Unknown Packager\nBuild Date      : Sat Oct 31 18:45:49 2026\nInstall Date    : Sat Oct 31 18:55:38 2026\nInstall Reason  : Explicitly installed\nInstall Script  : No\nValidated By    : None",
+      "stderr": "sha256sum: /proc//exe: No such file or directory\nsha256sum: /proc//exe: No such file or directory\nbash: line 1: /proc//environ: No such file or directory"
+    },
+    {
+      "frame": "08-candidate-session.png",
+      "time": "2026-10-31T22:00:24+00:00",
+      "sha256": "ff1d714beb6dd20d0fcd59a694e44719fba8a3f984203b32b3de69376f061878"
+    },
+    {
+      "name": "candidate notification introspection",
+      "time": "2026-10-31T22:00:31+00:00",
+      "command": "gdbus introspect --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "node /org/freedesktop/Notifications {\n  interface org.freedesktop.DBus.Properties {\n    methods:\n      Get(in  s interface_name,\n          in  s property_name,\n          out v value);\n      GetAll(in  s interface_name,\n             out a{sv} properties);\n      Set(in  s interface_name,\n          in  s property_name,\n          in  v value);\n    signals:\n      PropertiesChanged(s interface_name,\n                        a{sv} changed_properties,\n                        as invalidated_properties);\n    properties:\n  };\n  interface org.freedesktop.DBus.Introspectable {\n    methods:\n      Introspect(out s xml_data);\n    signals:\n    properties:\n  };\n  interface org.freedesktop.DBus.Peer {\n    methods:\n      Ping();\n      GetMachineId(out s machine_uuid);\n    signals:\n    properties:\n  };\n  interface org.freedesktop.Notifications {\n    methods:\n      Notify(in  s arg_0,\n             in  u arg_1,\n             in  s arg_2,\n             in  s arg_3,\n             in  s arg_4,\n             in  as arg_5,\n             in  a{sv} arg_6,\n             in  i arg_7,\n             out u arg_8);\n      CloseNotification(in  u arg_0);\n      GetCapabilities(out as arg_0);\n      GetServerInformation(out s arg_0,\n                           out s arg_1,\n                           out s arg_2,\n                           out s arg_3);\n    signals:\n      NotificationClosed(u arg_0,\n                         u arg_1);\n      ActionInvoked(u arg_0,\n                    s arg_1);\n      ActivationToken(u arg_0,\n                      s arg_1);\n    properties:\n  };\n};",
+      "stderr": ""
+    },
+    {
+      "name": "candidate GetServerInformation",
+      "time": "2026-10-31T22:00:38+00:00",
+      "command": "gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.GetServerInformation",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "('gnome-shell', 'GNOME', '51.1', '1.2')",
+      "stderr": ""
+    },
+    {
+      "name": "candidate notify-send",
+      "time": "2026-10-31T22:00:44+00:00",
+      "command": "notify-send -a 'Installed session qualification' -t 0 'Candidate Marlin CI image' 'libnotify GetServerInformation and Notify succeeded'",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "frame": "09-candidate-notify-send.png",
+      "time": "2026-10-31T22:00:45+00:00",
+      "sha256": "6c70e51a5c996abe2d54a74b1a0c71d61ba7c866edb80222a3059e903d6ea227"
+    },
+    {
+      "name": "reference session identity",
+      "time": "2026-10-31T22:01:03+00:00",
+      "command": "ps -u tuna-test -o pid,comm; busctl --user status org.freedesktop.Notifications",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "PID COMMAND\n   2714 systemd\n   2716 (sd-pam)\n   2731 gnome-keyring-d\n   2737 dbus-broker-lau\n   2738 dbus-broker\n   2741 gdm-wayland-ses\n   2750 gnome-session-i\n   2774 gvfsd\n   2780 gvfsd-fuse\n   2792 gnome-session-c\n   2797 gnome-session-s\n   2807 gnome-shell\n   2835 at-spi-bus-laun\n   2841 dbus-broker-lau\n   2842 dbus-broker\n   2843 at-spi2-registr\n   2863 xdg-permission-\n   2866 gnome-shell-cal\n   2882 gjs\n   2909 ibus-daemon\n   2910 gsd-a11y-settin\n   2911 gsd-color\n   2912 gsd-datetime\n   2914 gsd-housekeepin\n   2915 gsd-keyboard\n   2916 gsd-media-keys\n   2919 gsd-power\n   2920 gsd-print-notif\n   2921 gsd-rfkill\n   2922 gsd-screensaver\n   2925 gsd-sharing\n   2926 gsd-disk-utilit\n   2927 gsd-smartcard\n   2928 gsd-sound\n   2929 gsd-usb-protect\n   2932 gsd-wwan\n   2935 evolution-sourc\n   2988 gsd-printer\n   3026 gjs\n   3036 ibus-dconf\n   3039 ibus-extension-\n   3043 pipewire\n   3045 wireplumber\n   3048 pipewire-pulse\n   3062 ibus-portal\n   3064 localsearch-3\n   3119 dconf-service\n   3148 goa-daemon\n   3172 gvfsd-metadata\n   3179 goa-identity-se\n   3185 gvfs-udisks2-vo\n   3216 evolution-calen\n   3223 gvfs-mtp-volume\n   3234 gvfs-gphoto2-vo\n   3239 gvfs-goa-volume\n   3252 evolution-addre\n   3260 gvfs-afc-volume\n   3274 ibus-engine-sim\n   3474 xdg-desktop-por\n   3481 xdg-document-po\n   3491 xdg-desktop-por\n   3510 xdg-desktop-por\n   3553 bwrap\n   3554 bwrap\n   3555 glycin-svg\n   3690 sh\n   3691 ps\nPID=2882\nPIDFD=yes\nPPID=2714\nTTY=n/a\nUID=1000\nEUID=1000\nSUID=1000\nFSUID=1000\nOwnerUID=1000\nGID=1000\nEGID=1000\nSGID=1000\nFSGID=1000\nSupplementaryGIDs=1000 1000\nComm=gjs\nExe=/usr/bin/gjs-console\nCommandLine=/usr/bin/gjs -m /usr/share/gnome-shell/org.gnome.Shell.Notifications\nCGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/app-dbus\\x2d:1.2\\x2dorg.gnome.Shell.Notifications.slice/dbus-:1.2-org.gnome.Shell.Notifications@0.service\nUnit=user@1000.service\nSlice=user-1000.slice\nUserUnit=dbus-:1.2-org.gnome.Shell.Notifications@0.service\nUserSlice=app-dbus\\x2d:1.2\\x2dorg.gnome.Shell.Notifications.slice\nSession=n/a\nAuditLoginUID=1000\nAuditSessionID=6\nUniqueName=:1.19\nEffectiveCapabilities=\nPermittedCapabilities=\nInheritableCapabilities=cap_wake_alarm\nBoundingCapabilities=cap_chown cap_dac_override cap_dac_read_search \n        cap_fowner cap_fsetid cap_kill cap_setgid \n        cap_setuid cap_setpcap cap_linux_immutable cap_net_bind_service \n        cap_net_broadcast cap_net_admin cap_net_raw cap_ipc_lock \n        cap_ipc_owner cap_sys_module cap_sys_rawio cap_sys_chroot \n        cap_sys_ptrace cap_sys_pacct cap_sys_admin cap_sys_boot \n        cap_sys_nice cap_sys_resource cap_sys_time cap_sys_tty_config \n        cap_mknod cap_lease cap_audit_write cap_audit_control \n        cap_setfcap cap_mac_override cap_mac_admin cap_syslog \n        cap_wake_alarm cap_block_suspend cap_audit_read cap_perfmon \n        cap_bpf cap_checkpoint_restore",
+      "stderr": ""
+    },
+    {
+      "frame": "13-gnome51-reference-lock.png",
+      "time": "2026-10-31T22:01:07+00:00",
+      "sha256": "d4cacf4c183194915c8ba5701a5314b6a0186ea4d9be756362a46df3bba0a8b3"
+    },
+    {
+      "name": "GNOME51 reference locked",
+      "time": "2026-10-31T22:01:12+00:00",
+      "command": "loginctl show-session $(loginctl list-sessions --no-legend | awk '$3==\"tuna-test\" && $4==\"seat0\"{print $1}') -p LockedHint -p Service -p Type; gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "Service=gdm-password\nType=wayland\nLockedHint=yes\n(true,)",
+      "stderr": ""
+    },
+    {
+      "frame": "14-gnome51-reference-unlocked.png",
+      "time": "2026-10-31T22:01:17+00:00",
+      "sha256": "9bc8693191f6ec60519d2b0ac8b8e823980b9ff6001397eae0f09edcf3917bf7"
+    },
+    {
+      "name": "GNOME51 reference unlocked",
+      "time": "2026-10-31T22:01:23+00:00",
+      "command": "loginctl show-session $(loginctl list-sessions --no-legend | awk '$3==\"tuna-test\" && $4==\"seat0\"{print $1}') -p LockedHint -p Service -p Type; gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "Service=gdm-password\nType=wayland\nLockedHint=no\n(false,)",
+      "stderr": ""
+    },
+    {
+      "name": "logout reference to GDM",
+      "time": "2026-10-31T22:01:28+00:00",
+      "command": "gnome-session-quit --logout --no-prompt",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "frame": "15-gdm-tuna-selection.png",
+      "time": "2026-10-31T22:01:38+00:00",
+      "sha256": "2544a3debfa1a7bd296efcd433ea639d12914e02122daa25baf85ddb968cd921"
+    },
+    {
+      "frame": "16-gdm-tuna-selected.png",
+      "time": "2026-10-31T22:01:44+00:00",
+      "sha256": "8735828ac3729308bb22cf759ca243c10db8db3935dce749dbfaf64d2cc1a9a6"
+    },
+    {
+      "frame": "17-tuna-candidate-session.png",
+      "time": "2026-10-31T22:02:11+00:00",
+      "sha256": "67e04ab33add4bae598a61192b9786f8a25600343aa4fff0a87257ff6752691f"
+    },
+    {
+      "name": "Tuna candidate running identity",
+      "time": "2026-10-31T22:02:20+00:00",
+      "command": "set -e; loginctl list-sessions --no-legend; loginctl show-session $(loginctl list-sessions --no-legend | awk '$3==\"tuna-test\" && $4==\"seat0\"{print $1}') -p Name -p Service -p Type -p Class -p State -p LockedHint; sha256sum /proc/$(pgrep -u tuna-test -x tuna-compositor)/exe /proc/$(pgrep -u tuna-test -x tuna-shell-gtk)/exe; tr \"\\0\" \"\\n\" < /proc/$(pgrep -u tuna-test -x tuna-compositor)/environ | sort; busctl --user status org.freedesktop.Notifications",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "16 1000 tuna-test seat0 4717 user          tty2 no -\n17 1000 tuna-test -     4864 manager       -    no -\n 3    0 root      -     2440 user          -    no -\n 4    0 root      -     2447 manager-early -    no -\nName=tuna-test\nService=gdm-password\nType=wayland\nClass=user\nState=active\nLockedHint=no\n975c5b677d2196e586d78074f1ea289206fe3a67bbfdb25b9349015079bb6520  /proc/4907/exe\n4e995fd2c0e598c0546c211c5de0fefdf9b60d388edf1e1b1c3ce5f0832866e1  /proc/5008/exe\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\nDESKTOP_SESSION=tuna\nGDMSESSION=tuna\nGDM_LANG=en_US.UTF-8\nGNOME_SHELL_SLOWDOWN_FACTOR=0.8\nHOME=/var/home/tuna-test\nKWIN_COMPOSE=Q\nLANG=en_US.UTF-8\nLIBGL_ALWAYS_SOFTWARE=1\nLOGNAME=tuna-test\nMAIL=/var/spool/mail/tuna-test\nMOTD_SHOWN=pam\nPATH=/usr/local/bin:/usr/bin\nPWD=/var/home/tuna-test\nSHELL=/bin/bash\nUSER=tuna-test\nUSERNAME=tuna-test\nWLR_RENDERER=pixman\nXDG_CURRENT_DESKTOP=Tuna:GNOME\nXDG_DATA_DIRS=/var/home/tuna-test/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share/:/usr/share/\nXDG_RUNTIME_DIR=/run/user/1000\nXDG_SEAT=seat0\nXDG_SESSION_CLASS=user\nXDG_SESSION_DESKTOP=tuna\nXDG_SESSION_EXTRA_DEVICE_ACCESS=render:accel\nXDG_SESSION_ID=16\nXDG_SESSION_TYPE=wayland\nXDG_VTNR=2\nPID=5008\nPIDFD=yes\nPPID=4907\nTTY=tty2\nUID=1000\nEUID=1000\nSUID=1000\nFSUID=1000\nOwnerUID=1000\nGID=1000\nEGID=1000\nSGID=1000\nFSGID=1000\nSupplementaryGIDs=1000 1000\nComm=tuna-shell-gtk\nExe=/usr/bin/tuna-shell-gtk\nCommandLine=/usr/bin/tuna-shell-gtk\nCGroup=/user.slice/user-1000.slice/session-16.scope\nUnit=session-16.scope\nSlice=user-1000.slice\nUserUnit=n/a\nUserSlice=-.slice\nSession=16\nAuditLoginUID=1000\nAuditSessionID=16\nUniqueName=:1.61\nEffectiveCapabilities=\nPermittedCapabilities=\nInheritableCapabilities=cap_wake_alarm\nBoundingCapabilities=cap_chown cap_dac_override cap_dac_read_search \n        cap_fowner cap_fsetid cap_kill cap_setgid \n        cap_setuid cap_setpcap cap_linux_immutable cap_net_bind_service \n        cap_net_broadcast cap_net_admin cap_net_raw cap_ipc_lock \n        cap_ipc_owner cap_sys_module cap_sys_rawio cap_sys_chroot \n        cap_sys_ptrace cap_sys_pacct cap_sys_admin cap_sys_boot \n        cap_sys_nice cap_sys_resource cap_sys_time cap_sys_tty_config \n        cap_mknod cap_lease cap_audit_write cap_audit_control \n        cap_setfcap cap_mac_override cap_mac_admin cap_syslog \n        cap_wake_alarm cap_block_suspend cap_audit_read cap_perfmon \n        cap_bpf cap_checkpoint_restore",
+      "stderr": ""
+    },
+    {
+      "name": "Tuna candidate introspection",
+      "time": "2026-10-31T22:02:27+00:00",
+      "command": "gdbus introspect --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "node /org/freedesktop/Notifications {\n  interface org.freedesktop.DBus.Introspectable {\n    methods:\n      Introspect(out s arg_0);\n    signals:\n    properties:\n  };\n  interface org.freedesktop.DBus.Peer {\n    methods:\n      Ping();\n      GetMachineId(out s arg_0);\n    signals:\n    properties:\n  };\n  interface org.freedesktop.DBus.Properties {\n    methods:\n      Get(in  s interface_name,\n          in  s property_name,\n          out v arg_2);\n      Set(in  s interface_name,\n          in  s property_name,\n          in  v value);\n      GetAll(in  s interface_name,\n             out a{sv} arg_1);\n    signals:\n      PropertiesChanged(s interface_name,\n                        a{sv} changed_properties,\n                        as invalidated_properties);\n    properties:\n  };\n  interface org.freedesktop.Notifications {\n    methods:\n      Notify(in  s app_name,\n             in  u replaces_id,\n             in  s app_icon,\n             in  s summary,\n             in  s body,\n             in  as actions,\n             in  a{sv} hints,\n             in  i _expire_timeout,\n             out u arg_8);\n      CloseNotification(in  u id);\n      GetCapabilities(out as arg_0);\n      GetServerInformation(out s arg_0,\n                           out s arg_1,\n                           out s arg_2,\n                           out s arg_3);\n    signals:\n      ActionInvoked(u id,\n                    s action_key);\n      NotificationClosed(u id,\n                         u reason);\n    properties:\n  };\n};",
+      "stderr": ""
+    },
+    {
+      "name": "Tuna candidate GetServerInformation",
+      "time": "2026-10-31T22:02:38+00:00",
+      "command": "gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.GetServerInformation",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "('tuna-shell', 'Tuna', '0.1.0', '1.2')",
+      "stderr": ""
+    },
+    {
+      "name": "Tuna candidate notify-send",
+      "time": "2026-10-31T22:02:56+00:00",
+      "command": "notify-send -a 'Installed session qualification' -t 0 'Tuna candidate CI image' 'libnotify GetServerInformation and Notify succeeded'",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "frame": "18-tuna-notify-send.png",
+      "time": "2026-10-31T22:02:57+00:00",
+      "sha256": "8f334f9f7035585b677324e6b814b045614f5fc247cbe791544b2aa1accaa70e"
+    },
+    {
+      "frame": "19-tuna-notification-list.png",
+      "time": "2026-10-31T22:02:58+00:00",
+      "sha256": "6546561ada18d2ca8d23d3257146c449f8ceba88266d3e7d4dca1f2481c22c19"
+    },
+    {
+      "frame": "20-tuna-super-l-lock.png",
+      "time": "2026-10-31T22:03:09+00:00",
+      "sha256": "5ef5fe3f05c674a61161468d8d079d61d012253b5ee0dd5d0c1f2f498ccb8786"
+    },
+    {
+      "name": "Tuna candidate locked",
+      "time": "2026-10-31T22:03:18+00:00",
+      "command": "loginctl show-session $(loginctl list-sessions --no-legend | awk '$3==\"tuna-test\" && $4==\"seat0\"{print $1}') -p LockedHint -p Service -p Type; gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "Service=gdm-password\nType=wayland\nLockedHint=yes\n(true,)",
+      "stderr": ""
+    },
+    {
+      "frame": "21-tuna-unlock-password.png",
+      "time": "2026-10-31T22:03:20+00:00",
+      "sha256": "577997a93433683f093b7e273d4244963a44dafe675d62a940709e60c2e1404e"
+    },
+    {
+      "frame": "22-tuna-unlocked.png",
+      "time": "2026-10-31T22:03:25+00:00",
+      "sha256": "d25ffbb7ec9ac7c35d4ade4ad2e7cb603cfdecab6d654ed0e9ec4522905444af"
+    },
+    {
+      "name": "Tuna candidate unlocked",
+      "time": "2026-10-31T22:03:30+00:00",
+      "command": "loginctl show-session $(loginctl list-sessions --no-legend | awk '$3==\"tuna-test\" && $4==\"seat0\"{print $1}') -p LockedHint -p Service -p Type; gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive",
+      "user": "tuna-test",
+      "exit": 0,
+      "stdout": "Service=gdm-password\nType=wayland\nLockedHint=no\n(false,)",
+      "stderr": ""
+    },
+    {
+      "name": "candidate logind integration journal",
+      "time": "2026-10-31T22:03:36+00:00",
+      "command": "journalctl -b _COMM=tuna-compositor --no-pager -o cat | tail -70; find /var/cache/pacman/pkg -maxdepth 1 -name \"tuna-desktop*\" -type f -exec sha256sum {} \\;; pacman -Sp --print-format \"%l\" tuna-desktop",
+      "user": "root",
+      "exit": 1,
+      "stdout": "tuna-compositor: nested session on tuna-nested-4907 (1280x800)\npci id for fd 11: 1234:1111, driver (null)\npci id for fd 10: 1234:1111, driver (null)\npci id for fd 12: 1234:1111, driver (null)\npci id for fd 10: 1234:1111, driver (null)\npci id for fd 12: 1234:1111, driver (null)\ntuna-compositor: drm: output Virtual-1 1280x800 at 0,0 scale 1 transform 0\ntuna-compositor: linux-dmabuf v3 with 114 formats\ntuna-compositor: cursor theme \"Adwaita\" size 24 (themes [\"Adwaita\", \"AdwaitaLegacy\", \"hicolor\", \"default\"])\ntuna-compositor: screenshot service on org.gnome.Shell.Screenshot\ntuna-compositor: serving org.gnome.Mutter.ColorManager\ntuna-compositor: serving org.gnome.Mutter.DisplayConfig\ntuna-compositor: serving org.gnome.Shell.Introspect\ntuna-compositor: serving org.gnome.Mutter.ScreenCast\ntuna-compositor: serving org.gnome.Mutter.IdleMonitor\ntuna-compositor: serving org.gnome.Mutter.RemoteDesktop\ntuna-compositor: serving org.gnome.Mutter.ServiceChannel\ntuna-compositor: serving org.gnome.SettingsDaemon.Color\ntuna-compositor: serving org.gnome.SessionManager (inhibitors, session activity)\ntuna-compositor: colour: Virtual-1 assigned profile icc-328f0e2812fcf98509c622822a4536a9 (/var/home/tuna-test/.local/share/icc/edid-bb6ad72dc802b000932c73ad20996ae5.icc)\ntuna-compositor: colour: device xrandr-Red Hat, Inc.-QEMU Monitor-0x00000000 (Virtual-1) registered at /org/freedesktop/ColorManager/devices/xrandr_Red_Hat__Inc__QEMU_Monitor_0x00000000_tuna_test_1000\ntuna-compositor: session services: display environment imported (systemd=true bus=true)\ntuna-compositor: session services: holding the session leader FIFO\ntuna-compositor: ime: IBus bridge started\ntuna-compositor: session services: graphical target active\ntuna-compositor: session services: portals refreshed\ntuna-compositor: switcher keys: 12 chords, cycle-group Some(SwitcherKey { keysym: 65475, mods: 8, kind: CycleGroup }), cycle-windows Some(SwitcherKey { keysym: 65307, mods: 8, kind: CycleWindows })\ntuna-compositor: overview focus parked\ntuna-compositor: switcher keys: 12 chords, cycle-group Some(SwitcherKey { keysym: 65475, mods: 8, kind: CycleGroup }), cycle-windows Some(SwitcherKey { keysym: 65307, mods: 8\n, kind\n:\nCycleWindows })\ntuna-compositor: wallpaper decoded for 1280x800 in 106 ms\ntuna-compositor: session services: GDM session and display registered\ntuna-compositor: libinput: scroll-wheel emulation button rejected for QEMU QEMU USB Tablet: Unsupported\ntuna-compositor: overview focus restored\ntuna-compositor: modifier super keycode=125 pressed=true\ntuna-compositor: modifier super keycode=125 pressed=true\ntuna-compositor: modifier super keycode=125 pressed=false\ntuna-compositor: modifier super keycode=125 pressed=false\ntuna-compositor: cycle chord near-miss: sym=Some(65307) mods=0\ntuna-compositor: modifier super keycode=125 pressed=true\ntuna-compositor: modifier super keycode=125 pressed=true\ntuna-compositor: display power save mode 3\ntuna-compositor: modifier super keycode=125 pressed=false\ntuna-compositor: modifier super keycode=125 pressed=false\ntuna-compositor: display power save mode 0\ntuna-compositor: wallpaper decoded for 1280x800 in 58 ms",
+      "stderr": "find: '/var/cache/pacman/pkg': No such file or directory\nerror: target not found: tuna-desktop"
+    },
+    {
+      "name": "candidate package repository metadata",
+      "time": "2026-10-31T22:04:12+00:00",
+      "command": "cat /etc/pacman.conf; cat /etc/pacman.d/tuna* 2>/dev/null || true; ls /var/lib/pacman/local/tuna-desktop*/; sha256sum /var/lib/pacman/local/tuna-desktop*/*",
+      "user": "root",
+      "exit": 1,
+      "stdout": "#\n# /etc/pacman.conf\n#\n# See the pacman.conf(5) manpage for option and repository directives\n\n#\n# GENERAL OPTIONS\n#\n[options]\n# The following paths are commented out with their default values listed.\n# If you wish to use different paths, uncomment and update the paths.\n#RootDir     = /\nDBPath      = /usr/lib/sysimage/lib/pacman/\nCacheDir    = /usr/lib/sysimage/cache/pacman/pkg/\nLogFile     = /usr/lib/sysimage/log/pacman.log\n#GPGDir      = /etc/pacman.d/gnupg/\n#HookDir     = /etc/pacman.d/hooks/\nHoldPkg     = pacman glibc\n#XferCommand = /usr/bin/curl -L -C - -f -o %o %u\n#XferCommand = /usr/bin/wget --passive-ftp -c -O %o %u\n#CleanMethod = KeepInstalled\nArchitecture = auto\n\n# Pacman won't upgrade packages listed in IgnorePkg and members of IgnoreGroup\n#IgnorePkg   =\n#IgnoreGroup =\n\n#NoUpgrade   =\n#NoExtract   =\n\n# Misc options\n#UseSyslog\n#Color\nNoProgressBar\n# We cannot check disk space from within a chroot environment\n#CheckSpace\nVerbosePkgLists\nParallelDownloads = 5\n# No kernel landlock in containerd\nDisableSandboxFilesystem\n#DisableSandboxSyscalls\n\n# By default, pacman accepts packages signed by keys that its local keyring\n# trusts (see pacman-key and its man page), as well as unsigned packages.\nSigLevel    = Required DatabaseOptional\nLocalFileSigLevel = Optional\n#RemoteFileSigLevel = Required\n\n# NOTE: You must run `pacman-key --init` before first using pacman; the local\n# keyring can then be populated with the keys of all official Arch Linux\n# packagers with `pacman-key --populate archlinux`.\n\n#\n# REPOSITORIES\n#   - can be defined here or included from another file\n#   - pacman will search repositories in the order defined here\n#   - local/custom mirrors can be added here or in separate files\n#   - repositories listed first will take precedence when packages\n#     have identical names, regardless of version number\n#   - URLs will have $repo replaced by the name of the current repo\n#   - URLs will have $arch replaced by the name of the architecture\n#\n# Repository entries are of the format:\n#       [repo-name]\n#       Server = ServerName\n#       Include = IncludePath\n#\n# The header [repo-name] is crucial - it must be present and\n# uncommented to enable the repo.\n#\n\n# The testing repositories are disabled by default. To enable, uncomment the\n# repo name header and Include lines. You can add preferred servers immediately\n# after the header, and they will be used before the default mirrors.\n\n#[core-testing]\n#Include = /etc/pacman.d/mirrorlist\n\n[core]\nInclude = /etc/pacman.d/mirrorlist\n\n#[extra-testing]\n#Include = /etc/pacman.d/mirrorlist\n\n[extra]\nInclude = /etc/pacman.d/mirrorlist\n\n# An example of a custom package repository.  See the pacman manpage for\n# tips on creating your own repositories.\n#[custom]\n#SigLevel = Optional TrustAll\n#Server = file:///home/custompkgs\n[options]\nNoExtract  = usr/share/help/* !usr/share/help/en* !usr/share/help/C/*\nNoExtract  = usr/share/gtk-doc/html/* usr/share/doc/*\nNoExtract  = usr/share/locale/* usr/share/X11/locale/* usr/share/i18n/*\nNoExtract   = !*locale*/en*/* !usr/share/i18n/charmaps/UTF-8.gz !usr/share/*locale*/locale.*\nNoExtract   = !usr/share/*locales/en_?? !usr/share/*locales/i18n* !usr/share/*locales/iso*\nNoExtract   = !usr/share/*locales/trans*\nNoExtract   = !usr/share/X11/locale/C/*\nNoExtract   = !usr/share/X11/locale/compose.dir !usr/share/X11/locale/iso8859-1/*\nNoExtract  = !usr/share/*locales/C !usr/share/*locales/POSIX !usr/share/i18n/charmaps/ANSI_X3.4-1968.gz\nNoExtract  = usr/share/man/* usr/share/info/*\nNoExtract  = usr/share/vim/vim*/lang/*\nNoExtract  = etc/pacman.conf etc/pacman.d/mirrorlist",
+      "stderr": "ls: cannot access '/var/lib/pacman/local/tuna-desktop*/': No such file or directory\nsha256sum: '/var/lib/pacman/local/tuna-desktop*/*': No such file or directory"
+    }
+  ],
+  "candidate": {
+    "kind": "CI-built preview bootc image; not released marlin:tuna",
+    "image": "ghcr.io/tuna-os/tuna-desktop/marlin-tuna-preview@sha256:fd982116d87a978e795f462e412d7acab0d3d7d3af035285002979033a8e92a8",
+    "ci_run": 41227349354,
+    "artifact_id": 13054270086,
+    "package_name": "tuna-desktop-1.0.0beta.2-1-x86_64.pkg.tar.zst",
+    "package_sha256": "8e123e50d29d73d007c377401c0002893efa400572ff7e9443655c297fd05de3",
+    "source": "7a623e10b856ca663343271de6528f87e82dc75b",
+    "package_binary_sha256": {
+      "/usr/bin/tuna-session": "d9a612ef48108826b5efcad82505c38c46b0c35503c8705b4be7a0218c4eeb2d",
+      "/usr/bin/tuna-compositor": "975c5b677d2196e586d78074f1ea289206fe3a67bbfdb25b9349015079bb6520",
+      "/usr/bin/tuna-shell-gtk": "4e995fd2c0e598c0546c211c5de0fefdf9b60d388edf1e1b1c3ce5f0832866e1"
+    },
+    "corral_switch_receipt": "candidate-build.log"
+  },
+  "release": "1e6ce28f4d5dfd7918ac7340bd93454a9fcc211c 2026-10-29T15:00:47-05:00 feat(scroll): niri columns \u2014 consume/expel, height distribution, nearest-gap drops, modifier resize (P-WM-07) (#823)",
+  "locked-hint-fix": "90417283c6f69945acb1ac401361d3204b728d7c 2026-10-29T21:03:22-05:00 fix(lock): report logind LockedHint and honour logind Lock/Unlock (#846) (#849)",
+  "notification-fix": "1bc9d96bfd1fff8e171fa13624303782bfc8f6f4 2026-10-29T16:24:13-05:00 Shell: notify-send, banner over date menu, QS tiles following keys, translucent QS menu (#850)",
+  "gnome_reference": {
+    "js/ui/screenShield.js": {
+      "sha256": "cbe6c9f35362fe485b961574b35f59fcd777bae8f36ec713ad1d2461eeeba0ca",
+      "upstream": "https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/ui/screenShield.js"
+    },
+    "js/misc/loginManager.js": {
+      "sha256": "30c2b7e11d019e3ca908420fc29dbdff946d694b96bf996616c25b23e078496b",
+      "upstream": "https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/misc/loginManager.js"
+    },
+    "js/ui/notificationDaemon.js": {
+      "sha256": "dc0e2893df128963741c9c520d49f833fea0f0fb32e24ff9c1022bbf8567ce7c",
+      "upstream": "https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/ui/notificationDaemon.js"
+    },
+    "js/dbusServices/notifications/notificationDaemon.js": {
+      "sha256": "45939ad227a59318e72193ff428ccef2b4d2397567d481abe58bf2e5fc586219",
+      "upstream": "https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/dbusServices/notifications/notificationDaemon.js"
+    }
+  },
+  "cleanup": {
+    "delete_receipt": "cleanup-delete.json",
+    "inventory": "cleanup-inventory.json",
+    "owned_inventory": []
+  },
+  "qualification_summary": {
+    "published_locked_hint": "FAIL: no while ScreenSaver.GetActive true",
+    "published_notify_send": "FAIL: UnknownMethod GetServerInformation",
+    "candidate_tuna_locked_hint": "PASS: yes while locked; no after password unlock",
+    "candidate_tuna_notify_send": "PASS: exit 0; tuna-shell server spec 1.2; visible banner",
+    "reference": "GNOME Shell 51.1 runtime; GNOME Shell 51.0 source",
+    "scope": "exact 7a623e10 CI preview only; not released marlin:tuna or other revisions",
+    "baseline_package_archive_sha256": null,
+    "baseline_package_archive_note": "Archive not retained; exact published image digest, native package query and installed/running binary hashes retained."
+  }
+}

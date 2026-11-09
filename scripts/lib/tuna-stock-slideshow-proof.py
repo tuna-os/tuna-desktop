@@ -328,40 +328,71 @@ def check_frame_owners(owners, label):
             or owners['compositor_start'] != ORIGINAL_HOST['start_ticks']):
         raise RuntimeError(f'frame owners changed during {label}: {owners}')
 
-_FILE_IDENTITY = re.compile(r'Some\(FileIdentity \{ path: "([^"]+)", dev: (\d+), ino: (\d+), bytes: (\d+), modified: \((-?\d+), (-?\d+)\), changed: \((-?\d+), (-?\d+)\) \}\)')
+_MAX_IDENTITY_BYTES = 64 * 1024 * 1024  # wallpaper.rs MAX_SOURCE_BYTES
 
-def check_file_identity(rendered, label, expect_path=None):
-    """The compositor's Debug-rendered FileIdentity must parse and its
-    path/dev/ino/size/mtime/ctime must match a live stat: the frame's
-    bytes are the claimed file's bytes. Timestamps are bound too, so
-    a same-inode same-size in-place mutation cannot pass. When
-    `expect_path` is given the parsed path must equal it exactly."""
-    match = _FILE_IDENTITY.fullmatch(rendered)
-    if not match:
-        raise RuntimeError(f'{label} identity is not a complete FileIdentity: {rendered!r:.200}')
-    path = match.group(1)
-    if expect_path is not None and path != expect_path:
-        raise RuntimeError(f'{label} identity is for {path!r:.100}, expected {expect_path!r:.100}')
-    dev, ino, size = int(match.group(2)), int(match.group(3)), int(match.group(4))
-    mtime, mtime_nsec = int(match.group(5)), int(match.group(6))
-    ctime, ctime_nsec = int(match.group(7)), int(match.group(8))
+def check_file_identity(identity, label, expect_path=None):
+    """Bind the typed producer receipt to the same regular file and bytes.
+
+    Debug text is not a machine schema. Missing, legacy or malformed fields
+    fail closed; neither stat metadata nor matching pixels replace SHA256.
+    """
+    if type(identity) is not dict or set(identity) != {'path', 'metadata', 'sha256'}:
+        raise RuntimeError(f'{label} identity is not a typed FileIdentity')
+    path, metadata, digest = identity['path'], identity['metadata'], identity['sha256']
+    if type(path) is not str or (expect_path is not None and path != expect_path):
+        raise RuntimeError(f'{label} identity path does not match the owned fixture')
+    if type(metadata) is not dict or set(metadata) != {'dev', 'ino', 'bytes', 'modified', 'changed'}:
+        raise RuntimeError(f'{label} identity metadata is malformed')
+    if any(type(metadata[key]) is not int or not 0 <= metadata[key] < 2**64
+           for key in ('dev', 'ino', 'bytes')) or metadata['bytes'] > _MAX_IDENTITY_BYTES:
+        raise RuntimeError(f'{label} identity file metadata is outside producer bounds')
+    for key in ('modified', 'changed'):
+        value = metadata[key]
+        if (type(value) is not list or len(value) != 2
+                or any(type(part) is not int for part in value)
+                or not -2**63 <= value[0] < 2**63 or not 0 <= value[1] < 1_000_000_000):
+            raise RuntimeError(f'{label} identity timestamp is malformed')
+    if (type(digest) is not list or len(digest) != 32
+            or any(type(byte) is not int or not 0 <= byte <= 255 for byte in digest)):
+        raise RuntimeError(f'{label} identity content digest is malformed')
+    expected = (metadata['dev'], metadata['ino'], metadata['bytes'],
+                *metadata['modified'], *metadata['changed'])
+
+    def matches(info):
+        return (stat.S_ISREG(info.st_mode)
+                and (info.st_dev, info.st_ino, info.st_size,
+                     info.st_mtime_ns // 1_000_000_000, info.st_mtime_ns % 1_000_000_000,
+                     info.st_ctime_ns // 1_000_000_000, info.st_ctime_ns % 1_000_000_000) == expected)
+
     try:
-        actual = Path(path).stat()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, 'rb') as source:
+            if not matches(os.fstat(source.fileno())):
+                raise RuntimeError(f'{label} identity does not match live file metadata')
+            content = hashlib.sha256()
+            remaining = metadata['bytes'] + 1
+            while remaining:
+                budget('identity content read')
+                block = source.read(min(16384, remaining))
+                if not block:
+                    break
+                remaining -= len(block)
+                content.update(block)
+            if (content.digest() != bytes(digest)
+                    or not matches(os.fstat(source.fileno()))
+                    or not matches(os.stat(path, follow_symlinks=False))):
+                raise RuntimeError(f'{label} identity does not match stable live file content')
+            budget('identity content acceptance')
     except OSError:
-        raise RuntimeError(f'{label} identity path is not statable: {path}')
-    live_mtime, live_ctime = actual.st_mtime_ns, actual.st_ctime_ns
-    if (actual.st_ino != ino or actual.st_size != size or actual.st_dev != dev
-            or (live_mtime // 1_000_000_000, live_mtime % 1_000_000_000) != (mtime, mtime_nsec)
-            or (live_ctime // 1_000_000_000, live_ctime % 1_000_000_000) != (ctime, ctime_nsec)):
-        raise RuntimeError(f'{label} identity does not match live file: {rendered!r:.200}')
+        raise RuntimeError(f'{label} identity path is not a readable owned regular file') from None
     return path
 
 def is_plain_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
 def check_paint(paint, style, fixed, first, last):
-    """Strict per-frame receipt against the compositor's actual
-    paint_record schema (wallpaper.rs:444-449). Raises on any
+    """Strict per-frame receipt against the compositor's typed paint schema.
+    Raises on any
     missing/mistyped/ranged-out field or provenance mismatch, so an
     accepted frame ties actual pixels to the expected XML source,
     generation, viewport and owner — never to bare construction
@@ -409,13 +440,13 @@ def check_paint(paint, style, fixed, first, last):
         raise RuntimeError('paint source identities are not a nonempty list')
     ref_paths = set()
     for ref in refs:
-        if not isinstance(ref, dict) or not isinstance(ref.get('path'), str) or not isinstance(ref.get('identity'), str):
-            raise RuntimeError(f'source identity entry is malformed: {ref!r:.200}')
+        if (type(ref) is not dict or set(ref) != {'path', 'identity'}
+                or type(ref['path']) is not str
+                or ref['path'] not in {str(OUT / (name + '.png')) for name in COLORS}):
+            raise RuntimeError('source identity is not an owned public fixture reference')
         if ref['path'] in ref_paths:
             raise RuntimeError(f'duplicate source identity path: {ref["path"]!r:.100}')
-        live = check_file_identity(ref['identity'], 'reference ' + ref['path'][-40:])
-        if live != ref['path']:
-            raise RuntimeError(f'reference path disagrees with its identity: {ref["path"]!r:.100} vs {live!r:.100}')
+        check_file_identity(ref['identity'], 'reference ' + ref['path'][-40:], expect_path=ref['path'])
         ref_paths.add(ref['path'])
     if paint['from'] not in ref_paths or (paint['to'] is not None and paint['to'] not in ref_paths):
         raise RuntimeError('paint frames are missing from the source identities')
