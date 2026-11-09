@@ -7,7 +7,11 @@ art = Path(os.environ['TUNA_FLASH_PROOF_ARTIFACTS'])
 bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
 (art/'client-ready.json').write_text(json.dumps({'pid':os.getpid()}))
 seen = None
+# Bounded: an orphaned client (proof driver gone) must not poll forever.
+idle_end = time.monotonic() + 300
 while True:
+    if time.monotonic() > idle_end:
+        raise SystemExit('no new screenshot request within 300 s')
     try:
         request=json.loads((art/'request.json').read_text())
     except (OSError,ValueError):
@@ -15,6 +19,7 @@ while True:
     if request['id']==seen:
         time.sleep(.01);continue
     seen=request['id']
+    idle_end = time.monotonic() + 300
     started=time.monotonic()
     (art/'started.json').write_text(json.dumps({'id':seen,'monotonic':started}))
     try:

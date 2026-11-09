@@ -66,6 +66,7 @@ mod aids;
 mod auth;
 mod color;
 mod display;
+mod motion;
 mod osk;
 
 /// Display-rate loop pacing: while anything moves, dispatch blocks at
@@ -608,6 +609,9 @@ struct RemoteHeld {
     grant: std::sync::Arc<std::sync::atomic::AtomicBool>,
     keys: std::collections::HashSet<u32>,
     buttons: std::collections::HashSet<u32>,
+    /// NotifyKeyboardKeysym presses: keysym to its key and the level
+    /// modifier this grant pressed around it (evdev).
+    keysyms: std::collections::HashMap<u32, (u32, Option<u32>)>,
 }
 
 struct PendingScreenshotReply {
@@ -699,6 +703,9 @@ pub struct Runtime {
     wellbeing_effects: crate::wellbeing_effects::Effects,
     /// GNOME's keyboard accessibility aids, ahead of everything else (#350).
     input_aids: aids::RuntimeAids,
+    /// Pointer motion waiting for its output frame (Mutter's stage
+    /// event queue); see [`crate::motion_coalesce`].
+    motion_queue: crate::motion_coalesce::MotionCoalescer,
     /// Keys GNOME's on-screen keyboard holds down (#349).
     osk: osk::RuntimeOsk,
     /// An Escape press cancelled a client drag; its repeats and release
@@ -738,6 +745,10 @@ pub struct Runtime {
     /// GNOME's per-device tablet and stylus settings (owned GIO reader).
     tablet_settings: crate::tablet_settings::Reader,
     tablet_settings_status: Option<crate::night_light_settings::CacheStatus>,
+    /// `org.gnome.desktop.privacy` `privacy-screen` (owned GIO worker;
+    /// hardware session only, #356).
+    #[cfg(feature = "drm")]
+    privacy_screen_settings: Option<crate::privacy_screen_settings::PrivacyScreenSettings>,
     /// Configured transform per connector (Settings/monitors.xml):
     /// the sensor overrides these live but never rewrites them.
     manual_transforms: std::collections::HashMap<String, u32>,
@@ -843,9 +854,9 @@ pub struct Runtime {
     atspi_points: AtspiPoints,
     exit: bool,
     stats: RunStats,
-    /// `TUNA_COMPOSITOR_STATE` snapshot path (journeys only).
-    state_path: Option<std::path::PathBuf>,
-    state_last: String,
+    /// Owned, bounded-latest publisher for opt-in `TUNA_COMPOSITOR_STATE`.
+    /// Filesystem writes never run on the compositor thread.
+    state_publisher: Option<crate::state_snapshot::Publisher>,
     /// Opt-in synthetic touchpad phases for the nested proof harness.
     proof_swipe_last: String,
     /// The `sequence` of the last phase consumed, published in the state
@@ -952,11 +963,18 @@ impl Runtime {
                 let handle = event_loop.handle();
                 handle
                     .insert_source(sources.session, |event, _, rt: &mut Runtime| {
+                        let activated =
+                            matches!(event, smithay::backend::session::Event::ActivateSession);
                         if matches!(event, smithay::backend::session::Event::PauseSession) {
                             rt.manager.cancel_strip_pointer(&mut rt.state);
                         }
                         if let Backend::Drm(drm) = &mut rt.backend {
                             drm.on_session_event(event);
+                        }
+                        // Monitors may have come or gone while another VT
+                        // owned the device.
+                        if activated {
+                            rt.on_drm_hotplug();
                         }
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
@@ -971,6 +989,23 @@ impl Runtime {
                         }
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                if let Some(udev) = sources.udev {
+                    handle
+                        .insert_source(udev, |event, _, rt: &mut Runtime| {
+                            let smithay::backend::udev::UdevEvent::Changed { device_id } = event
+                            else {
+                                return;
+                            };
+                            if let Backend::Drm(drm) = &mut rt.backend {
+                                drm.on_device_changed(device_id);
+                            }
+                            if matches!(&rt.backend, Backend::Drm(drm) if drm.is_device(device_id))
+                            {
+                                rt.on_drm_hotplug();
+                            }
+                        })
+                        .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                }
                 handle
                     .insert_source(sources.input, |event, _, rt: &mut Runtime| {
                         // A VT switch revokes the evdev fds before libseat's
@@ -1348,7 +1383,24 @@ impl Runtime {
         let hardware = false;
         let a11y_keyboard =
             (hardware || session.screen_reader).then(crate::a11y_keyboard::Monitor::start);
+        // org.gnome.desktop.privacy privacy-screen, on its own GIO thread
+        // as mutter's meta-settings.c reads it in-process (#356); only
+        // the hardware session has privacy screens.
+        #[cfg(feature = "drm")]
+        let privacy_screen_settings =
+            hardware.then(|| crate::privacy_screen_settings::PrivacyScreenSettings::start(&wake));
         let loop_handle = event_loop.handle();
+        let state_path = std::env::var_os("TUNA_COMPOSITOR_STATE")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute());
+        let state_dir = state_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf);
+        let state_publisher = state_path
+            .map(crate::state_snapshot::Publisher::start)
+            .transpose()
+            .map_err(|error| RuntimeError::Loop(format!("state snapshot publisher: {error}")))?;
         let mut runtime = Runtime {
             display,
             state,
@@ -1375,6 +1427,8 @@ impl Runtime {
             // Mutter's meta-input-settings.c reads them in-process.
             tablet_settings: crate::tablet_settings::Reader::new(&wake),
             tablet_settings_status: None,
+            #[cfg(feature = "drm")]
+            privacy_screen_settings,
             numlock: {
                 let wake = wake.clone();
                 crate::numlock::NumlockMemory::start(crate::numlock::CliStore, move || {
@@ -1427,6 +1481,7 @@ impl Runtime {
             input_settings: Default::default(),
             wellbeing_effects: Default::default(),
             input_aids: aids::RuntimeAids::default(),
+            motion_queue: crate::motion_coalesce::MotionCoalescer::new(),
             osk: osk::RuntimeOsk::default(),
             dnd_escape_held: false,
             orca: crate::orca::Reader::new(&session.socket_name, a11y_keyboard.clone()),
@@ -1467,17 +1522,14 @@ impl Runtime {
             atspi_points: AtspiPoints::default(),
             exit: false,
             stats: RunStats::default(),
-            state_path: std::env::var_os("TUNA_COMPOSITOR_STATE")
-                .map(std::path::PathBuf::from)
-                .filter(|p| p.is_absolute()),
-            state_last: String::new(),
+            state_publisher,
             proof_swipe_last: String::new(),
             proof_swipe_sequence: None,
             #[cfg(feature = "drm")]
             performance_trace: crate::performance_trace::Trace::from_env(),
         };
         runtime.animation_clock =
-            crate::animation_clock::AnimationClock::from_env(runtime.state_path.is_some());
+            crate::animation_clock::AnimationClock::from_env(runtime.state_publisher.is_some());
         runtime.wallpaper.set_wake(&runtime.wake);
         // Night Light (#339): D-Bus preview/clear/temp-disable
         // records ping the already-registered wake above; its no-op
@@ -1496,7 +1548,7 @@ impl Runtime {
         let started = runtime.animation_clock.now();
         runtime.overview_progress_at = started;
         runtime.strip_view_at = started;
-        runtime.proof_polling = runtime.state_path.is_some()
+        runtime.proof_polling = runtime.state_publisher.is_some()
             && [crate::animation_clock::CLOCK_ENV, "TUNA_PROOF_SWIPE_INPUT"]
                 .iter()
                 .any(|key| std::env::var_os(key).is_some());
@@ -1506,11 +1558,6 @@ impl Runtime {
         // tick itself rewrites there would wake the loop on its own
         // writes, so then the dir is not watched and the blank file is
         // read on every tick.
-        let state_dir = runtime
-            .state_path
-            .as_deref()
-            .and_then(std::path::Path::parent)
-            .map(std::path::Path::to_path_buf);
         if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|dir| state_dir.as_deref() != Some(std::path::Path::new(dir)))
         {
@@ -1670,6 +1717,8 @@ impl Runtime {
     /// snapshots), overview dismissed, and the exclusive lock surface
     /// up with an empty list — no window titles while locked.
     fn engage_lock(&mut self) {
+        // Motion that came before the lock is the session's, not the shield's.
+        self.flush_motion();
         // Track lifecycle separately: idle check_timeout has already locked its flag.
         self.unlock_slot.note_lock(&self.unlock_generation);
         #[cfg(feature = "drm")]
@@ -1687,7 +1736,8 @@ impl Runtime {
         self.control.cancel_pending_accelerators();
         self.cursor.on_lock();
         self.control.set_locked(true);
-        let remote_ids: Vec<_> = self.remote_held.keys().copied().collect();
+        let mut remote_ids: Vec<_> = self.remote_held.keys().copied().collect();
+        remote_ids.extend(self.state.remote_clipboard.sessions());
         for id in remote_ids {
             self.stop_remote_input(id);
         }
@@ -1704,6 +1754,9 @@ impl Runtime {
             });
         }
         self.control.set_overview(false);
+        // The shield covers GNOME's switcher popup and its window clones;
+        // no window image may draw over the lock.
+        self.switcher_thumbnails.clear();
         self.overlay.show(Vec::new());
     }
 
@@ -1867,6 +1920,7 @@ impl Runtime {
     }
 
     fn release_lock(&mut self) {
+        self.flush_motion();
         self.reset_input_aid_ownership();
         if let Some(monitor) = &self.a11y_keyboard {
             monitor.set_locked(false);
@@ -2001,14 +2055,15 @@ impl Runtime {
         }
     }
 
-    /// Route one backend input event: consumed by the lock surface while
+    /// Route one backend input event, after [`Self::on_manager_input`]
+    /// coalesced motion: consumed by the lock surface while
     /// locked (credential entry submits through [`try_unlock`](Self::try_unlock);
     /// windows hear nothing), else to the recovery overlay while it is visible,
     /// else through the overview triggers to the window manager.
     /// Trigger events still reach clients (tap toggles without
     /// breaking Super-combos); only Escape-closes is consumed, so a
     /// closing keypress never double-acts on client UI.
-    fn on_manager_input(&mut self, input: ManagerInput) {
+    fn dispatch_manager_input(&mut self, input: ManagerInput) {
         if let Some(monitor) = &self.a11y_keyboard {
             monitor.set_locked(self.is_locked());
             if self
@@ -2240,14 +2295,11 @@ impl Runtime {
             // the hub broadcast; the next hub poll delivers it to the
             // shell, which owns MRU order and rendering.
             for action in self.manager.take_switcher_queue() {
-                // A closing switcher takes its thumbnails with it.
-                if matches!(
-                    action,
-                    tuna_shell_control::SwitcherAction::Commit
-                        | tuna_shell_control::SwitcherAction::Cancel
-                ) {
-                    self.switcher_thumbnails.clear();
-                }
+                // A closing switcher's window images fade out with its
+                // popup (switcherPopup.js fadeAndDestroy): the shell keeps
+                // sending their frames at the fading opacity and clears
+                // them once the fade ends; the control hub clears them if
+                // that shell goes away first, and the lock clears them.
                 self.control.queue_switcher(action);
             }
             for (action, time, mode) in self.manager.take_accelerators_fired() {
@@ -2412,11 +2464,11 @@ impl Runtime {
         Vec::new()
     }
 
-    /// Write the compositor-side state snapshot when it changed
-    /// (`TUNA_COMPOSITOR_STATE`, journeys only; #65). App ids and ids,
-    /// never titles.
+    /// Queue one coherent compositor-side state snapshot (`TUNA_COMPOSITOR_STATE`,
+    /// journeys only; #65). The owned writer atomically publishes the latest body
+    /// without making rendering wait on disk. App ids and ids, never titles.
     fn publish_state(&mut self) {
-        if self.state_path.is_none() {
+        if self.state_publisher.is_none() {
             return;
         }
         let mut keyboard = self.manager.keyboard_summary(&mut self.state);
@@ -2424,7 +2476,7 @@ impl Runtime {
             let saving = self.numlock.saving(self.manager.keyboard_num_lock());
             keyboard.insert("numlock_saving".into(), saving.into());
         }
-        let Some(path) = self.state_path.as_ref() else {
+        let Some(publisher) = self.state_publisher.as_ref() else {
             return;
         };
         let model = self.manager.model();
@@ -2584,6 +2636,11 @@ impl Runtime {
 
             // The Alt+Tab switcher's window thumbnails being drawn.
             "switcher_thumbnails": self.switcher_thumbnails.len(),
+            // ... and how opaque each window image is drawn (#501).
+            "switcher_thumbnail_alphas": switcher_previews(&self.manager, &self.switcher_thumbnails)
+                .iter()
+                .map(|p| p.alpha)
+                .collect::<Vec<_>>(),
             // GNOME's tile preview while a dragged window is over a
             // snap edge: the window and the area it would fill.
             "tile_preview": self.manager.tile_preview(&self.state).map(|(id, r)| {
@@ -2694,6 +2751,33 @@ impl Runtime {
         // GNOME Settings' display configuration (#340): modes, the
         // kernel's CRTC modes on hardware, pending confirmation.
         doc["display_config"] = self.display_config_diagnostics();
+        // The window manager's outputs (wl_outputs) and the output each
+        // window returns to, for the hotplug storm.
+        let primary_output = self.state.primary_output_name();
+        doc["outputs"] = self
+            .state
+            .output_slices()
+            .into_iter()
+            .map(|(name, r)| {
+                serde_json::json!({
+                    "primary": primary_output.as_deref() == Some(name.as_str()),
+                    "name": name,
+                    "rect": [r.loc.x, r.loc.y, r.size.w, r.size.h],
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+        doc["window_outputs"] = snapshot
+            .windows
+            .iter()
+            .map(|w| {
+                (
+                    w.id.to_string(),
+                    serde_json::json!(self.manager.preferred_output(w.id)),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into();
         doc["color"] = self.color_diagnostics();
         let motion = self.input_settings.motion;
         doc["motion_policy"] = serde_json::json!(motion.level.as_str());
@@ -2731,6 +2815,11 @@ impl Runtime {
             let pos = self.manager.pointer_pos();
             [pos.x, pos.y]
         }));
+        doc["interactive_move_window"] = serde_json::json!(if self.is_locked() {
+            None
+        } else {
+            self.manager.interactive_move_window()
+        });
         doc["input_aids"] = self.input_aids_summary();
         // What the on-screen keyboard follows (#349): the focused field's
         // content type only, never text; nothing while locked.
@@ -2781,13 +2870,7 @@ impl Runtime {
             doc["tablets"] = drm.tablets_introspect();
         }
         let doc = doc.to_string();
-        if doc == self.state_last {
-            return;
-        }
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &doc).is_ok() && std::fs::rename(&tmp, path).is_ok() {
-            self.state_last = doc;
-        }
+        publisher.publish(doc);
     }
 
     /// The overview at rest on the primary output (#54): the window
@@ -3031,7 +3114,7 @@ impl Runtime {
     /// Each atomically replaced JSON file is consumed once; ordinary sessions
     /// never read it because state instrumentation is also required.
     fn proof_swipe_input(&mut self) {
-        if self.state_path.is_none() {
+        if self.state_publisher.is_none() {
             return;
         }
         let Some(path) = std::env::var_os("TUNA_PROOF_SWIPE_INPUT")
@@ -3910,9 +3993,11 @@ impl Runtime {
 
     /// One D-Bus screen-cast request.
     fn stop_remote_input(&mut self, session_id: u64) {
+        self.state.revoke_remote_clipboard(session_id);
         let Some(held) = self.remote_held.remove(&session_id) else {
             return;
         };
+        self.flush_motion();
         held.grant.store(true, std::sync::atomic::Ordering::SeqCst);
         let time = self.lock_now_ms() as u32;
         // Cleanup must reach the seat even while the lock shield has no
@@ -3950,6 +4035,11 @@ impl Runtime {
             return;
         }
         let time = self.lock_now_ms() as u32;
+        use crate::mutter::RemoteInput;
+        if let RemoteInput::Keysym { keysym, pressed } = input {
+            self.remote_keysym(session_id, grant, keysym, pressed);
+            return;
+        }
         let held = self
             .remote_held
             .entry(session_id)
@@ -3957,8 +4047,8 @@ impl Runtime {
                 grant,
                 keys: Default::default(),
                 buttons: Default::default(),
+                keysyms: Default::default(),
             });
-        use crate::mutter::RemoteInput;
         let input = match input {
             RemoteInput::Key { evdev, pressed } => {
                 // ManagerInput uses evdev; WindowManager adds the XKB offset
@@ -3975,6 +4065,7 @@ impl Runtime {
                     time,
                 }
             }
+            RemoteInput::Keysym { .. } => return,
             RemoteInput::Button { button, pressed } => {
                 if (pressed && !held.buttons.insert(button))
                     || (!pressed && !held.buttons.remove(&button))
@@ -4031,6 +4122,66 @@ impl Runtime {
         self.on_manager_input(input);
     }
 
+    /// mutter's `notify_keyval` (meta-virtual-input-device-native.c):
+    /// the keysym's first key in the effective layout, with Shift or
+    /// AltGr pressed before it for its level and released after it. A
+    /// keysym the layout lacks types nothing. Keys go through the grant's
+    /// held set, so Stop and lock release them like keycode input.
+    fn remote_keysym(
+        &mut self,
+        session_id: u64,
+        grant: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        keysym: u32,
+        pressed: bool,
+    ) {
+        use crate::mutter::RemoteInput;
+        let key = |evdev, pressed| RemoteInput::Key { evdev, pressed };
+        if !pressed {
+            let Some((code, modifier)) = self
+                .remote_held
+                .get_mut(&session_id)
+                .and_then(|held| held.keysyms.remove(&keysym))
+            else {
+                return;
+            };
+            self.remote_input(session_id, grant.clone(), key(code, false));
+            if let Some(modifier) = modifier {
+                self.remote_input(session_id, grant, key(modifier, false));
+            }
+            return;
+        }
+        let held = self.remote_held.get(&session_id);
+        if held.is_some_and(|held| held.keysyms.contains_key(&keysym)) {
+            return;
+        }
+        let Some((code, level)) = self.manager.keycode_for_keysym(&mut self.state, keysym) else {
+            eprintln!(
+                "tuna-compositor: remote: no keycode for keysym {keysym:#x} in the current layout"
+            );
+            return;
+        };
+        if crate::mutter::remote_desktop::valid_key(code).is_err() {
+            return;
+        }
+        // A level modifier the grant already holds stays the grant's.
+        let modifier = crate::osk::level_modifier(level)
+            .and_then(|modifier| self.manager.keycode_for_keysym(&mut self.state, modifier))
+            .map(|(modifier, _)| modifier)
+            .filter(|modifier| {
+                !self
+                    .remote_held
+                    .get(&session_id)
+                    .is_some_and(|held| held.keys.contains(modifier))
+            });
+        if let Some(modifier) = modifier {
+            self.remote_input(session_id, grant.clone(), key(modifier, true));
+        }
+        self.remote_input(session_id, grant, key(code, true));
+        if let Some(held) = self.remote_held.get_mut(&session_id) {
+            held.keysyms.insert(keysym, (code, modifier));
+        }
+    }
+
     fn on_screencast_request(&mut self, request: crate::mutter::ToLoop) {
         match request {
             crate::mutter::ToLoop::RemoteInput {
@@ -4043,6 +4194,10 @@ impl Runtime {
                 self.remote_input(session_id, grant, input);
             }
             crate::mutter::ToLoop::RemoteStop { session_id } => self.stop_remote_input(session_id),
+            crate::mutter::ToLoop::RemoteClipboard(request) => {
+                let locked = self.is_locked();
+                self.state.remote_clipboard_request(request, locked);
+            }
             crate::mutter::ToLoop::RemoteKeymap { reply } => {
                 let keymap = self
                     .state
@@ -4060,6 +4215,7 @@ impl Runtime {
             }
             crate::mutter::ToLoop::StartCast {
                 session_id,
+                stream_id,
                 grant,
                 target,
                 signal,
@@ -4097,7 +4253,7 @@ impl Runtime {
                 let Some(pw) = self.pipewire.as_ref() else {
                     return;
                 };
-                match pw.start_cast(session_id, target, width, height, signal) {
+                match pw.start_cast(session_id, stream_id, target, width, height, signal) {
                     Some(cast) => self.casts.push(cast),
                     None => eprintln!("tuna-compositor: screen cast: stream failed to start"),
                 }
@@ -4105,6 +4261,13 @@ impl Runtime {
             crate::mutter::ToLoop::StopCast { session_id } => {
                 self.casts.retain(|cast| cast.session_id != session_id);
                 self.cast_grants.remove(&session_id);
+            }
+            crate::mutter::ToLoop::StopStream {
+                session_id,
+                stream_id,
+            } => {
+                self.casts
+                    .retain(|cast| cast.session_id != session_id || cast.stream_id != stream_id);
             }
             crate::mutter::ToLoop::SensorSample {
                 present,
@@ -4164,6 +4327,7 @@ impl Runtime {
         if self.is_locked() || x < 0 || y < 0 {
             return;
         }
+        self.flush_motion();
         let Some(surface) = crate::layer::exclusive_keyboard_layer(&self.state) else {
             return;
         };
@@ -4444,8 +4608,15 @@ impl Runtime {
     /// How long the loop may sleep before the next [`tick`](Self::tick)
     /// (#503). Wayland clients, input, page flips, the control socket,
     /// signals, runtime files and worker threads wake it earlier through
-    /// their event sources; this covers what only time moves.
+    /// their event sources; this covers what only time moves, and
+    /// coalesced motion falling due.
     fn next_wake(&self) -> Duration {
+        let wake = self.producer_wake();
+        self.motion_wake().map_or(wake, |due| wake.min(due))
+    }
+
+    /// The timed producers' earliest wake.
+    fn producer_wake(&self) -> Duration {
         #[cfg(feature = "drm")]
         let native = matches!(self.backend, Backend::Drm(_));
         #[cfg(not(feature = "drm"))]
@@ -4587,6 +4758,9 @@ impl Runtime {
                 self.blank = crate::lock::IdleBlank::parse(&text);
             }
         }
+        // Motion folded since the last frame reaches the window manager
+        // now, before client requests and this tick's frame.
+        self.flush_motion_if_due();
         self.display
             .dispatch_clients(&mut self.state)
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
@@ -4613,9 +4787,13 @@ impl Runtime {
         }
         // A client's pointer warp moved the manager's pointer: the
         // drawn cursor follows (#89).
+        // Not while coalesced motion is pending: the backend's pointer
+        // is ahead of the manager's until the frame delivers it.
         #[cfg(feature = "drm")]
         if let Backend::Drm(drm) = &mut self.backend {
-            drm.set_pointer(self.manager.pointer_pos());
+            if !self.motion_queue.pending() {
+                drm.set_pointer(self.manager.pointer_pos());
+            }
         }
         // Publish the output inventory every tick (multi-monitor): the
         // hub broadcasts on change only, so the steady state costs one
@@ -4678,6 +4856,11 @@ impl Runtime {
         }
         for pad in outcome.pad_osd_closed {
             self.pad_osd_closed(pad);
+        }
+        // PanelMenu.Button.vfunc_hide: the hidden button's menu closes
+        // without BoxPointer's close.
+        if outcome.close_menu_unanimated {
+            self.menu_close.close_unanimated(std::time::Instant::now());
         }
         if let Some(request) = self.state.take_shortcut_consent_update() {
             self.control
@@ -4743,7 +4926,12 @@ impl Runtime {
             self.manager.window_action(&mut self.state, window, action);
         }
         if let Some(thumbnails) = outcome.switcher_thumbnails {
-            self.switcher_thumbnails = thumbnails;
+            // A fade frame landing after the lock engaged draws nothing.
+            self.switcher_thumbnails = if self.is_locked() {
+                Vec::new()
+            } else {
+                thumbnails
+            };
         }
         if let Some(keys) = outcome.switcher_keys {
             self.manager.set_switcher_keys(keys);
@@ -5040,6 +5228,8 @@ impl Runtime {
         );
         self.publish_state();
         self.publish_cast_outputs();
+        #[cfg(feature = "drm")]
+        self.privacy_screen_tick();
         self.publish_display_state();
         self.publish_overview_previews();
         let strip_was_animating = self.manager.strip_animating();
@@ -5058,14 +5248,11 @@ impl Runtime {
         // Send what this tick queued for the shell now, not at the next
         // wake, which may be far off (#503).
         self.control.flush(self.manager.model());
-        #[cfg(feature = "drm")]
-        if matches!(self.backend, Backend::Drm(_)) {
-            // Rendering queues callbacks only for a submitted scanout. Send
-            // those events now so a redraw need not wait for the next tick.
-            self.display
-                .flush_clients()
-                .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-        }
+        // Every backend queues render-produced callbacks. Send them before
+        // sleeping, without requiring another client request or render wake.
+        self.display
+            .flush_clients()
+            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         Ok(!self.exit)
     }
 
@@ -5130,6 +5317,7 @@ impl Runtime {
     fn on_tablet_input(&mut self, event: crate::tablet::TabletEvent) {
         use crate::tablet::TabletEvent;
         let mut waking_blank = false;
+        self.flush_motion();
         if let Some(time) = event.time() {
             waking_blank = self.blank_alpha() > 0.0;
             self.lock.note_input(u64::from(time));
@@ -6547,25 +6735,33 @@ fn switcher_previews(
 ) -> Vec<crate::overview::Preview> {
     thumbnails
         .iter()
-        .filter_map(|t| {
-            let geo = manager.geometry(t.window)?;
-            let (w, h) = (f64::from(geo.size.w.max(1)), f64::from(geo.size.h.max(1)));
-            let scale = (f64::from(t.width) / w)
-                .min(f64::from(t.height) / h)
-                .min(1.0);
-            let (sw, sh) = ((w * scale).round() as i32, (h * scale).round() as i32);
-            Some(crate::overview::Preview {
-                id: t.window,
-                rect: Rectangle::new(
-                    (t.x + (t.width - sw) / 2, t.y + (t.height - sh) / 2).into(),
-                    (sw, sh).into(),
-                ),
-                scale,
-                active: false,
-                alpha: 1.0,
-            })
-        })
+        .filter_map(|t| Some(switcher_preview(t, manager.geometry(t.window)?.size)))
         .collect()
+}
+
+/// One thumbnail's window (of `size`) fitted into its frame, drawn at the
+/// frame's opacity: the clone sits inside the thumbnail list, so it fades
+/// with it (altTab.js THUMBNAIL_FADE_TIME) and with the whole popup
+/// (switcherPopup.js POPUP_FADE_OUT_TIME).
+fn switcher_preview(
+    t: &tuna_shell_control::SwitcherThumbnail,
+    size: smithay::utils::Size<i32, Logical>,
+) -> crate::overview::Preview {
+    let (w, h) = (f64::from(size.w.max(1)), f64::from(size.h.max(1)));
+    let scale = (f64::from(t.width) / w)
+        .min(f64::from(t.height) / h)
+        .min(1.0);
+    let (sw, sh) = ((w * scale).round() as i32, (h * scale).round() as i32);
+    crate::overview::Preview {
+        id: t.window,
+        rect: Rectangle::new(
+            (t.x + (t.width - sw) / 2, t.y + (t.height - sh) / 2).into(),
+            (sw, sh).into(),
+        ),
+        scale,
+        active: false,
+        alpha: f32::from(t.opacity) / 255.0,
+    }
 }
 
 use crate::wellbeing_effects::FrameColor;
@@ -7969,6 +8165,31 @@ mod tests {
         // Superseded epoch: the worker succeeded, but a denied attempt never applies.
         assert_eq!(unlock_outcome(true, true), (true, false));
         assert_eq!(unlock_outcome(true, false), (true, true));
+    }
+
+    #[test]
+    fn switcher_thumbnails_draw_their_window_at_the_frames_opacity() {
+        let thumbnail = |opacity| tuna_shell_control::SwitcherThumbnail {
+            window: 3,
+            x: 100,
+            y: 50,
+            width: 256,
+            height: 160,
+            opacity,
+        };
+        let size = (1280, 800).into();
+        // Half way through a fade (Clutter's 0-255 opacity): half alpha.
+        let half = switcher_preview(&thumbnail(128), size);
+        assert_eq!(half.alpha, 128.0 / 255.0);
+        assert!((half.alpha - 0.5).abs() <= 1.0 / 255.0);
+        assert_eq!(switcher_preview(&thumbnail(255), size).alpha, 1.0);
+        assert_eq!(switcher_preview(&thumbnail(0), size).alpha, 0.0);
+        // The fit is unchanged: scaled down to the frame, centred in it.
+        assert_eq!(half.scale, 0.2);
+        assert_eq!(
+            half.rect,
+            Rectangle::new((100, 50).into(), (256, 160).into())
+        );
     }
 
     /// A preview record must ping an idle loop through the share's

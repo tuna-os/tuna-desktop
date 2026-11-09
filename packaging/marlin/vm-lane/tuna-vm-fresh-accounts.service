@@ -1,0 +1,15 @@
+# CI-only (tunaOS#4092): record-free fresh-account fixtures, only for
+# scripts/tuna-vm-lane --fresh-accounts (SMBIOS credential).
+[Unit]
+Description=Tuna VM lane fresh-account fixtures
+ConditionCredential=tuna.vm.fresh-accounts
+After=systemd-sysusers.service systemd-tmpfiles-setup.service
+Before=accounts-daemon.service gdm.service display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/tuna-vm-fresh-accounts
+
+[Install]
+WantedBy=multi-user.target

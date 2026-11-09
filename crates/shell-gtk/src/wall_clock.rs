@@ -346,13 +346,13 @@ mod tests {
 
     #[test]
     fn a_time_zone_change_redraws_the_clock_at_once() {
+        let _dispatch = crate::test_dispatch_guard();
         let dir = zone_dir("monitor");
         let link = dir.join("localtime");
         point(&link, "Pacific/Auckland");
         // The timerfd watch lives on the default context, which this
-        // thread must own (fd_watch::add_local); it is never iterated here.
-        let main = glib::MainContext::default();
-        let _owner = main.acquire().expect("default main context free");
+        // thread owns through the dispatch guard above (fd_watch::add_local
+        // asserts ownership); it is never iterated here.
         let ticks = Rc::new(Cell::new(0));
         let counted = ticks.clone();
         // A private context: only the zone monitor attaches here (the

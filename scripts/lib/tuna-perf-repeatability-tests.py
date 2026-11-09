@@ -24,6 +24,16 @@ def measurement_script(profile):
     return "set -euo pipefail\n" + expected.strip()[5:] + "\n"
 
 
+SHELL_COMMAND = r'''#!/bin/sh
+set -eu
+name=${0##*/}
+printf '%s\000' "$(($# + 1))" "$name" "$@" >> "$RECEIPTS"
+if [ "$name" = sudo ] && [ -n "${FAIL_IMAGE_BUILD:-}" ] && [ "${1:-}" = podman ] && [ "${2:-}" = build ]; then
+    exit 17
+fi
+'''
+
+
 COMMAND = r'''#!/usr/bin/env python3
 import json,os,sys
 from pathlib import Path
@@ -37,10 +47,8 @@ if name=='tuna-vm-perf':
     repeat=next(v.split('=',1)[1] for v in row['meta'] if v.startswith('acquisition_repeat='))
     row['profile']=args[args.index('--gnome-profile')+1]
     row['case']=row['profile']+':'+repeat+':'+row['desktop']
-with open(os.environ['RECEIPTS'],'a') as stream:
-    stream.write(json.dumps(row)+'\n')
-if name=='sudo' and os.environ.get('FAIL_IMAGE_BUILD') and args[:2]==['podman','build']:
-    sys.exit(17)
+with open(os.environ['RECEIPTS'],'ab') as stream:
+    stream.write(b'\0'.join([str(len(args)+1).encode(),os.fsencode(name),*(os.fsencode(arg) for arg in args)])+b'\0')
 if name=='tuna-vm-perf':
     target=Path(row['out']);target.mkdir(parents=True,exist_ok=True)
     sys.path.insert(0, str(Path.cwd()/'scripts/lib'))
@@ -60,6 +68,30 @@ if name=='tuna-vm-perf':
 '''
 
 
+def _read_receipts(path):
+    fields = path.read_bytes().split(b'\0') if path.exists() else [b'']
+    if fields.pop() != b'':
+        raise ValueError("unterminated command receipt")
+    rows = []
+    position = 0
+    while position < len(fields):
+        count = int(fields[position])
+        if count < 1 or position + count >= len(fields):
+            raise ValueError("invalid command receipt field count")
+        name, *args = [os.fsdecode(field) for field in fields[position+1:position+count+1]]
+        position += count + 1
+        row = {'command': name, 'args': args}
+        if name == 'tuna-vm-perf':
+            row['desktop'] = args[args.index('--desktop')+1]
+            row['out'] = args[args.index('--out')+1]
+            row['meta'] = [args[i+1] for i, v in enumerate(args) if v == '--meta']
+            repeat = next(v.split('=', 1)[1] for v in row['meta'] if v.startswith('acquisition_repeat='))
+            row['profile'] = args[args.index('--gnome-profile')+1]
+            row['case'] = row['profile']+':'+repeat+':'+row['desktop']
+        rows.append(row)
+    return rows
+
+
 class Repeatability(unittest.TestCase):
     def execute(self, failure=None, image_failure=False, receipt_failure=False, thread_diagnostics=None):
         with tempfile.TemporaryDirectory() as directory:
@@ -69,7 +101,7 @@ class Repeatability(unittest.TestCase):
             (root / 'scripts').mkdir()
             for name in ('sudo', 'truncate', 'rm'):
                 path = commands / name
-                path.write_text(COMMAND)
+                path.write_text(SHELL_COMMAND)
                 path.chmod(0o755)
             path = root / 'scripts/tuna-vm-perf'
             path.write_text(COMMAND)
@@ -86,7 +118,7 @@ class Repeatability(unittest.TestCase):
                 python = commands / 'python3'
                 python.write_text('#!/bin/sh\nif [ "$1" = - ]; then exit 23; fi\nexec /usr/bin/python3 "$@"\n')
                 python.chmod(0o755)
-            receipts = root / 'receipts.jsonl'
+            receipts = root / 'receipts.argv'
             env = dict(os.environ, PATH=str(commands) + os.pathsep + os.environ['PATH'],
                        RECEIPTS=str(receipts), GITHUB_SHA='controlled-source', FAIL_CASE=failure or '', FAIL_IMAGE_BUILD='1' if image_failure else '')
             env.pop('PERF_THREAD_DIAGNOSTICS', None)
@@ -96,7 +128,7 @@ class Repeatability(unittest.TestCase):
                                       capture_output=True, text=True, timeout=30) for profile in ('diagnostic', 'stock')]
             result = next((r for r in results if r.returncode), results[-1])
             statuses = [json.loads((root / path / 'acquisition-status.json').read_text()) if (root / path / 'acquisition-status.json').exists() else None for path in ('perf-artifacts', 'perf-artifacts/stock')]
-            rows = [json.loads(line) for line in receipts.read_text().splitlines()] if receipts.exists() else []
+            rows = _read_receipts(receipts)
             artifacts = sorted(str(path.relative_to(root)) for path in (root / 'perf-artifacts').rglob('controlled-command-receipt.json'))
             return result, rows, artifacts, statuses
 

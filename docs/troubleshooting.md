@@ -34,7 +34,8 @@ names, and add `git rev-parse HEAD`.
 | `gtk4-layer-shell-0` is missing on Ubuntu 24.04 | Ubuntu 24.04 does not package it. Build it with `scripts/ci-install-gtk4-layer-shell`, as CI does. The shell needs version 1.1 or later. |
 | The `pipewire` or `libspa` crate's build script fails to find `libclang` | Install `libclang-dev` (Ubuntu) or `clang` (Arch); bindgen needs it at build time. |
 | A dependency says it needs a newer `rustc` | No MSRV is declared and CI uses the current stable toolchain. Run `rustup update stable`. |
-| The machine runs out of memory or disk while building several worktrees | Use the `just` recipes: they build with two jobs, queue on one machine-wide lock and run `just gc` when less than 20 GiB is free. See [local iteration with `just`](testing.md#local-iteration-with-just). |
+| The machine runs out of memory or disk while building several worktrees | Use the `just` recipes: builds share two machine-wide slots (one per 8 GiB of RAM) at half the CPUs each, and run `just gc` when less than 20 GiB is free. See [local iteration with `just`](testing.md#local-iteration-with-just). |
+| `just build` or `just proof` waits on `tuna-semaphore: all N slots ... are busy` | Other worktrees hold every build or proof slot; it starts when one frees. A proof holds its slot for at most `TUNA_PROOF_TIMEOUT` (45) minutes. |
 | `cargo fmt --check` or clippy fails in CI but not locally | CI runs `cargo clippy --workspace --all-targets -- -D warnings`, so any warning fails. Run `just check` before pushing. |
 
 ## Starting the compositor

@@ -1,0 +1,17 @@
+{
+  "argv": [
+    "/home/ubuntu/.cache/tuna-journey-venv/bin/python",
+    "/home/ubuntu/dev/rust-wayland-desktop/.worktrees/variant-qualification/scripts/tuna-corral-journey",
+    "--image",
+    "ghcr.io/tuna-os/yellowfin@sha256:355f66da7929059fc046527da6177e4958d97dab9546d62ca3d5ac53bc4daa4f",
+    "--vm",
+    "tuna-q-variant-yellowfin-1031145321",
+    "--node",
+    "karnataka",
+    "--out",
+    "/tmp/tuna-variant-inventory-20261031/yellowfin"
+  ],
+  "exit": 1,
+  "stdout": "pass  greeter-user-list: GDM shows the user list\npass  greeter-password: Select the user; GDM asks for the password\npass  session-is-tuna: Password login starts Tuna Desktop (lands in the overview)\npass  portal-availability: Published portal interfaces respond (not capture consent)\npass  desktop: Escape leaves the overview for the desktop\npass  overview: Super opens the overview\npass  app-grid: Super+A shows the app grid\npass  search-files: Type to search finds Files\npass  launch-files: Enter launches Files\nfail  launch-settings: Search and launch GNOME Settings\npass  alt-tab-switcher: Alt+Tab shows the window switcher\npass  alt-tab-commit: Releasing Alt raises the other window\npass  alt-tab-back: Alt+Tab tap returns to Settings\npass  settings-appearance: Open Settings > Appearance\nfail  settings-dark-style: Choosing Dark applies dark style\nfail  settings-wallpaper: Choosing a background changes the wallpaper\nfail  quick-settings: Super+S opens quick settings\nfail  quick-settings-night-light: Night Light tile toggles Night Light\nnot-exercised  quick-settings-sliders: Volume and brightness sliders\nfail  notify-send: notify-send (libnotify) posts a notification\npass  notification-banner: Notify over D-Bus shows a banner\npass  date-menu: Super+V lists the notification\nfail  lock: Super+L locks the screen\npass  unlock-refused: A wrong password is refused\npass  unlock: The right password unlocks\npass  power-menu: Quick settings power menu\npass  logout-dialog: Log Out asks for confirmation\npass  logout: Logging out returns to GDM\n20 passed, 7 failed, 1 not exercised; failed: launch-settings, settings-dark-style, settings-wallpaper, quick-settings, quick-settings-night-light, notify-send, lock\n",
+  "stderr": ""
+}

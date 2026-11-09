@@ -1446,6 +1446,63 @@ fn rebound_switcher_keys_replace_the_builtin_chords() {
 }
 
 #[test]
+fn cycle_chord_inside_an_open_switcher_cancels_only_on_escape() {
+    // GNOME's defaults: switch-applications Alt+Tab, cycle-windows
+    // Alt+Escape. The open popup holds the keyboard, so Alt+Escape
+    // cancels it (switcherPopup.js:211-219) instead of starting a
+    // cycle, and Alt+F6 does nothing; with no popup open the same
+    // chord cycles.
+    use tuna_shell_control::{SwitcherKey, SwitcherKeyKind, MOD_ALT};
+    const F6_KEYCODE: u32 = 64;
+    let mut f = two_windows();
+    f.manager.set_switcher_keys(vec![
+        SwitcherKey {
+            keysym: 0xff09,
+            mods: MOD_ALT,
+            kind: SwitcherKeyKind::Applications,
+        },
+        SwitcherKey {
+            keysym: 0xff1b,
+            mods: MOD_ALT,
+            kind: SwitcherKeyKind::CycleWindows,
+        },
+        SwitcherKey {
+            keysym: 0xffc3,
+            mods: MOD_ALT,
+            kind: SwitcherKeyKind::CycleGroup,
+        },
+    ]);
+    press(&mut f.manager, &mut f.comp, ALT_LEFT_KEYCODE);
+    press(&mut f.manager, &mut f.comp, TAB_KEYCODE);
+    release(&mut f.manager, &mut f.comp, TAB_KEYCODE);
+    press(&mut f.manager, &mut f.comp, F6_KEYCODE);
+    release(&mut f.manager, &mut f.comp, F6_KEYCODE);
+    assert_eq!(
+        f.manager.take_switcher_queue(),
+        vec![SwitcherAction::Step { forward: true }]
+    );
+    press(&mut f.manager, &mut f.comp, ESCAPE_KEYCODE);
+    release(&mut f.manager, &mut f.comp, ESCAPE_KEYCODE);
+    release(&mut f.manager, &mut f.comp, ALT_LEFT_KEYCODE);
+    assert_eq!(
+        f.manager.take_switcher_queue(),
+        vec![SwitcherAction::Cancel]
+    );
+
+    press(&mut f.manager, &mut f.comp, ALT_LEFT_KEYCODE);
+    press(&mut f.manager, &mut f.comp, ESCAPE_KEYCODE);
+    release(&mut f.manager, &mut f.comp, ESCAPE_KEYCODE);
+    release(&mut f.manager, &mut f.comp, ALT_LEFT_KEYCODE);
+    assert_eq!(
+        f.manager.take_switcher_queue(),
+        vec![SwitcherAction::Cycle {
+            forward: true,
+            group: false
+        }]
+    );
+}
+
+#[test]
 fn alt_tab_steps_commits_and_cancels_without_leaking_keys() {
     let mut f = two_windows();
     assert!(f.manager.focus(&mut f.comp.state, Some(f.id_b)));
