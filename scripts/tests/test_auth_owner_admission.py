@@ -249,7 +249,7 @@ class DisplayReadiness(unittest.TestCase):
                       + 'out="$1"; pretest_phase=display_admission\n'
                       + SCRIPT[start:end] + 'false\n')
             result = subprocess.run(['bash', '-c', script, 'owned-test', str(owned)],
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 1)
             receipt = json.loads((owned / 'pretest-failure.json').read_text())
             self.assertEqual(receipt['phase'], 'display_admission')

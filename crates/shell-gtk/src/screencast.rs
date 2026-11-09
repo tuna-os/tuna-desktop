@@ -264,7 +264,11 @@ impl Recorder {
                 return;
             }
         };
-        let path = file_path(template, &jiff::Zoned::now().datetime(), &videos_dir());
+        let path = file_path(
+            template,
+            &crate::wall_clock::now().datetime(),
+            &videos_dir(),
+        );
         *self.phase.borrow_mut() = Phase::Starting;
         // As GNOME, the indicator shows from the start.
         self.changed(true);

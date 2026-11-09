@@ -356,4 +356,27 @@ mod tests {
         assert_eq!(out.opacity(t0 + ms(650)), 0.25);
         assert!(out.done(t0 + ms(700)));
     }
+
+    #[test]
+    fn a_late_first_frame_samples_the_requested_fade_not_a_new_one() {
+        // A fade starts at its request on animation time, so a first tick
+        // that arrives 300 ms late finds it finished instead of starting
+        // a fresh 100 ms fade while the 600 ms hold already runs
+        // (workspaceSwitcherPopup.js:103-109,115-120).
+        let full = MotionPolicy::default();
+        let t0 = ms(1_000);
+        let fade = Fade::new(0.0, 1.0, t0, full);
+        assert_eq!(fade.opacity(t0 + ms(300)), 1.0);
+        assert!(fade.done(t0 + ms(300)));
+        assert_eq!(fade.opacity(t0 + ms(50)), 0.75);
+        let slow = Fade::new(0.0, 1.0, t0, MotionPolicy::new(MotionLevel::Full, 2.0));
+        assert_eq!(slow.opacity(t0 + ms(100)), 0.75);
+        assert!(slow.done(t0 + ms(200)));
+        // Fade-out likewise charges the wait and begins at drawn opacity.
+        let out = Fade::new(0.75, 0.0, ms(2_000), full);
+        assert_eq!(out.opacity(ms(2_050)), 0.1875);
+        assert!(out.done(ms(2_300)));
+        // A sample earlier than the request must not extrapolate.
+        assert_eq!(out.opacity(ms(1_999)), 0.75);
+    }
 }

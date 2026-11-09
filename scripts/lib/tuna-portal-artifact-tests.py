@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the actual FD-based portal artifact finalizer with bounded failures."""
 from contextlib import nullcontext
+import ast
 import importlib.util
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import time
 import unittest
 from unittest.mock import patch
 from tuna_picker_geometry import application_id, committed_window, new_parent_window
+import tuna_picker_progress as progress
 
 spec = importlib.util.spec_from_file_location('finalizer', Path(__file__).with_name('tuna-portal-artifact-finalize.py'))
 f = importlib.util.module_from_spec(spec)
@@ -137,7 +139,7 @@ class FinalizationTests(unittest.TestCase):
             tail = wrapper[start:wrapper.index('fi\n', start)]
             for proof, cleanup, expected in ((23, 1, 23), (0, 1, 1), (0, 0, 0)):
                 code = f'status={proof}\npython3() {{ return {cleanup}; }}\n' + tail
-                result = subprocess.run(['bash', '-c', code], capture_output=True)
+                result = subprocess.run(['bash', '-c', code], capture_output=True, timeout=60)
                 self.assertEqual(result.returncode, expected, (name, proof, cleanup, result.stderr))
 
     def test_root_symlink_refused(self):
@@ -157,7 +159,7 @@ class FinalizationTests(unittest.TestCase):
 
 
 class FixtureRetirementTests(unittest.TestCase):
-    FIXTURES = ('backgrounds-run.sh', 'slideshow-run.sh', 'svg-run.sh')
+    FIXTURES = ('run.sh', 'backgrounds-run.sh', 'slideshow-run.sh', 'svg-run.sh')
     ROOT = Path(__file__).parents[2]
 
     def start_child(self, body):
@@ -171,7 +173,7 @@ class FixtureRetirementTests(unittest.TestCase):
     def test_real_child_exit_is_awaited(self):
         child = self.start_child('import signal,time\n'
             'signal.signal(signal.SIGTERM, lambda *_: (time.sleep(.15), exit(0)))\n'
-            'print("ready", flush=True)\nwhile True: time.sleep(.01)')
+            'print("ready", flush=True)\ntime.sleep(60)\nexit("no SIGTERM within 60 s")')
         start = time.monotonic()
         r.retire(os.getpid(), [child.pid], timeout=2)
         self.assertGreaterEqual(time.monotonic() - start, .1)
@@ -212,15 +214,21 @@ class FixtureRetirementTests(unittest.TestCase):
         supervisor = '''import pathlib,signal,subprocess,sys,time
 root=pathlib.Path(sys.argv[1])
 writer=subprocess.Popen([sys.executable,'-c',
-    'import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); '
-    'exec("while True:\\n (p/\\".tuna-wallpaper.tmp\\").write_text(\\"pixels\\"); (p/\\".tuna-wallpaper.tmp\\").replace(p/\\"tuna-wallpaper\\"); time.sleep(.001)")',str(root)])
+    'import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); end=time.monotonic()+60; '
+    'exec("while time.monotonic()<end:\\n (p/\\".tuna-wallpaper.tmp\\").write_text(\\"pixels\\"); (p/\\".tuna-wallpaper.tmp\\").replace(p/\\"tuna-wallpaper\\"); time.sleep(.001)"); '
+    'sys.exit("writer not terminated within 60 s")',str(root)])
 stopping=False
 def stop(*_):
     global stopping
     stopping=True
 signal.signal(signal.SIGTERM,stop)
 (root/'ready').write_text('ready')
-while not stopping: time.sleep(.01)
+end=time.monotonic()+60
+while not stopping:
+    if time.monotonic()>end:
+        writer.kill()
+        raise SystemExit('no SIGTERM within 60 s')
+    time.sleep(.01)
 time.sleep(.15)
 writer.terminate()
 writer.wait()
@@ -235,7 +243,7 @@ if (root/'x-retired').exists(): raise RuntimeError('X server retired before comp
                     'root=pathlib.Path(sys.argv[1])\n'
                     'signal.signal(signal.SIGTERM, lambda *_: ((root/"x-retired").write_text("done"), exit(0)))\n'
                     '(root/"x-ready").write_text("ready")\n'
-                    'while True: time.sleep(.01)\n')
+                    'time.sleep(60)\nexit("no SIGTERM within 60 s")\n')
                 wrapper = (self.ROOT / 'tests/portal-reference' / name).read_text()
                 cleanup = wrapper[wrapper.index('cleanup() {'):wrapper.index('trap cleanup EXIT')]
                 cleanup = cleanup.replace('/repo/', str(self.ROOT) + '/').replace('/out/', str(root) + '/')
@@ -249,6 +257,37 @@ if (root/'x-retired').exists(): raise RuntimeError('X server retired before comp
                 self.assertEqual((root / 'writer-retired').read_text(), 'reaped')
                 self.assertTrue((root / 'x-retired').is_file())
                 self.assertIn('"qualified_retirement": true', (root / 'process-retirement.json').read_text())
+
+    def test_sigterm_runs_actual_chooser_child_teardown_before_owner_exit(self):
+        source = (self.ROOT / 'scripts/lib/tuna-portal-filechooser-client.py').read_text()
+        functions = '\n'.join(ast.get_source_segment(source, node)
+            for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in ('stop_unrelated', 'retire_on_signal'))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            writer = ('import pathlib,signal,time\n'
+                f'root=pathlib.Path({str(root)!r})\n'
+                'def stop(*_):\n'
+                ' time.sleep(.15)\n'
+                ' (root/"writer-retired").write_text("reaped")\n'
+                ' raise SystemExit(0)\n'
+                'signal.signal(signal.SIGTERM,stop)\n'
+                'print("ready",flush=True)\n'
+                'time.sleep(60)\n')
+            body = ('import atexit,signal,subprocess,sys\n' + functions + '\n' +
+                f'unrelated_process=subprocess.Popen([sys.executable,"-c",{writer!r}],stdout=subprocess.PIPE,text=True)\n'
+                'atexit.register(stop_unrelated)\n'
+                'signal.signal(signal.SIGTERM,retire_on_signal)\n'
+                'assert unrelated_process.stdout.readline()=="ready\\n"\n'
+                'print("ready",flush=True)\n'
+                'signal.pause()\n')
+            owner = self.start_child(body)
+            start = time.monotonic()
+            owner.terminate()
+            self.assertEqual(owner.wait(timeout=5), 128 + 15)
+            self.assertGreaterEqual(time.monotonic() - start, .1)
+            self.assertEqual((root / 'writer-retired').read_text(), 'reaped')
 
     def test_abnormally_exited_compositor_cannot_qualify_retirement(self):
         for name in self.FIXTURES:
@@ -271,7 +310,7 @@ if (root/'x-retired').exists(): raise RuntimeError('X server retired before comp
             for proof in (0, 23):
                 code = (f'status={proof}\njq() {{ return 1; }}\n'
                         'python3() { echo FINALIZER_RAN; return 0; }\n' + wrapper[start:end])
-                result = subprocess.run(['bash', '-c', code], capture_output=True, text=True)
+                result = subprocess.run(['bash', '-c', code], capture_output=True, text=True, timeout=60)
                 self.assertEqual(result.returncode, proof or 1, (name, proof))
                 self.assertNotIn('FINALIZER_RAN', result.stdout)
 
@@ -285,7 +324,7 @@ if (root/'x-retired').exists(): raise RuntimeError('X server retired before comp
                 for proof in (0, 23):
                     code = ('python3() { return 1; }\n' + cleanup +
                             f'\ntrap cleanup EXIT\nexit {proof}\n')
-                    result = subprocess.run(['bash', '-c', code], capture_output=True, text=True)
+                    result = subprocess.run(['bash', '-c', code], capture_output=True, text=True, timeout=60)
                     self.assertEqual(result.returncode, proof or 1, (name, proof, result.stderr))
 
 
@@ -365,6 +404,84 @@ class PickerGeometryTests(unittest.TestCase):
         self.scene["focused"] = 18
         self.record["window_size"] = [0, 300]
         self.assertIsNone(self.ready())
+
+
+class PickerModalProgressTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 0.0
+        self.retained = []
+        self.before = dict(clicks=1, keys=1, sequence=6, pid=711)
+        self.baseline = dict(self.before, sequence=28)
+
+    def observe(self, advances, *, changed=None, focused=34, deadline=30):
+        reads = 0
+        def parent():
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                return dict(self.baseline)
+            return dict(self.baseline,
+                sequence=self.baseline["sequence"] + advances(self.now),
+                **(changed or {}))
+        def sleep(seconds):
+            self.now += seconds
+        with patch.object(progress.time, "monotonic", side_effect=lambda: self.now), \
+                patch.object(progress.time, "monotonic_ns", side_effect=lambda: int(self.now * 1e9)), \
+                patch.object(progress.time, "sleep", side_effect=sleep):
+            return progress.observe_modal_parent(parent, lambda: dict(focused=focused),
+                self.before, 34, deadline, self.retained.append)
+
+    def test_ten_real_post_injection_advances_pass_and_are_retained(self):
+        after, scene = self.observe(lambda elapsed: int(elapsed * 20))
+        self.assertEqual(after["sequence"], 38)
+        self.assertEqual(scene["focused"], 34)
+        receipt, = self.retained
+        self.assertEqual(receipt["before_input"]["sequence"], 6)
+        self.assertEqual(receipt["baseline_after_input"]["sequence"], 28)
+        self.assertEqual(receipt["required_advances"], 10)
+        self.assertEqual(receipt["inner_bound_seconds"], 2)
+        self.assertEqual(receipt["result"], "passed")
+        self.assertLess(receipt["elapsed_seconds"], 2)
+
+    def test_pre_injection_progress_cannot_satisfy_the_fresh_boundary(self):
+        # Old baseline 6 would accept the already-observed 28 as fresh.
+        # The post-injection baseline must still observe ten NEW callbacks.
+        with self.assertRaisesRegex(RuntimeError, "did not process fresh events"):
+            self.observe(lambda _: 0)
+        receipt, = self.retained
+        self.assertEqual(receipt["result"], "failed")
+        self.assertEqual(receipt["observations"][-1]["parent"]["sequence"], 28)
+        self.assertGreaterEqual(receipt["elapsed_seconds"], 2)
+        self.assertLess(receipt["elapsed_seconds"], 2.05)
+
+    def test_nine_advances_do_not_lower_the_floor_or_extend_two_seconds(self):
+        with self.assertRaisesRegex(RuntimeError, "did not process fresh events"):
+            self.observe(lambda elapsed: min(9, int(elapsed * 20)))
+        receipt, = self.retained
+        self.assertEqual(receipt["observations"][-1]["parent"]["sequence"], 37)
+        self.assertGreaterEqual(receipt["elapsed_seconds"], 2)
+        self.assertLess(receipt["elapsed_seconds"], 2.05)
+
+    def test_click_key_and_focus_leaks_remain_failures_even_with_progress(self):
+        for changed, focused in [({"clicks": 2}, 34), ({"keys": 2}, 34), ({}, 32)]:
+            with self.subTest(changed=changed, focused=focused):
+                with self.assertRaisesRegex(RuntimeError, "leaked input or stole dialog focus"):
+                    self.observe(lambda _: 10, changed=changed, focused=focused)
+                self.assertEqual(self.retained[-1]["result"], "failed")
+
+    def test_outer_deadline_can_only_shorten_the_existing_inner_bound(self):
+        with self.assertRaisesRegex(RuntimeError, "did not process fresh events"):
+            self.observe(lambda _: 0, deadline=.5)
+        self.assertLess(self.retained[-1]["elapsed_seconds"], .55)
+
+    def test_actual_ui_observes_after_the_sole_injection_and_retains_failures(self):
+        ui = Path(__file__).with_name("tuna-portal-filechooser-ui.py").read_text()
+        injection = ui.index('"click", "1"], check=True)')
+        self.assertLess(injection, ui.index("after, fresh = observe_modal_parent("))
+        self.assertIn('out.with_suffix(".parent-probe.json")', ui)
+        client = Path(__file__).with_name("tuna-portal-filechooser-client.py").read_text()
+        self.assertIn('"monotonic_ns": time.monotonic_ns()', client)
+        self.assertIn('"process_time_ns": time.process_time_ns()', client)
 
 
 if __name__ == '__main__':

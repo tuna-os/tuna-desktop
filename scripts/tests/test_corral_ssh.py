@@ -26,8 +26,8 @@ class Tests(unittest.TestCase):
    with self.assertRaises(ValueError):
     with m.projected_kubeconfig('selected'):self.fail('must refuse')
  def setup(self,d):
-  key=pathlib.Path(d)/'key';subprocess.run(['ssh-keygen','-q','-t','ed25519','-N','','-f',str(key)],check=True)
-  pub=pathlib.Path(str(key)+'.pub');fp=subprocess.check_output(['ssh-keygen','-lf',str(pub)]).decode().split()[1]
+  key=pathlib.Path(d)/'key';subprocess.run(['ssh-keygen','-q','-t','ed25519','-N','','-f',str(key)],check=True, timeout=60)
+  pub=pathlib.Path(str(key)+'.pub');fp=subprocess.check_output(['ssh-keygen','-lf',str(pub)], timeout=60).decode().split()[1]
   manifest={'ssh':{'user':'root','password_authentication':False,'authorized_keys_path':'/etc/ssh/authorized_keys/root','public_key_sha256':hashlib.sha256(pub.read_bytes()).hexdigest(),'public_key_fingerprint':fp}}
   return key,pub,fp,manifest
  def test_actual_key_pair_binds_original_export(self):

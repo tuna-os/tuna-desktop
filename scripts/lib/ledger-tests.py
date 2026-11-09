@@ -20,7 +20,7 @@ class LedgerQualification(unittest.TestCase):
                     "--tests", str(root / "tests"), "--assertions", str(root / "assertions")]
             if complete:
                 argv.append("--require-complete")
-            return subprocess.run(argv, capture_output=True, text=True)
+            return subprocess.run(argv, capture_output=True, text=True, timeout=60)
 
     def row(self, status="pass", refs="proof:G-TEST", ident="P-TEST", behavior="A real behavior"):
         return f"| {ident} | {behavior} | {status} | {refs} | evidence | — |\n"

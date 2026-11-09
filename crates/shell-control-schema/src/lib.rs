@@ -15,6 +15,7 @@
 //! `docs/api-stability.md` in the repository.
 
 pub mod background;
+pub mod introspect;
 pub mod motion;
 pub use motion::{MotionLevel, MotionPolicy};
 
@@ -36,11 +37,11 @@ pub mod layer_namespaces;
 pub use layer_namespaces::{
     APP_GRID_NAMESPACE, BANNER_NAMESPACE, DISPLAY_CHANGE_NAMESPACE, DOCK_NAMESPACE,
     END_SESSION_NAMESPACE, FOLDER_DIALOG_NAMESPACE, GTK_BANNERS_NAMESPACE, GTK_PANEL_NAMESPACE,
-    IBUS_CANDIDATES_NAMESPACE, KBD_A11Y_NAMESPACE, NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE,
-    OSK_NAMESPACE, OVERVIEW_NAMESPACE, PAD_OSD_NAMESPACE, PANEL_NAMESPACE, POINTER_A11Y_NAMESPACE,
-    POLKIT_NAMESPACE, PREVIEW_CHROME_NAMESPACE, SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE,
-    SWITCHER_NAMESPACE, SWITCHER_THUMBNAILS_NAMESPACE, WINDOW_MENU_NAMESPACE,
-    WORKSPACE_POPUP_NAMESPACE,
+    IBUS_CANDIDATES_NAMESPACE, KBD_A11Y_NAMESPACE, MOUNT_OPERATION_NAMESPACE,
+    NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OSK_NAMESPACE, OVERVIEW_NAMESPACE, PAD_OSD_NAMESPACE,
+    PANEL_NAMESPACE, POINTER_A11Y_NAMESPACE, POLKIT_NAMESPACE, PREVIEW_CHROME_NAMESPACE,
+    SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
+    SWITCHER_THUMBNAILS_NAMESPACE, WINDOW_MENU_NAMESPACE, WORKSPACE_POPUP_NAMESPACE,
 };
 
 /// Panel height in pixels (compositor ↔ shell contract).
@@ -204,12 +205,21 @@ impl ProtocolVersion {
     /// `ShowOsd`, `ShowPadOsd`, `PadOsdLabels`, `PadOsdInput`, `ClosePadOsd`
     /// and shell-to-compositor `RequestPadOsd`, `PadOsdClosed`.
     /// Positional postcard peers must ship together.
-    /// `0.46` appends the compositor-to-shell `WorkspaceProgress` message
+    /// `0.46` appends compositor-to-shell `SeatTouchMode` (the seat's
+    /// touch-mode, which picks the unlock dialog's hint text, #502).
+    /// Positional postcard peers must ship together.
+    /// `0.47` appends `opacity` to `SwitcherThumbnail` (the switcher's
+    /// window images fade with their GTK frame, altTab.js 51
+    /// THUMBNAIL_FADE_TIME and switcherPopup.js POPUP_FADE_OUT_TIME) and
+    /// the shell-to-compositor `CloseMenuUnanimated` command (panelMenu.js
+    /// 51 `vfunc_hide`: a hidden panel button's menu closes without
+    /// BoxPointer's close). Positional postcard peers must ship together.
+    /// `0.48` appends the compositor-to-shell `WorkspaceProgress` message
     /// (a finger-following workspace swipe's position, for the Activities
-    /// dots, #596).
+    /// dots, #596). Positional postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 46,
+        minor: 48,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -242,7 +252,7 @@ pub struct WindowInfo {
     pub workspace: WorkspaceId,
     /// Whether the window currently holds keyboard focus.
     pub focused: bool,
-    /// Fresh one-use activation Bearer [REDACTED] for this window, minted with the
+    /// Fresh one-use [`ActivationToken`] for this window, minted with the
     /// snapshot or delta that carries it. The shell presents it back in
     /// `ActivateWindow`; presenting it consumes it. Several live tokens
     /// for one window may coexist (each snapshot/delta mints anew); each
@@ -334,7 +344,7 @@ pub enum CommandKind {
     ActivateWindow {
         /// Window to activate.
         window: WindowId,
-        /// Compositor-minted Bearer [REDACTED] proving a recent user interaction.
+        /// Compositor-minted [`ActivationToken`] proving a recent user interaction.
         token: ActivationToken,
     },
     /// Make a workspace active.
@@ -495,6 +505,13 @@ pub enum CommandKind {
     /// Since 0.45: the shown pad OSD closed; the compositor stops routing
     /// pad events to the shell.
     PadOsdClosed { pad: u32 },
+    /// Since 0.47: the panel menu closing now closes without animation
+    /// (`PanelMenu.Button.vfunc_hide` calls `menu.close({animate:
+    /// false})`, gnome-shell 51 `js/ui/panelMenu.js:149-154`): its button
+    /// was hidden under it. Sent before the menu's popup goes; the
+    /// compositor draws no BoxPointer close for the panel popup that goes
+    /// next (or drops the one it just started).
+    CloseMenuUnanimated,
 }
 
 /// One on-screen keyboard action (gnome-shell 51 `KeyboardController`).
@@ -732,6 +749,16 @@ pub struct SwitcherThumbnail {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    /// Since 0.47: how opaque the window image is drawn, as Clutter's
+    /// 0–255 actor opacity: the thumbnail's frame and its window clone
+    /// fade together (altTab.js THUMBNAIL_FADE_TIME, switcherPopup.js
+    /// POPUP_FADE_OUT_TIME). Older JSON peers mean fully opaque.
+    #[serde(default = "opaque")]
+    pub opacity: u8,
+}
+
+fn opaque() -> u8 {
+    u8::MAX
 }
 
 /// GNOME's window-menu actions (windowMenu.js) the compositor carries out.
@@ -1079,7 +1106,13 @@ pub enum Message {
     PadOsdInput { pad: u32, event: PadOsdEvent },
     /// Since 0.45: the shown pad was unplugged; close its OSD.
     ClosePadOsd { pad: u32 },
-    /// Since 0.46: where a finger-following workspace swipe holds the
+    /// Since 0.46: mutter's seat `touch-mode` (a touchscreen and no
+    /// laptop switch, or one folded into a tablet), which the unlock
+    /// dialog's hint follows (`unlockDialog.js:388-440`). Sent on change
+    /// and in each handshake snapshot, only to peers advertising
+    /// minor >= 46.
+    SeatTouchMode { touch_mode: bool },
+    /// Since 0.48: where a finger-following workspace swipe holds the
     /// workspace strip, so the Activities dots follow it (GNOME 51
     /// `workspaceAnimation.js:255-268` binds the primary monitor's swipe
     /// progress to the shared workspaces adjustment that `panel.js`
@@ -1088,7 +1121,7 @@ pub enum Message {
     /// the fingers hold it and, on release, how long the strip takes to
     /// settle there (ease-out-cubic, already scaled by the motion policy).
     /// Sent only on swipe begin, update and release, to peers advertising
-    /// minor >=46.
+    /// minor >= 48.
     WorkspaceProgress { position: u32, duration_us: u32 },
 }
 
@@ -1735,7 +1768,7 @@ impl From<DecodeError> for ControlError {
     }
 }
 
-/// Compositor-minted activation Bearer [REDACTED] authorizing one privileged window action.
+/// Compositor-minted activation token authorizing one privileged window action.
 ///
 /// Opaque to the shell: minting, expiry (30 s), one-use removal, seat
 /// binding, and `app_id` matching are compositor policy (ADR 0002), not
@@ -2276,7 +2309,9 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
             check_pad_labels(&osd.labels)?;
         }
         Message::PadOsdLabels { labels, .. } => check_pad_labels(labels)?,
-        Message::PadOsdInput { .. } | Message::ClosePadOsd { .. } => {}
+        Message::PadOsdInput { .. }
+        | Message::ClosePadOsd { .. }
+        | Message::SeatTouchMode { .. } => {}
         Message::WorkspaceProgress {
             position,
             duration_us,
@@ -2504,8 +2539,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_46() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 46));
+    fn current_version_is_0_48() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 48));
+        // A 0.47 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 47).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 49).is_compatible_with(&CURRENT_VERSION));
     }
 
     #[test]
@@ -3848,20 +3886,84 @@ mod tablet_osd_wire_order_tests {
             tag(postcard::to_slice(&close, &mut buffer).unwrap()),
             auth + 5
         );
+        // 0.46 appends the seat's touch-mode after them.
+        let touch = Message::SeatTouchMode { touch_mode: true };
+        assert_eq!(
+            tag(postcard::to_slice(&touch, &mut buffer).unwrap()),
+            auth + 6
+        );
+        let bytes = postcard::to_slice(&touch, &mut buffer).unwrap();
+        assert_eq!(postcard::from_bytes::<Message>(bytes).unwrap(), touch);
+    }
+}
+
+#[cfg(test)]
+mod switcher_fade_and_menu_close_wire_tests {
+    use super::*;
+
+    #[test]
+    fn switcher_thumbnail_opacity_rides_last_and_round_trips() {
+        let mut buffer = [0_u8; 128];
+        for opacity in [0, 128, u8::MAX] {
+            let thumbnail = SwitcherThumbnail {
+                window: 7,
+                x: 10,
+                y: 20,
+                width: 256,
+                height: 160,
+                opacity,
+            };
+            let body = postcard::to_slice(&thumbnail, &mut buffer).unwrap();
+            // Appended after the 0.19 fields: the old prefix is untouched.
+            assert_eq!(body.last(), Some(&opacity));
+            let decoded: SwitcherThumbnail = postcard::from_bytes(body).unwrap();
+            assert_eq!(decoded, thumbnail);
+            let command = Message::Command {
+                id: 1,
+                kind: CommandKind::SetSwitcherThumbnails {
+                    thumbnails: vec![thumbnail],
+                },
+            };
+            let frame = encode_frame(&command);
+            assert_eq!(decode_frame(&frame).unwrap(), command);
+        }
+        assert_eq!(opaque(), 255);
     }
 
     #[test]
-    fn workspace_progress_follows_close_pad_osd_and_is_bounded() {
+    fn close_menu_unanimated_follows_pad_osd_closed() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 64];
+        let closed =
+            tag(postcard::to_slice(&CommandKind::PadOsdClosed { pad: 1 }, &mut buffer).unwrap());
+        assert_eq!(
+            tag(postcard::to_slice(&CommandKind::CloseMenuUnanimated, &mut buffer).unwrap()),
+            closed + 1
+        );
+        let command = Message::Command {
+            id: 9,
+            kind: CommandKind::CloseMenuUnanimated,
+        };
+        let frame = encode_frame(&command);
+        assert_eq!(decode_frame(&frame).unwrap(), command);
+    }
+
+    #[test]
+    fn workspace_progress_follows_seat_touch_mode_and_is_bounded() {
         let tag = |bytes: &[u8]| bytes[0];
         let mut buffer = [0_u8; 256];
-        let close = tag(postcard::to_slice(&Message::ClosePadOsd { pad: 1 }, &mut buffer).unwrap());
+        let touch = tag(postcard::to_slice(
+            &Message::SeatTouchMode { touch_mode: true },
+            &mut buffer,
+        )
+        .unwrap());
         let progress = Message::WorkspaceProgress {
             position: 12_500,
             duration_us: 0,
         };
         assert_eq!(
             tag(postcard::to_slice(&progress, &mut buffer).unwrap()),
-            close + 1
+            touch + 1
         );
         assert_eq!(decode_frame(&encode_frame(&progress)).unwrap(), progress);
         for (position, duration_us) in [

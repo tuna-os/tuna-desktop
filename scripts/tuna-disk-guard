@@ -1,0 +1,95 @@
+#!/bin/sh
+# tuna-disk-guard — keep parallel worktrees from filling the disk.
+#
+# Usage: scripts/tuna-disk-guard [--watch [SECONDS]] [--include-main]
+#
+# When free space on this repository's filesystem is below
+# TUNA_MIN_FREE_GB (default 40), deletes:
+#   - the target/ of each of this repository's worktrees (`git worktree
+#     list`) that no running process references (cwd, executable,
+#     arguments or environment) and that nothing touched for
+#     TUNA_IDLE_MINUTES (default 45); the main checkout's target only with
+#     --include-main;
+#   - stale proof and CI scratch: ${TMPDIR:-/tmp}/tuna-proof-* and entries
+#     of TUNA_CI_ARTIFACTS (default /tmp/tuna-ci-artifacts) older than 90
+#     minutes and not referenced by a running process.
+# Each removal is logged on stdout. One pass by default; --watch repeats
+# every SECONDS (default 600).
+set -eu
+
+min_free_gb=${TUNA_MIN_FREE_GB:-40}
+idle_min=${TUNA_IDLE_MINUTES:-45}
+scratch_min=90
+ci_artifacts=${TUNA_CI_ARTIFACTS:-/tmp/tuna-ci-artifacts}
+tmp=${TMPDIR:-/tmp}
+watch=
+interval=600
+include_main=
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        --watch)
+            watch=1
+            case ${2:-} in ''|*[!0-9]*) ;; *) interval=$2; shift ;; esac ;;
+        --include-main) include_main=1 ;;
+        -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+        *) echo "tuna-disk-guard: unknown argument $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+repo=$(git rev-parse --show-toplevel)
+main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+
+log() { echo "$(date -u +%FT%TZ) tuna-disk-guard: $*"; }
+free_gb() { df -P -k "$repo" | awk 'NR==2 { print int($4 / 1048576) }'; }
+
+# Every path a running process holds: cwd, executable, arguments and
+# environment values, one per line.
+held_paths() {
+    for p in /proc/[0-9]*; do
+        readlink "$p/cwd" 2>/dev/null || true
+        readlink "$p/exe" 2>/dev/null || true
+        tr '\0' '\n' <"$p/cmdline" 2>/dev/null || true
+        tr '\0' '\n' <"$p/environ" 2>/dev/null | sed 's/^[^=]*=//' || true
+    done
+}
+
+# Remove DIR unless a running process references it or anything inside it
+# changed in the last MINUTES.
+reap() {
+    dir=$1 minutes=$2
+    [ -d "$dir" ] || return 0
+    if awk -v d="$dir" 'index($0, d) { found = 1; exit } END { exit !found }' "$held"; then
+        return 0
+    fi
+    recent=$(find "$dir" -mmin "-$minutes" -print -quit 2>/dev/null) || return 0
+    [ -z "$recent" ] || return 0
+    rm -rf "$dir"
+    log "removed $dir"
+}
+
+pass() {
+    free=$(free_gb)
+    [ "$free" -lt "$min_free_gb" ] || return 0
+    log "${free}G free (< ${min_free_gb}G)"
+    held=$(mktemp "$tmp/tuna-disk-guard.XXXXXX")
+    held_paths >"$held"
+    git -C "$repo" worktree list --porcelain | sed -n 's/^worktree //p' >"$held.wt"
+    while IFS= read -r wt; do
+        [ "$wt" != "$main" ] || [ -n "$include_main" ] || continue
+        reap "$wt/target" "$idle_min"
+    done <"$held.wt"
+    for d in "$tmp"/tuna-proof-* "$ci_artifacts"/*; do
+        [ -e "$d" ] || continue
+        reap "$d" "$scratch_min"
+    done
+    rm -f "$held" "$held.wt"
+    log "now $(free_gb)G free"
+}
+
+pass
+while [ -n "$watch" ]; do
+    sleep "$interval"
+    pass
+done

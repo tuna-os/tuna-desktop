@@ -1,0 +1,8 @@
+Created symlink '/run/systemd/system/systemd-timesyncd.service' → '/dev/null'.
+CanNTP=no
+NTP=no
+              NTP service: n/a
+CanNTP=yes
+NTP=yes
+NTPSynchronized=yes
+enabled

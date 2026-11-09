@@ -12,6 +12,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import struct
+import zlib
 import unittest
 from pathlib import Path
 
@@ -23,6 +25,16 @@ RUN_ID = "38240110439"
 EVENT_SHA = "7b6c85922af14f4c239a4f958262b657adc6b03f"
 HEAD_SHA = "9dc2efb27f20087301abf3c6dbc65fe02294cfcb"
 TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+def png_blob(ident):
+    """Small real PNG fixture, decoded by the production media parser."""
+    color = hashlib.sha256(ident.encode()).digest()[:3]
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    return (b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 4, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress((b"\0" + color * 4) * 4)) + chunk(b"IEND", b""))
 
 
 def tsv_ids(path):
@@ -81,7 +93,7 @@ class FreshnessCase(unittest.TestCase):
             for ident, (mapped_stage, frame) in mapping.items():
                 if mapped_stage != stage:
                     continue
-                blob = b"PNG:" + ident.encode()
+                blob = png_blob(ident)
                 (stagedir / frame).write_bytes(blob)
                 entries.append({"file": frame, "sha256": hashlib.sha256(blob).hexdigest()})
             (stagedir / "frames.json").write_text(
@@ -94,13 +106,13 @@ class FreshnessCase(unittest.TestCase):
         return subprocess.run(
             [str(SCRIPT), "refresh", str(bundle), "--dest", str(dest),
              "--run-id", RUN_ID, "--merge-sha", EVENT_SHA, *extra],
-            capture_output=True, text=True)
+            capture_output=True, text=True, timeout=60)
 
     def freshness(self, dest, *extra):
         return subprocess.run(
             [str(SCRIPT), "freshness", "--dest", str(dest),
              "--expect-head", HEAD_SHA, "--expect-tree", TREE_SHA, *extra],
-            capture_output=True, text=True)
+            capture_output=True, text=True, timeout=60)
 
     def test_visual_map_covers_every_walkthrough_id(self):
         want = tsv_ids(MANIFEST_TSV)
@@ -193,7 +205,7 @@ class FreshnessCase(unittest.TestCase):
             self.assertEqual(entry["label"], "duplicate")
             self.assertEqual(entry["resolved_from"], "00-baseline-desktop.png")
             self.assertEqual((dest / "walkthrough" / "panel.png").read_bytes(),
-                             b"PNG:panel")
+                             png_blob("panel"))
 
     def test_refresh_refuses_unverified_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -268,7 +280,7 @@ class FreshnessCase(unittest.TestCase):
             result = subprocess.run(
                 [str(SCRIPT), "refresh", str(bundle), "--dest", str(dest),
                  "--run-id", RUN_ID, "--merge-sha", "0" * 40],
-                capture_output=True, text=True)
+                capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 1)
             self.assertIn("does not match the recorded event SHA", result.stderr)
 
@@ -288,7 +300,7 @@ class FreshnessCase(unittest.TestCase):
             result = subprocess.run(
                 [str(SCRIPT), "freshness", "--dest", str(dest),
                  "--expect-head", HEAD_SHA, "--expect-tree", "2" * 40],
-                capture_output=True, text=True)
+                capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 1)
             self.assertIn("recorded tree", result.stdout)
             self.assertIn("!= expected", result.stdout)
@@ -308,32 +320,32 @@ class FreshnessCase(unittest.TestCase):
         repo.mkdir()
         env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, timeout=60)
         (repo / "product.txt").write_text("v1")
         (repo / "docs" / "walkthrough").mkdir(parents=True)
         (repo / "docs" / "walkthrough" / "panel.png").write_bytes(b"old")
-        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, timeout=60)
         subprocess.run(["git", "-C", str(repo), "commit", "-qm", "a"], check=True,
-                       env={**dict(os.environ), **env})
+                       env={**dict(os.environ), **env}, timeout=60)
         head_a = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                                capture_output=True, text=True).stdout.strip()
+                                capture_output=True, text=True, timeout=60).stdout.strip()
         tree_a = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
-                                capture_output=True, text=True).stdout.strip()
+                                capture_output=True, text=True, timeout=60).stdout.strip()
         (repo / "docs" / "walkthrough" / "panel.png").write_bytes(b"new")
         subprocess.run(["git", "-C", str(repo), "commit", "-qam", "adopt"], check=True,
-                       env={**dict(os.environ), **env})
+                       env={**dict(os.environ), **env}, timeout=60)
         head_b = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                                capture_output=True, text=True).stdout.strip()
+                                capture_output=True, text=True, timeout=60).stdout.strip()
         tree_b = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
-                                capture_output=True, text=True).stdout.strip()
+                                capture_output=True, text=True, timeout=60).stdout.strip()
         (repo / "product.txt").write_text("v2")
         subprocess.run(["git", "-C", str(repo), "commit", "-qam", "product"], check=True,
-                       env={**dict(os.environ), **env})
+                       env={**dict(os.environ), **env}, timeout=60)
         tree_c = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
-                                capture_output=True, text=True).stdout.strip()
+                                capture_output=True, text=True, timeout=60).stdout.strip()
         return repo, head_a, tree_a, head_b, tree_b, tree_c
 
-    def test_freshness_accepts_walkthrough_only_drift(self):
+    def test_freshness_rejects_walkthrough_only_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, head_a, tree_a, head_b, tree_b, _ = self.make_git_repo(directory)
             bundle = self.make_bundle(directory, heads={s: head_a for s in
@@ -345,9 +357,9 @@ class FreshnessCase(unittest.TestCase):
             result = subprocess.run(
                 [str(SCRIPT), "freshness", "--dest", str(dest),
                  "--expect-head", head_b, "--expect-tree", tree_b],
-                capture_output=True, text=True, env={**dict(os.environ), **env})
-            self.assertEqual(result.returncode, 0, result.stdout)
-            self.assertIn("adopt drift", result.stdout)
+                capture_output=True, text=True, env={**dict(os.environ), **env}, timeout=60)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertNotIn("CURRENT", result.stdout)
 
     def test_freshness_rejects_product_drift(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -361,7 +373,7 @@ class FreshnessCase(unittest.TestCase):
             result = subprocess.run(
                 [str(SCRIPT), "freshness", "--dest", str(dest),
                  "--expect-tree", tree_c],
-                capture_output=True, text=True, env={**dict(os.environ), **env})
+                capture_output=True, text=True, env={**dict(os.environ), **env}, timeout=60)
             self.assertEqual(result.returncode, 1)
             self.assertIn("recorded tree", result.stdout)
             self.assertNotIn("CURRENT", result.stdout)
@@ -406,23 +418,28 @@ class FreshnessCase(unittest.TestCase):
             self.assertIn("every frame is STALE", result.stdout)
             self.assertNotIn("CURRENT", result.stdout)
 
-    def test_existing_check_ignores_freshness(self):
-        # Pin the gate-safe contract: `check` still validates only the
-        # markdown text and image existence, so a bogus manifest cannot
-        # change its verdict.
-        manifest_path = ROOT / "docs" / "walkthrough" / "manifest.json"
-        had_manifest = manifest_path.exists()
-        saved = manifest_path.read_bytes() if had_manifest else None
-        try:
-            manifest_path.write_bytes(b"not json")
-            check = subprocess.run(
-                [str(SCRIPT), "check"], capture_output=True, text=True)
-            self.assertEqual(check.returncode, 0, check.stderr)
-        finally:
-            if saved is None:
-                manifest_path.unlink(missing_ok=True)
-            else:
-                manifest_path.write_bytes(saved)
+    def test_existing_check_remains_page_existence_only(self):
+        # This diagnostic command never grants canonical freshness. Do not
+        # rewrite the repository's historical receipt while exercising it.
+        result = subprocess.run([str(SCRIPT), "check"], capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_refresh_refuses_missing_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self.make_bundle(directory, attempts={"panel": ""})
+            dest = Path(directory) / "dest"
+            result = self.refresh(bundle, dest)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("missing attempt", result.stderr)
+            self.assertFalse(dest.exists())
+
+    def test_legacy_freshness_cannot_qualify_canonical_history(self):
+        result = subprocess.run([str(SCRIPT), "freshness"], capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("CURRENT", result.stdout)
+        self.assertIn("receipted intake", result.stderr)
 
 
 if __name__ == "__main__":

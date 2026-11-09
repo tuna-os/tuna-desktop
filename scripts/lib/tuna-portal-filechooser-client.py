@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import sys
 import subprocess
 import time
@@ -33,6 +34,24 @@ parent_painted_size = None
 parent_pointer_probes = []
 original_pointer_host = None
 state_path = Path(os.environ.get("TUNA_COMPOSITOR_STATE", "/out/compositor-state.json"))
+
+def stop_unrelated():
+    if unrelated_process is not None and unrelated_process.poll() is None:
+        unrelated_process.terminate()
+        try:
+            unrelated_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            unrelated_process.kill()
+            unrelated_process.wait(timeout=5)
+
+def retire_on_signal(signum, _frame):
+    # The fixture retires this owner before finalization. SIGTERM must run
+    # its ordinary atexit teardown and reap B, not orphan a live JSON writer.
+    raise SystemExit(128 + signum)
+
+atexit.register(stop_unrelated)
+signal.signal(signal.SIGTERM, retire_on_signal)
+
 def scene():
     return json.loads(state_path.read_text())
 def pump_parent_until(predicate, message, timeout=5):
@@ -198,7 +217,9 @@ if parent_mode != "none":
         global parent_sequence
         parent_sequence += 1
         temporary = input_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"clicks": parent_clicks, "keys": parent_keys, "sequence": parent_sequence, "pid": os.getpid()}))
+        temporary.write_text(json.dumps({"clicks": parent_clicks, "keys": parent_keys,
+            "sequence": parent_sequence, "pid": os.getpid(),
+            "monotonic_ns": time.monotonic_ns(), "process_time_ns": time.process_time_ns()}))
         temporary.replace(input_path)
         return True
     GLib.timeout_add(50, record_parent_input)
@@ -290,15 +311,6 @@ if parent_mode != "none":
         str(Path(__file__).with_name("tuna-picker-unrelated-app.py")), str(unrelated_path)],
         env=unrelated_env, stdout=unrelated_log, stderr=subprocess.STDOUT)
     unrelated_log.close()
-    def stop_unrelated():
-        if unrelated_process.poll() is None:
-            unrelated_process.terminate()
-            try:
-                unrelated_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                unrelated_process.kill()
-                unrelated_process.wait(timeout=5)
-    atexit.register(stop_unrelated)
     def unrelated_state():
         if unrelated_process.poll() is not None:
             raise RuntimeError("Independent application exited during picker journey")

@@ -1,0 +1,29 @@
+Timezone=Pacific/Auckland
+inactive
+inactive
+2026-10-31T04:15:18+13:00 tuna-q-datetime NetworkManager[644]: <warn>  [1793373318.1971] device (enp1s0): mtu: failure to set IPv6 MTU
+2026-10-31T04:15:18+13:00 tuna-q-datetime NetworkManager[644]: <warn>  [1793373318.1972] platform-linux: do-add-ip6-address[2: fe80::d8cd:62b5:5d6a:b410]: failure 22 (Invalid argument)
+2026-10-31T04:15:18+13:00 tuna-q-datetime audit[5050]: CRED_ACQ pid=5050 uid=0 auid=0 ses=3 msg='op=PAM:setcred grantors=pam_shells,pam_faillock,pam_permit,pam_env,pam_faillock acct="root" exe="/usr/lib/ssh/sshd-session" hostname=10.42.0.39 addr=10.42.0.39 terminal=ssh res=success'
+2026-10-31T04:15:18+13:00 tuna-q-datetime kernel: audit: type=1103 audit(1793373318.278:843): pid=5050 uid=0 auid=0 ses=3 msg='op=PAM:setcred grantors=pam_shells,pam_faillock,pam_permit,pam_env,pam_faillock acct="root" exe="/usr/lib/ssh/sshd-session" hostname=10.42.0.39 addr=10.42.0.39 terminal=ssh res=success'
+2026-10-31T04:15:18+13:00 tuna-q-datetime systemd[1]: Started [systemd-run] systemd-stdio-bridge --user --quiet.
+2026-10-31T04:15:18+13:00 tuna-q-datetime audit[1]: SERVICE_START pid=1 uid=0 auid=4294967295 ses=4294967295 msg='unit=run-p5054-i9445 comm="systemd" exe="/usr/lib/systemd/systemd" hostname=? addr=? terminal=? res=success'
+2026-10-31T04:15:18+13:00 tuna-q-datetime kernel: audit: type=1130 audit(1793373318.292:844): pid=1 uid=0 auid=4294967295 ses=4294967295 msg='unit=run-p5054-i9445 comm="systemd" exe="/usr/lib/systemd/systemd" hostname=? addr=? terminal=? res=success'
+2026-10-31T04:15:18+13:00 tuna-q-datetime audit[5055]: USER_ACCT pid=5055 uid=0 auid=4294967295 ses=4294967295 msg='op=PAM:accounting grantors=pam_access,pam_unix,pam_permit,pam_time acct="tuna-test" exe="/usr/lib/systemd/systemd-executor" hostname=? addr=? terminal=? res=success'
+2026-10-31T04:15:18+13:00 tuna-q-datetime audit[5055]: CRED_ACQ pid=5055 uid=0 auid=4294967295 ses=4294967295 msg='op=PAM:setcred grantors=pam_shells,pam_faillock,pam_permit,pam_env,pam_faillock acct="tuna-test" exe="/usr/lib/systemd/systemd-executor" hostname=? addr=? terminal=? res=success'
+2026-10-31T04:15:18+13:00 tuna-q-datetime audit[5055]: SYSCALL arch=c000003e syscall=1 success=yes exit=4 a0=9 a1=7fff229016a0 a2=4 a3=0 items=0 ppid=1 pid=5055 auid=1000 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=(none) ses=20 comm="(systemd-stdio)" exe="/usr/lib/systemd/systemd-executor" key=(null)
+2026-10-31T04:15:18+13:00 tuna-q-datetime audit: PROCTITLE proctitle="(d-stdio-bridge)"
+2026-10-31T04:15:18+13:00 tuna-q-datetime (d-stdio-bridge)[5055]: pam_unix(login:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+2026-10-31T04:15:18+13:00 tuna-q-datetime kernel: audit: type=1101 audit(1793373318.305:845): pid=5055 uid=0 auid=4294967295 ses=4294967295 msg='op=PAM:accounting grantors=pam_access,pam_unix,pam_permit,pam_time acct="tuna-test" exe="/usr/lib/systemd/systemd-executor" hostname=? addr=? terminal=? res=success'
+2026-10-31T04:15:18+13:00 tuna-q-datetime kernel: audit: type=1103 audit(1793373318.305:846): pid=5055 uid=0 auid=4294967295 ses=4294967295 msg='op=PAM:setcred grantors=pam_shells,pam_faillock,pam_permit,pam_env,pam_faillock acct="tuna-test" exe="/usr/lib/systemd/systemd-executor" hostname=? addr=? terminal=? res=success'
+2026-10-31T04:15:18+13:00 tuna-q-datetime kernel: audit: type=1006 audit(1793373318.305:847): pid=5055 uid=0 old-auid=4294967295 auid=1000 tty=(none) old-ses=4294967295 ses=20 res=1
+2026-10-31T04:15:18+13:00 tuna-q-datetime kernel: audit: type=1300 audit(1793373318.305:847): arch=c000003e syscall=1 success=yes exit=4 a0=9 a1=7fff229016a0 a2=4 a3=0 items=0 ppid=1 pid=5055 auid=1000 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=(none) ses=20 comm="(systemd-stdio)" exe="/usr/lib/systemd/systemd-executor" key=(null)
+2026-10-31T04:15:18+13:00 tuna-q-datetime kernel: audit: type=1327 audit(1793373318.305:847): proctitle="(d-stdio-bridge)"
+2026-10-31T04:15:18+13:00 tuna-q-datetime systemd[1]: Started Session 20 of User tuna-test.
+2026-10-31T04:15:18+13:00 tuna-q-datetime audit[5055]: USER_START pid=5055 uid=0 auid=1000 ses=20 msg='op=PAM:session_open grantors=pam_loginuid,pam_keyinit,pam_systemd_home,pam_limits,pam_unix,pam_permit,pam_lastlog2,pam_mail,pam_umask,pam_systemd,pam_env acct="tuna-test" exe="/usr/lib/systemd/systemd-executor" hostname=? addr=? terminal=? res=success'
+2026-10-31T04:15:18+13:00 tuna-q-datetime kernel: audit: type=1105 audit(1793373318.337:848): pid=5055 uid=0 auid=1000 ses=20 msg='op=PAM:session_open grantors=pam_loginuid,pam_keyinit,pam_systemd_home,pam_limits,pam_unix,pam_permit,pam_lastlog2,pam_mail,pam_umask,pam_systemd,pam_env acct="tuna-test" exe="/usr/lib/systemd/systemd-executor" hostname=? addr=? terminal=? res=success'
+2026-10-31T04:15:18+13:00 tuna-q-datetime (sd-pam)[5057]: pam_unix(login:session): session closed for user tuna-test
+2026-10-31T04:15:18+13:00 tuna-q-datetime audit[1]: SERVICE_STOP pid=1 uid=0 auid=4294967295 ses=4294967295 msg='unit=run-p5054-i9445 comm="systemd" exe="/usr/lib/systemd/systemd" hostname=? addr=? terminal=? res=success'
+2026-10-31T04:15:18+13:00 tuna-q-datetime kernel: audit: type=1131 audit(1793373318.349:849): pid=1 uid=0 auid=4294967295 ses=4294967295 msg='unit=run-p5054-i9445 comm="systemd" exe="/usr/lib/systemd/systemd" hostname=? addr=? terminal=? res=success'
+2026-10-31T04:15:18+13:00 tuna-q-datetime systemd[1]: run-p5054-i9445.service: Deactivated successfully.
+2026-10-31T04:15:18+13:00 tuna-q-datetime systemd[1]: session-20.scope: Deactivated successfully.
+true

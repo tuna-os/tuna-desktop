@@ -1,0 +1,455 @@
+{
+  "collected_at_epoch": 1793374251,
+  "errors": {},
+  "manual_time": {
+    "enabled_after": "enabled",
+    "enabled_before": "enabled",
+    "ntp_after_off": "no",
+    "ntp_before": "yes",
+    "ntp_off": {
+      "error": "",
+      "exit": 0
+    },
+    "ntp_on": {
+      "error": "",
+      "exit": 0
+    },
+    "ntp_restored": "yes",
+    "offset": 7620,
+    "panel": [
+      {
+        "delta": 2.0,
+        "epoch": 1793381882,
+        "label": "Oct 30\u2002\u20075:38 PM",
+        "labels": [
+          "Oct 30\u2002\u20075:38 PM"
+        ],
+        "stale_delta": 7618.0,
+        "stale_shift": 7620,
+        "stale_zone": "UTC",
+        "zone": "UTC"
+      }
+    ],
+    "restore_set": {
+      "error": "",
+      "exit": 0
+    },
+    "restored_delta": -0.4579048156738281,
+    "set": {
+      "error": "",
+      "exit": 0,
+      "target": 1793381882
+    },
+    "set_delta": -0.24214887619018555,
+    "set_while_ntp": {
+      "error": "Call failed: Automatic time synchronization is enabled",
+      "exit": 1
+    },
+    "unit": "systemd-timesyncd.service",
+    "unit_after_off": "inactive",
+    "unit_restored": "active",
+    "zone": "UTC"
+  },
+  "ntp": {
+    "chronyd": "inactive",
+    "show": {
+      "CanNTP": "yes",
+      "LocalRTC": "no",
+      "NTP": "yes",
+      "NTPSynchronized": "yes",
+      "RTCTimeUSec": "Fri 2026-10-30 15:30:50 UTC",
+      "TimeUSec": "Fri 2026-10-30 15:30:51 UTC",
+      "Timezone": "UTC"
+    },
+    "show_raw": "Timezone=UTC\nLocalRTC=no\nCanNTP=yes\nNTP=yes\nNTPSynchronized=yes\nTimeUSec=Fri 2026-10-30 15:30:51 UTC\nRTCTimeUSec=Fri 2026-10-30 15:30:50 UTC\n",
+    "status": {
+      "local_time": "Fri 2026-10-30 15:30:51 UTC",
+      "ntp_service": "active",
+      "rtc_in_local_tz": "no",
+      "rtc_time": "Fri 2026-10-30 15:30:50",
+      "synchronized": "yes",
+      "timezone": "UTC",
+      "universal_time": "Fri 2026-10-30 15:30:51 UTC"
+    },
+    "status_raw": "               Local time: Fri 2026-10-30 15:30:51 UTC\n           Universal time: Fri 2026-10-30 15:30:51 UTC\n                 RTC time: Fri 2026-10-30 15:30:50\n                Time zone: UTC (UTC, +0000)\nSystem clock synchronized: yes\n              NTP service: active\n          RTC in local TZ: no\n",
+    "systemd_timesyncd": "active",
+    "timesync_status": "       Server: 131.239.5.43 (0.arch.pool.ntp.org)\nPoll interval: 2min 8s (min: 32s; max 34min 8s)\n         Leap: normal\n      Version: 4\n      Stratum: 2\n    Reference: 82CFF4F0\n    Precision: 1us (-25)\nRoot distance: 11.573ms (max: 5s)\n       Offset: -35.208ms\n        Delay: 53.480ms\n       Jitter: 13.307ms\n Packet count: 2\n    Frequency: +362.469ppm\n",
+    "timesync_status_error": ""
+  },
+  "ntp_absent": {
+    "before": {
+      "CanNTP": "yes",
+      "NTP": "yes"
+    },
+    "masked": {
+      "CanNTP": "no",
+      "NTP": "no",
+      "error": "Created symlink '/run/systemd/system/systemd-timesyncd.service' \u2192 '/dev/null'.",
+      "exit": 0
+    },
+    "masked_set_ntp": {
+      "error": "Call failed: NTP not supported",
+      "exit": 1
+    },
+    "restored": {
+      "CanNTP": "yes",
+      "NTP": "yes",
+      "error": "",
+      "exit": 0,
+      "unit": "active"
+    },
+    "stopped": {
+      "CanNTP": "yes",
+      "NTP": "no",
+      "error": "",
+      "exit": 0
+    },
+    "unit": "systemd-timesyncd.service",
+    "unmask": {
+      "error": "Removed '/run/systemd/system/systemd-timesyncd.service'.",
+      "exit": 0
+    }
+  },
+  "panel_clock": {
+    "nodes": [
+      {
+        "name": "tuna-shell-gtk",
+        "role": "application",
+        "showing": false
+      },
+      {
+        "name": "Top Bar",
+        "role": "frame",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "panel",
+        "showing": true
+      },
+      {
+        "name": "Activities",
+        "role": "button",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "panel",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "panel",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "panel",
+        "showing": true
+      },
+      {
+        "name": "Date and Time",
+        "role": "button",
+        "showing": true
+      },
+      {
+        "name": "Date and Time",
+        "role": "toggle button",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "panel",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "grouping",
+        "showing": true
+      },
+      {
+        "name": "Oct 30\u2002\u20073:30 PM",
+        "role": "label",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "panel",
+        "showing": true
+      },
+      {
+        "name": "System",
+        "role": "button",
+        "showing": true
+      },
+      {
+        "name": "System",
+        "role": "toggle button",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "panel",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "grouping",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "panel",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "image",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "image",
+        "showing": true
+      },
+      {
+        "name": "Search",
+        "role": "frame",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "panel",
+        "showing": true
+      },
+      {
+        "name": "Search",
+        "role": "entry",
+        "showing": true
+      },
+      {
+        "name": "Dash",
+        "role": "frame",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "scroll pane",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "panel",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "panel",
+        "showing": true
+      },
+      {
+        "name": "Files",
+        "role": "button",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "panel",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "panel",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "image",
+        "showing": true
+      },
+      {
+        "name": "Show Apps",
+        "role": "toggle button",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "panel",
+        "showing": true
+      },
+      {
+        "name": "",
+        "role": "image",
+        "showing": true
+      }
+    ],
+    "system_epoch": 1793374251,
+    "timezone": "UTC",
+    "tolerance": 120
+  },
+  "polkit": {
+    "after": "UTC",
+    "before": "UTC",
+    "error": "Call failed: Access denied as the requested operation requires interactive authentication. However, interactive authentication has not been enabled by the calling program.",
+    "exit": 1,
+    "expected": "denied",
+    "group": "wheel",
+    "groups": [
+      "tuna-test"
+    ],
+    "restored": true,
+    "target": "Pacific/Auckland",
+    "user": "tuna-test"
+  },
+  "read_only": false,
+  "rtc": {
+    "adjtime": "",
+    "local_rtc": "no",
+    "localtime_link": "../usr/share/zoneinfo/UTC",
+    "rtc_time_usec": "Fri 2026-10-30 15:30:50 UTC"
+  },
+  "timezone_rejection": {
+    "after": "UTC",
+    "before": "UTC",
+    "error": "Call failed: Invalid or not installed time zone 'Invalid/Zone'",
+    "exit": 1,
+    "rejected": true,
+    "unchanged": true,
+    "zone": "Invalid/Zone"
+  },
+  "timezone_round_trip": {
+    "observed": "Pacific/Auckland",
+    "observed_link": "../usr/share/zoneinfo/Pacific/Auckland",
+    "original": "UTC",
+    "panel": [
+      {
+        "delta": 39549.0,
+        "epoch": 1793374251,
+        "label": "Oct 30\u2002\u20073:30 PM",
+        "labels": [
+          "Oct 30\u2002\u20073:30 PM"
+        ],
+        "stale_delta": 51.0,
+        "stale_shift": 0,
+        "stale_zone": "UTC",
+        "zone": "Pacific/Auckland"
+      },
+      {
+        "delta": 39548.0,
+        "epoch": 1793374252,
+        "label": "Oct 30\u2002\u20073:30 PM",
+        "labels": [
+          "Oct 30\u2002\u20073:30 PM"
+        ],
+        "stale_delta": 52.0,
+        "stale_shift": 0,
+        "stale_zone": "UTC",
+        "zone": "Pacific/Auckland"
+      },
+      {
+        "delta": 39547.0,
+        "epoch": 1793374253,
+        "label": "Oct 30\u2002\u20073:30 PM",
+        "labels": [
+          "Oct 30\u2002\u20073:30 PM"
+        ],
+        "stale_delta": 53.0,
+        "stale_shift": 0,
+        "stale_zone": "UTC",
+        "zone": "Pacific/Auckland"
+      },
+      {
+        "delta": 39546.0,
+        "epoch": 1793374254,
+        "label": "Oct 30\u2002\u20073:30 PM",
+        "labels": [
+          "Oct 30\u2002\u20073:30 PM"
+        ],
+        "stale_delta": 54.0,
+        "stale_shift": 0,
+        "stale_zone": "UTC",
+        "zone": "Pacific/Auckland"
+      },
+      {
+        "delta": 39544.0,
+        "epoch": 1793374256,
+        "label": "Oct 30\u2002\u20073:30 PM",
+        "labels": [
+          "Oct 30\u2002\u20073:30 PM"
+        ],
+        "stale_delta": 56.0,
+        "stale_shift": 0,
+        "stale_zone": "UTC",
+        "zone": "Pacific/Auckland"
+      },
+      {
+        "delta": 39543.0,
+        "epoch": 1793374257,
+        "label": "Oct 30\u2002\u20073:30 PM",
+        "labels": [
+          "Oct 30\u2002\u20073:30 PM"
+        ],
+        "stale_delta": 57.0,
+        "stale_shift": 0,
+        "stale_zone": "UTC",
+        "zone": "Pacific/Auckland"
+      },
+      {
+        "delta": 39542.0,
+        "epoch": 1793374258,
+        "label": "Oct 30\u2002\u20073:30 PM",
+        "labels": [
+          "Oct 30\u2002\u20073:30 PM"
+        ],
+        "stale_delta": 58.0,
+        "stale_shift": 0,
+        "stale_zone": "UTC",
+        "zone": "Pacific/Auckland"
+      },
+      {
+        "delta": 39541.0,
+        "epoch": 1793374259,
+        "label": "Oct 30\u2002\u20073:30 PM",
+        "labels": [
+          "Oct 30\u2002\u20073:30 PM"
+        ],
+        "stale_delta": 59.0,
+        "stale_shift": 0,
+        "stale_zone": "UTC",
+        "zone": "Pacific/Auckland"
+      },
+      {
+        "delta": 39600.0,
+        "epoch": 1793374260,
+        "label": "Oct 30\u2002\u20073:31 PM",
+        "labels": [
+          "Oct 30\u2002\u20073:31 PM"
+        ],
+        "stale_delta": 0.0,
+        "stale_shift": 0,
+        "stale_zone": "UTC",
+        "zone": "Pacific/Auckland"
+      },
+      {
+        "delta": 39598.0,
+        "epoch": 1793374262,
+        "label": "Oct 30\u2002\u20073:31 PM",
+        "labels": [
+          "Oct 30\u2002\u20073:31 PM"
+        ],
+        "stale_delta": 2.0,
+        "stale_shift": 0,
+        "stale_zone": "UTC",
+        "zone": "Pacific/Auckland"
+      }
+    ],
+    "revert_error": "",
+    "revert_exit": 0,
+    "revert_verified": true,
+    "reverted": true,
+    "reverted_link": "../usr/share/zoneinfo/UTC",
+    "set_error": "",
+    "set_exit": 0,
+    "target": "Pacific/Auckland"
+  }
+}

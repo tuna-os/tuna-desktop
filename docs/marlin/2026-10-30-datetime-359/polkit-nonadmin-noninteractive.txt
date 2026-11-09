@@ -1,0 +1,4 @@
+rc=1
+Call failed: Access denied as the requested operation requires interactive authentication. However, interactive authentication has not been enabled by the calling program.
+Timezone=UTC
+uid=1000(tuna-test) gid=1000(tuna-test) groups=1000(tuna-test)

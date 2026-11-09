@@ -437,6 +437,12 @@ impl ScreenshotUi {
                 match key {
                     gdk::Key::Escape => ui.close(),
                     gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::space => ui.capture(),
+                    // screenshot.js binds Ctrl+C to `activate` as well.
+                    gdk::Key::c | gdk::Key::C
+                        if modifiers.contains(gdk::ModifierType::CONTROL_MASK) =>
+                    {
+                        ui.capture()
+                    }
                     gdk::Key::s | gdk::Key::S => ui.set_mode(Mode::Selection),
                     gdk::Key::c | gdk::Key::C => ui.set_mode(Mode::Screen),
                     gdk::Key::w | gdk::Key::W => {
@@ -1074,7 +1080,7 @@ fn save(texture: &gdk::Texture, crop: Rect, w: f64, h: f64, to_disk: bool) -> Op
         .unwrap_or_else(|| glib::home_dir().join("Pictures"));
     let dir = pictures.join("Screenshots");
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(file_name(&jiff::Zoned::now().datetime()));
+    let path = dir.join(file_name(&crate::wall_clock::now().datetime()));
     cropped.save_to_png(&path).ok()?;
     Some(cropped)
 }

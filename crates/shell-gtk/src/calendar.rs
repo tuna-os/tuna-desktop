@@ -257,7 +257,7 @@ impl CalendarUi {
         self.month_label.set_text(&logic::month_label(shown, today));
         self.events_title
             .set_text(&logic::events_title(selected, today));
-        let tz = jiff::tz::TimeZone::system();
+        let tz = crate::wall_clock::local_zone();
         let source = self.source.borrow().clone();
         let week_start = self.week_start.get();
         let show_weekdate = self.show_weekdate.get();

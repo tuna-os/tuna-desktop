@@ -312,7 +312,7 @@ class OtpPamModule(unittest.TestCase):
         cls.tmp = pathlib.Path(tempfile.mkdtemp(prefix="tuna-pam-otp-"))
         cls.module = cls.tmp / "tuna-pam-otp.so"
         subprocess.run(["cc", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC", "-o",
-                        str(cls.module), str(OTP_SOURCE), "-lpam"], check=True)
+                        str(cls.module), str(OTP_SOURCE), "-lpam"], check=True, timeout=120)
         cls.user = "tuna-proof-user"
         cls.password = "pw-" + secrets.token_hex(6)
         cls.code = str(secrets.randbelow(900000) + 100000)

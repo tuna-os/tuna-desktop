@@ -24,10 +24,10 @@ class SourceCleanImports(unittest.TestCase):
                 target = root / entry
                 target.write_text(target.read_text().replace('sys.dont_write_bytecode = True',
                                                               'sys.dont_write_bytecode = False'))
-            subprocess.run(['git', 'init', '-q', str(root)], check=True)
-            subprocess.run(['git', '-c', 'core.excludesFile=/dev/null', 'add', '.'], cwd=root, check=True)
+            subprocess.run(['git', 'init', '-q', str(root)], check=True, timeout=60)
+            subprocess.run(['git', '-c', 'core.excludesFile=/dev/null', 'add', '.'], cwd=root, check=True, timeout=60)
             subprocess.run(['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
-                            'commit', '-qm', 'Source import fixture'], cwd=root, check=True)
+                            'commit', '-qm', 'Source import fixture'], cwd=root, check=True, timeout=60)
             env = dict(os.environ)
             for name in ['PYTHONDONTWRITEBYTECODE', 'PYTHONPYCACHEPREFIX']:
                 env.pop(name, None)
@@ -35,7 +35,7 @@ class SourceCleanImports(unittest.TestCase):
                             "import runpy,sys; runpy.run_path(sys.argv[1],run_name='import_probe')",
                             str(root / entry)], cwd=root, env=env, check=True, timeout=15)
             status = subprocess.check_output(['git', '-c', 'core.excludesFile=/dev/null',
-                                               'status', '--porcelain'], cwd=root, text=True)
+                                               'status', '--porcelain'], cwd=root, text=True, timeout=60)
             self.assertEqual(status, '', 'actual import must not dirty the admitted tree')
             self.assertFalse(list(root.rglob('*.pyc')), 'no hidden bytecode side effect')
 

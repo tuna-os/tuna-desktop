@@ -31,7 +31,7 @@ fn main() {
     xml.push_str("  </gresource>\n</gresources>\n");
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
     let manifest = Path::new(&out).join("icons.gresource.xml");
-    std::fs::write(&manifest, xml).expect("write manifest");
+    write_if_changed(&manifest, &xml);
     glib_build_tools::compile_resources(
         &[root],
         manifest.to_str().expect("utf-8"),
@@ -60,10 +60,20 @@ fn compile_osk_layouts(out: &str) {
     }
     xml.push_str("  </gresource>\n</gresources>\n");
     let manifest = Path::new(out).join("osk-layouts.gresource.xml");
-    std::fs::write(&manifest, xml).expect("write manifest");
+    write_if_changed(&manifest, &xml);
     glib_build_tools::compile_resources(
         &[root],
         manifest.to_str().expect("utf-8"),
         "osk-layouts.gresource",
     );
+}
+
+/// Cargo reruns this script and rebuilds the crate when a file it compiles
+/// from is newer than the last build, so an unchanged manifest keeps its
+/// mtime: no-op builds stay no-ops and don't replace a running binary.
+fn write_if_changed(path: &Path, contents: &str) {
+    if std::fs::read_to_string(path).is_ok_and(|old| old == contents) {
+        return;
+    }
+    std::fs::write(path, contents).expect("write manifest");
 }

@@ -1,0 +1,45 @@
+/usr/lib/gsd-datetime
+active
+Timezone=Pacific/Auckland
+2026-10-31T07:01:30+13:00 tuna-q-datetime systemd[1]: uupd.service: Failed with result 'exit-code'.
+2026-10-31T07:01:30+13:00 tuna-q-datetime systemd[1]: Failed to start Universal Blue Update Oneshot Service.
+2026-10-31T07:01:30+13:00 tuna-q-datetime systemd[1]: uupd.service: Consumed 1.452s CPU time over 1min 10.854s wall clock time, 184.6M memory peak.
+2026-10-31T07:01:30+13:00 tuna-q-datetime systemd-logind[648]: Removed session 10.
+2026-10-31T07:01:38+13:00 tuna-q-datetime /usr/lib/gdm-wayland-session[2199]: tuna-ibus-bridge: text field left
+2026-10-31T07:01:38+13:00 tuna-q-datetime systemd-timedated[3192]: systemd-timesyncd.service: Enabling unit.
+2026-10-31T07:01:38+13:00 tuna-q-datetime systemd[1]: Reload requested from client PID 3192 ('systemd-timedat') (unit systemd-timedated.service)...
+2026-10-31T07:01:38+13:00 tuna-q-datetime systemd[1]: Reloading...
+2026-10-31T07:01:38+13:00 tuna-q-datetime systemd[1]: /usr/lib/systemd/system/flatpak-appstream-refresh.service:7: Unknown key 'ExecCondition' in section [Unit], ignoring.
+2026-10-31T07:01:38+13:00 tuna-q-datetime systemd[1]: Reloading finished in 169 ms.
+2026-10-31T07:01:38+13:00 tuna-q-datetime systemd-timedated[3192]: Set NTP to be enabled (systemd-timesyncd.service).
+2026-10-31T07:01:38+13:00 tuna-q-datetime systemd[1]: Starting Network Time Synchronization...
+2026-10-31T07:01:38+13:00 tuna-q-datetime systemd[1]: Started Network Time Synchronization.
+2026-10-31T04:16:56+13:00 tuna-q-datetime systemd[1]: Started [systemd-run] systemd-stdio-bridge --user --quiet.
+2026-10-31T04:16:56+13:00 tuna-q-datetime (d-stdio-bridge)[5236]: pam_unix(login:session): session opened for user tuna-test(uid=1000) by tuna-test(uid=0)
+2026-10-31T04:16:56+13:00 tuna-q-datetime systemd[1]: Started Session 25 of User tuna-test.
+2026-10-31T04:16:56+13:00 tuna-q-datetime systemd[2125]: Started [systemd-run] /usr/lib/gsd-datetime.
+2026-10-31T04:16:56+13:00 tuna-q-datetime (sd-pam)[5238]: pam_unix(login:session): session closed for user tuna-test
+2026-10-31T04:16:56+13:00 tuna-q-datetime systemd[1]: run-p5235-i1336.service: Deactivated successfully.
+2026-10-31T04:16:56+13:00 tuna-q-datetime systemd[1]: session-25.scope: Deactivated successfully.
+2026-10-31T04:16:56+13:00 tuna-q-datetime gsd-datetime[5239]: unsetenv() is not thread-safe and should not be used after threads are created
+2026-10-31T04:16:56+13:00 tuna-q-datetime gsd-datetime[5239]: Starting datetime manager
+2026-10-31T04:16:56+13:00 tuna-q-datetime gsd-datetime[5239]: _g_io_module_get_default: Found default implementation gvfs (GDaemonVfs) for ‘gio-vfs’
+2026-10-31T04:16:56+13:00 tuna-q-datetime gsd-datetime[5239]: _g_io_module_get_default: Found default implementation dconf (DConfSettingsBackend) for ‘gsettings-backend’
+2026-10-31T04:16:56+13:00 tuna-q-datetime gsd-datetime[5239]: watch_fast: "/org/gnome/desktop/datetime/" (establishing: 0, active: 0)
+2026-10-31T04:16:56+13:00 tuna-q-datetime gsd-datetime[5239]: Automatic timezone enabled
+2026-10-31T04:16:56+13:00 tuna-q-datetime gsd-datetime[5239]: Starting timezone monitor
+2026-10-31T04:16:56+13:00 tuna-q-datetime gsd-datetime[5239]: watch_established: "/org/gnome/desktop/datetime/" (establishing: 1)
+2026-10-31T04:16:56+13:00 tuna-q-datetime gsd-datetime[5239]: watch_fast: "/org/gnome/system/location/" (establishing: 0, active: 0)
+2026-10-31T04:16:56+13:00 tuna-q-datetime gsd-datetime[5239]: Timezone monitor enabled, starting geoclue
+2026-10-31T04:16:56+13:00 tuna-q-datetime gsd-datetime[5239]: Daemon activated
+2026-10-31T04:16:56+13:00 tuna-q-datetime gsd-datetime[5239]: Unable to register client: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The name is not activatable
+2026-10-31T04:16:56+13:00 tuna-q-datetime gsd-datetime[5239]: watch_established: "/org/gnome/system/location/" (establishing: 1)
+2026-10-31T04:16:56+13:00 tuna-q-datetime systemd[1]: Starting Location Lookup Service...
+2026-10-31T04:16:56+13:00 tuna-q-datetime geoclue[5253]: Failed to connect to avahi service: Daemon not running
+2026-10-31T04:16:56+13:00 tuna-q-datetime systemd[1]: Started Location Lookup Service.
+2026-10-31T04:17:21+13:00 tuna-q-datetime gsd-datetime[5239]: Failed to connect to GeoClue2 service: Timeout was reached
+2026-10-31T04:17:26+13:00 tuna-q-datetime systemd[1]: systemd-timedated.service: Deactivated successfully.
+2026-10-31T04:17:26+13:00 tuna-q-datetime systemd[1]: Starting Time & Date Service...
+2026-10-31T04:17:26+13:00 tuna-q-datetime systemd[1]: Started Time & Date Service.
+false
+false

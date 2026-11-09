@@ -1,0 +1,9 @@
+pid=51759 start=99979 name=:1.168 cgroup=0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-dbus\x2d:1.2\x2dorg.gnome.Settings.SearchProvider.slice/dbus-:1.2-org.gnome.Settings.SearchProvider@1.service
+== org.freedesktop.timedate1.set-timezone system-bus-name: (bba{ss}) false true 2 "polkit.retains_authorization_after_challenge" "1" "polkit.result" "auth_admin_keep"
+== org.freedesktop.timedate1.set-timezone unix-process:    (bba{ss}) true false 2 "polkit.retains_authorization_after_challenge" "1" "polkit.result" "yes"
+== org.freedesktop.timedate1.set-time system-bus-name: (bba{ss}) false true 2 "polkit.retains_authorization_after_challenge" "1" "polkit.result" "auth_admin_keep"
+== org.freedesktop.timedate1.set-time unix-process:    (bba{ss}) true false 1 "polkit.result" "yes"
+== org.freedesktop.timedate1.set-ntp system-bus-name: (bba{ss}) false true 2 "polkit.retains_authorization_after_challenge" "1" "polkit.result" "auth_admin_keep"
+== org.freedesktop.timedate1.set-ntp unix-process:    (bba{ss}) true false 2 "polkit.retains_authorization_after_challenge" "1" "polkit.result" "yes"
+== org.gnome.controlcenter.datetime.configure system-bus-name: (bba{ss}) false true 2 "polkit.retains_authorization_after_challenge" "1" "polkit.result" "auth_admin_keep"
+== org.gnome.controlcenter.datetime.configure unix-process:    (bba{ss}) true false 1 "polkit.result" "yes"

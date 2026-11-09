@@ -30,7 +30,7 @@ it — automation covers the same paths headless (see below).
    lines). The panel re-attaches and resyncs from a full snapshot —
    the exact window and workspace set, never partial state.
 5. While the overlay is visible, keyboard input stays on the shield:
-   Up/Down move the selection, Enter confirms, R relaunches the shell,
+   Up/Down move the selection, Enter refreshes the window list, R relaunches the shell,
    Esc dismisses. If the restart budget is spent, the session stays
    calm and observable until an operator relaunch (R).
 
@@ -169,7 +169,8 @@ scripts/tuna-nested run --shell-bin target/debug/tuna-shell-gtk
 
 ### Filing a bug
 
-Open an issue with:
+Open an issue with the details below; [troubleshooting](troubleshooting.md#filing-a-bug)
+lists what to add for installed and hardware sessions:
 
 - the exact command you ran and what you saw;
 - `nested.log` from the artifacts directory. Compositor lines carry codes,

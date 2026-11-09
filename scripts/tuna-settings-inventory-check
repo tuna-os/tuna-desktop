@@ -1,25 +1,130 @@
 #!/usr/bin/env python3
-"""Check that every pinned GNOME 51 desktop key has one documented disposition."""
+"""Check docs/settings-desktop-inventory.md against the pinned GNOME 51 keys.
+
+Every pinned key needs exactly one row `| key | status | reason | owner |`.
+The owner cell is `<category> — <GNOME 51 citation>[; evidence][ [GNOME Settings: …]]`:
+
+- implemented: status starts with "Honored"; cites a GNOME 51 consumer and at
+  least one `proof:`/`journey:` gate or `cargo:` test that exists in the tree;
+  a key GNOME Settings writes also needs an observable gate or an open issue.
+- toolkit / app-owned: status is "Via GTK" or "Ignored"; cites the owner.
+- deprecated: status "Ignored"; says which GNOME 51 sources were searched.
+- unimplemented: status "Ignored"; links the issue (`#N`).
+
+Cited ids must exist: a cargo test is a `#[test]` fn in crates/, a gate id
+is emitted by non-comment code under scripts/, tests/ or .github/.
+"""
 import json
 import re
+import sys
 from pathlib import Path
 
-root = Path(__file__).resolve().parent.parent
-source = json.loads((root / "tests/settings/gnome51-desktop-keys.json").read_text())
-expected = {(entry["schema"], entry["key"]) for entry in source["keys"]}
-actual = set()
-schema = None
-for line in (root / "docs/settings-desktop-inventory.md").read_text().splitlines():
-    if line.startswith("## org.gnome.desktop."):
-        schema = line[3:]
-    match = re.match(r"\| ([a-z0-9-]+) \| ([^|]+) \| ([^|]+) \|$", line)
-    if not match:
-        continue
-    key, status, reason = match.groups()
-    assert schema is not None and reason.strip(), line
-    assert status.strip().startswith(("Honored", "Via GTK", "Ignored")), line
-    item = (schema, key)
-    assert item not in actual, f"duplicate disposition: {item}"
-    actual.add(item)
-assert actual == expected, f"missing={sorted(expected - actual)} extra={sorted(actual - expected)}"
-print(f"settings inventory: {len(actual)} GNOME 51 desktop keys classified")
+CATEGORIES = ("implemented", "toolkit", "app-owned", "deprecated", "unimplemented")
+ROW = re.compile(r"\| ([a-z0-9-]+) \| ([^|]+) \| ([^|]+) \| ([^|]+) \|$")
+REF = re.compile(r"\b(proof|journey|cargo):([A-Za-z0-9_:-]+[A-Za-z0-9_])")
+ISSUE = re.compile(r"#\d+\b")
+CITATION = re.compile(r"\b51\b|gtk 4\.22|GNOME 51")
+GATE_ID = re.compile(r"(?<![A-Za-z0-9_-])([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)(?![A-Za-z0-9_-])")
+TEST_FN = re.compile(r"#\[(?:\w+::)?test[^\]]*\]\s*(?:#\[[^\]]*\]\s*)*(?:async\s+)?fn\s+(\w+)")
+
+
+def known_ids(root):
+    """Return (cargo test names, gate ids) present in the tree."""
+    tests = set()
+    for path in (root / "crates").rglob("*.rs"):
+        tests.update(TEST_FN.findall(path.read_text(encoding="utf-8", errors="replace")))
+    gates = set()
+    for base in ("scripts", "tests", ".github"):
+        for path in (root / base).rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            for line in text.splitlines():
+                stripped = line.lstrip()
+                if stripped.startswith(("#", "//")):
+                    continue
+                gates.update(GATE_ID.findall(line))
+    return tests, gates
+
+
+def check_owner(key, status, owner, tests, gates):
+    """Return the problems with one row's owner cell."""
+    problems = []
+    category, sep, rest = owner.partition(" — ")
+    if category not in CATEGORIES or not sep:
+        return [f"{key}: owner must start with one of {CATEGORIES} and ' — '"]
+    if not CITATION.search(rest):
+        problems.append(f"{key}: owner cites no GNOME 51 source")
+    honored = status.startswith("Honored")
+    if honored != (category == "implemented"):
+        problems.append(f"{key}: status '{status}' disagrees with category '{category}'")
+    if status.startswith("Via GTK") and category not in ("toolkit", "app-owned"):
+        problems.append(f"{key}: Via GTK rows are toolkit or app-owned")
+    refs = REF.findall(rest)
+    for kind, name in refs:
+        if kind == "cargo":
+            if name.rsplit("::", 1)[-1] not in tests:
+                problems.append(f"{key}: cargo test '{name}' does not exist")
+        elif name not in gates:
+            problems.append(f"{key}: {kind} id '{name}' is not emitted by any gate")
+    if category == "implemented" and not refs:
+        problems.append(f"{key}: implemented rows cite a test or proof id")
+    if category == "unimplemented" and not ISSUE.search(rest):
+        problems.append(f"{key}: unimplemented rows link an issue")
+    if (category == "implemented" and "[GNOME Settings:" in rest
+            and not any(kind != "cargo" for kind, _ in refs) and not ISSUE.search(rest)):
+        problems.append(f"{key}: GNOME Settings writes it; cite an observable gate or an open issue")
+    return problems
+
+
+def parse(text):
+    """Yield (schema, key, status, owner) rows; header rows are skipped."""
+    schema = None
+    for line in text.splitlines():
+        if line.startswith("## org.gnome.desktop."):
+            schema = line[3:]
+            continue
+        if line.startswith("| ") and not line.startswith("| Key |"):
+            match = ROW.match(line)
+            if not match:
+                if schema is not None and re.match(r"\| [a-z0-9-]+ \|", line):
+                    raise ValueError(f"malformed row (four cells needed): {line}")
+                continue
+            key, status, reason, owner = (c.strip() for c in match.groups())
+            if schema is None or not reason:
+                raise ValueError(f"row outside a schema or without a reason: {line}")
+            if not status.startswith(("Honored", "Via GTK", "Ignored")):
+                raise ValueError(f"unknown status: {line}")
+            yield schema, key, status, owner
+
+
+def main():
+    root = Path(__file__).resolve().parent.parent
+    source = json.loads((root / "tests/settings/gnome51-desktop-keys.json").read_text())
+    expected = {(entry["schema"], entry["key"]) for entry in source["keys"]}
+    tests, gates = known_ids(root)
+    actual, problems, counts = set(), [], {}
+    for schema, key, status, owner in parse(
+            (root / "docs/settings-desktop-inventory.md").read_text(encoding="utf-8")):
+        item = (schema, key)
+        if item in actual:
+            problems.append(f"duplicate disposition: {item}")
+        actual.add(item)
+        problems += check_owner(f"{schema} {key}", status, owner, tests, gates)
+        category = owner.partition(" — ")[0]
+        counts[category] = counts.get(category, 0) + 1
+    if actual != expected:
+        problems.append(f"missing={sorted(expected - actual)} extra={sorted(actual - expected)}")
+    for problem in problems:
+        print(f"tuna-settings-inventory-check: {problem}", file=sys.stderr)
+    if problems:
+        sys.exit(1)
+    summary = ", ".join(f"{counts.get(c, 0)} {c}" for c in CATEGORIES)
+    print(f"settings inventory: {len(actual)} GNOME 51 desktop keys classified ({summary})")
+
+
+if __name__ == "__main__":
+    main()

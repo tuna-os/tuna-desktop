@@ -125,7 +125,7 @@ class FadeSettleFilter(unittest.TestCase):
             json.dump({'wellbeing_effects': effects}, tmp)
             tmp.flush()
             proc = subprocess.run([self.jq, '-e', self.filt, tmp.name],
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True, timeout=60)
         return proc.returncode
 
     def test_settled_f32_admitted(self):

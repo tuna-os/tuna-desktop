@@ -1,0 +1,9 @@
+14:36:17
+Call failed: Connection timed out
+rc=1
+14:36:42
+Oct 30 14:36:42 tuna-q-datetime /usr/lib/gdm-wayland-session[33270]: polkit-agent-helper-1: needs to be setuid root
+Oct 30 14:36:42 tuna-q-datetime /usr/lib/gdm-wayland-session[33271]: polkit-agent-helper-1: needs to be setuid root
+Oct 30 14:36:42 tuna-q-datetime /usr/lib/gdm-wayland-session[33272]: polkit-agent-helper-1: needs to be setuid root
+Oct 30 14:36:42 tuna-q-datetime polkitd[761]: Operator of unix-session:5 FAILED to authenticate to gain authorization for action org.freedesktop.timedate1.set-timezone for system-bus-name::1.144 [<unknown>] (owned by unix-user:tuna-test)
+Timezone=UTC

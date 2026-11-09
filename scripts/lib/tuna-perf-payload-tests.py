@@ -127,14 +127,14 @@ class PayloadTests(unittest.TestCase):
                    "--repository", "tuna-os/tuna-desktop", "--out", str(output)]
         original.write_text(json.dumps(self.candidates(self.candidate(11, "2026-10-03T14:01:27Z"),
                                                       self.candidate(12))))
-        result = subprocess.run(command, text=True, capture_output=True)
+        result = subprocess.run(command, text=True, capture_output=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "12\n")
         receipt = json.loads(output.read_text())
         self.assertTrue(receipt["qualified"])
         self.assertEqual(receipt["candidate_count"], 2)
         original.write_text(json.dumps(self.candidates(self.candidate(head_repository=None))))
-        result = subprocess.run(command, text=True, capture_output=True)
+        result = subprocess.run(command, text=True, capture_output=True, timeout=60)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr.strip(), "payload provenance refused")
@@ -325,7 +325,7 @@ class PayloadTests(unittest.TestCase):
             else:
                 env["TUNA_PKG_SHA256"] = supplied
             result = subprocess.run(["sh", "-c", 'set -eu; ' + guard + ' && touch "' + str(marker) + '"'],
-                                    env=env, capture_output=True)
+                                    env=env, capture_output=True, timeout=60)
             with self.subTest(supplied=supplied, pinned=pinned):
                 self.assertEqual(result.returncode == 0, allowed)
                 self.assertEqual(marker.exists(), allowed)
@@ -333,7 +333,7 @@ class PayloadTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("zstd"), "zstd must be installed by CI preflight")
     def test_cli_failure_retains_original_zip_and_unpacked_package_identity(self):
         compressed = subprocess.run(["zstd", "-c"], input=self.archive(missing=payload.BINS[3]),
-                                    check=True, capture_output=True).stdout
+                                    check=True, capture_output=True, timeout=60).stdout
         archive = self.root / "actual.zip"
         with zipfile.ZipFile(archive, "w") as output:
             output.writestr("tuna-desktop-1.pkg.tar.zst", compressed)
@@ -343,7 +343,7 @@ class PayloadTests(unittest.TestCase):
         out = self.root / "failure.json"
         result = subprocess.run(["python3", str(Path(payload.__file__)), "archive", "--zip", str(archive),
             "--package", str(self.root / "original.zst"), "--report", str(report), "--out", str(out)],
-            capture_output=True)
+            capture_output=True, timeout=60)
         self.assertNotEqual(result.returncode, 0)
         receipt = json.loads(out.read_text())
         self.assertFalse(receipt["qualified"])
@@ -354,7 +354,7 @@ class PayloadTests(unittest.TestCase):
     def test_actual_compressed_tar_stream_and_invalid_compression(self):
         path = self.root / "package.zst"
         path.write_bytes(subprocess.run(["zstd", "-c"], input=self.archive(),
-                                       check=True, capture_output=True).stdout)
+                                       check=True, capture_output=True, timeout=60).stdout)
         report = payload.inspect_package(path)
         self.assertEqual(report["package"]["size"], path.stat().st_size)
         self.assertGreater(report["decompressed_bytes"], 0)

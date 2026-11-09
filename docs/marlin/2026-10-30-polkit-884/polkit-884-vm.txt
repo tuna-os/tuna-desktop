@@ -1,0 +1,27 @@
+image index digest: ghcr.io/tuna-os/marlin@sha256:ae6363c185015849701328fc38694f5ddcc0b4c804034a1d8d05577f1c70cf7d (marlin:tuna, re-resolved 2026-10-30)
+booted imageDigest: sha256:a182a20b732b6f8954be4afd7c0b47fa67306143100b5377d0b015a873415beb
+polkit 128-1
+tuna-desktop 1.0.0beta.1-1
+srw-rw-rw- 1 root root     0 Oct 30 17:23 /run/polkit/agent-helper.socket
+-rwxr-xr-x 1 root root 18528 Oct 15 22:16 /usr/lib/polkit-1/polkit-agent-helper-1
+active
+candidate sideloaded via bootc usroverlay: /usr/bin/tuna-shell-gtk sha256 624d700bc8683422ad07951d9084fce2ba27fa4d362cda9df243ffbef3243cf1 (image original 4578cf0282196cb73a48da424ee1fcce8298ded42b0ac1ac85c9f48034a3036a)
+running shell exe: 624d700bc8683422ad07951d9084fce2ba27fa4d362cda9df243ffbef3243cf1
+uid=1000(tuna-test) gid=1000(tuna-test) groups=1000(tuna-test)
+uid=1001(tadmin) gid=1001(tadmin) groups=1001(tadmin),998(wheel)
+
+## journal since panel opened (polkit lines)
+2026-10-30T17:31:01+00:00 tuna-q-polkit systemd[1]: Created slice Slice /system/polkit-agent-helper.
+2026-10-30T17:31:27+00:00 tuna-q-polkit unix_chkpwd[3169]: password check failed for user (tadmin)
+2026-10-30T17:31:27+00:00 tuna-q-polkit polkit-agent-helper-1[3127]: pam_unix(polkit-1:auth): authentication failure; logname= uid=0 euid=0 tty= ruser=tadmin rhost=  user=tadmin
+2026-10-30T17:31:29+00:00 tuna-q-polkit polkit-agent-helper-1[3127]: polkit-agent-helper-1: pam_authenticate failed: Authentication failure
+2026-10-30T17:31:29+00:00 tuna-q-polkit systemd[1]: polkit-agent-helper@0-7-2493_12821-1000.service: Deactivated successfully.
+2026-10-30T17:31:29+00:00 tuna-q-polkit audit[1]: SERVICE_START pid=1 uid=0 auid=4294967295 ses=4294967295 msg='unit=polkit-agent-helper@0-7-2493_12821-1000 comm="systemd" exe="/usr/lib/systemd/systemd" hostname=? addr=? terminal=? res=success'
+2026-10-30T17:31:29+00:00 tuna-q-polkit audit[1]: SERVICE_STOP pid=1 uid=0 auid=4294967295 ses=4294967295 msg='unit=polkit-agent-helper@0-7-2493_12821-1000 comm="systemd" exe="/usr/lib/systemd/systemd" hostname=? addr=? terminal=? res=success'
+2026-10-30T17:32:00+00:00 tuna-q-polkit systemd[1]: polkit-agent-helper@1-4097-2493_12821-1000.service: Deactivated successfully.
+2026-10-30T17:32:00+00:00 tuna-q-polkit audit[1]: SERVICE_START pid=1 uid=0 auid=4294967295 ses=4294967295 msg='unit=polkit-agent-helper@1-4097-2493_12821-1000 comm="systemd" exe="/usr/lib/systemd/systemd" hostname=? addr=? terminal=? res=success'
+2026-10-30T17:32:00+00:00 tuna-q-polkit audit[1]: SERVICE_STOP pid=1 uid=0 auid=4294967295 ses=4294967295 msg='unit=polkit-agent-helper@1-4097-2493_12821-1000 comm="systemd" exe="/usr/lib/systemd/systemd" hostname=? addr=? terminal=? res=success'
+
+needs-to-be-setuid lines this boot: 0
+polkit-agent-helper@ instances this boot: 2
+password strings in journal: 0

@@ -1,0 +1,192 @@
+[
+  {
+    "role": "application",
+    "name": "xdg-desktop-portal-gnome",
+    "showing": false
+  },
+  {
+    "role": "frame",
+    "name": "Share Screen",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "grouping",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "scroll pane",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "grouping",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "label",
+    "name": "An app wants to share your screen. Choose what you'd like to share.",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "grouping",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "_Entire Screen",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "toggle button",
+    "name": "Virtual-1",
+    "showing": true
+  },
+  {
+    "role": "label",
+    "name": "Virtual-1",
+    "showing": true
+  },
+  {
+    "role": "grouping",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "grouping",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "button",
+    "name": "Cancel",
+    "showing": true
+  },
+  {
+    "role": "label",
+    "name": "Cancel",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "label",
+    "name": "Share Screen",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "button",
+    "name": "Share",
+    "showing": true
+  },
+  {
+    "role": "label",
+    "name": "Share",
+    "showing": true
+  },
+  {
+    "role": "grouping",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  },
+  {
+    "role": "panel",
+    "name": "",
+    "showing": true
+  }
+]
