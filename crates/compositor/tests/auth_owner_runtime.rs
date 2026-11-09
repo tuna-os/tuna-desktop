@@ -1,7 +1,7 @@
 //! Actual runtimes, supervised control peer and a controlled delayed PAM
 //! module (libpam_wrapper): outer ownership, lock epochs and private PAM
 //! helper retirement. Not GTK UI, installed DRM, logind or S3.
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -584,6 +584,13 @@ fn run_parent(bin: &Path, role: &str, kind: &str) {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(tuna_compositor::control::is_private_dir(root.path()));
+    // Real startup must not inspect the invoking user's migration paths.
+    for name in ["home", "config", "cache", "data", "state"] {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.path().join(name))
+            .unwrap();
+    }
     let _artifacts = Artifacts {
         root: root.path().to_owned(),
         out: std::env::var_os("TUNA_AUTH_OWNER_ARTIFACTS").map(PathBuf::from),
@@ -664,6 +671,11 @@ fn run_parent(bin: &Path, role: &str, kind: &str) {
             .env("TUNA_AUTH_OWNER_TEST_BIN", std::env::current_exe().unwrap())
             .env("TUNA_AUTH_OWNER_ROOT", root.path())
             .env("XDG_RUNTIME_DIR", root.path())
+            .env("HOME", root.path().join("home"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
             .env("TUNA_COMPOSITOR_STATE", root.path().join("state.json"))
             .env("TUNA_LOCK_TRACE", "1")
             .env("TUNA_XWAYLAND", "0")

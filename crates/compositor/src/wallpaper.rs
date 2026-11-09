@@ -10,6 +10,7 @@
 //! oversized output — degrades to the solid clear, never an error.
 
 use crate::slideshow::{Sample, Timeline, MAX_XML_BYTES};
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::ffi::OsStringExt;
@@ -31,6 +32,7 @@ pub const WALLPAPER_FILE: &str = "tuna-wallpaper";
 /// Largest output area (in pixels) a wallpaper is scaled to; bigger
 /// outputs keep the solid clear rather than burning memory.
 pub const MAX_WALLPAPER_AREA: u64 = 7680 * 4320;
+const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Runtime-dir drop path for the wallpaper URI, beside the control
 /// socket and the Wayland socket.
@@ -534,8 +536,8 @@ impl Wallpaper {
             let paint_record = paint.animation.as_ref().map(|(sample,references)| serde_json::json!({
                 "sample_wall": sample.wall, "progress": sample.progress, "interval": sample.interval,
                 "from": sample.from, "to": sample.to, "slide": sample.slide,
-                "generation": epoch, "source_uri": paint.uri, "root_identity": format!("{:?}",paint.identity),
-                "source_identities": references.iter().map(|(path,id)| serde_json::json!({"path":path.to_string_lossy(),"identity":format!("{id:?}")})).collect::<Vec<_>>(), "geometry": {"physical":geometry.physical,
+                "generation": epoch, "source_uri": paint.uri, "root_identity": paint.identity,
+                "source_identities": references.iter().map(|(path,id)| serde_json::json!({"path":path.to_string_lossy(),"identity":id})).collect::<Vec<_>>(), "geometry": {"physical":geometry.physical,
                     "origin":geometry.origin,"desktop":geometry.desktop,"scale":geometry.scale()},
             }));
             let job = paint;
@@ -1302,22 +1304,20 @@ fn card_placement(
     (at.into(), Some(size.into()))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FileIdentity {
-    path: PathBuf,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+struct FileMetadata {
     dev: u64,
     ino: u64,
     bytes: u64,
     modified: (i64, i64),
     changed: (i64, i64),
 }
-impl FileIdentity {
-    fn from_metadata(path: PathBuf, m: &std::fs::Metadata) -> Option<Self> {
-        if !m.is_file() || m.len() > 64 * 1024 * 1024 {
+impl FileMetadata {
+    fn from_metadata(m: &std::fs::Metadata) -> Option<Self> {
+        if !m.is_file() || m.len() > MAX_SOURCE_BYTES {
             return None;
         }
         Some(Self {
-            path,
             dev: m.dev(),
             ino: m.ino(),
             bytes: m.len(),
@@ -1325,12 +1325,64 @@ impl FileIdentity {
             changed: (m.ctime(), m.ctime_nsec()),
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FileIdentity {
+    path: PathBuf,
+    metadata: FileMetadata,
+    sha256: [u8; 32],
+}
+impl serde::Serialize for FileIdentity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let mut receipt = serializer.serialize_struct("FileIdentity", 3)?;
+        // A native non-UTF8 path stays unrepresentable, never a lossy alias.
+        // Such a receipt cannot qualify the UTF8 public proof fixtures.
+        receipt.serialize_field("path", &self.path.to_str())?;
+        receipt.serialize_field("metadata", &self.metadata)?;
+        receipt.serialize_field("sha256", &self.sha256)?;
+        receipt.end()
+    }
+}
+impl FileIdentity {
     fn for_uri(uri: &str) -> Option<Self> {
         Self::for_path(&wallpaper_uri_to_path(uri)?)
     }
     fn for_path(path: &std::path::Path) -> Option<Self> {
         let path = path.canonicalize().ok()?;
-        Self::from_metadata(path.clone(), &std::fs::metadata(path).ok()?)
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .ok()?;
+        let metadata = FileMetadata::from_metadata(&file.metadata().ok()?)?;
+        // Equal-size in-place writes can share even nanosecond mtime/ctime.
+        // Hash on the bounded source worker, without retaining another image.
+        let mut hash = Sha256::new();
+        let mut buffer = [0; 16384];
+        let mut reader = file.by_ref().take(metadata.bytes + 1);
+        let mut bytes = 0;
+        loop {
+            let count = reader.read(&mut buffer).ok()?;
+            if count == 0 {
+                break;
+            }
+            bytes += count as u64;
+            hash.update(&buffer[..count]);
+        }
+        if bytes != metadata.bytes
+            || FileMetadata::from_metadata(&file.metadata().ok()?) != Some(metadata)
+            || FileMetadata::from_metadata(&std::fs::metadata(&path).ok()?) != Some(metadata)
+        {
+            return None;
+        }
+        Some(Self {
+            path,
+            metadata,
+            sha256: hash.finalize().into(),
+        })
     }
 }
 /// This entire observer executes on a bounded worker, including timezone
@@ -1405,7 +1457,7 @@ impl SourceObservation {
     }
 }
 fn read_identity(expected: &FileIdentity, limit: u64) -> Option<Vec<u8>> {
-    if expected.bytes > limit {
+    if expected.metadata.bytes > limit {
         return None;
     }
     let mut file = std::fs::OpenOptions::new()
@@ -1413,17 +1465,18 @@ fn read_identity(expected: &FileIdentity, limit: u64) -> Option<Vec<u8>> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&expected.path)
         .ok()?;
-    if FileIdentity::from_metadata(expected.path.clone(), &file.metadata().ok()?)
-        != Some(expected.clone())
-    {
+    if FileMetadata::from_metadata(&file.metadata().ok()?) != Some(expected.metadata) {
         return None;
     }
-    let mut bytes = Vec::new();
-    file.by_ref().take(limit + 1).read_to_end(&mut bytes).ok()?;
-    (bytes.len() as u64 == expected.bytes
-        && FileIdentity::from_metadata(expected.path.clone(), &file.metadata().ok()?)
-            == Some(expected.clone()))
-    .then_some(bytes)
+    let mut bytes = Vec::with_capacity(expected.metadata.bytes as usize + 1);
+    file.by_ref()
+        .take(expected.metadata.bytes + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 == expected.metadata.bytes
+        && FileMetadata::from_metadata(&file.metadata().ok()?) == Some(expected.metadata)
+        && <[u8; 32]>::from(Sha256::digest(&bytes)) == expected.sha256)
+        .then_some(bytes)
 }
 fn load_animation_wallpaper(
     uri: &str,
@@ -1440,9 +1493,6 @@ fn load_animation_wallpaper(
                 .iter()
                 .all(|(path, id)| FileIdentity::for_path(path) == *id)
     };
-    if !unchanged() {
-        return None;
-    }
     let decode = |path: &PathBuf| -> Option<std::sync::Arc<image::RgbaImage>> {
         let identity = references.iter().find(|(p, _)| p == path)?.1.as_ref()?;
         if let Some(found) = caches
@@ -1456,11 +1506,8 @@ fn load_animation_wallpaper(
             return Some(found);
         }
         let image = std::sync::Arc::new(
-            tuna_wallpaper::decode(&read_identity(identity, 64 * 1024 * 1024)?)?.to_rgba8(),
+            tuna_wallpaper::decode(&read_identity(identity, MAX_SOURCE_BYTES)?)?.to_rgba8(),
         );
-        if FileIdentity::for_path(path) != Some(identity.clone()) {
-            return None;
-        }
         let mut slots = caches.images.lock().ok()?;
         let mut bytes = slots
             .iter()
@@ -1558,9 +1605,6 @@ fn load_static_wallpaper(
         // Do not observe or decode its unused source, or consult an image cache.
         return tuna_wallpaper::background::render(None, settings, geometry);
     }
-    if FileIdentity::for_uri(uri) != expected {
-        return None;
-    }
     let original_identity = expected.clone();
     let cache = cache_root.map(|root| static_cache_path(root, uri, settings, geometry, &expected));
     let want = geometry.physical[0] as usize * geometry.physical[1] as usize * 4;
@@ -1589,31 +1633,8 @@ fn load_static_wallpaper(
         }
     }
     let mut raster = true;
-    let image = if settings.placement == tuna_shell_control::background::Placement::None {
-        None
-    } else if let Some(expected) = expected {
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&expected.path)
-            .ok()?;
-        if FileIdentity::from_metadata(expected.path.clone(), &file.metadata().ok()?)
-            != Some(expected.clone())
-        {
-            return None;
-        }
-        let mut bytes = Vec::new();
-        file.by_ref()
-            .take(64 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        if bytes.len() as u64 != expected.bytes
-            || FileIdentity::from_metadata(expected.path.clone(), &file.metadata().ok()?)
-                != Some(expected.clone())
-            || FileIdentity::for_uri(uri) != Some(expected)
-        {
-            return None;
-        }
+    let image = if let Some(expected) = expected {
+        let bytes = read_identity(&expected, MAX_SOURCE_BYTES)?;
         // A native SVG render also depends on the installed loader and
         // fonts, which this source-file key does not identify.
         raster = tuna_wallpaper::is_raster(&bytes);
@@ -1660,9 +1681,10 @@ fn static_cache_path(
 ) -> PathBuf {
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
-    // Version 5: version 4 entries may hold colour fallbacks of failed
-    // decodes (1.0.0-beta.1 stored them for SVGs it could not yet decode).
-    5u32.hash(&mut hash);
+    // Version 6: earlier entries may hold colour fallbacks of failed
+    // decodes (1.0.0-beta.1 stored them for SVGs it could not yet decode,
+    // and version 5 for raster signatures that failed to decode).
+    6u32.hash(&mut hash);
     uri.hash(&mut hash);
     settings.hash(&mut hash);
     geometry.hash(&mut hash);
@@ -1733,6 +1755,35 @@ fn cache_path(path: &std::path::Path, w: u32, h: u32) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_identity_receipts_are_typed_metadata_and_content_digest() {
+        let identity = FileIdentity {
+            path: PathBuf::from("/out/light-timeline.xml"),
+            metadata: FileMetadata {
+                dev: 1,
+                ino: 2,
+                bytes: 3,
+                modified: (4, 5),
+                changed: (6, 7),
+            },
+            sha256: [8; 32],
+        };
+        let expected = serde_json::json!({
+            "path": "/out/light-timeline.xml",
+            "metadata": {"dev": 1, "ino": 2, "bytes": 3, "modified": [4, 5], "changed": [6, 7]},
+            "sha256": vec![8u8; 32],
+        });
+        assert_eq!(serde_json::to_value(Some(&identity)).unwrap(), expected);
+        assert!(serde_json::to_value(None::<&FileIdentity>)
+            .unwrap()
+            .is_null());
+        let native_path = FileIdentity {
+            path: PathBuf::from(OsString::from_vec(vec![0xff])),
+            ..identity
+        };
+        assert!(serde_json::to_value(native_path).unwrap()["path"].is_null());
+    }
+
     #[test]
     fn malformed_current_wallpaper_policy_retires_old_maintenance_eligibility() {
         let _serial = RUNTIME_DIR_LOCK.lock().unwrap();
@@ -2512,21 +2563,6 @@ mod tests {
         assert_eq!(load(&good), marker);
     }
 
-    /// Wait until a new write in `dir` is stamped after `path`'s mtime.
-    /// Kernels before multigrain timestamps (Linux 6.13) stamp writes from a
-    /// coarse clock tick, so a same-size rewrite inside one tick has identical
-    /// metadata; an edit a person or program makes later never does.
-    fn next_timestamp_tick(dir: &std::path::Path, path: &std::path::Path) {
-        let previous = std::fs::metadata(path).unwrap().modified().unwrap();
-        let probe = dir.join(".tick");
-        loop {
-            std::fs::write(&probe, b"").unwrap();
-            if std::fs::metadata(&probe).unwrap().modified().unwrap() > previous {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-    }
     #[test]
     fn xml_reference_replacement_changes_epoch_and_rejects_stale_worker() {
         let dir = tempfile::tempdir().unwrap();
@@ -2548,10 +2584,12 @@ mod tests {
             .unwrap()
             .sample(100.0, [8, 8])
             .unwrap();
-        next_timestamp_tick(dir.path(), &picture);
+        // Replace owned fixture files so identity changes even within one timestamp tick.
+        let replacement_picture = dir.path().join("replacement.png");
         image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 240, 255]))
-            .save(&picture)
+            .save(&replacement_picture)
             .unwrap();
+        std::fs::rename(&replacement_picture, &picture).unwrap();
         let changed = SourceObservation::observe(&uri);
         assert_eq!(original.identity, changed.identity);
         assert_ne!(
@@ -2571,8 +2609,13 @@ mod tests {
             .is_none(),
             "stale source worker cannot publish old image identity"
         );
-        next_timestamp_tick(dir.path(), &xml);
-        std::fs::write(&xml, document.replace("<duration>4", "<duration>8")).unwrap();
+        let replacement_xml = dir.path().join("replacement.xml");
+        std::fs::write(
+            &replacement_xml,
+            document.replace("<duration>4", "<duration>8"),
+        )
+        .unwrap();
+        std::fs::rename(&replacement_xml, &xml).unwrap();
         assert!(
             load_animation_wallpaper(
                 &uri,
@@ -2725,6 +2768,83 @@ mod tests {
             b.sample(now, [8, 8]).unwrap().from,
             PathBuf::from("/night.png")
         );
+    }
+
+    #[test]
+    fn same_metadata_content_change_rejects_stale_cached_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let picture = dir.path().join("frame.png");
+        let red = std::sync::Arc::new(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([240, 0, 0, 255]),
+        ));
+        red.save(&picture).unwrap();
+        let original = FileIdentity::for_path(&picture).unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 240, 255]))
+            .save(&picture)
+            .unwrap();
+        let current = FileIdentity::for_path(&picture).unwrap();
+        assert_eq!(original.metadata.bytes, current.metadata.bytes);
+        // Simulate a filesystem returning every old metadata field for new
+        // bytes, independently of this machine's timestamp resolution.
+        let stale = FileIdentity {
+            metadata: current.metadata,
+            ..original
+        };
+        assert_eq!(stale.metadata, current.metadata);
+        assert_ne!(stale, current);
+        assert!(read_identity(&stale, MAX_SOURCE_BYTES).is_none());
+        assert!(read_identity(&current, MAX_SOURCE_BYTES).is_some());
+        let picture_uri = format!("file://{}", picture.display());
+        assert!(load_static_wallpaper(
+            &picture_uri,
+            PictureSettings::default(),
+            test_geometry(),
+            Some(stale.clone()),
+            None,
+        )
+        .is_none());
+
+        let xml = dir.path().join("timeline.xml");
+        std::fs::write(
+            &xml,
+            format!(
+                "<background><static><duration>4</duration><file>{}</file></static></background>",
+                picture.display()
+            ),
+        )
+        .unwrap();
+        let uri = format!("file://{}", xml.display());
+        let observed = SourceObservation::observe(&uri);
+        let sample = observed
+            .timeline
+            .as_ref()
+            .unwrap()
+            .sample(100.0, [8, 8])
+            .unwrap();
+        let caches = BackgroundCaches::default();
+        caches.images.lock().unwrap().push((stale.clone(), red));
+        assert!(load_animation_wallpaper(
+            &uri,
+            observed.identity.clone(),
+            sample.clone(),
+            vec![(picture.clone(), Some(stale))],
+            PictureSettings::default(),
+            test_geometry(),
+            &caches,
+        )
+        .is_none());
+        assert!(load_animation_wallpaper(
+            &uri,
+            observed.identity,
+            sample,
+            observed.references,
+            PictureSettings::default(),
+            test_geometry(),
+            &caches,
+        )
+        .is_some());
     }
 
     #[test]
