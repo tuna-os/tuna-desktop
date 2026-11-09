@@ -164,13 +164,61 @@ Each interface checks its caller itself. The main policies:
 |---|---|---|
 | `org.gnome.Mutter.ScreenCast`, `.RemoteDesktop`, `org.gnome.Shell.Screenshot`, `org.tuna.Screenshot` | compositor | Shell PID or authenticated installed portal. Denied while locked. |
 | `org.gnome.Mutter.ServiceChannel` | compositor | Same-user caller. Typed connections require the installed provider for that type. |
-| `org.gnome.Shell.Introspect` | compositor | Portal only. `TUNA_INTROSPECT_UNRESTRICTED=1` (test/development "unsafe mode") allows metadata only while unlocked (`introspect.rs:1-23`). |
-| `org.gnome.Shell` (OSD, search, app grid) | GTK shell | Caller must own `org.gnome.Settings`, `org.gnome.SettingsDaemon.MediaKeys` or the GNOME portal name, as GNOME's `DBusSenderChecker`. `TUNA_SHELL_DBUS_UNRESTRICTED=1` disables this for harnesses (`shell-gtk/src/shell_dbus.rs:25-29`, `372-376`). |
+| `org.gnome.Shell.Introspect` | compositor | Shell PID or authenticated installed portal (`capture_security::Authority::admit`). Denied while locked. `TUNA_INTROSPECT_UNRESTRICTED=1` (test/development "unsafe mode") allows metadata only while unlocked (`introspect.rs`). |
+| `/org/gnome/Shell/Introspect` on `org.gnome.Shell` | GTK shell relays to the compositor | The shell holds no window data and decides nothing: it forwards each call to the compositor's `org.tuna.Introspect` with the original caller's unique name. The compositor answers only when the relay is the supervised shell's PID and the original caller passes the `org.gnome.Shell.Introspect` rule above (`Authority::admit_forwarded`; `shell-gtk/src/introspect_forward.rs`). |
+| `org.gnome.Shell` (OSD, search, app grid) | GTK shell | Caller must own `org.gnome.Settings`, `org.gnome.SettingsDaemon.MediaKeys` or the GNOME portal name, as GNOME's `DBusSenderChecker`. `TUNA_SHELL_DBUS_UNRESTRICTED=1` disables this for harnesses (`shell-gtk/src/shell_dbus.rs:27-31`, `374-378`). |
 | `org.gnome.Shell.NetworkAgent` (system bus) | GTK shell | Only NetworkManager's current unique owner ([network agent](network-agent.md)). |
 | `org.freedesktop.impl.portal.Access` | shell (`org.freedesktop.impl.portal.desktop.tuna`) | Always answers "cancelled", so the requester is refused (`shell-host/src/lockdown.rs:66-83`). |
 
 Neither `UNRESTRICTED` variable is set by the packaged session
 (`share/wayland-sessions/tuna.desktop`, `crates/compositor/src/bin/tuna-session.rs`).
+
+### Native CI reference observer (not product authority)
+
+`packaging/marlin/vm-lane/tuna-vm-gnome-reference` is a fixed, finite CI
+fixture, not a capture grant or a product authorization mechanism. Its root
+controller owns `/proc` executable/start-generation observations and private
+receipts. Its UID1000 child reads existing public Gio settings and AT-SPI
+objects only. Same-UID access to `/proc/<pid>/exe` is **not** assumed:
+an actual bus daemon can be non-dumpable without invalidating that daemon.
+The fixture does not change dumpability, ptrace policy, proc mounts or bus
+security policy.
+
+The child inherits one private packet socketpair, with no listener or host
+service. Each request is bound to the spawned child's kernel
+`SCM_CREDENTIALS` and independently pinned process generation; socketpair
+`SO_PEERCRED` identifies its creator and is not used as sender identity.
+Requests cannot supply a PID, executable, command or arbitrary bus address.
+Only the existing admitted session bus and the accessibility address
+independently read from its pinned `org.a11y.Bus` owner are eligible.
+Session-bus owner queries are limited to that launcher and Mutter
+DisplayConfig. Accessibility owner queries are limited to the registry and
+unique application names in its actual root inventory, refreshed for later
+fixture launches.
+
+For a socket observation the child transfers exactly one connected Gio FD.
+The controller only inspects its address and kernel `SO_PEERCRED`; it never
+reads, authenticates or issues D-Bus calls on the child's stream. It compares
+that peer with its own independently connected fixed bus and original
+process/socket pins. Separate root-owned read-only, no-autostart connections
+resolve exact bus owners to UID/PID and `/proc` executable/hash/start/boot
+identities before and after observation. Returned child receipts must match
+those independent identities. Truncated packets, foreign senders, extra or
+missing FDs, changed peers and unobserved owners fail closed; received FDs
+are closed on success and failure. Packets are bounded to 64 KiB, requests
+to 12010, trees to 6000 nodes, and all work shares the existing at-most-25s
+operation deadline, including connection authentication.
+
+The first terminal operation failure is retained through stop and missing
+file probes; the host retrieves it before probing other receipts. This
+preserves cause, not a pass: run `41490837174`'s Tuna reference artifact
+`13168047462` recorded the UID1000 `/proc/1789/exe` permission failure.
+The GNOME artifact `13166824093` retained only a later missing
+`snapshot.json` file error after its original prepare failure was
+overwritten. Its original cause cannot be recovered from the retained
+member, serial command trace or job log. Controlled semantic regressions
+are not native qualification; fresh actual reference evidence and physical
+UI classification remain required for both legs.
 
 ## Current state compared with the target
 

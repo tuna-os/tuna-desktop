@@ -1,9 +1,15 @@
 #!/bin/bash
 # CI-only service probes on the actual guest user bus.
 set -u
-XDG_RUNTIME_DIR="/run/user/$(id -u)"
+XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export XDG_RUNTIME_DIR
 export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+# The service starts with GDM, before anyone logs in; the lane's GDM login
+# can take minutes when it retries user selection. Each probe's bounded
+# window starts once the account's user bus exists, not at boot.
+until [ -S "$XDG_RUNTIME_DIR/bus" ]; do
+    sleep 2
+done
 probe() {
     local name=$1
     shift

@@ -755,7 +755,14 @@ fn group_has_no_live_members(group: u32, deadline: Instant) -> io::Result<bool> 
         }
         let bytes = match std::fs::read(entry.path().join("stat")) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            // Reaping after open but before read returns ESRCH, not ENOENT.
+            // Either means this process can no longer keep the group alive.
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue
+            }
             Err(error) => return Err(error),
         };
         if bytes.len() > 4096 {

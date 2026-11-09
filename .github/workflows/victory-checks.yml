@@ -9,12 +9,16 @@ on:
     - cron: "17 4 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   victory-signal:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     permissions:
       contents: read

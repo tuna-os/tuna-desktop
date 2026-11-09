@@ -243,3 +243,42 @@ The frame-pacing p99 failures in the same runs are the observer's: every
 frame-pacer stall (173–307 ms) begins within 0.1–0.3 s of a 1 Hz observer
 record reaching the serial console, on both desktops (GNOME's p99 was
 200–213 ms in the same pairs).
+
+### The final settle: occluded graph damage and the frame linger (#503)
+
+In 40988065186 (EPYC 7763) the settle phase measured `tuna-compositor` at
+13.0–13.9% against gnome-shell's 5.5–7.9%, with System Monitor the only
+other busy process. Its Resources graphs redraw under Files, which leaves
+only System Monitor's top and bottom strips showing.
+
+Local replica: release `tuna-compositor` on the DRM backend (vkms,
+1280×800, llvmpipe, seatd), `tuna-shell-gtk`, GNOME Disks, and System
+Monitor and Files 51.1 with GTK 4.24.1 (the lane's versions) in the
+lane's stacking. `/proc` CPU over 30 s of the settle, percent of one core:
+
+| | main | culled damage | + no frame linger | + blocking a11y emitter |
+|---|---:|---:|---:|---:|
+| Compositor, settle | 6.0 | 3.9 | 2.1–2.2 | — |
+| llvmpipe threads, settle | 3.6 | 1.1 | 0.5–0.6 | — |
+| Repainted pixels per settle frame | 292k | 12k | 12k | — |
+| Loop wakeups per second, settle | 72 | 88 | 23 | — |
+| Compositor, idle (no windows) | 0.40 | — | — | 0.27 |
+
+- **Damage under opaque windows.** The damage tracker is given the passes
+  bottom to top, so it cannot cull by opacity, and every graph commit
+  repainted the graph's rectangle, drawing Files over it. Each window now
+  damages only what the opaque windows in front of it leave showing
+  (`native_repaint::Cover`), as drawing already culls and as Mutter clips
+  to unobscured regions. Every frame also damages one timing pixel, so a
+  frame whose damage was all hidden still records the commits it hid.
+- **No display-rate linger after a frame.** A queued frame kept the loop
+  ticking at 60 Hz for 500 ms, so a client committing 10–20 times a second
+  kept the compositor at 60 Hz. Input still lingers. Page flips, client
+  commits and the listed animations wake the loop.
+- **The accessibility keyboard emitter** polled its queue every 10 ms. It
+  now blocks until a key and is woken for a reset requested elsewhere.
+
+Not changed yet: `refresh_lockdown` still spawns `gsettings` every 2 s,
+the colour manager rescans the ICC store every 500 ms, and an idle tick
+still rebuilds the scene and re-reads the wallpaper drop file before
+deciding nothing changed.

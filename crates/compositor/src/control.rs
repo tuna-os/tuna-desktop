@@ -384,6 +384,8 @@ pub struct Session<'a> {
     pad_osd_requests: Vec<(u32, bool)>,
     /// `PadOsdClosed`s, drained by the hub.
     pad_osd_closed: Vec<u32>,
+    /// A `CloseMenuUnanimated` arrived, drained by the hub.
+    close_menu_unanimated: bool,
 }
 
 impl std::fmt::Debug for Session<'_> {
@@ -484,6 +486,7 @@ impl<'a> Session<'a> {
             pad_targets: std::rc::Rc::default(),
             pad_osd_requests: Vec::new(),
             pad_osd_closed: Vec::new(),
+            close_menu_unanimated: false,
         };
         let msg = match session.conn.read_frame() {
             Ok(msg) => msg,
@@ -608,13 +611,17 @@ impl<'a> Session<'a> {
 
     /// Ask the shell to draw GNOME's window menu.
     /// Peers older than 0.42 cannot decode `ConfirmDisplayChange`, nor
-    /// older than 0.45 the tablet OSD messages, nor older than 0.46
-    /// `OverviewSwipe`, and receive nothing.
+    /// older than 0.45 the tablet OSD messages, nor older than 0.48
+    /// `WorkspaceProgress`, nor older than 0.49 `OverviewSwipe`, and
+    /// receive nothing.
     pub fn send_window_menu(&mut self, menu: &Message) -> Result<(), ControlError> {
         if matches!(menu, Message::ConfirmDisplayChange { .. }) && self.peer_minor < 42 {
             return Ok(());
         }
-        if matches!(menu, Message::OverviewSwipe { .. }) && self.peer_minor < 46 {
+        if matches!(menu, Message::WorkspaceProgress { .. }) && self.peer_minor < 48 {
+            return Ok(());
+        }
+        if matches!(menu, Message::OverviewSwipe { .. }) && self.peer_minor < 49 {
             return Ok(());
         }
         let tablet = matches!(
@@ -674,6 +681,17 @@ impl<'a> Session<'a> {
             show: osk.show,
             touch_auto: osk.touch_auto,
         })
+    }
+
+    /// Send mutter's seat touch-mode (#502), which picks the unlock
+    /// dialog's hint. Peers older than 0.46 cannot decode it and
+    /// receive nothing.
+    pub fn send_seat_touch_mode(&mut self, touch_mode: bool) -> Result<(), ControlError> {
+        if self.peer_minor < 46 {
+            return Ok(());
+        }
+        self.conn
+            .write_frame(&Message::SeatTouchMode { touch_mode })
     }
 
     /// Send where the overview's window previews sit.
@@ -1125,6 +1143,17 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
+                kind: CommandKind::CloseMenuUnanimated,
+            } => {
+                self.close_menu_unanimated = true;
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
                 kind: CommandKind::WindowAction { window, action },
             } => {
                 // The window manager carries it out (drained by the hub);
@@ -1254,6 +1283,7 @@ impl<'a> Session<'a> {
             | Message::AcceleratorDeactivated { .. }
             | Message::WindowMenu { .. }
             | Message::WorkspacePopup { .. }
+            | Message::WorkspaceProgress { .. }
             | Message::PointerOutput { .. }
             | Message::ScreenReader { .. }
             | Message::KeyboardAidToggled { .. }
@@ -1268,6 +1298,7 @@ impl<'a> Session<'a> {
             | Message::PadOsdLabels { .. }
             | Message::PadOsdInput { .. }
             | Message::ClosePadOsd { .. }
+            | Message::SeatTouchMode { .. }
             | Message::OverviewSwipe { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
@@ -1313,6 +1344,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::AcceleratorDeactivated { .. } => "AcceleratorDeactivated",
         Message::WindowMenu { .. } => "WindowMenu",
         Message::WorkspacePopup { .. } => "WorkspacePopup",
+        Message::WorkspaceProgress { .. } => "WorkspaceProgress",
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
         Message::ConfirmDisplayChange { .. } => "ConfirmDisplayChange",
@@ -1327,6 +1359,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::PadOsdLabels { .. } => "PadOsdLabels",
         Message::PadOsdInput { .. } => "PadOsdInput",
         Message::ClosePadOsd { .. } => "ClosePadOsd",
+        Message::SeatTouchMode { .. } => "SeatTouchMode",
         Message::OverviewSwipe { .. } => "OverviewSwipe",
     }
 }
@@ -1504,6 +1537,7 @@ fn apply_command(
         | CommandKind::CancelVerification
         | CommandKind::RequestPadOsd { .. }
         | CommandKind::PadOsdClosed { .. }
+        | CommandKind::CloseMenuUnanimated
         | CommandKind::SwitchInputSource { .. }
         | CommandKind::SetWindowIconGeometries { .. }
         | CommandKind::SetWellbeingEffects { .. }
@@ -1581,6 +1615,8 @@ pub struct PollOutcome {
     pub pad_osd_requests: Vec<(u32, bool)>,
     /// Pad OSDs the shell closed, in order.
     pub pad_osd_closed: Vec<u32>,
+    /// The shell closed a panel menu unanimated (its button was hidden).
+    pub close_menu_unanimated: bool,
     /// Input-source switches to make (`true` backward), in order.
     pub input_source_switches: Vec<bool>,
     /// New switcher thumbnail frames, if the shell sent any.
@@ -1737,6 +1773,10 @@ pub struct ControlHub {
     /// intent (level), steps are discrete events: each one is sent to
     /// every live session exactly once, retained until all sends land.
     switcher_queue: Vec<SwitcherAction>,
+    /// The connection whose switcher thumbnails are drawn. The shell
+    /// clears them when its popup's fade ends; a shell that goes away
+    /// first takes them with it, as GNOME's clones die with its popup.
+    switcher_thumbnails_owner: Option<u64>,
     /// Accelerator presses waiting for the next poll.
     accelerator_queue: Vec<(u32, u32, u32, bool)>,
     /// Window-menu requests waiting for the next poll.
@@ -1745,6 +1785,10 @@ pub struct ControlHub {
     /// and the value every live session holds (#349).
     osk: OskBroadcast,
     osk_sent: Option<OskBroadcast>,
+    /// Mutter's seat touch-mode as last set by the runtime, and the
+    /// value every live session holds (#502).
+    touch_mode: bool,
+    touch_mode_sent: Option<bool>,
     /// Output inventory last handed to [`set_outputs`](Self::set_outputs)
     /// (multi-monitor): the runtime refreshes this every tick from the
     /// compositor's tracking, and [`poll`](Self::poll) broadcasts it
@@ -1838,12 +1882,16 @@ impl ControlHub {
             lockdown_rx,
             lockdown_inflight,
             switcher_queue: Vec::new(),
+            switcher_thumbnails_owner: None,
             accelerator_queue: Vec::new(),
             menu_queue: Vec::new(),
             osk: OskBroadcast::default(),
             // No focus and no auto-show is what a shell assumes before
             // any message: only a change is owed.
             osk_sent: Some(OskBroadcast::default()),
+            // No touch-mode is what a shell assumes before any message.
+            touch_mode: false,
+            touch_mode_sent: Some(false),
             outputs: Vec::new(),
             native_outputs: Vec::new(),
             pointer_output: None,
@@ -1991,6 +2039,7 @@ impl ControlHub {
             || self.outputs != self.outputs_sent
             || !self.switcher_queue.is_empty()
             || self.osk_sent != Some(self.osk)
+            || self.touch_mode_sent != Some(self.touch_mode)
             || !self.accelerator_queue.is_empty()
             || !self.menu_queue.is_empty()
             || self.sessions.iter().any(|s| s.owes_deltas(model));
@@ -2054,6 +2103,12 @@ impl ControlHub {
         self.osk.focus = focus;
         self.osk.touch_auto = touch_auto;
         self.osk.show = (self.osk.show || show) && focus.is_some();
+    }
+
+    /// Refresh mutter's seat touch-mode (#502); the next
+    /// [`poll`](Self::poll) broadcasts a change.
+    pub fn set_seat_touch_mode(&mut self, touch_mode: bool) {
+        self.touch_mode = touch_mode;
     }
 
     /// Set the session environment (#59); the next [`poll`](Self::poll)
@@ -2377,10 +2432,14 @@ impl ControlHub {
                     outcome
                         .pad_osd_closed
                         .extend(std::mem::take(&mut session.pad_osd_closed));
+                    outcome.close_menu_unanimated |=
+                        std::mem::take(&mut session.close_menu_unanimated);
                     outcome
                         .input_source_switches
                         .extend(std::mem::take(&mut session.input_source_switches));
                     if let Some(thumbnails) = session.switcher_thumbnails.take() {
+                        self.switcher_thumbnails_owner =
+                            (!thumbnails.is_empty()).then_some(session.connection_id);
                         outcome.switcher_thumbnails = Some(thumbnails);
                     }
                     if let Some(keys) = session.switcher_keys.take() {
@@ -2464,6 +2523,15 @@ impl ControlHub {
             } else {
                 self.sessions.swap_remove(i);
                 self.session_peers.swap_remove(i);
+            }
+        }
+        // The thumbnails' shell disconnected, crashed or was replaced
+        // (a narrowed gate evicts the old one) while they were drawn:
+        // nobody is left to fade them out.
+        if let Some(owner) = self.switcher_thumbnails_owner {
+            if !self.sessions.iter().any(|s| s.connection_id == owner) {
+                self.switcher_thumbnails_owner = None;
+                outcome.switcher_thumbnails = Some(Vec::new());
             }
         }
         // A Lock command changes the logical lock before Runtime::engage_lock
@@ -2557,6 +2625,17 @@ impl ControlHub {
                 // The input-panel request is an edge: sent once.
                 self.osk.show = false;
                 self.osk_sent = Some(self.osk);
+            }
+        }
+        if self.touch_mode_sent != Some(self.touch_mode) {
+            let mut all_sent = true;
+            for session in &mut self.sessions {
+                if session.send_seat_touch_mode(self.touch_mode).is_err() {
+                    all_sent = false;
+                }
+            }
+            if all_sent {
+                self.touch_mode_sent = Some(self.touch_mode);
             }
         }
         if self.outputs != self.outputs_sent {
@@ -2668,6 +2747,9 @@ impl ControlHub {
                 };
                 if osk != OskBroadcast::default() {
                     let _ = session.send_on_screen_keyboard(osk);
+                }
+                if self.touch_mode {
+                    let _ = session.send_seat_touch_mode(true);
                 }
                 if self.pointer_output.is_some() {
                     let _ = session.send_window_menu(&Message::PointerOutput {
@@ -2933,7 +3015,7 @@ mod auth_origin_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
-    fn setup() -> (tempfile::TempDir, ControlHub, StateModel) {
+    pub(super) fn setup() -> (tempfile::TempDir, ControlHub, StateModel) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(is_private_dir(dir.path()));
@@ -2945,7 +3027,7 @@ mod auth_origin_tests {
         .unwrap();
         (dir, hub, StateModel::new())
     }
-    fn connect(hub: &mut ControlHub, model: &mut StateModel) -> ControlConn {
+    pub(super) fn connect(hub: &mut ControlHub, model: &mut StateModel) -> ControlConn {
         let mut client = ControlConn::new(UnixStream::connect(hub.socket_path()).unwrap()).unwrap();
         client
             .write_frame(&Message::Hello {
@@ -2958,7 +3040,7 @@ mod auth_origin_tests {
         drain(&mut client);
         client
     }
-    fn drain(client: &mut ControlConn) -> Vec<(u64, CommandStatus)> {
+    pub(super) fn drain(client: &mut ControlConn) -> Vec<(u64, CommandStatus)> {
         let mut out = Vec::new();
         loop {
             match client.read_frame() {
@@ -3267,5 +3349,81 @@ mod auth_origin_tests {
         assert_eq!(hub.sessions.len(), 1);
         assert!(hub.next_connection.is_none());
         assert!(hub.refused_count() > 0);
+    }
+}
+
+#[cfg(test)]
+mod switcher_thumbnail_tests {
+    use super::auth_origin_tests::{connect, drain, setup};
+    use super::*;
+
+    fn send_thumbnails(client: &mut ControlConn, id: u64, windows: &[u64]) {
+        let thumbnails = windows
+            .iter()
+            .map(|&window| tuna_shell_control::SwitcherThumbnail {
+                window,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                opacity: 128,
+            })
+            .collect();
+        client
+            .write_frame(&Message::Command {
+                id,
+                kind: CommandKind::SetSwitcherThumbnails { thumbnails },
+            })
+            .unwrap();
+    }
+
+    /// Every thumbnail list the runtime is handed over a few rounds,
+    /// enough for a closed peer's EOF to be seen.
+    fn applied(
+        hub: &mut ControlHub,
+        model: &mut StateModel,
+    ) -> Vec<Vec<tuna_shell_control::SwitcherThumbnail>> {
+        (0..3)
+            .filter_map(|_| hub.poll(model).switcher_thumbnails)
+            .collect()
+    }
+
+    #[test]
+    fn a_departed_shell_takes_its_switcher_thumbnails_with_it() {
+        let (_dir, mut hub, mut model) = setup();
+        let mut shell = connect(&mut hub, &mut model);
+        let other = connect(&mut hub, &mut model);
+        send_thumbnails(&mut shell, 1, &[7, 8]);
+        let drawn = applied(&mut hub, &mut model);
+        assert_eq!(drawn.len(), 1);
+        assert_eq!(drawn[0].len(), 2);
+        assert_eq!(drain(&mut shell), [(1, CommandStatus::Applied)]);
+        // Another peer leaving changes nothing.
+        drop(other);
+        assert!(applied(&mut hub, &mut model).is_empty());
+        assert_eq!(hub.sessions.len(), 1);
+        // The shell dies mid-fade: the hub clears the drawn images once.
+        drop(shell);
+        assert_eq!(applied(&mut hub, &mut model), [Vec::new()]);
+        assert!(hub.sessions.is_empty());
+        assert!(applied(&mut hub, &mut model).is_empty());
+
+        // A shell that cleared its own thumbnails owes nothing on exit.
+        let mut shell = connect(&mut hub, &mut model);
+        send_thumbnails(&mut shell, 2, &[7]);
+        assert_eq!(applied(&mut hub, &mut model).len(), 1);
+        send_thumbnails(&mut shell, 3, &[]);
+        assert_eq!(applied(&mut hub, &mut model), [Vec::new()]);
+        drop(shell);
+        assert!(applied(&mut hub, &mut model).is_empty());
+
+        // A replaced shell: the gate narrows to the new process and
+        // evicts the old session while its thumbnails are drawn.
+        let mut shell = connect(&mut hub, &mut model);
+        send_thumbnails(&mut shell, 4, &[7]);
+        assert_eq!(applied(&mut hub, &mut model).len(), 1);
+        hub.set_peer_gate(PeerGate::Closed);
+        assert_eq!(applied(&mut hub, &mut model), [Vec::new()]);
+        assert!(hub.sessions.is_empty());
     }
 }

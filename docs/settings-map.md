@@ -46,16 +46,28 @@ GNOME 51 `org.gnome.desktop.a11y.interface reduced-motion` is read live and comb
 | org.gnome.desktop.screensaver picture-uri | Honored | Blurred, dimmed lock background; empty or missing files fall back to the desktop wallpaper |
 | org.gnome.desktop.notifications show-banners | Honored | Mirrors Do Not Disturb live in both directions. Proof G-NOTIFY-DND and G-SETTINGS-NOTIFICATIONS (external writes and banner policy) |
 | org.gnome.desktop.search-providers (all keys) | Honored | disable-external, disabled, enabled and sort-order. Proof G-SEARCH-PROVIDER |
-| org.gnome.desktop.background picture-uri, picture-uri-dark | Honored | Wallpaper: live publish, file identity, decode and visible repaint, with file-replacement refresh, an ignored invalid URI and revert. Proof G-SET-WALLPAPER |
+| org.gnome.desktop.background picture-uri, picture-uri-dark | Honored | Wallpaper: live publish, metadata and content identity, decode and visible repaint, with file-replacement refresh, an ignored invalid URI and revert. Proof G-SET-WALLPAPER |
 | org.gnome.shell favorite-apps | Honored | Used for the dash when Tuna Desktop has no pins of its own |
 | org.gnome.desktop.app-folders (folder-children and each folder's name, apps, categories, excluded-apps, translate) | Honored | App-grid folders, read on each grid open. Proof G-APP-FOLDERS |
 | org.gnome.shell command-history | Honored | the Run a Command dialog's Up/Down history, GNOME's `HistoryManager` (512 entries, moved-to-end, live reload); written on every new line (`crates/shell-gtk/src/run_dialog.rs`, #357) |
 | org.gnome.shell enabled-extensions | Ignored | GNOME Shell extensions are JavaScript. Tuna Desktop has its own extension point |
+| org.gnome.desktop.media-handling automount, autorun-never, autorun-x-content-start-app, autorun-x-content-ignore, autorun-x-content-open-folder | Honored | GNOME Shell 51's automount and autorun components in the GTK shell (`crates/shell-gtk/src/removable_media.rs`): hotplugged volumes mount while unlocked, active and uninhibited (automount inhibitor flag 16 from the compositor's `org.gnome.SessionManager`); a new mount launches its first `x-content` type's default app, opens the folder, does nothing, or posts the "“name” connected" notification with "Open with" actions. Mounts without an `x-content` type are sniffed in-process (gnome-shell's hotplug sniffer). `automount-open` has no GNOME 51 consumer (#361) |
+| org.gnome.shell remember-mount-password | Honored | The shell's volume passphrase prompt (`crates/shell-gtk/src/mount_operation.rs`, GNOME's `ShellMountPasswordDialog`) starts "Remember Password" from it and writes the choice back on Unlock (#361) |
 | org.gnome.settings-daemon.plugins.color night-light-enabled | Honored | The Night Light tile writes it; the compositor reads it live and tints every output in GL. It owns `org.gnome.SettingsDaemon.Color`, so gsd-color is not started. Proof G-QS-NIGHT (#339) |
 | org.gnome.settings-daemon.plugins.color night-light-temperature, night-light-schedule-automatic, night-light-schedule-from, night-light-schedule-to, night-light-last-coordinates | Honored | Read live by the compositor: gsd 51's clamp, local-time automatic and from/to schedules (midnight wrap, DST, runtime zone change), one-hour edge smear and 5 s jump smoothing. Geoclue never updates night-light-last-coordinates, so automatic mode uses the stored value or the from/to window. Proof G-QS-NIGHT drives NightLightPreview against night-light-temperature (#339) |
 | org.gnome.settings-daemon.plugins.power idle-dim, idle-brightness | Honored | gsd-power calls the shell's `org.gnome.Shell.Brightness.SetDimming`; the shell clips to `idle-brightness`. Proof V-GSD-POWER-IDLE (call observed; no physical backlight in the VM) |
 | org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout, sleep-inactive-ac-type, sleep-inactive-battery-timeout, sleep-inactive-battery-type, power-saver-profile-on-low-battery, ambient-enabled | Honored (unqualified) | Consumed by the running gsd-power; automatic suspend, battery policy and ambient light are not proven (gsd-power never suspends a VM) |
 | org.gnome.settings-daemon.plugins.power power-button-action | Honored | gsd-media-keys holds logind's `handle-power-key`, `handle-suspend-key` and `handle-hibernate-key` block inhibitor, so logind's HandlePowerKey never applies. The power key follows the key live, as in GNOME 51: `interactive` calls `org.gnome.SessionManager.Shutdown`, which opens the shell's end-session dialog (nothing while locked); `suspend` and `hibernate` go through logind and fall back to the dialog when logind cannot do them; `nothing` does nothing. gsd 51 powers a virtual machine (hostnamed chassis `vm`) off for every value except `nothing`. Proof V-POWER-BUTTON |
+
+Wallpaper source observations run on bounded workers, with one-second re-observation
+eligibility rather than filesystem reads on the frame thread. File identities include
+the bounded source's SHA-256 as well as device, inode, size and nanosecond mtime/ctime:
+same-length in-place edits must invalidate static caches and slideshow epochs even
+when the filesystem coalesces timestamps. Decode workers validate the bytes against
+the observed digest and recheck source identities before publishing. Native SVG
+FontConfig directory observations also re-enumerate sorted raw member names before
+accepting a receipt; unchanged directory metadata alone does not prove membership
+is unchanged.
 
 ## GNOME Settings Daemon plugins
 
@@ -69,10 +81,11 @@ targets below; the compositor holds gnome-session's leader FIFO so the targets
 and plugins stop with the session, and starts
 `gnome-session-x11-services-ready.target` when Xwayland is up, as GNOME Shell
 51 does. The compositor serves the `org.gnome.SessionManager` subset the
-plugins use (`InhibitedActions`, `SessionIsActive`, `Inhibit`, `Uninhibit`,
-`IsInhibited`, `GetInhibitors`, and `Shutdown`, `Reboot` and `Logout`, which
-open the shell's `org.gnome.SessionManager.EndSessionDialog`); idle inhibitors
-also hold off Tuna's idle lock.
+plugins and the shell's power menu use (`InhibitedActions`, `SessionIsActive`,
+`Inhibit`, `Uninhibit`, `IsInhibited`, `GetInhibitors`, `Suspend`, and
+`Shutdown`, `Reboot` and `Logout`, which open the shell's
+`org.gnome.SessionManager.EndSessionDialog` and carry its confirmation out);
+idle inhibitors also hold off Tuna's idle lock.
 Its `RestoreSupported` is false, as gnome-session 51 reports it, so GNOME
 Settings hides "Reopen Windows After Login"; window restoration is the client
 opt-in of `xdg_session_manager_v1` (P-SY-08).

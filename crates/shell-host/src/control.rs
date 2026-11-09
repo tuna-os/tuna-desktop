@@ -86,6 +86,14 @@ pub enum Handled {
         /// How many workspaces there are.
         count: u32,
     },
+    /// A finger-following workspace swipe moved (or released) the strip:
+    /// the Activities dots follow it.
+    WorkspaceProgress {
+        /// Workspace index in `WORKSPACE_PROGRESS_SCALE`ths.
+        position: u32,
+        /// 0 while held; the settle time on release, in microseconds.
+        duration_us: u32,
+    },
     /// A client asked for GNOME's window menu.
     WindowMenu(WindowMenuRequest),
     /// Connector under the compositor pointer changed.
@@ -125,6 +133,8 @@ pub enum Handled {
     ClosePadOsd {
         pad: u32,
     },
+    /// Mutter's seat touch-mode changed (the unlock dialog's hint).
+    SeatTouchMode(bool),
     /// A touchpad swipe holds (`settle_us: None`) or settles GNOME's
     /// overview controls state: the app grid follows it.
     OverviewSwipe {
@@ -791,6 +801,17 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// Tell the compositor the panel menu closing now goes unanimated
+    /// (`PanelMenu.Button.vfunc_hide`): draw no BoxPointer close for it.
+    pub fn close_menu_unanimated(&mut self) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::CloseMenuUnanimated,
+        })?;
+        Ok(id)
+    }
+
     /// Carry out one of GNOME's window-menu actions. Returns the request id.
     pub fn window_action(
         &mut self,
@@ -1201,6 +1222,7 @@ impl ControlClient {
             Message::PadOsdLabels { pad, labels } => Ok(Handled::PadOsdLabels { pad, labels }),
             Message::PadOsdInput { pad, event } => Ok(Handled::PadOsdInput { pad, event }),
             Message::ClosePadOsd { pad } => Ok(Handled::ClosePadOsd { pad }),
+            Message::SeatTouchMode { touch_mode } => Ok(Handled::SeatTouchMode(touch_mode)),
             Message::OverviewSwipe { state, settle_us } => {
                 Ok(Handled::OverviewSwipe { state, settle_us })
             }
@@ -1234,6 +1256,13 @@ impl ControlClient {
             Message::WorkspacePopup { index, count } => {
                 Ok(Handled::WorkspacePopup { index, count })
             }
+            Message::WorkspaceProgress {
+                position,
+                duration_us,
+            } => Ok(Handled::WorkspaceProgress {
+                position,
+                duration_us,
+            }),
             Message::AcceleratorDeactivated { action, time, mode } => {
                 // A GRAB_TRIGGER_RELEASE grab's release: UI state only.
                 Ok(Handled::AcceleratorDeactivated { action, time, mode })
@@ -1486,6 +1515,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::AcceleratorDeactivated { .. } => "AcceleratorDeactivated",
         Message::WindowMenu { .. } => "WindowMenu",
         Message::WorkspacePopup { .. } => "WorkspacePopup",
+        Message::WorkspaceProgress { .. } => "WorkspaceProgress",
         Message::ScreenReader { .. } => "ScreenReader",
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
@@ -1500,6 +1530,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::PadOsdLabels { .. } => "PadOsdLabels",
         Message::PadOsdInput { .. } => "PadOsdInput",
         Message::ClosePadOsd { .. } => "ClosePadOsd",
+        Message::SeatTouchMode { .. } => "SeatTouchMode",
         Message::OverviewSwipe { .. } => "OverviewSwipe",
     }
 }
@@ -1721,6 +1752,8 @@ mod tests {
         server_write(&mut peer, &snapshot_rev7());
         client.poll().unwrap();
         assert!(client.input_method_actions_allowed());
+        peer.shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(peer);
         assert!(client.poll().is_err());
         assert!(!client.input_method_actions_allowed());
@@ -1786,6 +1819,9 @@ mod tests {
         client.poll().unwrap();
         assert!(client.input_method_actions_allowed());
         let generation = client.connection_generation();
+        first_peer
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(first_peer);
         assert!(client.poll().is_err());
         assert_eq!(client.connection_generation(), generation + 1);
@@ -2006,6 +2042,10 @@ mod tests {
                 Handled::ClosePadOsd { pad: 3 },
             ),
             (
+                Message::SeatTouchMode { touch_mode: true },
+                Handled::SeatTouchMode(true),
+            ),
+            (
                 Message::OverviewSwipe {
                     state: 15_000,
                     settle_us: None,
@@ -2056,6 +2096,19 @@ mod tests {
             Message::Command {
                 id: second,
                 kind: CommandKind::PadOsdClosed { pad: 3 },
+            }
+        );
+    }
+
+    #[test]
+    fn unanimated_menu_close_reaches_the_compositor() {
+        let (mut client, mut peer) = handshook();
+        let id = client.close_menu_unanimated().expect("sent");
+        assert_eq!(
+            server_read(&mut peer),
+            Message::Command {
+                id,
+                kind: CommandKind::CloseMenuUnanimated,
             }
         );
     }
@@ -2158,14 +2211,22 @@ mod tests {
         assert_eq!(client.native_outputs(), &[owner]);
 
         // Transport loss and socket gone: redial fails, native_outputs must be cleared.
+        // Match real endpoint teardown even when another test's fork retains
+        // a descriptor until exec. Dropping one descriptor alone is not EOF.
+        let inherited_peer = server1.try_clone().expect("retained peer descriptor");
+        server1
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(server1);
         drop(listener);
         std::fs::remove_file(&path).expect("remove socket");
-        assert!(client.poll().is_err());
+        assert!(matches!(client.poll(), Err(ControlError::Io(error))
+            if !matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)));
         assert!(
             client.native_outputs().is_empty(),
             "failed redial must clear connection-scoped native outputs"
         );
+        drop(inherited_peer);
     }
 
     #[test]
@@ -2206,6 +2267,9 @@ mod tests {
         assert_eq!(client.native_outputs(), &[owner]);
 
         // Server 1 drops connection. Server 2 accepts reconnect.
+        server1
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(server1);
         // Redial attempt
         let (mut server2, _) = loop {
@@ -2260,11 +2324,21 @@ mod tests {
             },
         );
         client.poll().unwrap();
-        assert_eq!(client.native_outputs(), &[owner]);
+        assert_eq!(client.native_outputs(), std::slice::from_ref(&owner));
 
-        // Peer drops stream.
+        // A retained duplicate is an open endpoint, not transport loss.
+        let inherited_peer = peer.try_clone().expect("retained peer descriptor");
         drop(peer);
-        assert!(client.poll().is_err());
+        assert!(matches!(client.poll(), Err(ControlError::Io(error))
+            if error.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(client.native_outputs(), &[owner]);
+        assert!(!client.is_closed());
+        inherited_peer
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
+        drop(inherited_peer);
+        assert!(matches!(client.poll(), Err(ControlError::Io(error))
+            if error.kind() == io::ErrorKind::UnexpectedEof));
         assert!(
             client.native_outputs().is_empty(),
             "EOF must immediately clear native_outputs"
@@ -2784,6 +2858,9 @@ mod tests {
         );
         client.poll().unwrap();
         assert!(client.reconcile_wellbeing_effects(true, true).unwrap());
+        first_peer
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(first_peer);
         assert!(client.poll().is_err());
         assert_eq!(client.connection_generation(), 1);
@@ -2831,6 +2908,8 @@ mod tests {
             },
         );
         client.poll().unwrap();
+        peer.shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(peer);
         drop(listener);
         std::fs::remove_file(&path).unwrap();
@@ -3092,6 +3171,9 @@ mod tests {
         let (server1, _) = listener.accept().expect("accept one");
         // Hub and socket both gone: the redial must fail cleanly, not
         // hang or recurse.
+        server1
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(server1);
         drop(listener);
         std::fs::remove_file(&path).expect("remove socket");
@@ -3125,6 +3207,9 @@ mod tests {
         // An incomplete old frame must not contaminate the new stream.
         server1.write_all(&[10, 0, 0, 0, 1]).expect("partial frame");
         let generation = client.connection_generation();
+        server1
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(server1);
         assert!(matches!(client.poll(), Err(ControlError::WouldBlock)));
         assert!(client.needs_snapshot());
@@ -3172,6 +3257,9 @@ mod tests {
         let (path, listener) = listener_at(&dir);
         let mut client = ControlClient::connect(&path).expect("connect");
         let (server, _) = listener.accept().expect("accept");
+        server
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(server);
         drop(listener);
         std::fs::remove_file(&path).expect("remove socket");
@@ -3188,6 +3276,8 @@ mod tests {
     #[test]
     fn supplied_stream_reports_eof_without_redial() {
         let (mut client, peer) = pair();
+        peer.shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(peer);
         assert!(matches!(client.poll(), Err(ControlError::Io(e))
             if e.kind() == io::ErrorKind::UnexpectedEof));

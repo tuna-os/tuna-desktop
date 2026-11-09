@@ -16,6 +16,11 @@ before decoding.
   `ProtocolVersion::CURRENT` in `src/lib.rs`, whose doc comment lists every
   minor; the wire-change rules are in the
   [API stability policy](../../docs/api-stability.md#shell-control-protocol-tuna-shell-control).
+- Workspace swipe progress (0.48): `Message::WorkspaceProgress { position,
+  duration_us }` (peers >=48 only) carries a finger-following workspace
+  swipe's position in `WORKSPACE_PROGRESS_SCALE`ths of a workspace on begin,
+  each update and release (with the settle duration), so the shell's
+  Activities dots follow the fingers as GNOME 51's do.
 - Display-change confirmation (0.42): `Message::ConfirmDisplayChange
   { timeout_secs }` (sent only to peers advertising minor >=42) asks the shell
   for GNOME's "Keep these display settings?" dialog; the shell answers with
@@ -33,8 +38,8 @@ before decoding.
 - Dash targets: `WindowIconGeometry`, `MAX_WINDOW_ICON_GEOMETRIES`, and
   appended `CommandKind::SetWindowIconGeometries` full replacements. Unknown
   windows are ignored by the compositor; an empty list selects monitor fallback.
-- Overview swipe (0.46): `Message::OverviewSwipe { state, settle_us }`
-  (peers >=46 only) carries GNOME's overview controls state while a
+- Overview swipe (0.49): `Message::OverviewSwipe { state, settle_us }`
+  (peers >=49 only) carries GNOME's overview controls state while a
   touchpad swipe holds it (`settle_us: None`) and where and how fast its
   release settles, in `OVERVIEW_STATE_SCALE`ths up to `MAX_OVERVIEW_STATE`
   (the app grid); the shell's app grid follows it above the window picker.

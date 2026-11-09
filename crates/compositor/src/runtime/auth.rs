@@ -193,9 +193,7 @@ impl Runtime {
         if let (Some(doc), serde_json::Value::Object(extra)) = (doc.as_object_mut(), extra) {
             doc.extend(extra);
         }
-        // One write per line: the nested proofs share this stderr file.
-        let line = format!("tuna-compositor: lock conversation {doc}\n");
-        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+        eprintln!("tuna-compositor: lock conversation {doc}");
     }
 
     /// Relay one step; a lost origin cancels that conversation.

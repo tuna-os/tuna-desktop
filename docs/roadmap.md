@@ -6,6 +6,7 @@ This page holds the [public 12-month roadmap](#public-roadmap) (dated priorities
 **Architecture:** [Program architecture](architecture.md)  
 **Parity target:** GNOME 51 on the Marlin image family. Decided 2026-10-01. The published Marlin GNOME image measured on 2026-10-04 contains GNOME Shell 50.5, so GNOME 51 comparison evidence must identify its separately upgraded reference payload.
 **Target platform:** v1 targets every TunaOS variant, each qualified from its own image digest or explicitly unsupported with a recorded reason ([ADR 0008](adr/0008-v1-beta-track-and-release-scope.md)). Marlin remains the GNOME 51 parity/performance comparator; reference and candidate use the same VM image family.
+**Variant evidence:** [Source-backed 14-variant inventory and digest qualification matrix](v1-variant-qualification.md); package availability and stale unsupported declarations do not satisfy runtime gates.
 **Planning system:** Spektacular spec → plan → implement. Every delivery unit has a spek, a reviewed implementation plan, evidence, and an explicit gate.
 
 ## Public roadmap

@@ -4,7 +4,10 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import urllib.request
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import github_api  # noqa: E402
 
 REPO = "tuna-os/tuna-desktop"
 WORKFLOW = ".github/workflows/ci.yml"
@@ -32,20 +35,17 @@ def source_tuple(root):
 
 
 def api(path):
-    request = urllib.request.Request(f"https://api.github.com/repos/{REPO}/{path}", headers={
-        "Authorization": f"Bearer {os.environ['GH_TOKEN']}", "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28"})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        data = response.read(4 * 1024 * 1024 + 1)
-    if len(data) > 4 * 1024 * 1024:
-        raise ValueError("GitHub API response exceeds bounded admission size")
-    return json.loads(data)
+    return github_api.repo_json(REPO, path)
 
 
-def validate_identity(run, jobs, commit, expected_sha, run_id, attempt, event):
+def validate_identity(run, jobs, commit, expected_sha, run_id, attempt, event, event_head_sha, checked_sha):
+    if (not isinstance(event_head_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", event_head_sha)
+            or not isinstance(checked_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", checked_sha)
+            or expected_sha != checked_sha):
+        raise ValueError("explicit CI event head and checked source must match checkout provenance")
     if (run.get("id") != run_id or run.get("run_attempt") != attempt
             or run.get("repository", {}).get("full_name") != REPO
-            or run.get("head_sha") != expected_sha or run.get("path") != WORKFLOW
+            or run.get("head_sha") != event_head_sha or run.get("path") != WORKFLOW
             or run.get("event") != event or event not in ("workflow_dispatch", "pull_request", "push", "schedule")
             or run.get("status") not in ("in_progress", "queued") or run.get("conclusion") is not None
             or commit.get("sha") != expected_sha):
@@ -56,14 +56,14 @@ def validate_identity(run, jobs, commit, expected_sha, run_id, attempt, event):
                     ("id", "run_attempt", "head_sha", "path", "event", "status", "conclusion")}
         observed["repository"] = run.get("repository", {}).get("full_name")
         observed["commit_sha"] = commit.get("sha")
-        expected = {"id": run_id, "run_attempt": attempt, "head_sha": expected_sha,
+        expected = {"id": run_id, "run_attempt": attempt, "head_sha": event_head_sha,
                     "path": WORKFLOW, "event": event, "status": ["in_progress", "queued"],
                     "conclusion": None, "repository": REPO, "commit_sha": expected_sha}
         raise ValueError("CI repository/run/attempt/source/event/workflow mismatch: " +
                          json.dumps({"expected": expected, "observed": observed}, sort_keys=True))
     # The aggregate run may report queued while this exact job is running.
     # Admission still requires this exact job running and its exact green
-    # prerequisite, with matching source/run/attempt for both below.
+    # prerequisite, with matching event head/run/attempt for both below.
     current = [j for j in jobs if j.get("name") == JOB]
     check = [j for j in jobs if j.get("name") == "check"]
     if (len(current) != 1 or current[0].get("status") != "in_progress"
@@ -72,10 +72,10 @@ def validate_identity(run, jobs, commit, expected_sha, run_id, attempt, event):
             or check[0].get("conclusion") != "success"):
         raise ValueError("current comparison job and exact green prerequisite check required")
     for job in (current[0], check[0]):
-        if job.get("head_sha") != expected_sha or job.get("run_id") != run_id or job.get("run_attempt") != attempt:
+        if job.get("head_sha") != event_head_sha or job.get("run_id") != run_id or job.get("run_attempt") != attempt:
             raise ValueError("CI job source/run/attempt mismatch")
     return {"repository": REPO, "workflow": WORKFLOW, "run": run_id, "attempt": attempt,
-            "event": event, "head": expected_sha, "tree": commit["tree"]["sha"],
+            "event": event, "head": expected_sha, "event_head": event_head_sha, "tree": commit["tree"]["sha"],
             "job_id": current[0]["id"], "check_job_id": check[0]["id"]}
 
 
@@ -84,12 +84,15 @@ def current_identity(root):
     run_id, attempt = int(os.environ["GITHUB_RUN_ID"]), int(os.environ["GITHUB_RUN_ATTEMPT"])
     if os.environ.get("GITHUB_REPOSITORY") != REPO or os.environ.get("GITHUB_JOB") != JOB:
         raise ValueError("wrong CI repository/job")
+    if os.environ["GITHUB_SHA"] != os.environ["TUNA_CI_CHECKED_SHA"]:
+        raise ValueError("checked source does not match workflow event commit")
     jobs = api(f"actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100")
     if jobs.get("total_count", 101) > 100:
         raise ValueError("CI job admission requires complete bounded job page")
     result = validate_identity(api(f"actions/runs/{run_id}"), jobs.get("jobs", []),
                                api(f"git/commits/{source['sha']}"), source["sha"],
-                               run_id, attempt, os.environ["GITHUB_EVENT_NAME"])
+                               run_id, attempt, os.environ["GITHUB_EVENT_NAME"],
+                               os.environ["TUNA_CI_EVENT_HEAD_SHA"], os.environ["TUNA_CI_CHECKED_SHA"])
     if result["tree"] != source["tree"]:
         raise ValueError("GitHub source tree does not match checkout")
     return result
