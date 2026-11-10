@@ -24,7 +24,8 @@ labelled **target**.
   shown or receives input, and only the session user's own credentials
   unlock it.
 - **Window metadata.** Window titles and application identities are
-  private. They are published only to the portal's picker.
+  private. They are published only to the supervised shell (its window
+  list and `ext_foreign_toplevel_list_v1`) and the portal's picker.
 - **Shell authority.** Commands sent over the shell control socket can
   focus or close windows, drive the overview and engage the lock. Only the
   supervised shell may hold a session on that socket.
@@ -163,8 +164,22 @@ refuse locked frames. Full detail and the qualification evidence:
   (`layer_shell_is_visible_and_bindable_only_by_the_supervised_shell`).
 - `mutter_x11_interop` is visible only to typed service-channel
   connections (`x11_interop.rs:65-67`).
-- `ext_session_lock_manager_v1` is advertised to every client, but a lock
-  is granted only to the supervised shell's PID (`session_lock.rs:63-82`).
+- `ext_foreign_toplevel_list_v1` (every window's title and app id) is
+  visible and bindable only to the supervised shell's connection, with the
+  same filter as layer-shell (#1046). Evidence:
+  `crates/compositor/tests/protocols.rs`
+  (`the_shell_lists_toplevels_until_they_close_and_apps_cannot_bind_the_list`).
+- `ext_session_lock_manager_v1` is advertised to every client outside a
+  security context, but a lock is granted only to the supervised shell's
+  PID (`session_lock.rs`).
+- `wp_security_context_manager_v1` lets a sandbox engine (Flatpak) open a
+  listener whose clients join tagged with the context (#1046). Every
+  privileged global's filter (`ClientState::privileged`: virtual keyboard,
+  input method, `mutter_x11_interop`, layer-shell, the foreign toplevel
+  list) refuses such a client whatever its other state, and it sees neither
+  the session lock nor the manager itself, so it cannot nest a context.
+  Evidence: `crates/compositor/tests/protocols.rs`
+  (`security_context_clients_see_no_privileged_global`).
 - Input-method v2 is open to any client, as on GNOME (`protocols.rs:165-166`).
 
 ### Session-bus interfaces
