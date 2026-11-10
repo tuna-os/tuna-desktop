@@ -80,6 +80,7 @@ mod brightness;
 mod brightness_service;
 mod bt_menu;
 mod calendar;
+mod captive_portal;
 mod display_change;
 mod events;
 mod fd_watch;
@@ -2844,6 +2845,8 @@ fn build(app: &adw::Application) {
     polkit::start(app.upcast_ref());
     // GNOME's NetworkManager secret agent (Wi-Fi passwords).
     network_agent::start(app.upcast_ref());
+    // GNOME's captive-portal sign-in through its portal helper (#1042).
+    captive_portal::start(notify.clone());
     // GNOME's automount and autorun components (#361); off until the
     // compositor says the session is unlocked.
     let removable_media = removable_media::RemovableMedia::start(app.upcast_ref(), notify.clone());
