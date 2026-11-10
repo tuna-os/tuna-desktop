@@ -143,6 +143,7 @@ mod sound_feedback;
 mod switcher;
 #[cfg(test)]
 mod test_settings;
+mod thunderbolt;
 mod transient;
 mod tray;
 mod wall_clock;
@@ -2008,6 +2009,8 @@ fn build(app: &adw::Application) {
     let panel_network = status_icon("network-wired-symbolic", false);
     let panel_location = status_icon("location-services-active-symbolic", false);
     panel_location.update_property(&[gtk::accessible::Property::Label("Location in use")]);
+    // GNOME's Thunderbolt indicator: shown while boltd probes.
+    let panel_thunderbolt = status_icon(thunderbolt::ICON, false);
     let panel_dnd = status_icon("notifications-disabled-symbolic", false);
     let panel_volume = status_icon("audio-volume-high-symbolic", false);
     let panel_power_profile = status_icon("power-profile-balanced-symbolic", false);
@@ -2847,6 +2850,9 @@ fn build(app: &adw::Application) {
     // GNOME's automount and autorun components (#361); off until the
     // compositor says the session is unlocked.
     let removable_media = removable_media::RemovableMedia::start(app.upcast_ref(), notify.clone());
+    // GNOME's Thunderbolt client and auto-enrolment robot (#1041) on
+    // boltd; silent while boltd is not on the system bus.
+    let thunderbolt = thunderbolt::Thunderbolt::start(notify.clone(), panel_thunderbolt);
 
     // GNOME Shell is IBus's panel: it draws the candidate window.
     ibus_panel::start(app.upcast_ref(), ibus_properties.clone());
@@ -3910,6 +3916,8 @@ fn build(app: &adw::Application) {
                 if let Some(media) = removable_media.as_ref() {
                     media.sync_lock(authoritative_lock);
                 }
+                // Thunderbolt devices enrol only in an unlocked session.
+                thunderbolt.sync_lock(authoritative_lock);
                 screensaver.sync(locked);
                 // The session keyboard never shows over the lock screen.
                 osk.set_locked(locked);
