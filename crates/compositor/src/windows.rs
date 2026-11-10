@@ -1266,16 +1266,16 @@ impl WindowManager {
         output_width: i32,
         motion: tuna_shell_control::motion::MotionPolicy,
     ) {
-        let keep_alive = self
-            .workspace_tracker
-            .protected_workspaces(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        let keep_alive = self.workspace_tracker.occupying_workspaces(now);
+        let retained = self.workspace_tracker.retained_workspaces(now);
         if self.grab.is_some() || overview_dragging {
             return;
         }
         let previous_active = self.model.active_workspace();
         if let Some(indices) = self
             .model
-            .reconcile_dynamic_workspaces_with_remap(&keep_alive)
+            .reconcile_dynamic_workspaces_with_remap(&keep_alive, &retained)
         {
             self.workspace_tracker.remap(&indices);
             let active = self.model.active_workspace();
@@ -7726,10 +7726,12 @@ impl WindowManager {
                     "tuna-compositor: workspace now {}",
                     self.model.active_workspace()
                 );
-                // GNOME's switcher popup, outside the overview.
-                if !self.overview_open {
-                    self.workspace_popups.push(self.workspace_popup());
-                }
+            }
+            // GNOME's switcher popup, outside the overview, even when the
+            // key cannot leave the first or last workspace
+            // (windowManager.js:1869-1880).
+            if !self.overview_open {
+                self.workspace_popups.push(self.workspace_popup());
             }
         } else if pressed
             && self.super_held

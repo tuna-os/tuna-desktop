@@ -214,9 +214,12 @@ impl ProtocolVersion {
     /// the shell-to-compositor `CloseMenuUnanimated` command (panelMenu.js
     /// 51 `vfunc_hide`: a hidden panel button's menu closes without
     /// BoxPointer's close). Positional postcard peers must ship together.
+    /// `0.48` appends the compositor-to-shell `WorkspaceProgress` message
+    /// (a finger-following workspace swipe's position, for the Activities
+    /// dots, #596). Positional postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 47,
+        minor: 48,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -1109,7 +1112,27 @@ pub enum Message {
     /// and in each handshake snapshot, only to peers advertising
     /// minor >= 46.
     SeatTouchMode { touch_mode: bool },
+    /// Since 0.48: where a finger-following workspace swipe holds the
+    /// workspace strip, so the Activities dots follow it (GNOME 51
+    /// `workspaceAnimation.js:255-268` binds the primary monitor's swipe
+    /// progress to the shared workspaces adjustment that `panel.js`
+    /// `WorkspaceIndicators` reads). `position` is a fractional workspace
+    /// index in [`WORKSPACE_PROGRESS_SCALE`]ths; `duration_us` is 0 while
+    /// the fingers hold it and, on release, how long the strip takes to
+    /// settle there (ease-out-cubic, already scaled by the motion policy).
+    /// Sent only on swipe begin, update and release, to peers advertising
+    /// minor >= 48.
+    WorkspaceProgress { position: u32, duration_us: u32 },
 }
+
+/// [`Message::WorkspaceProgress`] positions are workspace indices times
+/// this.
+pub const WORKSPACE_PROGRESS_SCALE: u32 = 10_000;
+/// The highest [`Message::WorkspaceProgress`] position: workspace 1024.
+pub const MAX_WORKSPACE_PROGRESS: u32 = 1024 * WORKSPACE_PROGRESS_SCALE;
+/// The longest [`Message::WorkspaceProgress`] settle: a minute, far past
+/// GNOME's 400 ms swipe ceiling times any sane slow-down factor.
+pub const MAX_WORKSPACE_PROGRESS_US: u32 = 60_000_000;
 
 /// The click a hover (dwell) makes: GNOME's dwell click types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2289,6 +2312,15 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         Message::PadOsdInput { .. }
         | Message::ClosePadOsd { .. }
         | Message::SeatTouchMode { .. } => {}
+        Message::WorkspaceProgress {
+            position,
+            duration_us,
+        } if *position > MAX_WORKSPACE_PROGRESS || *duration_us > MAX_WORKSPACE_PROGRESS_US => {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ));
+        }
+        Message::WorkspaceProgress { .. } => {}
     }
     Ok(())
 }
@@ -2507,11 +2539,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_47() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 47));
-        // A 0.46 shell still negotiates; a newer minor does not.
-        assert!(ProtocolVersion::new(0, 46).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 48).is_compatible_with(&CURRENT_VERSION));
+    fn current_version_is_0_48() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 48));
+        // A 0.47 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 47).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 49).is_compatible_with(&CURRENT_VERSION));
     }
 
     #[test]
@@ -3914,5 +3946,38 @@ mod switcher_fade_and_menu_close_wire_tests {
         };
         let frame = encode_frame(&command);
         assert_eq!(decode_frame(&frame).unwrap(), command);
+    }
+
+    #[test]
+    fn workspace_progress_follows_seat_touch_mode_and_is_bounded() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 256];
+        let touch = tag(postcard::to_slice(
+            &Message::SeatTouchMode { touch_mode: true },
+            &mut buffer,
+        )
+        .unwrap());
+        let progress = Message::WorkspaceProgress {
+            position: 12_500,
+            duration_us: 0,
+        };
+        assert_eq!(
+            tag(postcard::to_slice(&progress, &mut buffer).unwrap()),
+            touch + 1
+        );
+        assert_eq!(decode_frame(&encode_frame(&progress)).unwrap(), progress);
+        for (position, duration_us) in [
+            (MAX_WORKSPACE_PROGRESS + 1, 0),
+            (10_000, MAX_WORKSPACE_PROGRESS_US + 1),
+        ] {
+            let bad = Message::WorkspaceProgress {
+                position,
+                duration_us,
+            };
+            assert!(
+                decode_frame(&encode_frame(&bad)).is_err(),
+                "{position} {duration_us}"
+            );
+        }
     }
 }
