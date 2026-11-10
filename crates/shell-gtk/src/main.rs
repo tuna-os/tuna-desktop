@@ -790,6 +790,33 @@ fn calendar_popover(notes: &gtk::Box) -> (gtk::Popover, Rc<calendar::CalendarUi>
     (popover, cal)
 }
 
+/// `Shell.App.activate()` for a media player's app (mpris.js `raise`):
+/// raise the app's newest window when it runs, else launch it.
+fn activate_app(shell: &RefCell<Shell>, entry: &tuna_shell_host::apps::AppEntry) {
+    let app_id = entry
+        .app_id
+        .strip_suffix(".desktop")
+        .unwrap_or(&entry.app_id);
+    let mut shell = shell.borrow_mut();
+    let window = shell.control.as_ref().and_then(|control| {
+        control
+            .model()
+            .windows()
+            .iter()
+            .rev()
+            .find(|w| w.app_id.as_deref() == Some(app_id))
+            .map(|w| w.id)
+    });
+    match (window, shell.control.as_mut()) {
+        (Some(id), Some(control)) => {
+            let _ = control.activate_window(id);
+        }
+        _ => {
+            let _ = tuna_shell_host::apps::launch(entry);
+        }
+    }
+}
+
 /// One GNOME 51 quick toggle (`.quick-toggle`): icon, bold title and an
 /// optional subtitle in a 176x48 pill.
 fn qs_tile(icon: &str, title: &str, subtitle: Option<&str>) -> services::Tile {
@@ -2117,8 +2144,10 @@ fn build(app: &adw::Application) {
             }
         });
     }
-    // GNOME's lock screen lists media players above the notifications
-    // (js/ui/mpris.js, unlockDialog.js `_addPlayer`, #348).
+    // GNOME 51's media players, one MediaMessage each (js/ui/mpris.js):
+    // above the calendar's notifications (messageList.js
+    // `MessageView._setupMpris`, #1037) and on the lock screen
+    // (unlockDialog.js `_addPlayer`, #348), from one MPRIS client.
     {
         let mpris = mpris::Mpris::start();
         let (source, act) = (mpris.clone(), mpris.clone());
@@ -2126,10 +2155,35 @@ fn build(app: &adw::Application) {
             Rc::new(move || source.lock_entries()),
             Rc::new(move |bus_name, action| act.act(bus_name, action)),
         );
-        let lock_ui = Rc::downgrade(&lock_ui);
+        let (source, act, raiser) = (mpris.clone(), mpris.clone(), mpris.clone());
+        let (shell, popover) = (shell.clone(), cal_popover.downgrade());
+        notify.set_media(
+            Rc::new(move || {
+                source
+                    .players()
+                    .into_iter()
+                    .map(|player| {
+                        let visible = mpris::media_visible(&player.policy, false);
+                        (player.entry, visible)
+                    })
+                    .collect::<Vec<_>>()
+            }),
+            Rc::new(move |bus_name: &str, action| act.act(bus_name, action)),
+            Rc::new(move |bus_name: &str| {
+                raiser.raise(bus_name, &|app| activate_app(&shell, app));
+                // `Main.panel.closeCalendar()`.
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
+            }),
+        );
+        let (lock_ui, notify) = (Rc::downgrade(&lock_ui), Rc::downgrade(&notify));
         mpris.connect_changed(move || {
             if let Some(lock_ui) = lock_ui.upgrade() {
                 lock_ui.refresh_media();
+            }
+            if let Some(notify) = notify.upgrade() {
+                notify.refresh_media();
             }
         });
     }

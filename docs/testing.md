@@ -450,10 +450,11 @@ TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-ar
 ```
 
 `--notify-lock-only` stops after panel readiness and runs just the
-lock-screen notification, media player, notification sound and
-disabled-app restore gates (G-NOTIFY-LOCK, G-NOTIFY-LOCK-PIXELS,
-G-NOTIFY-LOCK-PUSH, G-NOTIFY-LOCK-LIVE, G-NOTIFY-LOCK-MEDIA,
-G-NOTIFY-SOUND, G-NOTIFY-RESTORE); it needs pam_wrapper to unlock. The
+lock-screen notification, media player, notification sound,
+disabled-app restore and date-menu media gates (G-NOTIFY-LOCK,
+G-NOTIFY-LOCK-PIXELS, G-NOTIFY-LOCK-PUSH, G-NOTIFY-LOCK-LIVE,
+G-NOTIFY-LOCK-MEDIA, G-NOTIFY-SOUND, G-NOTIFY-RESTORE,
+G-NOTIFY-CALENDAR-MEDIA); it needs pam_wrapper to unlock. The
 proof's `canberra-gtk-play` stand-in records every event sound the shell
 asks for in `canberra-calls`, and `tuna-mpris-player-stub.py` is the
 media player.

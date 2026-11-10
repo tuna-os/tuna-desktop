@@ -784,6 +784,51 @@ window.tuna-banners {
   margin-bottom: 0;
 }
 
+/* The calendar's MediaMessages (_message-list.scss `.message-box`,
+   `.media-message`, `.message-media-control`): the cover beside the
+   track, 48px with $base_border_radius corners, the themed fallback a
+   32px icon on a faint 48px tile; flat controls that light up under the
+   pointer (lighten($hover_bg_color, 5%)) and grey out while insensitive
+   (lighten($insensitive_fg_color, 5%)). */
+.message-view .media-message .message-box {
+  padding: 6px;
+}
+
+.message-view .media-message .message-icon {
+  margin-right: 6px;
+  border-radius: 8px;
+}
+
+.message-view .media-message .message-icon.message-themed-icon {
+  min-width: 48px;
+  min-height: 48px;
+  background-color: rgba(255, 255, 255, 0.07);
+}
+
+.message-view .message-media-control {
+  min-width: 0;
+  padding: 0 18px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: none;
+  box-shadow: none;
+  color: #ffffff;
+}
+
+.message-view .message-media-control:hover {
+  background-color: #5c5c61;
+}
+
+.message-view .message-media-control:active {
+  background-color: #616166;
+}
+
+.message-view .message-media-control:disabled {
+  /* GNOME's insensitive colour, without libadwaita's extra fade. */
+  filter: none;
+  color: #a8a8aa;
+}
+
 .message-stack-card {
   border-radius: 18px;
 }

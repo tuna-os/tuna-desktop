@@ -1,6 +1,6 @@
 #!/usr/bin/python3
-"""A minimal MPRIS player for the GTK shell proof's G-GSD-MPRIS and
-G-NOTIFY-LOCK-MEDIA.
+"""A minimal MPRIS player for the GTK shell proof's G-GSD-MPRIS,
+G-NOTIFY-LOCK-MEDIA and G-NOTIFY-CALENDAR-MEDIA.
 
 Usage: tuna-mpris-player-stub.py MARKER [SECONDS [NAME]]
 
