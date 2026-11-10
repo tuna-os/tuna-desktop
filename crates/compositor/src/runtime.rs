@@ -65,6 +65,7 @@ mod aids;
 mod auth;
 mod color;
 mod display;
+mod input_capture;
 mod motion;
 mod osk;
 
@@ -742,6 +743,8 @@ pub struct Runtime {
     capture_authority: crate::capture_security::Authority,
     cast_grants: std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     remote_held: std::collections::HashMap<u64, RemoteHeld>,
+    /// org.gnome.Mutter.InputCapture's input diversion (#1040).
+    input_capture: crate::mutter::input_capture::Router,
     /// Keys the tablet action mappers' virtual keyboard holds (evdev).
     tablet_virtual_keys: std::collections::BTreeSet<u32>,
     /// The pad OSD labels the shell last received.
@@ -1009,13 +1012,17 @@ impl Runtime {
                             smithay::backend::input::InputEvent::TouchDown { .. }
                                 | smithay::backend::input::InputEvent::TouchMotion { .. }
                         );
-                        let inputs = match &mut rt.backend {
+                        let (inputs, from) = match &mut rt.backend {
                             Backend::Drm(drm) => {
                                 drm.set_hot_corner_active(corners_active);
-                                drm.translate(event, &corner_layout)
+                                let from = drm.pointer();
+                                (drm.translate(event, &corner_layout), from)
                             }
-                            Backend::Winit(_) => Vec::new(),
+                            Backend::Winit(_) => (Vec::new(), (0.0, 0.0).into()),
                         };
+                        // InputCapture (#1040) takes what an active
+                        // session captures before anything else sees it.
+                        let inputs = rt.route_input_capture(inputs, from);
                         for input in inputs {
                             let input = if touch { rt.unzoom_touch(input) } else { input };
                             if let ManagerInput::Button {
@@ -1235,6 +1242,7 @@ impl Runtime {
         // org.gnome.Shell.Introspect: the portal's window picker.
         let capture_authority = crate::capture_security::Authority::default();
         let introspect = crate::introspect::start(state.desktop_size(), capture_authority.clone());
+        let input_capture = crate::mutter::input_capture::Router::default();
         event_loop
             .handle()
             .insert_source(
@@ -1248,6 +1256,7 @@ impl Runtime {
                     power_save_share.clone(),
                     display_share.clone(),
                     color_share.clone(),
+                    input_capture.sessions(),
                 ),
                 |event, _, rt: &mut Runtime| {
                     if let calloop::channel::Event::Msg(request) = event {
@@ -1479,6 +1488,7 @@ impl Runtime {
             capture_authority,
             cast_grants: Default::default(),
             remote_held: Default::default(),
+            input_capture,
             tablet_virtual_keys: Default::default(),
             pad_osd_labels_sent: None,
             introspect,
@@ -1748,6 +1758,8 @@ impl Runtime {
         for id in remote_ids {
             self.stop_remote_input(id);
         }
+        // Input capture never survives the lock (#1040).
+        self.input_capture.revoke_all();
         self.capture_authority.publish(true, self.shell.child_pid());
         self.state.set_shortcut_inhibition_locked(true);
         // A three-finger swipe under way is the unlocked session's: end
@@ -4365,6 +4377,7 @@ impl Runtime {
                 self.remote_input(session_id, grant, input);
             }
             crate::mutter::ToLoop::RemoteStop { session_id } => self.stop_remote_input(session_id),
+            crate::mutter::ToLoop::InputCaptureWarp { x, y } => self.input_capture_warp(x, y),
             crate::mutter::ToLoop::RemoteClipboard(request) => {
                 let locked = self.is_locked();
                 self.state.remote_clipboard_request(request, locked);
