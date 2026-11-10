@@ -43,6 +43,14 @@ before decoding.
   touchpad swipe holds it (`settle_us: None`) and where and how fast its
   release settles, in `OVERVIEW_STATE_SCALE`ths up to `MAX_OVERVIEW_STATE`
   (the app grid); the shell's app grid follows it above the window picker.
+- Close dialog (0.50): `Message::ShowCloseDialog { window, app_id,
+  connector, x, y, width, height }` (peers >=50 only) asks for gnome-shell's
+  "“%s” Is Not Responding" dialog over a window that missed mutter's
+  `check-alive-timeout`, resent as the window moves; `HideCloseDialog
+  { window }` dismisses it (a late pong, the window gone or hidden, the
+  lock). The shell answers `CommandKind::RespondCloseDialog { window,
+  response }` with `CloseDialogResponse::ForceClose` or `Wait`. Texts are
+  bounded by `MAX_TITLE_LEN`, sides by `MAX_CLOSE_DIALOG_SIDE`.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
   `ErrorKind`.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,

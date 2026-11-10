@@ -12,6 +12,7 @@
 //! and focused; titles are read from the surface role data; stacking is
 //! insertion order with focus raising to top. All code here is original.
 
+mod alive;
 mod tablet_input;
 
 use std::collections::{HashMap, HashSet};
@@ -532,6 +533,8 @@ pub struct WindowManager {
     /// Pending auto-raise `(window, due)`.
     auto_raise: Option<(u64, std::time::Instant)>,
     grab_raise: Option<GrabRaise>,
+    /// Mutter's alive checks and the close dialog (#1035).
+    alive: alive::AliveState,
 }
 
 impl WindowManager {
@@ -769,6 +772,7 @@ impl WindowManager {
             pointer_rest: None,
             auto_raise: None,
             grab_raise: None,
+            alive: alive::AliveState::new(state),
         }
     }
 
@@ -2475,6 +2479,10 @@ impl WindowManager {
         // Alt+Tab) until the pointer moves.
         self.sticky_focus = (self.focus_policy.mode.follows_pointer() && id.is_some())
             .then_some(StickyFocus { distance: 0.0 });
+        // meta_window_activate_full ends with meta_window_check_alive.
+        if let Some(id) = id {
+            self.check_alive(id);
+        }
         true
     }
 
@@ -3595,6 +3603,10 @@ impl WindowManager {
             pointer.frame(state);
         }
         if let Some(under) = crossing {
+            // events.c: motion over a window checks it is alive.
+            if let Some(id) = under {
+                self.check_alive(id);
+            }
             self.pointer_crossing(state, under);
         }
     }
@@ -3984,6 +3996,9 @@ impl WindowManager {
             {
                 if let Some(id) = self.window_at(pos) {
                     if self.modal_target(id) != id {
+                        // meta_window_handle_ungrabbed_event: every press
+                        // focuses and checks the window is alive.
+                        self.check_alive(id);
                         self.apply_focus_raise(state, Some(id), self.focus_policy.raise_on_click);
                         self.swallowed_button = Some(button);
                         return;
@@ -4010,6 +4025,10 @@ impl WindowManager {
                     .window_at(pos)
                     .and_then(|id| Some((id, self.shifted(id, self.windows.get(&id)?.geometry))))
                 {
+                    // meta_window_handle_ungrabbed_event focuses the pressed
+                    // window and checks it is alive before its modifier
+                    // actions.
+                    self.check_alive(id);
                     let decision = self.focus_policy.press(
                         self.held_mods(),
                         button,
@@ -4902,8 +4921,9 @@ impl WindowManager {
 
     /// Ask a window's client to close (polite `close` request). The
     /// client unmaps itself; `reconcile` drops it on the next tick and
-    /// focus falls back. False for unknown ids.
-    pub fn close_window(&self, id: u64) -> bool {
+    /// focus falls back. False for unknown ids. Like `meta_window_delete`,
+    /// the request checks the window is alive.
+    pub fn close_window(&mut self, id: u64) -> bool {
         let Some(window) = self.windows.get(&id) else {
             return false;
         };
@@ -4920,11 +4940,12 @@ impl WindowManager {
             }
         }
         eprintln!("tuna-compositor: window {id} close requested");
+        self.check_alive(id);
         true
     }
 
     /// Close the focused window, if any.
-    pub fn close_focused(&self) -> bool {
+    pub fn close_focused(&mut self) -> bool {
         self.model.focused().is_some_and(|id| self.close_window(id))
     }
 

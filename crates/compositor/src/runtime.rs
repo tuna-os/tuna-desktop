@@ -4867,6 +4867,8 @@ impl Runtime {
             // Tablet and stylus settings: the bounded re-read.
             self.tablet_settings.next_deadline(now),
             self.manager.focus_deadline(),
+            // Mutter's alive checks: a ping timing out, Wait, re-pings.
+            self.manager.alive_deadline(),
             // Window sessions are written 3 s after a change (Mutter).
             self.state.window_sessions().save_deadline(),
             // The lock conversation's shared idle/total deadline.
@@ -4941,6 +4943,7 @@ impl Runtime {
         self.manager.reconcile(&mut self.state);
         self.state.window_sessions_mut().save_if_due(Instant::now());
         self.focus_policy_tick();
+        self.alive_checks_tick();
         self.tablet_settings_tick();
         self.poll_input_aids();
         #[cfg(feature = "xwayland")]
@@ -5033,6 +5036,11 @@ impl Runtime {
         if outcome.close_menu_unanimated {
             self.menu_close.close_unanimated(std::time::Instant::now());
         }
+        // gnome-shell's close dialog answers (#1035): Wait or Force Quit.
+        for (window, response) in outcome.close_dialog_responses {
+            self.manager.close_dialog_response(window, response);
+        }
+        self.queue_close_dialogs();
         if let Some(request) = self.state.take_shortcut_consent_update() {
             self.control
                 .queue_message(tuna_shell_control::Message::ShortcutConsent { request });
@@ -5743,10 +5751,31 @@ impl Runtime {
             let mut policy = self.manager.focus_policy();
             policy.apply(&raw);
             self.manager.set_focus_policy(policy);
+            if let Some(ms) = raw.check_alive_timeout_ms {
+                self.manager.set_check_alive_timeout(ms);
+            }
         }
         if !self.is_locked() {
             self.manager.repick_pointer_window(&mut self.state);
             self.manager.run_focus_timers(&mut self.state, now);
+        }
+    }
+
+    /// Mutter's alive checks (#1035): pongs, ping timeouts and the close
+    /// dialog's timers; nothing pings or shows while locked, and the
+    /// supervised shell is never pinged.
+    fn alive_checks_tick(&mut self) {
+        let locked = self.is_locked();
+        self.manager.set_shell_pid(self.shell.child_pid());
+        self.manager
+            .run_alive_checks(&mut self.state, Instant::now(), locked);
+        self.queue_close_dialogs();
+    }
+
+    /// Hand the manager's close-dialog messages to the shell.
+    fn queue_close_dialogs(&mut self) {
+        for message in self.manager.take_close_dialogs() {
+            self.control.queue_message(message);
         }
     }
 
