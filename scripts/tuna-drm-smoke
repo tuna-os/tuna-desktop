@@ -1063,10 +1063,13 @@ at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "the session did not start at rest
 
 # One finger moves the pointer onto the client, which then has pointer
 # focus. Two fingers scroll it; the shell takes nothing. With natural
-# scrolling (GNOME's default) fingers moving up scroll down.
+# scrolling (GNOME's default) fingers moving up scroll down. The pointer
+# starts at the output's top-left, inside the panel strip, so the move
+# travels well below the panel: a 5 mm drop lands about 31 px down, still
+# on the 32 px panel, and the client never hears it.
 mark
 tp down 1
-tp move 10 5 200
+tp move 10 20 400
 tp up
 client "r['event'] == 'motion'" || fail D-TOUCHPAD-SWIPE "one-finger motion did not reach the client's event controller"
 mark
