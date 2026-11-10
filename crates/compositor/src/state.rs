@@ -1516,12 +1516,14 @@ mod dynamic_workspace_tests {
         let mut model = StateModel::new();
         model.insert("First", None, 0);
         model.set_active_workspace(3);
-        let remap = model.reconcile_dynamic_workspaces_with_remap(&[4]).unwrap();
+        let remap = model
+            .reconcile_dynamic_workspaces_with_remap(&[4], &[])
+            .unwrap();
         assert_eq!(remap, [(0, 0), (3, 1), (4, 2), (5, 3)]);
         assert_eq!(model.active_workspace(), 1);
         assert_eq!(model.workspaces(), &[0, 1, 2, 3]);
         assert!(model
-            .reconcile_dynamic_workspaces_with_remap(&[2])
+            .reconcile_dynamic_workspaces_with_remap(&[2], &[])
             .is_none());
     }
 
