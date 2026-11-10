@@ -178,15 +178,20 @@ impl StateModel {
     /// Preserve the active workspace and the empty slot after the last occupied
     /// one, remove other empty slots from the end, and keep at least two.
     pub fn reconcile_dynamic_workspaces(&mut self, keep_alive: &[u32]) -> bool {
-        self.reconcile_dynamic_workspaces_with_remap(keep_alive)
+        self.reconcile_dynamic_workspaces_with_remap(keep_alive, &[])
             .is_some()
     }
 
     /// The retained old-to-new indices let the runtime move workspace leases
-    /// together with the workspace object they protect.
+    /// together with the workspace object they protect. `retained`
+    /// workspaces (the departed-workspace grace) are only spared from
+    /// removal: unlike `keep_alive` they do not count as occupied, so an
+    /// empty trailing workspace the user just left stays the one empty
+    /// tail instead of making compaction append another.
     pub fn reconcile_dynamic_workspaces_with_remap(
         &mut self,
         keep_alive: &[u32],
+        retained: &[u32],
     ) -> Option<Vec<(u32, u32)>> {
         if self.fixed_workspace_count.is_some() {
             return None;
@@ -198,12 +203,14 @@ impl StateModel {
             .map(|window| u64::from(window.workspace))
             .chain(keep_alive.iter().map(|workspace| u64::from(*workspace)))
             .collect();
+        let retained: BTreeSet<u64> = retained.iter().map(|w| u64::from(*w)).collect();
         let mut slots: Vec<u64> = self
             .workspaces
             .iter()
             .copied()
             .map(u64::from)
             .chain(occupied.iter().copied())
+            .chain(retained.iter().copied())
             .chain([u64::from(self.active)])
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -228,6 +235,7 @@ impl StateModel {
             if slot != u64::from(self.active)
                 && slot != protected_empty
                 && !occupied.contains(&slot)
+                && !retained.contains(&slot)
             {
                 slots.remove(index);
             }
@@ -1370,6 +1378,48 @@ mod dynamic_workspace_tests {
         assert!(!model.reconcile_dynamic_workspaces(&[]));
         assert_eq!(model.revision(), revision);
         assert_eq!(model.active_workspace(), 1);
+    }
+
+    #[test]
+    fn leaving_the_empty_tail_never_pads_another() {
+        // Switching back from the empty trailing workspace leases it
+        // (J-WS-NEXT); the lease keeps it but must not make it count as
+        // occupied, or compaction appends a phantom third workspace that
+        // the Activities dots briefly show (#596).
+        let mut model = StateModel::new();
+        model.reconcile_dynamic_workspaces(&[]);
+        model.insert("First", None, 0);
+        assert!(!model.reconcile_dynamic_workspaces(&[]));
+        assert_eq!(model.workspaces(), &[0, 1]);
+        model.set_active_workspace(1);
+        model.reconcile_dynamic_workspaces_with_remap(&[], &[0]);
+        assert_eq!(model.workspaces(), &[0, 1]);
+        model.set_active_workspace(0);
+        model.reconcile_dynamic_workspaces_with_remap(&[], &[1]);
+        assert_eq!(model.workspaces(), &[0, 1]);
+        assert_eq!(model.active_workspace(), 0);
+    }
+
+    #[test]
+    fn a_retained_empty_middle_workspace_survives_compaction() {
+        let mut model = StateModel::new();
+        model.reconcile_dynamic_workspaces(&[]);
+        model.insert("First", None, 0);
+        model.reconcile_dynamic_workspaces(&[]);
+        model.set_active_workspace(1);
+        let second = model.insert("Second", None, 1);
+        model.reconcile_dynamic_workspaces(&[]);
+        assert_eq!(model.workspaces(), &[0, 1, 2]);
+        model.set_active_workspace(2);
+        model.insert("Third", None, 2);
+        model.reconcile_dynamic_workspaces(&[]);
+        assert_eq!(model.workspaces(), &[0, 1, 2, 3]);
+        model.remove(second);
+        model.set_active_workspace(0);
+        model.reconcile_dynamic_workspaces_with_remap(&[], &[1]);
+        assert_eq!(model.workspaces(), &[0, 1, 2, 3]);
+        assert!(model.reconcile_dynamic_workspaces(&[]));
+        assert_eq!(model.workspaces(), &[0, 1, 2]);
     }
 
     #[test]
