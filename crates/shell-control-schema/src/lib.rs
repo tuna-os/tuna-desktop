@@ -217,9 +217,13 @@ impl ProtocolVersion {
     /// `0.48` appends the compositor-to-shell `WorkspaceProgress` message
     /// (a finger-following workspace swipe's position, for the Activities
     /// dots, #596). Positional postcard peers must ship together.
+    /// `0.49` appends the compositor-to-shell `OverviewSwipe` message (the
+    /// overview controls state a touchpad swipe holds or settles, so the
+    /// shell's app grid follows it, #593). Positional postcard peers must
+    /// ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 48,
+        minor: 49,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -1123,6 +1127,17 @@ pub enum Message {
     /// Sent only on swipe begin, update and release, to peers advertising
     /// minor >= 48.
     WorkspaceProgress { position: u32, duration_us: u32 },
+    /// Since 0.49: where a touchpad swipe holds GNOME 51's overview
+    /// controls state (`ControlsState`: 0 hidden, 1 window picker, 2 app
+    /// grid; overviewControls.js:33-37), in [`OVERVIEW_STATE_SCALE`]ths.
+    /// The swipe spans all three states (overviewControls.js:757-797,
+    /// overview.js:355-397), so above the window picker the shell's app
+    /// grid follows the fingers. `settle_us` is `None` while the fingers
+    /// hold it; on release `state` is where it settles and `settle_us`
+    /// how long the ease-out-cubic takes (already scaled by the motion
+    /// policy, 0 with animations off). Sent on every overview swipe
+    /// phase, only to peers advertising minor >= 49.
+    OverviewSwipe { state: u32, settle_us: Option<u32> },
 }
 
 /// [`Message::WorkspaceProgress`] positions are workspace indices times
@@ -1133,6 +1148,14 @@ pub const MAX_WORKSPACE_PROGRESS: u32 = 1024 * WORKSPACE_PROGRESS_SCALE;
 /// The longest [`Message::WorkspaceProgress`] settle: a minute, far past
 /// GNOME's 400 ms swipe ceiling times any sane slow-down factor.
 pub const MAX_WORKSPACE_PROGRESS_US: u32 = 60_000_000;
+
+/// [`Message::OverviewSwipe`] states are `ControlsState` values times this.
+pub const OVERVIEW_STATE_SCALE: u32 = 10_000;
+/// The highest [`Message::OverviewSwipe`] state: `ControlsState.APP_GRID`.
+pub const MAX_OVERVIEW_STATE: u32 = 2 * OVERVIEW_STATE_SCALE;
+/// The longest [`Message::OverviewSwipe`] settle: a minute, far past
+/// GNOME's swipe ceiling times any sane slow-down factor.
+pub const MAX_OVERVIEW_SETTLE_US: u32 = 60_000_000;
 
 /// The click a hover (dwell) makes: GNOME's dwell click types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2320,7 +2343,16 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
                 postcard::Error::DeserializeBadEncoding,
             ));
         }
+        Message::OverviewSwipe { state, settle_us }
+            if *state > MAX_OVERVIEW_STATE
+                || settle_us.is_some_and(|us| us > MAX_OVERVIEW_SETTLE_US) =>
+        {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ));
+        }
         Message::WorkspaceProgress { .. } => {}
+        Message::OverviewSwipe { .. } => {}
     }
     Ok(())
 }
@@ -2539,11 +2571,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_48() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 48));
-        // A 0.47 shell still negotiates; a newer minor does not.
-        assert!(ProtocolVersion::new(0, 47).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 49).is_compatible_with(&CURRENT_VERSION));
+    fn current_version_is_0_49() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 49));
+        // A 0.48 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 48).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 50).is_compatible_with(&CURRENT_VERSION));
     }
 
     #[test]
@@ -3977,6 +4009,41 @@ mod switcher_fade_and_menu_close_wire_tests {
             assert!(
                 decode_frame(&encode_frame(&bad)).is_err(),
                 "{position} {duration_us}"
+            );
+        }
+    }
+
+    #[test]
+    fn overview_swipe_follows_workspace_progress_and_is_bounded() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 256];
+        let progress = tag(postcard::to_slice(
+            &Message::WorkspaceProgress {
+                position: 0,
+                duration_us: 0,
+            },
+            &mut buffer,
+        )
+        .unwrap());
+        for settle_us in [None, Some(0), Some(180_000)] {
+            let swipe = Message::OverviewSwipe {
+                state: 15_000,
+                settle_us,
+            };
+            assert_eq!(
+                tag(postcard::to_slice(&swipe, &mut buffer).unwrap()),
+                progress + 1
+            );
+            assert_eq!(decode_frame(&encode_frame(&swipe)).unwrap(), swipe);
+        }
+        for (state, settle_us) in [
+            (MAX_OVERVIEW_STATE + 1, None),
+            (OVERVIEW_STATE_SCALE, Some(MAX_OVERVIEW_SETTLE_US + 1)),
+        ] {
+            let bad = Message::OverviewSwipe { state, settle_us };
+            assert!(
+                decode_frame(&encode_frame(&bad)).is_err(),
+                "{state} {settle_us:?}"
             );
         }
     }

@@ -612,12 +612,16 @@ impl<'a> Session<'a> {
     /// Ask the shell to draw GNOME's window menu.
     /// Peers older than 0.42 cannot decode `ConfirmDisplayChange`, nor
     /// older than 0.45 the tablet OSD messages, nor older than 0.48
-    /// `WorkspaceProgress`, and receive nothing.
+    /// `WorkspaceProgress`, nor older than 0.49 `OverviewSwipe`, and
+    /// receive nothing.
     pub fn send_window_menu(&mut self, menu: &Message) -> Result<(), ControlError> {
         if matches!(menu, Message::ConfirmDisplayChange { .. }) && self.peer_minor < 42 {
             return Ok(());
         }
         if matches!(menu, Message::WorkspaceProgress { .. }) && self.peer_minor < 48 {
+            return Ok(());
+        }
+        if matches!(menu, Message::OverviewSwipe { .. }) && self.peer_minor < 49 {
             return Ok(());
         }
         let tablet = matches!(
@@ -1295,6 +1299,7 @@ impl<'a> Session<'a> {
             | Message::PadOsdInput { .. }
             | Message::ClosePadOsd { .. }
             | Message::SeatTouchMode { .. }
+            | Message::OverviewSwipe { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
                     kind: ErrorKind::UnknownCommand,
@@ -1355,6 +1360,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::PadOsdInput { .. } => "PadOsdInput",
         Message::ClosePadOsd { .. } => "ClosePadOsd",
         Message::SeatTouchMode { .. } => "SeatTouchMode",
+        Message::OverviewSwipe { .. } => "OverviewSwipe",
     }
 }
 

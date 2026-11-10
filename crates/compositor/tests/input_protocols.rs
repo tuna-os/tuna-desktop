@@ -7,7 +7,7 @@ use std::os::unix::net::UnixStream;
 
 use smithay::utils::{Logical, Point};
 use tuna_compositor::motion_coalesce::MotionCoalescer;
-use tuna_compositor::windows::{swipe_action, ManagerInput, SwipeAction, WindowManager};
+use tuna_compositor::windows::{ManagerInput, WindowManager};
 use tuna_compositor::TestCompositor;
 use wayland_client::{
     protocol::{
@@ -673,18 +673,6 @@ fn coalesced_relative_motion_sums_every_delta_for_a_locked_pointer() {
         [(5.625, 3.0, 5.25, 2.25, 6_000)],
         "one relative event, every delta summed exactly"
     );
-}
-
-#[test]
-fn three_finger_swipes_follow_gnome() {
-    assert_eq!(swipe_action(0.0, -150.0), Some(SwipeAction::OpenOverview));
-    assert_eq!(swipe_action(10.0, 140.0), Some(SwipeAction::CloseOverview));
-    assert_eq!(swipe_action(-160.0, 20.0), Some(SwipeAction::NextWorkspace));
-    assert_eq!(
-        swipe_action(160.0, -20.0),
-        Some(SwipeAction::PreviousWorkspace)
-    );
-    assert_eq!(swipe_action(40.0, -60.0), None, "short swipes do nothing");
 }
 
 #[test]

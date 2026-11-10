@@ -1552,7 +1552,7 @@ impl DrmBackend {
                 self.recount_touch_devices();
                 Vec::new()
             }
-            // Touchpad swipes (#60): three fingers are the shell's.
+            // Touchpad swipes (#60): three or more fingers are the shell's.
             InputEvent::GestureSwipeBegin { event } => {
                 use smithay::backend::input::GestureBeginEvent;
                 vec![ManagerInput::SwipeBegin {
@@ -1562,8 +1562,10 @@ impl DrmBackend {
             }
             InputEvent::GestureSwipeUpdate { event } => {
                 use smithay::backend::input::GestureSwipeUpdateEvent;
+                use smithay::reexports::input::event::gesture::GestureEventCoordinates;
                 vec![ManagerInput::SwipeUpdate {
                     delta: event.delta(),
+                    delta_unaccel: (event.dx_unaccelerated(), event.dy_unaccelerated()).into(),
                     time: (event.time() / 1000) as u32,
                 }]
             }

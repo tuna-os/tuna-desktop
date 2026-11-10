@@ -4148,6 +4148,7 @@ fn lock_surface_alone_hears_touchpad_swipes_and_the_scroll_stop() {
         // The tail of a swipe begun before the lock goes nowhere.
         ManagerInput::SwipeUpdate {
             delta: (0.0, -10.0).into(),
+            delta_unaccel: (0.0, -10.0).into(),
             time: 5001,
         },
         ManagerInput::SwipeEnd {
@@ -4160,10 +4161,12 @@ fn lock_surface_alone_hears_touchpad_swipes_and_the_scroll_stop() {
         },
         ManagerInput::SwipeUpdate {
             delta: (0.0, -20.0).into(),
+            delta_unaccel: (0.0, -20.0).into(),
             time: 5004,
         },
         ManagerInput::SwipeUpdate {
             delta: (0.0, -20.0).into(),
+            delta_unaccel: (0.0, -20.0).into(),
             time: 5005,
         },
         ManagerInput::SwipeEnd {
