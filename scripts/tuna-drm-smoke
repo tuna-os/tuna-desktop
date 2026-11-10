@@ -1149,8 +1149,14 @@ pass D-TOUCHPAD-SWIPE "three fingers left/right slid to the next workspace and b
 # three fingers up follow into the app grid, whose shell surface maps and
 # follows them, and the release lands there with the grid easing over the
 # swipe's settle time; down comes back to the window picker.
+# The emulated pad is 53 mm tall and fingers land on its middle row, so
+# the long swipe starts low on the pad: 38 mm up is about 1.3 of the
+# overview's 300-unit travel.
 prev_release="$(last_release)"
-tp swipe 3 0 -60 300
+tp down 3 0.5 0.82
+tp hold 30
+tp move 0 -38 300
+tp up
 released '.target == 1 and .from == 1' ||
     fail D-TOUCHPAD-SWIPE "a long swipe up from the desktop did not stop at the window picker: $(last_release)"
 at_rest 1 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "the long swipe did not settle on the window picker"
@@ -1199,7 +1205,9 @@ FIRST_WS="$(jq -r '.workspaces[0]' "$CSTATE")"
 [ "$FIRST_WS" = "$HOME_WS" ] || fail D-TOUCHPAD-SWIPE "the session's workspace is not the first of four"
 tp swipe 3 0 -25 300
 at_rest 1 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "the overview did not open for the sideways swipes"
-tp down 3
+# The pad is 97 mm wide and three fingers span 30 mm, so the sideways
+# swipes start from the side they move away from to stay on it.
+tp down 3 0.74 0.5
 tp move -20 0 300
 state ".touchpad_swipe.active and .touchpad_swipe.orientation == \"horizontal\" and .overview_motion.scroll.held
        and .overview_motion.scroll.position > 0.2 and .overview_motion.scroll.position < 1
@@ -1217,16 +1225,25 @@ state '.overview_motion.scroll == null and .overview_motion.scroll_release.veloc
 strip_settled="$(jq '.overview_motion.scroll_release.target' "$CSTATE")"
 state ".overview_open and .active_workspace == (.workspaces[$strip_settled])" 5 ||
     fail D-TOUCHPAD-SWIPE "the overview's workspaces settled at $strip_settled without switching there"
-tp swipe 3 60 0 250
+tp down 3 0.25 0.5
+tp hold 30
+tp move 50 0 200
+tp up
 state ".overview_open and .active_workspace == $HOME_WS and .overview_motion.scroll == null" 10 ||
     fail D-TOUCHPAD-SWIPE "a long swipe back did not return to the first workspace"
-tp swipe 3 -35 0 120
+tp down 3 0.74 0.5
+tp hold 30
+tp move -35 0 120
+tp up
 state '.overview_motion.scroll == null and (.overview_motion.scroll_release | .target - .from > 1 and .curve == "ease-out-cubic" and .duration_ms > 0)' 10 ||
     fail D-TOUCHPAD-SWIPE "a fast sideways flick did not carry the strip past the next workspace: $(jq -c .overview_motion.scroll_release "$CSTATE")"
 strip_flick="$(jq -c .overview_motion.scroll_release "$CSTATE")"
 state ".overview_open and .active_workspace != $HOME_WS and .active_workspace != (.workspaces[1])" 5 ||
     fail D-TOUCHPAD-SWIPE "the flick did not settle two or more workspaces on"
-tp swipe 3 80 0 250
+tp down 3 0.25 0.5
+tp hold 30
+tp move 50 0 200
+tp up
 state ".active_workspace == $HOME_WS and .overview_motion.scroll == null" 10 || fail D-TOUCHPAD-SWIPE "could not come back to the first workspace"
 tp swipe 3 0 25 250
 at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "could not close the overview after the sideways swipes"
