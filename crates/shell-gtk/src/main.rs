@@ -145,6 +145,7 @@ mod switcher;
 mod test_settings;
 mod transient;
 mod tray;
+mod user_switch;
 mod wall_clock;
 mod wellbeing;
 mod wifi;
@@ -1156,6 +1157,50 @@ fn quick_settings_popover(
             power_ui.activate(action);
         });
     }
+    // GNOME 51's last row, under Log Out… (status/system.js ShutdownItem):
+    // Switch User…, on a hardware session only. Its rule and the
+    // AccountsService/logind facts behind it live in `user_switch.rs`.
+    let switch_user = power_ui
+        .offers_switch_user()
+        .then(|| power_menu_box.item(None, user_switch::LABEL).0);
+    let switch_availability = user_switch::Availability::new();
+    if let Some(item) = switch_user.as_ref() {
+        let (shell, popover, availability) =
+            (shell.clone(), popover.clone(), switch_availability.clone());
+        item.connect_clicked(move |_| {
+            popover.popdown();
+            // `activateSwitchUser` refuses an unavailable action; the
+            // rule is re-read live, so a stale row cannot bypass it.
+            let locked = shell.borrow().control.as_ref().is_some_and(|c| c.locked());
+            let allowed = lockdown::read().entry_visibility().user_switch;
+            if !user_switch::switch_user_visible(allowed, &availability.facts(), locked) {
+                eprintln!("tuna-shell-gtk: switch user is not available");
+                return;
+            }
+            // Lock first (`Main.screenShield.lock(false)`, which declines
+            // while `disable-lock-screen` is set), then go to the login
+            // screen. A lock that cannot be requested keeps this session.
+            if lockdown::read().entry_visibility().lock_screen {
+                let requested = shell.borrow_mut().control.as_mut().map(|c| c.lock());
+                match requested {
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        eprintln!("tuna-shell-gtk: switch user: lock failed: {e}; not switching");
+                        return;
+                    }
+                    None => {
+                        eprintln!(
+                            "tuna-shell-gtk: switch user: no compositor to lock; not switching"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                eprintln!("tuna-shell-gtk: switch user: screen lock is locked down, not locking");
+            }
+            user_switch::goto_login_session();
+        });
+    }
     let power_menu = power_menu_box.revealer.clone();
     {
         let motion = power_menu_box.motion.clone();
@@ -1183,21 +1228,57 @@ fn quick_settings_popover(
     }
     // Administrative lockdown (#357): the lock button and the
     // session-ending rows follow the live policy; a nested session
-    // with no rows shows no power menu at all.
+    // with no rows shows no power menu at all. Switch User… follows
+    // GNOME's whole rule (`user_switch::switch_user_visible`): the
+    // policy, the AccountsService and seat facts, and the lock state.
     {
         let actions = power_ui.actions().to_vec();
+        let power_button = power.clone();
+        let offers_switch_user = switch_user.is_some();
+        let (shell, availability) = (shell.clone(), switch_availability.clone());
         let apply: Rc<dyn Fn(lockdown::EntryVisibility)> =
             Rc::new(move |visible: lockdown::EntryVisibility| {
                 lock.set_visible(visible.lock_screen);
                 for (action, row) in &power_rows {
                     row.set_visible(power::action_allowed(*action, visible.log_out));
                 }
-                if let Some(separator) = log_out_separator.as_ref() {
-                    separator.set_visible(visible.log_out);
+                let locked = shell
+                    .try_borrow()
+                    .is_ok_and(|shell| shell.control.as_ref().is_some_and(|c| c.locked()));
+                let switch_visible = switch_user.is_some()
+                    && user_switch::switch_user_visible(
+                        visible.user_switch,
+                        &availability.facts(),
+                        locked,
+                    );
+                if let Some(row) = switch_user.as_ref() {
+                    row.set_visible(switch_visible);
                 }
-                power.set_visible(power::power_menu_visible_for(&actions, visible.log_out));
+                if let Some(separator) = log_out_separator.as_ref() {
+                    separator.set_visible(visible.log_out || switch_visible);
+                }
+                power.set_visible(
+                    power::power_menu_visible_for(&actions, visible.log_out) || switch_visible,
+                );
             });
         apply(lockdown::read().entry_visibility());
+        {
+            let apply = Rc::downgrade(&apply);
+            switch_availability.connect_changed(Rc::new(move || {
+                if let Some(apply) = apply.upgrade() {
+                    apply(lockdown::read().entry_visibility());
+                }
+            }));
+        }
+        if offers_switch_user {
+            switch_availability.start();
+        }
+        {
+            // Opening the menu re-applies the rule, which also follows
+            // the session's lock state (`_sessionUpdated`).
+            let apply = apply.clone();
+            power_button.connect_clicked(move |_| apply(lockdown::read().entry_visibility()));
+        }
         if let Some(lockdown_settings) = settings(lockdown::SCHEMA) {
             lockdown_settings.connect_changed(None, move |_, _| {
                 apply(lockdown::read().entry_visibility());
