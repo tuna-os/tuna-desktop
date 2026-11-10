@@ -45,7 +45,7 @@ in `/proc/<pid>/environ` and know what overriding them does.
 |---|---|---|---|
 | `TUNA_CONTROL_SOCKET` | compositor, for the shell | Path of the compositor's control socket, `$XDG_RUNTIME_DIR/tuna-<socket>.control`. Without it the shell runs with an empty overview. | set at `crates/compositor/src/supervise.rs:433`; path from `crates/compositor/src/runtime.rs:853-861`; read at `crates/shell-gtk/src/main.rs:314`, `crates/shell-host/src/main.rs:37-39` |
 | `TUNA_SESSION_KIND` | compositor, for the shell | `nested` or `hardware`, from the backend in use. The shell treats anything other than `hardware` as nested: Log Out ends only the compositor and there is no Power Off, Restart or Suspend. A value already in the compositor's environment is passed through unchanged, which proofs use. | set at `crates/compositor/src/runtime.rs:1166-1176`; read at `crates/shell-gtk/src/power.rs:169-172` |
-| `WAYLAND_DISPLAY` | compositor, for itself and its children | The private socket name, set in the compositor's own process only and restored on shutdown. | `crates/compositor/src/runtime.rs:571-578`, `crates/compositor/src/supervise.rs:429` |
+| `WAYLAND_DISPLAY` | compositor, for child services | The private socket name, configured explicitly per child command (ADR 0003); the compositor process environment remains unmutated. | `crates/compositor/src/supervise.rs:429`, `crates/compositor/src/orca.rs:334`, `crates/compositor/src/ime.rs:205`, `crates/compositor/src/bell.rs:52` |
 | `XDG_CURRENT_DESKTOP` | `tuna-session`, for the compositor | `Tuna:GNOME` when the display manager did not set it. The session file's `DesktopNames=Tuna;GNOME;` normally sets it. | `crates/compositor/src/bin/tuna-session.rs:55-67`, `share/wayland-sessions/tuna.desktop` |
 | `XDG_SESSION_TYPE` | `tuna-session`, for the compositor | Always `wayland`. A TTY login starts with `tty`. | `crates/compositor/src/bin/tuna-session.rs:69-73` |
 | `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`, `DISPLAY` | compositor (DRM/KMS only), for the systemd user manager and D-Bus activation | Imported with `systemctl --user set-environment` and `UpdateActivationEnvironment` so that portals and activated services find the session. `DISPLAY` is imported empty, then set to Xwayland's display once it is ready. A nested session never changes the host's activation environment. | `crates/compositor/src/session_services.rs:52-61`, `crates/compositor/src/session_services.rs:218-240`, `crates/compositor/src/session_services.rs:403-423` |
@@ -185,7 +185,7 @@ uses each one for.
 
 | Variable | Used for | Source |
 |---|---|---|
-| `WAYLAND_DISPLAY`, `DISPLAY` | With `--backend auto` (the default), a non-empty value in either means "run nested in a window"; neither means DRM/KMS. | `crates/compositor/src/runtime.rs:252-256` |
+| `WAYLAND_DISPLAY`, `DISPLAY` | With `--backend auto` (the default), a non-empty value in either means "run nested in a window"; neither means DRM/KMS. | `crates/compositor/src/runtime.rs:257-262` |
 | `XDG_RUNTIME_DIR` | The Wayland socket, the control socket (never in a shared temporary directory) and GNOME's session leader FIFO. Must be absolute and private to the user. | `crates/compositor/src/runtime.rs:853-861`, `crates/compositor/src/session_services.rs:434-441`, `crates/shell-host/src/xdg.rs:36` |
 | `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `HOME` | Where settings, caches and state live: `monitors.xml`, the wallpaper cache, window sessions, ICC profiles, the shell's state. Also the paths the startup upgrade guard checks. | `crates/compositor/src/monitors.rs:255-261`, `crates/compositor/src/wallpaper.rs:1635-1637`, `crates/compositor/src/xdg_session.rs:485-488`, `crates/compositor/src/color_manager.rs:623-629`, `crates/shell-host/src/xdg.rs:23-51`, `crates/compositor/src/user_upgrade.rs:84-98` |
 | `XDG_DATA_DIRS` | Desktop entries and icon themes. | `crates/shell-host/src/apps.rs:101-106`, `crates/shell-host/src/icons.rs:31-40`, `crates/compositor/src/cursor.rs:108` |
@@ -222,8 +222,10 @@ The script's header documents its options; they all start with `TRY_TUNA_`:
 | `TUNA_BUILD_SLOT_BASE` | `/tmp/tuna-local-build.slot` | Prefix of the build slots' lock files (`.0`, `.1`, …). |
 | `TUNA_PROOF_SLOTS` | `1` | Nested (private Xvfb) proofs that may run at once; above 1 is opt-in, as timing-sensitive proof stages flake under the load. |
 | `TUNA_PROOF_SLOT_BASE` | `/tmp/tuna-local-proof.slot` | Prefix of the nested proofs' slot lock files. |
-| `TUNA_PROOF_LOCK` | `/tmp/tuna-local-proof.lock` | Lock file that serializes proofs of machine-wide state (vkms, seatd, uinput, sudo). |
-| `TUNA_PROOF_TIMEOUT` | `45` | Minutes before `just proof` stops a proof and everything it started. |
+| `TUNA_PROOF_LOCK` | `/tmp/tuna-local-proof.lock` | Prefix of the one slot file (`.0`) that serializes proofs of machine-wide state (vkms, seatd, uinput, sudo). |
+| `TUNA_PROOF_TIMEOUT` | the proof's CI job `timeout-minutes`, at least 45 | Minutes before `just proof` stops a proof and everything it started. |
+| `TUNA_BUILD_TIMEOUT` | `60` | Minutes before `just build`, `test` or `clippy` stops cargo's process group. |
+| `TUNA_SLOT_WAIT` | `120` | Minutes a recipe waits for a build or proof slot before giving up (exit 75). |
 | `TUNA_MIN_FREE_GB` | `40` | Below this many GiB free on the repository's filesystem, `tuna-disk-guard` removes idle worktree targets and stale scratch. Build recipes run this guard first. |
 | `TUNA_IDLE_MINUTES` | `45` | How long a worktree target must be untouched before `tuna-disk-guard` may remove it; running-process references always protect it. |
 | `TUNA_CI_ARTIFACTS` | `/tmp/tuna-ci-artifacts` | Where `just ci-artifacts` downloads to. |
