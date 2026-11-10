@@ -188,4 +188,15 @@ GNOME's version.
 - **layer-shell is present,** unlike Mutter. Tuna Desktop's shell is a separate
   process and draws its panel, overview and banners through it.
 
+The clipboard outlives the client that copied it, as Mutter's
+`meta-clipboard-manager.c` keeps it. When a client sets the clipboard
+(`wl_data_device` or data control), the compositor copies its most
+preferred supported type in Mutter's order (images up to 200 MiB, plain
+text up to 4 MiB; a larger copy is cut at the limit, as Mutter's is).
+When that owner clears the clipboard, destroys its source or
+disconnects, the compositor offers the finished copy, that one type
+only, as its own selection. The primary selection is not retained, as in
+Mutter. Unlike Mutter, a RemoteDesktop session's selection is not
+copied (`crates/compositor/src/clipboard_manager.rs`, #1033).
+
 `xdg_toplevel_icon_manager_v1` v1 accepts square SHM icons and sanitized theme names, applied on the next surface commit. PNGs live in a private, bounded compositor cache. X11 `_NET_WM_ICON` and legacy square TrueColor `WM_HINTS` pixmaps (24/32-bit color, optional 1-bit transparency mask) are read on a bounded worker for mapped window identities. Palette and unsupported visuals fall back to a generic app icon.

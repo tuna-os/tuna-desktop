@@ -4935,6 +4935,9 @@ impl Runtime {
         self.display
             .dispatch_clients(&mut self.state)
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        // Smithay has stored this dispatch's selections: copy a new one,
+        // or take over from an owner that went away (MetaClipboardManager).
+        self.state.retain_clipboard();
         self.display
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;

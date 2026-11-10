@@ -85,6 +85,7 @@ pub mod animation_clock;
 mod auth_owner;
 mod bell;
 pub mod capture_security;
+pub mod clipboard_manager;
 pub mod color_manager;
 mod constraint_motion;
 pub mod control;
@@ -257,6 +258,9 @@ pub struct State {
     /// RemoteDesktop sessions with the clipboard enabled, and who owns
     /// the clipboard as they see it (mutter's MetaClipboardSession).
     pub(crate) remote_clipboard: crate::mutter::remote_clipboard::Registry,
+    /// The saved copy of the clipboard, served once its owner is gone
+    /// (mutter's MetaClipboardManager).
+    pub(crate) clipboard_manager: clipboard_manager::ClipboardManager,
     pub(crate) panel_surfaces: Vec<layer::PanelSurface>,
     /// Ids of `wl_surface`s whose layer-shell role was destroyed.
     /// Smithay 0.7 keeps validating them on commit against reset
@@ -725,12 +729,13 @@ impl OutputHandler for State {}
 /// Clipboard/drag-and-drop: advertised so toolkit clients accept the
 /// display. Client copy/paste and primary selection round-trip
 /// through the smithay selection state; both focuses mirror keyboard
-/// focus (see [`State::sync_selection_focus`]). The only
-/// compositor-provided selection is a RemoteDesktop session's
-/// (SetSelection); its user data is the session id. Drag-and-drop
-/// pointer grabs are not served yet.
+/// focus (see [`State::sync_selection_focus`]). Compositor-provided
+/// clipboard selections are a RemoteDesktop session's (SetSelection)
+/// and the clipboard manager's retained copy of a gone client's
+/// selection; [`clipboard_manager::CompositorSelection`] tells them
+/// apart. Drag-and-drop pointer grabs are not served yet.
 impl SelectionHandler for State {
-    type SelectionUserData = u64;
+    type SelectionUserData = clipboard_manager::CompositorSelection;
 
     fn new_selection(
         &mut self,
@@ -739,23 +744,37 @@ impl SelectionHandler for State {
         _seat: Seat<Self>,
     ) {
         if ty == smithay::wayland::selection::SelectionTarget::Clipboard {
-            self.remote_clipboard
-                .client_selection(source.map(|source| source.mime_types()));
+            // A cleared clipboard reaches the remote sessions from
+            // `retain_clipboard`, which may take it over first.
+            if let Some(source) = &source {
+                self.remote_clipboard
+                    .client_selection(Some(source.mime_types()));
+            }
+            self.clipboard_manager.client_selection(source);
         }
     }
 
-    /// A client pastes a remote session's selection: mutter's
-    /// `meta_selection_source_remote_read_async`.
+    /// A client pastes a remote session's selection (mutter's
+    /// `meta_selection_source_remote_read_async`) or the retained copy
+    /// (`meta_selection_source_memory_read_async`).
     fn send_selection(
         &mut self,
         ty: smithay::wayland::selection::SelectionTarget,
         mime_type: String,
         fd: std::os::fd::OwnedFd,
         _seat: Seat<Self>,
-        session_id: &u64,
+        user_data: &clipboard_manager::CompositorSelection,
     ) {
-        if ty == smithay::wayland::selection::SelectionTarget::Clipboard {
-            self.remote_clipboard.transfer(*session_id, &mime_type, fd);
+        if ty != smithay::wayland::selection::SelectionTarget::Clipboard {
+            return;
+        }
+        match *user_data {
+            clipboard_manager::CompositorSelection::Remote(session_id) => {
+                self.remote_clipboard.transfer(session_id, &mime_type, fd)
+            }
+            clipboard_manager::CompositorSelection::Retained(generation) => {
+                self.clipboard_manager.serve(generation, &mime_type, fd);
+            }
         }
     }
 }
@@ -1080,6 +1099,7 @@ impl State {
             tablet_pads: Vec::new(),
             primary_selection_state: PrimarySelectionState::new::<State>(dh),
             remote_clipboard: Default::default(),
+            clipboard_manager: Default::default(),
             panel_surfaces: Vec::new(),
             dead_layer_surfaces: std::collections::HashSet::new(),
             popups: smithay::desktop::PopupManager::default(),
@@ -1497,10 +1517,19 @@ impl TestCompositor {
 
     /// Dispatch pending client requests and flush replies. Drives the
     /// display without an event loop; tests interleave this with client
-    /// actions instead of blocking on either side.
+    /// actions instead of blocking on either side. Between the two, the
+    /// clipboard manager runs as in the runtime's tick.
     pub fn pump(&mut self) {
         self.display.dispatch_clients(&mut self.state).unwrap();
+        self.state.retain_clipboard();
         self.display.flush_clients().unwrap();
+    }
+
+    /// Whether the clipboard manager finished copying the current client
+    /// selection, so the copying client may go away (socketpair tests wait
+    /// for the copy thread instead of racing it).
+    pub fn clipboard_copy_saved(&self) -> bool {
+        self.state.clipboard_manager.finished().is_some()
     }
 
     /// Seat capability handles for native protocol fixtures.
