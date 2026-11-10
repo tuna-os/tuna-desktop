@@ -45,8 +45,10 @@ is represented by a match, a version floor or a recorded deviation; a
 source-only floor is never described as a measured native version.
 
 **Golden test.** `crates/compositor/tests/protocols.rs` asserts the exact
-list and versions below. Adding or dropping a protocol updates the test
-and this page together.
+list and versions an ordinary client sees (`EXPECTED`), and that the
+supervised shell's connection sees exactly that plus `SHELL_ONLY`
+(layer-shell). Adding or dropping a protocol updates the test and this
+page together.
 
 ## Advertised by Tuna Desktop
 
@@ -61,7 +63,7 @@ and this page together.
 | zwp_primary_selection_device_manager_v1 | 1 | |
 | xdg_wm_base | 6 | popups with positioner constraints and grabs |
 | zxdg_output_manager_v1 | 3 | |
-| zwlr_layer_shell_v1 | 4 | Tuna Desktop's own shell draws through it |
+| zwlr_layer_shell_v1 | 4 | Tuna Desktop's own shell draws through it. Only the supervised shell's connection may bind it: the native connection whose peer pid is the shell child the compositor spawned and still holds (`tuna-shell-gtk`, or the legacy `tuna-shell-host`), the same identity the session lock and control socket check. Every other client's registry omits it and a blind bind by name is a protocol error (#1048; `ClientState::admit_supervised_shell`, `layer::is_shell_peer`) |
 | zwp_linux_dmabuf_v1 | 3 | only when the renderer reports formats |
 | xdg_activation_v1 | 1 | focus policy below |
 | wp_viewporter | 1 | |
@@ -186,6 +188,8 @@ GNOME's version.
 - **xdg-decoration is absent,** as in Mutter. GNOME is client-side
   decorations only, and the golden test asserts the absence.
 - **layer-shell is present,** unlike Mutter. Tuna Desktop's shell is a separate
-  process and draws its panel, overview and banners through it.
+  process and draws its panel, overview and banners through it. Only that
+  supervised shell can see or bind it; applications cannot, so they have no
+  more surface-placement reach than on GNOME.
 
 `xdg_toplevel_icon_manager_v1` v1 accepts square SHM icons and sanitized theme names, applied on the next surface commit. PNGs live in a private, bounded compositor cache. X11 `_NET_WM_ICON` and legacy square TrueColor `WM_HINTS` pixmaps (24/32-bit color, optional 1-bit transparency mask) are read on a bounded worker for mapped window identities. Palette and unsupported visuals fall back to a generic app icon.

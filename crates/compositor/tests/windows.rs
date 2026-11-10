@@ -467,8 +467,21 @@ fn pump(
 /// Connect one client and bind globals (compositor, seat with keyboard
 /// and pointer, xdg shell).
 fn connect(comp: &mut TestCompositor) -> (Connection, EventQueue<Client>, Client) {
+    connect_with(comp, TestCompositor::add_client)
+}
+
+/// Connect the supervised shell: the only client offered layer-shell
+/// (#1048), so every shell layer surface below comes from here.
+fn connect_shell(comp: &mut TestCompositor) -> (Connection, EventQueue<Client>, Client) {
+    connect_with(comp, TestCompositor::add_shell_client)
+}
+
+fn connect_with(
+    comp: &mut TestCompositor,
+    admit: fn(&mut TestCompositor, UnixStream) -> wayland_server::Client,
+) -> (Connection, EventQueue<Client>, Client) {
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    comp.add_client(server_stream);
+    admit(comp, server_stream);
     let conn = Connection::from_socket(client_stream).unwrap();
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
@@ -1902,7 +1915,7 @@ fn overview_parks_keyboard_focus_and_restores_on_dismiss() {
     assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
 
     // Third client: the shell overview layer surface.
-    let (conn_c, mut queue_c, mut client_c) = connect(&mut f.comp);
+    let (conn_c, mut queue_c, mut client_c) = connect_shell(&mut f.comp);
     let qh_c = queue_c.handle();
     let surface_c = client_c
         .compositor
@@ -2010,7 +2023,7 @@ fn shell_layer(
     WlSurface,
     ZwlrLayerSurfaceV1,
 ) {
-    let (conn, mut queue, mut client) = connect(comp);
+    let (conn, mut queue, mut client) = connect_shell(comp);
     let qh = queue.handle();
     let surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
     let layer = client.layer_shell.as_ref().unwrap().get_layer_surface(
@@ -3557,7 +3570,7 @@ fn picking_a_window_in_the_overview_survives_the_close() {
     assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
 
     // Third client: the shell overview layer surface.
-    let (conn_c, mut queue_c, mut client_c) = connect(&mut f.comp);
+    let (conn_c, mut queue_c, mut client_c) = connect_shell(&mut f.comp);
     let qh_c = queue_c.handle();
     let surface_c = client_c
         .compositor
@@ -3608,7 +3621,7 @@ fn a_window_launched_from_the_overview_is_focused_when_it_closes() {
     assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
 
     // Third client: the shell overview layer surface.
-    let (conn_c, mut queue_c, mut client_c) = connect(&mut f.comp);
+    let (conn_c, mut queue_c, mut client_c) = connect_shell(&mut f.comp);
     let qh_c = queue_c.handle();
     let surface_c = client_c
         .compositor
@@ -3721,7 +3734,7 @@ fn strip_columns_resize_on_primary_output_failover_without_losing_focus() {
 fn exclusive_overlay_receives_navigation_and_retains_popup_system_accelerators() {
     use tuna_shell_control::{Accelerator, MODE_NORMAL, MODE_POPUP, MOD_ALT, MOD_CTRL};
     let mut f = two_windows();
-    let (conn, mut queue, mut client) = connect(&mut f.comp);
+    let (conn, mut queue, mut client) = connect_shell(&mut f.comp);
     let qh = queue.handle();
     let surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
     let layer = client.layer_shell.as_ref().unwrap().get_layer_surface(
@@ -3825,7 +3838,7 @@ fn panel_dynamic_exclusive_hold_suppresses_normal_accelerators() {
     // Evdev `s` (KEY_S): the Super+S quick-settings chord shape.
     const S_KEYCODE: u32 = 31;
     let mut f = two_windows();
-    let (conn, mut queue, mut client) = connect(&mut f.comp);
+    let (conn, mut queue, mut client) = connect_shell(&mut f.comp);
     let qh = queue.handle();
     let surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
     let layer = client.layer_shell.as_ref().unwrap().get_layer_surface(
@@ -3894,7 +3907,7 @@ fn panel_dynamic_exclusive_hold_suppresses_normal_accelerators() {
 fn exclusive_overview_keeps_overview_accelerators() {
     use tuna_shell_control::{Accelerator, MODE_OVERVIEW, MOD_LOGO, OVERVIEW_NAMESPACE};
     let mut f = two_windows();
-    let (conn, mut queue, mut client) = connect(&mut f.comp);
+    let (conn, mut queue, mut client) = connect_shell(&mut f.comp);
     let qh = queue.handle();
     let surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
     let layer = client.layer_shell.as_ref().unwrap().get_layer_surface(

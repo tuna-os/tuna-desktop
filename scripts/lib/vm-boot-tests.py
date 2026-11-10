@@ -1289,6 +1289,20 @@ class ConstraintProofCleanup(unittest.TestCase):
             self.assertEqual(actual["cleanup_errors"][0]["action"], "constraint-quit")
             self.assertTrue((Path(out) / "hot-corner-constraint-mouse-restoration.json").exists())
             self.assertTrue((Path(out) / "hot-corner-constraint-stderr.json").exists())
+
+    def test_principal_quit_by_the_proof_is_not_quit_again(self):
+        calls = []
+        def run(action):
+            calls.append(action)
+            if action == "constraint-quit":
+                raise RuntimeError("principal already gone")
+            return {"stderr": "", "truncated": False}
+        with tempfile.TemporaryDirectory() as out, patch.object(lane, "restore_corner_mouse", return_value={"verified": True}):
+            lane.finish_constraint_proof(SimpleNamespace(run=run), object(), {}, out,
+                {"principal": {"pid": 42}, "principal_quit": True, "primary_error": None})
+            self.assertEqual(calls, ["constraint-log"])
+            actual = json.loads((Path(out) / "hot-corner-constraints.json").read_text())
+            self.assertEqual(actual["cleanup_errors"], [])
 class PublicOrcaNavigation(unittest.TestCase):
     def focus_module(self):
         file = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-shell-focus"

@@ -232,7 +232,9 @@ const FORBIDDEN_GLOBAL_SUBSTRINGS: &[&str] = &[
 fn no_capture_or_toplevel_control_global_advertised() {
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     let mut comp = TestCompositor::new();
-    comp.add_client(server_stream);
+    // The supervised shell's registry is the widest a native client gets:
+    // the ordinary globals plus layer-shell (#1048). None may capture.
+    comp.add_shell_client(server_stream);
 
     let conn = Connection::from_socket(client_stream).unwrap();
     let mut queue = conn.new_event_queue();

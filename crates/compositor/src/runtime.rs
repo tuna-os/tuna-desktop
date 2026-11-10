@@ -1166,7 +1166,9 @@ impl Runtime {
         event_loop
             .handle()
             .insert_source(socket, |stream, _, runtime: &mut Runtime| {
-                let client_data = ClientState::native_connection(&stream);
+                let mut client_data = ClientState::native_connection(&stream);
+                // Layer-shell is the supervised shell's alone (#1048).
+                client_data.admit_supervised_shell(&stream, runtime.shell.child_pid());
                 if let Ok(client) = runtime
                     .display
                     .handle()

@@ -329,6 +329,10 @@ pub(crate) struct ClientState {
     /// one client allowed a virtual keyboard (to hand back the keys
     /// IBus does not take).
     pub(crate) ime_bridge: bool,
+    /// The supervised shell's own connection: the one client offered
+    /// `zwlr_layer_shell_v1` (#1048). Set at accept time only when the
+    /// peer is the shell child the runtime holds (`layer::is_shell_peer`).
+    pub(crate) supervised_shell: bool,
     /// Optional tag applied to windows of a D-Bus-created ordinary client.
     pub(crate) connection_window_tag: Option<String>,
     /// Optional liveness marker for an ordinary service-channel connection.
@@ -368,6 +372,27 @@ impl ClientState {
             ime_bridge: true,
             ..Self::default()
         }
+    }
+    /// State for the supervised shell's connection (layer-shell admitted).
+    pub(crate) fn supervised_shell() -> Self {
+        Self {
+            supervised_shell: true,
+            ..Self::default()
+        }
+    }
+    /// Admit an accepted native connection to layer-shell when its peer is
+    /// the shell child `shell_pid` the runtime still holds. The peer is the
+    /// pinned original process when the kernel supplied a pidfd (no identity
+    /// once it exited), else its `SO_PEERCRED` pid, as the session lock's
+    /// shell check reads it.
+    pub(crate) fn admit_supervised_shell(&mut self, socket: &UnixStream, shell_pid: Option<u32>) {
+        let peer = match &self.original_credentials {
+            Some(credentials) => crate::capture_security::pinned_process_id(credentials),
+            None => rustix::net::sockopt::socket_peercred(socket)
+                .ok()
+                .and_then(|peer| u32::try_from(peer.pid.as_raw_pid()).ok()),
+        };
+        self.supervised_shell = crate::layer::is_shell_peer(peer, shell_pid);
     }
 }
 
@@ -1071,7 +1096,15 @@ impl State {
             seat_state,
             seat,
             dh: dh.clone(),
-            layer_shell_state: WlrLayerShellState::new::<State>(dh),
+            // Only the supervised shell may place layer surfaces (#1048):
+            // GNOME has no client-placed shell layers at all, and Mutter
+            // hides privileged globals from clients that lack the
+            // capability (meta-wayland-x11-interop.c `x11_interop_filter`).
+            layer_shell_state: WlrLayerShellState::new_with_filter::<State, _>(dh, |client| {
+                client
+                    .get_data::<ClientState>()
+                    .is_some_and(|data| data.supervised_shell)
+            }),
             data_device_state: DataDeviceState::new::<State>(dh),
             dnd_icon: None,
             cursor_image: smithay::input::pointer::CursorImageStatus::default_named(),
@@ -1492,6 +1525,17 @@ impl TestCompositor {
         self.display
             .handle()
             .insert_client(stream, Arc::new(ClientState::ime_bridge()))
+            .unwrap()
+    }
+
+    /// Attach the supervised shell's connection in native protocol
+    /// fixtures: the one client offered layer-shell. The runtime grants
+    /// this only to the shell child's own pid; public clients use
+    /// `add_client`.
+    pub fn add_shell_client(&mut self, stream: UnixStream) -> Client {
+        self.display
+            .handle()
+            .insert_client(stream, Arc::new(ClientState::supervised_shell()))
             .unwrap()
     }
 

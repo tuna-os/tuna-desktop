@@ -3,6 +3,8 @@
 //! The globals list is golden: adding or dropping a protocol is a
 //! deliberate change that updates `EXPECTED` and `docs/protocols.md`
 //! together. xdg-decoration stays absent on purpose (Mutter parity).
+//! `EXPECTED` is what an ordinary client sees; `SHELL_ONLY` holds the
+//! globals the supervised shell's connection sees on top of it (#1048).
 
 use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
@@ -40,12 +42,14 @@ wayland_client::delegate_noop!(Client: ignore XdgToplevelIconV1);
 wayland_client::delegate_noop!(Client: ignore wayland_client::protocol::wl_shm::WlShm);
 wayland_client::delegate_noop!(Client: ignore wayland_client::protocol::wl_shm_pool::WlShmPool);
 wayland_client::delegate_noop!(Client: ignore wayland_client::protocol::wl_buffer::WlBuffer);
+use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::ZwlrLayerShellV1;
+wayland_client::delegate_noop!(Client: ignore ZwlrLayerShellV1);
 
 const ROUNDS: usize = 200;
 
-/// Every global a client sees on a headless compositor, by version.
-/// linux-dmabuf joins once a renderer reports formats (see below), and
-/// wl_output once an output is connected.
+/// Every global an ordinary client sees on a headless compositor, by
+/// version. linux-dmabuf joins once a renderer reports formats (see
+/// below), and wl_output once an output is connected.
 const EXPECTED: &[(&str, u32)] = &[
     ("ext_session_lock_manager_v1", 1),
     ("wl_compositor", 6),
@@ -68,7 +72,6 @@ const EXPECTED: &[(&str, u32)] = &[
     ("xdg_toplevel_tag_manager_v1", 1),
     ("xdg_wm_base", 6),
     ("xdg_wm_dialog_v1", 1),
-    ("zwlr_layer_shell_v1", 4),
     ("zwp_idle_inhibit_manager_v1", 1),
     ("zwp_keyboard_shortcuts_inhibit_manager_v1", 1),
     ("zwp_pointer_constraints_v1", 1),
@@ -81,6 +84,10 @@ const EXPECTED: &[(&str, u32)] = &[
     ("zxdg_importer_v2", 1),
     ("zxdg_output_manager_v1", 3),
 ];
+
+/// Globals filtered to the supervised shell's connection (#1048): its
+/// registry is `EXPECTED` plus these, an ordinary client's lacks them.
+const SHELL_ONLY: &[(&str, u32)] = &[("zwlr_layer_shell_v1", 4)];
 
 #[derive(Default)]
 struct Client {
@@ -215,18 +222,27 @@ wayland_client::delegate_noop!(Client: ignore XdgActivationV1);
 
 struct Peer {
     _conn: Connection,
+    registry: WlRegistry,
     queue: EventQueue<Client>,
     client: Client,
 }
 
 fn connect(comp: &mut TestCompositor) -> Peer {
+    connect_with(comp, TestCompositor::add_client)
+}
+
+fn connect_with(
+    comp: &mut TestCompositor,
+    admit: fn(&mut TestCompositor, UnixStream) -> wayland_server::Client,
+) -> Peer {
     let (server, stream) = UnixStream::pair().unwrap();
-    comp.add_client(server);
+    admit(comp, server);
     let conn = Connection::from_socket(stream).unwrap();
     let queue = conn.new_event_queue();
-    conn.display().get_registry(&queue.handle(), ());
+    let registry = conn.display().get_registry(&queue.handle(), ());
     Peer {
         _conn: conn,
+        registry,
         queue,
         client: Client::default(),
     }
@@ -308,6 +324,61 @@ fn advertised_globals_match_the_golden_list() {
             .contains_key("zxdg_decoration_manager_v1"),
         "GNOME is client-side decorations only"
     );
+}
+
+fn seen_globals(peer: &Peer) -> Vec<(String, u32)> {
+    peer.client
+        .globals
+        .iter()
+        .map(|(k, (_, v))| (k.clone(), *v))
+        .collect()
+}
+
+#[test]
+fn layer_shell_is_visible_and_bindable_only_by_the_supervised_shell() {
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    let mut app = connect(&mut comp);
+    let mut shell = connect_with(&mut comp, TestCompositor::add_shell_client);
+    pump(&mut comp, &mut manager, &mut [&mut app, &mut shell]);
+
+    // The shell's registry is the ordinary one plus the filtered globals.
+    let mut expected: Vec<(String, u32)> = EXPECTED
+        .iter()
+        .chain(SHELL_ONLY)
+        .map(|(k, v)| ((*k).to_owned(), *v))
+        .collect();
+    expected.sort();
+    assert_eq!(seen_globals(&shell), expected);
+    for (interface, _) in SHELL_ONLY {
+        assert!(
+            !app.client.globals.contains_key(*interface),
+            "{interface} must stay out of an ordinary client's registry"
+        );
+    }
+
+    // Knowing the global's name (from the shell's registry) must not let
+    // an ordinary client bind it blind: the bind is a protocol error.
+    let (name, _) = shell.client.globals["zwlr_layer_shell_v1"];
+    let _forced: ZwlrLayerShellV1 = app.registry.bind(name, 4, &app.queue.handle(), ());
+    let mut denied = false;
+    for _ in 0..ROUNDS {
+        let _ = app.queue.flush();
+        comp.pump();
+        if let Some(guard) = app.queue.prepare_read() {
+            let _ = guard.read();
+        }
+        let _ = app.queue.dispatch_pending(&mut app.client);
+        if app._conn.backend().last_error().is_some() {
+            denied = true;
+            break;
+        }
+    }
+    assert!(denied, "a blind bind of the shell-only global must fail");
+    // The shell's own connection is untouched by the denial.
+    let _bound: ZwlrLayerShellV1 = shell.registry.bind(name, 4, &shell.queue.handle(), ());
+    pump(&mut comp, &mut manager, &mut [&mut shell]);
+    assert!(shell._conn.backend().last_error().is_none());
 }
 
 #[test]
