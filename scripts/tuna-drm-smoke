@@ -1240,10 +1240,15 @@ state '.overview_motion.scroll == null and (.overview_motion.scroll_release | .t
 strip_flick="$(jq -c .overview_motion.scroll_release "$CSTATE")"
 state ".overview_open and .active_workspace != $HOME_WS and .active_workspace != (.workspaces[1])" 5 ||
     fail D-TOUCHPAD-SWIPE "the flick did not settle two or more workspaces on"
-tp down 3 0.25 0.5
-tp hold 30
-tp move 50 0 200
-tp up
+# The flick may have carried the strip to the last workspace, further
+# than one swipe across the pad brings back, so come back in two.
+for _ in 1 2; do
+    tp down 3 0.25 0.5
+    tp hold 30
+    tp move 50 0 200
+    tp up
+    state ".overview_motion.scroll == null" 10 || fail D-TOUCHPAD-SWIPE "a swipe back did not settle"
+done
 state ".active_workspace == $HOME_WS and .overview_motion.scroll == null" 10 || fail D-TOUCHPAD-SWIPE "could not come back to the first workspace"
 tp swipe 3 0 25 250
 at_rest 0 "$HOME_WS" || fail D-TOUCHPAD-SWIPE "could not close the overview after the sideways swipes"
