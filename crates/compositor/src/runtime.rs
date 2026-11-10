@@ -947,19 +947,7 @@ impl Runtime {
                 let handle = event_loop.handle();
                 handle
                     .insert_source(sources.session, |event, _, rt: &mut Runtime| {
-                        let activated =
-                            matches!(event, smithay::backend::session::Event::ActivateSession);
-                        if matches!(event, smithay::backend::session::Event::PauseSession) {
-                            rt.manager.cancel_strip_pointer(&mut rt.state);
-                        }
-                        if let Backend::Drm(drm) = &mut rt.backend {
-                            drm.on_session_event(event);
-                        }
-                        // Monitors may have come or gone while another VT
-                        // owned the device.
-                        if activated {
-                            rt.on_drm_hotplug();
-                        }
+                        rt.on_session_event(event);
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
                 handle
@@ -1697,6 +1685,38 @@ impl Runtime {
         self.control.is_locked()
     }
 
+    /// Apply the compositor-thread half of a coalesced logind update.
+    /// The monitor invalidates auth epochs before waking this thread.
+    fn on_sleep_update(&mut self, lock: bool, wake: bool) {
+        if lock {
+            self.engage_lock();
+        }
+        if wake {
+            // Lock is compositor-owned even if the supervised shell died.
+            self.engage_lock();
+            #[cfg(feature = "drm")]
+            if let Backend::Drm(drm) = &mut self.backend {
+                drm.resume_from_sleep();
+            }
+        }
+    }
+
+    #[cfg(feature = "drm")]
+    fn on_session_event(&mut self, event: smithay::backend::session::Event) {
+        let activated = matches!(event, smithay::backend::session::Event::ActivateSession);
+        if matches!(event, smithay::backend::session::Event::PauseSession) {
+            self.manager.cancel_strip_pointer(&mut self.state);
+        }
+        if let Backend::Drm(drm) = &mut self.backend {
+            drm.on_session_event(event);
+        }
+        // Monitors may have come or gone while another VT
+        // owned the device.
+        if activated {
+            self.on_drm_hotplug();
+        }
+    }
+
     /// Engage the lock: flag (idle machine plus hub mirror for
     /// snapshots), overview dismissed, and the exclusive lock surface
     /// up with an empty list — no window titles while locked.
@@ -1913,6 +1933,9 @@ impl Runtime {
         self.control.set_locked(false);
         self.state.set_shortcut_inhibition_locked(false);
         self.overlay.hide();
+        // The lock held the keyboard (`hold_lock_focus`); hand it back,
+        // as GNOME's unlock returns focus to the focused window.
+        self.manager.restore_keyboard_owner(&mut self.state);
     }
 
     /// logind's `Lock` signal (`loginctl lock-session`): `screenShield.js`
@@ -4971,23 +4994,27 @@ impl Runtime {
         // flag. Anyone else's locker is dropped, which tells it the
         // lock failed.
         if let Some((locker, pid)) = self.state.take_lock_request() {
-            let ours = matches!(
-                (pid, self.shell.child_pid()),
-                (Some(pid), Some(child)) if u32::try_from(pid).ok() == Some(child)
+            use crate::session_lock::{lock_request_verdict, LockVerdict};
+            let verdict = lock_request_verdict(
+                pid,
+                self.shell.child_pid(),
+                self.control.lock_screen_allowed(),
             );
-            // Administrative lockdown (#357): a disabled lock screen
-            // refuses even our own shell's locker (no Wayland bypass).
-            let approved = ours && self.control.lock_screen_allowed();
-            if approved {
-                if !self.is_locked() {
-                    self.engage_lock();
+            match verdict {
+                LockVerdict::Approved => {
+                    if !self.is_locked() {
+                        self.engage_lock();
+                    }
                 }
-            } else if ours {
-                eprintln!("tuna-compositor: session lock refused by administrator policy");
-            } else {
-                eprintln!("tuna-compositor: session lock refused for pid {pid:?}");
+                LockVerdict::RefusedByPolicy => {
+                    eprintln!("tuna-compositor: session lock refused by administrator policy");
+                }
+                LockVerdict::RefusedForeign => {
+                    eprintln!("tuna-compositor: session lock refused for pid {pid:?}");
+                }
             }
-            self.state.resolve_lock_request(locker, approved);
+            self.state
+                .resolve_lock_request(locker, verdict == LockVerdict::Approved);
         }
         // A lock client's unlock_and_destroy never unlocks by itself:
         // only a verified password clears the flag.
@@ -5087,6 +5114,15 @@ impl Runtime {
             if !self.overlay.visible {
                 self.overlay.show(Vec::new());
             }
+            // Keyboard focus belongs to the lock screen from the moment
+            // the session locks, not from the first key: an application
+            // behind the lock must not go on believing it is focused.
+            let lock_surface = self
+                .state
+                .primary_output_name()
+                .and_then(|name| self.state.lock_surface_for(&name));
+            self.manager
+                .hold_lock_focus(&mut self.state, lock_surface.as_ref());
         } else {
             if let Some(ime) = &mut self.ime {
                 ime.poll(crate::state::system_millis(), &mut self.display.handle());
@@ -5245,20 +5281,9 @@ impl Runtime {
     /// primary output advance fifo barriers and commit timers (#89).
     #[cfg(feature = "drm")]
     fn page_flipped(&mut self, flip: crate::drm::PageFlip) {
-        use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
-        use smithay::utils::{Monotonic, Time};
-        // Mutter's KMS flags: vsync'd, kernel-timestamped, completion
-        // reported by the hardware.
-        let (time, flags): (Time<Monotonic>, Kind) = match flip.time {
-            Some(time) => (
-                Time::from(time),
-                Kind::Vsync | Kind::HwClock | Kind::HwCompletion,
-            ),
-            None => (
-                self.state.presentation_now(),
-                Kind::Vsync | Kind::HwCompletion,
-            ),
-        };
+        use smithay::utils::Monotonic;
+        let (time, flags) =
+            crate::frame_timing::flip_presentation(flip.time, self.state.presentation_now());
         if let Some(mut feedback) = flip.feedback {
             feedback.presented::<_, Monotonic>(
                 time,
@@ -7962,6 +7987,26 @@ impl AuthOwnerProbe<'_> {
     pub fn invalidate_epoch(&mut self) -> bool {
         crate::auth_owner::advance_epoch(&self.runtime.unlock_generation)
     }
+    /// Inject the same compositor-thread sleep update as the logind
+    /// monitor. This trusted Rust-only probe does not simulate S3/KMS.
+    pub fn prepare_for_sleep(&mut self, sleeping: bool) {
+        if sleeping {
+            crate::auth_owner::advance_epoch(&self.runtime.unlock_generation);
+        }
+        self.runtime.on_sleep_update(sleeping, !sleeping);
+    }
+
+    /// Inject libseat's runtime notification, not a kernel VT switch.
+    #[cfg(feature = "drm")]
+    pub fn set_session_active(&mut self, active: bool) {
+        use smithay::backend::session::Event;
+        self.runtime.on_session_event(if active {
+            Event::ActivateSession
+        } else {
+            Event::PauseSession
+        });
+    }
+
     pub fn try_unlock(&mut self, user: &str, password: &str) -> bool {
         self.runtime.try_unlock(user, password)
     }
@@ -8073,16 +8118,7 @@ fn run_loop(
         #[cfg(feature = "drm")]
         if let Some(monitor) = &sleep_monitor {
             let (lock, wake) = monitor.take();
-            if lock {
-                runtime.engage_lock();
-            }
-            if wake {
-                // Lock is compositor-owned even if the supervised shell died.
-                runtime.engage_lock();
-                if let Backend::Drm(drm) = &mut runtime.backend {
-                    drm.resume_from_sleep();
-                }
-            }
+            runtime.on_sleep_update(lock, wake);
         }
         #[cfg(feature = "drm")]
         match logind_session.as_ref().and_then(|session| session.take()) {

@@ -150,6 +150,21 @@ Roost minimizes toward it as GNOME Shell 51's `_minimizeWindow` does. No
 match in the tree is exhaustive over WmWindowProperty. The isolated diff
 is retained in ICON-GEOMETRY-API-PATCH.diff; the pinned version stays 0.7.0.
 
+Issue #729 changes src/wayland/session_lock/lock.rs and mod.rs: the
+ext_session_lock_v1 duplicate_output check now tracks outputs per lock
+object (SessionLockState) instead of in a manager-wide list that only
+unlock_and_destroy cleared. Upstream's list outlived a refused or
+superseded lock, so when the shell, which creates its lock surfaces before
+Locked as GTK does, locked again with the same wl_output, the new lock
+surface was a duplicate_output protocol error that disconnected the whole
+shell; the list also grew without bound for any client. The protocol
+defines the error per lock object ("more than one lock surface for a given
+output"), which is still enforced. Real-client tests in
+crates/compositor/tests/session_lock_protocol.rs cover the refused retry,
+the superseded pending lock and the per-lock duplicate. The isolated diff
+is retained in SESSION-LOCK-OUTPUTS-PATCH.diff; SessionLockManagerState
+loses its crate-private field; the pinned version stays 0.7.0.
+
 Issue #364 additionally changes `src/wayland/input_method/{mod.rs,
 input_method_handle.rs,input_method_keyboard_grab.rs}`. Registry visibility
 and forced binds both enforce the compositor's input-method admission
