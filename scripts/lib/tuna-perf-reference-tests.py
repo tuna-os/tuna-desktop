@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -14,6 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT/'scripts/lib'))
 import gnome_reference as policy
+import vm_gnome_reference as vm_reference
 
 
 def load(name, path):
@@ -198,6 +200,41 @@ class ReferencePolicy(unittest.TestCase):
         diagnostic=source.rsplit('FROM ',1)[1]
         self.assertIn("pacman -Q mutter | grep -qx 'mutter 51.0-1.7'",diagnostic)
         self.assertIn('sha256sum -c sha256sums',diagnostic)
+
+    def test_reference_base_is_one_pinned_platform_under_the_pinned_snapshot(self):
+        # Runs 43009988803/43209624981: the moving marlin:gnome tag carried
+        # openssl-3, which archive snapshot 2026/10/13 cannot replace, so the
+        # snapshot's openssl could not be installed over its libraries.
+        recipe=ROOT/'packaging/marlin/perf/Containerfile.baseline'
+        source=recipe.read_text()
+        bases=[line for line in source.splitlines() if line.startswith('ARG BASE_IMAGE')]
+        self.assertEqual(bases,['ARG BASE_IMAGE='+vm_reference.BASE_REPOSITORY+'@'+vm_reference.PINNED_PLATFORM])
+        self.assertIn('\nARG ARCH_ARCHIVE_SNAPSHOT=2026/10/13\nFROM ${BASE_IMAGE} AS gnome-baseline\n',source)
+        self.assertIn('pacman -Syyuu --noconfirm gnome-shell mutter gdm',source)
+        self.assertIn("gnome-shell --version | grep -qx 'GNOME Shell 51.0'",source)
+        workflow=(ROOT/'.github/workflows/performance-baseline.yml').read_text()
+        build=workflow.split('      - name: Build one shared preview payload\n',1)[1].split('      - name: ',1)[0]
+        self.assertNotIn('marlin:gnome',workflow)
+        self.assertNotIn('--build-arg BASE_IMAGE=ghcr',build)
+        self.assertNotIn('--build-arg "BASE_IMAGE=ghcr',build)
+        select=[line.strip() for line in build.splitlines() if line.strip().startswith(('base_image=','[[ "$base_image" =~'))]
+        self.assertEqual(len(select),2)
+        self.assertLess(build.index(select[1]),build.index('sudo podman build'))
+        recorded='sudo podman inspect "$base_image" --format \'{{.Digest}}\' | tee base-digest\n'
+        self.assertIn(recorded,build)
+        self.assertIn('[[ "$(cat base-digest)" == "${base_image#*@}" ]] ||',build.split(recorded,1)[1].splitlines()[0])
+        pinned=vm_reference.BASE_REPOSITORY+'@'+vm_reference.PINNED_PLATFORM
+        for base,status in ((pinned,0),('ghcr.io/tuna-os/marlin:gnome',2),(pinned[:-1],2),
+                            ('ghcr.io/tuna-os/marlin:gnome@'+vm_reference.PINNED_PLATFORM,2),
+                            ('ghcr.io/other/marlin@'+vm_reference.PINNED_PLATFORM,2)):
+            with self.subTest(base=base), tempfile.TemporaryDirectory() as root:
+                copy_=Path(root)/'packaging/marlin/perf/Containerfile.baseline'
+                copy_.parent.mkdir(parents=True)
+                copy_.write_text(source.replace(bases[0],'ARG BASE_IMAGE='+base))
+                result=subprocess.run(['bash','-euo','pipefail','-c','\n'.join(select)+'\nprintf %s "$base_image"'],
+                                      cwd=root,text=True,capture_output=True)
+                self.assertEqual(result.returncode,status,result.stderr)
+                self.assertEqual(result.stdout,base if status==0 else '')
 
 
 if __name__=='__main__':unittest.main()

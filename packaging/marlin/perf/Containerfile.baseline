@@ -1,4 +1,4 @@
-# CI-only GNOME 51.0 baseline derived from the recorded Marlin image.
+# CI-only GNOME 51.0 baseline derived from one recorded Marlin platform image.
 # The declared baseline is GNOME 51.0 (ADR 0007), but Arch and the published
 # Marlin tag have moved on to the 51.1 point release. Resolve every Arch
 # repository from one dated Arch Linux Archive snapshot instead of the moving
@@ -13,11 +13,22 @@
 # and extra databases are newer than the snapshot, so a plain -y keeps them.
 # -uu then performs one complete transaction that also downgrades packages the
 # base image already took from newer mirrors.
+# BASE_IMAGE is one immutable linux/amd64 platform manifest, never the moving
+# marlin:gnome tag. A downgrade can only replace packages the snapshot knows:
+# once the tag picked up Arch's openssl 4 transition, its new openssl-3
+# compatibility package (absent from the snapshot) kept /usr/lib/libssl.so.3
+# and libcrypto.so.3, the snapshot's openssl 3.6.5 could not be installed over
+# them and the transaction stopped on conflicting files (runs 43009988803 and
+# 43209624981). The pinned manifest is the paired VM reference base that normal
+# CI verifies with cosign (PINNED_PLATFORM in scripts/lib/vm_gnome_reference.py,
+# docs/vm-lifecycle.md); scheduled run 41298393645 resolved the tag to exactly
+# this manifest and built both profiles from this snapshot. Moving either pin
+# needs a base whose whole package set the snapshot can still replace.
 # The archive is a single host and pacman's built-in downloader neither
 # retries nor waits more than 10 s to connect, so every derived stage fetches
 # through curl with bounded retries instead (run 38712122495 lost the profiler
 # build to archive connect timeouts).
-ARG BASE_IMAGE=ghcr.io/tuna-os/marlin:gnome
+ARG BASE_IMAGE=ghcr.io/tuna-os/marlin@sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e8636e44c3f
 ARG COHERENT_BASE=gnome-baseline
 ARG ARCH_ARCHIVE_SNAPSHOT=2026/10/13
 FROM ${BASE_IMAGE} AS gnome-baseline
