@@ -21,7 +21,7 @@
 //! | Run a Command dialog (Alt+F2) | `run_dialog.rs` | `runDialog.js` `open()` | never opens when `disable-command-line` denies |
 //! | Password peek icons | `lock.rs` unlock prompt, `polkit.rs`, `network_agent.rs` | `st-password-entry.c` `disable-show-password` | [`bind_password_entry`] drops the peek icon and re-hides the text live |
 //! | Screenshots and screencasts | `screenshot_ui.rs`, `main.rs` screenshot keys, `screencast.rs` | `screenshot.js` `_storeScreenshot`, `screencastService.js` | `disable-save-to-disk` keeps captures on the clipboard only and refuses screencasts |
-//! | User switch row | none (Tuna ships no Switch User) | `systemActions.js` `_updateSwitchUser` | `visible.user_switch` gates the row when it lands |
+//! | Switch User… row | `main.rs` power menu, `user_switch.rs` | `systemActions.js` `_updateSwitchUser`/`activateSwitchUser` | hidden when `disable-user-switching` denies (with GNOME's AccountsService, seat and lock-state conditions), plus a live guard on activation |
 //!
 //! `disable-printing`, `disable-print-setup` (GTK print dialogs in each
 //! application), `disable-application-handlers` (no GNOME 51 desktop
@@ -95,7 +95,7 @@ pub struct EntryVisibility {
     pub lock_screen: bool,
     /// Session-ending rows (Log Out…, Restart…, Power Off…) shown.
     pub log_out: bool,
-    /// User-switch row shown (gates the row when one exists).
+    /// Switch User… allowed (one of GNOME's conditions for the row).
     pub user_switch: bool,
     /// Run a Command dialog opens.
     pub run_command: bool,
@@ -277,9 +277,10 @@ pub fn bind_password_entry_to(entry: &gtk::PasswordEntry, settings: gio::Setting
 /// Callers pass the already-built rows; when `disable-log-out` hides
 /// the only nested row, the caller hides the menu itself.
 ///
-/// Exercised by the integration target (the binary wires its own
-/// watcher around per-widget visibility); the allow keeps the
-/// binary's build quiet until the user-switch row lands.
+/// Exercised by the integration target. The binary wires its own
+/// watcher: its Switch User… row also needs GNOME's AccountsService,
+/// seat and lock-state conditions (`user_switch.rs`), so it never calls
+/// this.
 #[allow(dead_code)]
 pub fn apply_entry_visibility(
     visibility: &EntryVisibility,

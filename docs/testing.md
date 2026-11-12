@@ -203,6 +203,26 @@ two: `/tmp/tuna-local-build.slot.N`, `TUNA_BUILD_SLOTS`), so two run at
 once and the rest queue instead of exhausting memory; a cold
 `cargo test --workspace` build at six jobs peaks at 6.4 GiB.
 
+Nothing waits forever. These defaults bound every recipe:
+
+| What | Default | Knob |
+|---|---|---|
+| `just build`, `test`, `clippy` | stopped after 60 min: TERM to cargo's process group (every `rustc` and test binary), KILL 30 s later, slot freed, exit 124 with `TIMED OUT` | `TUNA_BUILD_TIMEOUT` (minutes) |
+| `just proof <name>` | stopped the same way after its CI job's `timeout-minutes` (gtk-shell-proof: 60), at least 45 min; leftovers it started are reaped | `TUNA_PROOF_TIMEOUT` (minutes) |
+| waiting for a build or proof slot | gives up after 120 min with exit 75 | `TUNA_SLOT_WAIT` (minutes) |
+| a slot held past its timeout + 15 min | `scripts/tuna-reaper` reports it and kills the holder, the processes below it with the process groups they lead, and everything carrying its `TUNA_PROOF_RUN` marker | run by `scripts/tuna-disk-guard` on every pass |
+
+Each slot file's mtime records when it was taken, and its contents the
+command's timeout in minutes (`scripts/lib/tuna-semaphore`),
+which is what the reaper measures. `scripts/lib/tuna-timeout MINUTES LABEL
+COMMAND...` is the wrapper the recipes use; Ctrl-C still reaches the
+command's group.
+
+The reaper checks each holder's `/proc/PID/fdinfo` for the actual flock.
+It does not require a `/proc/locks` entry: PID namespaces can hide a live
+inherited lock after the short-lived `flock` utility exits. Merely opening an
+old slot file does not make a process eligible for retirement.
+
 When `sccache` is installed (`cargo install --locked sccache`, or a
 release binary on `PATH`) every recipe compiles through it, so a fresh
 worktree reuses the dependencies any other worktree already compiled from
@@ -251,9 +271,9 @@ Cleanup is automatic where it is safe:
   proof's timing-sensitive stages fail intermittently. Proofs that touch
   machine-wide state (vkms, seatd, uinput, `sudo` or apt, like
   `drm-smoke`), and scripts that don't start an Xvfb, run one at a time
-  (`/tmp/tuna-local-proof.lock`). A proof's own `cargo build` waits for a
-  build slot. A proof still running after 45 minutes
-  (`TUNA_PROOF_TIMEOUT`) is stopped and its slot freed. Proofs that need
+  (`/tmp/tuna-local-proof.lock.0`). A proof's own `cargo build` waits for a
+  build slot. A proof still running past its timeout (above) is stopped
+  and its slot freed. Proofs that need
   another proof's prebuilt binaries (`--bin-dir`) are refused with the
   name of their caller. When the proof ends, pass or fail, any process it
   started is stopped, including daemons that detached from it
@@ -365,6 +385,13 @@ native ownership and private PAM retirement cases. Its PID readiness
 markers are published only after complete PID contents are written.
 Artifacts retain supervised test-client panics and early compositor exit
 status; a compiled test or cache hit is not a substitute for these cases.
+The native probe keeps a libc `getenv` reader running across launch and
+teardown and asserts the compositor's `WAYLAND_DISPLAY` never changes.
+The real supervised control client still receives the private display.
+This guards the startup race seen in #919: changing process environment
+after GIO workers start can free the `environ` array while native
+`getenv` traverses it. Child commands, including the bell player, receive
+their display explicitly; no startup or teardown environment rewrite is safe.
 
 The focused private-helper proof is
 `TUNA_REQUIRE_PAM_WRAPPER=1 cargo test -p tuna-compositor --test pam_helper`.
@@ -432,7 +459,7 @@ cannot satisfy the gate.
 | `gtk-shell` | `TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts` | gtk4-layer-shell (`scripts/ci-install-gtk4-layer-shell`), `xwayland pipewire wireplumber at-spi2-core python3-pyatspi fonts-cantarell ffmpeg libpam-wrapper` and the GStreamer PipeWire plugins; see the job for the full list | GTK shell panel, calendar, quick settings, overview, notifications, lock and unlock, AT-SPI trees; writes `assertions.txt` |
 | `gtk-shell` | `scripts/tuna-scale-proof --artifacts gtk-shell-artifacts/scale` | as above | The same session at 150 percent scale; writes `assertions.txt` |
 | `gtk-shell` | `scripts/tuna-slow-portal-proof --artifacts gtk-shell-artifacts/slow-portal` | as above | On a dbus-daemon bus whose portal activation hangs, the shell owns `org.gnome.Shell` within 15 s (40 s on GTK before 4.17, whose GtkApplication always waits on the inhibit portal) and makes no GDK portal call; writes `assertions.txt` |
-| `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg kmod`; run `scripts/ci-install-vkms` after `apt-get update` to ensure vkms for the running kernel | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe` and seatd |
+| `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg kmod python3-evdev python3-gi gir1.2-gtk-4.0 gsettings-desktop-schemas`; run `scripts/ci-install-vkms` after `apt-get update` to ensure vkms for the running kernel | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe`, seatd and uinput |
 
 `app-content` and `scroll-proof` download Playwright and Chromium into a
 temporary venv on every run, so they need network access.
@@ -483,6 +510,32 @@ includes vkms without a separate extra-modules package. No usable candidate
 or a still-missing module fails setup, and package installation errors are
 fatal. Module loading and the real vkms device and presentation assertions
 remain mandatory in the smoke test.
+
+The smoke test also drives real libinput with uinput devices (ADR 0008),
+so it needs `python3-evdev` and the GTK 4 PyGObject client packages the
+CI job installs. `D-TABLET` emulates a Wacom Cintiq 22HD
+(`scripts/lib/tuna-uinput-tablet.py`). `D-TOUCHPAD-SWIPE` (P-IN-02)
+emulates a Synaptics TM3053-004 clickpad as the kernel's rmi4 driver
+creates it (`scripts/lib/tuna-uinput-touchpad.py`, the capabilities of
+libinput's `litest-device-synaptics-rmi4.c`). The kernel timestamps its
+finger motion and libinput classifies it as a touchpad and turns it into
+pointer motion, two-finger scrolling and `LIBINPUT_EVENT_GESTURE_SWIPE_*`.
+The phase then checks GNOME 51's swipe trackers against the compositor
+state: up and down open and close the overview, which follows the held
+fingers; left and right switch workspace; a slow half swipe settles
+back; a short fast flick completes; a long swipe from the desktop stops
+at the window picker, and from the picker the swipe follows into the app
+grid (the shell's grid surface maps and eases on release) and back; in
+the open overview, with four fixed workspaces (mutter's schema is
+compiled in when the host lacks it), a sideways swipe scrolls the
+workspaces under the fingers and a fast flick settles two or more on;
+four fingers are the shell's too; scrolling, and no swipe, reaches a GTK
+4 client; turning natural-scroll off reverses the gestures; and the
+swipe follows under reduced motion and with animations off. The emulator
+also runs on its own and reads
+commands (`down N`, `move DX DY MS`, `hold MS`, `up`, `swipe N DX DY MS
+[PAUSE]`, `scroll`, `tap`, `click`) on stdin, in millimetres and
+milliseconds. Other phases can import `create_touchpad()` from it.
 
 ## GNOME Core applications: installed-image evidence
 
@@ -729,6 +782,25 @@ Proof `G-ANIMATION-CLOCK` samples the overview this way at 125 and 250 ms
 in both directions. `G-ANIMATIONS-OFF` and `G-INTROSPECT-MOTION` check the
 live motion policy: animations off snaps everything, Reduced Motion
 (fade-only) snaps overview and strip motion but keeps the idle-shield fade.
+A held touchpad swipe is not an animation. As in GNOME 51 (overview.js:359-380,
+animationUtils.js:23-33), the overview follows the fingers under every
+policy, across the desktop, the window picker and the app grid, and so do
+the overview's workspaces under a sideways swipe. The release eases under
+full motion and Reduced Motion, with the slow-down factor applied, and
+lands at once with animations off (`G-SWIPE-REDUCED-MOTION`,
+`G-SWIPE-APPGRID`, `G-SWIPE-OVERVIEW-SCROLL`, `D-TOUCHPAD-SWIPE`).
+
+The GTK shell reads the same clock file (`crates/shell-gtk/src/anim_clock.rs`)
+for the animations proofs sample from its side. With `TUNA_TRANSIENT_TRACE`
+set, the workspace switcher popup and the Activities dots log each fade,
+swipe phase and changed frame (`tuna-shell-gtk: ws-popup ...`,
+`tuna-shell-gtk: ws-dots ...`, one write per line), and
+`scripts/lib/ws-anim-proof.py` recomputes GNOME 51's values from
+`workspaceSwitcherPopup.js` and `panel.js` to check them. The popup's
+600 ms hold is measured on this clock too, so a frozen clock holds it.
+Gates `G-WS-POPUP-CLOCK`, `G-WS-DOTS-CLOCK`, `G-WS-DOTS-SWIPE` and their
+`-POLICY` variants sample them; the swipe gates check the dots against the
+release time the compositor records for the strip.
 
 The workspace popup's 100 ms fade starts at the display/fade request, not
 the first GTK tick. A delayed first frame therefore samples the fade's
@@ -796,6 +868,38 @@ it after a Num Lock change and before the next `gsettings set`. The
 `keyboard.keymap_generation` field goes up each time a keymap is
 applied. Wait for it after changing the input sources or `xkb-options`
 and before typing.
+
+## Settings bindings in unit tests
+
+Shell unit tests that read GSettings use
+`crates/shell-gtk/src/test_settings.rs`. `SettingsFixture::new(xml)`
+compiles a `<schemalist>` with `glib-compile-schemas --strict` into a
+temporary directory, and `settings(id)` opens it on a private memory
+backend, so no dconf, session bus or host schema is involved and
+parallel tests cannot see each other's writes. Create the fixture inside
+`glib::MainContext::with_thread_default` and use `dispatch_until` when a
+test needs `changed` signals. `background_settings.rs` binds GNOME's
+background, interface and screensaver keys this way.
+
+## Shell state across session transitions
+
+`just proof session-sync-proof` runs the real nested runtime with a
+supervised `ControlClient` observer and a mapped xdg window. The existing
+trusted Rust-only probe injects sleep and seat notifications through the
+same internal handlers as logind and libseat; no IPC command or normal
+binary flag can inject them. The observer reconnects across pause and
+activation and checks that windows, workspaces and overview survive.
+Sleep must lock, dismiss overview and redact the window list. A shell
+disconnected throughout wake must reconnect into the current locked
+state, including when seat activation follows wake.
+
+The GTK CI lane runs this bounded proof and keeps `result.json` and
+`runtime.log` in the `session-sync-proof` artifact (built under
+`$RUNNER_TEMP`, so the later source-freeze gate sees a clean checkout). This qualifies
+runtime/control state propagation on **simulated notifications**, not
+physical VT switching, logind suspend delivery or S3. KMS scanout reset,
+libseat device-fd revocation and libinput resume still need a native
+seat/DRM VM or hardware proof; the nested backend has no such devices.
 
 The stock GNOME Settings journey (`tests/portal-reference/settings-run.sh`)
 instead uses a private **dconf** backend. Settings and Tuna's first-run
