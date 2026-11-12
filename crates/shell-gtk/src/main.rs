@@ -80,6 +80,8 @@ mod brightness;
 mod brightness_service;
 mod bt_menu;
 mod calendar;
+mod captive_portal;
+mod close_dialog;
 mod display_change;
 mod events;
 mod fd_watch;
@@ -94,6 +96,7 @@ mod ibus_property_menu;
 mod input_sources;
 mod introspect_forward;
 mod kbd_a11y;
+mod kbd_backlight;
 mod keybindings;
 mod live_apps;
 mod location;
@@ -131,6 +134,7 @@ mod providers;
 mod public_search_diagnostic;
 mod removable_media;
 mod renderer;
+mod rfkill;
 mod run_dialog;
 mod screencast;
 mod screensaver;
@@ -143,8 +147,10 @@ mod sound_feedback;
 mod switcher;
 #[cfg(test)]
 mod test_settings;
+mod thunderbolt;
 mod transient;
 mod tray;
+mod user_switch;
 mod wall_clock;
 mod wellbeing;
 mod wifi;
@@ -214,6 +220,8 @@ struct Drained {
     consent: Option<Option<(u64, String)>>,
     /// The latest display-change confirmation countdown, in seconds.
     display_change: Option<u32>,
+    /// Close dialogs over windows that stopped answering pings, in order.
+    close_dialogs: Vec<close_dialog::Update>,
     popups: Vec<(u32, u32)>,
     /// The latest workspace swipe phase `(position, duration_us)`, wire
     /// fixed point: the Activities dots follow it.
@@ -318,6 +326,12 @@ fn drain(
             Handled::WindowMenu(request) => out.menus.push(request),
             Handled::ShortcutConsent(request) => out.consent = Some(request),
             Handled::ConfirmDisplayChange(secs) => out.display_change = Some(secs),
+            Handled::ShowCloseDialog(request) => {
+                out.close_dialogs.push(close_dialog::Update::Show(request));
+            }
+            Handled::HideCloseDialog(window) => {
+                out.close_dialogs.push(close_dialog::Update::Hide(window));
+            }
             Handled::ScreenReader(state) => {
                 if matches!(
                     state,
@@ -1050,6 +1064,7 @@ struct PanelIcons {
     network: gtk::Image,
     location: gtk::Image,
     dnd: gtk::Image,
+    airplane: gtk::Image,
     volume: gtk::Image,
     power_profile: gtk::Image,
     battery: gtk::Box,
@@ -1156,6 +1171,50 @@ fn quick_settings_popover(
             power_ui.activate(action);
         });
     }
+    // GNOME 51's last row, under Log Out… (status/system.js ShutdownItem):
+    // Switch User…, on a hardware session only. Its rule and the
+    // AccountsService/logind facts behind it live in `user_switch.rs`.
+    let switch_user = power_ui
+        .offers_switch_user()
+        .then(|| power_menu_box.item(None, user_switch::LABEL).0);
+    let switch_availability = user_switch::Availability::new();
+    if let Some(item) = switch_user.as_ref() {
+        let (shell, popover, availability) =
+            (shell.clone(), popover.clone(), switch_availability.clone());
+        item.connect_clicked(move |_| {
+            popover.popdown();
+            // `activateSwitchUser` refuses an unavailable action; the
+            // rule is re-read live, so a stale row cannot bypass it.
+            let locked = shell.borrow().control.as_ref().is_some_and(|c| c.locked());
+            let allowed = lockdown::read().entry_visibility().user_switch;
+            if !user_switch::switch_user_visible(allowed, &availability.facts(), locked) {
+                eprintln!("tuna-shell-gtk: switch user is not available");
+                return;
+            }
+            // Lock first (`Main.screenShield.lock(false)`, which declines
+            // while `disable-lock-screen` is set), then go to the login
+            // screen. A lock that cannot be requested keeps this session.
+            if lockdown::read().entry_visibility().lock_screen {
+                let requested = shell.borrow_mut().control.as_mut().map(|c| c.lock());
+                match requested {
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        eprintln!("tuna-shell-gtk: switch user: lock failed: {e}; not switching");
+                        return;
+                    }
+                    None => {
+                        eprintln!(
+                            "tuna-shell-gtk: switch user: no compositor to lock; not switching"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                eprintln!("tuna-shell-gtk: switch user: screen lock is locked down, not locking");
+            }
+            user_switch::goto_login_session();
+        });
+    }
     let power_menu = power_menu_box.revealer.clone();
     {
         let motion = power_menu_box.motion.clone();
@@ -1183,21 +1242,57 @@ fn quick_settings_popover(
     }
     // Administrative lockdown (#357): the lock button and the
     // session-ending rows follow the live policy; a nested session
-    // with no rows shows no power menu at all.
+    // with no rows shows no power menu at all. Switch User… follows
+    // GNOME's whole rule (`user_switch::switch_user_visible`): the
+    // policy, the AccountsService and seat facts, and the lock state.
     {
         let actions = power_ui.actions().to_vec();
+        let power_button = power.clone();
+        let offers_switch_user = switch_user.is_some();
+        let (shell, availability) = (shell.clone(), switch_availability.clone());
         let apply: Rc<dyn Fn(lockdown::EntryVisibility)> =
             Rc::new(move |visible: lockdown::EntryVisibility| {
                 lock.set_visible(visible.lock_screen);
                 for (action, row) in &power_rows {
                     row.set_visible(power::action_allowed(*action, visible.log_out));
                 }
-                if let Some(separator) = log_out_separator.as_ref() {
-                    separator.set_visible(visible.log_out);
+                let locked = shell
+                    .try_borrow()
+                    .is_ok_and(|shell| shell.control.as_ref().is_some_and(|c| c.locked()));
+                let switch_visible = switch_user.is_some()
+                    && user_switch::switch_user_visible(
+                        visible.user_switch,
+                        &availability.facts(),
+                        locked,
+                    );
+                if let Some(row) = switch_user.as_ref() {
+                    row.set_visible(switch_visible);
                 }
-                power.set_visible(power::power_menu_visible_for(&actions, visible.log_out));
+                if let Some(separator) = log_out_separator.as_ref() {
+                    separator.set_visible(visible.log_out || switch_visible);
+                }
+                power.set_visible(
+                    power::power_menu_visible_for(&actions, visible.log_out) || switch_visible,
+                );
             });
         apply(lockdown::read().entry_visibility());
+        {
+            let apply = Rc::downgrade(&apply);
+            switch_availability.connect_changed(Rc::new(move || {
+                if let Some(apply) = apply.upgrade() {
+                    apply(lockdown::read().entry_visibility());
+                }
+            }));
+        }
+        if offers_switch_user {
+            switch_availability.start();
+        }
+        {
+            // Opening the menu re-applies the rule, which also follows
+            // the session's lock state (`_sessionUpdated`).
+            let apply = apply.clone();
+            power_button.connect_clicked(move |_| apply(lockdown::read().entry_visibility()));
+        }
         if let Some(lockdown_settings) = settings(lockdown::SCHEMA) {
             lockdown_settings.connect_changed(None, move |_, _| {
                 apply(lockdown::read().entry_visibility());
@@ -1414,6 +1509,29 @@ fn quick_settings_popover(
     let night = qs_tile("night-light-symbolic", "Night Light", None);
     let dark = qs_tile("dark-mode-symbolic", "Dark Style", None);
     let dnd_tile = qs_tile("notifications-disabled-symbolic", "Do Not Disturb", None);
+    // GNOME 51's Keyboard toggle (status/backlight.js): its menu sets no
+    // header and holds only the brightness slider or the level buttons.
+    let kbd_menu_ui = QsMenu::new(kbd_backlight::ICON, kbd_backlight::TITLE);
+    if let Some(header) = kbd_menu_ui.header_icon.parent() {
+        header.set_visible(false);
+    }
+    let kbd_tile = qs_menu_tile(
+        kbd_backlight::ICON,
+        kbd_backlight::TITLE,
+        None,
+        &kbd_menu_ui,
+    );
+    // `menuButtonAccessibleName`: the arrow is the outer box's last child.
+    if let Some(arrow) = kbd_tile.outer.last_child() {
+        arrow.update_property(&[gtk::accessible::Property::Label(
+            kbd_backlight::MENU_BUTTON_NAME,
+        )]);
+    }
+    let keyboard = kbd_backlight::KeyboardBacklight::new(kbd_tile.clone(), &kbd_menu_ui.section);
+    // GNOME 51's Airplane Mode toggle (status/rfkill.js) and its panel
+    // indicator.
+    let airplane_tile = qs_tile(rfkill::ICON, rfkill::TITLE, None);
+    let airplane = rfkill::Airplane::new(airplane_tile.clone(), icons.airplane);
     // Location services: the GeoClue2 agent behind the panel's in-use
     // indicator. GNOME puts the master switch in Settings, not quick
     // settings, so there is no tile: Settings (and the proof) writes
@@ -1436,6 +1554,10 @@ fn quick_settings_popover(
     for tile in [&night, &dark, &dnd_tile] {
         grid.add(tile, None);
     }
+    // Keyboard, then Airplane Mode, as panel.js adds `_backlight` and
+    // `_rfkill` after Do Not Disturb.
+    grid.add(&kbd_tile, Some(&kbd_menu_ui));
+    grid.add(&airplane_tile, None);
     let (
         wifi_outer,
         wired_outer,
@@ -1487,6 +1609,7 @@ fn quick_settings_popover(
         &wired_menu_ui.revealer,
         &bt_menu_ui.revealer,
         &wwan_menu_ui.revealer,
+        &kbd_menu_ui.revealer,
         &sound_menu_ui.revealer,
     ] {
         {
@@ -1603,6 +1726,8 @@ fn quick_settings_popover(
         brightness,
         brightness_controller: brightness_controller.clone(),
     }));
+    keyboard.attach();
+    airplane.attach();
     // Do Not Disturb drives the shell's notification store (banners
     // held back) and mirrors GNOME's show-banners key.
     let notes_settings = settings(NOTIFICATIONS_SCHEMA).filter(|notes| {
@@ -1674,6 +1799,8 @@ fn quick_settings_popover(
         &night_outer,
         &dark_outer,
         &dnd_outer,
+        &kbd_tile.outer,
+        &airplane_tile.outer,
     ] {
         tile.add_css_class("qs-dimmable");
     }
@@ -2008,7 +2135,12 @@ fn build(app: &adw::Application) {
     let panel_network = status_icon("network-wired-symbolic", false);
     let panel_location = status_icon("location-services-active-symbolic", false);
     panel_location.update_property(&[gtk::accessible::Property::Label("Location in use")]);
+    // GNOME's Thunderbolt indicator: shown while boltd probes.
+    let panel_thunderbolt = status_icon(thunderbolt::ICON, false);
     let panel_dnd = status_icon("notifications-disabled-symbolic", false);
+    // GNOME 51 rfkill.js `Indicator`: shown while Airplane Mode is on.
+    let panel_airplane = status_icon(rfkill::ICON, false);
+    panel_airplane.update_property(&[gtk::accessible::Property::Label(rfkill::TITLE)]);
     let panel_volume = status_icon("audio-volume-high-symbolic", false);
     let panel_power_profile = status_icon("power-profile-balanced-symbolic", false);
     let panel_battery = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -2152,6 +2284,7 @@ fn build(app: &adw::Application) {
             network: panel_network,
             location: panel_location,
             dnd: panel_dnd,
+            airplane: panel_airplane,
             volume: panel_volume,
             power_profile: panel_power_profile,
             battery: panel_battery,
@@ -2844,9 +2977,14 @@ fn build(app: &adw::Application) {
     polkit::start(app.upcast_ref());
     // GNOME's NetworkManager secret agent (Wi-Fi passwords).
     network_agent::start(app.upcast_ref());
+    // GNOME's captive-portal sign-in through its portal helper (#1042).
+    captive_portal::start(notify.clone());
     // GNOME's automount and autorun components (#361); off until the
     // compositor says the session is unlocked.
     let removable_media = removable_media::RemovableMedia::start(app.upcast_ref(), notify.clone());
+    // GNOME's Thunderbolt client and auto-enrolment robot (#1041) on
+    // boltd; silent while boltd is not on the system bus.
+    let thunderbolt = thunderbolt::Thunderbolt::start(notify.clone(), panel_thunderbolt);
 
     // GNOME Shell is IBus's panel: it draws the candidate window.
     ibus_panel::start(app.upcast_ref(), ibus_properties.clone());
@@ -3718,6 +3856,19 @@ fn build(app: &adw::Application) {
             }),
         )
     };
+    // gnome-shell's close dialog over a window that stopped answering
+    // pings: Force Quit or Wait go back to the compositor.
+    let close_dialogs = {
+        let shell = shell.clone();
+        close_dialog::CloseDialogs::new(
+            app.upcast_ref(),
+            Rc::new(move |window, response| {
+                if let Some(control) = shell.borrow_mut().control.as_mut() {
+                    let _ = control.respond_close_dialog(window, response);
+                }
+            }),
+        )
+    };
     // gnome-shell's pad OSD and its org.gnome.Shell.Wacom.PadOsd service.
     let pad_osd_ui = {
         let (closed_shell, request_shell) = (shell.clone(), shell.clone());
@@ -3829,6 +3980,7 @@ fn build(app: &adw::Application) {
                     menus,
                     consent,
                     display_change,
+                    close_dialogs: close_dialog_updates,
                     popups,
                     workspace_progress,
                     overview_swipes,
@@ -3910,6 +4062,8 @@ fn build(app: &adw::Application) {
                 if let Some(media) = removable_media.as_ref() {
                     media.sync_lock(authoritative_lock);
                 }
+                // Thunderbolt devices enrol only in an unlocked session.
+                thunderbolt.sync_lock(authoritative_lock);
                 screensaver.sync(locked);
                 // The session keyboard never shows over the lock screen.
                 osk.set_locked(locked);
@@ -3925,6 +4079,17 @@ fn build(app: &adw::Application) {
                     display_change_dialog.close();
                 } else if let Some(secs) = display_change {
                     display_change_dialog.show(secs);
+                }
+                // A new connection replays what is still shown.
+                close_dialogs.sync_connection(auth_generation);
+                if locked {
+                    close_dialogs.hide_all();
+                } else {
+                    let apps = chrome_apps.get();
+                    close_dialogs.apply(close_dialog_updates, |app_id| {
+                        let entry = app_id.and_then(|id| providers::provider_app(&apps, id));
+                        close_dialog::app_name(entry.map(|entry| entry.name.as_str()), app_id)
+                    });
                 }
                 if locked {
                     pad_osd_ui.close();

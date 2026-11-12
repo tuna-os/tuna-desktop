@@ -155,6 +155,20 @@ the superseded pending lock and the per-lock duplicate. The isolated diff
 is retained in SESSION-LOCK-OUTPUTS-PATCH.diff; SessionLockManagerState
 loses its crate-private field; the pinned version stays 0.7.0.
 
+Issue #1033 changes src/wayland/selection/source.rs: SelectionSource,
+the public handle SelectionHandler::new_selection receives, gains an
+IsAlive implementation that forwards to its provider. Mutter's clipboard
+manager (meta-clipboard-manager.c) takes the clipboard over with a saved
+copy when the owning client goes away, so the compositor must notice a
+dead clipboard owner. Upstream only drops a dead source lazily, the next
+time seat_data.rs send_selection runs, and tells no handler; a client
+that destroys its source or disconnects therefore left no trace. The
+compositor keeps the SelectionSource it was handed and checks it after
+each client dispatch. Real socketpair tests in
+crates/compositor/tests/data_device.rs cover a disconnecting owner and a
+destroyed source. The isolated diff is retained in
+CLIPBOARD-SOURCE-ALIVE-PATCH.diff; the pinned version stays 0.7.0.
+
 Issue #364 additionally changes `src/wayland/input_method/{mod.rs,
 input_method_handle.rs,input_method_keyboard_grab.rs}`. Registry visibility
 and forced binds both enforce the compositor's input-method admission

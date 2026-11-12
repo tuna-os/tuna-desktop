@@ -75,7 +75,11 @@ pub(crate) struct LockProtocol {
 impl LockProtocol {
     pub(crate) fn new(dh: &smithay::reexports::wayland_server::DisplayHandle) -> Self {
         Self {
-            state: SessionLockManagerState::new::<State, _>(dh, |_client| true),
+            // Only the shell's lock is ever approved; a client inside a
+            // wp_security_context_v1 does not even see the global (#1046).
+            state: SessionLockManagerState::new::<State, _>(dh, |client| {
+                !crate::ClientState::sandboxed(client)
+            }),
             pending: None,
             owner: None,
             approved_lock: None,

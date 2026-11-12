@@ -65,6 +65,7 @@ mod aids;
 mod auth;
 mod color;
 mod display;
+mod input_capture;
 mod motion;
 mod osk;
 
@@ -742,6 +743,8 @@ pub struct Runtime {
     capture_authority: crate::capture_security::Authority,
     cast_grants: std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     remote_held: std::collections::HashMap<u64, RemoteHeld>,
+    /// org.gnome.Mutter.InputCapture's input diversion (#1040).
+    input_capture: crate::mutter::input_capture::Router,
     /// Keys the tablet action mappers' virtual keyboard holds (evdev).
     tablet_virtual_keys: std::collections::BTreeSet<u32>,
     /// The pad OSD labels the shell last received.
@@ -1009,13 +1012,17 @@ impl Runtime {
                             smithay::backend::input::InputEvent::TouchDown { .. }
                                 | smithay::backend::input::InputEvent::TouchMotion { .. }
                         );
-                        let inputs = match &mut rt.backend {
+                        let (inputs, from) = match &mut rt.backend {
                             Backend::Drm(drm) => {
                                 drm.set_hot_corner_active(corners_active);
-                                drm.translate(event, &corner_layout)
+                                let from = drm.pointer();
+                                (drm.translate(event, &corner_layout), from)
                             }
-                            Backend::Winit(_) => Vec::new(),
+                            Backend::Winit(_) => (Vec::new(), (0.0, 0.0).into()),
                         };
+                        // InputCapture (#1040) takes what an active
+                        // session captures before anything else sees it.
+                        let inputs = rt.route_input_capture(inputs, from);
                         for input in inputs {
                             let input = if touch { rt.unzoom_touch(input) } else { input };
                             if let ManagerInput::Button {
@@ -1166,7 +1173,9 @@ impl Runtime {
         event_loop
             .handle()
             .insert_source(socket, |stream, _, runtime: &mut Runtime| {
-                let client_data = ClientState::native_connection(&stream);
+                let mut client_data = ClientState::native_connection(&stream);
+                // Layer-shell is the supervised shell's alone (#1048).
+                client_data.admit_supervised_shell(&stream, runtime.shell.child_pid());
                 if let Ok(client) = runtime
                     .display
                     .handle()
@@ -1235,6 +1244,7 @@ impl Runtime {
         // org.gnome.Shell.Introspect: the portal's window picker.
         let capture_authority = crate::capture_security::Authority::default();
         let introspect = crate::introspect::start(state.desktop_size(), capture_authority.clone());
+        let input_capture = crate::mutter::input_capture::Router::default();
         event_loop
             .handle()
             .insert_source(
@@ -1248,6 +1258,7 @@ impl Runtime {
                     power_save_share.clone(),
                     display_share.clone(),
                     color_share.clone(),
+                    input_capture.sessions(),
                 ),
                 |event, _, rt: &mut Runtime| {
                     if let calloop::channel::Event::Msg(request) = event {
@@ -1479,6 +1490,7 @@ impl Runtime {
             capture_authority,
             cast_grants: Default::default(),
             remote_held: Default::default(),
+            input_capture,
             tablet_virtual_keys: Default::default(),
             pad_osd_labels_sent: None,
             introspect,
@@ -1748,6 +1760,8 @@ impl Runtime {
         for id in remote_ids {
             self.stop_remote_input(id);
         }
+        // Input capture never survives the lock (#1040).
+        self.input_capture.revoke_all();
         self.capture_authority.publish(true, self.shell.child_pid());
         self.state.set_shortcut_inhibition_locked(true);
         // A three-finger swipe under way is the unlocked session's: end
@@ -2080,6 +2094,7 @@ impl Runtime {
                 self.lock.note_input(input_time(&input));
                 self.idle_since = Instant::now();
                 self.idle_monitor.activity();
+                self.state.protocols.idle_notifier.activity(Instant::now());
                 self.active_at = Instant::now();
                 return;
             }
@@ -2102,6 +2117,7 @@ impl Runtime {
         self.lock.note_input(input_time(&input));
         self.idle_since = Instant::now();
         self.idle_monitor.activity();
+        self.state.protocols.idle_notifier.activity(Instant::now());
         self.active_at = Instant::now();
         if self.is_locked() {
             self.cursor.locate.reset_keys();
@@ -2436,6 +2452,35 @@ impl Runtime {
     /// Loop handle for event-source installation (XWayland spawn).
     pub fn loop_handle(&self) -> LoopHandle<'static, Runtime> {
         self.loop_handle.clone()
+    }
+
+    /// Put the listener of every security context committed since the
+    /// last call on the loop (wp_security_context_v1, #1046): a client
+    /// it accepts joins the display inside that context, so no
+    /// privileged global admits it. The listener goes once its creator
+    /// closes the context's close fd.
+    fn admit_security_contexts(&mut self) {
+        for (source, context) in self.state.take_security_contexts() {
+            let inserted =
+                self.loop_handle
+                    .insert_source(source, move |stream, _, runtime: &mut Runtime| {
+                        let data = ClientState::security_context(&stream, context.clone());
+                        if runtime
+                            .display
+                            .handle()
+                            .insert_client(stream, Arc::new(data))
+                            .is_ok()
+                        {
+                            runtime.stats.clients += 1;
+                        }
+                    });
+            if let Err(error) = inserted {
+                eprintln!(
+                    "tuna-compositor: security context listener not added: {}",
+                    error.error
+                );
+            }
+        }
     }
 
     /// Mutable protocol state, for the X11 handler impls.
@@ -4365,6 +4410,7 @@ impl Runtime {
                 self.remote_input(session_id, grant, input);
             }
             crate::mutter::ToLoop::RemoteStop { session_id } => self.stop_remote_input(session_id),
+            crate::mutter::ToLoop::InputCaptureWarp { x, y } => self.input_capture_warp(x, y),
             crate::mutter::ToLoop::RemoteClipboard(request) => {
                 let locked = self.is_locked();
                 self.state.remote_clipboard_request(request, locked);
@@ -4854,6 +4900,7 @@ impl Runtime {
         }
         for deadline in [
             self.idle_monitor.next_deadline(),
+            self.state.protocols.idle_notifier.next_deadline(),
             self.orca.next_deadline(),
             self.manager.workspace_lease_deadline(),
             self.wallpaper.maintenance_deadline(),
@@ -4867,6 +4914,8 @@ impl Runtime {
             // Tablet and stylus settings: the bounded re-read.
             self.tablet_settings.next_deadline(now),
             self.manager.focus_deadline(),
+            // Mutter's alive checks: a ping timing out, Wait, re-pings.
+            self.manager.alive_deadline(),
             // Window sessions are written 3 s after a change (Mutter).
             self.state.window_sessions().save_deadline(),
             // The lock conversation's shared idle/total deadline.
@@ -4935,12 +4984,17 @@ impl Runtime {
         self.display
             .dispatch_clients(&mut self.state)
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        // Smithay has stored this dispatch's selections: copy a new one,
+        // or take over from an owner that went away (MetaClipboardManager).
+        self.state.retain_clipboard();
+        self.admit_security_contexts();
         self.display
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         self.manager.reconcile(&mut self.state);
         self.state.window_sessions_mut().save_if_due(Instant::now());
         self.focus_policy_tick();
+        self.alive_checks_tick();
         self.tablet_settings_tick();
         self.poll_input_aids();
         #[cfg(feature = "xwayland")]
@@ -5033,6 +5087,11 @@ impl Runtime {
         if outcome.close_menu_unanimated {
             self.menu_close.close_unanimated(std::time::Instant::now());
         }
+        // gnome-shell's close dialog answers (#1035): Wait or Force Quit.
+        for (window, response) in outcome.close_dialog_responses {
+            self.manager.close_dialog_response(window, response);
+        }
+        self.queue_close_dialogs();
         if let Some(request) = self.state.take_shortcut_consent_update() {
             self.control
                 .queue_message(tuna_shell_control::Message::ShortcutConsent { request });
@@ -5241,6 +5300,12 @@ impl Runtime {
             self.idle_since = Instant::now();
         }
         self.idle_inhibited = inhibited;
+        // ext-idle-notify honours the same inhibitors for its ordinary
+        // notifications; input-only ones ignore them.
+        self.state
+            .protocols
+            .idle_notifier
+            .tick(Instant::now(), inhibited);
         if !self.is_locked() && self.lock.check_timeout(self.lock_now_ms()) {
             // Administrative lockdown (#357): a disabled lock screen
             // never engages on idle; restart the stretch instead so no
@@ -5496,6 +5561,7 @@ impl Runtime {
             self.lock.note_input(u64::from(time));
             self.idle_since = Instant::now();
             self.idle_monitor.activity();
+            self.state.protocols.idle_notifier.activity(Instant::now());
             self.active_at = Instant::now();
         }
         let event = match event {
@@ -5743,10 +5809,31 @@ impl Runtime {
             let mut policy = self.manager.focus_policy();
             policy.apply(&raw);
             self.manager.set_focus_policy(policy);
+            if let Some(ms) = raw.check_alive_timeout_ms {
+                self.manager.set_check_alive_timeout(ms);
+            }
         }
         if !self.is_locked() {
             self.manager.repick_pointer_window(&mut self.state);
             self.manager.run_focus_timers(&mut self.state, now);
+        }
+    }
+
+    /// Mutter's alive checks (#1035): pongs, ping timeouts and the close
+    /// dialog's timers; nothing pings or shows while locked, and the
+    /// supervised shell is never pinged.
+    fn alive_checks_tick(&mut self) {
+        let locked = self.is_locked();
+        self.manager.set_shell_pid(self.shell.child_pid());
+        self.manager
+            .run_alive_checks(&mut self.state, Instant::now(), locked);
+        self.queue_close_dialogs();
+    }
+
+    /// Hand the manager's close-dialog messages to the shell.
+    fn queue_close_dialogs(&mut self) {
+        for message in self.manager.take_close_dialogs() {
+            self.control.queue_message(message);
         }
     }
 
