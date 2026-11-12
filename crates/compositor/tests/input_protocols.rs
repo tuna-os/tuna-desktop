@@ -427,20 +427,24 @@ struct Peer {
 }
 
 fn connect(comp: &mut TestCompositor) -> Peer {
-    connect_with_admission(comp, false)
+    connect_with_admission(comp, TestCompositor::add_client)
 }
 
 fn connect_ime_bridge(comp: &mut TestCompositor) -> Peer {
-    connect_with_admission(comp, true)
+    connect_with_admission(comp, TestCompositor::add_ime_bridge_client)
 }
 
-fn connect_with_admission(comp: &mut TestCompositor, ime_bridge: bool) -> Peer {
+/// The supervised shell's connection: the only client offered layer-shell.
+fn connect_shell(comp: &mut TestCompositor) -> Peer {
+    connect_with_admission(comp, TestCompositor::add_shell_client)
+}
+
+fn connect_with_admission(
+    comp: &mut TestCompositor,
+    admit: fn(&mut TestCompositor, UnixStream) -> wayland_server::Client,
+) -> Peer {
     let (server, stream) = UnixStream::pair().unwrap();
-    let server = if ime_bridge {
-        comp.add_ime_bridge_client(server)
-    } else {
-        comp.add_client(server)
-    };
+    let server = admit(comp, server);
     let conn = Connection::from_socket(stream).unwrap();
     let queue = conn.new_event_queue();
     let registry = conn.display().get_registry(&queue.handle(), ());
@@ -829,7 +833,8 @@ fn layer_constraints_use_actual_origin_and_commit_regions_before_activation() {
             comp.state.set_output_size(1280, 800);
             comp.state.set_output_location("tuna-0", (-400, 100));
             let mut manager = comp.window_manager();
-            let mut app = connect(&mut comp);
+            // Layer-shell is the supervised shell's alone (#1048).
+            let mut app = connect_shell(&mut comp);
             pump(&mut comp, &mut manager, &mut [&mut app]);
             let qh = app.queue.handle();
             let surface = app

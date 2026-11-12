@@ -45,7 +45,11 @@ is represented by a match, a version floor or a recorded deviation; a
 source-only floor is never described as a measured native version.
 
 **Golden test.** `crates/compositor/tests/protocols.rs` asserts the exact
-list and versions below. Adding or dropping a protocol updates the test
+list and versions an ordinary client sees (`EXPECTED`), that the
+supervised shell's connection sees exactly that plus `SHELL_ONLY`
+(layer-shell, the foreign toplevel list), and that a client inside a
+`wp_security_context_v1` sees `EXPECTED` less `SANDBOX_HIDDEN` (session
+lock, security context). Adding or dropping a protocol updates the test
 and this page together.
 
 ## Advertised by Tuna Desktop
@@ -61,7 +65,7 @@ and this page together.
 | zwp_primary_selection_device_manager_v1 | 1 | |
 | xdg_wm_base | 6 | popups with positioner constraints and grabs |
 | zxdg_output_manager_v1 | 3 | |
-| zwlr_layer_shell_v1 | 4 | Tuna Desktop's own shell draws through it |
+| zwlr_layer_shell_v1 | 4 | Tuna Desktop's own shell draws through it. Only the supervised shell's connection may bind it: the native connection whose peer pid is the shell child the compositor spawned and still holds (`tuna-shell-gtk`, or the legacy `tuna-shell-host`), the same identity the session lock and control socket check. Every other client's registry omits it and a blind bind by name is a protocol error (#1048; `ClientState::admit_supervised_shell`, `layer::is_shell_peer`) |
 | zwp_linux_dmabuf_v1 | 3 | only when the renderer reports formats |
 | xdg_activation_v1 | 1 | focus policy below |
 | wp_viewporter | 1 | |
@@ -75,7 +79,7 @@ and this page together.
 | zwp_relative_pointer_manager_v1 | 1 | raw motion from the DRM backend |
 | zwp_tablet_manager_v2 | 2 | tablets, tools (pressure, tilt, distance, buttons, tool cursors) and pads (buttons, rings, strips, mode groups, application labels shown on the pad OSD) from libinput on the DRM backend; the vendored Smithay adds pads, labels and version 2 (`third-party/smithay/TABLET-PAD-API-PATCH.diff`); pad dials need libinput 1.26 (the `input` crate's `libinput_1_26` feature), newer than Ubuntu 24.04's 1.25 (#344) |
 | zwp_pointer_constraints_v1 | 1 | a locked pointer stays put; a confined one stays in its window |
-| ext_session_lock_manager_v1 | 1 | the shell's lock screen; only the supervised shell's lock is granted, and only a password the compositor verified unlocks; while locked, input goes only to the lock surface (or nowhere without one), keyboard focus leaves applications as the session locks and returns to the focused window on unlock; duplicate_output is checked per lock object, so a refused or superseded lock does not make the shell's next lock on the same output a protocol error (`third-party/smithay/SESSION-LOCK-OUTPUTS-PATCH.diff`) |
+| ext_session_lock_manager_v1 | 1 | the shell's lock screen; only the supervised shell's lock is granted, and only a password the compositor verified unlocks; while locked, input goes only to the lock surface (or nowhere without one), keyboard focus leaves applications as the session locks and returns to the focused window on unlock; duplicate_output is checked per lock object, so a refused or superseded lock does not make the shell's next lock on the same output a protocol error (`third-party/smithay/SESSION-LOCK-OUTPUTS-PATCH.diff`). Hidden from clients inside a security context |
 | wp_presentation | 2 | CLOCK_MONOTONIC, as Mutter; see frame timing below |
 | wp_fifo_manager_v1 | 1 | a barrier is released on the next refresh cycle |
 | wp_commit_timing_manager_v1 | 1 | a timed update applies on the refresh cycle whose next presentation reaches its time; a tv_nsec of a second or more is an invalid_timestamp error, as in Mutter |
@@ -86,6 +90,11 @@ and this page together.
 | xdg_session_manager_v1 | 1 | window session save and restore as in Mutter 51 (P-SY-08): a client that opens a session gets its windows back after logout or reboot (workspace, position and size, maximized, tiled, fullscreen, output; minimized is not restored, as in Mutter); store `$XDG_DATA_HOME/tuna/window-sessions.json`, written 3 s after a change and at exit (`crates/compositor/src/xdg_session.rs`) |
 | zwp_keyboard_shortcuts_inhibit_manager_v1 | 1 | after Allow, the focused window gets every key, the shell's grabs, Super and Alt+Tab included; Super+Escape (Mutter's restore-shortcuts) takes them back until the window is focused again |
 | wp_pointer_warp_v1 | 1 | honoured while the surface has pointer focus from the enter serial it names; nested, the host pointer stays where it is |
+| wp_security_context_manager_v1 | 1 | a sandbox engine (Flatpak) creates a listener; every client accepted on it joins the display tagged with the context (sandbox engine, app id, instance id: `ClientState::security_context`) until the engine closes the context's close fd. Such a client is refused every privileged global whatever else it is (layer-shell, the foreign toplevel list, input-method, virtual keyboard, `mutter_x11_interop`: `ClientState::privileged`), does not see the session lock, and does not see this manager, so it cannot nest. The published `sandboxed-app-id` stays the one read from the live peer, not the engine's claim (#1046) |
+| ext_idle_notifier_v1 | 2 | idle and resumed from the clock org.gnome.Mutter.IdleMonitor keeps: every timestamped input event restarts it, and the notifications are checked on the same loop tick and deadline. `get_idle_notification` honours the idle inhibitors the idle lock honours (zwp_idle_inhibitor_v1 and org.gnome.SessionManager's idle flag): it never idles while one is held, an idle one resumes when one appears, and its timeout restarts when the last goes. `get_input_idle_notification` counts input alone (`crates/compositor/src/idle_notify.rs`, #1046) |
+| wp_content_type_manager_v1 | 1 | the hint is kept per surface and applied on commit (`protocols::surface_content_type`); recorded for future VRR and frame scheduling, nothing acts on it yet (#1046) |
+| ext_foreign_toplevel_list_v1 | 1 | the supervised shell's alone, like layer-shell: window titles and app ids are published only to the shell and the portal picker (`docs/security-model.md`), so every other registry omits it and a blind bind is a protocol error. A handle per window in the window model, native and X11 alike, with its title and app id (empty when unknown), updated when either changes and `closed` when the window unmaps (#1046) |
+| wp_alpha_modifier_v1 | 1 | the multiplier applies wherever a surface is drawn: Smithay's `WaylandSurfaceRenderElement`, which every surface draw goes through, multiplies it into the element's alpha (#1046) |
 
 ### xdg-activation policy
 
@@ -187,6 +196,17 @@ GNOME's version.
 - **xdg-decoration is absent,** as in Mutter. GNOME is client-side
   decorations only, and the golden test asserts the absence.
 - **layer-shell is present,** unlike Mutter. Tuna Desktop's shell is a separate
-  process and draws its panel, overview and banners through it.
+  process and draws its panel, overview and banners through it. Only that
+  supervised shell can see or bind it; applications cannot, so they have no
+  more surface-placement reach than on GNOME.
+- **security-context, ext-idle-notify, content-type, ext-foreign-toplevel-list
+  and alpha-modifier are present,** though Mutter 51 advertises none of
+  them (#1046). Smithay 0.7 implements them and they cost GNOME apps
+  nothing: security-context lets Flatpak mark its clients so they are kept
+  from every privileged global, idle-notify serves idle daemons from the
+  idle clock GNOME's IdleMonitor already uses, content-type is only
+  recorded, and alpha-modifier only changes how a client's own surface is
+  blended. The foreign toplevel list is offered to the supervised shell
+  only, so applications learn no more about other windows than on GNOME.
 
 `xdg_toplevel_icon_manager_v1` v1 accepts square SHM icons and sanitized theme names, applied on the next surface commit. PNGs live in a private, bounded compositor cache. X11 `_NET_WM_ICON` and legacy square TrueColor `WM_HINTS` pixmaps (24/32-bit color, optional 1-bit transparency mask) are read on a bounded worker for mapped window identities. Palette and unsupported visuals fall back to a generic app icon.

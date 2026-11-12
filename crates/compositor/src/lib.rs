@@ -103,6 +103,7 @@ pub mod fprintd;
 pub mod frame_timing;
 pub mod icc;
 pub mod idle_monitor;
+mod idle_notify;
 pub mod ime;
 pub mod input_aids;
 pub mod introspect;
@@ -329,6 +330,10 @@ pub(crate) struct ClientState {
     /// one client allowed a virtual keyboard (to hand back the keys
     /// IBus does not take).
     pub(crate) ime_bridge: bool,
+    /// The supervised shell's own connection: the one client offered
+    /// `zwlr_layer_shell_v1` (#1048). Set at accept time only when the
+    /// peer is the shell child the runtime holds (`layer::is_shell_peer`).
+    pub(crate) supervised_shell: bool,
     /// Optional tag applied to windows of a D-Bus-created ordinary client.
     pub(crate) connection_window_tag: Option<String>,
     /// Optional liveness marker for an ordinary service-channel connection.
@@ -338,6 +343,14 @@ pub(crate) struct ClientState {
     /// Original bus or accepted-socket peer credentials, with a process pin.
     original_credentials: Option<Arc<zbus::fdo::ConnectionCredentials>>,
     sandboxed_app_id: Arc<std::sync::OnceLock<Option<String>>>,
+    /// The `wp_security_context_v1` this client connected through, when it
+    /// came in on a sandbox engine's listener rather than the session
+    /// socket (#1046). Such a client passes no privileged global's filter
+    /// ([`ClientState::privileged`]) and cannot create a nested context.
+    /// The context's app id is the creator's claim and stays here; the
+    /// published `sandboxed-app-id` remains the one discovered from the
+    /// live peer (`sandbox_identity.rs`).
+    security_context: Option<smithay::wayland::security_context::SecurityContext>,
 }
 
 impl ClientState {
@@ -368,6 +381,55 @@ impl ClientState {
             ime_bridge: true,
             ..Self::default()
         }
+    }
+    /// State for the supervised shell's connection (layer-shell admitted).
+    pub(crate) fn supervised_shell() -> Self {
+        Self {
+            supervised_shell: true,
+            ..Self::default()
+        }
+    }
+    /// Admit an accepted native connection to layer-shell when its peer is
+    /// the shell child `shell_pid` the runtime still holds. The peer is the
+    /// pinned original process when the kernel supplied a pidfd (no identity
+    /// once it exited), else its `SO_PEERCRED` pid, as the session lock's
+    /// shell check reads it.
+    pub(crate) fn admit_supervised_shell(&mut self, socket: &UnixStream, shell_pid: Option<u32>) {
+        let peer = match &self.original_credentials {
+            Some(credentials) => crate::capture_security::pinned_process_id(credentials),
+            None => rustix::net::sockopt::socket_peercred(socket)
+                .ok()
+                .and_then(|peer| u32::try_from(peer.pid.as_raw_pid()).ok()),
+        };
+        self.supervised_shell = crate::layer::is_shell_peer(peer, shell_pid);
+    }
+    /// State for a client accepted on a security-context listener: an
+    /// ordinary native connection (peer credentials, sandbox discovery)
+    /// tagged with the context, and no capability flag.
+    pub(crate) fn security_context(
+        socket: &UnixStream,
+        context: smithay::wayland::security_context::SecurityContext,
+    ) -> Self {
+        Self {
+            security_context: Some(context),
+            ..Self::native_connection(socket)
+        }
+    }
+    /// Whether `client` connected through a `wp_security_context_v1`
+    /// listener.
+    pub(crate) fn sandboxed(client: &Client) -> bool {
+        client
+            .get_data::<ClientState>()
+            .is_some_and(|data| data.security_context.is_some())
+    }
+    /// The filter of every privileged global: `capability` of a client
+    /// outside any security context. A client inside one fails whatever
+    /// its other state says, as `wp_security_context_v1` asks of
+    /// privileged protocols (sway's `filter_global` is the same shape).
+    pub(crate) fn privileged(client: &Client, capability: impl FnOnce(&Self) -> bool) -> bool {
+        client
+            .get_data::<ClientState>()
+            .is_some_and(|data| data.security_context.is_none() && capability(data))
     }
 }
 
@@ -1041,11 +1103,21 @@ delegate_shm!(State);
 delegate_seat!(State);
 delegate_output!(State);
 
-/// A manually-driven compositor for tests: no calloop loop, no backend.
+/// A manually-driven compositor for tests: no backend, and no event loop
+/// beyond the one holding security-context listeners, which [`pump`]
+/// polls without blocking.
+///
+/// [`pump`]: TestCompositor::pump
 pub struct TestCompositor {
     pub display: Display<State>,
     pub state: State,
+    security_listeners: calloop::EventLoop<'static, SecurityListenerData>,
+    /// Clients accepted on security-context listeners, in accept order.
+    security_clients: Vec<Client>,
 }
+
+/// What a test's security-context listener needs to admit a client.
+type SecurityListenerData = (DisplayHandle, Vec<Client>);
 
 impl Default for TestCompositor {
     fn default() -> Self {
@@ -1071,7 +1143,13 @@ impl State {
             seat_state,
             seat,
             dh: dh.clone(),
-            layer_shell_state: WlrLayerShellState::new::<State>(dh),
+            // Only the supervised shell may place layer surfaces (#1048):
+            // GNOME has no client-placed shell layers at all, and Mutter
+            // hides privileged globals from clients that lack the
+            // capability (meta-wayland-x11-interop.c `x11_interop_filter`).
+            layer_shell_state: WlrLayerShellState::new_with_filter::<State, _>(dh, |client| {
+                ClientState::privileged(client, |data| data.supervised_shell)
+            }),
             data_device_state: DataDeviceState::new::<State>(dh),
             dnd_icon: None,
             cursor_image: smithay::input::pointer::CursorImageStatus::default_named(),
@@ -1474,7 +1552,12 @@ impl TestCompositor {
         let display: Display<State> = Display::new().unwrap();
         let dh = display.handle();
         let state = State::new(&dh);
-        Self { display, state }
+        Self {
+            display,
+            state,
+            security_listeners: calloop::EventLoop::try_new().unwrap(),
+            security_clients: Vec::new(),
+        }
     }
 
     /// Attach a client connected through `stream`.
@@ -1495,12 +1578,69 @@ impl TestCompositor {
             .unwrap()
     }
 
-    /// Dispatch pending client requests and flush replies. Drives the
-    /// display without an event loop; tests interleave this with client
-    /// actions instead of blocking on either side.
+    /// Attach the supervised shell's connection in native protocol
+    /// fixtures: the one client offered layer-shell. The runtime grants
+    /// this only to the shell child's own pid; public clients use
+    /// `add_client`.
+    pub fn add_shell_client(&mut self, stream: UnixStream) -> Client {
+        self.display
+            .handle()
+            .insert_client(stream, Arc::new(ClientState::supervised_shell()))
+            .unwrap()
+    }
+
+    /// Dispatch pending client requests, accept connections waiting on
+    /// security-context listeners (as the runtime's loop does), and flush
+    /// replies. Drives the display without blocking; tests interleave
+    /// this with client actions instead of blocking on either side.
     pub fn pump(&mut self) {
         self.display.dispatch_clients(&mut self.state).unwrap();
+        let listeners = self.security_listeners.handle();
+        for (source, context) in self.state.take_security_contexts() {
+            listeners
+                .insert_source(
+                    source,
+                    move |stream, _, (dh, accepted): &mut SecurityListenerData| {
+                        let data = ClientState::security_context(&stream, context.clone());
+                        accepted.push(dh.insert_client(stream, Arc::new(data)).unwrap());
+                    },
+                )
+                .map_err(|error| error.error)
+                .unwrap();
+        }
+        let mut data = (
+            self.display.handle(),
+            std::mem::take(&mut self.security_clients),
+        );
+        self.security_listeners
+            .dispatch(std::time::Duration::ZERO, &mut data)
+            .unwrap();
+        self.security_clients = data.1;
         self.display.flush_clients().unwrap();
+    }
+
+    /// The security context each client accepted on a
+    /// `wp_security_context_v1` listener carries, in accept order.
+    pub fn security_context_clients(
+        &self,
+    ) -> Vec<smithay::wayland::security_context::SecurityContext> {
+        self.security_clients
+            .iter()
+            .filter_map(|client| client.get_data::<ClientState>()?.security_context.clone())
+            .collect()
+    }
+
+    /// Seat input at `now`, as the runtime's input path reports it to
+    /// ext-idle-notify beside org.gnome.Mutter.IdleMonitor.
+    pub fn idle_activity(&mut self, now: std::time::Instant) {
+        self.state.protocols.idle_notifier.activity(now);
+    }
+
+    /// The runtime's idle tick at `now`: ext-idle-notify notifications
+    /// due by then fire, held back by live idle inhibitors.
+    pub fn idle_tick(&mut self, now: std::time::Instant) {
+        let inhibited = self.state.idle_inhibited();
+        self.state.protocols.idle_notifier.tick(now, inhibited);
     }
 
     /// Seat capability handles for native protocol fixtures.

@@ -1552,6 +1552,9 @@ impl WindowManager {
         // hold focus past this tick while the overview is open.
         self.reconcile_overview_focus(state);
         self.reconcile_exclusive_layer(state);
+        // The shell's ext-foreign-toplevel-list follows the model as it
+        // stands after this tick's maps, title changes and unmaps (#1046).
+        state.sync_foreign_toplevels(self.model.revision(), self.model.windows());
         let _ = seen;
     }
 

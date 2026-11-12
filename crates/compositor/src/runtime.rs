@@ -1173,7 +1173,9 @@ impl Runtime {
         event_loop
             .handle()
             .insert_source(socket, |stream, _, runtime: &mut Runtime| {
-                let client_data = ClientState::native_connection(&stream);
+                let mut client_data = ClientState::native_connection(&stream);
+                // Layer-shell is the supervised shell's alone (#1048).
+                client_data.admit_supervised_shell(&stream, runtime.shell.child_pid());
                 if let Ok(client) = runtime
                     .display
                     .handle()
@@ -2092,6 +2094,7 @@ impl Runtime {
                 self.lock.note_input(input_time(&input));
                 self.idle_since = Instant::now();
                 self.idle_monitor.activity();
+                self.state.protocols.idle_notifier.activity(Instant::now());
                 self.active_at = Instant::now();
                 return;
             }
@@ -2114,6 +2117,7 @@ impl Runtime {
         self.lock.note_input(input_time(&input));
         self.idle_since = Instant::now();
         self.idle_monitor.activity();
+        self.state.protocols.idle_notifier.activity(Instant::now());
         self.active_at = Instant::now();
         if self.is_locked() {
             self.cursor.locate.reset_keys();
@@ -2448,6 +2452,35 @@ impl Runtime {
     /// Loop handle for event-source installation (XWayland spawn).
     pub fn loop_handle(&self) -> LoopHandle<'static, Runtime> {
         self.loop_handle.clone()
+    }
+
+    /// Put the listener of every security context committed since the
+    /// last call on the loop (wp_security_context_v1, #1046): a client
+    /// it accepts joins the display inside that context, so no
+    /// privileged global admits it. The listener goes once its creator
+    /// closes the context's close fd.
+    fn admit_security_contexts(&mut self) {
+        for (source, context) in self.state.take_security_contexts() {
+            let inserted =
+                self.loop_handle
+                    .insert_source(source, move |stream, _, runtime: &mut Runtime| {
+                        let data = ClientState::security_context(&stream, context.clone());
+                        if runtime
+                            .display
+                            .handle()
+                            .insert_client(stream, Arc::new(data))
+                            .is_ok()
+                        {
+                            runtime.stats.clients += 1;
+                        }
+                    });
+            if let Err(error) = inserted {
+                eprintln!(
+                    "tuna-compositor: security context listener not added: {}",
+                    error.error
+                );
+            }
+        }
     }
 
     /// Mutable protocol state, for the X11 handler impls.
@@ -4867,6 +4900,7 @@ impl Runtime {
         }
         for deadline in [
             self.idle_monitor.next_deadline(),
+            self.state.protocols.idle_notifier.next_deadline(),
             self.orca.next_deadline(),
             self.manager.workspace_lease_deadline(),
             self.wallpaper.maintenance_deadline(),
@@ -4948,6 +4982,7 @@ impl Runtime {
         self.display
             .dispatch_clients(&mut self.state)
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        self.admit_security_contexts();
         self.display
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
@@ -5254,6 +5289,12 @@ impl Runtime {
             self.idle_since = Instant::now();
         }
         self.idle_inhibited = inhibited;
+        // ext-idle-notify honours the same inhibitors for its ordinary
+        // notifications; input-only ones ignore them.
+        self.state
+            .protocols
+            .idle_notifier
+            .tick(Instant::now(), inhibited);
         if !self.is_locked() && self.lock.check_timeout(self.lock_now_ms()) {
             // Administrative lockdown (#357): a disabled lock screen
             // never engages on idle; restart the stretch instead so no
@@ -5509,6 +5550,7 @@ impl Runtime {
             self.lock.note_input(u64::from(time));
             self.idle_since = Instant::now();
             self.idle_monitor.activity();
+            self.state.protocols.idle_notifier.activity(Instant::now());
             self.active_at = Instant::now();
         }
         let event = match event {
