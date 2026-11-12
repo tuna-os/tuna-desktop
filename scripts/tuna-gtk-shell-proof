@@ -1326,6 +1326,9 @@ if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
     fi
 fi
+# The frames client starts through the proof's launcher, which
+# G-X11-FRAME-RECOVERY holds while it reads the windows bare.
+x11f_launcher
 # The compositor and the shell share this log from one file description.
 # Truncate first (a fresh log each run, as before), then append: O_APPEND
 # keeps each process's write() contiguous, so concurrent lines can only
@@ -1999,8 +2002,9 @@ if command -v Xwayland >/dev/null 2>&1; then
             fail G-X11-DEMAND "XIM connected before an application needed X11"
         fi
     fi
-    # The frames client is an X11 client too: none before the first window.
-    if pgrep -P "$COMPOSITOR_PID" -x tuna-x11-frames >/dev/null; then
+    # The frames client is an X11 client too: none before the first window,
+    # not even its launcher.
+    if pgrep -P "$COMPOSITOR_PID" -x "tuna-x11-frames|${X11F_LAUNCH##*/}" >/dev/null; then
         fail G-X11-DEMAND "the X11 frames client started before an application needed X11"
     fi
     pass G-X11-DEMAND "native GTK and IBus startup advertise sockets without an XWayland, XIM or frames-client process"
