@@ -17,9 +17,10 @@
 //!   is accumulated here and clamped to the output union, so the window
 //!   manager keeps receiving absolute positions like the nested backend.
 //!
-//! The pointer is drawn in software (an arrow of solid rectangles):
-//! there is no host cursor on bare hardware. Client cursor surfaces are
-//! not composited yet.
+//! The compositor draws the pointer itself on top of each frame
+//! (`crate::cursor::draw`, called from `runtime.rs`): cursor themes,
+//! requested shapes and client cursor surfaces. No KMS cursor plane is
+//! used.
 
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
