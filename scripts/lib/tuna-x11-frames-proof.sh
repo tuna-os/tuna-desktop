@@ -149,6 +149,51 @@ x11f_log_errors() {
         grep -E 'tuna-x11-frames.*(CRITICAL|ERROR)|X Window System error|tuna-compositor: x11 frames: (offer|XSETTINGS) refused' || true
 }
 
+# The frames client's launcher, and the file that holds its start.
+X11F_LAUNCH=""
+X11F_HOLD=""
+
+# Have the compositor about to start run its frames client through a
+# launcher (the supervisor's TUNA_X11_FRAMES), so that a gate can hold the
+# client's next start. The supervisor starts a new frames client half a
+# second after one died; what G-X11-FRAME-RECOVERY reads in between would
+# otherwise have to be caught in that half second.
+#
+# The launcher becomes the frames client the supervisor itself would have
+# run (crates/compositor/src/x11_frames.rs `resolve`: tuna-x11-frames
+# beside the compositor's executable, otherwise on PATH). It is the same
+# process: the pid the supervisor started, named tuna-x11-frames from then
+# on. Until then it carries its own name, so a held start is not taken
+# for a running frames client (pgrep -x tuna-x11-frames); to the
+# supervisor it is a client that started and has not exited, which costs
+# no restart. Without the hold file it starts the client at once.
+x11f_launcher() {
+    X11F_LAUNCH="$ARTIFACTS/x11f-launch"
+    X11F_HOLD="$X11F_LAUNCH.hold"
+    rm -f "$X11F_HOLD"
+    cat >"$X11F_LAUNCH" <<'EOF'
+#!/bin/sh
+# Written by scripts/lib/tuna-x11-frames-proof.sh (x11f_launcher): the
+# compositor's frames client, not started while "$0.hold" exists. The
+# wait ends with the compositor, and after a minute whatever became of
+# the proof that asked for it.
+held=0
+while [ -e "$0.hold" ] && [ "$held" -lt 600 ]; do
+    kill -0 "$PPID" 2>/dev/null || exit 1
+    sleep 0.1
+    held=$((held + 1))
+done
+compositor="$(readlink "/proc/$PPID/exe" 2>/dev/null || true)"
+if [ -f "${compositor%/*}/tuna-x11-frames" ]; then
+    exec "${compositor%/*}/tuna-x11-frames" "$@"
+fi
+exec tuna-x11-frames "$@"
+EOF
+    chmod +x "$X11F_LAUNCH"
+    TUNA_X11_FRAMES="$X11F_LAUNCH"
+    export TUNA_X11_FRAMES
+}
+
 x11_frames_proof() {
 for x11f_tool in Xwayland xclock xeyes xev xprop xwininfo; do
     command -v "$x11f_tool" >/dev/null 2>&1 ||
@@ -466,8 +511,11 @@ DISPLAY="$X11F_DISPLAY" xprop -spy -id "$x11f_xev_client" _NET_FRAME_EXTENTS >"$
 x11f_spy_pid=$!
 sleep 0.5
 x11f_recovery_mark="$(wc -c <"$LOG")"
+# The supervisor's next frames client stays held until the bare windows
+# are read and clicked: nothing frames them before that.
+: >"$X11F_HOLD"
+x11f_held="$(date +%s)"
 kill -KILL "$x11f_frames_pid"
-# The bare interval lasts the supervisor's restart delay: sample fast.
 # The frame's X11 window carried the Wayland surface and took it along:
 # each window has none until Xwayland made one for its bare wrapper (a
 # few frames; the compositor reports it as surface_rect), and a press
@@ -491,6 +539,14 @@ jq -e ".windows[] | select(.id == $x11f_xev) | .rect == [$x11f_x, $x11f_y, $x11f
     fail G-X11-FRAME-RECOVERY "the bare window did not keep its origin and client size: $(jq -c ".windows[] | select(.id == $x11f_xev)" "$ARTIFACTS/x11-frame-bare.json")"
 x11f_until 5 x11f_pressed "$x11f_count" ||
     fail G-X11-FRAME-RECOVERY "a click on the window after its frame went never reached the client"
+# The press went to a bare window: both still are.
+jq -e "[.windows[] | select(.id == $x11f_xev or .id == $x11f_other)] | length == 2 and all(.[]; .x11_framed == false)" "$CSTATE" >/dev/null ||
+    fail G-X11-FRAME-RECOVERY "the windows did not stay bare while the next frames client was held: $(jq -c "[.windows[] | select(.id == $x11f_xev or .id == $x11f_other) | {id, x11_framed}]" "$CSTATE")"
+# The hold ends with the press. It cannot last: the window manager
+# offers its bare windows to a frames client for ten seconds from the
+# supervisor's start of it (OFFER_WINDOW_MS), which was the launcher's.
+rm -f "$X11F_HOLD"
+x11f_held=$(($(date +%s) - x11f_held))
 # The supervisor's next frames client, and the same windows framed again
 # at the same rectangles.
 # shellcheck disable=SC2329 # run by x11f_until
@@ -500,7 +556,7 @@ x11f_restarted() {
 }
 x11f_until 15 x11f_restarted || fail G-X11-FRAME-RECOVERY "the frames client was not restarted"
 cstate "[.windows[] | select(.id == $x11f_xev or .id == $x11f_other)] | length == 2 and all(.[]; .x11_framed and .x11_frame_extents[2] > 0)" "framed again" 15 ||
-    fail G-X11-FRAME-RECOVERY "the windows were not framed again by the restarted frames client"
+    fail G-X11-FRAME-RECOVERY "the windows were not framed again by the restarted frames client (its start was held for up to $x11f_held s of the 10 s it is offered windows)"
 cstate "(.windows[] | select(.id == $x11f_xev) | .rect == [$x11f_xev_rect]) and (.windows[] | select(.id == $x11f_other) | .rect == [$x11f_other_rect])" "same rectangles" 5 ||
     fail G-X11-FRAME-RECOVERY "the reframed windows did not come back to their rectangles"
 x11f_frame="$(x11f_parent "$x11f_xev_client")"
