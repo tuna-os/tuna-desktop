@@ -935,8 +935,9 @@ xdotool key Right
 sleep 0.6
 grid_tiles key-right
 grid_second="$(grid_focused_tile "$ARTIFACTS/a11y-grid-key-right.json")"
-[ -n "$grid_second" ] && [ "$grid_second" != "$grid_first" ] ||
+if [ -z "$grid_second" ] || [ "$grid_second" = "$grid_first" ]; then
     fail G-GRID-ON-DEMAND "Right did not move the focus from '$grid_first' to the next tile (got '$grid_second')"
+fi
 xdotool key Escape
 cstate '.overview_open | not' "closed" 3 || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-GRID-ON-DEMAND "overview stayed open"; }
 sleep 1
