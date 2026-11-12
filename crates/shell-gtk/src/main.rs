@@ -81,6 +81,7 @@ mod brightness_service;
 mod bt_menu;
 mod calendar;
 mod captive_portal;
+mod close_dialog;
 mod display_change;
 mod events;
 mod fd_watch;
@@ -219,6 +220,8 @@ struct Drained {
     consent: Option<Option<(u64, String)>>,
     /// The latest display-change confirmation countdown, in seconds.
     display_change: Option<u32>,
+    /// Close dialogs over windows that stopped answering pings, in order.
+    close_dialogs: Vec<close_dialog::Update>,
     popups: Vec<(u32, u32)>,
     /// The latest workspace swipe phase `(position, duration_us)`, wire
     /// fixed point: the Activities dots follow it.
@@ -323,6 +326,12 @@ fn drain(
             Handled::WindowMenu(request) => out.menus.push(request),
             Handled::ShortcutConsent(request) => out.consent = Some(request),
             Handled::ConfirmDisplayChange(secs) => out.display_change = Some(secs),
+            Handled::ShowCloseDialog(request) => {
+                out.close_dialogs.push(close_dialog::Update::Show(request));
+            }
+            Handled::HideCloseDialog(window) => {
+                out.close_dialogs.push(close_dialog::Update::Hide(window));
+            }
             Handled::ScreenReader(state) => {
                 if matches!(
                     state,
@@ -3847,6 +3856,19 @@ fn build(app: &adw::Application) {
             }),
         )
     };
+    // gnome-shell's close dialog over a window that stopped answering
+    // pings: Force Quit or Wait go back to the compositor.
+    let close_dialogs = {
+        let shell = shell.clone();
+        close_dialog::CloseDialogs::new(
+            app.upcast_ref(),
+            Rc::new(move |window, response| {
+                if let Some(control) = shell.borrow_mut().control.as_mut() {
+                    let _ = control.respond_close_dialog(window, response);
+                }
+            }),
+        )
+    };
     // gnome-shell's pad OSD and its org.gnome.Shell.Wacom.PadOsd service.
     let pad_osd_ui = {
         let (closed_shell, request_shell) = (shell.clone(), shell.clone());
@@ -3958,6 +3980,7 @@ fn build(app: &adw::Application) {
                     menus,
                     consent,
                     display_change,
+                    close_dialogs: close_dialog_updates,
                     popups,
                     workspace_progress,
                     overview_swipes,
@@ -4056,6 +4079,17 @@ fn build(app: &adw::Application) {
                     display_change_dialog.close();
                 } else if let Some(secs) = display_change {
                     display_change_dialog.show(secs);
+                }
+                // A new connection replays what is still shown.
+                close_dialogs.sync_connection(auth_generation);
+                if locked {
+                    close_dialogs.hide_all();
+                } else {
+                    let apps = chrome_apps.get();
+                    close_dialogs.apply(close_dialog_updates, |app_id| {
+                        let entry = app_id.and_then(|id| providers::provider_app(&apps, id));
+                        close_dialog::app_name(entry.map(|entry| entry.name.as_str()), app_id)
+                    });
                 }
                 if locked {
                     pad_osd_ui.close();

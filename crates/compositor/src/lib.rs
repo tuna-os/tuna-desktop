@@ -47,7 +47,10 @@ use smithay::{
         },
         shell::{
             wlr_layer::WlrLayerShellState,
-            xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState},
+            xdg::{
+                PopupSurface, PositionerState, ShellClient, ToplevelSurface, XdgShellHandler,
+                XdgShellState,
+            },
         },
         shm::{ShmHandler, ShmState},
     },
@@ -169,6 +172,7 @@ pub mod touchpad_swipe;
 mod transient_family;
 pub mod transitions;
 pub mod unlock;
+pub mod unresponsive;
 pub mod user_upgrade;
 mod wake;
 pub mod wallpaper;
@@ -300,6 +304,10 @@ pub struct State {
     /// Smithay clears role data immediately after `toplevel_destroyed` returns.
     pub(crate) closed_toplevel_parents:
         std::collections::HashMap<wl_surface::WlSurface, wl_surface::WlSurface>,
+    /// xdg_wm_base clients whose pong answered their pending ping, for
+    /// the window manager's alive checks (mutter's
+    /// `meta_display_pong_for_serial`, see [`unresponsive`]).
+    pub(crate) pongs: Vec<ShellClient>,
     /// dmabuf, activation, viewporter and the other #89 protocols.
     pub(crate) protocols: protocols::Protocols,
     /// presentation-time, fifo and commit-timing (#89).
@@ -556,6 +564,12 @@ impl XdgShellHandler for State {
             self.closed_toplevel_parents
                 .insert(surface.wl_surface().clone(), parent);
         }
+    }
+
+    /// A pong matching the client's pending ping (Smithay checks the
+    /// serial): the manager's next alive check marks its windows alive.
+    fn client_pong(&mut self, client: ShellClient) {
+        self.pongs.push(client);
     }
 
     fn parent_changed(&mut self, surface: ToplevelSurface) {
@@ -1170,6 +1184,7 @@ impl State {
             retired_output_globals: Vec::new(),
             window_requests: Vec::new(),
             closed_toplevel_parents: std::collections::HashMap::new(),
+            pongs: Vec::new(),
             protocols: protocols::Protocols::new(dh),
             frame_timing: frame_timing::FrameTiming::new(dh),
             lock_protocol: session_lock::LockProtocol::new(dh),
