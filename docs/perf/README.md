@@ -72,13 +72,19 @@ The run's summary page and `perf-artifacts/perf-gate.json` in the `marlin-perfor
   - `fail`: over the ratio or the ceiling.
   - `missing`: fewer than three stock-profile pairs measured an enforced metric, which also fails.
   - `warn`: a provisional budget (`enforced: false`) is over its ratio or ceiling, or has too few pairs.
+  - `unenforced`: a provisional budget is within its ratio and ceiling. This is not a pass.
+
+  The summary prints both provisional statuses with `not enforced`, names every such budget above the table, and `check` repeats them on stderr. `perf-gate.json` lists them under `unenforced`. They never change the exit status.
+- **Memory against the v1 criterion.** A statement of whether the criterion (below) is enforced, the four criterion metrics with `met` or `not met` against the target ratio, PSS in MiB by process role for GNOME, Tuna and their difference (idle, settle and the whole run), and each desktop's largest processes. The JSON has every phase under `memory.by_role_mib` and every process under `memory.by_process_mib`.
 - **Per-role attribution, for each desktop.** The mean CPU of each phase, split into compositor, shell, xwayland, portals, services and apps. GNOME's compositor and shell are one process (`gnome-shell`), so compare Tuna's "desktop" role (compositor plus shell) against it.
-- **A 90% confidence interval for every ratio.** A seeded block bootstrap (1000 replicates, blocks of three 1 s intervals) resamples the pairs and, inside each session, the phase's intervals or observations, and recomputes the gated statistic. The same artifact always gives the same interval. `unstable` marks a decision whose interval straddles the budget: the run cannot tell that metric's pass from its fail. The status still follows the point estimate, so the interval loosens nothing.
+- **A 90% confidence interval for every ratio.** A seeded block bootstrap (1000 replicates, blocks of three 1 s intervals) resamples the pairs and, inside each session, the phase's intervals or observations, and recomputes the gated statistic. The same artifact always gives the same interval. Memory metrics draw from a separate stream with the same seed, so budgeting them moved no other interval. `unstable` marks a decision whose interval straddles the budget: the run cannot tell that metric's pass from its fail. The status still follows the point estimate, so the interval loosens nothing.
 - **The host CPU model and refused sessions.** GitHub's KVM runners vary (EPYC 7763, EPYC 9V74, EPYC 9V45, Xeon 8370C), and some ratios move by host class; compare runs on the same class. A session whose observer wrote records over 32 KiB, or ran with per-thread diagnostics, is refused with its reason: such an observer perturbs what it measures (#782). Its pair then counts as unmeasured.
 
 The JSON's `meets_target` separately compares the median paired ratio against the target without a denominator floor. Passing a floor-stabilized idle CPU budget does not establish parity. Two measured zero values meet the target; positive Tuna usage against measured zero GNOME usage does not.
 
-Metric names are `cpu.<phase>.<role>.<stat>`, `overview.response_ms.<stat>` and `frame_pacing.interval_ms.<stat>`. CPU is in percent of one core, summed over the role's processes. Only intervals wholly inside a phase count. A process's first interval after it starts is not counted.
+Metric names are `cpu.<phase>.<role>.<stat>`, `pss.<scope>.<role>.<stat>`, `overview.response_ms.<stat>` and `frame_pacing.interval_ms.<stat>`. CPU is in percent of one core, summed over the role's processes. Only intervals wholly inside a phase count. A process's first interval after it starts is not counted.
+
+Memory is PSS in MiB, summed over the role's processes in each one-second sample. `<scope>` is a phase or `whole`. A phase takes the samples whose collection lies wholly inside it, the rule the session report uses for `idle_user_pss_kib`, and needs at least three. `whole` takes every sample of the run, like `whole_user_pss_kib`. `<stat>` is `p50` (budgeted) or `p95` (the near-peak). A process counts in the samples that see it: one that exits stops counting, and nothing is carried forward. A sample with an unreadable process or a row without a whole `pss_kib` makes its phase and the whole run unmeasured for that session, never smaller.
 
 | Phase | Workload |
 |---|---|
@@ -92,6 +98,23 @@ Metric names are `cpu.<phase>.<role>.<stat>`, `overview.response_ms.<stat>` and 
 | `settle` | 30 s without input, three apps open |
 
 `cpu.whole.total.p50` matches the whole-run figure in older reports. Frame pacing uses the frame-pacer probe's presentation intervals. Overview response is the QMP-observed upper bound described above.
+
+### Memory criterion
+
+v1 requires memory no worse than GNOME 51 ([v1 checklist](../v1.md)). The gate expresses that as four metrics at a ratio of 1.00 or below: `pss.idle.desktop.p50`, `pss.idle.total.p50`, `pss.whole.desktop.p50` and `pss.whole.total.p50`. `desktop` is compositor plus shell, as for CPU. `total` is every process of the session user, so it also contains the workload's three apps and the session services.
+
+**The criterion is not enforced yet.** The four budgets are provisional: `enforced: false`, with `max_ratio` at the target ratio because no budget has been calibrated. ADR 0009 enforces a budget only after a paired run measured it in three stock pairs, and enforcing it is a ratchet step that cites that run. Until then a green gate says nothing about memory, and the report says so in its memory section and on stderr.
+
+The budgets cite [run 42807208426](https://github.com/tuna-os/tuna-desktop/actions/runs/42807208426) (2026-11-10, package `dea433d0`, EPYC 7763). That run predates these metrics; its three stock pairs were replayed through `tuna-perf-gate check` locally:
+
+| Metric | GNOME MiB | Tuna MiB | Median ratio | Pair ratios |
+|---|---:|---:|---:|---|
+| `pss.idle.desktop.p50` | 254.5 | 257.4 | 1.01 | 1.014, 1.010, 1.005 |
+| `pss.idle.total.p50` | 472.5 | 435.3 | 0.92 | 0.921, 0.919, 0.961 |
+| `pss.whole.desktop.p50` | 253.8 | 275.9 | 1.09 | 1.090, 1.090, 1.085 |
+| `pss.whole.total.p50` | 880.5 | 737.0 | 0.83 | 0.834, 0.823, 0.857 |
+
+The session total is below GNOME mostly outside the desktop: `gnome-system-monitor` held 171.5 MiB in the GNOME sessions and 42.9 MiB in the Tuna sessions, and the services role was 42.5 MiB smaller. The desktop role was above GNOME: `tuna-compositor` 175.1 MiB plus the shell role's 100.9 MiB against `gnome-shell` 225.7 MiB plus 27.7 MiB. One run on one host class is not a calibration.
 
 ### How budgets ratchet
 
@@ -117,7 +140,7 @@ The first budgets are the median ratios over the three stock pairs of [paired ru
   This lowers each budget to the measured ratio plus the margin, never below 1.0, and never raises one. When the run's 90% interval reaches above the point ratio, its upper bound is used instead, so one quiet run cannot set a budget inside its own noise. Commit the result with the run linked in the PR. Enforcing a provisional budget is also a tightening.
 - **Loosening** (a higher ratio, ceiling or floor, dropping `enforced`, or removing a budget) needs a new ADR under `docs/adr/`, referenced from the budget's `adr` field, as the roadmap's change control requires. CI's ratchet check (`scripts/tuna-perf-gate ratchet --base <main's budgets.json>`) refuses any change that is not backed by new run evidence, and any loosening without that ADR.
 
-Every budget in the baseline is enforced, since that run measured each one in three pairs. A budget added later without three measured pairs starts provisional (`enforced: false`) and is enforced from the first run that measures it.
+Every budget in the baseline is enforced, since that run measured each one in three pairs. A budget added later without three measured pairs starts provisional (`enforced: false`) and is enforced from the first run that measures it. The memory budgets are in that state. A provisional budget's `max_ratio` is ratcheted like any other: enforcing it needs a newer run as `evidence`, and raising it needs an ADR.
 
 ### Running it locally
 

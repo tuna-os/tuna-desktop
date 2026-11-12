@@ -17,6 +17,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts/lib"))
+import gnome_reference  # noqa: E402
 import perf_budget as pb  # noqa: E402
 
 loader = importlib.machinery.SourceFileLoader("gate", str(ROOT / "scripts/tuna-perf-gate"))
@@ -49,12 +50,28 @@ def samples(load, names=True, start=0, end=101):
     return rows
 
 
-def write_session(directory, load, overview_ms=200, pacing=16.7, names=True):
+def memory_samples(memory, start=0, end=101):
+    """One sample per second; memory(second) is {process name: PSS MiB} of the processes alive then."""
+    rows, pids = [], {}
+    for second in range(start, end):
+        processes = []
+        for name, mib in sorted(memory(second).items()):
+            pid = pids.setdefault(name, 100 + len(pids))
+            processes.append({"pid": pid, "start_ticks": pid, "cpu_ticks": 0, "comm": name[:15], "cmd": name,
+                              "pss_kib": round(mib * 1024), "rss_kib": round(mib * 2048)})
+        rows.append({"monotonic_s": float(second), "boottime_s": float(second), "hz": 100,
+                     "cpu_interval_start_boottime_s": float(second - 1) if second > start else None,
+                     "cpu_observed_percent": 0.0 if second > start else None, "unreadable": [],
+                     "processes": processes, "pss_kib": sum(p["pss_kib"] for p in processes)})
+    return rows
+
+
+def write_session(directory, load, overview_ms=200, pacing=16.7, names=True, rows=None):
     directory.mkdir(parents=True)
     phases = {f"{p}_{edge}": float(v) for p, (a, b) in PHASES.items() for edge, v in (("start", a), ("end", b))}
     (directory / "report.json").write_text(json.dumps(
         {"presentation_cadence": {"interval_ms": {"p95": pacing, "p99": pacing * 2}}}))
-    (directory / "samples.json").write_text(json.dumps(samples(load, names)))
+    (directory / "samples.json").write_text(json.dumps(samples(load, names) if rows is None else rows))
     (directory / "guest-phases.json").write_text(json.dumps(phases))
     (directory / "observations.json").write_text(json.dumps(
         [{"index": i, "upper_s": overview_ms / 1000} for i in range(20)]))
@@ -127,6 +144,13 @@ class Attribution(unittest.TestCase):
 def run_gate(args):
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         return gate.main(args)
+
+
+def run_gate_output(args):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        status = gate.main(args)
+    return status, out.getvalue(), err.getvalue()
 
 
 class Gate(unittest.TestCase):
@@ -394,6 +418,257 @@ class Observer(unittest.TestCase):
             self.assertEqual(pb.host_cpu(session), "AMD EPYC 7763 64-Core Processor")
             (session / "report.json").write_text("{}")
             self.assertIsNone(pb.host_cpu(session))
+
+
+GNOME_MEMORY = {"gnome-shell": 180, "gjs": 20, "gsd-color": 100, "nautilus": 200}   # desktop 200, total 500 MiB
+
+
+def steady(processes):
+    return lambda second: processes
+
+
+def memory_tree(root, compositors=(120, 160, 340), spoil=None):
+    """One pair per Tuna compositor size: desktop is 60 MiB and the session 290 MiB above it."""
+    for index, compositor in enumerate(compositors):
+        base = Path(root) / ("" if index == 0 else f"repeat-{index + 1}")
+        write_session(base / "gnome", {}, rows=memory_samples(steady(GNOME_MEMORY)))
+        rows = memory_samples(steady({"tuna-compositor": compositor, "tuna-shell-gtk": 60, "pipewire": 30,
+                                      "nautilus": 200}))
+        if spoil == index:
+            rows[20]["unreadable"] = [{"pid": 100, "error": "PermissionError"}]
+        write_session(base / "tuna", {}, rows=rows)
+
+
+def memory_budgets(enforced):
+    return budgets(**{metric: budget(1.0, floor=0, enforced=enforced) for metric in pb.MEMORY_CRITERION})
+
+
+class Memory(unittest.TestCase):
+    """v1's "memory no worse than GNOME 51": PSS by role per pair, and never a silent pass."""
+
+    def rows(self, config, **kwargs):
+        with tempfile.TemporaryDirectory() as directory:
+            memory_tree(directory, **kwargs)
+            series = pb.pair_series(pb.discover_pairs(directory))
+            return {row["metric"]: row for row in
+                    pb.evaluate(config, pb.compare(None, series), 3, pb.confidence(config, series))}
+
+    def test_each_sample_sums_the_processes_alive_by_role(self):
+        def memory(second):
+            alive = {"tuna-compositor": 100, "tuna-shell-gtk": 40, "tuna-shell-host": 10, "Xwayland": 8,
+                     "xdg-desktop-portal-gtk": 4, "pipewire": 6}
+            if 3 <= second <= 5:
+                alive["nautilus"] = 50      # starts, then exits
+            return alive
+        raw = memory_samples(memory, end=8)
+        raw[6]["processes"].append({"pid": 900, "start_ticks": 900, "cmd": "tuna-shell-gtk", "pss_kib": 2048})
+        rows = pb.pss_samples(raw)
+        self.assertEqual([row[:2] for row in rows[:2]], [(None, 0.0), (0.0, 1.0)])
+        before, during, after, second_shell = rows[2], rows[4], rows[7], rows[6]
+        self.assertEqual(before[2], {"compositor": 100, "shell": 50, "xwayland": 8, "portals": 4, "services": 6,
+                                     "apps": 0, "desktop": 150, "total": 168})
+        self.assertEqual((during[2]["apps"], during[2]["desktop"], during[2]["total"]), (50, 150, 218))
+        self.assertEqual(during[4]["nautilus"], 50)
+        self.assertEqual(after[2], before[2])
+        self.assertNotIn("nautilus", after[4])
+        self.assertEqual((second_shell[2]["shell"], second_shell[4]["tuna-shell-gtk"]), (52, 42))
+        self.assertTrue(all(row[3] for row in rows))
+
+    def test_a_phase_takes_wholly_contained_collections_and_the_whole_run_takes_all(self):
+        # The collections ending at 10 s and 41 s straddle the idle markers.
+        def memory(second):
+            return {"tuna-compositor": 200 if 11 <= second <= 40 else (300 if second >= 50 else 999)}
+        raw = memory_samples(memory)
+        series = pb.pss_series(raw, {"idle_start": 10.0, "idle_end": 40.0, "overview_start": 50.0,
+                                     "overview_end": 52.5, "typing_start": 5.0})
+        # Overview holds two collections; typing has no end marker.
+        self.assertEqual({metric.split(".")[1] for metric in series}, {"idle", "whole"})
+        self.assertEqual(series["pss.idle.compositor.p50"], ("p50", [200.0] * 30))
+        self.assertEqual(series["pss.idle.total.p95"], ("p95", [200.0] * 30))
+        # The session report takes the same collections for its idle PSS.
+        self.assertEqual(gnome_reference.idle_pss(raw, 10.0, 40.0), [200 * 1024] * 30)
+        metrics = pb.summarize(series)
+        self.assertEqual(len(series["pss.whole.total.p50"][1]), 101)
+        self.assertEqual((metrics["pss.whole.total.p50"], metrics["pss.whole.total.p95"]), (300, 999))
+        self.assertEqual((metrics["pss.whole.desktop.p50"], metrics["pss.whole.apps.p50"]), (300, 0))
+
+    def test_a_process_that_exits_stops_counting_from_its_last_sample(self):
+        def memory(second):
+            alive = {"gnome-shell": 200}
+            if second <= 20:
+                alive["nautilus"] = 50      # alive for the first ten of thirty idle samples
+            return alive
+        raw, phases = memory_samples(memory), {"idle_start": 10.0, "idle_end": 40.0}
+        metrics = pb.summarize(pb.pss_series(raw, phases))
+        self.assertEqual((metrics["pss.idle.apps.p50"], metrics["pss.idle.apps.p95"]), (0, 50))
+        self.assertEqual((metrics["pss.idle.total.p50"], metrics["pss.idle.total.p95"]), (200, 250))
+        self.assertEqual((metrics["pss.idle.desktop.p50"], metrics["pss.idle.desktop.p95"]), (200, 200))
+        processes = pb.process_pss(raw, phases)
+        self.assertEqual(processes["idle"], {"gnome-shell": {"p50": 200, "p95": 200},
+                                             "nautilus": {"p50": 0, "p95": 50}})
+        self.assertEqual(processes["whole"]["nautilus"], {"p50": 0, "p95": 50})
+
+    def test_too_few_or_failed_samples_leave_a_scope_unmeasured_never_smaller(self):
+        phases = {"idle_start": 10.0, "idle_end": 40.0, "settle_start": 80.0, "settle_end": 100.0}
+        complete = memory_samples(steady(GNOME_MEMORY))
+
+        def scopes(raw):
+            return {metric.split(".")[1] for metric in pb.pss_series(raw, phases)}
+        self.assertEqual(scopes(complete), {"idle", "settle", "whole"})
+        # An observer gap leaves two idle collections: too few, while the rest stands.
+        self.assertEqual(scopes([row for row in complete if not 13 <= row["boottime_s"] <= 40]), {"settle", "whole"})
+        # A sample the observer could not complete would understate memory.
+        for spoil in (lambda row: row.update(unreadable=[{"pid": 100, "error": "PermissionError"}]),
+                      lambda row: row["processes"][0].pop("pss_kib"),
+                      lambda row: row["processes"][0].update(pss_kib=None),
+                      lambda row: row["processes"][0].update(pss_kib=True),
+                      lambda row: row["processes"][0].update(pss_kib=-1),
+                      lambda row: row["processes"][0].update(pss_kib=1.5),
+                      lambda row: row.update(processes=None)):
+            raw = copy.deepcopy(complete)
+            spoil(raw[20])
+            self.assertEqual(scopes(raw), {"settle"})
+            self.assertIsNone(pb.pss_samples(raw)[20][2])
+
+    def test_unnamed_processes_report_only_the_total(self):
+        raw = memory_samples(steady(GNOME_MEMORY))
+        for row in raw:
+            for process in row["processes"]:
+                del process["comm"], process["cmd"]
+        series = pb.pss_series(raw, {"idle_start": 10.0, "idle_end": 40.0})
+        self.assertEqual(set(series), {f"pss.{scope}.total.{stat}" for scope in ("idle", "whole")
+                                       for stat in ("p50", "p95")})
+        self.assertEqual(pb.summarize(series)["pss.idle.total.p50"], 500)
+
+    def test_pair_ratios_take_the_median_and_an_unenforced_budget_neither_passes_nor_fails(self):
+        rows = self.rows(memory_budgets(enforced=False))
+        desktop, total = rows["pss.idle.desktop.p50"], rows["pss.idle.total.p50"]
+        # Desktop 180, 220 and 400 MiB against 200: ratios 0.9, 1.1 and one disturbed 2.0.
+        self.assertEqual((desktop["gnome"], desktop["tuna"]), (200, 220))
+        self.assertAlmostEqual(desktop["ratio"], 1.1)
+        self.assertEqual((desktop["status"], desktop["reason"]), ("warn", "ratio 1.10 > budget 1.00"))
+        self.assertFalse(desktop["meets_target"])
+        self.assertEqual(desktop["ci90"], [0.9, 2.0])
+        self.assertFalse(desktop["decision_stable"])
+        # Session 410, 450 and 630 MiB against 500.
+        self.assertEqual((total["gnome"], total["tuna"]), (500, 450))
+        self.assertAlmostEqual(total["ratio"], 0.9)
+        self.assertEqual(total["status"], "unenforced")
+        self.assertTrue(total["meets_target"])
+        self.assertEqual({row["status"] for row in rows.values()}, {"warn", "unenforced"})
+        self.assertEqual(pb.failed(list(rows.values())), [])
+        self.assertEqual([row["metric"] for row in pb.unenforced(list(rows.values()))], sorted(pb.MEMORY_CRITERION))
+
+    def test_an_enforced_memory_budget_fails_over_its_ratio_and_when_a_pair_is_unmeasured(self):
+        rows = self.rows(memory_budgets(enforced=True))
+        self.assertEqual(rows["pss.idle.desktop.p50"]["status"], "fail")
+        self.assertEqual(rows["pss.idle.total.p50"]["status"], "pass")
+        # One Tuna session has an incomplete sample: its pair is unmeasured, not lighter.
+        rows = self.rows(memory_budgets(enforced=True), spoil=0)
+        self.assertEqual({row["status"] for row in rows.values()}, {"missing"})
+        self.assertEqual(rows["pss.whole.total.p50"]["reason"], "2 of 3 required pairs measured")
+        rows = self.rows(memory_budgets(enforced=False), spoil=0)
+        self.assertEqual({row["status"] for row in rows.values()}, {"warn"})
+        self.assertEqual(pb.failed(list(rows.values())), [])
+
+    def test_report_says_memory_is_not_enforced_and_attributes_it_by_role_and_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            memory_tree(root / "artifacts" / "stock")
+            config = memory_budgets(enforced=False)
+            config["metrics"]["cpu.idle.total.mean"] = budget(1.0)
+            path, out = root / "budgets.json", root / "gate.json"
+            path.write_text(json.dumps(config))
+            status, summary, errors = run_gate_output(["check", "--artifacts", str(root / "artifacts"),
+                                                       "--budgets", str(path), "--out", str(out)])
+            result = json.loads(out.read_text())
+        self.assertEqual(status, 0)     # the desktop is over the target, yet it cannot fail the gate
+        for line in ("pss.idle.desktop.p50: not enforced (ratio 1.10 > budget 1.00)",
+                     "pss.idle.total.p50: not enforced (within budget)",
+                     "memory: the v1 criterion (PSS ratio <= 1.00) is not enforced; "
+                     "this result neither passes nor fails it"):
+            self.assertIn(line, errors.splitlines())
+        for text in ("4 of 5 budgets are not enforced: `pss.idle.desktop.p50`, `pss.idle.total.p50`, "
+                     "`pss.whole.desktop.p50`, `pss.whole.total.p50`. They are reported, cannot fail this gate "
+                     "and are not passes.",
+                     "| `cpu.idle.total.mean` | pass |",
+                     "| `pss.idle.desktop.p50` | warn (ratio 1.10 > budget 1.00), not enforced, unstable | "
+                     "200.0 | 220.0 | 1.10 |",
+                     "| `pss.idle.total.p50` | not enforced (within budget), unstable | 500.0 | 450.0 | 0.90 |",
+                     "**The memory criterion is not enforced by this gate.** v1 requires memory no worse than "
+                     "GNOME 51: a Tuna / GNOME PSS ratio <= 1.00",
+                     "| `pss.whole.desktop.p50` | not enforced | 200.0 | 220.0 | 1.10 | not met |",
+                     "| `pss.whole.total.p50` | not enforced | 500.0 | 450.0 | 0.90 | met |",
+                     "| idle | p50 | GNOME 51 | 180.0 | 20.0 | 0.0 | 0.0 | 100.0 | 200.0 | 200.0 | 500.0 |",
+                     "| idle | p50 | Tuna Desktop | 160.0 | 60.0 | 0.0 | 0.0 | 30.0 | 200.0 | 220.0 | 450.0 |",
+                     "| idle | p50 | Tuna − GNOME | -20.0 | +40.0 | +0.0 | +0.0 | -70.0 | +0.0 | +20.0 | -50.0 |",
+                     "| whole | p95 | Tuna Desktop | 160.0 |",
+                     "| `gnome-shell` | compositor | 180.0 | 180.0 |",
+                     "| `tuna-compositor` | compositor | 160.0 | 160.0 |"):
+            self.assertIn(text, summary)
+        self.assertEqual(result["unenforced"], sorted(pb.MEMORY_CRITERION))
+        statuses = {row["metric"]: row["status"] for row in result["results"]}
+        self.assertEqual(statuses, {"cpu.idle.total.mean": "pass", "pss.idle.desktop.p50": "warn",
+                                    "pss.idle.total.p50": "unenforced", "pss.whole.desktop.p50": "warn",
+                                    "pss.whole.total.p50": "unenforced"})
+        memory = result["memory"]
+        self.assertFalse(memory["criterion"]["enforced"])
+        self.assertEqual(memory["criterion"]["metrics"]["pss.whole.desktop.p50"],
+                         {"enforcement": "not enforced", "gnome": 200, "tuna": 220,
+                          "ratio": memory["criterion"]["metrics"]["pss.whole.desktop.p50"]["ratio"],
+                          "meets_target": False})
+        self.assertEqual(memory["by_role_mib"]["tuna"]["settle"]["p50"],
+                         {"compositor": 160, "shell": 60, "xwayland": 0, "portals": 0, "services": 30, "apps": 200,
+                          "desktop": 220, "total": 450})
+        self.assertEqual(memory["by_process_mib"]["gnome"]["idle"][:2],
+                         [{"process": "nautilus", "role": "apps", "p50": 200, "p95": 200},
+                          {"process": "gnome-shell", "role": "compositor", "p50": 180, "p95": 180}])
+        self.assertEqual(memory["by_process_mib"]["tuna"]["whole"][1],
+                         {"process": "tuna-compositor", "role": "compositor", "p50": 160, "p95": 160})
+
+    def test_the_criterion_is_enforced_only_by_enforced_budgets_at_the_target(self):
+        def criterion(config):
+            rows = list(self.rows(config).values())
+            return pb.memory_criterion(rows), pb.markdown(rows, [], config)
+        result, summary = criterion(memory_budgets(enforced=True))
+        self.assertTrue(result["enforced"])
+        self.assertFalse(result["metrics"]["pss.idle.desktop.p50"]["meets_target"])
+        self.assertIn("**The memory criterion is enforced.**", summary)
+        self.assertNotIn("not enforced", summary)
+        # A budget looser than the target is a regression budget, not the criterion.
+        loose = memory_budgets(enforced=True)
+        loose["metrics"]["pss.whole.desktop.p50"]["max_ratio"] = 1.3
+        result, summary = criterion(loose)
+        self.assertFalse(result["enforced"])
+        self.assertEqual(result["metrics"]["pss.whole.desktop.p50"]["enforcement"],
+                         "enforced at 1.30, above the target")
+        self.assertIn("**The memory criterion is not enforced by this gate.**", summary)
+        # Without any memory budget the report still says so, and shows nothing as met.
+        result, summary = criterion(budgets(**{"cpu.idle.total.mean": budget(1.0)}))
+        self.assertFalse(result["enforced"])
+        self.assertEqual({value["enforcement"] for value in result["metrics"].values()}, {"no budget"})
+        self.assertIn("**The memory criterion is not enforced by this gate.**", summary)
+        self.assertIn("| `pss.whole.total.p50` | no budget | - | - | - | not measured |", summary)
+
+    def test_enforcing_a_provisional_budget_needs_a_newer_run_and_cannot_raise_its_ratio(self):
+        base = memory_budgets(enforced=False)
+
+        def check(**change):
+            head = copy.deepcopy(base)
+            head["metrics"]["pss.whole.total.p50"].update(change)
+            return pb.ratchet_violations(base, head, ROOT)
+        self.assertEqual(check(enforced=True, evidence=RUN.format(2)), [])
+        self.assertTrue(any("without new run evidence" in p for p in check(enforced=True)))
+        self.assertTrue(any("needs a new ADR" in p
+                            for p in check(enforced=True, max_ratio=1.3, evidence=RUN.format(2))))
+
+    def test_validate_knows_pss_metrics_by_scope_role_and_statistic(self):
+        known = ("pss.idle.desktop.p50", "pss.whole.total.p95", "pss.settle.apps.p50")
+        self.assertEqual(pb.validate(budgets(**{metric: budget(1.0, floor=0, enforced=False) for metric in known})),
+                         [])
+        unknown = ("pss.idle.total.mean", "pss.nap.total.p50", "pss.idle.gpu.p50", "rss.idle.total.p50")
+        self.assertEqual(pb.validate(budgets(**{metric: budget(1.0) for metric in unknown})),
+                         [f"{metric}: unknown metric" for metric in unknown])
 
 
 class Ratchet(unittest.TestCase):
