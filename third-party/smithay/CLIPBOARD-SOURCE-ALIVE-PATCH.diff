@@ -1,0 +1,18 @@
+diff --git a/src/wayland/selection/source.rs b/src/wayland/selection/source.rs
+index 345e1ff51..86aca60e0 100644
+--- a/src/wayland/selection/source.rs
++++ b/src/wayland/selection/source.rs
+@@ -28,6 +28,13 @@ impl SelectionSource {
+     }
+ }
+ 
++impl IsAlive for SelectionSource {
++    #[inline]
++    fn alive(&self) -> bool {
++        self.provider.alive()
++    }
++}
++
+ /// Provider of the selection data.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum SelectionSourceProvider {
