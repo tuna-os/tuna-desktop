@@ -5,8 +5,8 @@
 > as a GDM session or from a TTY, and as a nested window otherwise. A hardware
 > session needs a seat from logind or seatd. Hardware support is new: it is
 > proven on the kernel's virtual KMS device in CI (`scripts/tuna-drm-smoke`)
-> and not yet qualified on real GPUs; the cursor is drawn in software and
-> client cursor images are not composited yet.
+> and not yet qualified on real GPUs. The compositor draws the cursor,
+> including client cursor images, into each frame; no KMS cursor plane is used.
 
 ## Test-drive in a VM (one command)
 

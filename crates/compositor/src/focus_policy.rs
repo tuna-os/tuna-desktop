@@ -91,6 +91,11 @@ pub struct RawFocusSettings {
     pub resize_with_right_button: bool,
     /// `None` when `org.gnome.mutter` is not installed.
     pub focus_change_on_pointer_rest: Option<bool>,
+    /// `org.gnome.mutter check-alive-timeout` in milliseconds (0 disables
+    /// the alive check, see [`crate::unresponsive`]); `None` when the key
+    /// is not installed. Not a focus key: read here because Mutter's
+    /// `prefs.c` reads the whole schema together.
+    pub check_alive_timeout_ms: Option<u32>,
 }
 
 /// The effective focus policy. [`Default`] is GNOME 51's session default.
@@ -350,6 +355,7 @@ mod tests {
             mouse_button_modifier: "<Super>".into(),
             resize_with_right_button: false,
             focus_change_on_pointer_rest: Some(true),
+            check_alive_timeout_ms: Some(5000),
         }
     }
 
