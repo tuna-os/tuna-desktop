@@ -1023,6 +1023,14 @@ jobs:
           TUNA_REQUIRE_IBUS: "1"
           TUNA_REQUIRE_WAYLAND_INFO: "1"
           TUNA_REQUIRE_GSD_MEDIA_KEYS: "1"
+      # Closed windows must free their surfaces and textures (#1088): 100
+      # libadwaita windows leave the compositor within a fixed bound.
+      - name: Closed windows leave no memory behind
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: scripts/tuna-gtk-shell-proof --window-leak-only --artifacts gtk-shell-artifacts/window-leak
       # Initial DnD target focus must not wait for another physical motion.
       # Run the unchanged shared hover/reorder assertions independently of
       # unrelated full-suite assertions, using this job's just-built binaries.
