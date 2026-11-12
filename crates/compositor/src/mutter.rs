@@ -22,6 +22,10 @@ use zbus::object_server::{InterfaceRef, SignalEmitter};
 use zbus::zvariant::{DeserializeDict, OwnedObjectPath, OwnedValue, Type, Value};
 use zbus::{fdo, interface, ObjectServer};
 
+mod capture_eis;
+pub(crate) mod input_capture;
+#[cfg(test)]
+mod input_capture_bus_tests;
 #[cfg(test)]
 mod remote_bus_tests;
 pub mod remote_clipboard;
@@ -169,6 +173,12 @@ pub enum ToLoop {
     /// A RemoteDesktop session's clipboard request (mutter's
     /// MetaClipboardSession); the loop owns the seat's selection.
     RemoteClipboard(remote_clipboard::Request),
+    /// An InputCapture session's `Release` with `cursor_position`: warp
+    /// the pointer there (mutter's `clutter_seat_warp_pointer`).
+    InputCaptureWarp {
+        x: f64,
+        y: f64,
+    },
     StartCast {
         session_id: u64,
         stream_id: u64,
@@ -1514,7 +1524,7 @@ fn owners_alive(
 /// Serve DisplayConfig and ScreenCast on the session bus from a thread.
 /// Returns the channel the event loop reads cast requests from.
 #[allow(clippy::too_many_arguments)] // one share per service the thread serves
-pub fn start(
+pub(crate) fn start(
     outputs: Outputs,
     windows: Windows,
     authority: crate::capture_security::Authority,
@@ -1524,6 +1534,7 @@ pub fn start(
     power_save: std::sync::Arc<crate::power_save::PowerSaveShare>,
     display_state: Arc<crate::display_config::DisplayShare>,
     color: Arc<crate::color_manager::ColorShare>,
+    input_capture: input_capture::CaptureSessions,
 ) -> calloop::channel::Channel<ToLoop> {
     let (to_loop, from_dbus) = calloop::channel::channel();
     let _ = std::thread::Builder::new()
@@ -1562,6 +1573,14 @@ pub fn start(
                 to_loop: to_loop.clone(),
                 next_id,
             };
+            let input_capture_service = input_capture::InputCapture {
+                authority: authority.clone(),
+                sessions: input_capture.clone(),
+                outputs: outputs.clone(),
+                to_loop: to_loop.clone(),
+                signals: signals.clone(),
+                next_id: Arc::new(AtomicU64::new(1)),
+            };
             let service_channel = ServiceChannel {
                 display,
                 authority: authority.clone(),
@@ -1574,6 +1593,7 @@ pub fn start(
                 .and_then(|b| b.serve_at("/org/gnome/Mutter/ScreenCast", screencast))
                 .and_then(|b| b.serve_at("/org/gnome/Mutter/DisplayConfig", display_config))
                 .and_then(|b| b.serve_at("/org/gnome/Mutter/RemoteDesktop", remote_desktop))
+                .and_then(|b| b.serve_at("/org/gnome/Mutter/InputCapture", input_capture_service))
                 .and_then(|b| b.serve_at("/org/gnome/Mutter/ServiceChannel", service_channel))
                 .and_then(|b| b.serve_at("/org/gnome/SettingsDaemon/Color", night_light_color))
                 .and_then(|b| {
@@ -1607,6 +1627,7 @@ pub fn start(
                 "org.gnome.Mutter.DisplayConfig",
                 "org.gnome.Mutter.ScreenCast",
                 "org.gnome.Mutter.RemoteDesktop",
+                "org.gnome.Mutter.InputCapture",
                 "org.gnome.Mutter.ServiceChannel",
             ] {
                 match conn.request_name_with_flags(name, flags) {
@@ -1711,6 +1732,39 @@ pub fn start(
                     let _ = conn.object_server().remove::<Session, _>(&path);
                     if let Ok(mut sessions) = sessions.lock() {
                         sessions.retain(|(s, _)| s.id != session.id);
+                    }
+                }
+                // InputCapture sessions: revoked as the grants above (a
+                // session the loop closed on lock goes the same way),
+                // and told when the monitor layout changes (mutter's
+                // on_monitors_changed).
+                let captures: Vec<_> = input_capture
+                    .lock()
+                    .map(|s| s.values().cloned().collect())
+                    .unwrap_or_default();
+                let owners: Vec<String> = captures.iter().map(|s| s.owner.clone()).collect();
+                let alive = owners_alive(&authority, conn.inner(), &owners, OWNER_CHECK_TIMEOUT);
+                let zones = if captures.is_empty() {
+                    input_capture::Zones::default()
+                } else {
+                    outputs
+                        .lock()
+                        .map(|o| input_capture::Zones::from_outputs(&o))
+                        .unwrap_or_default()
+                };
+                for (session, alive) in captures.into_iter().zip(alive) {
+                    if alive && !session.is_closed() {
+                        session.sync_zones(zones.clone());
+                        continue;
+                    }
+                    session.close();
+                    let _ = conn
+                        .object_server()
+                        .remove::<input_capture::CaptureSession, _>(
+                            input_capture::session_path(session.id).as_str(),
+                        );
+                    if let Ok(mut sessions) = input_capture.lock() {
+                        sessions.remove(&session.id);
                     }
                 }
                 // Mutter inhibits orientation tracking while the display

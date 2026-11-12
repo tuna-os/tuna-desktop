@@ -135,6 +135,20 @@ pub enum Handled {
     },
     /// Mutter's seat touch-mode changed (the unlock dialog's hint).
     SeatTouchMode(bool),
+    /// A touchpad swipe holds (`settle_us: None`) or settles GNOME's
+    /// overview controls state: the app grid follows it.
+    OverviewSwipe {
+        /// `ControlsState` in `OVERVIEW_STATE_SCALE`ths.
+        state: u32,
+        /// The release's settle time, in microseconds.
+        settle_us: Option<u32>,
+    },
+    /// A window stopped answering pings: show (or move) gnome-shell's
+    /// close dialog over its frame (0.50).
+    ShowCloseDialog(CloseDialogRequest),
+    /// Hide this window's close dialog (it answered, went away or left
+    /// the screen, or the session locked).
+    HideCloseDialog(u64),
     /// The keyboard switched Sticky or Slow Keys: save and confirm.
     KeyboardAidToggled {
         aid: tuna_shell_control::KeyboardAid,
@@ -804,6 +818,21 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// Answer the close dialog over `window`: gnome-shell's Force Quit
+    /// (`ForceClose`) or Wait (0.50).
+    pub fn respond_close_dialog(
+        &mut self,
+        window: u64,
+        response: tuna_shell_control::CloseDialogResponse,
+    ) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::RespondCloseDialog { window, response },
+        })?;
+        Ok(id)
+    }
+
     /// Carry out one of GNOME's window-menu actions. Returns the request id.
     pub fn window_action(
         &mut self,
@@ -1215,6 +1244,27 @@ impl ControlClient {
             Message::PadOsdInput { pad, event } => Ok(Handled::PadOsdInput { pad, event }),
             Message::ClosePadOsd { pad } => Ok(Handled::ClosePadOsd { pad }),
             Message::SeatTouchMode { touch_mode } => Ok(Handled::SeatTouchMode(touch_mode)),
+            Message::OverviewSwipe { state, settle_us } => {
+                Ok(Handled::OverviewSwipe { state, settle_us })
+            }
+            Message::ShowCloseDialog {
+                window,
+                app_id,
+                connector,
+                x,
+                y,
+                width,
+                height,
+            } => Ok(Handled::ShowCloseDialog(CloseDialogRequest {
+                window,
+                app_id,
+                connector,
+                x,
+                y,
+                width,
+                height,
+            })),
+            Message::HideCloseDialog { window } => Ok(Handled::HideCloseDialog(window)),
             Message::KeyboardAidToggled { aid, enabled } => {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
@@ -1485,6 +1535,21 @@ pub struct WindowMenuRequest {
     pub workspace_right: bool,
 }
 
+/// Where to show gnome-shell's close dialog: over the frame of a window
+/// that stopped answering pings, in logical pixels local to the output
+/// `connector` (`None`: the primary output).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseDialogRequest {
+    pub window: u64,
+    /// The window's app id, which names the app in the title.
+    pub app_id: Option<String>,
+    pub connector: Option<String>,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
 /// Short label for unexpected-message diagnostics.
 fn message_label(msg: &Message) -> &'static str {
     match msg {
@@ -1520,6 +1585,9 @@ fn message_label(msg: &Message) -> &'static str {
         Message::PadOsdInput { .. } => "PadOsdInput",
         Message::ClosePadOsd { .. } => "ClosePadOsd",
         Message::SeatTouchMode { .. } => "SeatTouchMode",
+        Message::OverviewSwipe { .. } => "OverviewSwipe",
+        Message::ShowCloseDialog { .. } => "ShowCloseDialog",
+        Message::HideCloseDialog { .. } => "HideCloseDialog",
     }
 }
 
@@ -2033,6 +2101,26 @@ mod tests {
                 Message::SeatTouchMode { touch_mode: true },
                 Handled::SeatTouchMode(true),
             ),
+            (
+                Message::OverviewSwipe {
+                    state: 15_000,
+                    settle_us: None,
+                },
+                Handled::OverviewSwipe {
+                    state: 15_000,
+                    settle_us: None,
+                },
+            ),
+            (
+                Message::OverviewSwipe {
+                    state: 20_000,
+                    settle_us: Some(180_000),
+                },
+                Handled::OverviewSwipe {
+                    state: 20_000,
+                    settle_us: Some(180_000),
+                },
+            ),
         ];
         for (message, expected) in cases {
             server_write(&mut peer, &message);
@@ -2079,6 +2167,53 @@ mod tests {
                 kind: CommandKind::CloseMenuUnanimated,
             }
         );
+    }
+
+    #[test]
+    fn close_dialog_messages_decode_and_answers_reach_the_compositor() {
+        let (mut client, mut peer) = handshook();
+        server_write(
+            &mut peer,
+            &Message::ShowCloseDialog {
+                window: 4,
+                app_id: Some("org.gnome.TextEditor".into()),
+                connector: Some("DP-1".into()),
+                x: 10,
+                y: 42,
+                width: 800,
+                height: 600,
+            },
+        );
+        assert_eq!(
+            client.poll().expect("show"),
+            Handled::ShowCloseDialog(CloseDialogRequest {
+                window: 4,
+                app_id: Some("org.gnome.TextEditor".into()),
+                connector: Some("DP-1".into()),
+                x: 10,
+                y: 42,
+                width: 800,
+                height: 600,
+            })
+        );
+        server_write(&mut peer, &Message::HideCloseDialog { window: 4 });
+        assert_eq!(client.poll().expect("hide"), Handled::HideCloseDialog(4));
+        for response in [
+            tuna_shell_control::CloseDialogResponse::ForceClose,
+            tuna_shell_control::CloseDialogResponse::Wait,
+        ] {
+            let id = client.respond_close_dialog(4, response).expect("sent");
+            assert_eq!(
+                server_read(&mut peer),
+                Message::Command {
+                    id,
+                    kind: CommandKind::RespondCloseDialog {
+                        window: 4,
+                        response
+                    },
+                }
+            );
+        }
     }
 
     #[test]

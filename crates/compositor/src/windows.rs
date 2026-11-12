@@ -12,6 +12,7 @@
 //! and focused; titles are read from the surface role data; stacking is
 //! insertion order with focus raising to top. All code here is original.
 
+mod alive;
 mod tablet_input;
 
 use std::collections::{HashMap, HashSet};
@@ -532,6 +533,8 @@ pub struct WindowManager {
     /// Pending auto-raise `(window, due)`.
     auto_raise: Option<(u64, std::time::Instant)>,
     grab_raise: Option<GrabRaise>,
+    /// Mutter's alive checks and the close dialog (#1035).
+    alive: alive::AliveState,
 }
 
 impl WindowManager {
@@ -769,6 +772,7 @@ impl WindowManager {
             pointer_rest: None,
             auto_raise: None,
             grab_raise: None,
+            alive: alive::AliveState::new(state),
         }
     }
 
@@ -1581,6 +1585,9 @@ impl WindowManager {
         // hold focus past this tick while the overview is open.
         self.reconcile_overview_focus(state);
         self.reconcile_exclusive_layer(state);
+        // The shell's ext-foreign-toplevel-list follows the model as it
+        // stands after this tick's maps, title changes and unmaps (#1046).
+        state.sync_foreign_toplevels(self.model.revision(), self.model.windows());
         let _ = seen;
     }
 
@@ -2509,6 +2516,10 @@ impl WindowManager {
         // Alt+Tab) until the pointer moves.
         self.sticky_focus = (self.focus_policy.mode.follows_pointer() && id.is_some())
             .then_some(StickyFocus { distance: 0.0 });
+        // meta_window_activate_full ends with meta_window_check_alive.
+        if let Some(id) = id {
+            self.check_alive(id);
+        }
         true
     }
 
@@ -3629,6 +3640,10 @@ impl WindowManager {
             pointer.frame(state);
         }
         if let Some(under) = crossing {
+            // events.c: motion over a window checks it is alive.
+            if let Some(id) = under {
+                self.check_alive(id);
+            }
             self.pointer_crossing(state, under);
         }
     }
@@ -4018,6 +4033,9 @@ impl WindowManager {
             {
                 if let Some(id) = self.window_at(pos) {
                     if self.modal_target(id) != id {
+                        // meta_window_handle_ungrabbed_event: every press
+                        // focuses and checks the window is alive.
+                        self.check_alive(id);
                         self.apply_focus_raise(state, Some(id), self.focus_policy.raise_on_click);
                         self.swallowed_button = Some(button);
                         return;
@@ -4044,6 +4062,10 @@ impl WindowManager {
                     .window_at(pos)
                     .and_then(|id| Some((id, self.shifted(id, self.windows.get(&id)?.geometry))))
                 {
+                    // meta_window_handle_ungrabbed_event focuses the pressed
+                    // window and checks it is alive before its modifier
+                    // actions.
+                    self.check_alive(id);
                     let decision = self.focus_policy.press(
                         self.held_mods(),
                         button,
@@ -4936,8 +4958,9 @@ impl WindowManager {
 
     /// Ask a window's client to close (polite `close` request). The
     /// client unmaps itself; `reconcile` drops it on the next tick and
-    /// focus falls back. False for unknown ids.
-    pub fn close_window(&self, id: u64) -> bool {
+    /// focus falls back. False for unknown ids. Like `meta_window_delete`,
+    /// the request checks the window is alive.
+    pub fn close_window(&mut self, id: u64) -> bool {
         let Some(window) = self.windows.get(&id) else {
             return false;
         };
@@ -4954,11 +4977,12 @@ impl WindowManager {
             }
         }
         eprintln!("tuna-compositor: window {id} close requested");
+        self.check_alive(id);
         true
     }
 
     /// Close the focused window, if any.
-    pub fn close_focused(&self) -> bool {
+    pub fn close_focused(&mut self) -> bool {
         self.model.focused().is_some_and(|id| self.close_window(id))
     }
 
@@ -6729,58 +6753,25 @@ pub enum ManagerInput {
         /// Microseconds, the protocol's precision.
         utime: u64,
     },
-    /// Touchpad swipe gesture phases (#60). Three-finger swipes are
-    /// the shell's (overview, workspaces); others reach the client.
+    /// Touchpad swipe gesture phases (#60). Swipes of three or more
+    /// fingers are the shell's (overview, workspaces; see
+    /// [`crate::touchpad_swipe`]); others reach the client.
     SwipeBegin {
         fingers: u32,
         time: u32,
     },
     SwipeUpdate {
+        /// Accelerated, as clients receive it (pointer-gestures).
         delta: Point<f64, Logical>,
+        /// Unaccelerated, as GNOME's swipe trackers read it
+        /// (swipeTracker.js:142).
+        delta_unaccel: Point<f64, Logical>,
         time: u32,
     },
     SwipeEnd {
         cancelled: bool,
         time: u32,
     },
-}
-
-/// What a finished three-finger touchpad swipe does (GNOME 51).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SwipeAction {
-    /// Swipe up: open the overview.
-    OpenOverview,
-    /// Swipe down: close it.
-    CloseOverview,
-    /// Fingers move left: the next workspace slides in (content follows
-    /// the fingers, as on GNOME).
-    NextWorkspace,
-    /// Fingers move right: the previous workspace.
-    PreviousWorkspace,
-}
-
-/// Fingers GNOME reserves for its own swipes.
-pub const SHELL_SWIPE_FINGERS: u32 = 3;
-/// Distance a swipe must travel to act (logical pixels).
-pub const SWIPE_THRESHOLD: f64 = 100.0;
-
-/// Classify a finished swipe by its dominant axis; short swipes do
-/// nothing.
-pub fn swipe_action(dx: f64, dy: f64) -> Option<SwipeAction> {
-    if dx.abs().max(dy.abs()) < SWIPE_THRESHOLD {
-        return None;
-    }
-    Some(if dy.abs() >= dx.abs() {
-        if dy < 0.0 {
-            SwipeAction::OpenOverview
-        } else {
-            SwipeAction::CloseOverview
-        }
-    } else if dx < 0.0 {
-        SwipeAction::NextWorkspace
-    } else {
-        SwipeAction::PreviousWorkspace
-    })
 }
 
 /// X11 keycodes are kernel evdev numbers plus 8; the winit backend
@@ -7385,7 +7376,7 @@ impl WindowManager {
                     pointer.frame(state);
                 }
             }
-            ManagerInput::SwipeUpdate { delta, time } => {
+            ManagerInput::SwipeUpdate { delta, time, .. } => {
                 if let Some(pointer) = self.pointer.clone() {
                     pointer.gesture_swipe_update(
                         state,

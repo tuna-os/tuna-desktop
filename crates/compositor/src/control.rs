@@ -386,6 +386,8 @@ pub struct Session<'a> {
     pad_osd_closed: Vec<u32>,
     /// A `CloseMenuUnanimated` arrived, drained by the hub.
     close_menu_unanimated: bool,
+    /// Close-dialog answers `(window, response)`, drained by the hub.
+    close_dialog_responses: Vec<(u64, tuna_shell_control::CloseDialogResponse)>,
 }
 
 impl std::fmt::Debug for Session<'_> {
@@ -487,6 +489,7 @@ impl<'a> Session<'a> {
             pad_osd_requests: Vec::new(),
             pad_osd_closed: Vec::new(),
             close_menu_unanimated: false,
+            close_dialog_responses: Vec::new(),
         };
         let msg = match session.conn.read_frame() {
             Ok(msg) => msg,
@@ -612,12 +615,23 @@ impl<'a> Session<'a> {
     /// Ask the shell to draw GNOME's window menu.
     /// Peers older than 0.42 cannot decode `ConfirmDisplayChange`, nor
     /// older than 0.45 the tablet OSD messages, nor older than 0.48
-    /// `WorkspaceProgress`, and receive nothing.
+    /// `WorkspaceProgress`, nor older than 0.49 `OverviewSwipe`, nor older
+    /// than 0.50 the close-dialog messages, and receive nothing.
     pub fn send_window_menu(&mut self, menu: &Message) -> Result<(), ControlError> {
         if matches!(menu, Message::ConfirmDisplayChange { .. }) && self.peer_minor < 42 {
             return Ok(());
         }
         if matches!(menu, Message::WorkspaceProgress { .. }) && self.peer_minor < 48 {
+            return Ok(());
+        }
+        if matches!(menu, Message::OverviewSwipe { .. }) && self.peer_minor < 49 {
+            return Ok(());
+        }
+        if matches!(
+            menu,
+            Message::ShowCloseDialog { .. } | Message::HideCloseDialog { .. }
+        ) && self.peer_minor < 50
+        {
             return Ok(());
         }
         let tablet = matches!(
@@ -1150,6 +1164,38 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
+                kind: CommandKind::RespondCloseDialog { window, response },
+            } => {
+                if self.peer_minor < 50 {
+                    self.conn.write_frame(&Message::Error {
+                        kind: ErrorKind::UnknownCommand,
+                        message: "close dialog responses require negotiated minor 50".into(),
+                    })?;
+                    return Ok(Handled::ErrorSent {
+                        kind: ErrorKind::UnknownCommand,
+                    });
+                }
+                // The window manager carries it out (drained by the hub).
+                // No dialog shows over the lock screen, so none answers.
+                let status = if self.locked.get() {
+                    CommandStatus::Denied {
+                        reason: "session locked".into(),
+                    }
+                } else if model.windows().any(|w| w.id == window) {
+                    self.close_dialog_responses.push((window, response));
+                    CommandStatus::Applied
+                } else {
+                    CommandStatus::Denied {
+                        reason: "unknown window".into(),
+                    }
+                };
+                let applied = status == CommandStatus::Applied;
+                self.conn
+                    .write_frame(&Message::CommandResult { id, status })?;
+                Ok(Handled::CommandResult { id, applied })
+            }
+            Message::Command {
+                id,
                 kind: CommandKind::WindowAction { window, action },
             } => {
                 // The window manager carries it out (drained by the hub);
@@ -1295,6 +1341,9 @@ impl<'a> Session<'a> {
             | Message::PadOsdInput { .. }
             | Message::ClosePadOsd { .. }
             | Message::SeatTouchMode { .. }
+            | Message::OverviewSwipe { .. }
+            | Message::ShowCloseDialog { .. }
+            | Message::HideCloseDialog { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
                     kind: ErrorKind::UnknownCommand,
@@ -1355,6 +1404,9 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::PadOsdInput { .. } => "PadOsdInput",
         Message::ClosePadOsd { .. } => "ClosePadOsd",
         Message::SeatTouchMode { .. } => "SeatTouchMode",
+        Message::OverviewSwipe { .. } => "OverviewSwipe",
+        Message::ShowCloseDialog { .. } => "ShowCloseDialog",
+        Message::HideCloseDialog { .. } => "HideCloseDialog",
     }
 }
 
@@ -1532,6 +1584,7 @@ fn apply_command(
         | CommandKind::RequestPadOsd { .. }
         | CommandKind::PadOsdClosed { .. }
         | CommandKind::CloseMenuUnanimated
+        | CommandKind::RespondCloseDialog { .. }
         | CommandKind::SwitchInputSource { .. }
         | CommandKind::SetWindowIconGeometries { .. }
         | CommandKind::SetWellbeingEffects { .. }
@@ -1611,6 +1664,8 @@ pub struct PollOutcome {
     pub pad_osd_closed: Vec<u32>,
     /// The shell closed a panel menu unanimated (its button was hidden).
     pub close_menu_unanimated: bool,
+    /// Close-dialog answers `(window, response)`, in order (#1035).
+    pub close_dialog_responses: Vec<(u64, tuna_shell_control::CloseDialogResponse)>,
     /// Input-source switches to make (`true` backward), in order.
     pub input_source_switches: Vec<bool>,
     /// New switcher thumbnail frames, if the shell sent any.
@@ -1775,6 +1830,9 @@ pub struct ControlHub {
     accelerator_queue: Vec<(u32, u32, u32, bool)>,
     /// Window-menu requests waiting for the next poll.
     menu_queue: Vec<Message>,
+    /// The close dialogs shown now (their latest `ShowCloseDialog`), so a
+    /// shell (re)connecting mid-hang gets them with its snapshot.
+    close_dialogs: std::collections::BTreeMap<u64, Message>,
     /// What the on-screen keyboard follows, as last set by the runtime,
     /// and the value every live session holds (#349).
     osk: OskBroadcast,
@@ -1879,6 +1937,7 @@ impl ControlHub {
             switcher_thumbnails_owner: None,
             accelerator_queue: Vec::new(),
             menu_queue: Vec::new(),
+            close_dialogs: std::collections::BTreeMap::new(),
             osk: OskBroadcast::default(),
             // No focus and no auto-show is what a shell assumes before
             // any message: only a change is owed.
@@ -2302,6 +2361,15 @@ impl ControlHub {
     }
 
     pub fn queue_message(&mut self, message: Message) {
+        match &message {
+            Message::ShowCloseDialog { window, .. } => {
+                self.close_dialogs.insert(*window, message.clone());
+            }
+            Message::HideCloseDialog { window } => {
+                self.close_dialogs.remove(window);
+            }
+            _ => {}
+        }
         self.menu_queue.push(message);
     }
 
@@ -2428,6 +2496,9 @@ impl ControlHub {
                         .extend(std::mem::take(&mut session.pad_osd_closed));
                     outcome.close_menu_unanimated |=
                         std::mem::take(&mut session.close_menu_unanimated);
+                    outcome
+                        .close_dialog_responses
+                        .extend(std::mem::take(&mut session.close_dialog_responses));
                     outcome
                         .input_source_switches
                         .extend(std::mem::take(&mut session.input_source_switches));
@@ -2749,6 +2820,9 @@ impl ControlHub {
                     let _ = session.send_window_menu(&Message::PointerOutput {
                         name: self.pointer_output.clone(),
                     });
+                }
+                for shown in self.close_dialogs.values() {
+                    let _ = session.send_window_menu(shown);
                 }
                 session.connection_id = connection_id;
                 session.auth_owner = self.auth_owner;

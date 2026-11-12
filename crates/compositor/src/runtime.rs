@@ -65,6 +65,7 @@ mod aids;
 mod auth;
 mod color;
 mod display;
+mod input_capture;
 mod motion;
 mod osk;
 
@@ -742,14 +743,18 @@ pub struct Runtime {
     capture_authority: crate::capture_security::Authority,
     cast_grants: std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     remote_held: std::collections::HashMap<u64, RemoteHeld>,
+    /// org.gnome.Mutter.InputCapture's input diversion (#1040).
+    input_capture: crate::mutter::input_capture::Router,
     /// Keys the tablet action mappers' virtual keyboard holds (evdev).
     tablet_virtual_keys: std::collections::BTreeSet<u32>,
     /// The pad OSD labels the shell last received.
     pad_osd_labels_sent: Option<tuna_shell_control::PadOsdLabels>,
     /// Window list org.gnome.Shell.Introspect serves (window sharing).
     introspect: crate::introspect::Handle,
-    /// A three-finger swipe in progress: its travel so far (#60).
-    shell_swipe: Option<Point<f64, Logical>>,
+    /// The touchpad swipe the shell holds (#60, GNOME's
+    /// `TouchpadSwipeGesture`) and the tracker it drives.
+    shell_swipe: crate::touchpad_swipe::TouchpadSwipe,
+    swipe_target: SwipeTarget,
     /// The overview's animations (#499): the open/close transition,
     /// the swipe driving it, and the settled scene's own motion.
     overview_motion: crate::overview::OverviewMotion,
@@ -1007,13 +1012,17 @@ impl Runtime {
                             smithay::backend::input::InputEvent::TouchDown { .. }
                                 | smithay::backend::input::InputEvent::TouchMotion { .. }
                         );
-                        let inputs = match &mut rt.backend {
+                        let (inputs, from) = match &mut rt.backend {
                             Backend::Drm(drm) => {
                                 drm.set_hot_corner_active(corners_active);
-                                drm.translate(event, &corner_layout)
+                                let from = drm.pointer();
+                                (drm.translate(event, &corner_layout), from)
                             }
-                            Backend::Winit(_) => Vec::new(),
+                            Backend::Winit(_) => (Vec::new(), (0.0, 0.0).into()),
                         };
+                        // InputCapture (#1040) takes what an active
+                        // session captures before anything else sees it.
+                        let inputs = rt.route_input_capture(inputs, from);
                         for input in inputs {
                             let input = if touch { rt.unzoom_touch(input) } else { input };
                             if let ManagerInput::Button {
@@ -1164,7 +1173,9 @@ impl Runtime {
         event_loop
             .handle()
             .insert_source(socket, |stream, _, runtime: &mut Runtime| {
-                let client_data = ClientState::native_connection(&stream);
+                let mut client_data = ClientState::native_connection(&stream);
+                // Layer-shell is the supervised shell's alone (#1048).
+                client_data.admit_supervised_shell(&stream, runtime.shell.child_pid());
                 if let Ok(client) = runtime
                     .display
                     .handle()
@@ -1233,6 +1244,7 @@ impl Runtime {
         // org.gnome.Shell.Introspect: the portal's window picker.
         let capture_authority = crate::capture_security::Authority::default();
         let introspect = crate::introspect::start(state.desktop_size(), capture_authority.clone());
+        let input_capture = crate::mutter::input_capture::Router::default();
         event_loop
             .handle()
             .insert_source(
@@ -1246,6 +1258,7 @@ impl Runtime {
                     power_save_share.clone(),
                     display_share.clone(),
                     color_share.clone(),
+                    input_capture.sessions(),
                 ),
                 |event, _, rt: &mut Runtime| {
                     if let calloop::channel::Event::Msg(request) = event {
@@ -1443,7 +1456,8 @@ impl Runtime {
             blank_watched: false,
             shell_retry_ms: None,
             proof_polling: false,
-            shell_swipe: None,
+            shell_swipe: Default::default(),
+            swipe_target: SwipeTarget::None,
             overview_motion: Default::default(),
             overview_progress_at: Duration::ZERO,
             tile_animation: None,
@@ -1476,6 +1490,7 @@ impl Runtime {
             capture_authority,
             cast_grants: Default::default(),
             remote_held: Default::default(),
+            input_capture,
             tablet_virtual_keys: Default::default(),
             pad_osd_labels_sent: None,
             introspect,
@@ -1745,18 +1760,15 @@ impl Runtime {
         for id in remote_ids {
             self.stop_remote_input(id);
         }
+        // Input capture never survives the lock (#1040).
+        self.input_capture.revoke_all();
         self.capture_authority.publish(true, self.shell.child_pid());
         self.state.set_shortcut_inhibition_locked(true);
         // A three-finger swipe under way is the unlocked session's: end
         // it cancelled, so its overview or workspace slide never resumes
         // (GNOME's trackers interrupt outside their allowed action modes,
         // swipeTracker.js `_updateTouchpadGesture`/`_endTouchpadGesture`).
-        if self.shell_swipe.is_some() {
-            self.shell_swipe_input(&ManagerInput::SwipeEnd {
-                cancelled: true,
-                time: crate::state::system_millis() as u32,
-            });
-        }
+        self.interrupt_shell_swipe(crate::state::system_millis() as u32);
         self.control.set_overview(false);
         // The shield covers GNOME's switcher popup and its window clones;
         // no window image may draw over the lock.
@@ -2082,6 +2094,7 @@ impl Runtime {
                 self.lock.note_input(input_time(&input));
                 self.idle_since = Instant::now();
                 self.idle_monitor.activity();
+                self.state.protocols.idle_notifier.activity(Instant::now());
                 self.active_at = Instant::now();
                 return;
             }
@@ -2104,6 +2117,7 @@ impl Runtime {
         self.lock.note_input(input_time(&input));
         self.idle_since = Instant::now();
         self.idle_monitor.activity();
+        self.state.protocols.idle_notifier.activity(Instant::now());
         self.active_at = Instant::now();
         if self.is_locked() {
             self.cursor.locate.reset_keys();
@@ -2144,6 +2158,10 @@ impl Runtime {
                 .feed_matched(&input, matches_key, self.manager.pointer_pos(), now);
         }
         if self.is_locked() {
+            // Locking ends the session's action mode mid-swipe: GNOME's
+            // trackers interrupt back to where they began
+            // (swipeTracker.js:487-491, 587-591).
+            self.interrupt_shell_swipe(input_time(&input) as u32);
             // The lock takes the keyboard: a held Escape's release
             // never comes back to the drag cancel below.
             self.dnd_escape_held = false;
@@ -2198,8 +2216,8 @@ impl Runtime {
                 return;
             }
         }
-        // Three-finger swipes are the shell's (GNOME 51): consumed here,
-        // acted on at the end. Other swipes reach the client.
+        // Swipes of three or more fingers are the shell's (GNOME 51):
+        // consumed here. Other swipes reach the client.
         if self.shell_swipe_input(&input) {
             self.publish_workspace_progress();
             return;
@@ -2436,6 +2454,35 @@ impl Runtime {
         self.loop_handle.clone()
     }
 
+    /// Put the listener of every security context committed since the
+    /// last call on the loop (wp_security_context_v1, #1046): a client
+    /// it accepts joins the display inside that context, so no
+    /// privileged global admits it. The listener goes once its creator
+    /// closes the context's close fd.
+    fn admit_security_contexts(&mut self) {
+        for (source, context) in self.state.take_security_contexts() {
+            let inserted =
+                self.loop_handle
+                    .insert_source(source, move |stream, _, runtime: &mut Runtime| {
+                        let data = ClientState::security_context(&stream, context.clone());
+                        if runtime
+                            .display
+                            .handle()
+                            .insert_client(stream, Arc::new(data))
+                            .is_ok()
+                        {
+                            runtime.stats.clients += 1;
+                        }
+                    });
+            if let Err(error) = inserted {
+                eprintln!(
+                    "tuna-compositor: security context listener not added: {}",
+                    error.error
+                );
+            }
+        }
+    }
+
     /// Mutable protocol state, for the X11 handler impls.
     pub fn state_mut(&mut self) -> &mut State {
         &mut self.state
@@ -2640,6 +2687,8 @@ impl Runtime {
                 "workspace": at, "rect": [r.loc.x, r.loc.y, r.size.w, r.size.h],
             })),
             "overview_progress": progress,
+            // GNOME's controls state: 0 desktop, 1 window picker, 2 app grid.
+            "overview_state": self.overview_motion.controls_state(self.overview_app_grid),
             "workspace_cards": workspace_cards,
 
             // The Alt+Tab switcher's window thumbnails being drawn.
@@ -2795,6 +2844,7 @@ impl Runtime {
         let manual = self.animation_clock.is_manual();
         doc["animation_clock_manual"] = serde_json::json!(manual);
         doc["proof_swipe_sequence"] = serde_json::json!(self.proof_swipe_sequence);
+        doc["touchpad_swipe"] = self.shell_swipe.snapshot();
         doc["animation_clock_ms"] =
             serde_json::json!(manual.then(|| self.animation_clock.now().as_millis() as u64));
         doc["overview_motion"] = self.overview_motion.diagnostics();
@@ -2882,23 +2932,32 @@ impl Runtime {
     }
 
     /// The overview at rest on the primary output (#54): the window
-    /// picker or the app grid, before any animation.
+    /// picker or the app grid, before any animation, or between them and
+    /// between workspaces where a swipe draws it.
     fn overview_base(&self) -> crate::overview::OverviewLayout {
         let size = self.state.primary_size();
         let output = Rectangle::new((0, 0).into(), size);
         let model = self.manager.model();
-        let layout = if self.overview_app_grid {
-            crate::overview::app_grid_layout_with_policy
-        } else {
-            crate::overview::layout_with_policy
-        };
-        layout(
-            output,
-            crate::windows::WORK_AREA_TOP,
-            model.workspaces(),
+        let windows = self.manager.overview_windows();
+        let dynamic = model.fixed_workspace_count().is_none();
+        self.overview_motion.resting(
             model.active_workspace(),
-            &self.manager.overview_windows(),
-            model.fixed_workspace_count().is_none(),
+            self.overview_app_grid,
+            |workspace, app_grid| {
+                let layout = if app_grid {
+                    crate::overview::app_grid_layout_with_policy
+                } else {
+                    crate::overview::layout_with_policy
+                };
+                layout(
+                    output,
+                    crate::windows::WORK_AREA_TOP,
+                    model.workspaces(),
+                    workspace,
+                    &windows,
+                    dynamic,
+                )
+            },
         )
     }
 
@@ -3008,7 +3067,7 @@ impl Runtime {
     /// three-finger swipe is held, as GNOME's `_shouldAnimate`.
     fn step_size_changes(&mut self) {
         let policy = crate::size_change::Policy::from_motion(self.input_settings.motion);
-        let allowed = !self.control.overview_open() && self.shell_swipe.is_none();
+        let allowed = !self.control.overview_open() && !self.shell_swipe.active();
         let now = self.animation_clock.now();
         let renderer = match &mut self.backend {
             Backend::Winit(backend) => backend.renderer(),
@@ -3171,14 +3230,18 @@ impl Runtime {
                 fingers: value["fingers"].as_u64().map_or(3, |f| f as u32),
                 time,
             },
-            Some("update") => ManagerInput::SwipeUpdate {
-                delta: (
+            Some("update") => {
+                let delta: Point<f64, Logical> = (
                     value["dx"].as_f64().unwrap_or(0.0),
                     value["dy"].as_f64().unwrap_or(0.0),
                 )
-                    .into(),
-                time,
-            },
+                    .into();
+                ManagerInput::SwipeUpdate {
+                    delta,
+                    delta_unaccel: delta,
+                    time,
+                }
+            }
             Some("end") => ManagerInput::SwipeEnd {
                 cancelled: value["cancelled"].as_bool().unwrap_or(false),
                 time,
@@ -3199,108 +3262,247 @@ impl Runtime {
         self.on_manager_input(input);
     }
 
-    /// Track a three-finger swipe; returns whether `input` was one of
-    /// its phases (and so consumed).
+    /// Track a touchpad swipe as GNOME's swipe trackers do; returns
+    /// whether `input` was one of the shell's swipe phases (and so
+    /// consumed).
     fn shell_swipe_input(&mut self, input: &ManagerInput) -> bool {
+        use crate::touchpad_swipe::Step;
         match *input {
             ManagerInput::SwipeBegin { fingers, .. } => {
-                if fingers == crate::windows::SHELL_SWIPE_FINGERS {
-                    self.shell_swipe = Some(Point::from((0.0, 0.0)));
-                    return true;
-                }
-                false
+                // A begin replaces whatever an unfinished swipe left.
+                self.swipe_target = SwipeTarget::None;
+                self.shell_swipe.begin(fingers)
             }
-            ManagerInput::SwipeUpdate { delta, time } => match self.shell_swipe.as_mut() {
-                Some(travel) => {
-                    *travel += delta;
-                    let travel = *travel;
-                    // On the desktop a horizontal swipe drags the
-                    // workspace strip with the fingers (GNOME).
-                    let desktop =
-                        !self.control.overview_open() && self.overview_motion.progress() == 0.0;
-                    if self.manager.workspace_slide().following() {
-                        self.manager
-                            .workspace_slide_mut()
-                            .update_swipe(delta.x, time);
-                    } else if desktop
-                        && !self.overview_motion.swiping()
-                        && travel.x.abs() > travel.y.abs()
-                    {
-                        let policy = self.input_settings.motion;
-                        let now = self.animation_clock.now();
-                        let width = self.state.primary_size().w;
-                        let model = self.manager.model();
-                        let active = model.active_workspace();
-                        let workspaces = model.workspaces().to_vec();
-                        let slide = self.manager.workspace_slide_mut();
-                        slide.begin_swipe(active, &workspaces, width, policy, time, now);
-                        slide.update_swipe(travel.x, time);
+            ManagerInput::SwipeUpdate {
+                delta_unaccel,
+                time,
+                ..
+            } => {
+                let natural = self.input_settings.touchpad_natural_scroll;
+                let rtl = self.input_settings.right_to_left;
+                match self
+                    .shell_swipe
+                    .update(delta_unaccel.x, delta_unaccel.y, natural, rtl)
+                {
+                    None => false,
+                    Some(Step::Pending) => true,
+                    Some(Step::Update {
+                        orientation,
+                        delta,
+                        begin,
+                    }) => {
+                        if begin {
+                            self.begin_swipe_target(orientation, time);
+                        }
+                        self.update_swipe_target(delta, time);
+                        true
                     }
-                    // GNOME's overview follows the fingers: a vertical
-                    // swipe moves the transition (up opens) as it goes.
-                    if travel.y.abs() > travel.x.abs()
-                        && !self.manager.workspace_slide().following()
-                    {
-                        self.overview_motion.swipe_update(
-                            time,
-                            -travel.y,
-                            OVERVIEW_SWIPE_DISTANCE,
-                            self.input_settings.motion,
-                        );
-                    }
-                    true
                 }
-                None => false,
-            },
-            ManagerInput::SwipeEnd { cancelled, time } => {
-                let Some(travel) = self.shell_swipe.take() else {
+            }
+            ManagerInput::SwipeEnd { time, .. } => {
+                if self.shell_swipe.end().is_none() {
                     return false;
-                };
-                if self.manager.workspace_slide().following() {
-                    // Released: the slide finishes on the fingers'
-                    // velocity; the model switches now so focus and
-                    // input never wait for it.
-                    let now = self.animation_clock.now();
-                    let target = self
-                        .manager
-                        .workspace_slide_mut()
-                        .end_swipe(cancelled, time, now);
-                    if let Some(target) = target {
-                        if target != self.manager.model().active_workspace() {
-                            self.manager.switch_to_workspace(&mut self.state, target);
-                        }
-                    }
-                    return true;
                 }
-                // Released: finish where GNOME's swipe tracker would,
-                // keeping the fingers' momentum (back where it began
-                // when cancelled).
-                if let Some(open) = self.overview_motion.swipe_end(
-                    time,
-                    cancelled,
-                    OVERVIEW_SWIPE_DISTANCE,
-                    self.input_settings.motion,
-                ) {
-                    self.control.set_overview(open);
-                    return true;
-                }
-                if !cancelled {
-                    use crate::windows::SwipeAction;
-                    match crate::windows::swipe_action(travel.x, travel.y) {
-                        Some(SwipeAction::OpenOverview) => self.control.set_overview(true),
-                        Some(SwipeAction::CloseOverview) => self.control.set_overview(false),
-                        Some(SwipeAction::NextWorkspace) => {
-                            self.manager.switch_relative(&mut self.state, 1);
-                        }
-                        Some(SwipeAction::PreviousWorkspace) => {
-                            self.manager.switch_relative(&mut self.state, -1);
-                        }
-                        None => {}
-                    }
-                }
+                // A libinput cancel lands as a release does
+                // (swipeTracker.js:194-198).
+                self.end_swipe_target(time, false);
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Lose a held swipe without its release (the session locked).
+    fn interrupt_shell_swipe(&mut self, time: u32) {
+        if self.shell_swipe.end().is_some() {
+            self.end_swipe_target(time, true);
+        }
+    }
+
+    /// The swipe committed to `orientation`: start the tracker GNOME
+    /// has on that axis now. Vertical is always the overview's
+    /// (overview.js:226-233, normal and overview modes), across the
+    /// desktop, the window picker and the app grid
+    /// (overviewControls.js:757-775). Horizontal is the desktop's
+    /// workspace strip, or the overview's workspaces while it is open or
+    /// opening (workspaceAnimation.js:363-372); with workspaces only on
+    /// the primary monitor, a horizontal swipe over another monitor moves
+    /// nothing (workspaceAnimation.js:509-512, workspacesView.js:961-962).
+    fn begin_swipe_target(&mut self, orientation: crate::touchpad_swipe::Orientation, time: u32) {
+        use crate::touchpad_swipe::Orientation;
+        self.swipe_target = match orientation {
+            Orientation::Vertical => {
+                let app_grid = self.control.overview_open() && self.overview_app_grid;
+                self.overview_motion.swipe_begin(time, app_grid);
+                SwipeTarget::Overview { travel: 0.0 }
+            }
+            Orientation::Horizontal if self.swipe_over_secondary() => SwipeTarget::None,
+            Orientation::Horizontal if self.control.overview_open() => {
+                // The overview's strip: GNOME's dynamic workspaces end
+                // with an empty one, which a swipe can reach.
+                let model = self.manager.model();
+                let workspaces = if model.fixed_workspace_count().is_none() {
+                    crate::overview::shown_workspaces(
+                        model.workspaces(),
+                        &self.manager.overview_windows(),
+                    )
+                } else {
+                    model.workspaces().to_vec()
+                };
+                let active = model.active_workspace();
+                self.overview_motion.scroll_begin(time, workspaces, active);
+                SwipeTarget::OverviewWorkspaces
+            }
+            Orientation::Horizontal => {
+                self.workspace_swipe_begin(time);
+                SwipeTarget::Workspaces
+            }
+        };
+    }
+
+    /// The tracker moves by `delta` touchpad units (GNOME's sign).
+    fn update_swipe_target(&mut self, delta: f64, time: u32) {
+        match &mut self.swipe_target {
+            SwipeTarget::None => {}
+            SwipeTarget::Overview { travel } => {
+                *travel += delta;
+                let travel = *travel;
+                self.overview_motion.swipe_update(
+                    time,
+                    travel,
+                    crate::touchpad_swipe::TOUCHPAD_BASE_HEIGHT,
+                );
+                let state = self.overview_motion.controls_state(self.overview_app_grid);
+                self.publish_overview_swipe(state, None);
+            }
+            SwipeTarget::Workspaces => self.workspace_swipe_update(-delta, time),
+            SwipeTarget::OverviewWorkspaces => self.overview_motion.scroll_update(time, delta),
+        }
+    }
+
+    /// The fingers lifted (`interrupted`: the swipe was lost): finish
+    /// where GNOME's tracker lands, keeping the fingers' momentum.
+    fn end_swipe_target(&mut self, time: u32, interrupted: bool) {
+        match std::mem::replace(&mut self.swipe_target, SwipeTarget::None) {
+            SwipeTarget::None => {}
+            SwipeTarget::Overview { .. } => {
+                if let Some((state, duration_ms)) = self.overview_motion.swipe_end(
+                    time,
+                    interrupted,
+                    crate::touchpad_swipe::TOUCHPAD_BASE_HEIGHT,
+                    self.input_settings.motion,
+                ) {
+                    // `gestureEnd` checks Show Apps for the app grid
+                    // (overviewControls.js:781-786); the shell follows.
+                    self.overview_app_grid = state >= crate::overview::CONTROLS_APP_GRID;
+                    self.control
+                        .set_overview(state >= crate::overview::CONTROLS_WINDOW_PICKER);
+                    self.publish_overview_swipe(state, Some(duration_ms));
+                }
+            }
+            SwipeTarget::Workspaces => self.workspace_swipe_end(time, interrupted),
+            SwipeTarget::OverviewWorkspaces => {
+                let motion = self.input_settings.motion;
+                let Some(target) = self.overview_motion.scroll_end(time, interrupted, motion)
+                else {
+                    return;
+                };
+                // The model switches now so focus never waits for the
+                // ease; the drawn strip keeps easing. A step past the last
+                // workspace creates GNOME's trailing empty one.
+                let model = self.manager.model();
+                let active = model.active_workspace();
+                let strip = self
+                    .overview_motion
+                    .workspace_scroll()
+                    .map(|(strip, _)| strip.to_vec())
+                    .unwrap_or_default();
+                let index = |workspace| strip.iter().position(|w| *w == workspace);
+                if let (Some(from), Some(to)) = (index(active), index(target)) {
+                    if from != to {
+                        self.manager
+                            .switch_relative(&mut self.state, to as i32 - from as i32);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tell the shell where a swipe holds GNOME's overview controls state
+    /// (`settle_ms: None`) or settles it, so its app grid follows.
+    fn publish_overview_swipe(&mut self, state: f64, settle_ms: Option<f64>) {
+        let scale = f64::from(tuna_shell_control::OVERVIEW_STATE_SCALE);
+        self.control
+            .queue_message(tuna_shell_control::Message::OverviewSwipe {
+                state: (state.clamp(0.0, crate::overview::CONTROLS_APP_GRID) * scale).round()
+                    as u32,
+                settle_us: settle_ms.map(|ms| {
+                    (ms.max(0.0) * 1000.0)
+                        .round()
+                        .min(f64::from(tuna_shell_control::MAX_OVERVIEW_SETTLE_US))
+                        as u32
+                }),
+            });
+    }
+
+    /// Whether the pointer, where a swipe acts, is over a monitor other
+    /// than the primary while workspaces are only on the primary.
+    fn swipe_over_secondary(&self) -> bool {
+        if !self.input_settings.workspace_policy.only_on_primary {
+            return false;
+        }
+        let outputs: Vec<_> = self
+            .state
+            .hot_corner_outputs()
+            .into_iter()
+            .map(|(rect, primary)| crate::workspace_policy::OutputBounds {
+                x: rect.loc.x,
+                y: rect.loc.y,
+                width: rect.size.w,
+                height: rect.size.h,
+                primary,
+            })
+            .collect();
+        let pointer = self.manager.pointer_pos();
+        crate::workspace_policy::on_secondary(
+            (pointer.x.floor() as i32, pointer.y.floor() as i32, 1, 1),
+            &outputs,
+        )
+    }
+
+    /// A horizontal swipe on the desktop holds the workspace strip
+    /// where it is drawn.
+    fn workspace_swipe_begin(&mut self, time: u32) {
+        let policy = self.input_settings.motion;
+        let now = self.animation_clock.now();
+        let width = self.state.primary_size().w;
+        let model = self.manager.model();
+        let active = model.active_workspace();
+        let workspaces = model.workspaces().to_vec();
+        let slide = self.manager.workspace_slide_mut();
+        slide.begin_swipe(active, &workspaces, width, policy, time, now);
+    }
+
+    /// The strip follows the fingers' `dx` (negative towards the next
+    /// workspace, natural scrolling applied).
+    fn workspace_swipe_update(&mut self, dx: f64, time: u32) {
+        self.manager.workspace_slide_mut().update_swipe(dx, time);
+    }
+
+    /// Released: the slide finishes on the fingers' velocity; the model
+    /// switches now so focus and input never wait for it.
+    fn workspace_swipe_end(&mut self, time: u32, cancelled: bool) {
+        let now = self.animation_clock.now();
+        let target = self
+            .manager
+            .workspace_slide_mut()
+            .end_swipe(cancelled, time, now);
+        if let Some(target) = target {
+            // The strip's snap points include GNOME's trailing empty
+            // workspace, so the target always exists (#596).
+            if target != self.manager.model().active_workspace() {
+                self.manager.switch_to_workspace(&mut self.state, target);
+            }
         }
     }
 
@@ -4219,6 +4421,7 @@ impl Runtime {
                 self.remote_input(session_id, grant, input);
             }
             crate::mutter::ToLoop::RemoteStop { session_id } => self.stop_remote_input(session_id),
+            crate::mutter::ToLoop::InputCaptureWarp { x, y } => self.input_capture_warp(x, y),
             crate::mutter::ToLoop::RemoteClipboard(request) => {
                 let locked = self.is_locked();
                 self.state.remote_clipboard_request(request, locked);
@@ -4672,7 +4875,7 @@ impl Runtime {
                     < 0.2 * self.input_settings.motion.slowdown()
             })
             || self.state.protocols.bell.visual(now).is_some()
-            || self.shell_swipe.is_some()
+            || self.shell_swipe.active()
             || self.overlay.visible
             || !self.casts.is_empty()
             // A running PAM worker publishes its terminal phase before
@@ -4708,6 +4911,7 @@ impl Runtime {
         }
         for deadline in [
             self.idle_monitor.next_deadline(),
+            self.state.protocols.idle_notifier.next_deadline(),
             self.orca.next_deadline(),
             self.manager.workspace_lease_deadline(),
             self.wallpaper.maintenance_deadline(),
@@ -4721,6 +4925,8 @@ impl Runtime {
             // Tablet and stylus settings: the bounded re-read.
             self.tablet_settings.next_deadline(now),
             self.manager.focus_deadline(),
+            // Mutter's alive checks: a ping timing out, Wait, re-pings.
+            self.manager.alive_deadline(),
             // Window sessions are written 3 s after a change (Mutter).
             self.state.window_sessions().save_deadline(),
             // The lock conversation's shared idle/total deadline.
@@ -4789,12 +4995,17 @@ impl Runtime {
         self.display
             .dispatch_clients(&mut self.state)
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        // Smithay has stored this dispatch's selections: copy a new one,
+        // or take over from an owner that went away (MetaClipboardManager).
+        self.state.retain_clipboard();
+        self.admit_security_contexts();
         self.display
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         self.manager.reconcile(&mut self.state);
         self.state.window_sessions_mut().save_if_due(Instant::now());
         self.focus_policy_tick();
+        self.alive_checks_tick();
         self.tablet_settings_tick();
         self.poll_input_aids();
         #[cfg(feature = "xwayland")]
@@ -4887,6 +5098,11 @@ impl Runtime {
         if outcome.close_menu_unanimated {
             self.menu_close.close_unanimated(std::time::Instant::now());
         }
+        // gnome-shell's close dialog answers (#1035): Wait or Force Quit.
+        for (window, response) in outcome.close_dialog_responses {
+            self.manager.close_dialog_response(window, response);
+        }
+        self.queue_close_dialogs();
         if let Some(request) = self.state.take_shortcut_consent_update() {
             self.control
                 .queue_message(tuna_shell_control::Message::ShortcutConsent { request });
@@ -5095,6 +5311,12 @@ impl Runtime {
             self.idle_since = Instant::now();
         }
         self.idle_inhibited = inhibited;
+        // ext-idle-notify honours the same inhibitors for its ordinary
+        // notifications; input-only ones ignore them.
+        self.state
+            .protocols
+            .idle_notifier
+            .tick(Instant::now(), inhibited);
         if !self.is_locked() && self.lock.check_timeout(self.lock_now_ms()) {
             // Administrative lockdown (#357): a disabled lock screen
             // never engages on idle; restart the stretch instead so no
@@ -5350,6 +5572,7 @@ impl Runtime {
             self.lock.note_input(u64::from(time));
             self.idle_since = Instant::now();
             self.idle_monitor.activity();
+            self.state.protocols.idle_notifier.activity(Instant::now());
             self.active_at = Instant::now();
         }
         let event = match event {
@@ -5597,10 +5820,31 @@ impl Runtime {
             let mut policy = self.manager.focus_policy();
             policy.apply(&raw);
             self.manager.set_focus_policy(policy);
+            if let Some(ms) = raw.check_alive_timeout_ms {
+                self.manager.set_check_alive_timeout(ms);
+            }
         }
         if !self.is_locked() {
             self.manager.repick_pointer_window(&mut self.state);
             self.manager.run_focus_timers(&mut self.state, now);
+        }
+    }
+
+    /// Mutter's alive checks (#1035): pongs, ping timeouts and the close
+    /// dialog's timers; nothing pings or shows while locked, and the
+    /// supervised shell is never pinged.
+    fn alive_checks_tick(&mut self) {
+        let locked = self.is_locked();
+        self.manager.set_shell_pid(self.shell.child_pid());
+        self.manager
+            .run_alive_checks(&mut self.state, Instant::now(), locked);
+        self.queue_close_dialogs();
+    }
+
+    /// Hand the manager's close-dialog messages to the shell.
+    fn queue_close_dialogs(&mut self) {
+        for message in self.manager.take_close_dialogs() {
+            self.control.queue_message(message);
         }
     }
 
@@ -5676,7 +5920,7 @@ impl Runtime {
         let flashes = self.screenshot_flashes.samples(now);
         let allowed = crate::window_lifecycle::effects_allowed(
             self.control.overview_open(),
-            self.shell_swipe.is_some(),
+            self.shell_swipe.active(),
             self.manager.workspace_slide().running(),
             locked,
         );
@@ -6612,11 +6856,22 @@ impl Runtime {
     }
 }
 
-/// Overview backdrop (GNOME 51's `#overviewGroup`, #222226).
-/// Vertical finger travel for a whole overview transition (logical
-/// touchpad units, as libinput reports swipe deltas).
-const OVERVIEW_SWIPE_DISTANCE: f64 = 300.0;
+/// The tracker a committed touchpad swipe drives.
+#[derive(Debug)]
+enum SwipeTarget {
+    /// Nothing moves (no swipe, or one GNOME's trackers ignore).
+    None,
+    /// The overview's controls state (desktop, window picker, app grid),
+    /// `travel` touchpad units toward the app grid.
+    Overview { travel: f64 },
+    /// The desktop's workspace strip ([`crate::workspace_slide`]).
+    Workspaces,
+    /// The open overview's workspaces (`WorkspacesView`), scrolled by
+    /// [`crate::overview::OverviewMotion`].
+    OverviewWorkspaces,
+}
 
+/// Overview backdrop (GNOME 51's `#overviewGroup`, #222226).
 const OVERVIEW_BACKGROUND: Color32F = Color32F::new(34.0 / 255.0, 34.0 / 255.0, 38.0 / 255.0, 1.0);
 
 /// The overview's solid fills (the workspace thumbnails strip) in
