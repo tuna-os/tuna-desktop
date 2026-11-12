@@ -8,6 +8,8 @@
 #   G-A11Y-MENU-RESTART and G-SHELL-STABLE only.
 #   --notify-lock-only runs panel readiness and the lock-screen notification
 #   and notification sound gates only (needs pam_wrapper).
+#   --tray-only runs panel readiness and the AppIndicator pointer, library,
+#   keyboard and X11 tray gates only.
 #   --grid-hover-only runs panel readiness, G-GRID-HOVER, G-GRID-REORDER,
 #   and G-SHELL-STABLE only.
 #   --keyboard-routes-only runs panel readiness and the P-A11Y-02 keyboard
@@ -253,6 +255,30 @@
 #                  manager, which asks the logind stub itself (Reboot,
 #                  PowerOff) or, for Log Out (last), ends the compositor
 #                  through its orderly shutdown (#589)
+#   G-END-SESSION-USERS Restart… and Power Off… list the other users'
+#                  logind sessions under "Other users are logged in" as
+#                  GNOME 51 titles them (graphical by user name, console
+#                  and remote by real name), leaving out the greeter's,
+#                  the closing one and this one; Log Out… lists none
+#   G-END-SESSION-REALNAME Log Out… names the user by their
+#                  AccountsService real name ("Log Out Proof Person");
+#                  without AccountsService the plain strings stay
+#   G-END-SESSION-BATTERY with gnome-software's offline update prepared
+#                  and UPower's display device discharging below 30 %,
+#                  "Install pending software updates" starts unchecked
+#                  and checking it shows the low-battery warning; a
+#                  scheduled update turns Restart… into "Restart &
+#                  Install Updates" with the warning, which hides live
+#                  once charging; without updates no warning shows;
+#                  cancelling leaves gnome-software untouched
+#   G-END-SESSION-ASYNC delayed gnome-software replies cannot reopen a
+#                  closed dialog, replace a newer Open, or confirm a
+#                  newer request with an older confirmation
+#   G-END-SESSION-BOOT-OPTIONS where logind can reboot into the boot
+#                  loader menu, holding Alt swaps Restart for Boot Options
+#                  (not on Power Off…); releasing it swaps back; Boot
+#                  Options has the shell set logind's 60 s boot loader
+#                  menu before the manager's Reboot(true)
 #   G-LOCKDOWN-LOG-OUT disable-log-out flipped live removes Log Out…,
 #                  Restart… and Power Off… from the open power menu,
 #                  keeps Suspend, and restores them (#357)
@@ -406,6 +432,17 @@
 #   G-TRAY      an AppIndicator item shows in the panel with its
 #               tooltip, its menu row reaches the item, and the row
 #               leaves the panel when the item exits (P-TR-01)
+#   G-TRAY-POINTER the AppIndicator extension's pointer: middle click is
+#               SecondaryActivate, the wheel Scroll, a double click
+#               Activate without the menu, single and secondary
+#               clicks the menu (P-TR-01)
+#   G-TRAY-AYATANA a real libayatana-appindicator item: label, keyboard
+#               route (Ctrl+Alt+Tab, Enter, arrows, Right into a
+#               submenu), check state, live menu/label/attention/
+#               Passive updates, middle click and scroll reach the
+#               library, and the item leaves on exit (P-TR-01, P-A11Y-02)
+#   G-TRAY-X11  the same library item from an XWayland (GDK_BACKEND=x11)
+#               client shows and fires its menu (P-TR-01)
 #   G-SWITCHER-GROUP Alt+Above_Tab shows an app's windows as thumbnails
 #               inside the output and steps through them; W closes the
 #               focused one
@@ -444,6 +481,7 @@ INSTALLED_PACKAGE=0
 SCREENSHOT_KEYS_ONLY=0
 A11Y_FOCUS_ONLY=0
 NOTIFY_LOCK_ONLY=0
+TRAY_ONLY=0
 GRID_HOVER_ONLY=0
 KEYBOARD_ROUTES_ONLY=0
 GRID_CANCEL_ONLY=0
@@ -459,6 +497,7 @@ while [ $# -gt 0 ]; do
         --screenshot-keys-only) SCREENSHOT_KEYS_ONLY=1; shift ;;
         --a11y-focus-only) A11Y_FOCUS_ONLY=1; shift ;;
         --notify-lock-only) NOTIFY_LOCK_ONLY=1; shift ;;
+        --tray-only) TRAY_ONLY=1; shift ;;
         --grid-hover-only) GRID_HOVER_ONLY=1; shift ;;
         --keyboard-routes-only) KEYBOARD_ROUTES_ONLY=1; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
@@ -1361,15 +1400,228 @@ if [ "$INSTALLED_PACKAGE" = 1 ]; then
     cp "$CSTATE" "$ARTIFACTS/installed-desktop-before-panel.json"
 fi
 
+# Tray helpers: dump the shell, wait for a node, aim at a node's live
+# accessibility bounds (the panel surface sits at the output origin),
+# and wait for a fixture's marker line.
+tray_dump() {
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/$1" 20 >/dev/null 2>&1
+}
+tray_wait() {
+    for _ in $(seq 1 30); do
+        tray_dump "$1"
+        "$3" "$ARTIFACTS/$1" "$2" && return 0
+        sleep 0.5
+    done
+    return 1
+}
+tray_point() {
+    jq -er --arg n "$2" '[.[] | select(.showing and .name == $n and ((.bounds[2] // 0) > 0) and ((.bounds[3] // 0) > 0))][0].bounds | "\((.[0] + .[2] / 2) | floor) \((.[1] + .[3] / 2) | floor)"' "$ARTIFACTS/$1"
+}
+tray_marker() {
+    end=$(($(date +%s) + 10))
+    until grep -q -- "$2" "$1" 2>/dev/null || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+    grep -q -- "$2" "$1" 2>/dev/null
+}
+tray_checked() {
+    jq -e --arg n "$2" --argjson c "$3" 'any(.[]; .name == $n and .showing and .checked == $c)' "$1" >/dev/null
+}
+
+tray_pointer_gate() {
+# Tray pointer (P-TR-01), as the AppIndicator extension's
+# indicatorStatusIcon.js vfunc_button_press_event/vfunc_scroll_event.
+TRAY_MARKER="$ARTIFACTS/tray-pointer-marker"
+rm -f "$TRAY_MARKER"
+"$PY" "$ROOT/scripts/lib/tuna-tray-item-stub.py" "$TRAY_MARKER" >"$ARTIFACTS/tray-pointer.log" 2>&1 &
+TRAY_PID=$!
+tray_wait a11y-tray-pointer.json "Tuna Desktop Tray Probe" showing ||
+    fail G-TRAY-POINTER "the item never showed in the panel"
+tray_xy="$(tray_point a11y-tray-pointer.json "Tuna Desktop Tray Probe")" ||
+    fail G-TRAY-POINTER "the item has no showing bounds"
+# shellcheck disable=SC2086
+xdotool mousemove --window "$WID" $tray_xy click 2
+tray_marker "$TRAY_MARKER" '^secondary$' || fail G-TRAY-POINTER "middle click did not reach SecondaryActivate"
+xdotool click 4
+tray_marker "$TRAY_MARKER" '^scroll -[1-9][0-9]* vertical$' || fail G-TRAY-POINTER "the wheel did not reach Scroll"
+xdotool click --repeat 2 --delay 60 1
+tray_marker "$TRAY_MARKER" '^activated$' || fail G-TRAY-POINTER "a double click did not Activate"
+sleep 1
+tray_dump a11y-tray-double.json
+hidden "$ARTIFACTS/a11y-tray-double.json" "Open Probe" ||
+    fail G-TRAY-POINTER "a double click opened the menu as well"
+xdotool click 1
+tray_wait a11y-tray-single.json "Open Probe" showing ||
+    fail G-TRAY-POINTER "a single click never opened the menu"
+scrot "$ARTIFACTS/03c-tray-pointer-menu.png" >/dev/null
+xdotool key Escape
+tray_wait a11y-tray-single-closed.json "Open Probe" hidden || fail G-TRAY-POINTER "Escape left the menu open"
+xdotool click 3
+tray_wait a11y-tray-secondary.json "Open Probe" showing ||
+    fail G-TRAY-POINTER "a secondary click never opened the menu"
+xdotool key Escape
+tray_wait a11y-tray-secondary-closed.json "Open Probe" hidden || fail G-TRAY-POINTER "Escape left the menu open"
+[ "$(grep -c '^activated$' "$TRAY_MARKER")" = 1 ] ||
+    fail G-TRAY-POINTER "single or secondary clicks activated the item"
+kill "$TRAY_PID" 2>/dev/null || true
+tray_wait a11y-tray-pointer-gone.json "Tuna Desktop Tray Probe" hidden ||
+    fail G-TRAY-POINTER "the item stayed after it exited"
+pass G-TRAY-POINTER "middle click, wheel, double, single and secondary clicks follow the AppIndicator extension"
+}
+
+tray_ayatana_gate() {
+# A real libayatana-appindicator item (P-TR-01): the library Ubuntu and
+# Fedora apps use, registering by object path and exporting a GtkMenu
+# through libdbusmenu. Driven from the keyboard (P-A11Y-02).
+if "$PY" -c 'import gi; gi.require_version("Gtk", "3.0"); gi.require_version("AyatanaAppIndicator3", "0.1")' 2>/dev/null; then
+    AYATANA_MARKER="$ARTIFACTS/tray-ayatana-marker"
+    rm -f "$AYATANA_MARKER"
+    env -u DISPLAY GDK_BACKEND=wayland WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-tray-ayatana.py" "$AYATANA_MARKER" >"$ARTIFACTS/tray-ayatana.log" 2>&1 &
+    AYATANA_PID=$!
+    tray_marker "$AYATANA_MARKER" '^ready$' || fail G-TRAY-AYATANA "the library item never started"
+    tray_wait a11y-ayatana.json "Tuna Ayatana Probe" showing ||
+        fail G-TRAY-AYATANA "the path-registered library item never showed"
+    jq -e 'any(.[]; .role == "label" and .name == "7" and .showing)' "$ARTIFACTS/a11y-ayatana.json" >/dev/null ||
+        fail G-TRAY-AYATANA "the item's label is not shown beside its icon"
+    scrot "$ARTIFACTS/03d-tray-ayatana.png" >/dev/null
+    # Ctrl+Alt+Tab into the bar, Tab to the item, Enter opens its menu.
+    # A fired row returns focus to the client (G-PANEL-FOCUS), so each
+    # visit walks in again.
+    ayatana_open() {
+        xdotool key ctrl+alt+Tab
+        sleep 1
+        for _ in $(seq 1 12); do
+            tray_dump "a11y-ayatana-walk-$1.json"
+            focused "$ARTIFACTS/a11y-ayatana-walk-$1.json" "Tuna Ayatana Probe" && break
+            xdotool key Tab
+            sleep 0.7
+        done
+        focused "$ARTIFACTS/a11y-ayatana-walk-$1.json" "Tuna Ayatana Probe" ||
+            fail G-TRAY-AYATANA "the bar's focus walk never reached the item"
+        xdotool key Return
+        tray_wait "a11y-ayatana-menu-$1.json" "Ayatana Open" showing || fail G-TRAY-AYATANA "Enter did not open the menu"
+        cp "$ARTIFACTS/a11y-ayatana-menu-$1.json" "$ARTIFACTS/a11y-ayatana-menu.json"
+    }
+    ayatana_open first
+    showing "$ARTIFACTS/a11y-ayatana-menu.json" "Ayatana More" || fail G-TRAY-AYATANA "the submenu row is missing"
+    tray_checked "$ARTIFACTS/a11y-ayatana-menu.json" "Ayatana Check" true ||
+        fail G-TRAY-AYATANA "the check item is not shown checked"
+    hidden "$ARTIFACTS/a11y-ayatana-menu.json" "Ayatana Deep" || fail G-TRAY-AYATANA "the submenu opened by itself"
+    scrot "$ARTIFACTS/03e-tray-ayatana-menu.png" >/dev/null
+    for _ in $(seq 1 8); do
+        tray_dump a11y-ayatana-down.json
+        focused "$ARTIFACTS/a11y-ayatana-down.json" "Ayatana More" && break
+        xdotool key Down
+        sleep 0.5
+    done
+    focused "$ARTIFACTS/a11y-ayatana-down.json" "Ayatana More" || fail G-TRAY-AYATANA "Down never reached the submenu row"
+    xdotool key Right
+    tray_wait a11y-ayatana-sub.json "Ayatana Deep" showing || fail G-TRAY-AYATANA "Right did not open the submenu"
+    tray_wait a11y-ayatana-sub-focus.json "Ayatana Deep" focused || fail G-TRAY-AYATANA "Right did not focus the submenu's row"
+    scrot "$ARTIFACTS/03f-tray-ayatana-submenu.png" >/dev/null
+    xdotool key Return
+    tray_marker "$AYATANA_MARKER" '^activate Ayatana Deep$' || fail G-TRAY-AYATANA "Enter on the submenu row never reached the app"
+    tray_wait a11y-ayatana-fired.json "Ayatana Open" hidden || fail G-TRAY-AYATANA "the menu stayed open after a row fired"
+    ayatana_open again
+    hidden "$ARTIFACTS/a11y-ayatana-menu.json" "Ayatana Deep" || fail G-TRAY-AYATANA "the submenu stayed open across menus"
+    for _ in $(seq 1 8); do
+        tray_dump a11y-ayatana-check.json
+        focused "$ARTIFACTS/a11y-ayatana-check.json" "Ayatana Check" && break
+        xdotool key Down
+        sleep 0.5
+    done
+    xdotool key Return
+    tray_marker "$AYATANA_MARKER" '^toggled Ayatana Check False$' || fail G-TRAY-AYATANA "the check item never toggled in the app"
+    tray_wait a11y-ayatana-toggled.json "Ayatana Check" hidden || fail G-TRAY-AYATANA "the menu stayed open after the toggle"
+    ayatana_open toggled
+    cp "$ARTIFACTS/a11y-ayatana-menu.json" "$ARTIFACTS/a11y-ayatana-unchecked.json"
+    tray_checked "$ARTIFACTS/a11y-ayatana-unchecked.json" "Ayatana Check" false ||
+        fail G-TRAY-AYATANA "the menu kept the stale check state"
+    # A row added while the menu is open appears in place.
+    kill -HUP "$AYATANA_PID"
+    tray_wait a11y-ayatana-added.json "Ayatana Added" showing || fail G-TRAY-AYATANA "a live LayoutUpdated row never appeared"
+    showing "$ARTIFACTS/a11y-ayatana-added.json" "Ayatana Open" || fail G-TRAY-AYATANA "the live update closed the menu"
+    xdotool key Escape
+    tray_wait a11y-ayatana-escaped.json "Ayatana Open" hidden || fail G-TRAY-AYATANA "Escape left the menu open"
+    xdotool key Escape
+    sleep 1
+    # Pointer actions reach the library: middle click its secondary
+    # target, the wheel its scroll-event; a primary click opens the menu
+    # at once (the library has no Activate).
+    tray_xy="$(tray_point a11y-ayatana-escaped.json "Tuna Ayatana Probe")" || fail G-TRAY-AYATANA "the item has no bounds"
+    # shellcheck disable=SC2086
+    xdotool mousemove --window "$WID" $tray_xy click 2
+    tray_marker "$AYATANA_MARKER" '^activate Ayatana Open$' || fail G-TRAY-AYATANA "middle click never reached the secondary target"
+    xdotool click 5
+    tray_marker "$AYATANA_MARKER" '^scroll ' || fail G-TRAY-AYATANA "the wheel never reached the library"
+    xdotool click 1
+    tray_wait a11y-ayatana-click.json "Ayatana Open" showing || fail G-TRAY-AYATANA "a click did not open the menu"
+    xdotool key Escape
+    tray_wait a11y-ayatana-click-closed.json "Ayatana Open" hidden || fail G-TRAY-AYATANA "Escape left the menu open"
+    # Live label, attention icon and description, Passive and back.
+    kill -USR1 "$AYATANA_PID"
+    tray_wait a11y-ayatana-attention.json "Tuna Ayatana Probe Alert" showing ||
+        fail G-TRAY-AYATANA "NeedsAttention never took the attention description"
+    jq -e 'any(.[]; .role == "label" and .name == "8" and .showing)' "$ARTIFACTS/a11y-ayatana-attention.json" >/dev/null ||
+        fail G-TRAY-AYATANA "the label did not update live"
+    scrot "$ARTIFACTS/03g-tray-ayatana-attention.png" >/dev/null
+    # Passive hides the item whatever its icon; Active brings back the
+    # normal icon and its description.
+    ayatana_hidden() { hidden "$1" "Tuna Ayatana Probe Alert" && hidden "$1" "Tuna Ayatana Probe"; }
+    kill -USR2 "$AYATANA_PID"
+    tray_wait a11y-ayatana-passive.json - ayatana_hidden || fail G-TRAY-AYATANA "a Passive item stayed visible"
+    kill -USR2 "$AYATANA_PID"
+    tray_wait a11y-ayatana-active.json "Tuna Ayatana Probe" showing || fail G-TRAY-AYATANA "the item never came back from Passive"
+    kill "$AYATANA_PID" 2>/dev/null || true
+    tray_wait a11y-ayatana-gone.json - ayatana_hidden || fail G-TRAY-AYATANA "the item stayed after the app exited"
+    pass G-TRAY-AYATANA "a libayatana item registers by path, its label, menu, submenu and check work from the keyboard, and it updates and leaves live"
+else
+    echo "tuna-gtk-shell-proof: G-TRAY-AYATANA skipped (no AyatanaAppIndicator3 typelib)"
+fi
+}
+
+# G-TRAY-X11 needs the session's XWayland display ($x11_display).
+tray_x11_gate() {
+    if "$PY" -c 'import gi; gi.require_version("Gtk", "3.0"); gi.require_version("AyatanaAppIndicator3", "0.1")' 2>/dev/null; then
+        X11_TRAY_MARKER="$ARTIFACTS/tray-x11-marker"
+        rm -f "$X11_TRAY_MARKER"
+        DISPLAY="$x11_display" GDK_BACKEND=x11 "$PY" "$ROOT/scripts/lib/tuna-tray-ayatana.py" "$X11_TRAY_MARKER" "Tuna X11 Tray Probe" >"$ARTIFACTS/tray-x11.log" 2>&1 &
+        X11_TRAY_PID=$!
+        tray_marker "$X11_TRAY_MARKER" '^ready$' || fail G-TRAY-X11 "the X11 library item never started"
+        tray_wait a11y-tray-x11.json "Tuna X11 Tray Probe" showing || fail G-TRAY-X11 "the X11 client's item never showed"
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-tray-x11-menu.json" 20 \
+            --press "Tuna X11 Tray Probe" >/dev/null 2>&1 || fail G-TRAY-X11 "could not open the X11 item"
+        tray_wait a11y-tray-x11-open.json "Ayatana Open" showing || fail G-TRAY-X11 "the X11 item's menu never showed"
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-tray-x11-fire.json" 20 \
+            --press "Ayatana Open" >/dev/null 2>&1 || fail G-TRAY-X11 "could not fire the X11 item's row"
+        tray_marker "$X11_TRAY_MARKER" '^activate Ayatana Open$' || fail G-TRAY-X11 "the row never reached the X11 client"
+        kill "$X11_TRAY_PID" 2>/dev/null || true
+        tray_wait a11y-tray-x11-gone.json "Tuna X11 Tray Probe" hidden || fail G-TRAY-X11 "the X11 item stayed after exit"
+        pass G-TRAY-X11 "an XWayland client's AppIndicator shows, fires its menu row and leaves"
+    else
+        echo "tuna-gtk-shell-proof: G-TRAY-X11 skipped (no AyatanaAppIndicator3 typelib)"
+    fi
+}
+
 # The panel is up once the shell registers on the a11y bus with its
 # controls; that also proves the accessible tree.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel.json" 60 ||
     fail A11Y-PANEL "shell never registered on the accessibility bus"
+SOCKET_NAME="$(sed -n 's/.*nested session on \([^ ]*\) .*/\1/p' "$LOG" | head -1)"
+[ -n "$SOCKET_NAME" ] || fail A11Y-PANEL "the nested session never logged its Wayland socket"
 if [ "$NOTIFY_LOCK_ONLY" = 1 ]; then
     [ -n "$PAM_ON" ] || fail G-NOTIFY-LOCK "--notify-lock-only needs pam_wrapper to unlock"
     cstate '.active_workspace != null and .locked == false' "notification desktop ready" ||
         fail G-NOTIFY-LOCK "desktop never became ready"
     notify_lock_proof
+    exit 0
+fi
+if [ "$TRAY_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "tray desktop ready" ||
+        fail G-TRAY-POINTER "desktop never became ready"
+    tray_pointer_gate
+    tray_ayatana_gate
+    cstate '.x11_display != null' "xwayland" 30 || fail G-TRAY-X11 "XWayland display never advertised"
+    x11_display="$(jq -r '.x11_display' "$CSTATE")"
+    tray_x11_gate
     exit 0
 fi
 if [ "$KEYBOARD_ROUTES_ONLY" = 1 ]; then
@@ -1716,6 +1968,12 @@ pass G-TRAY "an AppIndicator item shows with its tooltip, fires its menu, and le
 xdotool key Escape
 sleep 1
 
+# The comparison slice runs old binaries that predate these tray gates.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    tray_pointer_gate
+    tray_ayatana_gate
+fi
+
 # App stages: three libadwaita windows (scripts/lib/tuna-test-window.py).
 # Reserving an X11 display must not launch a compatibility process. The
 # panel/calendar are already real native Wayland clients at this point.
@@ -1734,7 +1992,6 @@ if command -v Xwayland >/dev/null 2>&1; then
     fi
     pass G-X11-DEMAND "native GTK and IBus startup advertise sockets without an XWayland or XIM process"
 fi
-SOCKET_NAME="$(sed -n 's/.*nested session on \([^ ]*\) .*/\1/p' "$LOG" | head -1)"
 # One at a time, so window ids (and with them GNOME's running-app order
 # in the dash) follow Alpha, Beta, Gamma.
 n=0
@@ -4756,6 +5013,7 @@ EOF
     fi
     kill "$XEV_PID" 2>/dev/null || true
     pass G-X11-INPUT-FOCUS "X input focus is the focused X11 window $xev_window"
+    tray_x11_gate
 else
     echo "tuna-gtk-shell-proof: G-X11-APP skipped (no Xwayland or xeyes)"
 fi
@@ -10968,6 +11226,268 @@ grep -q "^PowerOff True pid=$MANAGER_PID$" "$POWER_LOG" ||
 end_bus signal ConfirmedShutdown || fail G-END-SESSION-POWEROFF "Power Off emitted no ConfirmedShutdown"
 end_bus returned Shutdown || fail G-END-SESSION-POWEROFF "the manager did not answer Shutdown once confirmed"
 pass G-END-SESSION-POWEROFF "Power Off… asks org.gnome.SessionManager.Shutdown, whose dialog lists the inhibiting app and counts down from 60; Cancel leaves the session, Power Off has the manager ask logind PowerOff(true)"
+
+# The rest of GNOME 51's endSessionDialog.js (P-SY-07): other users'
+# sessions, the real name, the low-battery warning with offline updates,
+# and Restart's Alt Boot Options. AccountsService answers for this gate
+# only (the stub's opt-in "accounts"), so the rest of the proof keeps
+# GNOME's no-AccountsService strings.
+TUNA_STUB_SERVICES=accounts "$PY" "$ROOT/scripts/lib/tuna-service-stubs.py" "$BACKLIGHT" \
+    >"$ARTIFACTS/stubs-accounts.log" 2>&1 &
+ACCOUNTS_PID=$!
+for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/stubs-accounts.log" && break; sleep 0.3; done
+grep -q ready "$ARTIFACTS/stubs-accounts.log" || fail G-END-SESSION-REALNAME "the AccountsService stub did not start"
+# $1 tag, $2 menu row, $3 jq filter the open dialog must meet.
+end_open() {
+    end_bus_mark=$(($(wc -l <"$END_BUS_LOG") + 1))
+    open_power_menu "end-$1" || return 1
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-$1-press.json" 20 \
+        --press "$2" || return 1
+    end_dump_until "end-$1" "$3" 10
+}
+end_cancel() {
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-$1-cancel.json" 20 \
+        --press "Cancel" || return 1
+    end_dump_until "end-$1-cancelled" '(any(.[]; .showing and (.name | test("automatically"))) | not)' 5
+}
+me=$(id -un)
+for row in "Restart…" "Power Off…"; do
+    tag=users-$([ "$row" = "Restart…" ] && echo restart || echo poweroff)
+    end_open "$tag" "$row" 'any(.[]; .showing and .name == "Other users are logged in")
+        and any(.[]; .showing and .name == "alice") and any(.[]; .showing and .name == "Bob Builder (console)")
+        and any(.[]; .showing and .name == "carol (remote)")' ||
+        fail G-END-SESSION-USERS "$row did not list the other users' sessions"
+    for left_out in dave gdm-greeter "$me" "dave (console)" "Proof Person"; do
+        hidden "$ARTIFACTS/a11y-end-$tag.json" "$left_out" ||
+            fail G-END-SESSION-USERS "$row lists '$left_out' (closing, greeter or this session)"
+    done
+    scrot "$ARTIFACTS/22-end-session-$tag.png" >/dev/null
+    end_cancel "$tag" || fail G-END-SESSION-USERS "could not cancel $row"
+done
+pass G-END-SESSION-USERS "Restart… and Power Off… list alice, Bob Builder (console) and carol (remote) under \"Other users are logged in\", not the greeter, the closing session or this one"
+
+end_open realname "Log Out…" 'any(.[]; .showing and .name == "Log Out Proof Person")
+    and any(.[]; .showing and (.name | test("^Proof Person will be logged out automatically in 60 seconds$")))' ||
+    fail G-END-SESSION-REALNAME "Log Out… did not name the user by their real name"
+hidden "$ARTIFACTS/a11y-end-realname.json" "Other users are logged in" ||
+    fail G-END-SESSION-REALNAME "Log Out… lists other users' sessions"
+scrot "$ARTIFACTS/22-end-session-realname.png" >/dev/null
+end_cancel realname || fail G-END-SESSION-REALNAME "could not cancel Log Out…"
+kill "$ACCOUNTS_PID" 2>/dev/null || true
+wait "$ACCOUNTS_PID" 2>/dev/null || true
+end_open no-accounts "Log Out…" 'any(.[]; .showing and .name == "Log Out")
+    and any(.[]; .showing and (.name | test("^You will be logged out automatically in")))' ||
+    fail G-END-SESSION-REALNAME "without AccountsService Log Out… did not fall back to GNOME's plain strings"
+end_cancel no-accounts || fail G-END-SESSION-REALNAME "could not cancel Log Out…"
+pass G-END-SESSION-REALNAME "Log Out… reads \"Log Out Proof Person\" from AccountsService and falls back to \"Log Out\" without it"
+
+# gnome-software's OfflineUpdates on the session bus: GetState answers
+# the state file; SetAction and Cancel are logged.
+SOFTWARE_STATE="$ARTIFACTS/offline-update-state"
+SOFTWARE_LOG="$ARTIFACTS/offline-update.log"
+SOFTWARE_DELAY="$ARTIFACTS/offline-update-delay"
+SOFTWARE_TRACE="$ARTIFACTS/offline-update-trace"
+: >"$SOFTWARE_DELAY"
+: >"$SOFTWARE_TRACE"
+: >"$SOFTWARE_LOG"
+echo prepared >"$SOFTWARE_STATE"
+"$PY" - "$SOFTWARE_STATE" "$SOFTWARE_LOG" "$SOFTWARE_DELAY" "$SOFTWARE_TRACE" >"$ARTIFACTS/offline-update-stub.log" 2>&1 <<'PYSOFT' &
+import sys
+from gi.repository import Gio, GLib
+state_file, log_file, delay_file, trace_file = sys.argv[1:5]
+node = Gio.DBusNodeInfo.new_for_xml("""<node><interface name="org.gnome.Software.OfflineUpdates">
+<method name="GetState"><arg type="s" direction="out"/></method><method name="Cancel"/>
+<method name="SetAction"><arg type="s" direction="in"/></method></interface></node>""")
+def call(c, sender, path, iface, method, params, invocation):
+    with open(trace_file, "a") as fh:
+        fh.write(method + "\n")
+    result = None
+    if method == "GetState":
+        result = GLib.Variant("(s)", (open(state_file).read().strip(),))
+    else:
+        with open(log_file, "a") as fh:
+            fh.write(f"{method} {' '.join(map(str, params.unpack()))}".rstrip() + "\n")
+    delay = open(delay_file).read().split()
+    if delay and delay[0] == method:
+        def reply():
+            invocation.return_value(result)
+            return GLib.SOURCE_REMOVE
+        GLib.timeout_add(int(delay[1]), reply)
+    else:
+        invocation.return_value(result)
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+bus.register_object("/org/gnome/Software/OfflineUpdates", node.interfaces[0], call, None, None)
+Gio.bus_own_name_on_connection(bus, "org.gnome.Software", Gio.BusNameOwnerFlags.NONE, None, None)
+print("ready", flush=True)
+GLib.MainLoop().run()
+PYSOFT
+SOFTWARE_PID=$!
+for _ in $(seq 1 20); do grep -q ready "$ARTIFACTS/offline-update-stub.log" && break; sleep 0.3; done
+grep -q ready "$ARTIFACTS/offline-update-stub.log" || fail G-END-SESSION-BATTERY "the gnome-software stub did not start"
+upower_set() {
+    gdbus call --address "$DBUS_SYSTEM_BUS_ADDRESS" --dest org.freedesktop.UPower \
+        --object-path /org/freedesktop/UPower/devices/DisplayDevice \
+        --method org.freedesktop.DBus.Properties.Set org.freedesktop.UPower.Device "$1" "$2" >/dev/null
+}
+upower_set Percentage '<20.0>'
+upower_set State '<uint32 2>'
+upower_set IsPresent '<true>'
+WARNING="Low battery power: please plug in before installing updates"
+end_open battery-prepared "Power Off…" 'any(.[]; .showing and .name == "Install pending software updates" and (.checked | not))
+    and any(.[]; .showing and .name == "Power Off")' ||
+    fail G-END-SESSION-BATTERY "with a prepared update and a low battery Power Off… did not offer the unchecked update box"
+hidden "$ARTIFACTS/a11y-end-battery-prepared.json" "$WARNING" ||
+    fail G-END-SESSION-BATTERY "the warning showed with no update to install"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-battery-check.json" 20 \
+    --press "Install pending software updates" || fail G-END-SESSION-BATTERY "could not check the update box"
+end_dump_until end-battery-checked "any(.[]; .showing and .name == \"$WARNING\")
+    and any(.[]; .showing and .name == \"Install Updates & Power Off\")" 5 ||
+    fail G-END-SESSION-BATTERY "checking the update box did not show the low-battery warning and GNOME's title"
+scrot "$ARTIFACTS/22-end-session-battery.png" >/dev/null
+end_cancel battery-prepared || fail G-END-SESSION-BATTERY "could not cancel Power Off…"
+echo scheduled >"$SOFTWARE_STATE"
+end_open battery-scheduled "Restart…" "any(.[]; .showing and .name == \"Restart & Install Updates\")
+    and any(.[]; .showing and (.name | test(\"^The system will automatically restart and install updates in 60 seconds$\")))
+    and any(.[]; .showing and .name == \"Restart & Install\") and any(.[]; .showing and .name == \"$WARNING\")" ||
+    fail G-END-SESSION-BATTERY "a scheduled update did not open GNOME's Restart & Install Updates with the warning"
+hidden "$ARTIFACTS/a11y-end-battery-scheduled.json" "Install pending software updates" ||
+    fail G-END-SESSION-BATTERY "Restart & Install Updates offered the update box"
+upower_set State '<uint32 1>'
+end_dump_until end-battery-charging "(any(.[]; .showing and .name == \"$WARNING\") | not)
+    and any(.[]; .showing and .name == \"Restart & Install Updates\")" 5 ||
+    fail G-END-SESSION-BATTERY "the warning stayed once the battery charged"
+end_cancel battery-scheduled || fail G-END-SESSION-BATTERY "could not cancel Restart & Install Updates"
+upower_set State '<uint32 2>'
+echo none >"$SOFTWARE_STATE"
+end_open battery-none "Restart…" 'any(.[]; .showing and .name == "Restart") and any(.[]; .showing and (.name | test("will restart automatically in 60")))' ||
+    fail G-END-SESSION-BATTERY "without updates Restart… did not open plainly"
+for absent in "$WARNING" "Install pending software updates"; do
+    hidden "$ARTIFACTS/a11y-end-battery-none.json" "$absent" ||
+        fail G-END-SESSION-BATTERY "without updates the dialog shows '$absent'"
+done
+end_cancel battery-none || fail G-END-SESSION-BATTERY "could not cancel Restart…"
+[ ! -s "$SOFTWARE_LOG" ] || fail G-END-SESSION-BATTERY "cancelling told gnome-software: $(cat "$SOFTWARE_LOG")"
+
+# Exercise outstanding service replies, not just a pure generation
+# helper: neither Close nor a newer Open may be undone by an old one.
+# The stub traces method receipt before delaying its reply.
+end_direct() {
+    direct_method=$1
+    shift
+    timeout 15 gdbus call --session --dest org.gnome.Shell \
+        --object-path /org/gnome/SessionManager/EndSessionDialog \
+        --method "org.gnome.SessionManager.EndSessionDialog.$direct_method" "$@"
+}
+software_received() {
+    received_until=$(($(date +%s) + 5))
+    until [ "$(grep -c "^$1$" "$SOFTWARE_TRACE")" -gt "$2" ]; do
+        [ "$(date +%s)" -le "$received_until" ] || return 1
+        sleep 0.1
+    done
+}
+echo 'GetState 2000' >"$SOFTWARE_DELAY"
+trace_mark=$(grep -c '^GetState$' "$SOFTWARE_TRACE")
+end_direct Open 1 0 60 '[]' >"$ARTIFACTS/end-async-close-call.log" 2>&1 &
+END_OPEN_PID=$!
+software_received GetState "$trace_mark" || fail G-END-SESSION-ASYNC "GetState never reached the stub"
+end_direct Close >/dev/null || fail G-END-SESSION-ASYNC "Close failed during GetState"
+if wait "$END_OPEN_PID"; then fail G-END-SESSION-ASYNC "the invalidated Open succeeded after Close"; fi
+end_dump_until end-async-closed '(any(.[]; .showing and (.name | test("automatically"))) | not)' 5 ||
+    fail G-END-SESSION-ASYNC "the delayed Open reopened after Close"
+trace_mark=$(grep -c '^GetState$' "$SOFTWARE_TRACE")
+end_direct Open 1 0 60 '[]' >"$ARTIFACTS/end-async-old-open.log" 2>&1 &
+END_OPEN_PID=$!
+software_received GetState "$trace_mark" || fail G-END-SESSION-ASYNC "the old Open never reached GetState"
+: >"$SOFTWARE_DELAY"
+end_direct Open 2 0 60 '[]' >/dev/null || fail G-END-SESSION-ASYNC "the newer Open failed"
+if wait "$END_OPEN_PID"; then fail G-END-SESSION-ASYNC "the older Open superseded the newer one"; fi
+end_dump_until end-async-newer 'any(.[]; .showing and (.name | test("^The system will restart automatically in")))' 5 ||
+    fail G-END-SESSION-ASYNC "the delayed Power Off replaced the newer Restart"
+end_direct Close >/dev/null || fail G-END-SESSION-ASYNC "Close failed after overlapping Opens"
+
+# A confirmed Power Off awaits Cancel of a prepared update. Replace it
+# with Restart before Cancel returns: no old ConfirmedShutdown (nor any
+# other confirmation) may answer that new dialog.
+echo prepared >"$SOFTWARE_STATE"
+end_direct Open 1 0 60 '[]' >/dev/null || fail G-END-SESSION-ASYNC "Power Off Open failed"
+end_dump_until end-async-confirm-open 'any(.[]; .showing and .name == "Install pending software updates" and (.checked | not))' 5 ||
+    fail G-END-SESSION-ASYNC "Power Off did not offer the unchecked prepared update"
+echo 'Cancel 2000' >"$SOFTWARE_DELAY"
+trace_mark=$(grep -c '^Cancel$' "$SOFTWARE_TRACE" || true)
+end_bus_mark=$(($(wc -l <"$END_BUS_LOG") + 1))
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-async-confirm.json" 20 \
+    --press "Power Off" || fail G-END-SESSION-ASYNC "could not confirm Power Off"
+software_received Cancel "$trace_mark" || fail G-END-SESSION-ASYNC "the confirmation did not reach Cancel"
+echo none >"$SOFTWARE_STATE"
+end_direct Open 2 0 60 '[]' >/dev/null || fail G-END-SESSION-ASYNC "the replacement Restart failed"
+sleep 3
+end_dump_until end-async-confirm-newer 'any(.[]; .showing and (.name | test("^The system will restart automatically in")))' 5 ||
+    fail G-END-SESSION-ASYNC "the old confirmation dismissed the newer Restart"
+for signal in ConfirmedShutdown ConfirmedReboot ConfirmedLogout; do
+    if end_bus signal "$signal"; then fail G-END-SESSION-ASYNC "the old confirmation emitted $signal for the newer dialog"; fi
+done
+end_direct Close >/dev/null || fail G-END-SESSION-ASYNC "Close failed after the stale confirmation"
+# Close while a confirmation awaits its service reply still answers the
+# manager with Closed, rather than leaving Shutdown/Reboot waiting.
+echo prepared >"$SOFTWARE_STATE"
+end_direct Open 1 0 60 '[]' >/dev/null || fail G-END-SESSION-ASYNC "Power Off Open failed before Close"
+trace_mark=$(grep -c '^Cancel$' "$SOFTWARE_TRACE")
+end_bus_mark=$(($(wc -l <"$END_BUS_LOG") + 1))
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-async-confirm-close.json" 20 \
+    --press "Power Off" || fail G-END-SESSION-ASYNC "could not confirm Power Off before Close"
+software_received Cancel "$trace_mark" || fail G-END-SESSION-ASYNC "the closing confirmation did not reach Cancel"
+end_direct Close >/dev/null || fail G-END-SESSION-ASYNC "Close failed during the confirmation"
+sleep 3
+end_bus signal Closed || fail G-END-SESSION-ASYNC "Close during confirmation emitted no Closed"
+if end_bus signal ConfirmedShutdown; then fail G-END-SESSION-ASYNC "the closed confirmation emitted ConfirmedShutdown"; fi
+end_dump_until end-async-confirm-closed '(any(.[]; .showing and (.name | test("automatically"))) | not)' 5 ||
+    fail G-END-SESSION-ASYNC "the dialog survived Close during confirmation"
+: >"$SOFTWARE_DELAY"
+pass G-END-SESSION-ASYNC "delayed update calls cannot reopen after Close, replace a newer Open or confirm its dialog"
+upower_set IsPresent '<false>'
+upower_set Percentage '<37.0>'
+kill "$SOFTWARE_PID" 2>/dev/null || true
+pass G-END-SESSION-BATTERY "below 30 % discharging, a prepared update's box starts unchecked and checking it warns; a scheduled one opens Restart & Install Updates warned until charging; no updates, no warning"
+
+end_open boot-poweroff "Power Off…" 'any(.[]; .showing and (.name | test("will power off automatically in 60")))' ||
+    fail G-END-SESSION-BOOT-OPTIONS "Power Off… did not open"
+xdotool keydown Alt_L
+sleep 0.5
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-boot-poweroff-alt.json" 20 ||
+    { xdotool keyup Alt_L; fail G-END-SESSION-BOOT-OPTIONS "accessibility dump failed"; }
+xdotool keyup Alt_L
+{ button_showing "$ARTIFACTS/a11y-end-boot-poweroff-alt.json" "Power Off" &&
+    hidden "$ARTIFACTS/a11y-end-boot-poweroff-alt.json" "Boot Options"; } ||
+    fail G-END-SESSION-BOOT-OPTIONS "Alt on Power Off… offered Boot Options"
+end_cancel boot-poweroff || fail G-END-SESSION-BOOT-OPTIONS "could not cancel Power Off…"
+end_open boot "Restart…" 'any(.[]; .showing and (.name | test("will restart automatically in 60")))' ||
+    fail G-END-SESSION-BOOT-OPTIONS "Restart… did not open"
+{ button_showing "$ARTIFACTS/a11y-end-boot.json" "Restart" && hidden "$ARTIFACTS/a11y-end-boot.json" "Boot Options"; } ||
+    fail G-END-SESSION-BOOT-OPTIONS "Boot Options showed without Alt"
+xdotool keydown Alt_L
+end_dump_until end-boot-alt 'any(.[]; .showing and .name == "Boot Options")
+    and (any(.[]; .showing and .name == "Restart" and (.role == "push button" or .role == "button")) | not)' 5 ||
+    { xdotool keyup Alt_L; fail G-END-SESSION-BOOT-OPTIONS "holding Alt did not swap Restart for Boot Options"; }
+scrot "$ARTIFACTS/22-end-session-boot-options.png" >/dev/null
+xdotool keyup Alt_L
+end_dump_until end-boot-released '(any(.[]; .showing and .name == "Boot Options") | not)
+    and any(.[]; .showing and .name == "Restart" and (.role == "push button" or .role == "button"))' 5 ||
+    fail G-END-SESSION-BOOT-OPTIONS "releasing Alt did not bring Restart back"
+power_mark=$(wc -l <"$POWER_LOG")
+xdotool keydown Alt_L
+end_dump_until end-boot-alt-again 'any(.[]; .showing and .name == "Boot Options")' 5 ||
+    { xdotool keyup Alt_L; fail G-END-SESSION-BOOT-OPTIONS "holding Alt again did not show Boot Options"; }
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-boot-press.json" 20 \
+    --press "Boot Options" || { xdotool keyup Alt_L; fail G-END-SESSION-BOOT-OPTIONS "could not press Boot Options"; }
+xdotool keyup Alt_L
+end=$(($(date +%s) + 10))
+until tail -n +"$((power_mark + 1))" "$POWER_LOG" | grep -q "^Reboot True pid=$MANAGER_PID$" || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+boot_calls=$(tail -n +"$((power_mark + 1))" "$POWER_LOG")
+{ [ "$(printf '%s\n' "$boot_calls" | sed -n 1p)" = "SetRebootToBootLoaderMenu 60000000 pid=$(bus_pid "$END_SHELL")" ] &&
+    [ "$(printf '%s\n' "$boot_calls" | sed -n 2p)" = "Reboot True pid=$MANAGER_PID" ]; } ||
+    fail G-END-SESSION-BOOT-OPTIONS "Boot Options did not set the boot loader menu before the manager's Reboot: $boot_calls"
+end_bus signal ConfirmedReboot || fail G-END-SESSION-BOOT-OPTIONS "Boot Options emitted no ConfirmedReboot"
+pass G-END-SESSION-BOOT-OPTIONS "holding Alt swaps Restart for Boot Options (not on Power Off…), which sets logind's 60 s boot loader menu before the manager's Reboot(true)"
 
 # Log Out…'s confirmation ends the session, so it runs last (below).
 end_session_gate G-END-SESSION-LOGOUT logout "Log Out…" Logout 0 "logged out" ""
