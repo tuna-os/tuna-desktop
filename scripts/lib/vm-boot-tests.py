@@ -3152,6 +3152,31 @@ class TourViewPredicates(unittest.TestCase):
                 Path(recorder.dir) / "f000000.png"))
             recorder.close()
 
+    def test_a_slow_decode_of_a_still_captured_in_time_does_not_miss_the_view(self):
+        # CI runs 43217494460, 43244398470: the switcher was ready and its
+        # still captured inside the 10 s view, but ffmpeg got only the
+        # leftover milliseconds to decode it (TimeoutExpired).
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        pixels = tour_frame(self.NAVY, self.SWITCHER)
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(
+                header + pixels if args["format"] == "ppm" else tour_png(pixels))
+        now = [0.0]
+        real_run = lane.subprocess.run
+        def slow_decode(argv, **kwargs):
+            if argv[0] == "ffmpeg":
+                now[0] += 20.0
+            return real_run(argv, **kwargs)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(lane.time, "monotonic", lambda: now[0]), \
+                patch.object(lane.subprocess, "run", slow_decode):
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=5, settle=0))
+            receipt = recorder.still_confirmations["alt-tab"]
+            self.assertTrue(receipt["evidence"]["within_deadline"])
+            self.assertTrue(receipt["evidence"]["exact_png"])
+            recorder.close()
+
     def test_exact_overview_png_is_confirmed_without_changing_calibrated_floors(self):
         pixels = tour_frame(self.GREY, [(180, 108, 1100, 660, self.NAVY),
                                        (440, 420, 840, 670, self.WHITE)])

@@ -183,7 +183,13 @@ class FprintdMock(unittest.TestCase):
         context = GLib.MainContext.default()
 
         def pump_for(count):
-            return wait_until(lambda: context.iteration(False) or len(signals) >= count)
+            # Dispatching any event is not the condition: wait for the
+            # signal count itself (a dispatched reply used to end the wait
+            # before the signal arrived).
+            def arrived():
+                context.iteration(False)
+                return len(signals) >= count
+            return wait_until(arrived)
 
         self.assertEqual(self.refused(owner, "VerifyStart", GLib.Variant("(s)", ("any",))),
                          "net.reactivated.Fprint.Error.ClaimDevice")
