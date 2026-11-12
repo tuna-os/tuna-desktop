@@ -15,42 +15,50 @@
 #include <time.h>
 #include "pointer-constraints-client.h"
 #include "relative-pointer-client.h"
-#include "layer-shell-client.h"
+#include "xdg-shell-client.h"
 
-/* CI-only ordinary session client. No shell control or privileged globals. */
+/* CI-only ordinary session client. No shell control or privileged globals.
+ * Ordinary clients cannot bind layer-shell (#1048), so the principal is a
+ * fullscreen xdg_toplevel: at the primary output's origin its surface-local
+ * coordinates equal global ones, and the 64x64 constraint region keeps its
+ * output-relative top-left place. */
 static struct wl_display *display;
 static struct wl_compositor *compositor;
 static struct wl_shm *shm;
 static struct wl_seat *seat;
 static struct wl_pointer *pointer;
 static struct wl_surface *surface;
-static struct zwlr_layer_shell_v1 *layers;
-static struct zwlr_layer_surface_v1 *layer;
+static struct xdg_wm_base *wm_base;
+static struct xdg_surface *xsurface;
+static struct xdg_toplevel *toplevel;
+static struct wl_buffer *shm_buffer;
 static struct zwp_pointer_constraints_v1 *constraints;
 static struct zwp_relative_pointer_manager_v1 *relative_manager;
 static struct zwp_relative_pointer_v1 *relative;
 static struct zwp_locked_pointer_v1 *locked;
 static struct zwp_confined_pointer_v1 *confined;
 static unsigned configured, entered, enter_count, leave_count, motions;
+static int32_t pending_w, pending_h;
+static unsigned pending_fullscreen, fullscreen, buffer_w, buffer_h;
 static unsigned locks, unlocks, confines, unconfines, receipts;
 static double pointer_x, pointer_y;
 static int mode, running = 1;
 static char socket_path[108];
 static struct { double dx, dy, ux, uy; uint64_t time; } events[128];
-static struct { uint32_t serial, width, height; } configure_events[16];
+static struct { uint32_t serial, width, height, chosen_w, chosen_h, fullscreen; } configure_events[64];
 
 static void die(const char *message) { perror(message); exit(1); }
 static uint32_t id(void *proxy) { return proxy ? wl_proxy_get_id(proxy) : 0; }
 static void snapshot(char *buffer, size_t capacity) {
  int n = snprintf(buffer, capacity,
- "{\"pid\":%ld,\"uid\":%ld,\"configured\":%u,\"entered\":%u,\"enter_count\":%u,\"leave_count\":%u,\"motions\":%u,\"local\":[%.17g,%.17g],\"locked\":%u,\"unlocked\":%u,\"confined\":%u,\"unconfined\":%u,\"mode\":%d,\"surface_id\":%u,\"pointer_id\":%u,\"relative_id\":%u,\"constraint_id\":%u,\"globals\":{\"compositor\":%u,\"shm\":%u,\"seat\":%u,\"layer_shell\":%u,\"constraints\":%u,\"relative_manager\":%u},\"buffer_size\":[%u,%u],\"configure_events\":[",
+ "{\"pid\":%ld,\"uid\":%ld,\"configured\":%u,\"entered\":%u,\"enter_count\":%u,\"leave_count\":%u,\"motions\":%u,\"local\":[%.17g,%.17g],\"locked\":%u,\"unlocked\":%u,\"confined\":%u,\"unconfined\":%u,\"mode\":%d,\"surface_id\":%u,\"pointer_id\":%u,\"relative_id\":%u,\"constraint_id\":%u,\"globals\":{\"compositor\":%u,\"shm\":%u,\"seat\":%u,\"wm_base\":%u,\"constraints\":%u,\"relative_manager\":%u},\"fullscreen\":%u,\"buffer_size\":[%u,%u],\"configure_events\":[",
  (long)getpid(), (long)getuid(), configured, entered, enter_count, leave_count, motions, pointer_x, pointer_y,
  locks, unlocks, confines, unconfines, mode, id(surface), id(pointer), id(relative), id(locked ? (void *)locked : (void *)confined),
- id(compositor), id(shm), id(seat), id(layers), id(constraints), id(relative_manager), configured ? 128u : 0u, configured ? 128u : 0u);
+ id(compositor), id(shm), id(seat), id(wm_base), id(constraints), id(relative_manager), fullscreen, buffer_w, buffer_h);
  if (n < 0 || (size_t)n >= capacity) die("snapshot bound");
  size_t used = (size_t)n;
  for (unsigned i = 0; i < configured; i++) {
-  n = snprintf(buffer + used, capacity - used, "%s{\"serial\":%u,\"raw\":[%u,%u],\"chosen\":[128,128]}", i ? "," : "", configure_events[i].serial, configure_events[i].width, configure_events[i].height);
+  n = snprintf(buffer + used, capacity - used, "%s{\"serial\":%u,\"raw\":[%u,%u],\"chosen\":[%u,%u],\"fullscreen\":%u}", i ? "," : "", configure_events[i].serial, configure_events[i].width, configure_events[i].height, configure_events[i].chosen_w, configure_events[i].chosen_h, configure_events[i].fullscreen);
   if (n < 0 || (size_t)n >= capacity - used) die("snapshot configure bound");
   used += (size_t)n;
  }
@@ -116,7 +124,7 @@ static void global(void *d, struct wl_registry *registry, uint32_t name, const c
   seat = wl_registry_bind(registry,name,&wl_seat_interface,7);
   wl_seat_add_listener(seat,&seat_listener,NULL);
  }
- else BIND(zwlr_layer_shell_v1,layers,4)
+ else BIND(xdg_wm_base,wm_base,1)
  else BIND(zwp_pointer_constraints_v1,constraints,1)
  else BIND(zwp_relative_pointer_manager_v1,relative_manager,1)
  #undef BIND
@@ -127,34 +135,46 @@ static void shm_format(void *d, struct wl_shm *s, uint32_t format) { (void)d;(vo
 static const struct wl_shm_listener shm_listener = { shm_format };
 static void buffer_release(void *d, struct wl_buffer *b) { (void)d;(void)b; }
 static const struct wl_buffer_listener buffer_listener = { buffer_release };
-static void configure(void *d, struct zwlr_layer_surface_v1 *l, uint32_t serial, uint32_t w, uint32_t h) {
+static void ping(void *d, struct xdg_wm_base *b, uint32_t serial) { (void)d; xdg_wm_base_pong(b,serial); }
+static const struct xdg_wm_base_listener wm_base_listener = { .ping = ping };
+static void toplevel_configure(void *d, struct xdg_toplevel *t, int32_t w, int32_t h, struct wl_array *states) {
+ (void)d; (void)t;
+ if (w < 0 || h < 0 || w > 8192 || h > 8192) { errno = EPROTO; die("actual configured size bound"); }
+ pending_w = w; pending_h = h; pending_fullscreen = 0;
+ uint32_t *state;
+ wl_array_for_each(state, states) if (*state == XDG_TOPLEVEL_STATE_FULLSCREEN) pending_fullscreen = 1;
+}
+static void toplevel_close(void *d, struct xdg_toplevel *t) { (void)d;(void)t;die("actual toplevel close requested"); }
+static const struct xdg_toplevel_listener toplevel_listener = { .configure = toplevel_configure, .close = toplevel_close };
+static void attach_buffer(uint32_t w, uint32_t h) {
+ size_t stride = (size_t)w * 4, size = stride * h;
+ int fd = memfd_create("tuna-vm-constraint-buffer",MFD_CLOEXEC);
+ if (fd < 0 || ftruncate(fd,(off_t)size)) die("actual shm buffer");
+ uint32_t *pixels = mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+ if (pixels == MAP_FAILED) die("mmap");
+ for (size_t i=0;i<(size_t)w*h;i++) pixels[i]=0xff203040;
+ struct wl_shm_pool *pool=wl_shm_create_pool(shm,fd,(int32_t)size);
+ struct wl_buffer *next=wl_shm_pool_create_buffer(pool,0,(int32_t)w,(int32_t)h,(int32_t)stride,WL_SHM_FORMAT_ARGB8888);
+ wl_buffer_add_listener(next,&buffer_listener,NULL);
+ wl_surface_attach(surface,next,0,0);wl_surface_damage(surface,0,0,(int32_t)w,(int32_t)h);
+ wl_shm_pool_destroy(pool);munmap(pixels,size);close(fd);
+ if (shm_buffer) wl_buffer_destroy(shm_buffer);
+ shm_buffer = next; buffer_w = w; buffer_h = h;
+}
+static void surface_configure(void *d, struct xdg_surface *x, uint32_t serial) {
  (void)d;
- // Layer-shell zero dimensions explicitly leave the choice to the client.
- // Keep the actual requested/buffer geometry fixed at 128; reject every
- // nonzero suggestion that would change this principal's test geometry.
- if ((w && w != 128) || (h && h != 128)) {
-  fprintf(stderr,"actual configured dimensions: %u,%u\n",w,h);
-  errno = EPROTO; die("actual configured size");
- }
- if (configured >= 16) { errno = EOVERFLOW; die("actual configure receipt bound"); }
- configure_events[configured].serial=serial;configure_events[configured].width=w;configure_events[configured].height=h;
- zwlr_layer_surface_v1_ack_configure(l,serial);
- if (!configured) {
-  int fd = memfd_create("tuna-vm-constraint-buffer",MFD_CLOEXEC);
-  if (fd < 0 || ftruncate(fd,128*128*4)) die("actual shm buffer");
-  uint32_t *pixels = mmap(NULL,128*128*4,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
-  if (pixels == MAP_FAILED) die("mmap");
-  for (int i=0;i<128*128;i++) pixels[i]=0xff203040;
-  struct wl_shm_pool *pool=wl_shm_create_pool(shm,fd,128*128*4);
-  struct wl_buffer *buffer=wl_shm_pool_create_buffer(pool,0,128,128,128*4,WL_SHM_FORMAT_ARGB8888);
-  wl_buffer_add_listener(buffer,&buffer_listener,NULL);
-  wl_surface_attach(surface,buffer,0,0);wl_surface_damage(surface,0,0,128,128);
-  wl_shm_pool_destroy(pool);munmap(pixels,128*128*4);close(fd);
- }
+ // A zero dimension leaves the choice to the client; keep the former
+ // 128 test geometry there. Fullscreen configures name the output size.
+ uint32_t w = pending_w ? (uint32_t)pending_w : 128u, h = pending_h ? (uint32_t)pending_h : 128u;
+ if (configured >= 64) { errno = EOVERFLOW; die("actual configure receipt bound"); }
+ configure_events[configured].serial=serial;configure_events[configured].width=(uint32_t)pending_w;configure_events[configured].height=(uint32_t)pending_h;
+ configure_events[configured].chosen_w=w;configure_events[configured].chosen_h=h;configure_events[configured].fullscreen=pending_fullscreen;
+ xdg_surface_ack_configure(x,serial);
+ fullscreen = pending_fullscreen;
+ if (w != buffer_w || h != buffer_h) attach_buffer(w,h);
  configured++;wl_surface_commit(surface);
 }
-static void closed(void *d, struct zwlr_layer_surface_v1 *l) { (void)d;(void)l;die("actual layer admission closed"); }
-static const struct zwlr_layer_surface_v1_listener layer_listener = {configure,closed};
+static const struct xdg_surface_listener xsurface_listener = { .configure = surface_configure };
 static int allowed(const char *command) {
  return !strcmp(command,"status")||!strcmp(command,"lock")||!strcmp(command,"confine")||!strcmp(command,"destroy")||!strcmp(command,"empty")||!strcmp(command,"restore")||!strcmp(command,"quit");
 }
@@ -204,15 +224,16 @@ int main(int argc,char **argv) {
  if(bind(control,(struct sockaddr*)&address,sizeof(address))||listen(control,1))die("unique session control bind");
  display=wl_display_connect(NULL);if(!display)die("actual Wayland connect");
  struct wl_registry *registry=wl_display_get_registry(display);wl_registry_add_listener(registry,&registry_listener,NULL);
- if(wl_display_roundtrip(display)<0||!compositor||!shm||!seat||!layers||!constraints||!relative_manager)die("actual globals");
+ if(wl_display_roundtrip(display)<0||!compositor||!shm||!seat||!wm_base||!constraints||!relative_manager)die("actual globals");
+ xdg_wm_base_add_listener(wm_base,&wm_base_listener,NULL);
  if(wl_display_roundtrip(display)<0||!pointer)die("actual seat pointer");
  surface=wl_compositor_create_surface(compositor);
  relative=zwp_relative_pointer_manager_v1_get_relative_pointer(relative_manager,pointer);zwp_relative_pointer_v1_add_listener(relative,&relative_listener,NULL);
- layer=zwlr_layer_shell_v1_get_layer_surface(layers,surface,NULL,ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,"tuna-vm-constraints");
- zwlr_layer_surface_v1_add_listener(layer,&layer_listener,NULL);
- zwlr_layer_surface_v1_set_size(layer,128,128);zwlr_layer_surface_v1_set_anchor(layer,ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP|ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
- /* Ordinary layer protocol: extend this test overlay to its anchored edges. */
- zwlr_layer_surface_v1_set_exclusive_zone(layer,-1);zwlr_layer_surface_v1_set_keyboard_interactivity(layer,ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);wl_surface_commit(surface);
+ xsurface=xdg_wm_base_get_xdg_surface(wm_base,surface);xdg_surface_add_listener(xsurface,&xsurface_listener,NULL);
+ toplevel=xdg_surface_get_toplevel(xsurface);xdg_toplevel_add_listener(toplevel,&toplevel_listener,NULL);
+ xdg_toplevel_set_app_id(toplevel,"tuna-vm-constraints");xdg_toplevel_set_title(toplevel,"tuna-vm-constraints");
+ /* Ordinary fullscreen request before the first commit: no layer role. */
+ xdg_toplevel_set_fullscreen(toplevel,NULL);wl_surface_commit(surface);
  time_t deadline=time(NULL)+300;
  while(running&&time(NULL)<deadline) {
   while(wl_display_prepare_read(display)!=0)if(wl_display_dispatch_pending(display)<0)die("actual dispatch pending");
@@ -232,5 +253,5 @@ int main(int argc,char **argv) {
   }
  }
  if(running)die("actual client duration bound");
- zwlr_layer_surface_v1_destroy(layer);wl_surface_destroy(surface);wl_display_flush(display);wl_display_disconnect(display);close(control);unlink(socket_path);return 0;
+ xdg_toplevel_destroy(toplevel);xdg_surface_destroy(xsurface);wl_surface_destroy(surface);if(shm_buffer)wl_buffer_destroy(shm_buffer);wl_display_flush(display);wl_display_disconnect(display);close(control);unlink(socket_path);return 0;
 }
