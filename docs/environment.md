@@ -248,7 +248,7 @@ a private `XDG_RUNTIME_DIR`; it unsets `DISPLAY`, `WAYLAND_DISPLAY`,
 |---|---|---|
 | `TUNA_LOCAL_SRC` | `packaging/arch/PKGBUILD:5-7`, `:65-70` | Build the Arch package from this checkout instead of fetching the release tag: `TUNA_LOCAL_SRC="$PWD" makepkg -f --dir packaging/arch`. |
 | `TUNA_PKG`, `TUNA_PKG_SHA256` | `packaging/marlin/Containerfile:18-26` | Build arguments (`--build-arg`), not environment variables: the Arch package file to layer into the Marlin image, and its checksum. |
-| `TUNA_CI_ONLY` | `packaging/marlin/vm-lane/tuna-vm-constraints-build:4` | Must be `1`; stops the CI-only VM layer helper from running anywhere else. |
+| `TUNA_CI_ONLY` | `packaging/marlin/vm-lane/tuna-vm-constraints-build:4` | Must be `1`; stops the CI-only VM pointer-constraint client build from running anywhere else. |
 | `TUNAOS_GDM_DEFAULT_ROOT`, `TUNAOS_GDM_SESSIONS_ROOT`, `TUNAOS_GDM_THEME_ROOT` | `packaging/marlin/vm-lane/tunaos/tuna-gdm-*.sh`, `tuna-hide-other-sessions.sh` | Root directory prefix the VM-lane GDM helpers write under, so tests can run them on a scratch tree. |
 
 ### Proof scripts
