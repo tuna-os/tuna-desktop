@@ -354,9 +354,25 @@ popover.tuna-cal > contents {
   margin-left: 6px;
 }
 
+/* dateMenu.js gives the displays section St's .vfade: its cards fade
+   out towards an edge they continue beyond. GTK draws an undershoot
+   there, 40px deep where St fades over 68px; the gradient ends in the
+   menu's own background. */
+.tuna-cal .datemenu-displays-section > undershoot.top {
+  background: linear-gradient(to bottom, #36363a, rgba(54, 54, 58, 0));
+  box-shadow: none;
+}
+
+.tuna-cal .datemenu-displays-section > undershoot.bottom {
+  background: linear-gradient(to top, #36363a, rgba(54, 54, 58, 0));
+  box-shadow: none;
+}
+
 .tuna-cal .datemenu-today-button,
 .tuna-cal .calendar,
-.tuna-cal .events-button {
+.tuna-cal .events-button,
+.tuna-cal .world-clocks-button,
+.tuna-cal .weather-button {
   border-radius: 12px;
   margin: 4px;
   border: 1px solid transparent;
@@ -493,6 +509,82 @@ popover.tuna-cal > contents {
   font-weight: 400;
   font-size: 0.818em;
   color: #b2b2b4;
+  font-feature-settings: "tnum";
+}
+
+/* GNOME 51's World Clocks and Weather cards (_calendar.scss
+   .world-clocks-button, .weather-button): %card like the events card
+   (12px corners and padding, 4px margin); grid and box spacing ($base_padding
+   6px, twice that between columns) is set where the widgets are built.
+   Text is $fg_color at normal weight unless a rule below says otherwise. */
+.tuna-cal .world-clocks-button,
+.tuna-cal .weather-button {
+  padding: 12px;
+  background-color: #3f3f44;
+  color: #ffffff;
+  font-weight: normal;
+}
+
+/* %card's button states: st-lighten($card_bg_color, 4%) hovered, 9%
+   pressed. */
+.tuna-cal .events-button:hover,
+.tuna-cal .world-clocks-button:hover,
+.tuna-cal .weather-button:hover {
+  background-color: #49494f;
+}
+
+.tuna-cal .events-button:active,
+.tuna-cal .world-clocks-button:active,
+.tuna-cal .weather-button:active {
+  background-color: #55555c;
+}
+
+/* %heading titles in $card_insensitive_fg_color; $fg_color while they
+   ask for clocks or a location. */
+.tuna-cal .world-clocks-header,
+.tuna-cal .weather-header {
+  font-weight: 700;
+  color: #b2b2b4;
+}
+
+.tuna-cal .world-clocks-header.no-world-clocks,
+.tuna-cal .weather-header.no-location {
+  color: #ffffff;
+}
+
+.tuna-cal .weather-header.location {
+  font-weight: normal;
+}
+
+/* Bold tabular times; the offset from local time is a %caption. */
+.tuna-cal .world-clocks-time {
+  font-weight: bold;
+  font-feature-settings: "tnum";
+}
+
+.tuna-cal .world-clocks-timezone {
+  font-weight: 400;
+  font-size: 0.818em;
+  color: #b2b2b4;
+  font-feature-settings: "tnum";
+}
+
+/* A forecast: a %smaller time, a $large_scalable_icon_size (32px) icon
+   with $base_margin under it, and a bold tabular temperature. */
+.tuna-cal .weather-forecast-time {
+  font-weight: 400;
+  font-size: 0.818em;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
+.tuna-cal .weather-forecast-icon {
+  -gtk-icon-size: 32px;
+  margin-bottom: 4px;
+}
+
+.tuna-cal .weather-forecast-temp {
+  font-weight: bold;
   font-feature-settings: "tnum";
 }
 

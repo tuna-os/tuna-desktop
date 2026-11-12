@@ -36,6 +36,7 @@ depends=(
     'gtk4'
     'gtk4-layer-shell'
     'libadwaita'
+    'libgweather-4'
     'libcanberra'
     'libdrm'
     'libinput'

@@ -195,6 +195,15 @@ without the unrelated earlier gates. It adds no target motion or timing
 relaxation. CI runs this slice with its freshly built compositor and shell;
 the no-post-start-motion wire tests establish the precise protocol ordering.
 
+`scripts/tuna-gtk-shell-proof --datemenu-only --artifacts DIR` runs the date
+menu's gates alone, the same functions the full GTK proof calls
+(`scripts/lib/tuna-datemenu-proof.sh`): `G-CAL-OPEN`, `G-CAL-EVENTS`,
+`G-CAL-PREFS`, `G-CAL-LAUNCH`, `G-DATEMENU-WORLD-CLOCKS` and
+`G-DATEMENU-WEATHER`, then the calendar tree's accessibility golden and
+`G-SHELL-STABLE`. It takes about two minutes, one of them waiting for the
+wall clock's next minute to see the world clocks tick. The Weather card is
+fed from `TUNA_WEATHER_FIXTURE`, so the slice needs no network.
+
 Every build uses its own checkout's `target/` (an inherited
 `CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one) and no
 incremental state, with half the host's CPUs as jobs. Builds from every

@@ -1,5 +1,7 @@
 //! GNOME 51's date menu calendar column (dateMenu.js, calendar.js): the
-//! today button, a month grid of round day buttons and the events card.
+//! today button, a month grid of round day buttons and the displays
+//! section (`_displaysSection`): the events, world clocks and weather
+//! cards, which scroll together when the column runs out of screen.
 //! Built to the geometry measured from GNOME Shell 51 (docs/gnome-parity.md).
 
 use std::cell::Cell;
@@ -9,7 +11,17 @@ use gtk::prelude::*;
 use gtk4 as gtk;
 use jiff::civil::Date;
 
+use crate::live_apps::LiveApps;
 use crate::logic;
+use crate::weather::WeatherClient;
+use crate::weather_section::WeatherSection;
+use crate::world_clocks::WorldClocksSection;
+
+/// The least height the displays section keeps on a short monitor.
+const MIN_DISPLAYS_HEIGHT: i32 = 96;
+
+/// The margin around each card (style.css, GNOME's `%card`).
+const CARD_MARGIN: f64 = 4.0;
 
 /// The locale's first weekday, 0 = Sunday, computed the way
 /// gnome-shell's `shell_util_get_week_start` does from glibc.
@@ -43,10 +55,14 @@ pub struct CalendarUi {
     day_label: gtk::Label,
     date_label: gtk::Label,
     month_label: gtk::Label,
+    month: gtk::Box,
     grid: gtk::Grid,
     events_title: gtk::Label,
     events_card: gtk::Button,
     events_list: gtk::Box,
+    displays_section: gtk::ScrolledWindow,
+    world_clocks: Rc<WorldClocksSection>,
+    weather: Rc<WeatherSection>,
     source: std::cell::RefCell<Option<Rc<crate::events::EventSource>>>,
     clock_format: Cell<logic::ClockFormat>,
     week_start: Cell<i8>,
@@ -58,7 +74,7 @@ pub struct CalendarUi {
 }
 
 impl CalendarUi {
-    pub fn new(today: Date) -> Rc<Self> {
+    pub fn new(today: Date, apps: &Rc<LiveApps>) -> Rc<Self> {
         let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
         column.add_css_class("datemenu-calendar-column");
 
@@ -116,7 +132,64 @@ impl CalendarUi {
         events_box.append(&events_title);
         events_box.append(&events_list);
         events.set_child(Some(&events_box));
-        column.append(&events);
+
+        // dateMenu.js `_displaysSection`: the cards in a box
+        // ($base_padding apart) inside a scroll view without a
+        // scrollbar (`St.PolicyType.EXTERNAL`). Its `.vfade` is the
+        // undershoot gradient in style.css.
+        let displays = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        displays.add_css_class("datemenu-displays-box");
+        displays.append(&events);
+        let world_clocks = WorldClocksSection::new(apps);
+        displays.append(&world_clocks.button);
+        let weather = WeatherSection::new(WeatherClient::new(apps));
+        displays.append(&weather.button);
+        // A focused card is scrolled into view below, margin and all.
+        let viewport = gtk::Viewport::builder()
+            .child(&displays)
+            .scroll_to_focus(false)
+            .build();
+        let displays_section = gtk::ScrolledWindow::builder()
+            .child(&viewport)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::External)
+            .propagate_natural_height(true)
+            .build();
+        displays_section.add_css_class("datemenu-displays-section");
+        column.append(&displays_section);
+        // No gap under the month grid while no card shows.
+        let cards: [gtk::Widget; 3] = [
+            events.clone().upcast(),
+            world_clocks.button.clone().upcast(),
+            weather.button.clone().upcast(),
+        ];
+        let sync_section = {
+            let (section, cards) = (displays_section.clone(), cards.clone());
+            move || section.set_visible(cards.iter().any(|card| card.get_visible()))
+        };
+        for card in &cards {
+            let sync_section = sync_section.clone();
+            card.connect_visible_notify(move |_| sync_section());
+        }
+        sync_section();
+        // Keyboard focus brings a card into view with its margin: GTK's
+        // own scrolling stops at the card's edge, which leaves the last
+        // card on the section's edge, under the fade.
+        for card in &cards {
+            let focus = gtk::EventControllerFocus::new();
+            let (section, displays) = (displays_section.clone(), displays.clone());
+            focus.connect_enter(move |focus| {
+                let bounds = focus
+                    .widget()
+                    .and_then(|card| card.compute_bounds(&displays));
+                if let Some(bounds) = bounds {
+                    let top = f64::from(bounds.y()) - CARD_MARGIN;
+                    let bottom = f64::from(bounds.y() + bounds.height()) + CARD_MARGIN;
+                    section.vadjustment().clamp_page(top, bottom);
+                }
+            });
+            card.add_controller(focus);
+        }
 
         let ui = Rc::new(Self {
             column,
@@ -124,10 +197,14 @@ impl CalendarUi {
             day_label,
             date_label,
             month_label,
+            month: calendar,
             grid,
             events_title,
             events_card: events,
             events_list,
+            displays_section,
+            world_clocks,
+            weather,
             source: Default::default(),
             clock_format: Cell::new(logic::ClockFormat::TwentyFourHour),
             week_start: Cell::new(week_start()),
@@ -185,15 +262,37 @@ impl CalendarUi {
         }
     }
 
-    /// Launch the selected day through the same session-aware path as overview apps.
+    /// Launch the selected day through the same session-aware path as
+    /// overview apps; the Clocks and Weather cards activate their apps.
+    /// `close` closes the menu: after a calendar launch, and after any
+    /// click on the other two cards (dateMenu.js `vfunc_clicked`).
     pub fn connect_open(self: &Rc<Self>, close: impl Fn() + 'static) {
+        let close: Rc<dyn Fn()> = Rc::new(close);
         let ui = Rc::downgrade(self);
-        self.events_card.connect_clicked(move |_| {
-            let Some(ui) = ui.upgrade() else { return };
-            if launch_calendar(ui.selected.get()) {
-                close();
-            }
-        });
+        {
+            let close = close.clone();
+            self.events_card.connect_clicked(move |_| {
+                let Some(ui) = ui.upgrade() else { return };
+                if launch_calendar(ui.selected.get()) {
+                    close();
+                }
+            });
+        }
+        self.world_clocks.connect_activated(close.clone());
+        self.weather.connect_activated(close);
+    }
+
+    /// Keep the menu on its monitor. GNOME caps the date menu at the
+    /// work area and only the displays section gives way, by
+    /// scrolling; `available` is the height the column may take.
+    pub fn fit_height(&self, available: i32) {
+        let natural = |widget: &gtk::Widget| widget.measure(gtk::Orientation::Vertical, -1).1;
+        let fixed = natural(self.today_button.upcast_ref())
+            + natural(self.month.upcast_ref())
+            + 2 * self.column.spacing();
+        self.displays_section
+            .set_max_content_height((available - fixed).max(MIN_DISPLAYS_HEIGHT));
+        self.displays_section.vadjustment().set_value(0.0);
     }
 
     /// Take events from GNOME's calendar server.
@@ -208,11 +307,17 @@ impl CalendarUi {
         self.render();
     }
 
-    /// Event times follow GNOME's clock-format.
+    /// Event and forecast times follow GNOME's clock-format.
     pub fn set_clock_format(self: &Rc<Self>, format: logic::ClockFormat) {
         if self.clock_format.replace(format) != format {
             self.render();
+            self.weather.set_clock_format(format);
         }
+    }
+
+    /// The wall clock ticked or its zone moved: the world clocks follow.
+    pub fn clock_tick(&self) {
+        self.world_clocks.tick(self.clock_format.get());
     }
 
     /// Follow the clock: a new day moves "today" (and the selection, if

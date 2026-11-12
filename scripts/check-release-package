@@ -68,7 +68,7 @@ for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus
 done
 
 DEPENDS="$(dpkg-deb -f "$PKG" Depends)"
-for required in 'libgtk4-layer-shell0 (>= 1.1)' 'libgtk-4-1 (>= 4.12)' 'libadwaita-1-0 (>= 1.0)' 'libpam0g' 'gsettings-desktop-schemas' 'gnome-settings-daemon-common'; do
+for required in 'libgtk4-layer-shell0 (>= 1.1)' 'libgtk-4-1 (>= 4.12)' 'libadwaita-1-0 (>= 1.0)' 'libgweather-4-0t64 (>= 4.4) | libgweather-4-0 (>= 4.4)' 'libpam0g' 'gsettings-desktop-schemas' 'gnome-settings-daemon-common'; do
     printf '%s\n' "$DEPENDS" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -Fxq "$required" || fail "missing runtime floor $required"
 done
 # Both PAM conffiles and exact bridge contents/modes were checked in the

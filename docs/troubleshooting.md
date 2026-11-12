@@ -30,7 +30,7 @@ names, and add `git rev-parse HEAD`.
 
 | Symptom | Cause and fix |
 |---|---|
-| `pkg-config` cannot find `libseat`, `libinput`, `libudev`, `gbm`, `libdrm`, `xkbcommon`, `gtk4`, `libadwaita-1`, `libpipewire-0.3` or `gtk4-layer-shell-0` | A development package is missing. Install the list in [Prerequisites](development.md#prerequisites) for your distribution. |
+| `pkg-config` cannot find `libseat`, `libinput`, `libudev`, `gbm`, `libdrm`, `xkbcommon`, `gtk4`, `libadwaita-1`, `gweather4`, `libpipewire-0.3` or `gtk4-layer-shell-0` | A development package is missing. Install the list in [Prerequisites](development.md#prerequisites) for your distribution. |
 | `gtk4-layer-shell-0` is missing on Ubuntu 24.04 | Ubuntu 24.04 does not package it. Build it with `scripts/ci-install-gtk4-layer-shell`, as CI does. The shell needs version 1.1 or later. |
 | The `pipewire` or `libspa` crate's build script fails to find `libclang` | Install `libclang-dev` (Ubuntu) or `clang` (Arch); bindgen needs it at build time. |
 | A dependency says it needs a newer `rustc` | No MSRV is declared and CI uses the current stable toolchain. Run `rustup update stable`. |

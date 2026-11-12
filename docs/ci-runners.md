@@ -532,9 +532,9 @@ for ubuntu in 24.04 26.04; do
     ssh karnataka "sudo k3s ctr -n k8s.io run --rm '$ref' \
       'tuna-runner-smoke-${ubuntu//./-}' /bin/sh -ec '
         pkg-config --exists libseat libinput libudev gbm libdrm xkbcommon \
-          wayland-client gtk4 libadwaita-1 libpipewire-0.3
+          wayland-client gtk4 libadwaita-1 gweather4 libpipewire-0.3
         dpkg-query -W libpam0g-dev libpam-wrapper libgtk-4-dev \
-          libadwaita-1-dev libglib2.0-dev meson xwayland
+          libadwaita-1-dev libgweather-4-dev libglib2.0-dev meson xwayland
         test -x /opt/tuna-ci/job-started.sh
         if [ \"$ubuntu\" = 26.04 ]; then
           pkg-config --atleast-version=1.1 gtk4-layer-shell-0
