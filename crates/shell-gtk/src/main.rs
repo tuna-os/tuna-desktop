@@ -94,6 +94,7 @@ mod ibus_property_menu;
 mod input_sources;
 mod introspect_forward;
 mod kbd_a11y;
+mod kbd_backlight;
 mod keybindings;
 mod live_apps;
 mod location;
@@ -131,6 +132,7 @@ mod providers;
 mod public_search_diagnostic;
 mod removable_media;
 mod renderer;
+mod rfkill;
 mod run_dialog;
 mod screencast;
 mod screensaver;
@@ -1050,6 +1052,7 @@ struct PanelIcons {
     network: gtk::Image,
     location: gtk::Image,
     dnd: gtk::Image,
+    airplane: gtk::Image,
     volume: gtk::Image,
     power_profile: gtk::Image,
     battery: gtk::Box,
@@ -1414,6 +1417,29 @@ fn quick_settings_popover(
     let night = qs_tile("night-light-symbolic", "Night Light", None);
     let dark = qs_tile("dark-mode-symbolic", "Dark Style", None);
     let dnd_tile = qs_tile("notifications-disabled-symbolic", "Do Not Disturb", None);
+    // GNOME 51's Keyboard toggle (status/backlight.js): its menu sets no
+    // header and holds only the brightness slider or the level buttons.
+    let kbd_menu_ui = QsMenu::new(kbd_backlight::ICON, kbd_backlight::TITLE);
+    if let Some(header) = kbd_menu_ui.header_icon.parent() {
+        header.set_visible(false);
+    }
+    let kbd_tile = qs_menu_tile(
+        kbd_backlight::ICON,
+        kbd_backlight::TITLE,
+        None,
+        &kbd_menu_ui,
+    );
+    // `menuButtonAccessibleName`: the arrow is the outer box's last child.
+    if let Some(arrow) = kbd_tile.outer.last_child() {
+        arrow.update_property(&[gtk::accessible::Property::Label(
+            kbd_backlight::MENU_BUTTON_NAME,
+        )]);
+    }
+    let keyboard = kbd_backlight::KeyboardBacklight::new(kbd_tile.clone(), &kbd_menu_ui.section);
+    // GNOME 51's Airplane Mode toggle (status/rfkill.js) and its panel
+    // indicator.
+    let airplane_tile = qs_tile(rfkill::ICON, rfkill::TITLE, None);
+    let airplane = rfkill::Airplane::new(airplane_tile.clone(), icons.airplane);
     // Location services: the GeoClue2 agent behind the panel's in-use
     // indicator. GNOME puts the master switch in Settings, not quick
     // settings, so there is no tile: Settings (and the proof) writes
@@ -1436,6 +1462,10 @@ fn quick_settings_popover(
     for tile in [&night, &dark, &dnd_tile] {
         grid.add(tile, None);
     }
+    // Keyboard, then Airplane Mode, as panel.js adds `_backlight` and
+    // `_rfkill` after Do Not Disturb.
+    grid.add(&kbd_tile, Some(&kbd_menu_ui));
+    grid.add(&airplane_tile, None);
     let (
         wifi_outer,
         wired_outer,
@@ -1487,6 +1517,7 @@ fn quick_settings_popover(
         &wired_menu_ui.revealer,
         &bt_menu_ui.revealer,
         &wwan_menu_ui.revealer,
+        &kbd_menu_ui.revealer,
         &sound_menu_ui.revealer,
     ] {
         {
@@ -1603,6 +1634,8 @@ fn quick_settings_popover(
         brightness,
         brightness_controller: brightness_controller.clone(),
     }));
+    keyboard.attach();
+    airplane.attach();
     // Do Not Disturb drives the shell's notification store (banners
     // held back) and mirrors GNOME's show-banners key.
     let notes_settings = settings(NOTIFICATIONS_SCHEMA).filter(|notes| {
@@ -1674,6 +1707,8 @@ fn quick_settings_popover(
         &night_outer,
         &dark_outer,
         &dnd_outer,
+        &kbd_tile.outer,
+        &airplane_tile.outer,
     ] {
         tile.add_css_class("qs-dimmable");
     }
@@ -2009,6 +2044,9 @@ fn build(app: &adw::Application) {
     let panel_location = status_icon("location-services-active-symbolic", false);
     panel_location.update_property(&[gtk::accessible::Property::Label("Location in use")]);
     let panel_dnd = status_icon("notifications-disabled-symbolic", false);
+    // GNOME 51 rfkill.js `Indicator`: shown while Airplane Mode is on.
+    let panel_airplane = status_icon(rfkill::ICON, false);
+    panel_airplane.update_property(&[gtk::accessible::Property::Label(rfkill::TITLE)]);
     let panel_volume = status_icon("audio-volume-high-symbolic", false);
     let panel_power_profile = status_icon("power-profile-balanced-symbolic", false);
     let panel_battery = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -2152,6 +2190,7 @@ fn build(app: &adw::Application) {
             network: panel_network,
             location: panel_location,
             dnd: panel_dnd,
+            airplane: panel_airplane,
             volume: panel_volume,
             power_profile: panel_power_profile,
             battery: panel_battery,
