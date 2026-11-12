@@ -272,6 +272,100 @@ def profiles(group):
     return result
 
 
+def profile_errors(before, after, definitions):
+    """Name each probe's kprobe_profile loss; never tolerate any miss.
+
+    A p: probe and an r64: probe on one symbol share an aggregated kprobe,
+    and kprobes_inc_nmissed_count() charges a miss to both. An ftrace kprobe
+    misses only when it is hit while kprobe_running() on that CPU, i.e. a
+    re-entry; a return probe can also miss for lack of a free instance.
+    """
+    kinds = {definition.split()[0].split('/', 1)[1]: definition.split(':', 1)[0] for definition in definitions}
+    errors, misses = [], {}
+    for name, original in before.items():
+        current = after.get(name)
+        if not current:
+            errors.append('actual probe profile disappeared during capture: ' + name)
+            continue
+        if current['hits'] < original['hits']:
+            errors.append('actual probe hit counter regressed: ' + name)
+        missed = current['misses'] - original['misses']
+        if missed:
+            misses[name] = missed
+            if kinds.get(name) == 'p':
+                errors.append(f'actual kprobe missed {missed} hit(s): {name} (kprobe_profile; an entry '
+                              'probe misses only when hit while another kprobe handler runs on that CPU)')
+            else:
+                errors.append(f'actual kretprobe missed {missed} hit(s): {name} (kprobe_profile; its shared '
+                              'entry was re-entered or no return instance was free)')
+    return errors, misses
+
+
+TRACE_RECORD = re.compile(r'^\s*(?P<task>.+?)-(?P<pid>[0-9]+)\s+\[(?P<cpu>[0-9]+)\]\s+(?P<flags>\S+)\s+'
+                          r'(?P<ts>[0-9]+\.[0-9]+):\s+(?P<event>[A-Za-z0-9_]+):(?P<rest>.*)$')
+
+
+def locate_reentrant_misses(raw, group, limit=8):
+    """Find vblank timer IRQs whose kprobe record is absent from the trace.
+
+    The hrtimer_expire_entry tracepoint is not a kprobe, so it records the
+    callback even when kprobe_running() made every kprobe inside that IRQ
+    miss. The interrupted task's adjacent records on that CPU identify the
+    probe handler the IRQ re-entered. This locates loss; it repairs nothing.
+    """
+    records = {}
+    for line in raw.decode('utf-8', errors='replace').splitlines():
+        matched = TRACE_RECORD.match(line)
+        if matched:
+            records.setdefault(int(matched['cpu']), []).append(matched)
+    def irq(record):
+        return len(record['flags']) > 2 and record['flags'][2] in 'hHs'
+    def describe(record):
+        return {'event': record['event'], 'task': record['task'], 'pid': int(record['pid']),
+                'timestamp': record['ts'], 'flags': record['flags'], 'irq_context': irq(record),
+                'irqs_disabled': record['flags'][:1] in ('d', 'D')}
+    located = []
+    for cpu in sorted(records):
+        rows = records[cpu]
+        for index, row in enumerate(rows[:-1]):
+            if (row['event'] != 'hrtimer_expire_entry' or 'function=drm_vblank_timer_function' not in row['rest']
+                    or rows[index + 1]['event'] == group + '_timer'):
+                continue
+            interrupted = (row['task'], row['pid'])
+            neighbours = []
+            if index and not irq(rows[index - 1]) and (rows[index - 1]['task'], rows[index - 1]['pid']) == interrupted:
+                neighbours.append(rows[index - 1])
+            after = next((later for later in rows[index + 1:] if not irq(later)), None)
+            if after is not None and (after['task'], after['pid']) == interrupted:
+                neighbours.append(after)
+            handlers = [describe(record) for record in neighbours
+                        if record['event'].startswith(group + '_') and record['flags'][:1] not in ('d', 'D')]
+            located.append({'cpu': cpu, 'irq_timestamp': row['ts'], 'interrupted_task': row['task'],
+                            'interrupted_pid': int(row['pid']),
+                            'next_record': describe(rows[index + 1]),
+                            'interrupted_probe_candidates': handlers,
+                            'process_context_kprobe_reentered': bool(handlers)})
+            if len(located) >= limit:
+                return located
+    return located
+
+
+def reentry_errors(located):
+    errors = []
+    for row in located:
+        if row['process_context_kprobe_reentered']:
+            probes = ', '.join(f"{probe['event']} at {probe['timestamp']}" for probe in row['interrupted_probe_candidates'])
+            errors.append(f"located kprobe re-entry: the drm_vblank_timer_function hardirq on cpu{row['cpu']} at "
+                          f"{row['irq_timestamp']} interrupted {row['interrupted_task']}-{row['interrupted_pid']} "
+                          f"next to its IRQs-enabled process-context probe record ({probes}); the IRQ re-entered a "
+                          "process-context ftrace kprobe handler on the same vCPU, so every kprobe hit inside it was missed")
+        else:
+            errors.append(f"located vblank timer IRQ without its kprobe record on cpu{row['cpu']} at "
+                          f"{row['irq_timestamp']} ({row['interrupted_task']}-{row['interrupted_pid']}); "
+                          "no adjacent process-context probe record identifies the re-entered handler")
+    return errors
+
+
 def validate_trace_fields(raw, group, definitions):
     text = raw.decode('utf-8', errors='strict')
     required = {}
@@ -671,10 +765,12 @@ def stop(watchdog=False):
             for key in ('overrun', 'commit overrun', 'dropped events'):
                 if key not in values or not values[key].isdigit() or int(values[key]) != 0:
                     errors.append('actual trace buffer loss/missing loss field')
-        for name, before in marker['profiles_before'].items():
-            after = result['profiles_after'].get(name)
-            if not after or after['misses'] != before['misses'] or after['hits'] < before['hits']:
-                errors.append('actual probe missed events or counters regressed: ' + name)
+        probe_errors, result['probe_misses'] = profile_errors(
+            marker['profiles_before'], result['profiles_after'], marker['definitions'])
+        errors.extend(probe_errors)
+        if result['probe_misses'] and raw is not None:
+            result['located_reentry'] = locate_reentrant_misses(raw, marker['group'])
+            errors.extend(reentry_errors(result['located_reentry']))
     except Exception as error:
         errors.append(str(error)[:2048])
     result['cleanup_errors'] = cleanup(marker)

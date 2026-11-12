@@ -219,7 +219,12 @@ def retain_kernel_trace(agent, out, metadata):
         (out / 'kernel-vblank-artifact-errors.json').write_text(json.dumps(errors, indent=2))
         raise ValueError('incomplete independent kernel artifacts: ' + json.dumps(errors))
     if metadata.get("qualified_acquisition") is not True or metadata.get("errors") or metadata.get("cleanup_errors"):
-        raise ValueError("kernel observer reports actual loss, missing probes or invalid acquisition")
+        # Name the observer's own reasons (probe misses and their located
+        # re-entry, buffer loss, cleanup) so a refusal is distinguishable
+        # from a transport or acquisition fault.
+        reasons = {key: metadata.get(key) for key in ("errors", "cleanup_errors") if metadata.get(key)}
+        raise ValueError("kernel observer reports actual loss, missing probes or invalid acquisition: "
+                         + json.dumps(reasons, default=str)[:4096])
     if metadata.get("capture_filter") == "actual-native-timer-inventory-v1":
         times = [metadata.get(name) for name in ('discovery_started_monotonic_ns', 'discovery_finished_monotonic_ns', 'filters_ready_monotonic_ns')]
         if not all(type(value) is int for value in times) or not times[0] < times[1] <= times[2] or times[1] - times[0] > 1_000_000_000:
@@ -538,7 +543,10 @@ def main():
     observations, phases, guest_phases, notifications = [], {}, {}, []
     agent = None
     gnome_trace_active = False
-    gnome_start_uncertain = False
+    # Only an acknowledged gnome-trace-start owns a kernel observer to stop:
+    # stock and Tuna sessions never start one, and an uncertain start stays
+    # with its supervised start owner.
+    kernel_observer_started = False
     gnome_trace_summary = None
     tuna_overview_original = None
     tuna_overview_summary = None
@@ -637,9 +645,8 @@ def main():
             time.sleep(8)
         guest_phases["typing_end"] = guest_probe(agent, "clock")["boottime_s"]
         if trace_required(args.desktop, args.gnome_profile):
-            gnome_start_uncertain = True
             guest_probe(agent, "gnome-trace-start", out=out, start_owner=handoff)
-            gnome_start_uncertain = False
+            kernel_observer_started = True
             gnome_trace_active = True
             time.sleep(1)  # Preserve pre-input scopes after the actual drained boundary.
         if args.desktop == 'tuna':
@@ -793,7 +800,7 @@ def main():
                 except Exception:
                     # Fixed diagnostics only; preserve the original metric error.
                     print("GNOME profile cleanup failed", file=sys.stderr)
-            if agent is not None and args.desktop == "gnome" and not gnome_start_uncertain:
+            if agent is not None and kernel_observer_started:
                 try:
                     observer = guest_probe(agent, "kernel-trace-stop")["kernel_trace"]
                     if not (out / "kernel-vblank-source.json").exists():

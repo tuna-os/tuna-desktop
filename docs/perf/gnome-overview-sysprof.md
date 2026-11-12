@@ -137,6 +137,26 @@ The recipe, both patches and package checksum manifest are retained with each
 run, and the original mapped library's installed package identity selects this
 additional diagnostic requirement.
 
+## Kernel vblank observer probe misses
+
+The diagnostic GNOME session also runs `tuna-kernel-trace`, a tracefs observer
+with ftrace kprobes on the DRM vblank path. It refuses any `kprobe_profile` miss,
+and the refusal fails the session. An ftrace kprobe misses when it is hit while
+another kprobe handler runs on the same CPU. The p: and r64: probes on one
+symbol share a kprobe, so one miss counts against both. The vblank hrtimer
+fires in hardirq context. When it lands inside a process-context handler that
+runs with interrupts enabled (`flush`, or `timeout` called from the commit
+worker), every kprobe inside that IRQ is missed. Runs 42807208426 and
+43224217367 each lost one `timer` and one `timeout` hit this way.
+
+The refusal names each missing probe and its miss count. It also locates the
+re-entry: the `hrtimer_expire_entry` tracepoint record that lacks its `timer`
+kprobe record, with the interrupted task's adjacent probe record
+(`located_reentry` in `kernel-vblank-source.json`). Tracepoints cannot replace
+these kprobes. No 7.2.9 tracepoint carries the timer's CRTC identity, interval
+or restart value, the vblank timeout value, or the event pointer, user data or
+timestamp of a sent vblank event.
+
 
 ## Explicit stock and diagnostic benchmark profiles
 
