@@ -30,14 +30,22 @@ starts), just enough of each daemon behind GNOME 51's quick settings:
   brightness file the way the kernel would; the Manager's Suspend,
   SuspendWithFlags, Reboot and PowerOff. Power calls are appended to
   POWER_LOG as "METHOD ARG pid=CALLER_PID", and a suspend emits
-  PrepareForSleep(true) first, as logind does.
+  PrepareForSleep(true) first, as logind does. ListSessions lists this
+  session ($XDG_SESSION_ID, else c1, which GetSessionByPID returns;
+  no GetSession, so GNOME's reference shell monitors no session) with
+  five others: alice's graphical c2, bob's
+  console c3, carol's remote c4, the greeter's c5 and dave's closing c6.
+  CanRebootToBootLoaderMenu answers "yes"; SetRebootToBootLoaderMenu is
+  logged to POWER_LOG like the power calls.
+- AccountsService (opt-in, "accounts"): FindUserByName for this user
+  (RealName "Proof Person") and bob ("Bob Builder"); others are unknown.
 
 - polkit: the Authority's RegisterAuthenticationAgent, recording the
   agent's bus name and object path in $TUNA_STUB_POLKIT_LOG (one line,
   "NAME PATH") so a proof can call the agent's BeginAuthentication.
 
-TUNA_STUB_SERVICES (comma-separated: nm, bluez, ppd, logind, polkit, gdm;
-default all but gdm; gdm answers GNOME Shell's "can lock" probe, the
+TUNA_STUB_SERVICES (comma-separated: nm, bluez, ppd, logind, polkit, gdm,
+accounts; default all but gdm and accounts; gdm answers GNOME Shell's "can lock" probe, the
 display manager's Version, so a reference GNOME session can lock) limits which daemons are served, so a capture can match another
 session's services exactly.
 
@@ -156,6 +164,22 @@ XML = """
       <arg type="s" direction="in"/><arg type="s" direction="in"/>
       <arg type="u" direction="in"/>
     </method>
+    <property name="Id" type="s" access="read"/>
+    <property name="Name" type="s" access="read"/>
+    <property name="Class" type="s" access="read"/>
+    <property name="State" type="s" access="read"/>
+    <property name="Type" type="s" access="read"/>
+    <property name="Remote" type="b" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.Accounts">
+    <method name="FindUserByName">
+      <arg type="s" direction="in"/><arg type="o" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.Accounts.User">
+    <property name="UserName" type="s" access="read"/>
+    <property name="RealName" type="s" access="read"/>
+    <property name="IconFile" type="s" access="read"/>
   </interface>
   <interface name="org.freedesktop.PolicyKit1.Authority">
     <method name="RegisterAuthenticationAgent">
@@ -171,6 +195,12 @@ XML = """
     <method name="SuspendWithFlags"><arg type="t" direction="in"/></method>
     <method name="Reboot"><arg type="b" direction="in"/></method>
     <method name="PowerOff"><arg type="b" direction="in"/></method>
+    <method name="ListSessions"><arg type="a(susso)" direction="out"/></method>
+    <method name="GetSessionByPID">
+      <arg type="u" direction="in"/><arg type="o" direction="out"/>
+    </method>
+    <method name="CanRebootToBootLoaderMenu"><arg type="s" direction="out"/></method>
+    <method name="SetRebootToBootLoaderMenu"><arg type="t" direction="in"/></method>
     <signal name="PrepareForSleep"><arg type="b"/></signal>
   </interface>
 </node>
@@ -211,6 +241,22 @@ BT_DEVICES = [
 ]
 PPD = "/org/freedesktop/UPower/PowerProfiles"
 SESSION = "/org/freedesktop/login1/session/auto"
+ME = os.environ.get("USER") or __import__("pwd").getpwuid(os.getuid()).pw_name
+OWN_SESSION = os.environ.get("XDG_SESSION_ID") or "c1"
+# id, uid, user, seat, path, class, state, type, remote
+SESSIONS = [
+    (OWN_SESSION, os.getuid(), ME, "seat0", SESSION, "user", "active", "wayland", False),
+    ("c2", 1001, "alice", "seat0", "/org/freedesktop/login1/session/c2", "user", "online", "wayland", False),
+    ("c3", 1002, "bob", "seat0", "/org/freedesktop/login1/session/c3", "user", "online", "tty", False),
+    ("c4", 1003, "carol", "", "/org/freedesktop/login1/session/c4", "user", "active", "tty", True),
+    ("c5", 60578, "gdm-greeter", "seat0", "/org/freedesktop/login1/session/c5", "greeter", "online", "wayland", False),
+    ("c6", 1004, "dave", "seat0", "/org/freedesktop/login1/session/c6", "user", "closing", "wayland", False),
+]
+# path, user, real name
+ACCOUNTS = [
+    ("/org/freedesktop/Accounts/User" + str(os.getuid()), ME, "Proof Person"),
+    ("/org/freedesktop/Accounts/User1002", "bob", "Bob Builder"),
+]
 
 # (path, interface) -> {property: GLib.Variant}
 state = {
@@ -275,6 +321,15 @@ state = {
         "State": GLib.Variant("u", 2), "Percentage": GLib.Variant("d", 37.0),
         "TimeToEmpty": GLib.Variant("x", 5400), "TimeToFull": GLib.Variant("x", 1800),
     },
+    **{(path, "org.freedesktop.login1.Session"): {
+        "Id": GLib.Variant("s", sid), "Name": GLib.Variant("s", user),
+        "Class": GLib.Variant("s", cls), "State": GLib.Variant("s", st),
+        "Type": GLib.Variant("s", kind), "Remote": GLib.Variant("b", remote),
+    } for sid, _, user, _, path, cls, st, kind, remote in SESSIONS},
+    **{(path, "org.freedesktop.Accounts.User"): {
+        "UserName": GLib.Variant("s", user), "RealName": GLib.Variant("s", real),
+        "IconFile": GLib.Variant("s", ""),
+    } for path, user, real in ACCOUNTS},
     (PPD, "org.freedesktop.UPower.PowerProfiles"): {
         "ActiveProfile": GLib.Variant("s", "balanced"),
         "Profiles": GLib.Variant("aa{sv}", [
@@ -465,7 +520,20 @@ def method_call(c, sender, path, iface, method, params, invocation):
         set_property(c, None, path, "org.bluez.Device1", "Connected",
                      GLib.Variant("b", method == "Connect"))
         invocation.return_value(None)
-    elif method in ("Suspend", "SuspendWithFlags", "Reboot", "PowerOff"):
+    elif method == "ListSessions":
+        invocation.return_value(GLib.Variant("(a(susso))", (
+            [(sid, uid, user, seat, path) for sid, uid, user, seat, path, *_ in SESSIONS],)))
+    elif method == "GetSessionByPID":
+        invocation.return_value(GLib.Variant("(o)", (SESSION,)))
+    elif method == "CanRebootToBootLoaderMenu":
+        invocation.return_value(GLib.Variant("(s)", ("yes",)))
+    elif method == "FindUserByName":
+        found = [path for path, user, _ in ACCOUNTS if user == params.unpack()[0]]
+        if not found:
+            invocation.return_dbus_error("org.freedesktop.Accounts.Error.Failed", "unknown user")
+            return
+        invocation.return_value(GLib.Variant("(o)", (found[0],)))
+    elif method in ("Suspend", "SuspendWithFlags", "Reboot", "PowerOff", "SetRebootToBootLoaderMenu"):
         if method.startswith("Suspend"):
             c.emit_signal(None, "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
                           "PrepareForSleep", GLib.Variant("(b)", (True,)))
@@ -590,12 +658,16 @@ SERVICES = {
         ("/org/freedesktop/PolicyKit1/Authority", "org.freedesktop.PolicyKit1.Authority"),
     ]),
     "logind": (["org.freedesktop.login1"], [
-        (SESSION, "org.freedesktop.login1.Session"),
+        *[(path, "org.freedesktop.login1.Session") for _, _, _, _, path, *_ in SESSIONS],
         ("/org/freedesktop/login1", "org.freedesktop.login1.Manager"),
+    ]),
+    "accounts": (["org.freedesktop.Accounts"], [
+        ("/org/freedesktop/Accounts", "org.freedesktop.Accounts"),
+        *[(path, "org.freedesktop.Accounts.User") for path, *_ in ACCOUNTS],
     ]),
 }
 wanted = os.environ.get(
-    "TUNA_STUB_SERVICES", ",".join(k for k in SERVICES if k != "gdm")).split(",")
+    "TUNA_STUB_SERVICES", ",".join(k for k in SERVICES if k not in ("gdm", "accounts"))).split(",")
 names = []
 for key in wanted:
     if key not in SERVICES:
