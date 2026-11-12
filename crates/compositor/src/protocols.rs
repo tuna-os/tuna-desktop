@@ -842,9 +842,11 @@ delegate_security_context!(State);
 
 impl State {
     /// Security contexts committed since the last call. The caller puts
-    /// each listener on its event loop and inserts every accepted stream
-    /// with `ClientState::security_context`; the listener is dropped when
-    /// its creator closes the context's close fd.
+    /// each listener on its event loop inside a
+    /// `security_listener::RestingListener` (a failed accept must not end
+    /// the loop, #1071) and inserts every accepted stream with
+    /// `ClientState::security_context`; the listener is dropped when its
+    /// creator closes the context's close fd.
     pub(crate) fn take_security_contexts(
         &mut self,
     ) -> Vec<(SecurityContextListenerSource, SecurityContext)> {

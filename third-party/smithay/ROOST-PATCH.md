@@ -169,6 +169,59 @@ crates/compositor/tests/data_device.rs cover a disconnecting owner and a
 destroyed source. The isolated diff is retained in
 CLIPBOARD-SOURCE-ALIVE-PATCH.diff; the pinned version stays 0.7.0.
 
+Issue #203 changes src/wayland/compositor/handlers.rs: wl_region add and
+subtract with an empty, negative or overflowing rectangle, and
+wl_surface.damage with a negative size (damage_buffer already returned
+early), panicked in
+`Size::new` and took the whole session down (found by the nested stress
+suite's protocol fuzzer). Mutter hands the rectangle to pixman
+(meta-wayland-region.c, mtk_region_union_rectangle), which leaves the
+region unchanged for such a rectangle; the handler now ignores it the same
+way. The stress suite's `bad-region` adversary covers it. The isolated diff
+is retained in REGION-RECT-PATCH.diff; the pinned
+version stays 0.7.0.
+
+Issue #203 also changes src/wayland/shm/handlers.rs: wl_shm_pool.resize
+with a size of zero or less posted the invalid-size error and then went on
+to `NonZeroUsize::try_from(size).unwrap()`, which panicked and took the
+whole session down (found by the deeper, error-aware protocol fuzzer).
+The handler now returns after the error, as libwayland-server's
+shm_pool_resize does. The isolated diff is retained in
+SHM-RESIZE-PATCH.diff; the pinned version stays 0.7.0.
+
+Issue #203 also changes src/wayland/shell/xdg/handlers/surface.rs,
+surface/toplevel.rs and positioner.rs, all found by the deeper protocol
+fuzzer:
+
+- xdg_surface.get_popup accepted any parent, including the popup's own
+  xdg_surface or a second xdg_surface on a surface that already was a
+  popup. The popup then descended from itself and
+  `find_popup_root_surface` (and every other walk up the popup chain)
+  looped forever, hanging the whole session. As Mutter's
+  xdg_surface_constructor_get_popup (meta-wayland-xdg-shell.c), a parent
+  without an xdg role is refused with `invalid_popup_parent`; so is one
+  that descends from the new popup.
+- xdg_toplevel.set_min_size and set_max_size with a negative size panicked
+  in `Size::new`. They now post `invalid_size`, as Mutter's
+  xdg_toplevel_set_min_size and xdg_toplevel_set_max_size do.
+- xdg_positioner.set_parent_size with a negative size panicked the same
+  way. Mutter stores any parent size without an error; a negative one
+  cannot be a `Size`, so it is ignored.
+
+crates/compositor/tests/popups.rs covers the popup parent checks. The
+isolated diff is retained in XDG-SHELL-FUZZ-PATCH.diff; the pinned version
+stays 0.7.0.
+
+Issue #203 also changes src/wayland/compositor/tree.rs: placing a
+subsurface above itself removed it from its parent's child list, then
+inserted past the end and panicked. Both above-self and below-self now
+return an error before changing the list, which the request handler turns
+into `wl_subsurface.bad_surface`. This matches Mutter's `is_sibling`
+and `subsurface_place` in meta-wayland-subsurface.c. A missing child in
+the parent's list likewise returns an error instead of unwrapping.
+The real-client regression in crates/compositor/tests/popups.rs covers
+both requests and confirms another client is still served afterward.
+
 Issue #364 changes src/wayland/shell/xdg/mod.rs: xdg_wm_base is created at
 version 7, as Mutter 51 advertises it (META_XDG_WM_BASE_VERSION). Version 7
 adds only the four xdg_toplevel constrained_* states. A configure keeps
@@ -184,15 +237,17 @@ simultaneous binds and teardown/replacement.
 The same patch validates the locked XML's required request/error boundaries in
 handlers/surface.rs and handlers/surface/toplevel.rs. Nonpositive window
 geometry reports xdg_surface.InvalidSize; negative min/max hints report
-xdg_toplevel.InvalidSize before constructing a Size. Final double-buffered
+xdg_toplevel.InvalidSize before constructing a Size (the #203 check above,
+so that hunk lives in XDG-SHELL-FUZZ-PATCH.diff). Final double-buffered
 min/max relations are checked at commit, not eagerly between valid requests;
 zero maxima remain unbounded. Unknown, consumed or stale configure serials
 report xdg_surface.InvalidSerial on the actual surface. The pinned Mutter
 source instead warns/ignores invalid geometry and handles ACKs differently;
 these XML-required errors are not claimed to match that implementation.
 Socket consumers exercise the exact error target/code and valid double-buffered
-changes, rather than constructing expected enum sets. The isolated diff is
-retained in XDG-WM-BASE-7-PATCH.diff; the pinned version stays 0.7.0.
+changes, rather than constructing expected enum sets. The isolated diff,
+applied after XDG-SHELL-FUZZ-PATCH.diff, is retained in
+XDG-WM-BASE-7-PATCH.diff; the pinned version stays 0.7.0.
 
 Issue #364 additionally changes src/wayland/xdg_foreign/mod.rs and
 handlers.rs: zxdg_exporter_v1 and zxdg_importer_v1 join the v2 globals,

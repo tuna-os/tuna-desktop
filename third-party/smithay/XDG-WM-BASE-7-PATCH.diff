@@ -89,10 +89,10 @@ index 97874352..070acc1c 100644
          XdgShellState {
              known_toplevels: Vec::new(),
 diff --git a/src/wayland/shell/xdg/handlers/surface.rs b/src/wayland/shell/xdg/handlers/surface.rs
-index 3ae3a79e..71575a6f 100644
+index 60343fd9..f78a8cbc 100644
 --- a/src/wayland/shell/xdg/handlers/surface.rs
 +++ b/src/wayland/shell/xdg/handlers/surface.rs
-@@ -121,6 +121,7 @@ where
+@@ -146,6 +146,7 @@ where
                  });
  
                  if initial {
@@ -100,7 +100,7 @@ index 3ae3a79e..71575a6f 100644
                      compositor::add_post_commit_hook::<D, _>(
                          surface,
                          super::super::ToplevelSurface::commit_hook,
-@@ -251,6 +252,15 @@ where
+@@ -293,6 +294,15 @@ where
                          xdg_wm_base::Error::Role,
                          "xdg_surface must have a role of xdg_toplevel or xdg_popup.",
                      );
@@ -116,7 +116,7 @@ index 3ae3a79e..71575a6f 100644
                  }
  
                  compositor::with_states(surface, |states| {
-@@ -310,8 +320,8 @@ where
+@@ -352,8 +362,8 @@ where
                  let configure = match found_configure {
                      Ok(Some(configure)) => configure,
                      Ok(None) => {
@@ -128,36 +128,10 @@ index 3ae3a79e..71575a6f 100644
                          );
                          return;
 diff --git a/src/wayland/shell/xdg/handlers/surface/toplevel.rs b/src/wayland/shell/xdg/handlers/surface/toplevel.rs
-index 17bd3b9b..698b53d8 100644
+index 755c7e2b..a63ec878 100644
 --- a/src/wayland/shell/xdg/handlers/surface/toplevel.rs
 +++ b/src/wayland/shell/xdg/handlers/surface/toplevel.rs
-@@ -118,11 +118,25 @@ where
-                 }
-             }
-             xdg_toplevel::Request::SetMaxSize { width, height } => {
-+                if width < 0 || height < 0 {
-+                    toplevel.post_error(
-+                        xdg_toplevel::Error::InvalidSize,
-+                        "max size width and height must not be negative",
-+                    );
-+                    return;
-+                }
-                 with_toplevel_pending_state(data, |toplevel_data| {
-                     toplevel_data.max_size = (width, height).into();
-                 });
-             }
-             xdg_toplevel::Request::SetMinSize { width, height } => {
-+                if width < 0 || height < 0 {
-+                    toplevel.post_error(
-+                        xdg_toplevel::Error::InvalidSize,
-+                        "min size width and height must not be negative",
-+                    );
-+                    return;
-+                }
-                 with_toplevel_pending_state(data, |toplevel_data| {
-                     toplevel_data.min_size = (width, height).into();
-                 });
-@@ -187,6 +201,38 @@ where
+@@ -205,6 +205,38 @@ where
      }
  }
  
