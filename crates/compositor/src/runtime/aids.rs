@@ -230,7 +230,7 @@ impl Runtime {
 
     /// Keep a Mouse Keys move on some output: the nearest point of the
     /// nearest output when it would leave them all.
-    fn clamp_to_outputs(&self, x: f64, y: f64) -> (f64, f64) {
+    pub(super) fn clamp_to_outputs(&self, x: f64, y: f64) -> (f64, f64) {
         let mut best = (x, y);
         let mut best_distance = f64::INFINITY;
         for output in &self.state.outputs {

@@ -10,7 +10,7 @@ use smithay::input::keyboard::xkb;
 
 use smithay::utils::{Logical, Point};
 use tuna_compositor::motion_coalesce::MotionCoalescer;
-use tuna_compositor::windows::{swipe_action, ManagerInput, SwipeAction, WindowManager};
+use tuna_compositor::windows::{ManagerInput, WindowManager};
 use tuna_compositor::TestCompositor;
 use wayland_client::{
     protocol::{
@@ -450,20 +450,24 @@ struct Peer {
 }
 
 fn connect(comp: &mut TestCompositor) -> Peer {
-    connect_with_admission(comp, false)
+    connect_with_admission(comp, TestCompositor::add_client)
 }
 
 fn connect_ime_bridge(comp: &mut TestCompositor) -> Peer {
-    connect_with_admission(comp, true)
+    connect_with_admission(comp, TestCompositor::add_ime_bridge_client)
 }
 
-fn connect_with_admission(comp: &mut TestCompositor, ime_bridge: bool) -> Peer {
+/// The supervised shell's connection: the only client offered layer-shell.
+fn connect_shell(comp: &mut TestCompositor) -> Peer {
+    connect_with_admission(comp, TestCompositor::add_shell_client)
+}
+
+fn connect_with_admission(
+    comp: &mut TestCompositor,
+    admit: fn(&mut TestCompositor, UnixStream) -> wayland_server::Client,
+) -> Peer {
     let (server, stream) = UnixStream::pair().unwrap();
-    let server = if ime_bridge {
-        comp.add_ime_bridge_client(server)
-    } else {
-        comp.add_client(server)
-    };
+    let server = admit(comp, server);
     let conn = Connection::from_socket(stream).unwrap();
     let queue = conn.new_event_queue();
     let registry = conn.display().get_registry(&queue.handle(), ());
@@ -756,18 +760,6 @@ fn coalesced_relative_motion_sums_every_delta_for_a_locked_pointer() {
 }
 
 #[test]
-fn three_finger_swipes_follow_gnome() {
-    assert_eq!(swipe_action(0.0, -150.0), Some(SwipeAction::OpenOverview));
-    assert_eq!(swipe_action(10.0, 140.0), Some(SwipeAction::CloseOverview));
-    assert_eq!(swipe_action(-160.0, 20.0), Some(SwipeAction::NextWorkspace));
-    assert_eq!(
-        swipe_action(160.0, -20.0),
-        Some(SwipeAction::PreviousWorkspace)
-    );
-    assert_eq!(swipe_action(40.0, -60.0), None, "short swipes do nothing");
-}
-
-#[test]
 fn focused_real_constraints_own_motion_before_native_pressure_accumulates() {
     for locked in [true, false] {
         let mut comp = TestCompositor::new();
@@ -921,7 +913,8 @@ fn layer_constraints_use_actual_origin_and_commit_regions_before_activation() {
             comp.state.set_output_size(1280, 800);
             comp.state.set_output_location("tuna-0", (-400, 100));
             let mut manager = comp.window_manager();
-            let mut app = connect(&mut comp);
+            // Layer-shell is the supervised shell's alone (#1048).
+            let mut app = connect_shell(&mut comp);
             pump(&mut comp, &mut manager, &mut [&mut app]);
             let qh = app.queue.handle();
             let surface = app

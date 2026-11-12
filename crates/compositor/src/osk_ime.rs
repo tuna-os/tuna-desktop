@@ -54,10 +54,10 @@ impl OskIme {
             })
     }
 }
+/// The supervised IBus bridge, outside any security context: the filter
+/// every privileged global shares (#1046).
 fn authorized(client: &Client) -> bool {
-    client
-        .get_data::<ClientState>()
-        .is_some_and(|data| data.ime_bridge)
+    ClientState::privileged(client, |data| data.ime_bridge)
 }
 impl GlobalDispatch<TunaOskInputV1, ()> for State {
     fn bind(

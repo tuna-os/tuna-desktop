@@ -204,17 +204,21 @@ struct Peer {
     registry: WlRegistry,
 }
 fn connect(comp: &mut TestCompositor, trusted: bool) -> Peer {
+    connect_as(
+        comp,
+        if trusted {
+            ClientState::ime_bridge()
+        } else {
+            ClientState::default()
+        },
+    )
+}
+/// A peer whose connection carries exactly `data`.
+fn connect_as(comp: &mut TestCompositor, data: ClientState) -> Peer {
     let (server, stream) = UnixStream::pair().unwrap();
     comp.display
         .handle()
-        .insert_client(
-            server,
-            Arc::new(if trusted {
-                ClientState::ime_bridge()
-            } else {
-                ClientState::default()
-            }),
-        )
+        .insert_client(server, Arc::new(data))
         .unwrap();
     let conn = Connection::from_socket(stream).unwrap();
     let queue = conn.new_event_queue();
@@ -267,6 +271,50 @@ fn virtual_text_is_private_even_when_an_ordinary_client_guesses_the_global() {
     assert!(
         pump(&mut comp, &mut app).is_err(),
         "guessing the name must not grant admission"
+    );
+}
+#[test]
+fn virtual_text_is_refused_inside_a_security_context_whatever_the_bridge_flag() {
+    let mut comp = TestCompositor::new();
+    let mut bridge = connect(&mut comp, true);
+    pump(&mut comp, &mut bridge).unwrap();
+    let global = bridge
+        .state
+        .global
+        .expect("supervised bridge sees virtual input");
+    // No listener admission sets the bridge flag
+    // (`ClientState::security_context`); the filter must refuse a client
+    // inside a context even if one did (#1046).
+    let (creator, _creator_end) = UnixStream::pair().unwrap();
+    let creator = comp
+        .display
+        .handle()
+        .insert_client(creator, Arc::new(ClientState::default()))
+        .unwrap();
+    let mut sandboxed = connect_as(
+        &mut comp,
+        ClientState {
+            ime_bridge: true,
+            security_context: Some(smithay::wayland::security_context::SecurityContext {
+                sandbox_engine: Some("org.flatpak".into()),
+                app_id: Some("org.example.Sandboxed".into()),
+                instance_id: None,
+                creator_client_id: creator.id(),
+            }),
+            ..ClientState::default()
+        },
+    );
+    pump(&mut comp, &mut sandboxed).unwrap();
+    assert!(
+        sandboxed.state.global.is_none(),
+        "a client inside a security context must not discover virtual input"
+    );
+    let _forged: TunaOskInputV1 = sandboxed
+        .registry
+        .bind(global, 1, &sandboxed.queue.handle(), ());
+    assert!(
+        pump(&mut comp, &mut sandboxed).is_err(),
+        "the bridge flag must not admit a client inside a security context"
     );
 }
 #[test]
