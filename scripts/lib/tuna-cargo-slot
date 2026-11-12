@@ -12,9 +12,12 @@ if [ -z "${TUNA_BUILD_SLOT_HELD:-}" ]; then
         case $arg in
             -* | +*) continue ;;
             build | b | test | t | check | c | clippy | rustc | doc | d | bench | install | llvm-cov)
-                export TUNA_BUILD_SLOT_HELD=1
-                exec "$(dirname -- "$(readlink -f -- "$0")")/tuna-semaphore" \
-                    "${TUNA_BUILD_SLOT_BASE:?}" "${TUNA_BUILD_SLOTS:?}" "$real" "$@"
+                export TUNA_BUILD_SLOT_HELD=1 TUNA_SLOT_TIMEOUT="${TUNA_BUILD_TIMEOUT:-60}"
+                helper_dir=$(dirname -- "$(readlink -f -- "$0")")
+                exec "$helper_dir/tuna-semaphore" \
+                    "${TUNA_BUILD_SLOT_BASE:?}" "${TUNA_BUILD_SLOTS:?}" \
+                    "$helper_dir/tuna-timeout" "$TUNA_SLOT_TIMEOUT" \
+                    "proof cargo (TUNA_BUILD_TIMEOUT)" "$real" "$@"
                 ;;
         esac
         break

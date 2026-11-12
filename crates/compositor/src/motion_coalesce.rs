@@ -369,6 +369,7 @@ mod tests {
             },
             ManagerInput::SwipeUpdate {
                 delta: (1.0, 0.0).into(),
+                delta_unaccel: (1.0, 0.0).into(),
                 time: 2,
             },
             ManagerInput::SwipeEnd {
