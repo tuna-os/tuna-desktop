@@ -1,0 +1,29 @@
+#!/bin/sh
+# tuna-pacman-fetch OUT URL — pacman XferCommand for the pinned Arch archive.
+#
+# curl's own --retry covers refused connections, timeouts and HTTP 408/429/5xx.
+# It does not retry a transfer the server cuts off part-way (exit 18, 56 or
+# 92: archive.archlinux.org resets HTTP/2 streams under load), and one such
+# reset failed the whole reference image build. Those are retried here,
+# resuming the partial file. An HTTP error that outlived curl's retries
+# (exit 22, e.g. 404 for a database the snapshot does not carry) is final:
+# pacman expects that answer at once.
+set -u
+[ $# -eq 2 ] || { echo "usage: tuna-pacman-fetch OUT URL" >&2; exit 2; }
+out=$1
+url=$2
+attempts=${TUNA_PACMAN_FETCH_ATTEMPTS:-8}
+delay=${TUNA_PACMAN_FETCH_DELAY:-15}
+n=1
+while :; do
+    curl --fail --location --continue-at - --retry 8 --retry-connrefused \
+        --retry-delay "$delay" --connect-timeout 30 --silent --show-error \
+        --output "$out" "$url"
+    status=$?
+    [ "$status" -eq 0 ] && exit 0
+    [ "$status" -eq 22 ] && exit 22
+    [ "$n" -ge "$attempts" ] && exit "$status"
+    echo "tuna-pacman-fetch: curl exit $status for $url; attempt $n of $attempts, retrying in ${delay}s" >&2
+    n=$((n + 1))
+    sleep "$delay"
+done

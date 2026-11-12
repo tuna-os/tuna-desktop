@@ -1,4 +1,5 @@
-//! Compare the complete native scene before acquiring a scanout buffer.
+//! Compare complete nested/native scenes before submitting a frame or acquiring
+//! a scanout buffer. The shared damage machinery does not require DRM.
 //! Buffer-age history accounts for every intervening submitted frame; global
 //! drawing changes and reset buffers conservatively require a complete paint.
 //! Within one global drawing, the damage tracker takes each element's own

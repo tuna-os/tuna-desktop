@@ -413,6 +413,9 @@ pub struct WindowManager {
     lock_input_active: bool,
     /// Physical holds quarantined at unlock, until their genuine keyup.
     unlock_quarantined: HashSet<Keycode>,
+    /// Unlock found no popup grab to return the keyboard to: the next
+    /// reconcile re-delivers pointer focus, as after a grab.
+    unlock_pointer_refocus: bool,
     /// A touchpad swipe began on the session-lock surface and has not
     /// ended: only its updates and end follow it there.
     lock_swipe: bool,
@@ -714,6 +717,7 @@ impl WindowManager {
             accel_fired: Vec::new(),
             lock_input_active: false,
             unlock_quarantined: HashSet::new(),
+            unlock_pointer_refocus: false,
             lock_swipe: false,
             tablet: tablet_input::TabletFocus::default(),
             menu_requests: Vec::new(),
@@ -1470,16 +1474,21 @@ impl WindowManager {
             .collect();
         state.refresh_ime_cursor_origins();
         // Never pull focus out from under a live grab.
-        if state.take_popup_refocus() && !state.popup_grab_active() {
+        let grabbed = state.popup_grab_active();
+        let popup_refocus = state.take_popup_refocus() && !grabbed;
+        // Unlock already handed the keyboard back without raising
+        // (`unlock_input`); only the pointer is re-delivered here.
+        let unlock_refocus = std::mem::take(&mut self.unlock_pointer_refocus) && !grabbed;
+        if popup_refocus {
             self.restore_keyboard_owner(state);
-            // The grab held pointer focus wherever the pointer went:
-            // re-deliver it where the pointer is now, so the surface it
-            // left hears the leave (a panel button drops its hover).
-            if self.pointer.is_some() {
-                let pos = self.pointer_pos;
-                let time = (crate::state::system_millis() & u64::from(u32::MAX)) as u32;
-                self.pointer_motion(state, pos, time);
-            }
+        }
+        // The grab (or the lock) held pointer focus wherever the pointer
+        // went: re-deliver it where the pointer is now, so the surface it
+        // left hears the leave (a panel button drops its hover).
+        if (popup_refocus || unlock_refocus) && self.pointer.is_some() {
+            let pos = self.pointer_pos;
+            let time = (crate::state::system_millis() & u64::from(u32::MAX)) as u32;
+            self.pointer_motion(state, pos, time);
         }
         let live: Vec<ToplevelSurface> = state.toplevels();
         let mut seen = Vec::with_capacity(live.len());
@@ -4139,10 +4148,14 @@ impl WindowManager {
                     pointer.current_focus().is_some()
                 );
             }
+            let serial = SERIAL_COUNTER.next_serial();
+            if pressed {
+                state.pointer_press_serial = Some(serial);
+            }
             pointer.button(
                 state,
                 &ButtonEvent {
-                    serial: SERIAL_COUNTER.next_serial(),
+                    serial,
                     time,
                     button,
                     state: if pressed {
@@ -4261,6 +4274,12 @@ impl WindowManager {
     /// The authoritative lock-to-session handoff, never a per-frame focus sync.
     /// Clear client-visible holds before entering any session surface, but keep
     /// physical/XKB state until real keyup. Trusted AT runs before this filter.
+    ///
+    /// The keyboard goes back to what had it, as GNOME Shell's `popModal`
+    /// does (screenShield.js locks with a modal stage grab, which revokes
+    /// Mutter's Wayland popup grab without dismissing it): the topmost popup
+    /// of a grab that outlived the lock, else the owner a popup grab hands
+    /// back to (the parked overview, an Exclusive layer, the focused window).
     pub fn unlock_input(&mut self, state: &mut State) {
         if let Some(keyboard) = &self.keyboard {
             self.unlock_quarantined.extend(keyboard.pressed_keys());
@@ -4273,9 +4292,11 @@ impl WindowManager {
         // A popup grab is a logical owner, not a Smithay keyboard grab.
         // Lock input moved actual focus away; restore its deepest surface
         // without dismissing it or stealing focus for the underlying window.
-        let owner = state
-            .popup_grab_surface()
-            .cloned()
+        let grabbed = state.popup_grab_surface().cloned();
+        // No grab to return to: the next reconcile re-delivers pointer
+        // focus as after a grab.
+        self.unlock_pointer_refocus = grabbed.is_none();
+        let owner = grabbed
             .or_else(|| self.overview_held.clone())
             .or_else(|| crate::layer::exclusive_keyboard_layer(state));
         if let Some(surface) = owner {
@@ -4359,10 +4380,14 @@ impl WindowManager {
             } => {
                 if let Some(pointer) = self.pointer.clone() {
                     self.lock_pointer_enter(state, &pointer, surface, time);
+                    let serial = SERIAL_COUNTER.next_serial();
+                    if pressed {
+                        state.pointer_press_serial = Some(serial);
+                    }
                     pointer.button(
                         state,
                         &ButtonEvent {
-                            serial: SERIAL_COUNTER.next_serial(),
+                            serial,
                             time,
                             button,
                             state: if pressed {
