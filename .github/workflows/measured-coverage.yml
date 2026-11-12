@@ -19,8 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.99.1
           components: llvm-tools-preview
@@ -29,7 +31,7 @@ jobs:
         run: |
           . /etc/os-release
           echo "distro=$ID-$VERSION_ID" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           shared-key: measured-coverage-${{ steps.cache-platform.outputs.distro }}
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
@@ -39,7 +41,7 @@ jobs:
           # xwayland: the Xwayland keyboard grab test spawns a real server.
           sudo apt-get install -y libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev pkg-config libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libpam-wrapper libpam0g-dev meson ninja-build libwayland-dev wayland-protocols xwayland
       - name: Check out workflow-owned CI tooling
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v7.0.1
         with:
           repository: ${{ github.repository }}
           ref: ${{ github.workflow_sha }}
@@ -49,13 +51,13 @@ jobs:
           sparse-checkout: |
             /.github/actions/ci-tool/
             /scripts/ci-install-gtk4-layer-shell
-      - uses: ./.ci-workflow-tools/.github/actions/ci-tool
+      - uses: $/.github/actions/ci-tool
         with:
           tool: gtk4-layer-shell
           version: 4867d7b85cdf1e829fc1fd6f1d5f04c42cc99389
       - run: python3 scripts/lib/tuna-coverage-tests.py
       - run: python3 scripts/lib/tuna-security-artifact-tests.py
-      - uses: ./.ci-workflow-tools/.github/actions/ci-tool
+      - uses: $/.github/actions/ci-tool
         with:
           tool: cargo-llvm-cov
           version: 0.9.1
@@ -80,7 +82,7 @@ jobs:
         run: scripts/tuna-coverage-report coverage-artifacts/coverage.json --out coverage-artifacts/coverage-report.md
       - name: Require complete security evidence and executed boundary cases
         run: scripts/tuna-security-artifacts coverage-artifacts
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
           name: measured-test-coverage
