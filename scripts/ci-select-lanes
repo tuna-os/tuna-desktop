@@ -4,9 +4,15 @@
 Usage:
   scripts/ci-select-lanes [--event NAME] [--run-number N] [--size K] [--changed FILE|-]
 
-Prints `lanes=<JSON array>` for $GITHUB_OUTPUT; the reason goes to
-stderr and, when set, $GITHUB_STEP_SUMMARY. The `select-lanes` and `check`
-jobs always run and are not proof lanes.
+Prints `lanes=<JSON array>` and `core_apps=true|false` for $GITHUB_OUTPUT;
+the reason goes to stderr and, when set, $GITHUB_STEP_SUMMARY. The
+`select-lanes` and `check` jobs always run and are not proof lanes.
+
+`core_apps` selects the native Core consumer inside the marlin-vm lane as a
+whole: its image job, every leg and their join run together or not at all.
+Every event but pull_request runs it whenever marlin-vm runs; a pull request
+also needs a change to its source, guest observers or image transport
+(CORE_APPS_SOURCES).
 
 push, schedule and workflow_dispatch run every lane. A pull_request runs
 what its changed files (`git diff --name-only HEAD^1 HEAD` on the merge
@@ -82,6 +88,21 @@ FULL = [
 
 PACKAGE_CONSUMERS = ["arch-package", "portal-security", "remote-security",
                      "niri-parity", "marlin-image", "marlin-vm"]
+
+# What the native Core consumer executes or boots: host driver and leg
+# partition, the shared native observer and guest agent, image admission,
+# and its image layer. Prefix patterns (`*` also matches `/`).
+CORE_APPS_SOURCES = [
+    "scripts/lib/core_apps*",
+    "scripts/lib/vm_native_desktop*",
+    "scripts/lib/vm_guest_agent*",
+    "scripts/lib/vm_strip_*",
+    "scripts/tuna-vm-strip-image*",
+    "packaging/marlin/vm-lane/core-apps*",
+    "packaging/marlin/vm-lane/tuna-core-apps-install*",
+    "packaging/marlin/vm-lane/tuna-native-session*",
+    "packaging/marlin/vm-lane/Containerfile*",
+]
 
 OWNED = [
     ("scripts/tuna-gtk-shell-proof", ["gtk-shell", "journey"]),
@@ -173,6 +194,9 @@ WORKFLOW_JOB_LANE = {
     **{lane: lane for lane in LANES},
     "gdm51-native-package": "marlin-vm",
     "native-reference-context": "marlin-vm",
+    "core-apps-image": "marlin-vm",
+    "core-apps-leg": "marlin-vm",
+    "native-core-apps": "marlin-vm",
 }
 # Jobs that run on every pull request regardless of selection.
 WORKFLOW_ALWAYS_ON_JOBS = {"check", "ci-gate"}
@@ -268,6 +292,13 @@ def select(event, run_number, size, changed, wf_lanes=None):
     return [lane for lane in LANES if lane in chosen], "; ".join(reasons)
 
 
+def core_apps(event, lanes, changed):
+    """Whether the native Core consumer (image, every leg and the join) runs."""
+    if "marlin-vm" not in lanes:
+        return False
+    return event != "pull_request" or any(matches(path, CORE_APPS_SOURCES) for path in changed)
+
+
 def changed_files(source):
     if source == "-":
         return [line for line in sys.stdin.read().splitlines() if line]
@@ -296,7 +327,10 @@ def main():
         wf_lanes = workflow_lanes(*workflow_texts(args.base))
     lanes, reason = select(args.event, args.run_number, args.size, changed, wf_lanes)
     print("lanes=" + json.dumps(lanes, separators=(",", ":")))
-    message = f"ci lanes: {', '.join(lanes) or 'none'}\nreason: {reason}\n"
+    core = core_apps(args.event, lanes, changed)
+    print("core_apps=" + ("true" if core else "false"))
+    message = (f"ci lanes: {', '.join(lanes) or 'none'}\nreason: {reason}\n"
+               f"native Core consumer (image, legs, join): {'selected' if core else 'not selected'}\n")
     sys.stderr.write(message)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:

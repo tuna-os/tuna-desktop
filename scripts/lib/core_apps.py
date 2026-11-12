@@ -12,6 +12,7 @@ import subprocess
 import unicodedata
 import time
 
+import core_apps_legs
 from vm_native_desktop import NativeDesktop
 PLAIN_KEYS = {' ': 'spc', '\n': 'ret', '\r': 'ret', '\t': 'tab', '-': 'minus', '=': 'equal',
               '[': 'bracket_left', ']': 'bracket_right', '\\': 'backslash', ';': 'semicolon',
@@ -182,7 +183,12 @@ def _isolate_preedit_ink(crop):
 
 class Desktop(NativeDesktop):
     def __init__(self, qmp, agent_factory, out, metadata, select_mouse, nonce=None,
-                 auth_records=None, auth_refusal=None):
+                 auth_records=None, auth_refusal=None, *, leg):
+        if leg not in core_apps_legs.LEGS:
+            raise ValueError('declared native Core leg required')
+        self.leg = leg
+        self.assigned = None
+        self.timezone = None
         root = Path(__file__).resolve().parents[2]
         source_members = {
             '/usr/libexec/tuna-core-apps/' + name + '.py':
@@ -968,7 +974,7 @@ class Desktop(NativeDesktop):
         saved_timezone = False
         fixture_attempted = False
         prepared = False
-        timezone = None
+        domains = core_apps_legs.LEGS[self.leg]['domains']
         try:
             prepared = True
             self.inventory = self.guest('desktop', 'prepare')
@@ -988,29 +994,33 @@ class Desktop(NativeDesktop):
                    for app in self.inventory['apps'].values()):
                 raise RuntimeError('actual original Core package versions differ from image installation')
             self.retain('immutable-subject', {'source': self.metadata, 'inventory': self.inventory})
+            # Every installed application belongs to exactly one leg; this boot
+            # owes its own share and the join owes the union.
+            self.assigned = core_apps_legs.partition(self.inventory['apps'])[self.leg]
             for name in ('basic', 'data', 'media', 'system'):
-                importlib.import_module('core_apps_' + name).run(self)
-            original = self.guest('autotz', 'save')
-            saved_timezone = True
-            self.retain('shared-location-original-datetime-settings', original)
-            self.guest('autotz', 'configure', master=False, automatic=False)
-            fixture_attempted = True
-            self.retain('shared-official-geoclue-static-source',
-                        self.guest('autotz', 'fixture-prepare'))
-            endpoint = self.inventory['content_controls']['web']
-            importlib.import_module('core_apps_web').run(
-                self, prepared=endpoint['prepared'], endpoint=endpoint['endpoint'])
-            timezone = importlib.import_module('core_apps_autotz').run(self, manage_fixture=False)
+                if name in domains:
+                    importlib.import_module('core_apps_' + name).run(self)
+            if 'web' in domains:
+                original = self.guest('autotz', 'save')
+                saved_timezone = True
+                self.retain('shared-location-original-datetime-settings', original)
+                self.guest('autotz', 'configure', master=False, automatic=False)
+                fixture_attempted = True
+                self.retain('shared-official-geoclue-static-source',
+                            self.guest('autotz', 'fixture-prepare'))
+                endpoint = self.inventory['content_controls']['web']
+                importlib.import_module('core_apps_web').run(
+                    self, prepared=endpoint['prepared'], endpoint=endpoint['endpoint'])
+                self.timezone = importlib.import_module('core_apps_autotz').run(self, manage_fixture=False)
             observed = {row['app']['app_id'] for row in self._results}
-            if observed != set(self.inventory['apps']) or len(self._results) != len(observed):
+            if observed != set(self.assigned) or len(self._results) != len(observed):
                 raise RuntimeError('required actual installed Core applications remain unqualified')
         except Exception as error:
             failure = error
-            inventory = getattr(self, 'inventory', {}).get('apps', {})
             completed = {row['app']['app_id'] for row in self._results}
             self.retain('incomplete-core-apps-matrix', {
-                'source': self.metadata, 'completed_actual_app_results': self._results,
-                'not_qualified_apps': sorted(set(inventory) - completed),
+                'source': self.metadata, 'leg': self.leg, 'completed_actual_app_results': self._results,
+                'not_qualified_apps': sorted(set(self.assigned or ()) - completed),
                 'failure_type': type(error).__name__, 'unconfirmed_guest_child': self._uncertain,
                 'installed_signed_release_qualified': False})
         finally:
@@ -1047,9 +1057,11 @@ class Desktop(NativeDesktop):
             raise RuntimeError('actual Core matrix incomplete; original failure evidence retained') from failure
         if cleanup_errors:
             raise RuntimeError('actual Core matrix owned fixture restoration failed')
-        result = {'apps': self._results, 'automatic_timezone': timezone,
+        result = {'leg': self.leg, 'assigned_apps': self.assigned, 'apps': self._results,
+                  'automatic_timezone': self.timezone,
                   'source': self.metadata, 'inventory': self.inventory,
                   'installed_signed_release_qualified': False,
-                  'scope': 'actual DEV native operations; not final signed shipped-image qualification'}
+                  'scope': 'actual DEV native operations of one Core leg; not the complete matrix '
+                           'and not final signed shipped-image qualification'}
         self.retain('core-apps-component-results', result)
         return result

@@ -64,12 +64,16 @@ class CoreNativeRouting(unittest.TestCase):
 
     def test_native_profile_rejects_waivers_before_boot(self):
         import sys
-        base = ["tuna-vm-lane", "--profile", "core-apps", "--disk", "original.raw",
+        base = ["tuna-vm-lane", "--profile", "core-apps", "--core-leg", "basic", "--disk", "original.raw",
                 "--require-kvm", "--strip-image", "receipt.json"]
         variants = [base[:-2], [arg for arg in base if arg != "--require-kvm"]]
         variants += [base + flags for flags in (
             ["--tour"], ["--boots", "5"], ["--fresh-accounts"], ["--published"],
             ["--soak", "30"], ["--strip-edge"])]
+        # A Core boot without its leg, an undeclared leg, and a leg on another
+        # profile are refused: no boot may claim the whole matrix or none of it.
+        variants += [base[:3] + base[5:], base[:4] + ["everything"] + base[5:],
+                     ["tuna-vm-lane", "--core-leg", "basic", "--disk", "original.raw"]]
         for argv in variants:
             with self.subTest(argv=argv), patch.object(sys, "argv", argv), \
                     patch.object(lane, "boot") as boot, \
@@ -85,7 +89,7 @@ class CoreNativeRouting(unittest.TestCase):
             receipt.write_text(json.dumps({"commit": "a" * 40, "capture_commit": "a" * 40,
                                           "image_id": "sha256:" + "b" * 64,
                                           "base_image": "base@sha256:" + "c" * 64}))
-            argv = ["tuna-vm-lane", "--profile", "core-apps", "--disk", "original.raw",
+            argv = ["tuna-vm-lane", "--profile", "core-apps", "--core-leg", "web", "--disk", "original.raw",
                     "--out", out, "--require-kvm", "--strip-image", str(receipt)]
             argv += sum((["--meta", key + "=" + value] for key, value in
                          (("commit", "a" * 40), ("test_image_id", "sha256:" + "b" * 64),
@@ -97,11 +101,21 @@ class CoreNativeRouting(unittest.TestCase):
                     patch.object(lane, "gdm_login", return_value=False), \
                     patch.object(lane, "read_text", return_value=""), \
                     patch.object(lane.subprocess, "run", return_value=SimpleNamespace(stdout="QEMU test\n")), \
-                    patch("sys.stderr", io.StringIO()), self.assertRaisesRegex(SystemExit, "V-CORE-APPS"):
+                    patch("sys.stderr", io.StringIO()), self.assertRaisesRegex(SystemExit, "V-CORE-APPS-LEG"):
                 lane.main()
             manifest = json.loads((Path(out) / "manifest.json").read_text())
-            self.assertFalse(manifest["assertions"]["V-CORE-APPS"]["pass"])
-            self.assertEqual(manifest["lane"], "native-core-apps")
+            self.assertFalse(manifest["assertions"]["V-CORE-APPS-LEG"]["pass"])
+            self.assertNotIn("V-CORE-APPS", manifest["assertions"])
+            self.assertEqual(manifest["lane"], "native-core-apps-web")
+            # The failed leg still leaves the receipt the join reads, bound to
+            # the admitted identity and naming no completed application.
+            leg = json.loads((Path(out) / "core-apps-leg.json").read_text())
+            self.assertEqual((leg["leg"], leg["passed"], leg["completed_apps"], leg["assigned_apps"]),
+                             ("web", False, [], None))
+            self.assertEqual(leg["identity"]["commit"], "a" * 40)
+            self.assertEqual(leg["identity"]["image_id"], "sha256:" + "b" * 64)
+            self.assertEqual(leg["automatic_timezone"], {"required": True, "qualified": None})
+            self.assertFalse(leg["assertions"]["V-CORE-APPS-LEG"])
 
 
     def test_root_dispatch_rejects_unowned_request_with_sanitized_core_error(self):

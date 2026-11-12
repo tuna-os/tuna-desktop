@@ -3,6 +3,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import re
 import subprocess
 import unittest
 from pathlib import Path
@@ -69,6 +70,75 @@ class Selection(unittest.TestCase):
             for run in (0, 4, 19):
                 with self.subTest(path=path, run=run):
                     self.assertEqual(pr(path, run=run), ['arch-package', 'marlin-vm'])
+
+
+class CoreApps(unittest.TestCase):
+    """The native Core consumer (image, every leg, join) is selected as one."""
+
+    # The pull-request rule the select-lanes shell applied to the single
+    # core-apps matrix leg before it became parallel legs.
+    BEFORE = re.compile(r'^(scripts/lib/(core_apps|vm_native_desktop|vm_guest_agent|vm_strip_)'
+                        r'|scripts/tuna-vm-strip-image'
+                        r'|packaging/marlin/vm-lane/(core-apps|tuna-core-apps-install|tuna-native-session|Containerfile))')
+    SOURCES = ('scripts/lib/core_apps.py', 'scripts/lib/core_apps_legs.py', 'scripts/lib/core_apps_system.py',
+               'scripts/lib/vm_native_desktop.py', 'scripts/lib/vm_guest_agent.py',
+               'scripts/lib/vm_strip_image.py', 'scripts/lib/vm_strip_acceptance.py', 'scripts/tuna-vm-strip-image',
+               'packaging/marlin/vm-lane/core-apps/web.py', 'packaging/marlin/vm-lane/tuna-core-apps-install',
+               'packaging/marlin/vm-lane/tuna-native-session/native_session.py',
+               'packaging/marlin/vm-lane/Containerfile', 'packaging/marlin/vm-lane/Containerfile.core-apps')
+    OTHERS = ('scripts/tuna-vm-lane', 'scripts/lib/vm_gnome_reference.py', 'packaging/marlin/Containerfile',
+              'packaging/marlin/vm-lane/tuna-vm-lifecycle', 'packaging/marlin/vm-lane/gdm51/Containerfile',
+              'packaging/arch/PKGBUILD', 'share/pam.d/tuna-lock', 'crates/compositor/src/lib.rs',
+              'scripts/lib/core-apps.py', 'docs/vm-lifecycle.md', '.github/workflows/ci.yml',
+              'scripts/tests/test_core_apps_legs.py', 'xscripts/lib/core_apps.py')
+
+    def selected(self, event, *changed, run=0):
+        lanes = m.select(event, run, 2, list(changed))[0]
+        return m.core_apps(event, lanes, list(changed))
+
+    def test_every_event_but_a_pull_request_selects_it_with_marlin_vm(self):
+        for event in ('push', 'schedule', 'workflow_dispatch'):
+            self.assertTrue(self.selected(event))
+            self.assertFalse(m.core_apps(event, ['journey'], []))
+
+    def test_pull_request_selects_it_exactly_when_the_single_leg_was_selected(self):
+        for path in self.SOURCES + self.OTHERS:
+            for run in range(len(m.ROTATION)):
+                lanes = pr(path, run=run)
+                before = 'marlin-vm' in lanes and self.BEFORE.search(path) is not None
+                with self.subTest(path=path, run=run):
+                    self.assertEqual(m.core_apps('pull_request', lanes, [path]), before)
+        for path in self.SOURCES:
+            self.assertTrue(self.selected('pull_request', path), path)
+            self.assertTrue(self.selected('pull_request', 'docs/x.md', path, 'crates/shell/src/lib.rs'), path)
+        # marlin-vm alone (rotated or owned) never selects the Core consumer.
+        rotated = next(run for run in range(len(m.ROTATION)) if 'marlin-vm' in m.rotation(run, 2))
+        self.assertIn('marlin-vm', pr('crates/compositor/src/lib.rs', run=rotated))
+        self.assertFalse(self.selected('pull_request', 'crates/compositor/src/lib.rs', run=rotated))
+        self.assertIn('marlin-vm', pr('scripts/tuna-vm-lane'))
+        self.assertFalse(self.selected('pull_request', 'scripts/tuna-vm-lane'))
+        self.assertEqual(pr('.github/workflows/ci.yml'), m.LANES)
+        self.assertFalse(self.selected('pull_request', '.github/workflows/ci.yml'))
+
+    def test_no_marlin_vm_lane_means_no_core_consumer(self):
+        self.assertFalse(self.selected('pull_request', 'docs/vm-lifecycle.md'))
+        self.assertFalse(m.core_apps('pull_request', [], ['scripts/lib/core_apps.py']))
+        self.assertFalse(m.core_apps('push', [], []))
+
+    def test_command_emits_both_outputs(self):
+        def outputs(*argv, changed=''):
+            result = subprocess.run([str(ROOT / 'scripts/ci-select-lanes'), *argv], input=changed, text=True,
+                                    capture_output=True, check=True, cwd=ROOT,
+                                    env={'PATH': '/usr/bin:/bin'})
+            return dict(line.split('=', 1) for line in result.stdout.splitlines())
+        selected = outputs('--event', 'pull_request', '--changed', '-', changed='scripts/lib/core_apps_legs.py\n')
+        self.assertEqual(selected, {'lanes': '["arch-package","marlin-vm"]', 'core_apps': 'true'})
+        self.assertEqual(outputs('--event', 'pull_request', '--changed', '-', changed='scripts/tuna-vm-lane\n'),
+                         {'lanes': '["arch-package","marlin-vm"]', 'core_apps': 'false'})
+        self.assertEqual(outputs('--event', 'pull_request', '--changed', '-', changed='README.md\n'),
+                         {'lanes': '[]', 'core_apps': 'false'})
+        every = outputs('--event', 'push')
+        self.assertEqual((json.loads(every['lanes']), every['core_apps']), (m.LANES, 'true'))
 
 
     def test_transition_policy_and_suite_always_run_journey(self):
@@ -230,6 +300,21 @@ class WorkflowSync(unittest.TestCase):
         # reference members that native-reference-context downloads are
         # produced on the other events.
         self.assertIn("pull_request", self.jobs["native-reference-context"]["if"])
+
+    def test_core_consumer_jobs_follow_one_selection_inside_the_marlin_vm_lane(self):
+        consumer = ("core-apps-image", "core-apps-leg", "native-core-apps")
+        for name in consumer:
+            self.assertEqual(m.WORKFLOW_JOB_LANE[name], "marlin-vm")
+            self.assertIn("needs.select-lanes.outputs.core_apps == 'true'", self.jobs[name]["if"])
+        self.assertEqual(set(m.WORKFLOW_JOB_LANE), set(self.jobs) - m.WORKFLOW_ALWAYS_ON_JOBS - {"select-lanes"})
+        selector = next(step for step in self.jobs["select-lanes"]["steps"] if step.get("id") == "lanes")["run"]
+        # A draft pull request runs no lane and no Core consumer; every other
+        # case takes both outputs from the script.
+        self.assertIn("echo 'lanes=[]' >> \"$GITHUB_OUTPUT\"\n  echo 'core_apps=false' >> \"$GITHUB_OUTPUT\"", selector)
+        self.assertEqual(selector.count('scripts/ci-select-lanes >> "$GITHUB_OUTPUT"')
+                         + selector.count('--base "$BASE_SHA" >> "$GITHUB_OUTPUT"'), 2)
+        self.assertEqual(selector.count('core_apps='), 1)
+        self.assertNotIn('core', selector.split('primary=', 1)[1])
 
 
 if __name__ == "__main__":

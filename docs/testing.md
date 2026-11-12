@@ -53,6 +53,12 @@ base, and picks the proof lanes the change can affect:
   The slice size is the repository variable `CI_ROUND_ROBIN_SIZE`
   (default 2); each push to a PR covers a different slice and `main` runs
   them all after merge.
+- the native Core consumer inside `marlin-vm` (`core-apps-image`, every
+  `core-apps-leg` and the `native-core-apps` join) is selected as one by the
+  selector's second output, `core_apps`: on a pull request only when
+  `marlin-vm` is selected and the change touches `CORE_APPS_SOURCES` (the
+  host driver, native observer, guest agent, image admission or the Core
+  image layer); on every other event whenever `marlin-vm` runs.
 
 The step summary of `select-lanes` names the chosen lanes and why.
 Independent lanes start after selection, without waiting for workspace
@@ -63,7 +69,9 @@ wait for their producing proof jobs.
 
 `ci-gate` requires both infrastructure jobs to succeed and fails when any
 selected job fails or is cancelled. Only unselected proof lanes may be
-skipped. To run every lane on a branch, dispatch `ci` on it.
+skipped; the `native-core-apps` join in particular must succeed whenever its
+consumer was selected, so a skipped join fails the gate too. To run every
+lane on a branch, dispatch `ci` on it.
 
 ## Native Orca speech proof
 
@@ -698,6 +706,18 @@ Return to close the entry; the Disks journey uses the same helper.
 driver and guest observer unit tests (`scripts/tests/test_core_apps_*.py`,
 `test_vm_native_await.py`, `test_geoclue_agent_policy.py`) run in the CI
 `check` job; they do not qualify any application.
+
+That run also measured the budget: 10 min 46 s of setup, 68 s to a logged-in
+session, then 139 s, 86 s and 173 s for the three completed applications.
+At that pace 28 applications need about 63 minutes, more than the 60-minute
+job allows after setup, so a single boot could not pass even with every
+application working. The consumer now runs as five parallel boots of one
+admitted image, split by domain, and a join job recomputes completeness from
+their receipts before `V-CORE-APPS` is written
+([Required native Core applications](vm-lifecycle.md#required-native-core-applications)).
+The partition, the per-leg share and the join verdict are covered by
+`scripts/tests/test_core_apps_legs.py`, and selection by
+`scripts/lib/ci-select-lanes-tests.py`; the split itself has not yet run in CI.
 
 
 ## Marlin VM lane

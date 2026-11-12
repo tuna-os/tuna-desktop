@@ -36,6 +36,7 @@ jobs:
     outputs:
       lanes: ${{ steps.lanes.outputs.lanes }}
       vm_matrix: ${{ steps.lanes.outputs.vm_matrix }}
+      core_apps: ${{ steps.lanes.outputs.core_apps }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -60,27 +61,27 @@ jobs:
           # pull request is marked ready for review.
           if [ "$DRAFT" = true ]; then
             echo 'lanes=[]' >> "$GITHUB_OUTPUT"
+            echo 'core_apps=false' >> "$GITHUB_OUTPUT"
           elif [ -n "$BASE_SHA" ]; then
             git fetch --no-tags --quiet origin "$BASE_SHA"
             git diff --name-only "$BASE_SHA...HEAD" | scripts/ci-select-lanes --changed - --base "$BASE_SHA" >> "$GITHUB_OUTPUT"
           else
             scripts/ci-select-lanes >> "$GITHUB_OUTPUT"
           fi
-          # marlin-vm legs: a pull request runs the primary lifecycle leg only,
-          # plus the native Core consumer when the change touches its source,
-          # guest observers or image transport; the Orca 51 leg and the paired
-          # GNOME/Tuna references run on main, schedule and dispatch (each leg
-          # rebuilds the image and boots a VM for ~30 hosted minutes).
+          # marlin-vm legs: a pull request runs the primary lifecycle leg only;
+          # the Orca 51 leg and the paired GNOME/Tuna references run on main,
+          # schedule and dispatch (each leg rebuilds the image and boots a VM
+          # for ~30 hosted minutes). The native Core consumer is not a member
+          # of this matrix: scripts/ci-select-lanes emits core_apps for its
+          # image job, parallel legs and join (core-apps-image, core-apps-leg,
+          # native-core-apps), on a pull request only when the change touches
+          # its source, guest observers or image transport.
           primary='{"profile":"lifecycle","orca":"distribution","artifact":"marlin-vm"}'
-          core='{"profile":"core-apps","orca":"distribution","artifact":"native-core-apps"}'
           extra='{"profile":"lifecycle","orca":"upstream51","artifact":"marlin-vm-orca51"},{"profile":"gnome-reference","session":"gnome","orca":"distribution","artifact":"native-gnome51-reference"},{"profile":"tuna-reference","session":"tuna","orca":"distribution","artifact":"native-tuna-reference"}'
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             legs="$primary"
-            if git diff --name-only "$BASE_SHA...HEAD" | grep -Eq '^(scripts/lib/(core_apps|vm_native_desktop|vm_guest_agent|vm_strip_)|scripts/tuna-vm-strip-image|packaging/marlin/vm-lane/(core-apps|tuna-core-apps-install|tuna-native-session|Containerfile))'; then
-              legs="$legs,$core"
-            fi
           else
-            legs="$primary,$core,$extra"
+            legs="$primary,$extra"
           fi
           echo "vm_matrix={\"include\":[$legs]}" >> "$GITHUB_OUTPUT"
 
@@ -174,6 +175,7 @@ jobs:
       - run: python3 scripts/tests/test_core_apps_system.py
       - run: python3 scripts/tests/test_core_apps_web.py
       - run: python3 scripts/tests/test_core_apps_autotz.py
+      - run: python3 scripts/tests/test_core_apps_legs.py
       - run: python3 scripts/tests/test_geoclue_agent_policy.py
       - run: python3 scripts/tests/test_vm_reference_login.py
       - run: python3 scripts/tests/test_gnome_reference_guest.py
@@ -1664,27 +1666,27 @@ jobs:
         with:
           name: gdm51-native-package
           path: gdm51-artifacts
+      # The `&vm-…` run blocks below are reused verbatim by the native Core
+      # jobs (core-apps-image, core-apps-leg), so the image every Core leg
+      # boots is built, admitted and installed exactly as this lane's is.
       - name: Enable KVM
-        run: |
+        run: &vm-enable-kvm |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           ls -la /dev/kvm
       - name: Free disk for the image and the raw disk
-        run: |
+        run: &vm-free-disk |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift
           sudo mkdir -p /mnt/vm && sudo chown "$(id -u):$(id -g)" /mnt/vm
           df -h / /mnt
       - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core zstd
-      - name: Install host IME OCR for the core-apps leg
-        if: matrix.profile == 'core-apps'
-        run: sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-chi-sim
       - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
           cosign-release: v3.1.4
       - name: Resolve and verify the current native media base before product selection
-        if: matrix.profile == 'lifecycle' || matrix.profile == 'core-apps'
-        run: |
+        if: matrix.profile == 'lifecycle'
+        run: &vm-native-base |
           sudo apt-get install -y --no-install-recommends skopeo
           mkdir -p vm-lane-artifacts/native-base
           skopeo inspect --raw docker://ghcr.io/tuna-os/marlin:gnome > vm-lane-artifacts/native-base/index.json
@@ -1723,7 +1725,7 @@ jobs:
             --expected-base-platform "$(cat /mnt/vm/base-digest)" \
             --base-evidence vm-lane-artifacts/native-base --github-output "$GITHUB_OUTPUT"
       - name: Verify the original paired reference base before building or booting
-        if: matrix.profile != 'lifecycle' && matrix.profile != 'core-apps'
+        if: matrix.profile != 'lifecycle'
         run: |
           sudo apt-get install -y --no-install-recommends skopeo
           mkdir -p vm-lane-artifacts/reference-base
@@ -1745,7 +1747,7 @@ jobs:
           python3 scripts/lib/vm_gnome_reference.py verify-base --out vm-lane-artifacts/reference-base
           sudo podman pull --platform linux/amd64 "$platform"
       - name: Build the paired native reference fixture
-        if: matrix.profile != 'lifecycle' && matrix.profile != 'core-apps'
+        if: matrix.profile != 'lifecycle'
         env:
           REFERENCE_SESSION: ${{ matrix.session }}
         run: |
@@ -1758,10 +1760,10 @@ jobs:
           printf '%s\n' sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e8636e44c3f > /mnt/vm/base-digest
           sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id
       - name: Build the Marlin Tuna Desktop image and the VM test layer
-        if: matrix.profile == 'core-apps' || (matrix.profile == 'lifecycle' && steps.native-product.outputs.restored == 'false')
+        if: matrix.profile == 'lifecycle' && steps.native-product.outputs.restored == 'false'
         env:
           PRODUCT_PACKAGE: ${{ steps.native-product.outputs.package_path }}
-        run: |
+        run: &vm-build-fixture |
           sudo podman pull --platform linux/amd64 "ghcr.io/tuna-os/marlin@$(cat /mnt/vm/base-digest)"
           if [[ -n "$PRODUCT_PACKAGE" ]]; then
             cp "$PRODUCT_PACKAGE" ./tuna.pkg.tar.zst
@@ -1775,24 +1777,22 @@ jobs:
             -t localhost/marlin-tuna-preview:ci .
           sudo podman build -f packaging/marlin/vm-lane/Containerfile \
             -t localhost/marlin-tuna-vm:ci .
-          if [[ '${{ matrix.orca }}' == upstream51 ]]; then
-            sudo podman build -f packaging/marlin/vm-lane/orca51/Containerfile \
-              -t localhost/marlin-tuna-vm-orca51:ci .
-            sudo podman tag localhost/marlin-tuna-vm-orca51:ci localhost/marlin-tuna-vm:ci
-            mkdir -p orca51-package-provenance
-            probe_container=$(sudo podman create localhost/marlin-tuna-vm:ci /usr/bin/true)
-            sudo podman cp "$probe_container:/usr/share/tuna-vm-orca51/." orca51-package-provenance/
-            sudo podman rm "$probe_container"
-            sudo chown -R "$(id -u):$(id -g)" orca51-package-provenance
-          fi
-          if [[ '${{ matrix.profile }}' == core-apps ]]; then
-            sudo podman build -f packaging/marlin/vm-lane/Containerfile.core-apps \
-              --build-arg CORE_APPS=1 --build-arg "CORE_APPS_SOURCE_COMMIT=$GITHUB_SHA" \
-              -t localhost/marlin-tuna-vm-core-apps:ci .
-            sudo podman tag localhost/marlin-tuna-vm-core-apps:ci localhost/marlin-tuna-vm:ci
-          fi
-          # Final overlay follows every fixture branch and every Syu.
-          # FROM receives an immutable prior image ID, never a mutable tag.
+      - name: Add the upstream Orca 51 fixture layer
+        if: matrix.profile == 'lifecycle' && steps.native-product.outputs.restored == 'false' && matrix.orca == 'upstream51'
+        run: |
+          sudo podman build -f packaging/marlin/vm-lane/orca51/Containerfile \
+            -t localhost/marlin-tuna-vm-orca51:ci .
+          sudo podman tag localhost/marlin-tuna-vm-orca51:ci localhost/marlin-tuna-vm:ci
+          mkdir -p orca51-package-provenance
+          probe_container=$(sudo podman create localhost/marlin-tuna-vm:ci /usr/bin/true)
+          sudo podman cp "$probe_container:/usr/share/tuna-vm-orca51/." orca51-package-provenance/
+          sudo podman rm "$probe_container"
+          sudo chown -R "$(id -u):$(id -g)" orca51-package-provenance
+      # Final overlay follows every fixture branch and every Syu.
+      # FROM receives an immutable prior image ID, never a mutable tag.
+      - name: Overlay the reference GDM 51 on the final fixture image
+        if: matrix.profile == 'lifecycle' && steps.native-product.outputs.restored == 'false'
+        run: &vm-build-gdm51 |
           mkdir -p vm-lane-artifacts/gdm51
           cp gdm51-artifacts/manifest.json gdm51-artifacts/build-provenance.json vm-lane-artifacts/gdm51/
           prior_image=$(sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}')
@@ -1811,8 +1811,8 @@ jobs:
           trap - EXIT
           sudo chown -R "$(id -u):$(id -g)" vm-lane-artifacts/gdm51
       - name: Inspect the actual final native image without rebuilding it
-        if: matrix.profile == 'lifecycle' || matrix.profile == 'core-apps'
-        run: |
+        if: matrix.profile == 'lifecycle'
+        run: &vm-inspect-image |
           sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id-observed
           scripts/tuna-vm-strip-image --canonical-image-id "$(cat /mnt/vm/image-id-observed)" | tee /mnt/vm/image-id
           mkdir -p vm-lane-artifacts/image-kernels
@@ -1824,20 +1824,21 @@ jobs:
           sudo podman run --rm localhost/marlin-tuna-vm:ci sh -c 'bootc --version; ls -ld /home; ls /usr/lib/bootc/install/ && cat /usr/lib/bootc/install/*' || true
           df -h / /mnt
       - name: Bind installed acceptance to the original package and immutable final image
-        if: matrix.profile == 'lifecycle' || matrix.profile == 'core-apps'
+        if: matrix.profile == 'lifecycle'
         env:
+          IMAGE_FIXTURE: lifecycle
           PRODUCT_PACKAGE: ${{ steps.native-product.outputs.package_path }}
           PRODUCT_COMMIT: ${{ steps.native-product.outputs.product_commit }}
           PRODUCT_ORIGIN: ${{ steps.native-product.outputs.product_origin_path }}
-        run: |
+        run: &vm-bind-image |
           image_id=$(cat /mnt/vm/image-id)
           owned_container="tuna-strip-inspect-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           trap 'sudo podman rm -f "$owned_container" >/dev/null 2>&1 || true' EXIT
-          scripts/tuna-vm-strip-image --fixture '${{ matrix.profile }}' --inspection-program > /mnt/vm/strip-inspect.py
+          scripts/tuna-vm-strip-image --fixture "$IMAGE_FIXTURE" --inspection-program > /mnt/vm/strip-inspect.py
           timeout --kill-after=5s 60s sudo podman run --rm --name "$owned_container" -i \
             --entrypoint /usr/bin/python3 "$image_id" - "$image_id" \
             < /mnt/vm/strip-inspect.py > /mnt/vm/strip-image-observed.json
-          scripts/tuna-vm-strip-image --fixture '${{ matrix.profile }}' \
+          scripts/tuna-vm-strip-image --fixture "$IMAGE_FIXTURE" \
             --package "${PRODUCT_PACKAGE:-tuna.pkg.tar.zst}" \
             --observed /mnt/vm/strip-image-observed.json --commit "${PRODUCT_COMMIT:-$GITHUB_SHA}" \
             --capture-commit "$(git rev-parse HEAD)" --product-origin "$PRODUCT_ORIGIN" \
@@ -1858,7 +1859,7 @@ jobs:
             --package-basename "$PRODUCT_PACKAGE_BASENAME" --product-commit "$PRODUCT_COMMIT" \
             --out /mnt/vm/native-product
       - name: Install the image to a raw disk with bootc
-        run: |
+        run: &vm-bootc-install |
           # Marlin boots with systemd-boot, not bootupd, so it installs
           # on bootc's composefs backend; a sealed composefs root needs
           # fs-verity, which the image's default xfs lacks. Probed from
@@ -1896,16 +1897,6 @@ jobs:
           --meta "tuna_package=$PRODUCT_PACKAGE_BASENAME"
           --meta "commit=$PRODUCT_COMMIT"
           --meta "capture_commit=$(git rev-parse HEAD)"
-      - name: Complete required original native Core applications
-        if: matrix.profile == 'core-apps'
-        run: >-
-          scripts/tuna-vm-lane --profile core-apps --require-kvm --boots 1
-          --disk /mnt/vm/disk.raw --out vm-lane-artifacts
-          --strip-image vm-lane-artifacts/strip-image.json
-          --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
-          --meta "test_image_id=$(cat /mnt/vm/image-id)"
-          --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
-          --meta "commit=${{ github.sha }}"
       - name: Seal real native screenshots and video only after all five boots succeed
         if: matrix.profile == 'lifecycle'
         env:
@@ -1919,7 +1910,7 @@ jobs:
             --expect-image "$(cat /mnt/vm/image-id)" \
             --expect-package "$(sha256sum "$PRODUCT_PACKAGE" | cut -d' ' -f1)"
       - name: Observe the actual paired native switcher member
-        if: matrix.profile != 'lifecycle' && matrix.profile != 'core-apps'
+        if: matrix.profile != 'lifecycle'
         env:
           REFERENCE_PROFILE: ${{ matrix.profile }}
         run: >-
@@ -2007,6 +1998,212 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  # Native Core applications (#397, docs/vm-lifecycle.md). One boot cannot
+  # drive all 28 applications inside a 60-minute job, so the consumer is one
+  # image job, one parallel boot per leg (scripts/lib/core_apps_legs.py) and
+  # a join. Every leg loads the single image built here, so "same source,
+  # package and image" is observed per leg and compared by the join.
+  core-apps-image:
+    name: native-core-apps-image
+    runs-on: ubuntu-26.04
+    needs: [select-lanes, arch-package, gdm51-native-package]
+    if: needs.select-lanes.outputs.core_apps == 'true'
+    timeout-minutes: 45
+    outputs:
+      image_id: ${{ steps.image.outputs.image_id }}
+      package_sha256: ${{ steps.image.outputs.package_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: tuna-arch
+          path: arch-artifacts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: gdm51-native-package
+          path: gdm51-artifacts
+      - name: Free disk for the image and its archive
+        run: *vm-free-disk
+      - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends zstd
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+      - name: Resolve and verify the current native media base
+        run: *vm-native-base
+      - name: Build the Marlin Tuna Desktop image and the VM test layer
+        run: *vm-build-fixture
+      # Only this layer installs the 28 applications and their domain
+      # dependencies; the lifecycle rows never receive it.
+      - name: Add the native Core application layer
+        run: |
+          sudo podman build -f packaging/marlin/vm-lane/Containerfile.core-apps \
+            --build-arg CORE_APPS=1 --build-arg "CORE_APPS_SOURCE_COMMIT=$GITHUB_SHA" \
+            -t localhost/marlin-tuna-vm-core-apps:ci .
+          sudo podman tag localhost/marlin-tuna-vm-core-apps:ci localhost/marlin-tuna-vm:ci
+      - name: Overlay the reference GDM 51 on the final fixture image
+        run: *vm-build-gdm51
+      - name: Inspect the actual final native image without rebuilding it
+        run: *vm-inspect-image
+      # Admitted here first, so a wrong image fails before any leg boots;
+      # every leg repeats this admission on the image it actually loaded.
+      - name: Bind installed acceptance to the original package and immutable final image
+        env:
+          IMAGE_FIXTURE: core-apps
+        run: *vm-bind-image
+      - name: Export the one admitted image for every leg
+        id: image
+        run: |
+          image_id=$(cat /mnt/vm/image-id)
+          mkdir /mnt/vm/core-image
+          sudo podman save --format oci-archive --output /mnt/vm/core-image/image.oci.tar "$image_id"
+          sudo chown "$(id -u):$(id -g)" /mnt/vm/core-image/image.oci.tar
+          cp /mnt/vm/image-id /mnt/vm/base-digest /mnt/vm/core-image/
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          receipt = json.load(open('vm-lane-artifacts/strip-image.json'))
+          print('image_id=' + receipt['image_id'])
+          print('package_sha256=' + receipt['package_sha256'])
+          PY
+          ls -l /mnt/vm/core-image
+          df -h / /mnt
+      # Transport only: the legs of this run load it within the hour.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: native-core-apps-image
+          path: /mnt/vm/core-image/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: native-core-apps-image-evidence
+          path: vm-lane-artifacts/
+          retention-days: 14
+
+  core-apps-leg:
+    # One installed-session boot per leg, each running only its own domains
+    # with every per-application requirement unchanged. Measured in run
+    # 42395487640: about 12 minutes to a logged-in session, then 86-173 s per
+    # application; the largest leg (web: 7 applications and automatic
+    # timezone) needs about 31 of its 60 minutes. A leg states nothing about
+    # the matrix: it uploads a receipt and native-core-apps joins them.
+    name: native-core-apps-${{ matrix.leg }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # scripts/lib/core_apps_legs.py LEGS; the join fails on any difference.
+        leg: [basic, data, media, system, web]
+    runs-on: ubuntu-26.04
+    needs: [select-lanes, core-apps-image]
+    if: needs.select-lanes.outputs.core_apps == 'true'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: tuna-arch
+          path: arch-artifacts
+      - name: Enable KVM
+        run: *vm-enable-kvm
+      - name: Free disk for the image and the raw disk
+        run: *vm-free-disk
+      # tesseract: Desktop.ime() reads the rendered preedit on the host.
+      - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf ffmpeg python3-pil fonts-dejavu-core zstd tesseract-ocr tesseract-ocr-chi-sim
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: native-core-apps-image
+          path: /mnt/vm/core-image
+      - name: Load the one admitted image and require its exact identity
+        run: |
+          expected=$(cat /mnt/vm/core-image/image-id)
+          sudo podman load --input /mnt/vm/core-image/image.oci.tar
+          loaded=$(sudo podman image inspect "$expected" --format '{{.Id}}')
+          test "$(scripts/tuna-vm-strip-image --canonical-image-id "$loaded")" = "$expected"
+          sudo podman tag "$expected" localhost/marlin-tuna-vm:ci
+          rm /mnt/vm/core-image/image.oci.tar
+          cp /mnt/vm/core-image/base-digest /mnt/vm/base-digest
+          cp arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst ./tuna.pkg.tar.zst
+      - name: Inspect the actual loaded native image
+        run: *vm-inspect-image
+      - name: Bind installed acceptance to the original package and immutable final image
+        env:
+          IMAGE_FIXTURE: core-apps
+        run: *vm-bind-image
+      - name: Install the image to a raw disk with bootc
+        run: *vm-bootc-install
+      - name: Complete this leg's original native Core applications
+        env:
+          CORE_LEG: ${{ matrix.leg }}
+        run: >-
+          scripts/tuna-vm-lane --profile core-apps --core-leg "$CORE_LEG" --require-kvm --boots 1
+          --disk /mnt/vm/disk.raw --out vm-lane-artifacts
+          --strip-image vm-lane-artifacts/strip-image.json
+          --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
+          --meta "test_image_id=$(cat /mnt/vm/image-id)"
+          --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
+          --meta "commit=${{ github.sha }}"
+      # The receipt alone is what the join reads; a leg that never wrote one
+      # is a missing leg there.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: native-core-apps-receipt-${{ matrix.leg }}
+          path: vm-lane-artifacts/core-apps-leg.json
+          retention-days: 14
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: native-core-apps-${{ matrix.leg }}
+          path: vm-lane-artifacts/
+          retention-days: 14
+
+  native-core-apps:
+    # The only place V-CORE-APPS is stated. Runs whenever the consumer was
+    # selected, whatever happened to the image job and the legs, and passes
+    # only when every declared leg left a passing receipt from this run, all
+    # receipts name this run's source, package and image and one installed
+    # inventory, and the legs' completed applications are that inventory
+    # exactly. An absent, skipped, cancelled or failed leg fails it.
+    timeout-minutes: 10
+    runs-on: *runner-24
+    needs: [select-lanes, core-apps-image, core-apps-leg]
+    if: ${{ always() && needs.select-lanes.outputs.core_apps == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: native-core-apps-receipt-*
+          path: native-core-apps/legs
+      - name: Join every leg into the complete native Core verdict
+        if: always()
+        env:
+          IMAGE_ID: ${{ needs.core-apps-image.outputs.image_id }}
+          PACKAGE_SHA256: ${{ needs.core-apps-image.outputs.package_sha256 }}
+          IMAGE_RESULT: ${{ needs.core-apps-image.result }}
+          LEGS_RESULT: ${{ needs.core-apps-leg.result }}
+        run: >-
+          python3 scripts/lib/core_apps_legs.py join
+          --receipts native-core-apps/legs --out native-core-apps
+          --commit "$GITHUB_SHA" --image-id "$IMAGE_ID" --package-sha256 "$PACKAGE_SHA256"
+          --run-id "$GITHUB_RUN_ID"
+          --job "core-apps-image=$IMAGE_RESULT" --job "core-apps-leg=$LEGS_RESULT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: native-core-apps
+          path: native-core-apps/
+          if-no-files-found: error
+          retention-days: 14
+
   native-reference-context:
     # Artifact-only consumer of the two DEV members, not another VM producer.
     timeout-minutes: 10
@@ -2047,8 +2244,19 @@ jobs:
     # tests, and every cited cargo test / journey assertion must have
     # passed in this run.
     runs-on: *runner-24
-    needs: [select-lanes, check, journey, gtk-shell, orca-speech, drm-smoke, marlin-vm]
-    if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'parity-ledger')
+    needs: [select-lanes, check, journey, gtk-shell, orca-speech, drm-smoke, marlin-vm, native-core-apps]
+    # Every producer must have passed, as before. The native Core join is
+    # skipped only when its consumer was not selected (select-lanes'
+    # core_apps); selected, it must have passed like the others. The explicit
+    # results replace the implicit success(), which a skipped need fails.
+    if: >-
+      ${{ !cancelled()
+      && needs.select-lanes.result == 'success' && needs.check.result == 'success'
+      && needs.journey.result == 'success' && needs.gtk-shell.result == 'success'
+      && needs.orca-speech.result == 'success' && needs.drm-smoke.result == 'success'
+      && needs.marlin-vm.result == 'success'
+      && needs.native-core-apps.result == (needs.select-lanes.outputs.core_apps == 'true' && 'success' || 'skipped')
+      && contains(fromJSON(needs.select-lanes.outputs.lanes), 'parity-ledger') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -2081,19 +2289,33 @@ jobs:
         with:
           name: marlin-vm
           path: ledger-in/marlin-vm
-      - run: >-
-          scripts/tuna-ledger check --tests ledger-in/test-list.txt
-          --assertions ledger-in/journey/assertions.txt
-          --assertions ledger-in/gtk-shell/assertions.txt
-          --assertions ledger-in/gtk-shell/a11y/assertions.txt
-          --assertions ledger-in/gtk-shell/scale/assertions.txt
-          --assertions ledger-in/gtk-shell/magnifier/assertions.txt
-          --assertions ledger-in/gtk-shell/session-restore/assertions.txt
-          --assertions ledger-in/gtk-shell/osk/assertions.txt
-          --assertions ledger-in/gtk-shell/lock-auth/assertions.txt
-          --assertions ledger-in/orca-speech/assertions.txt
-          --assertions ledger-in/drm-smoke/assertions.txt
-          --assertions ledger-in/marlin-vm/assertions.txt
+      # V-CORE-APPS and its per-leg ids exist only in the join's assertions
+      # file, written as pass only when the whole native Core matrix passed.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        if: needs.select-lanes.outputs.core_apps == 'true'
+        with:
+          name: native-core-apps
+          path: ledger-in/native-core-apps
+      - env:
+          CORE_APPS: ${{ needs.select-lanes.outputs.core_apps }}
+        run: |
+          core=()
+          if [ "$CORE_APPS" = true ]; then
+            core=(--assertions ledger-in/native-core-apps/assertions.txt)
+          fi
+          scripts/tuna-ledger check --tests ledger-in/test-list.txt \
+            --assertions ledger-in/journey/assertions.txt \
+            --assertions ledger-in/gtk-shell/assertions.txt \
+            --assertions ledger-in/gtk-shell/a11y/assertions.txt \
+            --assertions ledger-in/gtk-shell/scale/assertions.txt \
+            --assertions ledger-in/gtk-shell/magnifier/assertions.txt \
+            --assertions ledger-in/gtk-shell/session-restore/assertions.txt \
+            --assertions ledger-in/gtk-shell/osk/assertions.txt \
+            --assertions ledger-in/gtk-shell/lock-auth/assertions.txt \
+            --assertions ledger-in/orca-speech/assertions.txt \
+            --assertions ledger-in/drm-smoke/assertions.txt \
+            --assertions ledger-in/marlin-vm/assertions.txt \
+            "${core[@]}"
 
   docs-shots:
     timeout-minutes: 20
@@ -2133,13 +2355,14 @@ jobs:
   ci-gate:
     timeout-minutes: 10
     # One stable status for the run: lanes the selection skipped report
-    # skipped, any failed or cancelled job fails the gate.
+    # skipped, any failed or cancelled job fails the gate. The native Core
+    # join may be skipped only when its consumer was not selected.
     if: always()
-    needs: [select-lanes, check, fprint-phase-proof, journey, app-content, scroll-proof, drm-smoke, grid-cancel-comparison, gtk-shell, orca-speech, portal-security, remote-security, niri-parity, arch-package, marlin-image, gdm51-native-package, marlin-vm, native-reference-context, parity-ledger, docs-shots]
+    needs: [select-lanes, check, fprint-phase-proof, journey, app-content, scroll-proof, drm-smoke, grid-cancel-comparison, gtk-shell, orca-speech, portal-security, remote-security, niri-parity, arch-package, marlin-image, gdm51-native-package, marlin-vm, core-apps-image, core-apps-leg, native-core-apps, native-reference-context, parity-ledger, docs-shots]
     runs-on: *runner-24
     steps:
       - env:
           RESULTS: ${{ toJSON(needs) }}
         run: |
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$RESULTS"
-          jq -e '.["select-lanes"].result == "success" and .check.result == "success" and all(.[]; .result == "success" or .result == "skipped")' <<<"$RESULTS" >/dev/null
+          jq -e '.["select-lanes"].result == "success" and .check.result == "success" and all(.[]; .result == "success" or .result == "skipped") and (.["select-lanes"].outputs.core_apps != "true" or .["native-core-apps"].result == "success")' <<<"$RESULTS" >/dev/null

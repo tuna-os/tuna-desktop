@@ -27,13 +27,26 @@ and `marlin-vm`/`marlin-vm-orca51` artifact identities.
 
 ## Required native Core applications
 
-Whenever `marlin-vm` is selected, its matrix also requires `native-core-apps`,
-using the original same-run `arch-package` producer. This branch exposes only
-`--profile lifecycle` and `--profile core-apps`: it has no Colour, protocol or
-reference-pair dependency. Full Core does not gate the independently routed
-native AutoTZ clock branch.
+The native Core consumer belongs to the `marlin-vm` lane but is not a member
+of its matrix. `scripts/ci-select-lanes` emits `core_apps`: true whenever
+`marlin-vm` runs on push, schedule and dispatch, and on a pull request only
+when the change also touches the consumer's source, guest observers or image
+transport (`CORE_APPS_SOURCES`). The flag selects three jobs together, using
+the original same-run `arch-package` producer:
 
-The Core row adds `Containerfile.core-apps` after the ordinary fixture layer.
+| Job | What it does |
+|---|---|
+| `core-apps-image` (`native-core-apps-image`) | Builds the one image, admits it, and exports it as an OCI archive with its image ID and base digest |
+| `core-apps-leg` (`native-core-apps-<leg>`) | One boot per leg: loads that archive, requires the exact image ID, repeats the admission, installs it with bootc and runs only its leg |
+| `native-core-apps` | Joins every leg's receipt and is the only place `V-CORE-APPS` is stated |
+
+This branch exposes only `--profile lifecycle` and `--profile core-apps`: it
+has no Colour, protocol or reference-pair dependency. Full Core does not gate
+the independently routed native AutoTZ clock branch.
+
+`core-apps-image` adds `Containerfile.core-apps` after the ordinary fixture
+layer, with the same build, GDM overlay, inspection and admission steps as
+the lifecycle rows (shared `&vm-…` run blocks in `ci.yml`).
 Only that layer installs all 28 original applications and their full domain
 dependencies through the guarded installer, with `CORE_APPS=1` and the actual
 `CORE_APPS_SOURCE_COMMIT`. The installer records the standard UID1000 account
@@ -43,11 +56,43 @@ default GPU, feature tour, fresh-account journeys and aggregate gates.
 Normal preview installation still invokes the packaged GeoClue policy helper
 after package installation, before the fixtures are layered.
 
-Core requires `--require-kvm --boots 1 --strip-image …`, without a tour,
-published-image mode, fresh-account journey or soak. Before QEMU starts the
+### Legs
+
+One boot cannot drive 28 applications inside the VM job's 60 minutes. Run
+42395487640 took 10 min 46 s to set up, 68 s to boot and log in, then 139 s,
+86 s and 173 s for Fonts, Calculator and Image Viewer: about 136 s per
+application with gaps, so 28 need about 63 minutes of the 48 that remain. The
+consumer therefore runs as parallel boots of the same image, split by domain
+(`scripts/lib/core_apps_legs.py`, `LEGS`):
+
+| Leg | Domains | Applications | Expected job time |
+|---|---|---|---|
+| `basic` | basic | Fonts, Calculator, Image Viewer, Document Viewer, Settings | about 23 min |
+| `data` | data | Files, Text Editor, Console, Calendar, Contacts | about 23 min |
+| `media` | media | Audio Player, Music, Video Player, Camera, Document Scanner | about 23 min |
+| `system` | system | Connections, Software, Disks, System Monitor, Logs, Disk Usage Analyzer | about 26 min |
+| `web` | web, autotz | Web, Characters, Maps, Weather, Clocks, Tour, Help, then automatic timezone | about 31 min |
+
+The times are 12 minutes to a logged-in session plus 136 s per application
+(and the timezone domain's bounded waits); at the slowest measured
+application (173 s) the largest leg still needs about 35 minutes. Only three
+applications have been timed, and a leg's setup now loads an archive instead
+of building, so these are estimates until a full run. `web` and `autotz` stay
+in one boot because they share one GeoClue static source and its restoration.
+The job limit is unchanged.
+
+Each leg is `--profile core-apps --core-leg <leg> --require-kvm --boots 1
+--strip-image …`, without a tour, published-image mode, fresh-account journey
+or soak; a Core boot without a declared leg is refused. Before QEMU starts the
 host generates one nonce and one new blank 512 MiB removable USB disk with
-serial `TC397-<nonce[:14]>`; the complete Core consumer receives that same
-nonce. Original system disks and default devices are unchanged.
+serial `TC397-<nonce[:14]>`; the leg's consumer receives that same nonce.
+Original system disks and default devices are unchanged. Inside the boot
+nothing per application changes: the domain's principal operation, the IME
+proof with host OCR, the scale pass, lock and unlock, frontend restart and
+owned-fixture cleanup are the same code. `Desktop.run` partitions the guest's
+installed inventory, fails on an installed application no leg declares or a
+declared one that is not installed, runs its leg's domains, and requires its
+results to be exactly its share.
 
 Final immutable-image inspection admits the original package ELFs, lifecycle
 and input helpers, all nine Core guest modules, the guarded installer, packaged
@@ -59,12 +104,43 @@ domain operations qualify. Root dispatch accepts the existing fixed
 sanitized operation/type/site records. QGA acquisition and execution share
 finite absolute deadlines; uncertain child retirement is never replayed.
 
-`V-CORE-APPS` passes only after the entire unchanged 28-application consumer
-and owned-fixture cleanup complete. A missing run or any failed domain is
-fatal and reaches the existing aggregate CI gate. Receipts and frames live
-under `vm-lane-artifacts/core-apps/`. This is DEV same-run package/image/source
-admission, not signed-release qualification or a claim of native runtime
-success; the real admitted Core run remains required.
+A leg records `V-CORE-APPS-LEG` in its own `assertions.txt` and writes
+`core-apps-leg.json`, pass or fail: its leg and domains, the admitted source
+commit and trees, package hash, image ID, base image and member hashes, the
+installed inventory it observed (application, package, version, desktop-entry
+hash, installation receipt and observer hashes), the applications assigned to
+it and the ones it completed, the timezone verdict, every lane assertion of
+the boot and the CI run. It never states the matrix.
+
+`native-core-apps` runs whenever the consumer was selected, whatever happened
+to the image job and the legs (`core_apps_legs.py join`). It passes only when
+
+- the image job and the leg matrix both ended in success;
+- every declared leg has exactly one receipt from this run, and it passed;
+- every receipt names the same identity, and that identity is this run's
+  commit, the image the image job exported and the package it was built from;
+- the installed inventory partitions cleanly, each leg's assignment is its
+  share of it, and the legs' completed applications are that inventory
+  exactly: none missing, none completed by two legs, none outside it;
+- the timezone domain is qualified by its leg and claimed by no other.
+
+Only then does its `assertions.txt` record `V-CORE-APPS`,
+`V-CORE-APPS-BASIC`, `-DATA`, `-MEDIA`, `-SYSTEM`, `-WEB` and
+`V-CORE-APPS-AUTOTZ` as pass; on any failure all seven are written as fail,
+with each leg's own state in the description and in `join.json`. An absent,
+skipped, cancelled or failed leg therefore fails the join. `ci-gate` fails
+when the consumer was selected and the join did not succeed, including a
+skipped join. `parity-ledger` needs the join, runs only if it succeeded
+whenever it was selected, and reads its `assertions.txt`; no ledger row cites
+these ids yet, and a row that does also needs the consumer selected on the
+pull requests that run the ledger.
+
+Receipts and frames live under `vm-lane-artifacts/core-apps/` in each
+`native-core-apps-<leg>` artifact; `native-core-apps` holds the verdict and a
+copy of every leg receipt, and `native-core-apps-image-evidence` the image
+job's base verification, GDM provenance and admission. This is DEV same-run
+package/image/source admission, not signed-release qualification or a claim
+of native runtime success; the real admitted Core run remains required.
 
 The speech lane invokes the pinned package factory through `bash`; the
 factory checkout's script execute bit is not an admission prerequisite.
