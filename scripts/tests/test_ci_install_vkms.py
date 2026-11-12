@@ -15,6 +15,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "scripts/ci-install-vkms"
 SMOKE = ROOT / "scripts/tuna-drm-smoke"
+COLORD_HELPER = ROOT / "scripts/lib/colord-startup.sh"
 
 # Each call is recorded before execution. Unexpected commands/arguments fail
 # closed, including any attempt to run a real apt-get, modprobe, or cargo.
@@ -213,7 +214,7 @@ class VkmsSetup(unittest.TestCase):
 
 
 class ColordReadiness(unittest.TestCase):
-    def run_readiness(self, ready):
+    def run_readiness(self, ready, exited=False):
         source = SMOKE.read_text()
         begin = source.index("end=$(($(date +%s) + 30))", source.index('COLORD_BIN=""'))
         loop = source[begin:source.index("\nCOLOR_LOG=", begin)]
@@ -222,29 +223,52 @@ class ColordReadiness(unittest.TestCase):
 set -eu
 ARTIFACTS="$1"
 READY="$2"
-COLORD_PID=1
+. "$4"
+COLORD_RECEIPT="$ARTIFACTS/colord-startup.txt"
+COLORD_REAPED=0
+if [ "$3" = 1 ]; then
+    # The wrapper really exited: reaping it once is bounded.
+    /bin/sh -c 'exit 42' &
+    COLORD_PID=$!
+    until colord_wrapper_exited; do /bin/sleep 0.02; done
+else
+    COLORD_PID=1
+    wait() { echo "unbounded launcher wait" >&2; exit 89; }
+fi
 cd_call() { return "$READY"; }
 kill() { echo "unprivileged launcher probe" >&2; exit 88; }
-wait() { echo "unbounded launcher wait" >&2; exit 89; }
 sleep() { :; }
 date() {
     if [ -f "$ARTIFACTS/clock" ]; then echo 1031
     else : >"$ARTIFACTS/clock"; echo 1000; fi
 }
 fail() { printf '%s: %s\n' "$1" "$2"; exit 97; }
+colord_failure_receipt() { echo failure-receipt >>"$COLORD_RECEIPT"; }
 ''' + loop
-            return subprocess.run(["/bin/sh", "-c", script, "colord-readiness", directory, str(ready)],
-                                  text=True, capture_output=True, timeout=5)
+            result = subprocess.run(["/bin/sh", "-c", script, "colord-readiness", directory, str(ready),
+                                     "1" if exited else "0", str(COLORD_HELPER)],
+                                    text=True, capture_output=True, timeout=5)
+            receipt = Path(directory) / "colord-startup.txt"
+            return result, receipt.read_text() if receipt.exists() else ""
 
     def test_ready_service_does_not_probe_or_wait_for_privileged_launcher(self):
-        result = self.run_readiness(0)
+        result, receipt = self.run_readiness(0)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(receipt, "")
 
     def test_unready_service_fails_at_original_deadline_without_wait(self):
-        result = self.run_readiness(1)
+        result, receipt = self.run_readiness(1)
         self.assertEqual(result.returncode, 97, result.stdout + result.stderr)
         self.assertIn("D-COLORD: colord never served the private system bus", result.stdout)
         self.assertEqual(result.stderr, "")
+        self.assertEqual(receipt, "failure-receipt\n")
+
+    def test_exited_wrapper_fails_with_its_reaped_status_and_receipt(self):
+        result, receipt = self.run_readiness(1, exited=True)
+        self.assertEqual(result.returncode, 97, result.stdout + result.stderr)
+        self.assertIn("D-COLORD: colord wrapper exited with status 42", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(receipt, "wrapper_status=42\nfailure-receipt\n")
 
 
 class PointerRestart(unittest.TestCase):
