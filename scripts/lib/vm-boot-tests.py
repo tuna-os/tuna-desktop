@@ -9,6 +9,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 import unittest
@@ -1364,6 +1365,20 @@ class ConstraintProofCleanup(unittest.TestCase):
             self.assertEqual(actual["cleanup_errors"][0]["action"], "constraint-quit")
             self.assertTrue((Path(out) / "hot-corner-constraint-mouse-restoration.json").exists())
             self.assertTrue((Path(out) / "hot-corner-constraint-stderr.json").exists())
+
+    def test_principal_quit_by_the_proof_is_not_quit_again(self):
+        calls = []
+        def run(action):
+            calls.append(action)
+            if action == "constraint-quit":
+                raise RuntimeError("principal already gone")
+            return {"stderr": "", "truncated": False}
+        with tempfile.TemporaryDirectory() as out, patch.object(lane, "restore_corner_mouse", return_value={"verified": True}):
+            lane.finish_constraint_proof(SimpleNamespace(run=run), object(), {}, out,
+                {"principal": {"pid": 42}, "principal_quit": True, "primary_error": None})
+            self.assertEqual(calls, ["constraint-log"])
+            actual = json.loads((Path(out) / "hot-corner-constraints.json").read_text())
+            self.assertEqual(actual["cleanup_errors"], [])
 class PublicOrcaNavigation(unittest.TestCase):
     def focus_module(self):
         file = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-shell-focus"
@@ -3021,8 +3036,17 @@ class TourViewPredicates(unittest.TestCase):
             else:
                 path.write_bytes(tour_png(probes[-1]))
         now = [0.0]
+        real_sleep = lane.time.sleep
         def advance(seconds):
-            now[0] += seconds
+            # Patching lane.time patches the process-wide time module. Only
+            # the lane's own polling advances the fake clock; library waits,
+            # such as Python 3.12 subprocess.wait() reaping ffmpeg in a
+            # time.sleep() loop, sleep for real. Otherwise a slow ffmpeg exit
+            # spins that loop and burns the whole fake await_still deadline.
+            if sys._getframe(1).f_globals is vars(lane):
+                now[0] += seconds
+            else:
+                real_sleep(seconds)
         # Polling time advances only at sleep boundaries, not while the host
         # writes a synthetic frame or schedules the test process.
         with tempfile.TemporaryDirectory() as directory, \

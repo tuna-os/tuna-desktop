@@ -46,7 +46,7 @@ ARG BASE_IMAGE=localhost/marlin-tuna-preview:ci
 FROM ${BASE_IMAGE} AS constraint-builder
 COPY packaging/marlin/vm-lane/tuna-vm-constraints.c /build/tuna-vm-constraints.c
 COPY packaging/marlin/vm-lane/tuna-vm-constraints-build /build/tuna-vm-constraints-build
-RUN pacman -S --needed --noconfirm gcc pkgconf wayland wayland-protocols wlr-protocols \
+RUN pacman -S --needed --noconfirm gcc pkgconf wayland wayland-protocols \
     && TUNA_CI_ONLY=1 /build/tuna-vm-constraints-build
 
 FROM ${BASE_IMAGE}

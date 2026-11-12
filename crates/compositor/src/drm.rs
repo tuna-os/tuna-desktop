@@ -17,9 +17,10 @@
 //!   is accumulated here and clamped to the output union, so the window
 //!   manager keeps receiving absolute positions like the nested backend.
 //!
-//! The pointer is drawn in software (an arrow of solid rectangles):
-//! there is no host cursor on bare hardware. Client cursor surfaces are
-//! not composited yet.
+//! The compositor draws the pointer itself on top of each frame
+//! (`crate::cursor::draw`, called from `runtime.rs`): cursor themes,
+//! requested shapes and client cursor surfaces. No KMS cursor plane is
+//! used.
 
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
@@ -1552,7 +1553,7 @@ impl DrmBackend {
                 self.recount_touch_devices();
                 Vec::new()
             }
-            // Touchpad swipes (#60): three fingers are the shell's.
+            // Touchpad swipes (#60): three or more fingers are the shell's.
             InputEvent::GestureSwipeBegin { event } => {
                 use smithay::backend::input::GestureBeginEvent;
                 vec![ManagerInput::SwipeBegin {
@@ -1562,8 +1563,10 @@ impl DrmBackend {
             }
             InputEvent::GestureSwipeUpdate { event } => {
                 use smithay::backend::input::GestureSwipeUpdateEvent;
+                use smithay::reexports::input::event::gesture::GestureEventCoordinates;
                 vec![ManagerInput::SwipeUpdate {
                     delta: event.delta(),
+                    delta_unaccel: (event.dx_unaccelerated(), event.dy_unaccelerated()).into(),
                     time: (event.time() / 1000) as u32,
                 }]
             }
