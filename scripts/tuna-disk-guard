@@ -70,6 +70,9 @@ reap() {
 }
 
 pass() {
+    if [ -x "$repo/scripts/tuna-reaper" ]; then
+        "$repo/scripts/tuna-reaper" || true
+    fi
     free=$(free_gb)
     [ "$free" -lt "$min_free_gb" ] || return 0
     log "${free}G free (< ${min_free_gb}G)"

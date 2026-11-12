@@ -140,6 +140,35 @@ nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
 
+Issue #729 changes src/wayland/session_lock/lock.rs and mod.rs: the
+ext_session_lock_v1 duplicate_output check now tracks outputs per lock
+object (SessionLockState) instead of in a manager-wide list that only
+unlock_and_destroy cleared. Upstream's list outlived a refused or
+superseded lock, so when the shell, which creates its lock surfaces before
+Locked as GTK does, locked again with the same wl_output, the new lock
+surface was a duplicate_output protocol error that disconnected the whole
+shell; the list also grew without bound for any client. The protocol
+defines the error per lock object ("more than one lock surface for a given
+output"), which is still enforced. Real-client tests in
+crates/compositor/tests/session_lock_protocol.rs cover the refused retry,
+the superseded pending lock and the per-lock duplicate. The isolated diff
+is retained in SESSION-LOCK-OUTPUTS-PATCH.diff; SessionLockManagerState
+loses its crate-private field; the pinned version stays 0.7.0.
+
+Issue #1033 changes src/wayland/selection/source.rs: SelectionSource,
+the public handle SelectionHandler::new_selection receives, gains an
+IsAlive implementation that forwards to its provider. Mutter's clipboard
+manager (meta-clipboard-manager.c) takes the clipboard over with a saved
+copy when the owning client goes away, so the compositor must notice a
+dead clipboard owner. Upstream only drops a dead source lazily, the next
+time seat_data.rs send_selection runs, and tells no handler; a client
+that destroys its source or disconnects therefore left no trace. The
+compositor keeps the SelectionSource it was handed and checks it after
+each client dispatch. Real socketpair tests in
+crates/compositor/tests/data_device.rs cover a disconnecting owner and a
+destroyed source. The isolated diff is retained in
+CLIPBOARD-SOURCE-ALIVE-PATCH.diff; the pinned version stays 0.7.0.
+
 Issue #353 changes Cargo.toml (the xwayland feature enables x11rb's xkb
 protocol) and src/xwayland/xwm/mod.rs, additively. X11Wm::select_bell_events
 does what Mutter 51's init_x11_bell does (src/x11/meta-x11-display.c): select

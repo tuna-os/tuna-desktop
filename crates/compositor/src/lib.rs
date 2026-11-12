@@ -47,7 +47,10 @@ use smithay::{
         },
         shell::{
             wlr_layer::WlrLayerShellState,
-            xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState},
+            xdg::{
+                PopupSurface, PositionerState, ShellClient, ToplevelSurface, XdgShellHandler,
+                XdgShellState,
+            },
         },
         shm::{ShmHandler, ShmState},
     },
@@ -85,6 +88,7 @@ pub mod animation_clock;
 mod auth_owner;
 mod bell;
 pub mod capture_security;
+pub mod clipboard_manager;
 pub mod color_manager;
 mod constraint_motion;
 pub mod control;
@@ -103,6 +107,7 @@ pub mod fprintd;
 pub mod frame_timing;
 pub mod icc;
 pub mod idle_monitor;
+mod idle_notify;
 pub mod ime;
 pub mod input_aids;
 pub mod introspect;
@@ -164,9 +169,11 @@ pub mod supervise;
 pub mod tablet;
 pub mod tablet_actions;
 pub(crate) mod tablet_settings;
+pub mod touchpad_swipe;
 mod transient_family;
 pub mod transitions;
 pub mod unlock;
+pub mod unresponsive;
 pub mod user_upgrade;
 mod wake;
 pub mod wallpaper;
@@ -256,6 +263,9 @@ pub struct State {
     /// RemoteDesktop sessions with the clipboard enabled, and who owns
     /// the clipboard as they see it (mutter's MetaClipboardSession).
     pub(crate) remote_clipboard: crate::mutter::remote_clipboard::Registry,
+    /// The saved copy of the clipboard, served once its owner is gone
+    /// (mutter's MetaClipboardManager).
+    pub(crate) clipboard_manager: clipboard_manager::ClipboardManager,
     pub(crate) panel_surfaces: Vec<layer::PanelSurface>,
     /// Ids of `wl_surface`s whose layer-shell role was destroyed.
     /// Smithay 0.7 keeps validating them on commit against reset
@@ -298,6 +308,10 @@ pub struct State {
     /// Smithay clears role data immediately after `toplevel_destroyed` returns.
     pub(crate) closed_toplevel_parents:
         std::collections::HashMap<wl_surface::WlSurface, wl_surface::WlSurface>,
+    /// xdg_wm_base clients whose pong answered their pending ping, for
+    /// the window manager's alive checks (mutter's
+    /// `meta_display_pong_for_serial`, see [`unresponsive`]).
+    pub(crate) pongs: Vec<ShellClient>,
     /// dmabuf, activation, viewporter and the other #89 protocols.
     pub(crate) protocols: protocols::Protocols,
     /// presentation-time, fifo and commit-timing (#89).
@@ -328,6 +342,10 @@ pub(crate) struct ClientState {
     /// one client allowed a virtual keyboard (to hand back the keys
     /// IBus does not take).
     pub(crate) ime_bridge: bool,
+    /// The supervised shell's own connection: the one client offered
+    /// `zwlr_layer_shell_v1` (#1048). Set at accept time only when the
+    /// peer is the shell child the runtime holds (`layer::is_shell_peer`).
+    pub(crate) supervised_shell: bool,
     /// Optional tag applied to windows of a D-Bus-created ordinary client.
     pub(crate) connection_window_tag: Option<String>,
     /// Optional liveness marker for an ordinary service-channel connection.
@@ -337,6 +355,14 @@ pub(crate) struct ClientState {
     /// Original bus or accepted-socket peer credentials, with a process pin.
     original_credentials: Option<Arc<zbus::fdo::ConnectionCredentials>>,
     sandboxed_app_id: Arc<std::sync::OnceLock<Option<String>>>,
+    /// The `wp_security_context_v1` this client connected through, when it
+    /// came in on a sandbox engine's listener rather than the session
+    /// socket (#1046). Such a client passes no privileged global's filter
+    /// ([`ClientState::privileged`]) and cannot create a nested context.
+    /// The context's app id is the creator's claim and stays here; the
+    /// published `sandboxed-app-id` remains the one discovered from the
+    /// live peer (`sandbox_identity.rs`).
+    security_context: Option<smithay::wayland::security_context::SecurityContext>,
 }
 
 impl ClientState {
@@ -367,6 +393,55 @@ impl ClientState {
             ime_bridge: true,
             ..Self::default()
         }
+    }
+    /// State for the supervised shell's connection (layer-shell admitted).
+    pub(crate) fn supervised_shell() -> Self {
+        Self {
+            supervised_shell: true,
+            ..Self::default()
+        }
+    }
+    /// Admit an accepted native connection to layer-shell when its peer is
+    /// the shell child `shell_pid` the runtime still holds. The peer is the
+    /// pinned original process when the kernel supplied a pidfd (no identity
+    /// once it exited), else its `SO_PEERCRED` pid, as the session lock's
+    /// shell check reads it.
+    pub(crate) fn admit_supervised_shell(&mut self, socket: &UnixStream, shell_pid: Option<u32>) {
+        let peer = match &self.original_credentials {
+            Some(credentials) => crate::capture_security::pinned_process_id(credentials),
+            None => rustix::net::sockopt::socket_peercred(socket)
+                .ok()
+                .and_then(|peer| u32::try_from(peer.pid.as_raw_pid()).ok()),
+        };
+        self.supervised_shell = crate::layer::is_shell_peer(peer, shell_pid);
+    }
+    /// State for a client accepted on a security-context listener: an
+    /// ordinary native connection (peer credentials, sandbox discovery)
+    /// tagged with the context, and no capability flag.
+    pub(crate) fn security_context(
+        socket: &UnixStream,
+        context: smithay::wayland::security_context::SecurityContext,
+    ) -> Self {
+        Self {
+            security_context: Some(context),
+            ..Self::native_connection(socket)
+        }
+    }
+    /// Whether `client` connected through a `wp_security_context_v1`
+    /// listener.
+    pub(crate) fn sandboxed(client: &Client) -> bool {
+        client
+            .get_data::<ClientState>()
+            .is_some_and(|data| data.security_context.is_some())
+    }
+    /// The filter of every privileged global: `capability` of a client
+    /// outside any security context. A client inside one fails whatever
+    /// its other state says, as `wp_security_context_v1` asks of
+    /// privileged protocols (sway's `filter_global` is the same shape).
+    pub(crate) fn privileged(client: &Client, capability: impl FnOnce(&Self) -> bool) -> bool {
+        client
+            .get_data::<ClientState>()
+            .is_some_and(|data| data.security_context.is_none() && capability(data))
     }
 }
 
@@ -493,6 +568,12 @@ impl XdgShellHandler for State {
             self.closed_toplevel_parents
                 .insert(surface.wl_surface().clone(), parent);
         }
+    }
+
+    /// A pong matching the client's pending ping (Smithay checks the
+    /// serial): the manager's next alive check marks its windows alive.
+    fn client_pong(&mut self, client: ShellClient) {
+        self.pongs.push(client);
     }
 
     fn parent_changed(&mut self, surface: ToplevelSurface) {
@@ -724,12 +805,13 @@ impl OutputHandler for State {}
 /// Clipboard/drag-and-drop: advertised so toolkit clients accept the
 /// display. Client copy/paste and primary selection round-trip
 /// through the smithay selection state; both focuses mirror keyboard
-/// focus (see [`State::sync_selection_focus`]). The only
-/// compositor-provided selection is a RemoteDesktop session's
-/// (SetSelection); its user data is the session id. Drag-and-drop
-/// pointer grabs are not served yet.
+/// focus (see [`State::sync_selection_focus`]). Compositor-provided
+/// clipboard selections are a RemoteDesktop session's (SetSelection)
+/// and the clipboard manager's retained copy of a gone client's
+/// selection; [`clipboard_manager::CompositorSelection`] tells them
+/// apart. Drag-and-drop pointer grabs are not served yet.
 impl SelectionHandler for State {
-    type SelectionUserData = u64;
+    type SelectionUserData = clipboard_manager::CompositorSelection;
 
     fn new_selection(
         &mut self,
@@ -738,23 +820,37 @@ impl SelectionHandler for State {
         _seat: Seat<Self>,
     ) {
         if ty == smithay::wayland::selection::SelectionTarget::Clipboard {
-            self.remote_clipboard
-                .client_selection(source.map(|source| source.mime_types()));
+            // A cleared clipboard reaches the remote sessions from
+            // `retain_clipboard`, which may take it over first.
+            if let Some(source) = &source {
+                self.remote_clipboard
+                    .client_selection(Some(source.mime_types()));
+            }
+            self.clipboard_manager.client_selection(source);
         }
     }
 
-    /// A client pastes a remote session's selection: mutter's
-    /// `meta_selection_source_remote_read_async`.
+    /// A client pastes a remote session's selection (mutter's
+    /// `meta_selection_source_remote_read_async`) or the retained copy
+    /// (`meta_selection_source_memory_read_async`).
     fn send_selection(
         &mut self,
         ty: smithay::wayland::selection::SelectionTarget,
         mime_type: String,
         fd: std::os::fd::OwnedFd,
         _seat: Seat<Self>,
-        session_id: &u64,
+        user_data: &clipboard_manager::CompositorSelection,
     ) {
-        if ty == smithay::wayland::selection::SelectionTarget::Clipboard {
-            self.remote_clipboard.transfer(*session_id, &mime_type, fd);
+        if ty != smithay::wayland::selection::SelectionTarget::Clipboard {
+            return;
+        }
+        match *user_data {
+            clipboard_manager::CompositorSelection::Remote(session_id) => {
+                self.remote_clipboard.transfer(session_id, &mime_type, fd)
+            }
+            clipboard_manager::CompositorSelection::Retained(generation) => {
+                self.clipboard_manager.serve(generation, &mime_type, fd);
+            }
         }
     }
 }
@@ -1040,11 +1136,21 @@ delegate_shm!(State);
 delegate_seat!(State);
 delegate_output!(State);
 
-/// A manually-driven compositor for tests: no calloop loop, no backend.
+/// A manually-driven compositor for tests: no backend, and no event loop
+/// beyond the one holding security-context listeners, which [`pump`]
+/// polls without blocking.
+///
+/// [`pump`]: TestCompositor::pump
 pub struct TestCompositor {
     pub display: Display<State>,
     pub state: State,
+    security_listeners: calloop::EventLoop<'static, SecurityListenerData>,
+    /// Clients accepted on security-context listeners, in accept order.
+    security_clients: Vec<Client>,
 }
+
+/// What a test's security-context listener needs to admit a client.
+type SecurityListenerData = (DisplayHandle, Vec<Client>);
 
 impl Default for TestCompositor {
     fn default() -> Self {
@@ -1070,7 +1176,13 @@ impl State {
             seat_state,
             seat,
             dh: dh.clone(),
-            layer_shell_state: WlrLayerShellState::new::<State>(dh),
+            // Only the supervised shell may place layer surfaces (#1048):
+            // GNOME has no client-placed shell layers at all, and Mutter
+            // hides privileged globals from clients that lack the
+            // capability (meta-wayland-x11-interop.c `x11_interop_filter`).
+            layer_shell_state: WlrLayerShellState::new_with_filter::<State, _>(dh, |client| {
+                ClientState::privileged(client, |data| data.supervised_shell)
+            }),
             data_device_state: DataDeviceState::new::<State>(dh),
             dnd_icon: None,
             cursor_image: smithay::input::pointer::CursorImageStatus::default_named(),
@@ -1079,6 +1191,7 @@ impl State {
             tablet_pads: Vec::new(),
             primary_selection_state: PrimarySelectionState::new::<State>(dh),
             remote_clipboard: Default::default(),
+            clipboard_manager: Default::default(),
             panel_surfaces: Vec::new(),
             dead_layer_surfaces: std::collections::HashSet::new(),
             popups: smithay::desktop::PopupManager::default(),
@@ -1091,6 +1204,7 @@ impl State {
             retired_output_globals: Vec::new(),
             window_requests: Vec::new(),
             closed_toplevel_parents: std::collections::HashMap::new(),
+            pongs: Vec::new(),
             protocols: protocols::Protocols::new(dh),
             frame_timing: frame_timing::FrameTiming::new(dh),
             lock_protocol: session_lock::LockProtocol::new(dh),
@@ -1473,7 +1587,12 @@ impl TestCompositor {
         let display: Display<State> = Display::new().unwrap();
         let dh = display.handle();
         let state = State::new(&dh);
-        Self { display, state }
+        Self {
+            display,
+            state,
+            security_listeners: calloop::EventLoop::try_new().unwrap(),
+            security_clients: Vec::new(),
+        }
     }
 
     /// Attach a client connected through `stream`.
@@ -1494,12 +1613,78 @@ impl TestCompositor {
             .unwrap()
     }
 
-    /// Dispatch pending client requests and flush replies. Drives the
-    /// display without an event loop; tests interleave this with client
-    /// actions instead of blocking on either side.
+    /// Attach the supervised shell's connection in native protocol
+    /// fixtures: the one client offered layer-shell. The runtime grants
+    /// this only to the shell child's own pid; public clients use
+    /// `add_client`.
+    pub fn add_shell_client(&mut self, stream: UnixStream) -> Client {
+        self.display
+            .handle()
+            .insert_client(stream, Arc::new(ClientState::supervised_shell()))
+            .unwrap()
+    }
+
+    /// Dispatch pending client requests, run the clipboard manager and
+    /// accept connections waiting on security-context listeners (as the
+    /// runtime's loop does), and flush replies. Drives the display without
+    /// blocking; tests interleave this with client actions instead of
+    /// blocking on either side.
     pub fn pump(&mut self) {
         self.display.dispatch_clients(&mut self.state).unwrap();
+        self.state.retain_clipboard();
+        let listeners = self.security_listeners.handle();
+        for (source, context) in self.state.take_security_contexts() {
+            listeners
+                .insert_source(
+                    source,
+                    move |stream, _, (dh, accepted): &mut SecurityListenerData| {
+                        let data = ClientState::security_context(&stream, context.clone());
+                        accepted.push(dh.insert_client(stream, Arc::new(data)).unwrap());
+                    },
+                )
+                .map_err(|error| error.error)
+                .unwrap();
+        }
+        let mut data = (
+            self.display.handle(),
+            std::mem::take(&mut self.security_clients),
+        );
+        self.security_listeners
+            .dispatch(std::time::Duration::ZERO, &mut data)
+            .unwrap();
+        self.security_clients = data.1;
         self.display.flush_clients().unwrap();
+    }
+
+    /// Whether the clipboard manager finished copying the current client
+    /// selection, so the copying client may go away (socketpair tests wait
+    /// for the copy thread instead of racing it).
+    pub fn clipboard_copy_saved(&self) -> bool {
+        self.state.clipboard_manager.finished().is_some()
+    }
+
+    /// The security context each client accepted on a
+    /// `wp_security_context_v1` listener carries, in accept order.
+    pub fn security_context_clients(
+        &self,
+    ) -> Vec<smithay::wayland::security_context::SecurityContext> {
+        self.security_clients
+            .iter()
+            .filter_map(|client| client.get_data::<ClientState>()?.security_context.clone())
+            .collect()
+    }
+
+    /// Seat input at `now`, as the runtime's input path reports it to
+    /// ext-idle-notify beside org.gnome.Mutter.IdleMonitor.
+    pub fn idle_activity(&mut self, now: std::time::Instant) {
+        self.state.protocols.idle_notifier.activity(now);
+    }
+
+    /// The runtime's idle tick at `now`: ext-idle-notify notifications
+    /// due by then fire, held back by live idle inhibitors.
+    pub fn idle_tick(&mut self, now: std::time::Instant) {
+        let inhibited = self.state.idle_inhibited();
+        self.state.protocols.idle_notifier.tick(now, inhibited);
     }
 
     /// Seat capability handles for native protocol fixtures.

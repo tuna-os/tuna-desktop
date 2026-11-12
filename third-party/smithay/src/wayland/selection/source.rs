@@ -28,6 +28,13 @@ impl SelectionSource {
     }
 }
 
+impl IsAlive for SelectionSource {
+    #[inline]
+    fn alive(&self) -> bool {
+        self.provider.alive()
+    }
+}
+
 /// Provider of the selection data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionSourceProvider {
