@@ -192,7 +192,11 @@ refuse locked frames. Full detail and the qualification evidence:
   and it sees neither
   the session lock nor the manager itself, so it cannot nest a context.
   Evidence: `crates/compositor/tests/protocols.rs`
-  (`security_context_clients_see_no_privileged_global`).
+  (`security_context_clients_see_no_privileged_global`). A connection the
+  listener cannot accept (no descriptor left: EMFILE, ENFILE) rests the
+  listener 250 ms and is retried, instead of ending the event loop and the
+  session (#1071, `security_listener.rs`;
+  `crates/compositor/tests/security_context_accept.rs`).
 - Input-method v2 is open to any client, as on GNOME (`protocols.rs:165-166`).
 
 ### Session-bus interfaces

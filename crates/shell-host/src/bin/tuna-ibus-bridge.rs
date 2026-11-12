@@ -84,6 +84,10 @@ const CAPABILITIES: u32 = 1 | 8 | 32;
 const RELEASE: u32 = 1 << 30;
 /// How long a key may wait on IBus before it goes to the app anyway.
 const CALL_TIMEOUT_MS: i32 = 2_000;
+/// After IBus leaves, the first and the longest wait between looks for
+/// a returned daemon.
+const IBUS_RETRY_MIN: Duration = Duration::from_millis(250);
+const IBUS_RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// What IBus tells the bridge.
 enum FromIbus {
@@ -202,6 +206,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // moving a parent must update IBus without another text edit.
         bridge.sync_cursor();
         bridge.apply_incoming();
+        bridge.follow_ibus();
         let now = Instant::now();
         if bridge.repeat.deadline(now).is_some_and(|at| at <= now) {
             // Like Mutter's native repeat callback, serve queued input first.
@@ -239,20 +244,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// A connection to the IBus bus at `address`.
+fn ibus_bus(address: &str) -> Result<gio::DBusConnection, glib::Error> {
+    gio::DBusConnection::for_address_sync(
+        address,
+        gio::DBusConnectionFlags::AUTHENTICATION_CLIENT
+            | gio::DBusConnectionFlags::MESSAGE_BUS_CONNECTION,
+        None,
+        None::<&gio::Cancellable>,
+    )
+}
+
 /// The IBus bus, starting the daemon when none runs (GNOME Shell's
 /// `ibus-daemon --panel disable`).
 fn ibus_connection() -> Result<gio::DBusConnection, Box<dyn std::error::Error>> {
-    let connect = |address: &str| {
-        gio::DBusConnection::for_address_sync(
-            address,
-            gio::DBusConnectionFlags::AUTHENTICATION_CLIENT
-                | gio::DBusConnectionFlags::MESSAGE_BUS_CONNECTION,
-            None,
-            None::<&gio::Cancellable>,
-        )
-    };
     if let Some(address) = ibus_address() {
-        if let Ok(bus) = connect(&address) {
+        if let Ok(bus) = ibus_bus(&address) {
             return Ok(bus);
         }
     }
@@ -262,7 +269,7 @@ fn ibus_connection() -> Result<gio::DBusConnection, Box<dyn std::error::Error>> 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if let Some(address) = ibus_address() {
-            if let Ok(bus) = connect(&address) {
+            if let Ok(bus) = ibus_bus(&address) {
                 return Ok(bus);
             }
         }
@@ -284,6 +291,7 @@ enum VirtualKeyOutcome {
 struct IbusContext {
     bus: gio::DBusConnection,
     path: String,
+    /// The context's signal subscription, dropped with it.
     _subscription: gio::SignalSubscription,
     /// Each context owns its queue: even an already dispatched old signal
     /// callback cannot enqueue an event into a later field's context.
@@ -469,6 +477,17 @@ fn char_offset(text: &str, byte: u32) -> u32 {
     text[..floor_boundary(text, byte as usize)].chars().count() as u32
 }
 
+/// `SetSurroundingText`'s arguments: IBus text, then the cursor and
+/// anchor in characters.
+fn surrounding_variant(surrounding: &Surrounding) -> glib::Variant {
+    let text = &surrounding.text;
+    glib::Variant::tuple_from_iter([
+        ibus_text_variant(text),
+        char_offset(text, surrounding.cursor).to_variant(),
+        char_offset(text, surrounding.anchor).to_variant(),
+    ])
+}
+
 /// Byte offset of character `chars` (the text's length past its end).
 fn byte_offset(text: &str, chars: usize) -> usize {
     text.char_indices()
@@ -564,10 +583,11 @@ struct Bridge {
     active: bool,
     preedit_active: bool,
     /// Surrounding text and content type pending the next `done`, and
-    /// the applied surrounding text.
+    /// the applied ones.
     pending_surrounding: Option<Surrounding>,
     surrounding: Option<Surrounding>,
     pending_content_type: Option<(u32, u32)>,
+    content_type: Option<(u32, u32)>,
     /// The latest cursor rectangle (global, see the module doc), and
     /// the one IBus last heard.
     cursor_rect: Option<(i32, i32, i32, i32)>,
@@ -575,6 +595,8 @@ struct Bridge {
     xkb: Option<(xkb::Keymap, xkb::State)>,
     vk_keymap: bool,
     gone: bool,
+    /// While IBus is gone: when to look for it next, and the wait after.
+    ibus_retry: Option<(Instant, Duration)>,
 }
 
 impl Bridge {
@@ -593,6 +615,64 @@ impl Bridge {
             let Some(event) = event else { break };
             self.apply(event);
         }
+    }
+
+    /// IBus's daemon exited or restarted: keys bypass it until one is
+    /// back, then the bridge takes its bus and a focused field a new
+    /// context, as GNOME Shell's input method creates one on IBus's
+    /// `connected` (js/misc/inputMethod.js `_onConnected`). IBus routes
+    /// keys only to a focused context and the compositor sends no new
+    /// activation for a field that kept focus, so a focused field is
+    /// focused in the new context at once; later fields get theirs on
+    /// activation.
+    fn follow_ibus(&mut self) {
+        if self.ibus.as_ref().is_some_and(|bus| bus.is_closed()) {
+            eprintln!("tuna-ibus-bridge: IBus left; keys go to the app until it returns");
+            self.ibus = None;
+            // The closed bus cannot carry the context's retirement.
+            self.repeat.cancel();
+            self.context = None;
+            if std::mem::take(&mut self.preedit_active) {
+                if let Some(im) = &self.im {
+                    im.set_preedit_string(String::new(), 0, 0);
+                    im.commit(self.serial);
+                }
+            }
+            self.ibus_retry = Some((Instant::now(), IBUS_RETRY_MIN));
+        }
+        let Some((at, wait)) = self.ibus_retry else {
+            return;
+        };
+        if Instant::now() < at {
+            return;
+        }
+        // A returned daemon's address names a live socket again.
+        let returned = match ibus_address().map(|address| ibus_bus(&address)) {
+            Some(Ok(bus)) if self.active => IbusContext::create(bus.clone())
+                .ok()
+                .map(|context| (bus, Some(context))),
+            Some(Ok(bus)) => Some((bus, None)),
+            _ => None,
+        };
+        let Some((bus, context)) = returned else {
+            self.ibus_retry = Some((Instant::now() + wait, (wait * 2).min(IBUS_RETRY_MAX)));
+            return;
+        };
+        eprintln!("tuna-ibus-bridge: IBus returned");
+        self.ibus_retry = None;
+        self.ibus = Some(bus);
+        if let Some(context) = context {
+            context.send("FocusIn", None);
+            if let Some((purpose, hints)) = self.content_type {
+                context.set_content_type(purpose, hints);
+            }
+            if let Some(surrounding) = &self.surrounding {
+                context.send("SetSurroundingText", Some(surrounding_variant(surrounding)));
+            }
+            self.sent_cursor_rect = None;
+            self.context = Some(context);
+        }
+        self.sync_cursor();
     }
 
     /// IBus's mask for the current modifiers (X's bits).
@@ -819,21 +899,21 @@ impl Bridge {
         if !self.active {
             return;
         }
-        let Some(context) = &self.context else {
-            return;
-        };
+        // The field's state is kept while IBus is away, for its return.
         if let Some((purpose, hints)) = self.pending_content_type.take() {
-            context.set_content_type(purpose, hints);
+            self.content_type = Some((purpose, hints));
+            if let Some(context) = &self.context {
+                context.set_content_type(purpose, hints);
+            }
         }
         if let Some(surrounding) = self.pending_surrounding.take() {
             if self.surrounding.as_ref() != Some(&surrounding) {
-                let text = &surrounding.text;
-                let args = glib::Variant::tuple_from_iter([
-                    ibus_text_variant(text),
-                    char_offset(text, surrounding.cursor).to_variant(),
-                    char_offset(text, surrounding.anchor).to_variant(),
-                ]);
-                context.send("SetSurroundingText", Some(args));
+                if let Some(context) = &self.context {
+                    context.send(
+                        "SetSurroundingText",
+                        Some(surrounding_variant(&surrounding)),
+                    );
+                }
                 self.surrounding = Some(surrounding);
             }
         }
@@ -876,6 +956,7 @@ impl Bridge {
         self.preedit_active = false;
         // A new field: what IBus heard about the last one is stale.
         self.surrounding = None;
+        self.content_type = None;
         self.sent_cursor_rect = None;
         eprintln!(
             "tuna-ibus-bridge: text field {}",
