@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   pristine-firstboot:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -31,7 +31,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: corral-source/go.mod
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
           cosign-release: v3.1.4
       - name: Install native producer, QEMU and actual browser dependencies
@@ -42,7 +42,7 @@ jobs:
           sudo modprobe loop
           sudo chmod a+rw /dev/kvm
           python3 -m venv "$RUNNER_TEMP/pristine-browser"
-          "$RUNNER_TEMP/pristine-browser/bin/pip" install playwright==1.58.0
+          "$RUNNER_TEMP/pristine-browser/bin/pip" install playwright==1.61.0
           "$RUNNER_TEMP/pristine-browser/bin/python" -m playwright install --with-deps chromium
       - name: Observe exact signed platform with no keys, accounts or image fixture
         env:
