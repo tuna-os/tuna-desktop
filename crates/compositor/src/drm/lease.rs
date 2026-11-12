@@ -4,7 +4,12 @@
 //!
 //! - One lease device global for the session's DRM device. It is
 //!   advertised even when nothing is leasable, as Mutter creates a global
-//!   per KMS device before looking at connectors.
+//!   per KMS device before looking at connectors. Beyond Mutter, a client
+//!   inside a `wp_security_context_v1` does not see it: a lease hands
+//!   over KMS resources of the session's own device, which
+//!   security-context asks compositors to keep from sandboxed clients
+//!   (`ClientState::sandboxed`, as session-lock). Xwayland, which relays
+//!   leases to X11 clients, and every other unsandboxed client see it.
 //! - A connector is for lease when it is connected and either carries the
 //!   kernel's `non-desktop` property (VR headsets) or is named in
 //!   [`DEBUG_LEASE_CONNECTORS_ENV`], a colon-separated list of connector
@@ -210,7 +215,10 @@ impl LeaseDevice {
             .list_lessees()
             .map_err(|error| format!("DRM leasing unavailable on the session master: {error}"))?;
         let node = DrmNode::from_dev_id(drm.device_id()).map_err(|e| e.to_string())?;
-        let state = DrmLeaseState::new::<State>(dh, &node).map_err(|e| e.to_string())?;
+        let state = DrmLeaseState::new_with_filter::<State, _>(dh, &node, |client| {
+            !crate::ClientState::sandboxed(client)
+        })
+        .map_err(|e| e.to_string())?;
         let mut device = Self {
             state,
             fd: drm.device_fd().clone(),

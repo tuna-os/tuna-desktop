@@ -140,9 +140,14 @@ while time.monotonic() < end:
                        and window.get("app_id") == "org.gnome.Nautilus"]
             if len(focused) != 1:
                 raise RuntimeError("Request.Close proof lacks an actual focused Nautilus dialog")
-            out.with_suffix(".close-ready.json").write_text(json.dumps({
+            # The caller polls for this path and parses it at once: publish
+            # the complete document with a rename, never a partial write.
+            ready = out.with_suffix(".close-ready.json")
+            staged = ready.with_name(ready.name + ".tmp")
+            staged.write_text(json.dumps({
                 "dialog_id": focused[0]["id"], "provider": request["provider"], "scene": current,
             }, indent=2))
+            staged.replace(ready)
             print("actual Nautilus dialog ready for caller Request.Close")
             sys.exit(0)
         if request["method"] == "OpenFile" and request["decision"] == "grant" and not located:
