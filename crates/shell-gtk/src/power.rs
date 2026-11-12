@@ -1,8 +1,10 @@
 //! Power menu and end-session dialog (GNOME 51 shape, #62, #589).
 //!
 //! The quick-settings power button opens an in-panel menu: Suspend,
-//! Restart…, Power Off…, Log Out. As GNOME Shell 51's `systemActions.js`,
-//! each row asks the session manager on the session bus
+//! Restart…, Power Off…, Log Out… and, on a hardware session, Switch
+//! User… (`user_switch.rs`, which owns that row's rule and activation).
+//! As GNOME Shell 51's `systemActions.js`, each of the other rows asks
+//! the session manager on the session bus
 //! (`org.gnome.SessionManager`: the compositor's `session_manager`, or
 //! gnome-session where it runs): `Suspend()`, `Reboot()`, `Shutdown()`
 //! and `Logout(0)`. The manager suspends at once; for the rest it checks
@@ -1054,6 +1056,13 @@ impl PowerUi {
     /// The actions the power menu offers here.
     pub fn actions(&self) -> &'static [Action] {
         menu_actions(self.nested)
+    }
+
+    /// Whether the menu carries Switch User… (`user_switch.rs`): a
+    /// hardware session's only; a nested preview's logind seat is the
+    /// host's, so switching there would leave the host desktop.
+    pub fn offers_switch_user(&self) -> bool {
+        !self.nested
     }
 
     /// Run a menu choice through the session manager, as GNOME Shell
