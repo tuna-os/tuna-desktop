@@ -154,6 +154,7 @@ mod sandbox_identity;
 pub mod screencast;
 pub mod screenshot;
 pub mod screenshot_flash;
+pub mod security_listener;
 pub mod session_lock;
 pub mod session_manager;
 pub mod session_services;
@@ -1146,10 +1147,13 @@ pub struct TestCompositor {
     security_listeners: calloop::EventLoop<'static, SecurityListenerData>,
     /// Clients accepted on security-context listeners, in accept order.
     security_clients: Vec<Client>,
+    /// Accept attempts on security-context listeners that failed.
+    security_accept_failures: u32,
 }
 
-/// What a test's security-context listener needs to admit a client.
-type SecurityListenerData = (DisplayHandle, Vec<Client>);
+/// What a test's security-context listener needs to admit a client, and
+/// its count of failed accepts.
+type SecurityListenerData = (DisplayHandle, Vec<Client>, u32);
 
 impl Default for TestCompositor {
     fn default() -> Self {
@@ -1591,6 +1595,7 @@ impl TestCompositor {
             state,
             security_listeners: calloop::EventLoop::try_new().unwrap(),
             security_clients: Vec::new(),
+            security_accept_failures: 0,
         }
     }
 
@@ -1635,10 +1640,15 @@ impl TestCompositor {
         for (source, context) in self.state.take_security_contexts() {
             listeners
                 .insert_source(
-                    source,
-                    move |stream, _, (dh, accepted): &mut SecurityListenerData| {
-                        let data = ClientState::security_context(&stream, context.clone());
-                        accepted.push(dh.insert_client(stream, Arc::new(data)).unwrap());
+                    security_listener::RestingListener::new(source),
+                    move |accept, _, (dh, accepted, failures): &mut SecurityListenerData| {
+                        match accept {
+                            security_listener::Accept::Client(stream) => {
+                                let data = ClientState::security_context(&stream, context.clone());
+                                accepted.push(dh.insert_client(stream, Arc::new(data)).unwrap());
+                            }
+                            security_listener::Accept::Failed { .. } => *failures += 1,
+                        }
                     },
                 )
                 .map_err(|error| error.error)
@@ -1647,11 +1657,12 @@ impl TestCompositor {
         let mut data = (
             self.display.handle(),
             std::mem::take(&mut self.security_clients),
+            self.security_accept_failures,
         );
         self.security_listeners
             .dispatch(std::time::Duration::ZERO, &mut data)
             .unwrap();
-        self.security_clients = data.1;
+        (_, self.security_clients, self.security_accept_failures) = data;
         self.display.flush_clients().unwrap();
     }
 
@@ -1671,6 +1682,13 @@ impl TestCompositor {
             .iter()
             .filter_map(|client| client.get_data::<ClientState>()?.security_context.clone())
             .collect()
+    }
+
+    /// How many accept attempts on security-context listeners have failed
+    /// so far. Each one rests its listener for
+    /// [`security_listener::REST`] (#1071).
+    pub fn security_accept_failures(&self) -> u32 {
+        self.security_accept_failures
     }
 
     /// Seat input at `now`, as the runtime's input path reports it to

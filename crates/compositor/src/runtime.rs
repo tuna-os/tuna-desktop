@@ -2458,12 +2458,16 @@ impl Runtime {
     /// last call on the loop (wp_security_context_v1, #1046): a client
     /// it accepts joins the display inside that context, so no
     /// privileged global admits it. The listener goes once its creator
-    /// closes the context's close fd.
+    /// closes the context's close fd. A connection that cannot be accepted
+    /// (no descriptor left) rests the listener instead of ending the loop
+    /// (#1071, `security_listener`).
     fn admit_security_contexts(&mut self) {
+        use crate::security_listener::{Accept, RestingListener, REST};
         for (source, context) in self.state.take_security_contexts() {
-            let inserted =
-                self.loop_handle
-                    .insert_source(source, move |stream, _, runtime: &mut Runtime| {
+            let inserted = self.loop_handle.insert_source(
+                RestingListener::new(source),
+                move |accept, _, runtime: &mut Runtime| match accept {
+                    Accept::Client(stream) => {
                         let data = ClientState::security_context(&stream, context.clone());
                         if runtime
                             .display
@@ -2473,7 +2477,19 @@ impl Runtime {
                         {
                             runtime.stats.clients += 1;
                         }
-                    });
+                    }
+                    // Said once per run of failures, not at every retry.
+                    Accept::Failed {
+                        error,
+                        repeated: false,
+                    } => eprintln!(
+                        "tuna-compositor: cannot accept a client on a security context \
+                         listener ({error}); it rests {} ms and retries",
+                        REST.as_millis()
+                    ),
+                    Accept::Failed { repeated: true, .. } => {}
+                },
+            );
             if let Err(error) = inserted {
                 eprintln!(
                     "tuna-compositor: security context listener not added: {}",
