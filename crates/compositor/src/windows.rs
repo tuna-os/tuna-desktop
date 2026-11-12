@@ -1071,6 +1071,48 @@ impl WindowManager {
         None
     }
 
+    /// Where window `id`'s surface lies and takes input, for diagnostic
+    /// journeys, never authority: the rectangle of its buffer (the
+    /// window's rectangle grown by its client-side shadow) and the
+    /// bounding box of what its input region adds, both in global logical
+    /// coordinates. No input rectangle when the surface set no region (it
+    /// takes input all over); nothing before the first buffer, or while
+    /// an X11 window has no surface (between the frame it lost or gained
+    /// and the X11 window that carries its surface next).
+    pub fn surface_input_state(&self, id: u64) -> Option<([i32; 4], Option<[i32; 4]>)> {
+        use smithay::wayland::compositor::{RectangleKind, SurfaceAttributes};
+        let window = self.windows.get(&id)?;
+        let surface = window.surface.wl_surface()?;
+        let origin = crate::popup::surface_origin(&surface, window.geometry.loc);
+        let size = buffer_size(&surface)?;
+        let input = with_states(&surface, |states| {
+            states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .current()
+                .input_region
+                .as_ref()
+                .map(|region| {
+                    region
+                        .rects
+                        .iter()
+                        .filter(|(kind, _)| matches!(kind, RectangleKind::Add))
+                        .map(|(_, rect)| *rect)
+                        .reduce(|all, rect| all.merge(rect))
+                        .unwrap_or_default()
+                })
+        });
+        let global = |rect: Rectangle<i32, Logical>| {
+            [
+                origin.x + rect.loc.x,
+                origin.y + rect.loc.y,
+                rect.size.w,
+                rect.size.h,
+            ]
+        };
+        Some((global(Rectangle::from_size(size)), input.map(global)))
+    }
+
     /// Whether window `id` is an X11 window (through Xwayland).
     pub fn is_x11(&self, id: u64) -> bool {
         #[cfg(feature = "xwayland")]
@@ -9133,15 +9175,19 @@ mod resize_tests {
     }
 }
 
+/// The size of a surface's committed buffer, in surface coordinates:
+/// the whole surface, shadow included. `None` before the first buffer.
+pub(crate) fn buffer_size(surface: &WlSurface) -> Option<Size<i32, Logical>> {
+    smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| s.surface_size())
+        .flatten()
+}
+
 /// The size a client committed for its window: its xdg window geometry,
 /// else its buffer's size. `None` before the first buffer.
 pub(crate) fn committed_size(
     surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
 ) -> Option<Size<i32, Logical>> {
-    let buffer = smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
-        s.surface_size()
-    })
-    .flatten()?;
+    let buffer = buffer_size(surface)?;
     let geometry = smithay::wayland::compositor::with_states(surface, |states| {
         states
             .cached_state

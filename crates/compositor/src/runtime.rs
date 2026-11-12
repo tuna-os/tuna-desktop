@@ -2671,7 +2671,15 @@ impl Runtime {
                 // An X11 window's frame (P-WM-10); all three null for a
                 // native window.
                 let x11_frame = self.manager.x11_frame_state(w.id);
+                let surface = self.manager.surface_input_state(w.id);
                 serde_json::json!({
+                    // The window's surface, shadow included (null while
+                    // it has no buffer: an X11 window whose frame just
+                    // came or went), and the bounding box of its input
+                    // region (null: none set, the whole surface takes
+                    // input).
+                    "surface_rect": surface.map(|(rect, _)| rect),
+                    "input_rect": surface.and_then(|(_, input)| input),
                     "id": w.id,
                     "app_id": app_of(w.id),
                     "introspect_eligible": self.manager.is_introspect_eligible(w.id),

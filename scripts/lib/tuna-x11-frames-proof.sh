@@ -468,17 +468,22 @@ sleep 0.5
 x11f_recovery_mark="$(wc -c <"$LOG")"
 kill -KILL "$x11f_frames_pid"
 # The bare interval lasts the supervisor's restart delay: sample fast.
+# The frame's X11 window carried the Wayland surface and took it along:
+# each window has none until Xwayland made one for its bare wrapper (a
+# few frames; the compositor reports it as surface_rect), and a press
+# has nowhere to go before that. The click below is made once, on a
+# window seen bare with its surface.
 x11f_bare=""
 x11f_bare_end=$(($(date +%s) + 10))
 while [ "$(date +%s)" -le "$x11f_bare_end" ]; do
-    if jq -e "[.windows[] | select(.id == $x11f_xev or .id == $x11f_other)] | length == 2 and all(.[]; .x11_framed == false)" "$CSTATE" >/dev/null 2>&1 &&
-        cp "$CSTATE" "$ARTIFACTS/x11-frame-bare.json"; then
+    if cp "$CSTATE" "$ARTIFACTS/x11-frame-bare.json" 2>/dev/null &&
+        jq -e "[.windows[] | select(.id == $x11f_xev or .id == $x11f_other)] | length == 2 and all(.[]; .x11_framed == false and .surface_rect != null)" "$ARTIFACTS/x11-frame-bare.json" >/dev/null 2>&1; then
         x11f_bare=1
         break
     fi
     sleep 0.05
 done
-[ -n "$x11f_bare" ] || fail G-X11-FRAME-RECOVERY "the windows were never seen bare after the frames client was killed"
+[ -n "$x11f_bare" ] || fail G-X11-FRAME-RECOVERY "the windows were never seen bare, each with its surface again, after the frames client was killed"
 x11f_count="$(x11f_presses)"
 xdotool click 1
 scrot -o "$ARTIFACTS/20-x11-frame-bare.png" >/dev/null
