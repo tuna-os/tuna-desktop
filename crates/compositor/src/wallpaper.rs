@@ -343,6 +343,17 @@ struct AnimationSample {
 }
 type AnimationPaint = (Sample, Vec<(PathBuf, Option<FileIdentity>)>);
 
+/// Whether a retained slideshow sample must be re-taken: its GNOME step
+/// interval elapsed, or the wall clock moved differently from the monotonic
+/// clock. GNOME Shell 51 re-samples immediately on resume (`prepare-for-sleep`
+/// false) and on a timezone change (`js/ui/background.js` lines 414-427);
+/// GnomeBG samples `g_get_real_time()` (`gnome-bg-slide-show.c` `now()`).
+/// `Instant` is CLOCK_MONOTONIC, which stops across suspend, so more than a
+/// second of disagreement identifies a resume or a wall-clock step.
+fn sample_due(sampled_wall: f64, elapsed_mono: f64, interval: f64, now_wall: f64) -> bool {
+    elapsed_mono >= interval || ((now_wall - sampled_wall) - elapsed_mono).abs() > 1.0
+}
+
 #[derive(Debug, Clone)]
 struct Paint {
     epoch: Option<String>,
@@ -566,7 +577,13 @@ impl Wallpaper {
                             &image_cache,
                         )
                     } else {
-                        load_static_wallpaper(&job.uri, settings, geometry, job.identity)
+                        load_static_wallpaper(
+                            &job.uri,
+                            settings,
+                            geometry,
+                            job.identity,
+                            static_cache_root().as_deref(),
+                        )
                     };
                     eprintln!(
                         "tuna-compositor: wallpaper {} for {}x{} in {} ms",
@@ -961,10 +978,12 @@ impl Wallpaper {
                     .position(|s| s.key == sample_key);
                 let previous = index.map(|i| &self.animation_samples[i]);
                 let due = previous.is_none_or(|old| {
-                    old.sampled_mono.elapsed().as_secs_f64() >= old.sample.interval
-                        || ((now - old.sampled_wall) - old.sampled_mono.elapsed().as_secs_f64())
-                            .abs()
-                            > 1.0
+                    sample_due(
+                        old.sampled_wall,
+                        old.sampled_mono.elapsed().as_secs_f64(),
+                        old.sample.interval,
+                        now,
+                    )
                 });
                 if due {
                     let logical = [
@@ -1585,11 +1604,14 @@ fn load_animation_wallpaper(
     unchanged().then_some(pixels)
 }
 
+/// `cache_root` holds rendered raster decodes across sessions (`None`: no
+/// persistent cache).
 fn load_static_wallpaper(
     uri: &str,
     settings: PictureSettings,
     geometry: Geometry,
     expected: Option<FileIdentity>,
+    cache_root: Option<&std::path::Path>,
 ) -> Option<Vec<u8>> {
     if !geometry.valid() {
         return None;
@@ -1600,7 +1622,7 @@ fn load_static_wallpaper(
         return tuna_wallpaper::background::render(None, settings, geometry);
     }
     let original_identity = expected.clone();
-    let cache = static_cache_path(uri, settings, geometry, expected.as_ref());
+    let cache = cache_root.map(|root| static_cache_path(root, uri, settings, geometry, &expected));
     let want = geometry.physical[0] as usize * geometry.physical[1] as usize * 4;
     if let Some(path) = cache.as_ref() {
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -1626,12 +1648,12 @@ fn load_static_wallpaper(
             }
         }
     }
-    let mut cacheable = true;
+    let mut raster = true;
     let image = if let Some(expected) = expected {
         let bytes = read_identity(&expected, MAX_SOURCE_BYTES)?;
         // A native SVG render also depends on the installed loader and
         // fonts, which this source-file key does not identify.
-        cacheable = tuna_wallpaper::is_raster(&bytes);
+        raster = tuna_wallpaper::is_raster(&bytes);
         tuna_wallpaper::decode(&bytes).map(|im| im.to_rgba8())
     } else {
         None
@@ -1640,7 +1662,10 @@ fn load_static_wallpaper(
     if FileIdentity::for_uri(uri) != original_identity {
         return None;
     }
-    if let Some(path) = cache.filter(|_| cacheable) {
+    // Persist only an actual raster decode. A failed decode renders the
+    // colour fallback, which must never outlive the decoder that failed:
+    // a later or repaired decoder for the same file would read it forever.
+    if let Some(path) = cache.filter(|_| raster && image.is_some()) {
         let tmp = path.with_extension("tmp");
         if path
             .parent()
@@ -1653,29 +1678,34 @@ fn load_static_wallpaper(
     Some(pixels)
 }
 
-fn static_cache_path(
-    uri: &str,
-    settings: PictureSettings,
-    geometry: Geometry,
-    identity: Option<&FileIdentity>,
-) -> Option<PathBuf> {
-    use std::hash::{Hash, Hasher};
+fn static_cache_root() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(base.join("tuna/wallpaper"))
+}
+
+fn static_cache_path(
+    root: &std::path::Path,
+    uri: &str,
+    settings: PictureSettings,
+    geometry: Geometry,
+    identity: &Option<FileIdentity>,
+) -> PathBuf {
+    use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
-    5u32.hash(&mut hash);
+    // Version 6: earlier entries may hold colour fallbacks of failed
+    // decodes (1.0.0-beta.1 stored them for SVGs it could not yet decode,
+    // and version 5 for raster signatures that failed to decode).
+    6u32.hash(&mut hash);
     uri.hash(&mut hash);
     settings.hash(&mut hash);
     geometry.hash(&mut hash);
     identity.hash(&mut hash);
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(
-        base.join("tuna/wallpaper")
-            .join(format!("static-{:016x}.argb", hash.finish())),
-    )
+    root.join(format!("static-{:016x}.argb", hash.finish()))
 }
 
 /// Decode `uri` and scale it to cover `output` exactly (center-crop),
@@ -2507,6 +2537,49 @@ mod tests {
         );
     }
     #[test]
+    fn static_cache_persists_raster_decodes_but_never_failed_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cache");
+        let load = |path: &std::path::Path| {
+            let uri = format!("file://{}", path.display());
+            let identity = FileIdentity::for_uri(&uri);
+            load_static_wallpaper(
+                &uri,
+                PictureSettings::default(),
+                test_geometry(),
+                identity,
+                Some(&root),
+            )
+            .expect("a failed decode still renders the colour fallback")
+        };
+        // A raster signature with no image, and malformed vector markup.
+        let broken = dir.path().join("broken.png");
+        std::fs::write(&broken, b"\x89PNG\r\n\x1a\n").unwrap();
+        let vector = dir.path().join("vector.svg");
+        std::fs::write(&vector, "<svg xmlns='http://www.w3.org/2000/svg'").unwrap();
+        for path in [&broken, &vector] {
+            assert_eq!(load(path).len(), 8 * 8 * 4);
+            assert!(
+                !root.exists() || std::fs::read_dir(&root).unwrap().next().is_none(),
+                "{} fallback must not outlive its failed decode",
+                path.display()
+            );
+        }
+        let good = dir.path().join("good.png");
+        checker_png(&good, 16, 16);
+        let first = load(&good);
+        let entries = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "an actual raster decode is persisted");
+        // A later session reads the persisted render instead of decoding.
+        let marker = vec![7u8; first.len()];
+        std::fs::write(&entries[0], &marker).unwrap();
+        assert_eq!(load(&good), marker);
+    }
+
+    #[test]
     fn xml_reference_replacement_changes_epoch_and_rejects_stale_worker() {
         let dir = tempfile::tempdir().unwrap();
         let picture = dir.path().join("frame.png");
@@ -2584,6 +2657,136 @@ mod tests {
     }
 
     #[test]
+    fn slideshow_sample_due_on_interval_resume_and_clock_step_only() {
+        // Same wall and monotonic progress inside the step: retained.
+        assert!(!sample_due(1000.0, 10.0, 56.0, 1010.0));
+        // Sub-second slew is not a clock step.
+        assert!(!sample_due(1000.0, 10.0, 56.0, 1010.9));
+        // The GNOME step interval elapsed.
+        assert!(sample_due(1000.0, 56.0, 56.0, 1056.0));
+        // Suspend: an hour of wall time, CLOCK_MONOTONIC stood still.
+        assert!(sample_due(1000.0, 0.5, 56.0, 4600.5));
+        // Wall clock stepped backwards.
+        assert!(sample_due(1000.0, 0.5, 56.0, 400.5));
+    }
+
+    #[test]
+    fn slideshow_refresh_resamples_after_suspend_and_clock_steps() {
+        let _lock = RUNTIME_DIR_LOCK.lock().expect("runtime lock");
+        let dir = tempfile::TempDir::new().unwrap();
+        let _runtime = RuntimeDirGuard::point_at(dir.path());
+        let frame = dir.path().join("frame.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([240, 0, 0, 255]))
+            .save(&frame)
+            .unwrap();
+        let xml = dir.path().join("timeline.xml");
+        std::fs::write(
+            &xml,
+            format!(
+                "<background><static><duration>3600</duration><file>{0}</file></static>\
+                 <static><duration>3600</duration><file>{0}</file></static></background>",
+                frame.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            wallpaper_drop_path(),
+            format!("file://{}\n#023c88\n#3584e4\n", xml.display()),
+        )
+        .unwrap();
+        let mut wallpaper = Wallpaper::new();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while wallpaper.animation_samples.is_empty() {
+            wallpaper.refresh((8, 8).into(), test_geometry());
+            assert!(
+                std::time::Instant::now() < end,
+                "slideshow observation did not complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // A sentinel marks the retained sample; only a re-sample replaces it.
+        let mark = |wallpaper: &mut Wallpaper, wall_shift: f64| {
+            let retained = &mut wallpaper.animation_samples[0];
+            retained.sample.slide = usize::MAX;
+            retained.sampled_wall += wall_shift;
+        };
+        let resampled = |wallpaper: &mut Wallpaper| {
+            wallpaper
+                .refresh((8, 8).into(), test_geometry())
+                .expect("observed slideshow");
+            assert_eq!(wallpaper.animation_samples.len(), 1);
+            wallpaper.animation_samples[0].sample.slide != usize::MAX
+        };
+        mark(&mut wallpaper, 0.0);
+        assert!(
+            !resampled(&mut wallpaper),
+            "inside its 56 s step the sample is retained"
+        );
+        // Suspend: an hour of wall time passed while CLOCK_MONOTONIC stood still.
+        mark(&mut wallpaper, -3600.0);
+        assert!(resampled(&mut wallpaper), "resume re-samples immediately");
+        // The wall clock stepped back ten minutes.
+        mark(&mut wallpaper, 600.0);
+        assert!(
+            resampled(&mut wallpaper),
+            "a wall-clock step re-samples immediately"
+        );
+    }
+
+    #[test]
+    fn xml_observation_follows_a_live_timezone_change() {
+        // `TZ` is process-global: run the body in a single-threaded
+        // child of this test binary so no sibling test sees it.
+        const CHILD: &str = "TUNA_WALLPAPER_TZ_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "wallpaper::tests::xml_observation_follows_a_live_timezone_change",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "child failed: {status}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let xml = dir.path().join("timeline.xml");
+        std::fs::write(
+            &xml,
+            "<background><starttime><year>2026</year><month>1</month><day>1</day>\
+             <hour>0</hour><minute>0</minute><second>0</second></starttime>\
+             <static><duration>3600</duration><file>/day.png</file></static>\
+             <static><duration>3600</duration><file>/night.png</file></static></background>",
+        )
+        .unwrap();
+        let uri = format!("file://{}", xml.display());
+        // POSIX zones need no tzdata. Each observation's mktime runs tzset,
+        // so the running process follows the new zone without a restart.
+        std::env::set_var("TZ", "UTC0");
+        let utc = SourceObservation::observe(&uri);
+        std::env::set_var("TZ", "JST-9");
+        let tokyo = SourceObservation::observe(&uri);
+        let (a, b) = (utc.timeline.unwrap(), tokyo.timeline.unwrap());
+        assert_eq!(a.start, 1_767_225_600.0);
+        assert_eq!(a.start - b.start, 9.0 * 3600.0);
+        assert_ne!(
+            utc.generation, tokyo.generation,
+            "a zone change must start a new render epoch"
+        );
+        let now = a.start + 1800.0;
+        assert_eq!(
+            a.sample(now, [8, 8]).unwrap().from,
+            PathBuf::from("/day.png")
+        );
+        assert_eq!(
+            b.sample(now, [8, 8]).unwrap().from,
+            PathBuf::from("/night.png")
+        );
+    }
+
+    #[test]
     fn same_metadata_content_change_rejects_stale_cached_workers() {
         let dir = tempfile::tempdir().unwrap();
         let picture = dir.path().join("frame.png");
@@ -2615,6 +2818,7 @@ mod tests {
             PictureSettings::default(),
             test_geometry(),
             Some(stale.clone()),
+            None,
         )
         .is_none());
 
@@ -2742,6 +2946,48 @@ mod tests {
             false
         ));
         assert_eq!(shown.len(), 2);
+    }
+
+    /// A picture that is missing, unreadable (EACCES) or undecodable
+    /// shows the background color and shading GNOME's settings give,
+    /// never a panic, a blank or a stale picture (Mutter draws
+    /// `primary-color`/`color-shading-type` when its image fails).
+    #[test]
+    fn missing_unreadable_and_undecodable_pictures_fall_back_to_the_color() {
+        use std::os::unix::fs::PermissionsExt;
+        let settings = PictureSettings {
+            placement: tuna_shell_control::background::Placement::Zoom,
+            shading: tuna_shell_control::background::Shading::Vertical,
+            primary: [240, 0, 0],
+            secondary: [0, 0, 240],
+        };
+        let g = test_geometry();
+        let color = tuna_wallpaper::background::render(None, settings, g).unwrap();
+        let load =
+            |uri: &str| load_static_wallpaper(uri, settings, g, FileIdentity::for_uri(uri), None);
+        let dir = tempfile::TempDir::new().unwrap();
+        let uri = |name: &str| format!("file://{}", dir.path().join(name).display());
+
+        assert_eq!(load(&uri("missing.png")), Some(color.clone()), "missing");
+        std::fs::write(dir.path().join("junk.png"), b"not an image").unwrap();
+        assert_eq!(load(&uri("junk.png")), Some(color.clone()), "undecodable");
+        std::fs::write(dir.path().join("empty.png"), b"").unwrap();
+        assert_eq!(load(&uri("empty.png")), Some(color.clone()), "empty");
+
+        let png = dir.path().join("wall.png");
+        checker_png(&png, 16, 16);
+        let picture = load(&uri("wall.png")).expect("readable picture decodes");
+        assert_ne!(picture, color, "the picture itself, not the color");
+        std::fs::set_permissions(&png, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&png).is_ok() {
+            // root / CAP_DAC_OVERRIDE reads anything: nothing to test.
+            eprintln!("skipping unreadable-file case: running with DAC override");
+            return;
+        }
+        assert_eq!(load(&uri("wall.png")), Some(color.clone()), "unreadable");
+        // Readable again: the picture returns (chmod changed its identity).
+        std::fs::set_permissions(&png, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(load(&uri("wall.png")), Some(picture));
     }
 
     #[test]

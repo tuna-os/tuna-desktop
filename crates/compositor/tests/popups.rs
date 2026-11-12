@@ -319,10 +319,20 @@ fn sync(f: &mut Fixture) {
 }
 
 fn fixture() -> Fixture {
+    fixture_with(TestCompositor::add_client)
+}
+
+/// The fixture on the supervised shell's connection: the only client
+/// offered layer-shell (#1048), as the GTK shell's panel is.
+fn shell_fixture() -> Fixture {
+    fixture_with(TestCompositor::add_shell_client)
+}
+
+fn fixture_with(admit: fn(&mut TestCompositor, UnixStream) -> wayland_server::Client) -> Fixture {
     let mut comp = TestCompositor::new();
     let manager = comp.window_manager();
     let (server, client_stream) = UnixStream::pair().unwrap();
-    comp.add_client(server);
+    admit(&mut comp, server);
     let conn = Connection::from_socket(client_stream).unwrap();
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
@@ -649,7 +659,7 @@ fn keyboard_focus_returns_to_the_exclusive_layer_after_the_grab() {
     // and keyboard focus must return to the Exclusive panel — not to
     // the focused window (or nothing), or the bar goes inactive with
     // GTK focus intact and the unwind assertion fails.
-    let mut f = fixture();
+    let mut f = shell_fixture();
     let layer = map_exclusive_layer(&mut f);
     assert_eq!(
         f.client.keyboard_entered.last().copied(),
