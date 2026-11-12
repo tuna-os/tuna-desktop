@@ -11,7 +11,7 @@ COPY packaging/marlin/vm-lane/tuna-vm-constraints.c /build/tuna-vm-constraints.c
 COPY packaging/marlin/vm-lane/tuna-vm-constraints-build /build/tuna-vm-constraints-build
 COPY scripts/tuna-frame-pacer-build /build/soak/tuna-frame-pacer-build
 COPY scripts/lib/tuna-frame-pacer.c /build/soak/lib/tuna-frame-pacer.c
-RUN bash /build/tuna-vm-published-pacman gcc pkgconf wayland wayland-protocols wlr-protocols \
+RUN bash /build/tuna-vm-published-pacman gcc pkgconf wayland wayland-protocols \
     && TUNA_CI_ONLY=1 /build/tuna-vm-constraints-build \
     && bash /build/soak/tuna-frame-pacer-build /build/soak/out
 
