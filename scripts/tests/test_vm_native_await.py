@@ -7,9 +7,8 @@ breakage still fails at the deadline, with the last read error
 attached to the TimeoutError.
 """
 import sys
+import unittest
 from pathlib import Path
-
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
 
@@ -30,33 +29,38 @@ def await_on(stub, read, predicate, timeout=10):
     return NativeDesktop.await_state(stub, 'probe-label', read, predicate, timeout=timeout)
 
 
-def test_flapping_read_recovers_within_budget():
-    stub = StubDesktop()
-    calls = []
+class AwaitStateFlappingReads(unittest.TestCase):
+    def test_flapping_read_recovers_within_budget(self):
+        stub = StubDesktop()
+        calls = []
 
-    def read():
-        calls.append(1)
-        if len(calls) < 3:
-            raise RuntimeError('accessibility owner changed during complete walk')
-        return {'n': 3}
+        def read():
+            calls.append(1)
+            if len(calls) < 3:
+                raise RuntimeError('accessibility owner changed during complete walk')
+            return {'n': 3}
 
-    assert await_on(stub, read, lambda value: value['n'] == 3) == {'n': 3}
-    assert len(calls) == 3
+        self.assertEqual(await_on(stub, read, lambda value: value['n'] == 3), {'n': 3})
+        self.assertEqual(len(calls), 3)
+
+    def test_persistent_read_error_fails_with_last_error_attached(self):
+        stub = StubDesktop()
+
+        def read():
+            raise RuntimeError('original native accessibility frame changed or departed')
+
+        with self.assertRaisesRegex(TimeoutError, 'frame changed or departed'):
+            await_on(stub, read, lambda value: True)
+        self.assertIn('frame changed or departed',
+                      stub.retained['failed-probe-label']['last_read_error'])
+
+    def test_predicate_timeout_keeps_plain_message(self):
+        stub = StubDesktop()
+        with self.assertRaisesRegex(
+                TimeoutError, '^actual readiness absolute deadline expired: probe-label$'):
+            await_on(stub, lambda: {'n': 1}, lambda value: value['n'] == 2)
+        self.assertIsNone(stub.retained['failed-probe-label']['last_read_error'])
 
 
-def test_persistent_read_error_fails_with_last_error_attached():
-    stub = StubDesktop()
-
-    def read():
-        raise RuntimeError('original native accessibility frame changed or departed')
-
-    with pytest.raises(TimeoutError, match='frame changed or departed'):
-        await_on(stub, read, lambda value: True)
-    assert 'frame changed or departed' in stub.retained['failed-probe-label']['last_read_error']
-
-
-def test_predicate_timeout_keeps_plain_message():
-    stub = StubDesktop()
-    with pytest.raises(TimeoutError, match='^actual readiness absolute deadline expired: probe-label$'):
-        await_on(stub, lambda: {'n': 1}, lambda value: value['n'] == 2)
-    assert stub.retained['failed-probe-label']['last_read_error'] is None
+if __name__ == '__main__':
+    unittest.main()

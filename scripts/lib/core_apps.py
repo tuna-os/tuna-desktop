@@ -326,7 +326,7 @@ class Desktop(NativeDesktop):
             raise RuntimeError('actual pointer target no longer showing/sensitive')
         return self._point(actor, tree, found[0], x_fraction, y_fraction)
 
-    def _point(self, actor, tree, node, fx, fy):
+    def _move_to(self, actor, tree, node, fx, fy):
         bounds = node['bounds']
         if bounds is None or bounds[2] <= 0 or bounds[3] <= 0:
             raise RuntimeError('actual accessible pointer rectangle unavailable')
@@ -344,12 +344,30 @@ class Desktop(NativeDesktop):
         self.qmp.cmd('input-send-event', events=[
             {'type': 'abs', 'data': {'axis': 'x', 'value': round(x * 32767 / (self.width - 1))}},
             {'type': 'abs', 'data': {'axis': 'y', 'value': round(y * 32767 / (self.height - 1))}}])
+        return x, y, selected
+
+    def _point(self, actor, tree, node, fx, fy):
+        x, y, selected = self._move_to(actor, tree, node, fx, fy)
         # Separate transactions avoid the observed PS/2/tablet old-position race.
         time.sleep(0.08)
         self.qmp.cmd('input-send-event', events=[{'type': 'btn', 'data': {'down': True, 'button': 'left'}}])
         time.sleep(0.08)
         self.qmp.cmd('input-send-event', events=[{'type': 'btn', 'data': {'down': False, 'button': 'left'}}])
         return {'actor': actor, 'node': node, 'point': [x, y], 'mouse': selected}
+
+    def rest_pointer(self, actor, tree, node):
+        """Move the real pointer onto an observed widget's center, unpressed."""
+        x, y, selected = self._move_to(actor, tree, node, 0.5, 0.5)
+        return {'actor': actor, 'node': node, 'point': [x, y], 'mouse': selected}
+
+    def _pointer_rests_on(self, actor, tree, node):
+        """Whether the compositor's own pointer lies inside an observed widget."""
+        position, bounds = tree['state'].get('pointer_position'), node['bounds']
+        if position is None or bounds is None:
+            return False
+        rect = self._window(actor, tree['state'])['rect']
+        left, top = rect[0] + bounds[0], rect[1] + bounds[1]
+        return left <= position[0] < left + bounds[2] and top <= position[1] < top + bounds[3]
 
     def _field_pixels(self, actor, state, node):
         if node['bounds'] is None:
@@ -420,28 +438,47 @@ class Desktop(NativeDesktop):
     def enter_location(self, window, directory, label='picker-exact-directory-location'):
         """Open a directory through a native Files-style location entry.
 
-        The entry completes subdirectories inline, after the typed text first
-        reads back exact: with the fixture's `web/` directory present it
-        became `<fixture>/web/` and Return opened that empty folder (run
-        42384050579: Folder is Empty). Remove any selected completion suffix
-        and accept only text that stays exact across consecutive reads.
+        The entry is a GtkEntryCompletion. Typing `<dir>/` pops that
+        directory's children up in a list below it, the list selects whichever
+        row the pointer rests on (hover selection), and Return with a selected
+        row replaces the text with that row and is consumed: the entry never
+        activates. The pointer stayed where the previous chooser's file cell
+        was clicked, inside that list, so Return turned `<fixture>/` into
+        `<fixture>/web/` and opened nothing: Papers' chooser kept its empty
+        start folder (runs 42384050579, 42390576348, 42395487640: Folder is
+        Empty), and Loupe's later choosers passed only because they already
+        started in the fixture. Rest the pointer on the entry, count only
+        reads the compositor reports it there, and require Return to close
+        the entry.
+
+        A directory with one child instead completes inline as a selected
+        suffix: remove it and accept only text that stays exact across
+        consecutive reads.
         """
         expected = str(directory).rstrip('/') + '/'
         self.keys('ctrl', 'l')
         self.type_ascii(expected)
+        def typed(value):
+            return [node for node in value['nodes'] if node['focused']
+                    and isinstance(node['text'], str) and node['text'].startswith(expected)]
+        entry = self.await_state(label + '-entry', lambda: self.tree(window),
+                                 lambda value: len(typed(value)) == 1)
+        self.rest_pointer(window, entry, typed(entry)[0])
         exact = [0]
         def location_settled(value):
-            typed = [node['text'] for node in value['nodes'] if node['focused']
-                     and isinstance(node['text'], str) and node['text'].startswith(expected)]
-            if typed == [expected]:
+            nodes = typed(value)
+            texts = [node['text'] for node in nodes]
+            if texts == [expected] and self._pointer_rests_on(window, value, nodes[0]):
                 exact[0] += 1
             else:
                 exact[0] = 0
-                if typed:
+                if texts and texts != [expected]:
                     self.keys('delete')
             return exact[0] >= 3
         self.await_state(label, lambda: self.tree(window), location_settled, timeout=30)
         self.keys('ret')
+        self.await_state(label + '-return-closed-entry', lambda: self.tree(window),
+                         lambda value: not typed(value))
 
     def _prepare_picker(self, actor, path, save=False):
         if not str(path).startswith(self.fixture + '/'):
@@ -482,14 +519,18 @@ class Desktop(NativeDesktop):
         An empty listing is ambiguous between a wrong folder and the app's
         own filter hiding the file (run 42390576348: Papers' chooser read
         Folder is Empty). Retain the pixels, then the filter menu's options
-        and its pixels. Best effort only: the original timeout still fails.
+        and its pixels. The chooser's other named toggles are not filters:
+        run 42395487640 retained `Show Options` beside `All Documents`, so
+        the menu was never opened. Best effort only: the original timeout
+        still fails.
         """
         try:
             self.observe('picker-content-cell-missing', picker)
             tree = self.tree(picker)
             filters = [node for node in tree['nodes'] if node['showing'] and node['role'] == 'toggle button'
-                       and node['sensitive'] and node['name'] not in ('', 'Search Current Folder', 'View Options',
-                                                                       'Search Everywhere')]
+                       and node['sensitive'] and node['name'] not in (
+                           '', 'Search Current Folder', 'View Options', 'Search Everywhere',
+                           'Show Options', 'Current Folder Menu')]
             self.retain('picker-filter-candidates', {'candidates': filters})
             if len(filters) == 1:
                 self.click_path(picker, filters[0]['path'])

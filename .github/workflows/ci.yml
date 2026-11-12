@@ -164,6 +164,17 @@ jobs:
       - run: python3 scripts/lib/ci-runner-guard-tests.py
       - run: python3 scripts/tests/test_ci_closed_pr_cleanup.py
       - run: python3 scripts/tests/test_vm_guest_agent_deadline.py
+      - run: python3 scripts/tests/test_vm_native_await.py
+      # The native Core-app host driver and guest observers (#1004). The
+      # desktop and media payload tests need the system PIL and PyYAML.
+      - run: /usr/bin/python3 scripts/tests/test_core_apps_desktop.py
+      - run: /usr/bin/python3 scripts/tests/test_core_apps_media_payloads.py
+      - run: python3 scripts/tests/test_core_apps_basic.py
+      - run: python3 scripts/tests/test_core_apps_discover.py
+      - run: python3 scripts/tests/test_core_apps_system.py
+      - run: python3 scripts/tests/test_core_apps_web.py
+      - run: python3 scripts/tests/test_core_apps_autotz.py
+      - run: python3 scripts/tests/test_geoclue_agent_policy.py
       - run: python3 scripts/tests/test_vm_reference_login.py
       - run: python3 scripts/tests/test_gnome_reference_guest.py
       - run: python3 scripts/tests/test_native_switcher_reference.py

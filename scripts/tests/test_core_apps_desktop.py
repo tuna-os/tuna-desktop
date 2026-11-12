@@ -934,18 +934,67 @@ class StartSearchQuery(unittest.TestCase):
 
 
 class EnterLocationCompletion(unittest.TestCase):
-    """The location entry's inline completion must not leak into Return.
+    """Return in the location entry must activate it, not take a completion.
 
-    Run 42384050579: `<fixture>/` completed to `<fixture>/web/` after the
-    exact text was first read, and Return opened the empty web folder.
+    Run 42395487640: the pointer stayed at [797.6, 253.3] from the previous
+    chooser's file-cell click, inside the completion list the picker window
+    [195, 141, 890, 550] popped up at [275, 59, 426, 176]. That list selects
+    the hovered row, and Return then replaced `<fixture>/` with
+    `<fixture>/web/` while the entry stayed open and nothing was opened.
+    The rig models exactly that: Return over the list appends the hovered
+    row; Return elsewhere closes the entry on its text.
     """
-    def rig(self, reads):
+    WINDOW = {'id': 33, 'rect': [195, 141, 890, 550]}
+    ENTRY = [259, 0, 442, 34]
+    LIST = [275, 59, 426, 176]
+    PARKED = [797.6171875, 253.3203125]
+    PICKER = {'id': 'picker', 'window_id': 33}
+
+    def over(self, model, bounds):
+        left, top = self.WINDOW['rect'][0] + bounds[0], self.WINDOW['rect'][1] + bounds[1]
+        x, y = model['pointer']
+        return left <= x < left + bounds[2] and top <= y < top + bounds[3]
+
+    def rig(self, reads=None, rest=True, consume_return=False):
         keys = []
+        model = {'pointer': list(self.PARKED), 'text': None, 'open': False, 'opened': None,
+                 'return_pointer': None}
+        scripted = None if reads is None else iter(reads)
         desktop = core_apps.Desktop.__new__(core_apps.Desktop)
-        desktop.keys = lambda *names: keys.append(names)
-        desktop.type_ascii = lambda text: keys.append(('type', text))
-        iterator = iter(reads)
-        desktop.tree = lambda window: {'nodes': [{'focused': True, 'text': next(iterator)}]}
+        desktop.width, desktop.height, desktop.scale = 1280, 800, 1.0
+        desktop._select_mouse = lambda qmp, relative: 'tablet'
+
+        class Qmp:
+            def cmd(self, command, events):
+                x, y = (event['data']['value'] for event in events)
+                model['pointer'] = [x * 1279 / 32767, y * 799 / 32767]
+        desktop.qmp = Qmp()
+        if not rest:
+            desktop.rest_pointer = lambda *a: None
+
+        def press(*names):
+            keys.append(names)
+            if names == ('ctrl', 'l'):
+                model['open'] = True
+            elif names == ('ret',):
+                model['return_pointer'] = list(model['pointer'])
+                if consume_return or self.over(model, self.LIST):
+                    model['text'] += 'web/'
+                else:
+                    model['open'], model['opened'] = False, model['text']
+        desktop.keys = press
+
+        def type_ascii(text):
+            keys.append(('type', text))
+            model['text'] = text
+        desktop.type_ascii = type_ascii
+
+        def tree(window):
+            text = next(scripted) if scripted is not None and model['open'] else model['text']
+            return {'nodes': [{'focused': model['open'], 'text': text, 'bounds': self.ENTRY}],
+                    'state': {'windows': [self.WINDOW], 'pointer_position': list(model['pointer'])}}
+        desktop.tree = tree
+
         def await_state(label, read, predicate, timeout=10):
             for _ in range(20):
                 value = read()
@@ -953,22 +1002,84 @@ class EnterLocationCompletion(unittest.TestCase):
                     return value
             raise TimeoutError(label)
         desktop.await_state = await_state
-        return desktop, keys
+        return desktop, keys, model
+
+    def test_pointer_left_on_the_completion_list_does_not_take_return(self):
+        base = '/fixture/run/'
+        desktop, keys, model = self.rig()
+        self.assertTrue(self.over(model, self.LIST))
+        desktop.enter_location(self.PICKER, '/fixture/run')
+        self.assertEqual(keys, [('ctrl', 'l'), ('type', base), ('ret',)])
+        self.assertEqual(model['opened'], base)
+        model['pointer'] = model['return_pointer']
+        self.assertTrue(self.over(model, self.ENTRY))
+        self.assertFalse(self.over(model, self.LIST))
+
+    def test_return_is_withheld_while_the_pointer_is_not_on_the_entry(self):
+        desktop, keys, model = self.rig(rest=False)
+        with self.assertRaisesRegex(TimeoutError, '^picker-exact-directory-location$'):
+            desktop.enter_location(self.PICKER, '/fixture/run')
+        self.assertNotIn(('ret',), keys)
+
+    def test_return_that_leaves_the_entry_open_fails(self):
+        desktop, keys, model = self.rig(consume_return=True)
+        with self.assertRaisesRegex(TimeoutError, '^files-location-return-closed-entry$'):
+            desktop.enter_location(self.PICKER, '/fixture/run', label='files-location')
+        self.assertEqual(keys[-1], ('ret',))
+        self.assertEqual(model['text'], '/fixture/run/web/')
+        self.assertIsNone(model['opened'])
 
     def test_completion_suffix_is_deleted_before_return(self):
         base = '/fixture/run/'
-        desktop, keys = self.rig([base, base + 'web/', base, base, base])
-        desktop.enter_location({'id': 'picker'}, '/fixture/run')
+        desktop, keys, model = self.rig([base, base + 'web/', base, base, base])
+        desktop.enter_location(self.PICKER, '/fixture/run')
         self.assertEqual(keys, [('ctrl', 'l'), ('type', base), ('delete',), ('ret',)])
+        self.assertEqual(model['opened'], base)
 
     def test_return_waits_for_three_consecutive_exact_reads(self):
         base = '/fixture/run/'
-        desktop, keys = self.rig([base, base, base])
-        desktop.enter_location({'id': 'picker'}, '/fixture/run/')
+        desktop, keys, model = self.rig([base, base, base, base])
+        desktop.enter_location(self.PICKER, '/fixture/run/')
         self.assertEqual(keys[-1], ('ret',))
-        desktop, _ = self.rig([base, base])
+        desktop, keys, model = self.rig([base, base, base])
         with self.assertRaises(StopIteration):
-            desktop.enter_location({'id': 'picker'}, '/fixture/run/')
+            desktop.enter_location(self.PICKER, '/fixture/run/')
+        self.assertNotIn(('ret',), keys)
+
+    def test_locked_or_unbounded_pointer_never_counts_as_resting(self):
+        desktop, keys, model = self.rig()
+        node = {'bounds': self.ENTRY}
+        state = {'windows': [self.WINDOW], 'pointer_position': [480, 158]}
+        self.assertTrue(desktop._pointer_rests_on(self.PICKER, {'state': state}, node))
+        self.assertFalse(desktop._pointer_rests_on(self.PICKER, {'state': state}, {'bounds': None}))
+        state['pointer_position'] = None
+        self.assertFalse(desktop._pointer_rests_on(self.PICKER, {'state': state}, node))
+
+
+class PickerFilterDiagnostic(unittest.TestCase):
+    """Only the chooser's filter toggle is opened for the empty-listing receipt.
+
+    Run 42395487640 retained `All Documents` and `Show Options` as candidates,
+    so the filter menu was never opened.
+    """
+    def test_named_chooser_toggles_are_not_filter_candidates(self):
+        names = ('', 'Search Current Folder', 'View Options', 'Search Everywhere',
+                 'Show Options', 'Current Folder Menu', 'All Documents')
+        tree = {'nodes': [{'showing': True, 'role': 'toggle button', 'sensitive': True,
+                           'name': name, 'path': [index]} for index, name in enumerate(names)]}
+        retained, clicked, keys = {}, [], []
+        desktop = core_apps.Desktop.__new__(core_apps.Desktop)
+        desktop.observe = lambda label, actor: {}
+        desktop.tree = lambda actor: tree
+        desktop.retain = lambda label, value: retained.__setitem__(label, value)
+        desktop.click_path = lambda actor, path: clicked.append(path)
+        desktop.keys = lambda *names: keys.append(names)
+        desktop._picker_listing_diagnostic({'id': 'picker'})
+        self.assertEqual([node['name'] for node in retained['picker-filter-candidates']['candidates']],
+                         ['All Documents'])
+        self.assertEqual(clicked, [[6]])
+        self.assertEqual(keys, [('esc',)])
+        self.assertNotIn('picker-diagnostic-error', retained)
 
 
 if __name__ == '__main__':

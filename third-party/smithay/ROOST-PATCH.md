@@ -226,3 +226,30 @@ Such a late request receives a tracked inert child without metadata; its
 release and parent teardown cannot unset the compositor owner. The returned-
 key consumer exercises this race with actual standard requests and verifies
 continued physical-key delivery to the compositor grab.
+
+PR #1004 additionally changes src/input/keyboard/mod.rs,
+src/wayland/seat/{keyboard.rs,mod.rs} and
+src/wayland/virtual_keyboard/virtual_keyboard_handle.rs for the native
+Core-app qualification, which must show that typed keys reached the
+application's own wl_keyboard rather than a shell surface. Upstream keeps
+no record of what it sent. The additive, opt-in
+KeyboardHandle::enable_delivery_observer counts each actual
+wl_keyboard.key send per live resource, on the physical path
+(KeyboardTarget::key for WlSurface) and on the virtual-keyboard path,
+after the send and without calling compositor code or taking the keyboard
+internal lock, which both paths may already hold.
+KeyboardHandle::delivery_snapshot returns one client's live bindings as
+KeyboardDeliverySnapshot/KeyboardDeliveryResource with connection and
+binding generations that are never reused, so a recreated binding cannot
+pass for a zero baseline; delivery_observer_status reports availability
+without a snapshot. The counts are sends, not client consumption.
+Enabling after any keyboard was bound is refused for good
+("late-activation"), since earlier sends cannot be reconstructed; a
+retired or missing binding, an unobserved resource, a failed keymap
+transfer and counter or generation overflow are errors, never zero.
+Destroying a keyboard resource removes its entry. A handle that never
+enables the observer records nothing. Real socket tests in
+crates/compositor/src/runtime/native_keyboard_observer_tests.rs send keys
+through a trusted virtual keyboard and check that only the focused
+client's count advances. The isolated diff is retained in
+KEYBOARD-DELIVERY-OBSERVER-PATCH.diff; the pinned version stays 0.7.0.

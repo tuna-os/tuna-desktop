@@ -675,6 +675,30 @@ Nautilus or any of the 28 applications. A fresh source-bound native Core
 matrix on the installed app/service/reference-GDM path is still required;
 the failed run is not a pass and must not be retried merely for green.
 
+The [native Core job in CI run 42395487640](https://github.com/tuna-os/tuna-desktop/actions/runs/42395487640/job/128507853672)
+completed Fonts, Calculator and Image Viewer and failed in Document Viewer at
+`picker-actual-content-cell`. Its `native-core-apps` artifact shows the host
+driver's fault, not the product's or the chooser filter's. The Files location
+entry is a `GtkEntryCompletion`: typing `<fixture>/` pops the directory's
+children up in a list below the entry, that list selects the row under the
+pointer, and Return with a selected row puts the row into the entry instead
+of activating it. In `core-apps/00728-guest-desktop-tree.json` the picker
+window is at `[195, 141, 890, 550]`, the list at `[275, 59, 426, 176]` inside
+it, and the compositor's `pointer_position` is `[797.6, 253.3]`, where the
+previous chooser's file cell had been clicked. After Return
+(`00733-guest-desktop-tree.json`) the list is gone, the entry is still focused
+and reads `<fixture>/web/`, and the view still shows Papers' empty start
+folder. The first Image Viewer chooser (`00453`, pointer at `[617.5, 419.5]`,
+outside the list) navigated; its later choosers (`00480`, `00679`) took the
+same `web/` row and passed only because Files had reopened in the fixture
+directory. `Desktop.enter_location` now rests the real pointer on the entry,
+counts exact reads only while the compositor reports it there, and requires
+Return to close the entry; the Disks journey uses the same helper.
+`scripts/tests/test_core_apps_desktop.py` replays that geometry. The host
+driver and guest observer unit tests (`scripts/tests/test_core_apps_*.py`,
+`test_vm_native_await.py`, `test_geoclue_agent_policy.py`) run in the CI
+`check` job; they do not qualify any application.
+
 
 ## Marlin VM lane
 

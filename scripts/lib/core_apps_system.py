@@ -487,9 +487,7 @@ def _disks(desktop):
     _require(len(mounted["mounted"]) == 1, "disposable fixture mounted at ambiguous destinations")
     destination = mounted["mounted"][0]
     files = desktop.start("org.gnome.Nautilus", "Files")
-    desktop.keys("ctrl", "l")
-    desktop.type_ascii(fixture["source"])
-    desktop.keys("ret")
+    desktop.enter_location(files, fixture["source"], label="disks-files-source-location")
     _await_text(desktop, files, "disks-files-source", "qualification.txt")
     _await_text(desktop, files, "disks-files-negative-source", "negative.bin")
     desktop.keys("ctrl", "a")
@@ -497,9 +495,7 @@ def _disks(desktop):
     copied = desktop.clipboard(mime="text/uri-list")
     uris = {line.strip() for line in base64.b64decode(copied["base64"]).decode().splitlines() if line.strip() and not line.startswith("#")}
     _require(uris == {"file://" + fixture["source"] + "/qualification.txt", "file://" + fixture["source"] + "/negative.bin"}, "native Files clipboard did not select exact owned disk payload controls")
-    desktop.keys("ctrl", "l")
-    desktop.type_ascii(destination)
-    desktop.keys("ret")
+    desktop.enter_location(files, destination, label="disks-files-destination-location")
     _await_text(desktop, files, "disks-files-mounted-destination", fixture["label"])
     desktop.keys("ctrl", "v")
     data = desktop.await_state("disks-native-files-payload-copy", lambda: desktop.guest("system", "disk-read"), payload_matches)
