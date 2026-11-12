@@ -198,6 +198,7 @@ jobs:
       - run: python3 scripts/tests/test_vm_strip_image.py
       - run: python3 scripts/tests/test_vm_strip_stationary_edge.py
       - run: python3 scripts/tests/test_fresh_accounts.py
+      - run: python3 scripts/tests/test_try_tuna_signature_gate.py
       - run: python3 scripts/lib/keyring-owner-proof-tests.py
       - run: python3 scripts/lib/tray-absence-proof-tests.py
       - run: python3 scripts/lib/ledger-tests.py
