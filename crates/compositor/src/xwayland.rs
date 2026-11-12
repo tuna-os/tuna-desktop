@@ -12,6 +12,45 @@
 //! with fake spawners. The Smithay `XWayland::spawn` wiring lands with the
 //! window-model join and installs its spawner there; until then the runtime
 //! polls with no spawner and the supervisor rests in `Pending`.
+//!
+//! # Server-side frames (P-WM-10)
+//!
+//! X11 windows that want window-manager decorations get them the way
+//! Mutter 51 gives them: a separate X11 client (the frames client, see
+//! `crate::x11_frames`) draws a GTK header bar in a frame window, and
+//! the window manager reparents the application's window into it, so the
+//! title bar is part of the window's own Wayland surface. This module
+//! holds the compositor's share as pure decisions:
+//!
+//! - `x11_wants_frame`: which windows are decorated, from Mutter's
+//!   `src/core/window.c` `meta_window_recalc_features` and
+//!   `meta_window_get_frame_type` with `src/x11/window-props.c`
+//!   `reload_mwm_hints`.
+//! - `X11Frame`: the frame, buffer and client rectangles, from
+//!   `src/x11/window-x11.c` `meta_window_x11_move_resize_internal`,
+//!   `meta_window_frame_rect_to_client_rect` and
+//!   `meta_window_client_rect_to_frame_rect`.
+//!
+//! The X11 protocol itself (`_MUTTER_NEEDS_FRAME`, `_MUTTER_FRAME_FOR`,
+//! `_MUTTER_FRAME_EXTENTS`, `_GTK_FRAME_EXTENTS`, `_NET_FRAME_EXTENTS`,
+//! adoption and loss of a frame) is in the vendored Smithay window
+//! manager (`third-party/smithay/ROOST-PATCH.md`). Requests the frame's
+//! header bar makes (`_NET_WM_MOVERESIZE`, `_NET_WM_STATE`,
+//! `WM_CHANGE_STATE`, `_GTK_SHOW_WINDOW_MENU`) arrive here as
+//! `X11ManagerEvent`s for the client window and run the same manager
+//! actions as a native window's.
+//!
+//! Divergences from Mutter, all because Smithay's window manager keeps an
+//! unframed window in a bare wrapper instead of on the root window:
+//!
+//! - Mutter shows a decorated window only once its frame exists. Here the
+//!   map waits for the frame for `X11_FRAME_WAIT` at most, and only
+//!   while a frames client runs; otherwise the window maps bare, exactly
+//!   as before this module knew of frames, and is framed if a frame
+//!   arrives later.
+//! - When the frames client dies Mutter unmanages and re-manages the
+//!   windows the X server hands back. Here they keep their place and
+//!   identity, bare, and are offered to the restarted frames client.
 
 use crate::supervise::RestartPolicy;
 
@@ -203,15 +242,218 @@ pub fn map_x11_identity(title: &str, class: &str, instance: &str) -> (String, Op
     (title, app_id)
 }
 
+/// How long a window that wants a frame waits for it before mapping bare.
+///
+/// Mutter waits without limit (`meta_window_x11_initialize_state` runs
+/// only once the frame is set). The frames client answers within a few
+/// frames once it runs; the bound keeps a window from never appearing
+/// when it does not answer.
+#[cfg(feature = "xwayland")]
+pub const X11_FRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Whether an X11 window is decorated by the window manager, as Mutter
+/// decides it in `meta_window_recalc_features`:
+///
+/// - "Use MWM hints initially": `_MOTIF_WM_HINTS` with the decorations
+///   flag and no decoration at all (`reload_mwm_hints`) turns it off.
+///   That is how GTK's client-side decorated windows opt out; Mutter has
+///   no separate `_GTK_FRAME_EXTENTS` test.
+/// - An override-redirect window, and a type whose
+///   `meta_window_get_frame_type` is `META_FRAME_TYPE_LAST` (desktop,
+///   dock, toolbar, splash screen, the menu and tooltip kinds,
+///   notification, combo, DND), has no frame. Normal, dialog, menu and
+///   utility windows have one; a window without a type is normal (or a
+///   dialog when transient), both framed.
+///
+/// Fullscreen does not enter into it: "We leave fullscreen windows
+/// decorated". The frame window carries the client's `_NET_WM_STATE`,
+/// GTK hides the header bar of a fullscreen frame, and the frame's
+/// extents drop to zero.
+#[cfg(feature = "xwayland")]
+pub fn x11_wants_frame(
+    window_type: Option<smithay::xwayland::xwm::WmWindowType>,
+    override_redirect: bool,
+    motif_undecorated: bool,
+) -> bool {
+    use smithay::xwayland::xwm::WmWindowType;
+    if override_redirect || motif_undecorated {
+        return false;
+    }
+    matches!(
+        window_type,
+        None | Some(
+            WmWindowType::Normal
+                | WmWindowType::Dialog
+                | WmWindowType::Menu
+                | WmWindowType::Utility
+        )
+    )
+}
+
+/// The borders of an X11 window and whether a frame window holds them.
+///
+/// The window model keeps the *frame rectangle* (what the user sees as
+/// the window, title bar included), like a native window's xdg geometry.
+/// Smithay's `X11Surface::configure` takes the *buffer rectangle*: the X11
+/// window carrying the Wayland surface, larger by the invisible borders
+/// (shadows and resize handles). The application sizes its own *client*
+/// window: inside the visible borders of a frame, or the whole buffer of
+/// a window without one (a client-decorated window brings the invisible
+/// borders itself, as `_GTK_FRAME_EXTENTS`).
+#[cfg(feature = "xwayland")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct X11Frame {
+    /// Visible and invisible borders around the frame rectangle.
+    pub extents: smithay::xwayland::xwm::FrameExtents,
+    /// Whether a frames-client frame holds the client.
+    pub framed: bool,
+}
+
+#[cfg(feature = "xwayland")]
+impl X11Frame {
+    /// The current frame of `surface`.
+    pub fn of(surface: &smithay::xwayland::X11Surface) -> Self {
+        Self {
+            extents: surface.frame_extents(),
+            framed: surface.is_framed(),
+        }
+    }
+
+    /// The buffer rectangle to configure for a frame rectangle.
+    pub fn buffer_rect(
+        &self,
+        frame: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
+    ) -> smithay::utils::Rectangle<i32, smithay::utils::Logical> {
+        self.extents.frame_rect_to_buffer_rect(frame)
+    }
+
+    /// The frame size that gives the application the client size it asked
+    /// for (at map or in a `ConfigureRequest`):
+    /// `meta_window_client_rect_to_frame_rect`.
+    pub fn frame_size_for_client(
+        &self,
+        client: smithay::utils::Size<i32, smithay::utils::Logical>,
+    ) -> smithay::utils::Size<i32, smithay::utils::Logical> {
+        let rect = smithay::utils::Rectangle::from_size(client);
+        if self.framed {
+            self.extents.client_rect_to_frame_rect(rect).size
+        } else {
+            self.extents.buffer_rect_to_frame_rect(rect).size
+        }
+    }
+
+    /// The client size inside a frame size:
+    /// `meta_window_frame_rect_to_client_rect`.
+    pub fn client_size(
+        &self,
+        frame: smithay::utils::Size<i32, smithay::utils::Logical>,
+    ) -> smithay::utils::Size<i32, smithay::utils::Logical> {
+        let rect = smithay::utils::Rectangle::from_size(frame);
+        if self.framed {
+            self.extents.frame_rect_to_client_rect(rect).size
+        } else {
+            self.extents.frame_rect_to_buffer_rect(rect).size
+        }
+    }
+
+    /// The frame size of a window whose X11 window carrying the surface
+    /// (what `X11Surface::geometry` reports) has `buffer` size. This is
+    /// the size a window is placed with when it maps: its frame, adopted
+    /// before the map is granted, already grew the buffer around the
+    /// client size the application asked for.
+    pub fn frame_size_in_buffer(
+        &self,
+        buffer: smithay::utils::Size<i32, smithay::utils::Logical>,
+    ) -> smithay::utils::Size<i32, smithay::utils::Logical> {
+        self.extents
+            .buffer_rect_to_frame_rect(smithay::utils::Rectangle::from_size(buffer))
+            .size
+    }
+
+    /// The client size inside a buffer of `buffer` size.
+    pub fn client_size_in_buffer(
+        &self,
+        buffer: smithay::utils::Size<i32, smithay::utils::Logical>,
+    ) -> smithay::utils::Size<i32, smithay::utils::Logical> {
+        self.client_size(self.frame_size_in_buffer(buffer))
+    }
+
+    /// The buffer size that gives the application the client size it
+    /// asked for.
+    pub fn buffer_size_for_client(
+        &self,
+        client: smithay::utils::Size<i32, smithay::utils::Logical>,
+    ) -> smithay::utils::Size<i32, smithay::utils::Logical> {
+        self.buffer_rect(smithay::utils::Rectangle::from_size(
+            self.frame_size_for_client(client),
+        ))
+        .size
+    }
+
+    /// Where `pos` lies on the surface of a window whose frame rectangle
+    /// is `frame`, when it is outside that rectangle but inside the
+    /// invisible borders around it: the shadow of a frame or of a
+    /// client-decorated window, part of which takes pointer input as the
+    /// resize handles (GTK's input shape). Mutter picks a window's actor
+    /// over its whole buffer, clipped to the surface's input region; the
+    /// caller checks that region at the returned surface-local point.
+    /// `None` inside the frame rectangle, outside the buffer, and for a
+    /// window without invisible borders.
+    pub fn invisible_border_point(
+        &self,
+        frame: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
+        pos: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) -> Option<smithay::utils::Point<i32, smithay::utils::Logical>> {
+        if self.extents.invisible.is_zero() {
+            return None;
+        }
+        let point = smithay::utils::Point::<i32, smithay::utils::Logical>::from((
+            pos.x.floor() as i32,
+            pos.y.floor() as i32,
+        ));
+        let buffer = self.buffer_rect(frame);
+        (buffer.contains(point) && !frame.contains(point)).then(|| point - buffer.loc)
+    }
+
+    /// The frame rectangle after the window went from `old` to this
+    /// frame: the same origin, sized so the application keeps its client
+    /// size (a floating window grows by the title bar when it is framed).
+    pub fn reframed(
+        &self,
+        old: &X11Frame,
+        frame: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
+    ) -> smithay::utils::Rectangle<i32, smithay::utils::Logical> {
+        smithay::utils::Rectangle::new(
+            frame.loc,
+            self.frame_size_for_client(old.client_size(frame.size)),
+        )
+    }
+
+    /// The frame rectangle inside a committed buffer of `buffer` size,
+    /// relative to the surface: the X11 counterpart of xdg window
+    /// geometry, by which every consumer of a window's surface places and
+    /// sizes it (`meta_window_x11_surface_rect_to_frame_rect`). `None`
+    /// when nothing is invisible and the surface is the window.
+    pub fn window_geometry(
+        &self,
+        buffer: smithay::utils::Size<i32, smithay::utils::Logical>,
+    ) -> Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>> {
+        (!self.extents.invisible.is_zero()).then(|| {
+            self.extents
+                .buffer_rect_to_frame_rect(smithay::utils::Rectangle::from_size(buffer))
+        })
+    }
+}
+
 /// X11 window-manager happenings the [`crate::State`] handlers queue
 /// for the window manager's `reconcile` drain, so all scene mutation
 /// stays on the one manager call path. (xwayland feature only.)
 #[cfg(feature = "xwayland")]
 #[derive(Debug, Clone)]
 pub enum X11ManagerEvent {
-    /// An X11 window asked to be mapped (already granted via
-    /// `set_mapped(true)` in the handler). Boxed: the surface is
-    /// ~270 bytes and dwarfs the other variants.
+    /// An X11 window asked to be mapped; the manager grants it with
+    /// `set_mapped(true)`, at once or when its frame arrives. Boxed: the
+    /// surface is ~270 bytes and dwarfs the other variants.
     MapRequest(Box<smithay::xwayland::X11Surface>),
     /// An X11 window was unmapped (X11 window id).
     Unmapped(u32),
@@ -228,12 +470,28 @@ pub enum X11ManagerEvent {
         width: Option<u32>,
         height: Option<u32>,
     },
-    /// An X11 window property changed; the manager re-reads identity.
+    /// An X11 window property changed; the manager re-reads identity and
+    /// the decoration decision.
     Property(u32),
     /// An X11 maximize/unmaximize request (X11 window id, maximize?).
     Maximize(u32, bool),
     /// An X11 fullscreen/unfullscreen request (X11 window id, on?).
     Fullscreen(u32, bool),
+    /// `_NET_WM_MOVERESIZE` move: the title bar of the window's frame is
+    /// being dragged (X11 window id).
+    Move(u32),
+    /// `_NET_WM_MOVERESIZE` resize from an edge of the frame.
+    Resize(u32, smithay::xwayland::xwm::ResizeEdge),
+    /// `WM_CHANGE_STATE` to iconic: the frame's minimize button.
+    Minimize(u32),
+    /// `_NET_CLOSE_WINDOW` (a pager; the frame's own close button sends
+    /// `WM_DELETE_WINDOW` to the client itself).
+    Close(u32),
+    /// `_GTK_SHOW_WINDOW_MENU` at a global position: a secondary click on
+    /// the frame's title bar.
+    Menu(u32, i32, i32),
+    /// The window's frame was adopted or lost, or its borders changed.
+    FrameChanged(u32),
 }
 
 /// Spawn the compatibility server and hook its event source into the
@@ -357,20 +615,17 @@ mod handlers {
         state.x11_events.push(event);
     }
 
-    /// Shared map-request handling: grant, then queue. Placement and
-    /// scene work stay in the manager's reconcile drain. Outcomes are
-    /// logged (id plus granted/refused) so a silent window has a trail.
+    /// Shared map-request handling: queue it. The grant
+    /// (`set_mapped(true)`), the decoration decision, placement and scene
+    /// work stay in the manager's reconcile drain, which may hold the map
+    /// until the window's frame arrives. A refusal is logged (id) so a
+    /// silent window has a trail; the manager logs the grant.
     fn on_map_request(state: &mut State, window: X11Surface) {
         let id = window.window_id();
         if window.is_override_redirect() {
             eprintln!("tuna-compositor: xwayland: map refused (override-redirect) id={id}");
             return;
         }
-        if window.set_mapped(true).is_err() {
-            eprintln!("tuna-compositor: xwayland: map refused (grant failed) id={id}");
-            return;
-        }
-        eprintln!("tuna-compositor: xwayland: map granted id={id}");
         push(state, X11ManagerEvent::MapRequest(Box::new(window)));
     }
 
@@ -487,15 +742,45 @@ mod handlers {
                 fn resize_request(
                     &mut self,
                     _xwm: XwmId,
-                    _window: X11Surface,
+                    window: X11Surface,
                     _button: u32,
-                    _resize_edge: smithay::xwayland::xwm::ResizeEdge,
+                    resize_edge: smithay::xwayland::xwm::ResizeEdge,
                 ) {
-                    // No interactive drag-to-resize in this slice; ignored.
+                    push(
+                        $state(self),
+                        X11ManagerEvent::Resize(window.window_id(), resize_edge),
+                    );
                 }
 
-                fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {
-                    // No interactive drag-to-move in this slice; ignored.
+                fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
+                    push($state(self), X11ManagerEvent::Move(window.window_id()));
+                }
+
+                fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+                    push($state(self), X11ManagerEvent::Minimize(window.window_id()));
+                }
+
+                fn close_request(&mut self, _xwm: XwmId, window: X11Surface) {
+                    push($state(self), X11ManagerEvent::Close(window.window_id()));
+                }
+
+                fn show_window_menu_request(
+                    &mut self,
+                    _xwm: XwmId,
+                    window: X11Surface,
+                    location: smithay::utils::Point<i32, smithay::utils::Logical>,
+                ) {
+                    push(
+                        $state(self),
+                        X11ManagerEvent::Menu(window.window_id(), location.x, location.y),
+                    );
+                }
+
+                fn frame_changed(&mut self, _xwm: XwmId, window: X11Surface) {
+                    push(
+                        $state(self),
+                        X11ManagerEvent::FrameChanged(window.window_id()),
+                    );
                 }
 
                 fn property_notify(
@@ -910,5 +1195,322 @@ mod identity_tests {
         assert_eq!(title, UNTITLED_X11_TITLE);
         assert!(!title.is_empty());
         assert_eq!(app_id, None);
+    }
+}
+
+#[cfg(all(test, feature = "xwayland"))]
+mod frame_tests {
+    use super::{x11_wants_frame, X11Frame};
+    use smithay::utils::{Logical, Rectangle, Size};
+    use smithay::xwayland::xwm::{addresses_window, FrameBorder, FrameExtents, WmWindowType};
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    fn size(w: i32, h: i32) -> Size<i32, Logical> {
+        (w, h).into()
+    }
+
+    /// A GTK frames-client frame: a 47 px header bar, and the shadow GDK
+    /// reports as `_GTK_FRAME_EXTENTS`, wider below than above.
+    fn gtk_frame() -> X11Frame {
+        X11Frame {
+            extents: FrameExtents {
+                visible: FrameBorder {
+                    left: 0,
+                    right: 0,
+                    top: 47,
+                    bottom: 0,
+                },
+                invisible: FrameBorder {
+                    left: 25,
+                    right: 25,
+                    top: 22,
+                    bottom: 28,
+                },
+            },
+            framed: true,
+        }
+    }
+
+    #[test]
+    fn mutter_frames_normal_dialog_menu_and_utility_windows_only() {
+        for kind in [
+            None,
+            Some(WmWindowType::Normal),
+            Some(WmWindowType::Dialog),
+            Some(WmWindowType::Menu),
+            Some(WmWindowType::Utility),
+        ] {
+            assert!(x11_wants_frame(kind, false, false), "framed type {kind:?}");
+        }
+        // meta_window_get_frame_type: META_FRAME_TYPE_LAST.
+        for kind in [
+            WmWindowType::Desktop,
+            WmWindowType::Dock,
+            WmWindowType::Toolbar,
+            WmWindowType::Splash,
+            WmWindowType::DropdownMenu,
+            WmWindowType::PopupMenu,
+            WmWindowType::Tooltip,
+            WmWindowType::Notification,
+            WmWindowType::Combo,
+            WmWindowType::Dnd,
+        ] {
+            assert!(
+                !x11_wants_frame(Some(kind), false, false),
+                "unframed type {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn motif_undecorated_and_override_redirect_windows_get_no_frame() {
+        // GTK client-side decorations and borderless players set
+        // _MOTIF_WM_HINTS decorations to 0.
+        assert!(!x11_wants_frame(Some(WmWindowType::Normal), false, true));
+        assert!(!x11_wants_frame(None, false, true));
+        // "We don't want to allow override-redirect windows to have
+        // decorated-window types".
+        assert!(!x11_wants_frame(Some(WmWindowType::Normal), true, false));
+        assert!(!x11_wants_frame(Some(WmWindowType::Dialog), true, false));
+    }
+
+    #[test]
+    fn frame_window_is_the_frame_rectangle_grown_by_the_invisible_borders() {
+        let frame = gtk_frame();
+        let visible = rect(100, 200, 640, 527);
+        let buffer = frame.buffer_rect(visible);
+        assert_eq!(buffer, rect(75, 178, 690, 577));
+        assert_eq!(frame.extents.buffer_rect_to_frame_rect(buffer), visible);
+    }
+
+    #[test]
+    fn client_sits_at_the_total_offset_and_loses_every_border() {
+        let frame = gtk_frame();
+        let buffer = frame.buffer_rect(rect(100, 200, 640, 527));
+        // frame->child_x / child_y: invisible plus visible, left and top.
+        let child = frame.extents.child_rect(buffer.size);
+        assert_eq!(child, rect(25, 69, 640, 480));
+        // The same client rectangle from the frame rectangle, in root
+        // coordinates (the synthetic ConfigureNotify the client receives).
+        assert_eq!(
+            frame
+                .extents
+                .frame_rect_to_client_rect(rect(100, 200, 640, 527)),
+            rect(100, 247, 640, 480)
+        );
+        assert_eq!(
+            Rectangle::new(buffer.loc + child.loc, child.size),
+            rect(100, 247, 640, 480)
+        );
+    }
+
+    #[test]
+    fn a_requested_client_size_grows_by_the_title_bar_and_back() {
+        let frame = gtk_frame();
+        assert_eq!(frame.frame_size_for_client(size(640, 480)), size(640, 527));
+        assert_eq!(frame.client_size(size(640, 527)), size(640, 480));
+        // No frame, no borders: the client is the window.
+        let bare = X11Frame::default();
+        assert_eq!(bare.frame_size_for_client(size(640, 480)), size(640, 480));
+        assert_eq!(bare.client_size(size(640, 480)), size(640, 480));
+        assert_eq!(
+            bare.buffer_rect(rect(10, 20, 640, 480)),
+            rect(10, 20, 640, 480)
+        );
+    }
+
+    #[test]
+    fn a_client_decorated_window_is_its_buffer_inside_its_own_shadow() {
+        // GTK draws the shadow itself and reports it as _GTK_FRAME_EXTENTS:
+        // the visible window is the client minus that margin.
+        let csd = X11Frame {
+            extents: FrameExtents {
+                visible: FrameBorder::default(),
+                invisible: FrameBorder {
+                    left: 26,
+                    right: 26,
+                    top: 23,
+                    bottom: 29,
+                },
+            },
+            framed: false,
+        };
+        assert_eq!(csd.frame_size_for_client(size(852, 652)), size(800, 600));
+        assert_eq!(csd.client_size(size(800, 600)), size(852, 652));
+        assert_eq!(
+            csd.buffer_rect(rect(100, 100, 800, 600)),
+            rect(74, 77, 852, 652)
+        );
+        assert_eq!(
+            csd.window_geometry(size(852, 652)),
+            Some(rect(26, 23, 800, 600))
+        );
+    }
+
+    #[test]
+    fn framing_a_bare_window_keeps_its_client_size_and_origin() {
+        let frame = gtk_frame();
+        let bare = X11Frame::default();
+        let framed = frame.reframed(&bare, rect(300, 150, 640, 480));
+        assert_eq!(framed, rect(300, 150, 640, 527));
+        // Losing the frame (the frames client died) gives the height back.
+        assert_eq!(bare.reframed(&frame, framed), rect(300, 150, 640, 480));
+    }
+
+    #[test]
+    fn adopting_a_frame_grows_the_x11_window_around_the_unchanged_client() {
+        // The X11 window carrying the surface when the frame arrives is
+        // the bare wrapper the client fills. The frame must not shrink
+        // the client into it: the buffer grows by every border, and the
+        // frame rectangle starts where the bare window did.
+        let frame = gtk_frame();
+        let bare = rect(300, 150, 640, 480);
+        let buffer = frame.extents.bare_rect_to_buffer_rect(bare);
+        assert_eq!(buffer, rect(275, 128, 690, 577));
+        assert_eq!(frame.extents.child_rect(buffer.size).size, bare.size);
+        // The same rectangle the manager lays the window out with.
+        let framed = frame.reframed(&X11Frame::default(), bare);
+        assert_eq!(frame.buffer_rect(framed), buffer);
+        // Losing the frame gives the client's rectangle back, at the
+        // frame rectangle's origin.
+        assert_eq!(frame.extents.buffer_rect_to_bare_rect(buffer), bare);
+        // Without borders nothing moves.
+        let none = FrameExtents::default();
+        assert_eq!(none.bare_rect_to_buffer_rect(bare), bare);
+        assert_eq!(none.buffer_rect_to_bare_rect(bare), bare);
+    }
+
+    #[test]
+    fn a_window_maps_at_the_frame_size_inside_its_x11_window() {
+        // A frame adopted before the map was granted: the X11 window is
+        // the asked client size plus every border.
+        let frame = gtk_frame();
+        assert_eq!(frame.frame_size_in_buffer(size(690, 577)), size(640, 527));
+        assert_eq!(frame.client_size_in_buffer(size(690, 577)), size(640, 480));
+        assert_eq!(frame.buffer_size_for_client(size(640, 480)), size(690, 577));
+        // No frame: the client is the X11 window.
+        let bare = X11Frame::default();
+        assert_eq!(bare.frame_size_in_buffer(size(640, 480)), size(640, 480));
+        assert_eq!(bare.client_size_in_buffer(size(640, 480)), size(640, 480));
+        assert_eq!(bare.buffer_size_for_client(size(640, 480)), size(640, 480));
+        // A client-decorated window is its X11 window, shadow included.
+        let csd = X11Frame {
+            extents: FrameExtents {
+                visible: FrameBorder::default(),
+                invisible: gtk_frame().extents.invisible,
+            },
+            framed: false,
+        };
+        assert_eq!(csd.frame_size_in_buffer(size(690, 530)), size(640, 480));
+        assert_eq!(csd.client_size_in_buffer(size(690, 530)), size(690, 530));
+        assert_eq!(csd.buffer_size_for_client(size(690, 530)), size(690, 530));
+    }
+
+    #[test]
+    fn the_invisible_border_is_part_of_the_surface_outside_the_window() {
+        let frame = gtk_frame();
+        let window = rect(100, 200, 640, 527);
+        let at = |x: f64, y: f64| frame.invisible_border_point(window, (x, y).into());
+        // Inside the frame rectangle: the window itself, not its border.
+        assert_eq!(at(100.0, 200.0), None);
+        assert_eq!(at(739.9, 726.9), None);
+        // Just outside each edge, in surface coordinates (the buffer
+        // starts 25 px left of and 22 px above the window).
+        assert_eq!(at(99.5, 300.0), Some((24, 122).into()));
+        assert_eq!(at(740.0, 300.0), Some((665, 122).into()));
+        assert_eq!(at(400.0, 199.0), Some((325, 21).into()));
+        assert_eq!(at(400.0, 727.0), Some((325, 549).into()));
+        // The corners of the shadow belong to it too.
+        assert_eq!(at(75.0, 178.0), Some((0, 0).into()));
+        assert_eq!(at(764.9, 754.9), Some((689, 576).into()));
+        // Past the shadow: not this window's surface.
+        assert_eq!(at(74.9, 300.0), None);
+        assert_eq!(at(765.0, 300.0), None);
+        assert_eq!(at(400.0, 177.9), None);
+        assert_eq!(at(400.0, 755.0), None);
+        // A maximized frame and a bare window have no invisible border.
+        let flat = X11Frame {
+            extents: FrameExtents {
+                visible: gtk_frame().extents.visible,
+                invisible: FrameBorder::default(),
+            },
+            framed: true,
+        };
+        assert_eq!(
+            flat.invisible_border_point(window, (99.0, 300.0).into()),
+            None
+        );
+        assert_eq!(
+            X11Frame::default().invisible_border_point(window, (99.0, 300.0).into()),
+            None
+        );
+    }
+
+    #[test]
+    fn window_geometry_is_the_surface_minus_the_shadow() {
+        let frame = gtk_frame();
+        assert_eq!(
+            frame.window_geometry(size(690, 577)),
+            Some(rect(25, 22, 640, 527))
+        );
+        // A maximized or fullscreen frame has no shadow: the surface is
+        // the window and carries no geometry of its own.
+        let flat = X11Frame {
+            extents: FrameExtents {
+                visible: gtk_frame().extents.visible,
+                invisible: FrameBorder::default(),
+            },
+            framed: true,
+        };
+        assert_eq!(flat.window_geometry(size(1920, 1048)), None);
+        assert_eq!(X11Frame::default().window_geometry(size(640, 480)), None);
+    }
+
+    #[test]
+    fn net_frame_extents_are_the_visible_borders_left_right_top_bottom() {
+        assert_eq!(gtk_frame().extents.net_frame_extents(), [0, 0, 47, 0]);
+        assert_eq!(FrameExtents::default().net_frame_extents(), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn frame_extents_properties_need_exactly_four_cardinals() {
+        assert_eq!(
+            FrameBorder::from_cardinals(&[1, 2, 3, 4]),
+            Some(FrameBorder {
+                left: 1,
+                right: 2,
+                top: 3,
+                bottom: 4,
+            })
+        );
+        // meta_frame_query_borders: `nitems == 4`, else no borders.
+        assert_eq!(FrameBorder::from_cardinals(&[]), None);
+        assert_eq!(FrameBorder::from_cardinals(&[1, 2, 3]), None);
+        assert_eq!(FrameBorder::from_cardinals(&[1, 2, 3, 4, 5]), None);
+    }
+
+    #[test]
+    fn borders_scale_from_x11_pixels_to_logical_pixels() {
+        let scaled = gtk_frame().extents.to_logical(2.0);
+        assert_eq!(scaled.visible.top, 24);
+        assert_eq!(scaled.invisible.left, 13);
+        assert_eq!(scaled.invisible.bottom, 14);
+        assert_eq!(gtk_frame().extents.to_logical(1.0), gtk_frame().extents);
+    }
+
+    #[test]
+    fn requests_naming_the_frame_reach_its_client_window() {
+        let (client, frame, other) = (0x40_0001, 0x60_0007, 0x40_0002);
+        // GTK sends _NET_WM_STATE, WM_CHANGE_STATE, _NET_WM_MOVERESIZE and
+        // _GTK_SHOW_WINDOW_MENU for the header bar's own window.
+        assert!(addresses_window(frame, client, Some(frame)));
+        assert!(addresses_window(client, client, Some(frame)));
+        assert!(addresses_window(client, client, None));
+        assert!(!addresses_window(other, client, Some(frame)));
+        // A window without a frame answers to its own id alone.
+        assert!(!addresses_window(frame, client, None));
     }
 }

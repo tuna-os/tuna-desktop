@@ -28,7 +28,7 @@ def process(name, pid, profile='gnome', uid=1000):
 
 def payload_integrity():
     evidence = {'ready': True}
-    for key, name, count in (('stock', 'stock-payload.sha256', 4), ('current_tuna', 'current-payload.sha256', 6)):
+    for key, name, count in (('stock', 'stock-payload.sha256', 4), ('current_tuna', 'current-payload.sha256', 7)):
         evidence[key] = {'receipt_path': '/usr/share/tuna-vm/' + name,
                          'receipt_sha256': proof.digest(name.encode()), 'checked_files': count}
     original = {n: '51.1-1' for n in ('gdm', 'gnome-shell', 'nautilus', 'gnome-control-center')}
@@ -816,7 +816,7 @@ class NativeSwitcherReferenceTests(unittest.TestCase):
     def test_actual_drm_payload_and_wayland_peer_observations_are_mandatory(self):
         for mutate in (
             lambda a: a['payload_integrity']['stock'].update(checked_files=0),
-            lambda a: a['payload_integrity']['current_tuna'].update(checked_files=7),
+            lambda a: a['payload_integrity']['current_tuna'].update(checked_files=8),
             lambda a: a['session']['native_gpu']['drm_fds'][0]['pci'].update(device='0x1111'),
             lambda a: a['session']['native_gpu']['drm_fds'][0]['connectors'][0].update(enabled='disabled'),
             lambda a: a['session']['wayland_socket'].update(peer=process('gnome-shell', 999)),

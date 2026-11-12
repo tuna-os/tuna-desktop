@@ -44,10 +44,15 @@ fn media_trace_enabled() -> bool {
 }
 
 #[cfg(feature = "xwayland")]
-use crate::xwayland::{map_x11_identity, X11ManagerEvent};
+use crate::xwayland::{
+    map_x11_identity, x11_wants_frame, X11Frame, X11ManagerEvent, X11_FRAME_WAIT,
+};
 use smithay::reexports::wayland_server::Resource as _;
 #[cfg(feature = "xwayland")]
-use smithay::xwayland::{xwm::WmWindowType, X11Surface};
+use smithay::xwayland::{
+    xwm::{ResizeEdge, WmWindowType},
+    X11Surface,
+};
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, ButtonState, Event as BackendEvent, InputBackend, InputEvent,
@@ -385,6 +390,19 @@ pub struct WindowManager {
     /// entry holds the one unified handle.
     #[cfg(feature = "xwayland")]
     x11_index: HashMap<u32, u64>,
+    /// The frame each X11 window was last laid out with, by model id: a
+    /// frame adopted or lost afterwards resizes a floating window around
+    /// its client instead of squeezing the client into the old rectangle.
+    #[cfg(feature = "xwayland")]
+    x11_frames: HashMap<u64, X11Frame>,
+    /// X11 windows whose map waits for their frame (Mutter shows a
+    /// decorated window only once its frame exists), each with the
+    /// instant the wait gives up and the window maps bare.
+    #[cfg(feature = "xwayland")]
+    x11_awaiting_frame: Vec<(X11Surface, std::time::Instant)>,
+    /// Whether a frames client runs: without one no map waits.
+    #[cfg(feature = "xwayland")]
+    x11_frames_client: bool,
     /// Model ids bottom-to-top; focus raises to the top.
     stacking: Vec<u64>,
     // Explicit activation history is independent of raising transient families.
@@ -698,6 +716,12 @@ impl WindowManager {
             surface_index: HashMap::new(),
             #[cfg(feature = "xwayland")]
             x11_index: HashMap::new(),
+            #[cfg(feature = "xwayland")]
+            x11_frames: HashMap::new(),
+            #[cfg(feature = "xwayland")]
+            x11_awaiting_frame: Vec::new(),
+            #[cfg(feature = "xwayland")]
+            x11_frames_client: false,
             stacking: Vec::new(),
             focus_history: Vec::new(),
             cascade: 0,
@@ -1017,6 +1041,30 @@ impl WindowManager {
         if let Some(window) = self.windows.get(&id) {
             if let WindowSurface::X11(surface) = window.surface.underlying_surface() {
                 return Some(surface.window_id());
+            }
+        }
+        let _ = id;
+        None
+    }
+
+    /// The frame of an X11 window for diagnostic journeys, never
+    /// authority: whether a frames-client frame holds it, its visible
+    /// borders (left, right, top, bottom: the client's
+    /// `_NET_FRAME_EXTENTS`), and the rectangle of the X11 window that
+    /// carries its surface, larger than the window by the invisible
+    /// borders (shadow and resize handles).
+    pub fn x11_frame_state(&self, id: u64) -> Option<(bool, [i32; 4], [i32; 4])> {
+        #[cfg(feature = "xwayland")]
+        if let Some(window) = self.windows.get(&id) {
+            if let WindowSurface::X11(surface) = window.surface.underlying_surface() {
+                let frame = X11Frame::of(surface);
+                let visible = frame.extents.visible;
+                let buffer = surface.geometry();
+                return Some((
+                    frame.framed,
+                    [visible.left, visible.right, visible.top, visible.bottom],
+                    [buffer.loc.x, buffer.loc.y, buffer.size.w, buffer.size.h],
+                ));
             }
         }
         let _ = id;
@@ -1514,6 +1562,10 @@ impl WindowManager {
         self.drain_x11_events(state);
         #[cfg(feature = "xwayland")]
         self.reconcile_x11_parents(state);
+        #[cfg(feature = "xwayland")]
+        self.sync_x11_positions();
+        #[cfg(feature = "xwayland")]
+        self.sync_x11_window_geometry();
         // Smithay's Window geometry uses a cached surface-tree bounding box.
         // Refresh it after dispatched commits (including unsynchronized
         // subsurfaces) before render-time width scaling reads the geometry.
@@ -2046,9 +2098,16 @@ impl WindowManager {
         let id = self.insert_managed(&title, app_id.as_deref());
         self.x11_index.insert(surface.window_id(), id);
         eprintln!("tuna-compositor: X11 window {id} mapped ({title})");
-        // GNOME placement at the size the client asked for.
+        // GNOME placement at the size the client asked for: the frame
+        // rectangle is that size plus the title bar of its frame, or
+        // minus the shadow a client-decorated window draws itself
+        // (meta_window_client_rect_to_frame_rect). The X11 window that
+        // carries the surface already has both: a frame adopted while
+        // the map waited grew around the client.
+        let frame = X11Frame::of(surface);
+        self.x11_frames.insert(id, frame);
         let asked = surface.geometry().size;
-        let wanted = (asked.w > 0 && asked.h > 0).then_some(asked);
+        let wanted = (asked.w > 0 && asked.h > 0).then(|| frame.frame_size_in_buffer(asked));
         let always_centered = matches!(
             surface.window_type(),
             Some(WmWindowType::Dialog | WmWindowType::Splash)
@@ -2092,23 +2151,306 @@ impl WindowManager {
         for id in ids {
             self.unmap(state, id);
         }
+        self.x11_awaiting_frame.clear();
+        self.x11_frames.clear();
         state.x11_events.clear();
     }
 
+    /// Whether a frames client runs (see [`crate::x11_frames`]). While
+    /// one does, a window that wants a frame maps once the frame arrived.
+    #[cfg(feature = "xwayland")]
+    pub fn set_x11_frames_client(&mut self, running: bool) {
+        self.x11_frames_client = running;
+    }
+
+    /// When the longest-waiting X11 window stops waiting for its frame.
+    #[cfg(feature = "xwayland")]
+    pub fn x11_frame_deadline(&self) -> Option<std::time::Instant> {
+        self.x11_awaiting_frame
+            .iter()
+            .map(|(_, deadline)| *deadline)
+            .min()
+    }
+
+    /// Grant a map request and register the window. Outcomes are logged
+    /// (id plus granted/refused) so a silent window has a trail.
+    #[cfg(feature = "xwayland")]
+    fn grant_x11_map(&mut self, state: &mut State, surface: &X11Surface) {
+        let id = surface.window_id();
+        if !surface.alive() {
+            return;
+        }
+        if surface.set_mapped(true).is_err() {
+            eprintln!("tuna-compositor: xwayland: map refused (grant failed) id={id}");
+            return;
+        }
+        eprintln!("tuna-compositor: xwayland: map granted id={id}");
+        self.map_x11(state, surface);
+    }
+
+    /// Map the windows whose frame arrived, and those that waited long
+    /// enough or whose frames client is gone (they map bare).
+    #[cfg(feature = "xwayland")]
+    fn release_awaited_x11(&mut self, state: &mut State) {
+        if self.x11_awaiting_frame.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let client = self.x11_frames_client;
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.x11_awaiting_frame)
+            .into_iter()
+            .partition(|(surface, deadline)| {
+                surface.is_framed() || !surface.alive() || !client || now >= *deadline
+            });
+        self.x11_awaiting_frame = waiting;
+        for (surface, _) in ready {
+            self.grant_x11_map(state, &surface);
+        }
+    }
+
+    /// An X11 window's frame was adopted or lost, or its borders changed
+    /// (meta-x11-frame.c `meta_frame_handle_xevent`: the frame rectangle
+    /// stays and the window is laid out again). A floating window whose
+    /// frame came or went after it mapped keeps its client size instead:
+    /// it grows or shrinks by the title bar.
+    #[cfg(feature = "xwayland")]
+    fn x11_frame_changed(&mut self, xid: u32) {
+        let Some(id) = self.x11_index.get(&xid).copied() else {
+            return;
+        };
+        let Some(frame) = self
+            .windows
+            .get(&id)
+            .and_then(|window| window.surface.x11_surface())
+            .map(X11Frame::of)
+        else {
+            return;
+        };
+        let old = self.x11_frames.insert(id, frame).unwrap_or_default();
+        if old.framed != frame.framed {
+            if let Some(window) = self.windows.get_mut(&id) {
+                if window.layout == WindowLayout::Floating {
+                    window.geometry = frame.reframed(&old, window.geometry);
+                } else if let Some(restore) = window.restore.as_mut() {
+                    *restore = frame.reframed(&old, *restore);
+                }
+            }
+            // The Wayland surface went with the X11 window that carried
+            // it (the bare wrapper or the frame): the seat follows to the
+            // new one once Xwayland associates it.
+            if self.model.focused() == Some(id) {
+                self.focus_awaits_surface = Some(id);
+            }
+            eprintln!(
+                "tuna-compositor: X11 window {id} {}",
+                if frame.framed { "framed" } else { "unframed" }
+            );
+        }
+        self.configure(id, self.model.focused() == Some(id));
+    }
+
+    /// window-props.c `reload_mwm_hints` and window.c
+    /// `meta_window_type_changed`: a mapped window's decoration follows
+    /// its Motif hints and type (`meta_window_ensure_frame` or
+    /// `meta_window_destroy_frame`).
+    #[cfg(feature = "xwayland")]
+    fn sync_x11_decoration(&mut self, xid: u32) {
+        let Some(surface) = self
+            .x11_index
+            .get(&xid)
+            .and_then(|id| self.windows.get(id))
+            .and_then(|window| window.surface.x11_surface())
+            .cloned()
+        else {
+            return;
+        };
+        let wants = x11_decorated(&surface);
+        if wants == surface.needs_frame() {
+            return;
+        }
+        let was_framed = surface.is_framed();
+        if surface.set_needs_frame(wants).is_err() {
+            eprintln!("tuna-compositor: xwayland: frame request refused id={xid}");
+        }
+        if surface.is_framed() != was_framed {
+            self.x11_frame_changed(xid);
+        }
+    }
+
+    /// `_NET_WM_MOVERESIZE` from an X11 window or its frame: the drag of
+    /// a frame's title bar or edge. As for `xdg_toplevel.move`, only
+    /// while the press that started it on this window is still held
+    /// (window-x11.c checks the button is pressed before
+    /// `meta_window_begin_grab_op`), and from where that press landed:
+    /// GTK asks only after its drag threshold, naming the press position
+    /// (the message's `x_root`, `y_root`, Mutter's grab anchor), so the
+    /// window catches up with the pointer instead of trailing it by the
+    /// threshold.
+    #[cfg(feature = "xwayland")]
+    fn begin_x11_drag(&mut self, state: &mut State, id: u64, edges: Option<u32>) {
+        if self.grab.is_some() {
+            return;
+        }
+        let Some(origin) = state
+            .seat
+            .get_pointer()
+            .filter(|pointer| pointer.is_grabbed())
+            .and_then(|pointer| pointer.grab_start_data())
+            .filter(|start| {
+                start.focus.as_ref().map(|(surface, _)| surface)
+                    == self
+                        .windows
+                        .get(&id)
+                        .and_then(|window| window.surface.wl_surface())
+                        .as_deref()
+            })
+            .map(|start| start.location)
+        else {
+            return;
+        };
+        match edges {
+            Some(edges) => self.begin_resize_from(state, id, edges, origin),
+            None => self.begin_move_from(state, id, origin),
+        }
+        self.grab_motion(state, self.pointer_pos);
+    }
+
+    /// Keep each X11 window where its window is. Mutter moves the X11
+    /// window with every move of a window
+    /// (`meta_window_x11_move_resize_internal`); here a move changes only
+    /// the model rectangle (an interactive drag, a keyboard move, a
+    /// placement), which is all a native window needs. An X11 client
+    /// works in root coordinates: it places its menus by them, and the
+    /// frame's header bar names them in `_NET_WM_MOVERESIZE` and
+    /// `_GTK_SHOW_WINDOW_MENU`. A change of size is configured where it
+    /// is decided.
+    #[cfg(feature = "xwayland")]
+    fn sync_x11_positions(&self) {
+        for (id, window) in &self.windows {
+            let WindowSurface::X11(surface) = window.surface.underlying_surface() else {
+                continue;
+            };
+            if surface.is_override_redirect() {
+                continue;
+            }
+            let buffer = X11Frame::of(surface).buffer_rect(window.geometry);
+            let current = surface.geometry();
+            if current.size == buffer.size
+                && current.loc != buffer.loc
+                && surface.configure(Some(buffer)).is_err()
+            {
+                eprintln!("tuna-compositor: window {id} X11 move refused");
+            }
+        }
+    }
+
+    /// Whether `pos`, outside the frame rectangle `frame` of window `id`,
+    /// is on the part of an X11 window's invisible border that takes
+    /// pointer input: the resize handles a frame (or a client-decorated
+    /// window) keeps in its shadow.
+    #[cfg(feature = "xwayland")]
+    fn x11_border_takes_input(
+        &self,
+        id: u64,
+        window: &ManagedWindow,
+        frame: Rectangle<i32, Logical>,
+        pos: Point<f64, Logical>,
+    ) -> bool {
+        let Some(point) = self
+            .x11_frames
+            .get(&id)
+            .and_then(|x11| x11.invisible_border_point(frame, pos))
+        else {
+            return false;
+        };
+        let Some(surface) = window.surface.wl_surface() else {
+            return false;
+        };
+        with_states(&surface, |states| {
+            states
+                .cached_state
+                .get::<smithay::wayland::compositor::SurfaceAttributes>()
+                .current()
+                .input_region
+                .as_ref()
+                .is_none_or(|region| region.contains(point))
+        })
+    }
+
+    /// Give each X11 window's surface the window geometry an xdg client
+    /// sets itself: the frame rectangle inside the buffer, which is
+    /// larger by the shadow of the frame window (or of a client-decorated
+    /// window). Rendering, hit-testing and popups place every window's
+    /// surface by that geometry ([`crate::popup::surface_origin`],
+    /// [`committed_size`]), so X11 windows need no path of their own.
+    /// Nothing else writes this state on Xwayland's surfaces; a commit
+    /// copies the pending value over the current one, so both are set.
+    #[cfg(feature = "xwayland")]
+    fn sync_x11_window_geometry(&self) {
+        for window in self.windows.values() {
+            let WindowSurface::X11(surface) = window.surface.underlying_surface() else {
+                continue;
+            };
+            let Some(wl) = surface.wl_surface() else {
+                continue;
+            };
+            let Some(buffer) =
+                smithay::backend::renderer::utils::with_renderer_surface_state(&wl, |s| {
+                    s.surface_size()
+                })
+                .flatten()
+            else {
+                continue;
+            };
+            let geometry = X11Frame::of(surface).window_geometry(buffer);
+            with_states(&wl, |states| {
+                let mut cached = states
+                    .cached_state
+                    .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
+                if cached.current().geometry != geometry {
+                    cached.current().geometry = geometry;
+                    cached.pending().geometry = geometry;
+                }
+            });
+        }
+    }
+
     /// Drain queued X11 manager events: map/unmap/size and identity
-    /// updates plus maximize/fullscreen requests, all on the one
-    /// manager call path. (xwayland feature only.)
+    /// updates, frame changes, and the maximize/fullscreen/minimize/
+    /// move/resize/close/menu requests of a window or its frame, all on
+    /// the one manager call path. (xwayland feature only.)
     #[cfg(feature = "xwayland")]
     fn drain_x11_events(&mut self, state: &mut State) {
         for event in state.take_x11_events() {
             match event {
                 X11ManagerEvent::MapRequest(surface) => {
-                    if self.x11_index.contains_key(&surface.window_id()) {
+                    let xid = surface.window_id();
+                    if self.x11_index.contains_key(&xid)
+                        || self
+                            .x11_awaiting_frame
+                            .iter()
+                            .any(|(waiting, _)| waiting.window_id() == xid)
+                    {
                         continue;
                     }
-                    self.map_x11(state, &surface);
+                    // meta_window_x11_new: a decorated window asks for its
+                    // frame (meta_window_ensure_frame) and shows once the
+                    // frames client answered. Without a frames client
+                    // nobody answers and the window maps bare at once.
+                    let wants = x11_decorated(&surface);
+                    if surface.set_needs_frame(wants).is_err() {
+                        eprintln!("tuna-compositor: xwayland: frame request refused id={xid}");
+                    }
+                    if wants && self.x11_frames_client && !surface.is_framed() {
+                        self.x11_awaiting_frame
+                            .push((*surface, std::time::Instant::now() + X11_FRAME_WAIT));
+                        continue;
+                    }
+                    self.grant_x11_map(state, &surface);
                 }
                 X11ManagerEvent::Unmapped(id) | X11ManagerEvent::Destroyed(id) => {
+                    self.x11_awaiting_frame
+                        .retain(|(waiting, _)| waiting.window_id() != id);
                     if let Some(model) = self.x11_index.get(&id).copied() {
                         self.unmap(state, model);
                     }
@@ -2123,20 +2465,35 @@ impl WindowManager {
                         // A toolkit can request its real size before MapRequest.
                         // Dropping it leaves the initial X geometry unchanged;
                         // map_x11 would then advertise that placeholder back.
+                        // It asks for its own window's size: a frame adopted
+                        // already keeps its borders around it.
+                        let frame = X11Frame::of(&surface);
                         let mut geometry = surface.geometry();
-                        geometry.size = requested_x11_size(geometry.size, width, height);
+                        geometry.size = frame.buffer_size_for_client(requested_x11_size(
+                            frame.client_size_in_buffer(geometry.size),
+                            width,
+                            height,
+                        ));
                         if surface.configure(Some(geometry)).is_err() {
                             eprintln!("tuna-compositor: pre-map X11 configure refused id={id}");
                         }
                         continue;
                     };
                     if let Some(window) = self.windows.get_mut(&model) {
-                        window.geometry.size =
-                            requested_x11_size(window.geometry.size, width, height);
+                        // The client asks for its own window's size: the
+                        // frame rectangle is that plus the title bar.
+                        let frame = X11Frame::of(&surface);
+                        let client = requested_x11_size(
+                            frame.client_size(window.geometry.size),
+                            width,
+                            height,
+                        );
+                        window.geometry.size = frame.frame_size_for_client(client);
                     }
                     self.configure(model, self.model.focused() == Some(model));
                 }
                 X11ManagerEvent::Property(id) => {
+                    self.sync_x11_decoration(id);
                     let pair = self.x11_index.get(&id).copied().and_then(|model| {
                         self.windows.get(&model).and_then(|window| {
                             window.surface.x11_surface().map(|surface| {
@@ -2172,8 +2529,37 @@ impl WindowManager {
                         self.set_fullscreen(state, model, on);
                     }
                 }
+                X11ManagerEvent::Move(id) => {
+                    if let Some(model) = self.x11_index.get(&id).copied() {
+                        self.begin_x11_drag(state, model, None);
+                    }
+                }
+                X11ManagerEvent::Resize(id, edge) => {
+                    if let Some(model) = self.x11_index.get(&id).copied() {
+                        self.begin_x11_drag(state, model, Some(x11_resize_edges(edge)));
+                    }
+                }
+                X11ManagerEvent::Minimize(id) => {
+                    if let Some(model) = self.x11_index.get(&id).copied() {
+                        self.minimize(state, model);
+                    }
+                }
+                X11ManagerEvent::Close(id) => {
+                    if let Some(model) = self.x11_index.get(&id).copied() {
+                        self.close_window(model);
+                    }
+                }
+                X11ManagerEvent::Menu(id, x, y) => {
+                    // window-x11.c _GTK_SHOW_WINDOW_MENU: the shell's
+                    // window menu at the pointer, as for a native window.
+                    if let Some(model) = self.x11_index.get(&id).copied() {
+                        self.menu_requests.push((model, x, y));
+                    }
+                }
+                X11ManagerEvent::FrameChanged(id) => self.x11_frame_changed(id),
             }
         }
+        self.release_awaited_x11(state);
     }
 
     /// Give the seat to a window that was focused before it had a
@@ -2312,6 +2698,7 @@ impl WindowManager {
                 #[cfg(feature = "xwayland")]
                 WindowSurface::X11(surface) => {
                     self.x11_index.remove(&surface.window_id());
+                    self.x11_frames.remove(&id);
                     state.window_icons.remove_cache(&format!("x11:{id}"));
                 }
             }
@@ -2684,8 +3071,23 @@ impl WindowManager {
             }
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(surface) => {
+                // The model rectangle is the frame rectangle; the X11
+                // window carrying the surface is larger by the invisible
+                // borders, and the window manager places the client
+                // inside it (meta_window_x11_move_resize_internal).
+                // _NET_WM_STATE follows the layout, on the client and its
+                // frame (meta_window_x11_set_net_wm_state): GTK draws a
+                // maximized frame without shadow and a fullscreen one
+                // without title bar, and the frame's extents follow.
+                let buffer = X11Frame::of(surface).buffer_rect(window.geometry);
                 if surface.set_activated(activated).is_err()
-                    || surface.configure(Some(window.geometry)).is_err()
+                    || surface
+                        .set_maximized(layout == WindowLayout::Maximized)
+                        .is_err()
+                    || surface
+                        .set_fullscreen(layout == WindowLayout::Fullscreen)
+                        .is_err()
+                    || surface.configure(Some(buffer)).is_err()
                 {
                     eprintln!("tuna-compositor: window {id} X11 configure refused");
                 }
@@ -3556,13 +3958,23 @@ impl WindowManager {
 
     /// Topmost window containing `pos`, if any. Only the active
     /// workspace is hit-testable; hidden workspaces never take focus.
+    /// An X11 window also takes the pointer on the resize handles in its
+    /// invisible border.
     pub fn window_at(&self, pos: Point<f64, Logical>) -> Option<u64> {
         let active = self.model.active_workspace();
         self.presentation_order().into_iter().rev().find(|id| {
             self.model.window(*id).is_some_and(|entry| {
                 (entry.workspace == active || self.on_all_workspaces(*id))
                     && self.windows.get(id).is_some_and(|w| {
-                        !w.minimized && contains(self.shifted(*id, w.geometry), pos)
+                        if w.minimized {
+                            return false;
+                        }
+                        let frame = self.shifted(*id, w.geometry);
+                        #[cfg(feature = "xwayland")]
+                        if self.x11_border_takes_input(*id, w, frame, pos) {
+                            return true;
+                        }
+                        contains(frame, pos)
                     })
             })
         })
@@ -5038,10 +5450,24 @@ impl WindowManager {
                 (current.min_size, current.max_size)
             }),
             #[cfg(feature = "xwayland")]
-            WindowSurface::X11(surface) => (
-                surface.min_size().unwrap_or(none.0),
-                surface.max_size().unwrap_or(none.1),
-            ),
+            WindowSurface::X11(surface) => {
+                // WM_NORMAL_HINTS bound the client window; the frame
+                // rectangle differs from it by the title bar or shadow.
+                let frame = X11Frame::of(surface);
+                let bound = |client: Option<Size<i32, Logical>>, none: Size<i32, Logical>| {
+                    client.map_or(none, |client| {
+                        let framed = frame.frame_size_for_client(client);
+                        Size::from((
+                            if client.w > 0 { framed.w } else { 0 },
+                            if client.h > 0 { framed.h } else { 0 },
+                        ))
+                    })
+                };
+                (
+                    bound(surface.min_size(), none.0),
+                    bound(surface.max_size(), none.1),
+                )
+            }
         }
     }
 
@@ -8784,6 +9210,76 @@ mod introspect_type_tests {
             assert!(!introspect_x11_type(Some(kind)), "auxiliary type {kind:?}");
         }
     }
+}
+
+/// Mutter's decoration decision for one X11 window
+/// ([`x11_wants_frame`]). Smithay's `is_decorated` is true when the
+/// Motif hints ask for no decoration at all.
+#[cfg(feature = "xwayland")]
+fn x11_decorated(surface: &X11Surface) -> bool {
+    x11_wants_frame(
+        surface.window_type(),
+        surface.is_override_redirect(),
+        surface.is_decorated(),
+    )
+}
+
+/// A `_NET_WM_MOVERESIZE` direction as the resize-edge bits the grab uses.
+#[cfg(feature = "xwayland")]
+fn x11_resize_edges(edge: ResizeEdge) -> u32 {
+    match edge {
+        ResizeEdge::Top => EDGE_TOP,
+        ResizeEdge::Bottom => EDGE_BOTTOM,
+        ResizeEdge::Left => EDGE_LEFT,
+        ResizeEdge::Right => EDGE_RIGHT,
+        ResizeEdge::TopLeft => EDGE_TOP | EDGE_LEFT,
+        ResizeEdge::TopRight => EDGE_TOP | EDGE_RIGHT,
+        ResizeEdge::BottomLeft => EDGE_BOTTOM | EDGE_LEFT,
+        ResizeEdge::BottomRight => EDGE_BOTTOM | EDGE_RIGHT,
+    }
+}
+
+#[cfg(all(test, feature = "xwayland"))]
+#[test]
+fn frame_edge_drags_resize_from_the_dragged_sides() {
+    let rect = |x: i32, y: i32, w: i32, h: i32| {
+        Rectangle::<i32, Logical>::new((x, y).into(), (w, h).into())
+    };
+    let start = rect(100, 100, 400, 300);
+    // GTK's frame sends _NET_WM_MOVERESIZE with the edge under the
+    // pointer; the grab moves exactly those sides.
+    assert_eq!(
+        resized(start, x11_resize_edges(ResizeEdge::BottomRight), 30, 20),
+        rect(100, 100, 430, 320)
+    );
+    assert_eq!(
+        resized(start, x11_resize_edges(ResizeEdge::TopLeft), 30, 20),
+        rect(130, 120, 370, 280)
+    );
+    assert_eq!(
+        resized(start, x11_resize_edges(ResizeEdge::Left), -40, 500),
+        rect(60, 100, 440, 300)
+    );
+    assert_eq!(
+        resized(start, x11_resize_edges(ResizeEdge::Top), 500, -40),
+        rect(100, 60, 400, 340)
+    );
+    assert_eq!(
+        resized(start, x11_resize_edges(ResizeEdge::Right), 25, 500),
+        rect(100, 100, 425, 300)
+    );
+    assert_eq!(
+        resized(start, x11_resize_edges(ResizeEdge::Bottom), 500, 25),
+        rect(100, 100, 400, 325)
+    );
+    assert_eq!(
+        resized(start, x11_resize_edges(ResizeEdge::TopRight), 10, 10),
+        rect(100, 110, 410, 290)
+    );
+    assert_eq!(
+        resized(start, x11_resize_edges(ResizeEdge::BottomLeft), 10, 10),
+        rect(110, 100, 390, 310)
+    );
 }
 
 /// Preserve dimensions absent from X11's ConfigureRequest value mask.

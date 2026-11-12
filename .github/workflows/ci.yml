@@ -1027,6 +1027,16 @@ jobs:
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts gtk-shell-artifacts/grid-hover
+      # Server-side frames for X11 windows (P-WM-10): the handshake with
+      # tuna-x11-frames, real pointer input on the title bar, undecorated
+      # windows left alone and recovery from a dead frames client. The same
+      # gates as in the full proof, independently of its earlier stages.
+      - name: X11 window frames
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: scripts/tuna-gtk-shell-proof --x11-frames-only --artifacts gtk-shell-artifacts/x11-frames
       # Native/X11 geometry and physical input at all required virtual scales.
       - run: |
           for scale in 1 1.25 1.5 2; do
@@ -1059,7 +1069,7 @@ jobs:
       - if: always()
         run: |
           mkdir -p gtk-shell-artifacts/bin
-          cp target/debug/tuna-compositor target/debug/tuna-shell-gtk target/debug/tuna-wallpaper-svg gtk-shell-artifacts/bin/
+          cp target/debug/tuna-compositor target/debug/tuna-shell-gtk target/debug/tuna-wallpaper-svg target/debug/tuna-x11-frames gtk-shell-artifacts/bin/
           cp /usr/local/lib/*/libgtk4-layer-shell.so* gtk-shell-artifacts/bin/ 2>/dev/null || cp /usr/local/lib/libgtk4-layer-shell.so* gtk-shell-artifacts/bin/
       # G-WS-INSERT publishes the targeted insertion frame/state. Full
       # parity captures need native fonts, wallpapers and installed apps;
@@ -1325,7 +1335,7 @@ jobs:
           pkg=$(ls packaging/arch/tuna-desktop-[0-9]*.pkg.tar.zst)
           namcap "$pkg" || true
           pacman -U --noconfirm "$pkg"
-          for bin in tuna-compositor tuna-session tuna-shell-host tuna-wallpaper-svg; do "$bin" --version; done
+          for bin in tuna-compositor tuna-session tuna-shell-host tuna-wallpaper-svg tuna-x11-frames; do "$bin" --version; done
           test -f /usr/share/wayland-sessions/tuna.desktop
           # Exact temporary bridge: installed-layout proof, not an upgrade test.
           for path in /usr/share/wayland-sessions/roost.desktop /etc/pam.d/roost-lock; do  # tuna-rename: keep

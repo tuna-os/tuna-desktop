@@ -72,10 +72,10 @@ jobs:
       - run: python3 scripts/lib/tuna-visual-provenance-tests.py
       - run: python3 scripts/lib/tuna-visual-walkthrough-map-tests.py
       - run: /usr/bin/python3 scripts/lib/tuna-scale-frame-tests.py
-      - run: cargo build --manifest-path Cargo.toml -p tuna-compositor -p tuna-shell-gtk -p tuna-shell-host
+      - run: cargo build --manifest-path Cargo.toml -p tuna-compositor -p tuna-shell-gtk -p tuna-shell-host -p tuna-x11-frames
       - run: |
           mkdir -p visual-bin
-          cp target/debug/tuna-compositor target/debug/tuna-shell-gtk target/debug/tuna-ibus-bridge visual-bin/
+          cp target/debug/tuna-compositor target/debug/tuna-shell-gtk target/debug/tuna-ibus-bridge target/debug/tuna-x11-frames visual-bin/
           cp /usr/local/lib/*/libgtk4-layer-shell.so* visual-bin/ 2>/dev/null || cp /usr/local/lib/libgtk4-layer-shell.so* visual-bin/
           sha256sum visual-bin/* > visual-bin/sha256sums.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -111,7 +111,7 @@ jobs:
             fi
           done
       - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps x11-utils at-spi2-core python3-pyatspi python3-pil fonts-cantarell libglib2.0-dev libgtk-4-dev libpipewire-0.3-dev libadwaita-1-dev libwayland-dev wayland-protocols libpam-wrapper ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0
-      - run: chmod +x visual-bin/tuna-compositor visual-bin/tuna-shell-gtk visual-bin/tuna-ibus-bridge && sha256sum -c visual-bin/sha256sums.txt
+      - run: chmod +x visual-bin/tuna-compositor visual-bin/tuna-shell-gtk visual-bin/tuna-ibus-bridge visual-bin/tuna-x11-frames && sha256sum -c visual-bin/sha256sums.txt
       - name: Install and verify CJK glyphs for the visual IME fixture
         if: ${{ matrix.stage == 'input' && (inputs.stages == '' || contains(format(',{0},', inputs.stages), ',input,')) }}
         run: |

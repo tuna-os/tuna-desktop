@@ -19,6 +19,80 @@ stopped and reaped on server loss before a fresh helper can start. Native bridge
 address probe and supervised shell discard inherited IBUS_ADDRESS; only the XIM
 helper receives the address discovered for the private Wayland-named bus.
 
+The frames client (`tuna-x11-frames`, issue #1034) is the other supervised X11
+client. Mutter 51 draws no X11 title bars itself: `mutter-x11-frames` creates a
+GTK frame window for each decorated X11 window and Mutter reparents the window
+into it. Tuna follows the same protocol (`_MUTTER_NEEDS_FRAME` on the window,
+`_MUTTER_FRAME_FOR` and `_MUTTER_FRAME_EXTENTS` on the frame, the frame's
+`_GTK_FRAME_EXTENTS` for its shadow, `_NET_FRAME_EXTENTS` back on the window);
+the window-manager half is an additive patch to the vendored Smithay
+(`X11-FRAMES-API-PATCH.diff`). Lifecycle, in `crates/compositor/src/x11_frames.rs`:
+
+- It starts only after the window manager is ready, with `DISPLAY` naming the
+  server and `GDK_BACKEND=x11`, so native startup and the idle reserved sockets
+  still own no extra process. The binary is `tuna-x11-frames` beside the
+  compositor, else on `PATH`. `TUNA_X11_FRAMES` names another client (the stock
+  `mutter-x11-frames` speaks the same protocol and serves as the oracle); an
+  empty value or `0` runs none.
+- An exit restarts it after 500 ms, doubling to 5 s at most, three times; a
+  client that ran for a minute gets that budget back. On server loss it is
+  killed and reaped before a fresh one starts for the next server.
+- With no frames client (not installed, turned off, budget spent) X11 windows
+  map undecorated, exactly as before. While one runs, a window that wants a
+  frame maps once the frame arrived, or bare after 1.5 s without one, and is
+  framed when a frame arrives later.
+- A frames client that dies leaves its windows mapped: the X server returns
+  them to the root window, the window manager wraps them bare where they
+  were (and maps them there: the X server's own attempt arrives as a
+  `MapRequest` for a window that is already managed), and offers them to the
+  restarted client.
+- A window keeps its client size when a frame comes or goes. The frame is put
+  around it with the title bar above, at the same window origin; without the
+  frame the window is shorter by the title bar.
+- Smithay keeps an unframed window in a wrapper, not on the root window where
+  the frames client looks when it starts. While the client starts (10 s) and
+  while a window waits, the window manager re-announces such windows every
+  100 ms (`X11Wm::request_frames`): `_MUTTER_NEEDS_FRAME` again and a synthetic
+  `ConfigureNotify` on the root, which the client's window tracker answers as
+  it would for a newly configured root child.
+
+The window manager now lists `_GTK_FRAME_EXTENTS` and `_GTK_SHOW_WINDOW_MENU`
+in `_NET_SUPPORTED`, as Mutter does. GTK X11 applications therefore draw their
+own shadows and report them in `_GTK_FRAME_EXTENTS`; the compositor treats that
+margin, like a frame's, as outside the window's rectangle. The title-bar keys
+of `org.gnome.desktop.wm.preferences` (`button-layout` and the double, middle
+and right click actions) are published on the window manager's XSETTINGS
+selection as `Gtk/DecorationLayout`, `Gtk/TitlebarDoubleClick`,
+`Gtk/TitlebarMiddleClick` and `Gtk/TitlebarRightClick`, translated as
+gnome-settings-daemon does.
+
+Three things a frame's header bar needs from the compositor, each as Mutter
+does it:
+
+- A drag or edge resize starts from where the press landed
+  (`_NET_WM_MOVERESIZE` names that point; GTK sends it only after its drag
+  threshold), so the window does not trail the pointer.
+- The X11 window follows every move of its window, not only resizes: the
+  header bar and X11 applications work in root coordinates.
+- The pointer reaches an X11 window's surface on the invisible border around
+  it, where the surface's input region covers it: the resize handles GTK
+  keeps in the shadow. Native windows are still picked by their rectangle
+  alone.
+
+A window without a frame is wrapped in a window of its own depth and visual,
+so a client-decorated X11 window keeps the alpha channel its shadow is drawn
+in. Override-redirect windows are not managed and get no frame.
+
+`scripts/tuna-gtk-shell-proof` gates all of this in the nested session
+(`G-X11-FRAME`, `G-X11-FRAME-ACTIONS`, `G-X11-FRAME-CSD`,
+`G-X11-FRAME-RECOVERY`, and the frames client's part of `G-X11-DEMAND` and
+`G-X11-RESTART`); `--x11-frames-only` runs the four frame gates alone. They
+read the X server with `xprop` and `xwininfo`, the frames client's
+accessible tree, the output's pixels, and the compositor's state file, where
+each X11 window carries `x11_framed`, `x11_frame_extents` (left, right, top,
+bottom) and `x11_buffer_rect` (the X11 window carrying the surface: `rect`
+plus the invisible borders).
+
 On server/manager failure the compositor removes the old source, compatibility
 windows and client, then retries on the same display with the existing bounded
 restart budget (initial attempt plus three retries, 500 ms exponential backoff

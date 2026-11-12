@@ -2,7 +2,7 @@
 //! package tooling.
 //!
 //! `scripts/tuna-release` must stay an executable fail-fast script that
-//! stamps `TUNA_VERSION`, stages the six binaries plus the session entry,
+//! stamps `TUNA_VERSION`, stages the seven binaries plus the session entry,
 //! generates the control metadata from the stamp, and builds via
 //! `dpkg-deb`. `docs/release.md` must keep the checklist and the
 //! notes-template sections; `docs/install.md` must keep the package-install
@@ -58,6 +58,7 @@ fn release_script_stages_layout_and_metadata_from_the_stamp() {
         "tuna-shell-gtk",
         "tuna-shell-host",
         "tuna-ibus-bridge",
+        "tuna-x11-frames",
         "tuna.desktop",
         "pam.d/tuna-lock",
         "DEBIAN/control",
@@ -174,6 +175,7 @@ fn arch_package_stamps_and_checks_the_version() {
         "tuna-shell-host",
         "tuna-shell-gtk",
         "tuna-ibus-bridge",
+        "tuna-x11-frames",
         "gtk4-layer-shell",
         "pam.d/tuna-lock",
         "tuna.desktop",

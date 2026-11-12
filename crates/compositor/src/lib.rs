@@ -186,6 +186,8 @@ pub mod workspace_policy;
 pub mod workspace_slide;
 pub mod workspace_tracker;
 #[cfg(feature = "xwayland")]
+pub mod x11_frames;
+#[cfg(feature = "xwayland")]
 mod x11_icons;
 #[cfg(feature = "xwayland")]
 pub mod x11_interop;

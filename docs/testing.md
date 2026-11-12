@@ -195,6 +195,14 @@ without the unrelated earlier gates. It adds no target motion or timing
 relaxation. CI runs this slice with its freshly built compositor and shell;
 the no-post-start-motion wire tests establish the precise protocol ordering.
 
+`scripts/tuna-gtk-shell-proof --x11-frames-only --artifacts DIR` runs the X11
+frame gates of the full GTK proof alone (`G-X11-FRAME`,
+`G-X11-FRAME-ACTIONS`, `G-X11-FRAME-CSD`, `G-X11-FRAME-RECOVERY`; P-WM-10):
+real X11 clients on the session's own Xwayland, the frames client
+`tuna-x11-frames` beside the compositor, and the real pointer on the title
+bar. It needs `xclock`, `xeyes`, `xev` (x11-apps), `xprop` and `xwininfo`
+(x11-utils). CI runs this slice too, with its freshly built binaries.
+
 Every build uses its own checkout's `target/` (an inherited
 `CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one) and no
 incremental state, with half the host's CPUs as jobs. Builds from every

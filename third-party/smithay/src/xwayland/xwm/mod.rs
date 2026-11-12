@@ -135,7 +135,6 @@ use x11rb::{
     },
     rust_connection::{ConnectionError, DefaultStream, RustConnection},
     wrapper::ConnectionExt as _,
-    COPY_DEPTH_FROM_PARENT,
 };
 
 pub mod settings;
@@ -191,6 +190,13 @@ mod atoms {
             _NET_WM_STATE_MODAL,
             _MOTIF_WM_HINTS,
             _NET_STARTUP_ID,
+            _NET_CLOSE_WINDOW,
+            _GTK_SHOW_WINDOW_MENU,
+            _GTK_FRAME_EXTENTS,
+
+            // frames client -> server (Mutter's frames protocol)
+            _MUTTER_FRAME_FOR,
+            _MUTTER_FRAME_EXTENTS,
 
             // server -> client
             WM_S0,
@@ -209,6 +215,8 @@ mod atoms {
             _NET_WM_STATE_FOCUSED,
             _NET_SUPPORTING_WM_CHECK,
             _XSETTINGS_SETTINGS,
+            _NET_FRAME_EXTENTS,
+            _MUTTER_NEEDS_FRAME,
 
             // selection
             _WL_SELECTION,
@@ -356,6 +364,35 @@ pub trait XwmHandler {
     }
     /// Window requests to be unminimized.
     fn unminimize_request(&mut self, xwm: XwmId, window: X11Surface) {
+        let _ = (xwm, window);
+    }
+    /// Window requests to be closed (`_NET_CLOSE_WINDOW`).
+    ///
+    /// [`X11Surface::close`] grants the wish.
+    fn close_request(&mut self, xwm: XwmId, window: X11Surface) {
+        let _ = (xwm, window);
+    }
+    /// Window asks for its window menu (`_GTK_SHOW_WINDOW_MENU`), as the
+    /// title bar of a frames-client frame does on a secondary click.
+    ///
+    /// `location` is the pointer position the menu belongs at.
+    fn show_window_menu_request(&mut self, xwm: XwmId, window: X11Surface, location: Point<i32, Logical>) {
+        let _ = (xwm, window, location);
+    }
+    /// The frame of a window changed.
+    ///
+    /// A frames-client frame was adopted for a window that asked for one
+    /// with [`X11Surface::set_needs_frame`], that frame went away while the
+    /// window stayed (it is back in a bare wrapper), or the borders
+    /// reported by [`X11Surface::frame_extents`] changed.
+    ///
+    /// The client kept its size when a frame came or went: the buffer
+    /// rectangle ([`X11Surface::geometry`]) grew or shrank by the borders
+    /// around the same frame rectangle origin. After a change of borders
+    /// the buffer rectangle stayed and the client was resized inside it.
+    /// The compositor lays the window out again with the new borders and
+    /// calls [`X11Surface::configure`].
+    fn frame_changed(&mut self, xwm: XwmId, window: X11Surface) {
         let _ = (xwm, window);
     }
 
@@ -819,8 +856,17 @@ impl X11Wm {
                 atoms._NET_WM_STATE_FOCUSED,
                 atoms._NET_ACTIVE_WINDOW,
                 atoms._NET_WM_MOVERESIZE,
+                atoms._NET_CLOSE_WINDOW,
+                atoms._NET_FRAME_EXTENTS,
                 atoms._NET_CLIENT_LIST,
                 atoms._NET_CLIENT_LIST_STACKING,
+                // As Mutter's set_supported_hint: GTK draws client-side
+                // shadows (and frames-client frames their invisible
+                // borders) only when the window manager lists
+                // _GTK_FRAME_EXTENTS, and asks for the window menu only
+                // when it lists _GTK_SHOW_WINDOW_MENU.
+                atoms._GTK_FRAME_EXTENTS,
+                atoms._GTK_SHOW_WINDOW_MENU,
             ],
         )?;
         conn.change_property32(
@@ -1314,8 +1360,67 @@ impl X11Wm {
         }
 
         self.xsettings.update(&self.conn)?;
+        // Clients learn of the change from this property alone: it must
+        // not wait in the buffer for the next unrelated request.
+        self.conn.flush()?;
 
         Ok(())
+    }
+
+    /// Offer every managed window that wants a frame and has none to the
+    /// frames client again. Returns how many windows were offered.
+    ///
+    /// Mutter's frames client (meta-window-tracker.c) learns of a window
+    /// by selecting input on it while it is a child of the root window:
+    /// at its creation, when the tracker starts (`XQueryTree` of the root)
+    /// or on a `ConfigureNotify` the root reports for it. Under Mutter an
+    /// unframed window is a root child; under this window manager it sits
+    /// in a bare wrapper, so a frames client that starts after the window
+    /// was wrapped never sees it. This sends that `ConfigureNotify` to the
+    /// root's `SubstructureNotify` listeners, after writing
+    /// `_MUTTER_NEEDS_FRAME` again, so `listen_set_up_frame` reads the
+    /// property and frames the window. A frames client that already knows
+    /// the window ignores both.
+    pub fn request_frames(&self) -> Result<usize, ConnectionError> {
+        let client_scale = self.client_scale.load(Ordering::Acquire);
+        let mut offered = 0;
+        for surface in &self.windows {
+            let geometry: Rectangle<i32, Client> = {
+                let state = surface.state.lock().unwrap();
+                if !state.needs_frame
+                    || state.framed
+                    || state.override_redirect
+                    || state.mapped_onto.is_none()
+                {
+                    continue;
+                }
+                state.geometry.to_client_precise_round(client_scale)
+            };
+            surface.announce_needs_frame(&self.conn)?;
+            self.conn.send_event(
+                false,
+                self.screen.root,
+                EventMask::SUBSTRUCTURE_NOTIFY,
+                ConfigureNotifyEvent {
+                    response_type: CONFIGURE_NOTIFY_EVENT,
+                    sequence: 0,
+                    event: self.screen.root,
+                    window: surface.window_id(),
+                    above_sibling: x11rb::NONE,
+                    x: geometry.loc.x as i16,
+                    y: geometry.loc.y as i16,
+                    width: geometry.size.w as u16,
+                    height: geometry.size.h as u16,
+                    border_width: 0,
+                    override_redirect: false,
+                },
+            )?;
+            offered += 1;
+        }
+        if offered > 0 {
+            self.conn.flush()?;
+        }
+        Ok(offered)
     }
 
     /// Gets the current primary output as advertised by xrandr
@@ -1441,15 +1546,18 @@ where
                 return Ok(());
             }
 
+            // A wrapper this window manager made after a frame went away
+            // (X11Surface::unframe) keeps the event mask it was created
+            // with.
+            if xwm.windows.iter().any(|s| s.mapped_window_id() == Some(n.window)) {
+                return Ok(());
+            }
+
             xwm.conn.change_window_attributes(
                 n.window,
                 &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
             )?;
             xwm.conn.flush()?;
-
-            if xwm.windows.iter().any(|s| s.mapped_window_id() == Some(n.window)) {
-                return Ok(());
-            }
 
             let geo = conn.get_geometry(n.window)?.reply()?;
             let geometry = Rectangle::<i32, Client>::new(
@@ -1477,17 +1585,35 @@ where
             }
         }
         Event::MapRequest(r) => {
+            // Mutter events.c: "Check whether the new window is a frame for
+            // another window". A frames-client window announcing itself
+            // with _MUTTER_FRAME_FOR is never a client of its own: it is
+            // adopted by the window it names, or left unmapped.
+            if let Some(client) = frame_for(&conn, &xwm.atoms, r.window)? {
+                let surface = xwm.windows.iter().find(|x| x.window_id() == client).cloned();
+                if let Some(surface) = surface {
+                    if surface.adopt_frame(r.window)? {
+                        // The frame is no client of its own any more: its
+                        // handle from CreateNotify is retired.
+                        let pos = xwm.windows.iter().position(|x| x.window_id() == r.window);
+                        let retired = pos.map(|pos| xwm.windows.remove(pos));
+                        drop(_guard);
+                        if let Some(frame) = retired {
+                            frame.state.lock().unwrap().alive = false;
+                            state.destroyed_window(xwm_id, frame);
+                        }
+                        state.frame_changed(xwm_id, surface);
+                    }
+                }
+                conn.flush()?;
+                return Ok(());
+            }
             if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == r.window).cloned() {
                 if surface.state.lock().unwrap().mapped_onto.is_none() {
                     // we reparent windows, because a lot of stuff expects, that we do
                     let geo = conn.get_geometry(r.window)?.reply()?;
                     let win = r.window;
                     let frame_win = conn.generate_id()?;
-                    let win_aux = CreateWindowAux::new().event_mask(
-                        EventMask::SUBSTRUCTURE_NOTIFY
-                            | EventMask::SUBSTRUCTURE_REDIRECT
-                            | EventMask::PROPERTY_CHANGE,
-                    );
 
                     {
                         let _guard = scopeguard::guard((), |_| {
@@ -1495,18 +1621,16 @@ where
                         });
 
                         conn.grab_server()?;
-                        let cookie1 = conn.create_window(
-                            COPY_DEPTH_FROM_PARENT,
-                            frame_win,
+                        let create_sequence = surface::create_wrapper(
+                            &conn,
                             xwm.screen.root,
-                            geo.x,
-                            geo.y,
-                            geo.width,
-                            geo.height,
-                            0,
-                            WindowClass::INPUT_OUTPUT,
-                            x11rb::COPY_FROM_PARENT,
-                            &win_aux,
+                            frame_win,
+                            win,
+                            geo.depth,
+                            Rectangle::new(
+                                (geo.x as i32, geo.y as i32).into(),
+                                (geo.width as i32, geo.height as i32).into(),
+                            ),
                         )?;
                         let cookie2 = conn.reparent_window(win, frame_win, 0, 0)?;
                         conn.map_window(win)?;
@@ -1515,8 +1639,7 @@ where
                         // of the reparent_window() request, thus remember its sequence number. The
                         // grab_server()/ungrab_server() is done so that the server does not handle other clients
                         // in-between, which could cause other events to get the same sequence number.
-                        xwm.sequences_to_ignore
-                            .push(Reverse(cookie1.sequence_number() as u16));
+                        xwm.sequences_to_ignore.push(Reverse(create_sequence as u16));
                         xwm.sequences_to_ignore
                             .push(Reverse(cookie2.sequence_number() as u16));
                     }
@@ -1529,6 +1652,13 @@ where
                     // In that case, we set the X11Surface's override-redirect state to false here
                     // to prevent `set_mapped` and `configure` from failing.
                     surface.state.lock().unwrap().override_redirect = false;
+
+                    // Mutter's meta_window_ensure_frame runs once the
+                    // window is managed: a wish recorded earlier with
+                    // X11Surface::set_needs_frame is announced now.
+                    if surface.needs_frame() {
+                        surface.announce_needs_frame(&conn)?;
+                    }
 
                     drop(_guard);
                     state.map_window_request(xwm_id, surface);
@@ -1553,22 +1683,26 @@ where
                     drop(_guard);
                     state.mapped_override_redirect_window(xwm_id, surface);
                 } else {
-                    xwm.client_list.push(surface.window_id());
-                    xwm.client_list_stacking.push(surface.window_id());
-                    conn.change_property32(
-                        PropMode::APPEND,
-                        xwm.screen.root,
-                        xwm.atoms._NET_CLIENT_LIST,
-                        AtomEnum::WINDOW,
-                        &[surface.window_id()],
-                    )?;
-                    conn.change_property32(
-                        PropMode::APPEND,
-                        xwm.screen.root,
-                        xwm.atoms._NET_CLIENT_LIST_STACKING,
-                        AtomEnum::WINDOW,
-                        &[surface.window_id()],
-                    )?;
+                    // A frame adopted for an already mapped window maps in
+                    // its turn: the window is listed once.
+                    if !xwm.client_list.contains(&surface.window_id()) {
+                        xwm.client_list.push(surface.window_id());
+                        xwm.client_list_stacking.push(surface.window_id());
+                        conn.change_property32(
+                            PropMode::APPEND,
+                            xwm.screen.root,
+                            xwm.atoms._NET_CLIENT_LIST,
+                            AtomEnum::WINDOW,
+                            &[surface.window_id()],
+                        )?;
+                        conn.change_property32(
+                            PropMode::APPEND,
+                            xwm.screen.root,
+                            xwm.atoms._NET_CLIENT_LIST_STACKING,
+                            AtomEnum::WINDOW,
+                            &[surface.window_id()],
+                        )?;
+                    }
                     drop(_guard);
                     state.map_window_notify(xwm_id, surface);
                 }
@@ -1631,6 +1765,16 @@ where
                     X11SurfaceError::Connection(err) => err,
                     X11SurfaceError::UnsupportedForOverrideRedirect => unreachable!(),
                 })?;
+            } else if let Some(surface) = xwm
+                .windows
+                .iter()
+                .find(|x| x.frame_window_id() == Some(r.window))
+                .cloned()
+            {
+                // meta-x11-frame.c meta_frame_handle_xevent: the frames
+                // client never sizes its frame; its request is answered
+                // with the rectangle this window manager gave it.
+                surface.notify_frame_geometry()?;
             }
         }
         Event::ConfigureNotify(n) => {
@@ -1681,6 +1825,27 @@ where
         }
         Event::UnmapNotify(n) => {
             if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
+                // A reparent by this window manager (into or out of a
+                // frame) unmaps a mapped client once: Mutter's
+                // unmaps_pending. Only a real event counts, not the
+                // synthetic one ICCCM clients send to withdraw.
+                if n.response_type & 0x80 == 0 {
+                    let mut state = surface.state.lock().unwrap();
+                    if state.unmaps_pending > 0 {
+                        state.unmaps_pending -= 1;
+                        return Ok(());
+                    }
+                }
+                // The frames client died: the X server's save-set put the
+                // client back on the root, unmapping and mapping it. Not a
+                // withdrawal; the window goes on in a bare wrapper, as it
+                // would without a frames client.
+                if surface.lost_frame(&conn)? {
+                    surface.unframe()?;
+                    drop(_guard);
+                    state.frame_changed(xwm_id, surface);
+                    return Ok(());
+                }
                 xwm.client_list.retain(|w| *w != surface.window_id());
                 xwm.client_list_stacking.retain(|w| *w != surface.window_id());
                 {
@@ -1703,16 +1868,11 @@ where
                         &xwm.client_list_stacking,
                     )?;
                     {
-                        let mut state = surface.state.lock().unwrap();
-                        conn.reparent_window(
-                            n.window,
-                            xwm.screen.root,
-                            state.geometry.loc.x as i16,
-                            state.geometry.loc.y as i16,
-                        )?;
-                        if let Some(frame) = state.mapped_onto.take() {
-                            conn.destroy_window(frame)?;
-                        }
+                        let loc = surface.state.lock().unwrap().geometry.loc;
+                        // Out of the frame before _MUTTER_NEEDS_FRAME goes:
+                        // the frames client destroys its frame on that.
+                        conn.reparent_window(n.window, xwm.screen.root, loc.x as i16, loc.y as i16)?;
+                        surface.withdraw_mapped_onto(&conn)?;
                     }
                 }
                 drop(_guard);
@@ -1762,7 +1922,18 @@ where
                 }
             }
 
-            if let Some(pos) = xwm.windows.iter().position(|x| x.window_id() == n.window) {
+            if let Some(surface) = xwm
+                .windows
+                .iter()
+                .find(|x| x.frame_window_id() == Some(n.window))
+                .cloned()
+            {
+                // Mutter events.c DestroyNotify with the frame as receiver:
+                // meta_window_destroy_frame. The window stays, bare.
+                surface.unframe()?;
+                drop(_guard);
+                state.frame_changed(xwm_id, surface);
+            } else if let Some(pos) = xwm.windows.iter().position(|x| x.window_id() == n.window) {
                 let surface = xwm.windows.remove(pos);
                 surface.state.lock().unwrap().alive = false;
                 drop(_guard);
@@ -2231,8 +2402,28 @@ where
                 }
             }
 
-            if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
-                if let Some(property) = surface.update_property(n.atom)? {
+            if let Some(surface) = xwm
+                .windows
+                .iter()
+                .find(|x| x.frame_window_id() == Some(n.window))
+                .cloned()
+            {
+                // meta-x11-frame.c meta_frame_handle_xevent: new borders.
+                if n.state == Property::NEW_VALUE
+                    && (n.atom == xwm.atoms._GTK_FRAME_EXTENTS || n.atom == xwm.atoms._MUTTER_FRAME_EXTENTS)
+                    && surface.update_frame_extents()?
+                {
+                    drop(_guard);
+                    state.frame_changed(xwm_id, surface);
+                }
+            } else if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
+                if n.atom == xwm.atoms._GTK_FRAME_EXTENTS {
+                    // A client-decorated window's own invisible borders.
+                    if surface.update_gtk_frame_extents()? {
+                        drop(_guard);
+                        state.frame_changed(xwm_id, surface);
+                    }
+                } else if let Some(property) = surface.update_property(n.atom)? {
                     drop(_guard);
                     state.property_notify(xwm_id, surface, property);
                 }
@@ -2334,7 +2525,12 @@ where
                 }
                 x if x == xwm.atoms.WM_CHANGE_STATE => {
                     let data = msg.data.as_data32();
-                    if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == msg.window).cloned() {
+                    if let Some(surface) = xwm
+                        .windows
+                        .iter()
+                        .find(|x| x.is_message_target(msg.window))
+                        .cloned()
+                    {
                         drop(_guard);
                         match data[0] {
                             1 => state.unminimize_request(xwm_id, surface),
@@ -2360,7 +2556,12 @@ where
                             .reply_unchecked()?
                             .map(|reply| String::from_utf8(reply.name)),
                     );
-                    if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == msg.window).cloned() {
+                    if let Some(surface) = xwm
+                        .windows
+                        .iter()
+                        .find(|x| x.is_message_target(msg.window))
+                        .cloned()
+                    {
                         drop(_guard);
                         match &data[1..=2] {
                             &[x, y]
@@ -2409,7 +2610,12 @@ where
                     }
                 }
                 x if x == xwm.atoms._NET_WM_MOVERESIZE => {
-                    if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == msg.window).cloned() {
+                    if let Some(surface) = xwm
+                        .windows
+                        .iter()
+                        .find(|x| x.is_message_target(msg.window))
+                        .cloned()
+                    {
                         drop(_guard);
                         let data = msg.data.as_data32();
                         match data[2] {
@@ -2430,6 +2636,35 @@ where
                             8 => state.move_request(xwm_id, surface, data[3]),
                             _ => {} // ignore keyboard moves/resizes for now
                         }
+                    }
+                }
+                x if x == xwm.atoms._NET_CLOSE_WINDOW => {
+                    if let Some(surface) = xwm
+                        .windows
+                        .iter()
+                        .find(|x| x.is_message_target(msg.window))
+                        .cloned()
+                    {
+                        drop(_guard);
+                        state.close_request(xwm_id, surface);
+                    }
+                }
+                x if x == xwm.atoms._GTK_SHOW_WINDOW_MENU => {
+                    if let Some(surface) = xwm
+                        .windows
+                        .iter()
+                        .find(|x| x.is_message_target(msg.window))
+                        .cloned()
+                    {
+                        // window-x11.c: "l[0] is device_id, which we don't
+                        // use"; l[1], l[2] are root coordinates, rounded
+                        // down to the stage (MTK_ROUNDING_STRATEGY_SHRINK).
+                        let data = msg.data.as_data32();
+                        let client_scale = xwm.client_scale.load(Ordering::Acquire);
+                        let logical = |value: u32| (f64::from(value as i32) / client_scale).floor() as i32;
+                        let location = Point::from((logical(data[1]), logical(data[2])));
+                        drop(_guard);
+                        state.show_window_menu_request(xwm_id, surface, location);
                     }
                 }
                 x => {
@@ -2463,6 +2698,25 @@ where
     }
     conn.flush()?;
     Ok(())
+}
+
+/// The window a frames-client window is a frame for: its
+/// `_MUTTER_FRAME_FOR` property, a single WINDOW (Mutter events.c reads
+/// it on `MapRequest` and takes it only when `nitems == 1`).
+fn frame_for(conn: &RustConnection, atoms: &Atoms, window: X11Window) -> Result<Option<X11Window>, ConnectionError> {
+    let Some(reply) = conn
+        .get_property(false, window, atoms._MUTTER_FRAME_FOR, AtomEnum::WINDOW, 0, 32)?
+        .reply_unchecked()?
+    else {
+        return Ok(None);
+    };
+    let Some(mut values) = reply.value32() else {
+        return Ok(None);
+    };
+    Ok(match (values.next(), values.next()) {
+        (Some(client), None) if client != x11rb::NONE => Some(client),
+        _ => None,
+    })
 }
 
 enum OutgoingAction {

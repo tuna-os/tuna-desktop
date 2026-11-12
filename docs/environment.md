@@ -50,6 +50,7 @@ in `/proc/<pid>/environ` and know what overriding them does.
 | `XDG_SESSION_TYPE` | `tuna-session`, for the compositor | Always `wayland`. A TTY login starts with `tty`. | `crates/compositor/src/bin/tuna-session.rs:69-73` |
 | `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`, `DISPLAY` | compositor (DRM/KMS only), for the systemd user manager and D-Bus activation | Imported with `systemctl --user set-environment` and `UpdateActivationEnvironment` so that portals and activated services find the session. `DISPLAY` is imported empty, then set to Xwayland's display once it is ready. A nested session never changes the host's activation environment. | `crates/compositor/src/session_services.rs:52-61`, `crates/compositor/src/session_services.rs:218-240`, `crates/compositor/src/session_services.rs:403-423` |
 | `GDK_DEBUG`, `ADW_DISABLE_PORTAL` | `tuna-shell-gtk`, for itself | The shell turns off GTK's and libadwaita's own portal use. Apps it launches get the values the shell started with. | `crates/shell-gtk/src/portal_opt_out.rs:20-33` |
+| `GSK_RENDERER`, `GDK_BACKEND`, `GDK_DEBUG`, `ADW_DISABLE_PORTAL` | `tuna-x11-frames`, for itself | The X11 frames client draws with Cairo, uses GDK's X11 backend whatever `GDK_BACKEND` the session set, and turns off GTK's and libadwaita's portal use as the shell does. It reads `DISPLAY` and starts no other program. | `crates/x11-frames/src/main.rs:120-130` |
 
 ## Debugging and trace output
 
@@ -58,8 +59,8 @@ session and the journal under GDM (see
 [session operations](session-operations.md#logs)). None of them logs typed
 text, passwords or window titles.
 
-The compositor, shell, shell-host/IBus bridge, wallpaper loader and SVG helper
-assemble each stderr record (including its newline) before one
+The compositor, shell, shell-host/IBus bridge, wallpaper loader, SVG helper and
+X11 frames client assemble each stderr record (including its newline) before one
 `stderr().lock().write_all`. Each crate has a small `stderr_record` helper;
 a crate-root `eprintln!` macro sends existing diagnostics through it, including
 the bridge's formatted fields that previously became partial-line writes.

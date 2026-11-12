@@ -18,6 +18,7 @@ A session is one long-lived compositor and a shell it supervises:
 | `tuna-compositor --internal-pam-conversation` | A private, short-lived helper that runs one PAM conversation for the lock screen. | the compositor, at each unlock attempt |
 | `tuna-ibus-bridge`, `ibus-daemon`, `ibus-x11` | Input methods, when IBus is installed. | the compositor |
 | `Xwayland` | X11 applications, when it is installed. | the compositor |
+| `tuna-x11-frames` | Title bars for X11 windows: the part `mutter-x11-frames` plays in GNOME. An X11 client of Xwayland. | the compositor, with Xwayland |
 | `orca` | The screen reader, when it is turned on. | the compositor |
 
 Sources: `crates/compositor/src/bin/tuna-session.rs`,
@@ -148,7 +149,8 @@ for a new one (`CreateTransientDisplay`). If that fails, the shell logs
 
 The compositor and the shells print plain lines to standard error. Every line
 starts with the program's name: `tuna-compositor:`, `tuna-shell-gtk:`,
-`tuna-shell-host:`, `tuna-ibus-bridge:`. They log codes, counts and service
+`tuna-shell-host:`, `tuna-ibus-bridge:`, `tuna-x11-frames:`. They log codes,
+counts and service
 names, never window titles, typed text or passwords. There are no log levels;
 the [trace variables](environment.md#debugging-and-trace-output) add more
 output for one area at a time.

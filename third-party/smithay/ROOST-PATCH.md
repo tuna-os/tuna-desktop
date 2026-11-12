@@ -169,6 +169,78 @@ crates/compositor/tests/data_device.rs cover a disconnecting owner and a
 destroyed source. The isolated diff is retained in
 CLIPBOARD-SOURCE-ALIVE-PATCH.diff; the pinned version stays 0.7.0.
 
+Issue #1034 changes src/xwayland/xwm/mod.rs and surface.rs for server-side
+frames of X11 windows, with the X11 protocol of Mutter 51's frames client
+(mutter src/x11/meta-x11-frame.c, events.c, window-x11.c; src/frames/). The
+frame handling is additive: without a frames client, and for a compositor
+that never calls set_needs_frame, a window is wrapped, mapped, configured
+and unmapped as before, with two corrections found while proving the frames
+against a live Xwayland. The bare wrapper is created with the client's depth
+and visual (create_wrapper; a window of another depth than the root gets
+the client's colormap and a border pixel): in a wrapper of the root's depth
+the X server composited a 32-bit client without alpha, so a client-decorated
+GTK window showed an opaque black box where its shadow is transparent. And
+X11Wm::set_xsettings flushes: the changed property used to wait in the
+request buffer for the next unrelated request. New atoms:
+_MUTTER_NEEDS_FRAME, _MUTTER_FRAME_FOR, _MUTTER_FRAME_EXTENTS,
+_GTK_FRAME_EXTENTS, _NET_FRAME_EXTENTS,
+_GTK_SHOW_WINDOW_MENU and _NET_CLOSE_WINDOW; _NET_SUPPORTED lists the last
+four of them, as Mutter's set_supported_hint does, because GTK draws
+client-side shadows only with _GTK_FRAME_EXTENTS supported and asks for the
+window menu only with _GTK_SHOW_WINDOW_MENU supported.
+X11Surface::set_needs_frame is meta_window_ensure_frame and
+meta_window_destroy_frame. A MapRequest for a window whose _MUTTER_FRAME_FOR
+names a managed window that wants a frame adopts it
+(meta_window_x11_set_frame_xwindow): the client is reparented from the bare
+wrapper into the frame at the extents offset, the wrapper is destroyed, and
+the frame becomes mapped_window_id, so WL_SURFACE_SERIAL on the frame
+associates the Wayland surface. Such a window is never passed to
+map_window_request; its own handle from new_window is retired through
+destroyed_window. The frame's borders are read as meta_frame_query_borders
+reads them and re-read on PropertyNotify; X11Surface::frame_extents returns
+them (or, without a frame, the window's own _GTK_FRAME_EXTENTS as invisible
+borders), with the Mutter rectangle conversions on the new FrameExtents and
+FrameBorder types. X11Surface::configure and geometry keep meaning the
+window that carries the surface; under a frame the client is placed inside
+it at the extents offset, _NET_FRAME_EXTENTS is published on the client, and
+_NET_WM_STATE is mirrored onto the frame. A client keeps its size when a
+frame is adopted or lost: the buffer rectangle grows or shrinks by the
+borders around the same frame rectangle origin
+(FrameExtents::bare_rect_to_buffer_rect, buffer_rect_to_bare_rect), as
+Mutter grows the frame around the client; a change of borders before the
+map was granted does the same, and afterwards keeps the buffer rectangle
+until the compositor lays the window out. A managed client is always mapped
+inside what it is mapped onto (adopt_frame and unframe map it after the
+reparent): the save-set's own MapWindow for a client handed back to the
+root is redirected to this window manager as a MapRequest for a window it
+already manages, and the client would stay unmapped in its new wrapper and
+in its next frame. The frame's own ConfigureRequest is answered with a
+synthetic ConfigureNotify. _NET_WM_STATE, WM_CHANGE_STATE
+and _NET_WM_MOVERESIZE messages are accepted for the client or its frame
+(X11Surface::is_message_target); XwmHandler gains close_request
+(_NET_CLOSE_WINDOW), show_window_menu_request (_GTK_SHOW_WINDOW_MENU) and
+frame_changed, each with a default body. Reparents by the window manager
+are told from withdrawals by an unmaps_pending count, as in Mutter. Two
+things differ from Mutter because an unframed window lives in a wrapper
+here, not on the root: when the frames client dies and the X server's
+save-set returns a client to the root, the window is wrapped bare again in
+place (Mutter unmanages and re-manages it), and X11Wm::request_frames
+re-announces unframed windows to a frames client that started after they
+were wrapped (_MUTTER_NEEDS_FRAME again plus a synthetic root
+ConfigureNotify, which the tracker treats like a configured root child).
+The frame keeps the wrapper's event mask (SubstructureNotify,
+SubstructureRedirect, PropertyChange) instead of Mutter's EVENT_MASK, since
+structure events of root children already arrive through the root.
+_NET_WM_ALLOWED_ACTIONS and _NET_WM_SYNC_REQUEST_COUNTER on the frame are
+not handled. Pure tests of the border arithmetic, the property parsing and
+the frame-id message predicate are in crates/compositor/src/xwayland.rs
+(frame_tests). The handshake itself needs a live X server and frames
+client; no cargo test covers it. The nested session's X11 frame gates do
+(scripts/tuna-gtk-shell-proof G-X11-FRAME, G-X11-FRAME-ACTIONS,
+G-X11-FRAME-CSD, G-X11-FRAME-RECOVERY, G-X11-RESTART), against a real
+Xwayland and tuna-x11-frames. The isolated diff is retained in
+X11-FRAMES-API-PATCH.diff; the pinned version stays 0.7.0.
+
 Issue #364 additionally changes `src/wayland/input_method/{mod.rs,
 input_method_handle.rs,input_method_keyboard_grab.rs}`. Registry visibility
 and forced binds both enforce the compositor's input-method admission

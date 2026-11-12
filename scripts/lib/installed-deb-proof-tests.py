@@ -388,7 +388,7 @@ class ReleaseDelegatePolicy(unittest.TestCase):
                 path.write_text('#!/bin/sh\nset -eu\n' + body + '\n')
                 path.chmod(0o755)
             tool('git', 'echo v0.1.0')
-            tool('cargo', 'test "$*" = "build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host"')
+            tool('cargo', 'test "$*" = "build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host -p tuna-x11-frames"')
             tool('dpkg-shlibdeps', 'exit 9' if failure == 'shlibs' else ('echo unknown' if failure == 'malformed' else 'echo "shlibs:Depends=libc6 (>= 2.36)"'))
             # tuna-rename: keep-begin
             tool('dpkg-deb', '''test "$1" = --root-owner-group
@@ -439,7 +439,7 @@ cp "$3/DEBIAN/control" "$OUTPUT"''')
                                         f"stderr:\n{result.stderr.decode(errors='replace')}")
             return result.returncode, output.read_text() if output.exists() else None
 
-    def test_real_release_delegates_locked_all_six_and_abi_closure(self):
+    def test_real_release_delegates_locked_all_seven_and_abi_closure(self):
         status, control = self.run_release()
         self.assertEqual(status, 0, self.release_diagnostics)
         self.assertIn('libc6 (>= 2.36)', control)

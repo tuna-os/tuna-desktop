@@ -70,12 +70,13 @@ nested backend additionally dlopens the EGL/Mesa display libraries
 
 ```sh
 cargo build --release \
-  -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk
+  -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk -p tuna-x11-frames
 ```
 
 Binaries land in `target/release/`: `tuna-compositor`, `tuna-shell-gtk`,
-`tuna-shell-host`, and `tuna-session` (the last is a second binary target of
-the compositor crate).
+`tuna-shell-host`, `tuna-x11-frames` (title bars for X11 windows; it needs
+GTK built with its X11 backend, `gtk4-x11.pc`), and `tuna-session` (a second
+binary target of the compositor crate).
 
 ## Installing
 
@@ -85,6 +86,7 @@ install -Dm0755 target/release/tuna-compositor "$DESTDIR$PREFIX/bin/tuna-composi
 install -Dm0755 target/release/tuna-shell-gtk  "$DESTDIR$PREFIX/bin/tuna-shell-gtk"
 install -Dm0755 target/release/tuna-shell-host "$DESTDIR$PREFIX/bin/tuna-shell-host"
 install -Dm0755 target/release/tuna-session   "$DESTDIR$PREFIX/bin/tuna-session"
+install -Dm0755 target/release/tuna-x11-frames "$DESTDIR$PREFIX/bin/tuna-x11-frames"
 install -Dm0644 share/wayland-sessions/tuna.desktop \
   "$DESTDIR$PREFIX/share/wayland-sessions/tuna.desktop"
 ```

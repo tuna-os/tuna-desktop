@@ -176,7 +176,7 @@ done
 echo "tuna-drm-smoke: vkms at $CARD"
 
 echo "tuna-drm-smoke: building"
-cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk
+cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk -p tuna-x11-frames
 "$ROOT/scripts/tuna-frame-pacer-build" "$ARTIFACTS/frame-pacer"
 
 # seatd always serves /run/seatd.sock (and removes a leftover one), so a

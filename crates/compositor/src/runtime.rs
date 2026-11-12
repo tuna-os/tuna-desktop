@@ -808,6 +808,10 @@ pub struct Runtime {
     x11_display: Option<u32>,
     #[cfg(feature = "xwayland")]
     x11_icon_reader: crate::x11_icons::Reader,
+    /// The X11 frames client (P-WM-10): GTK title bars for X11 windows,
+    /// started once the X11 window manager is ready.
+    #[cfg(feature = "xwayland")]
+    x11_frames: crate::x11_frames::X11Frames,
     /// Real-time anchor of the last input event. Input stamps live on
     /// the backend event clock while idle is measured here, so each
     /// tick evaluates the lock in the input base as
@@ -1441,6 +1445,8 @@ impl Runtime {
             x11_display: None,
             #[cfg(feature = "xwayland")]
             x11_icon_reader: crate::x11_icons::Reader::new(),
+            #[cfg(feature = "xwayland")]
+            x11_frames: crate::x11_frames::X11Frames::new(),
             overview_search: false,
             overview_app_grid: false,
             overview_drag: None,
@@ -2661,17 +2667,29 @@ impl Runtime {
                 .map(|w| w.id)
                 .filter(|id| self.manager.is_above(*id))
                 .collect::<Vec<_>>(),
-            "windows": self.manager.overview_windows().iter().map(|w| serde_json::json!({
-                "id": w.id,
-                "app_id": app_of(w.id),
-                "introspect_eligible": self.manager.is_introspect_eligible(w.id),
-                "x11_window_id": self.manager.x11_window_id(w.id),
-                "parent_window_id": self.manager.transient_parent(w.id),
-                "application_window_id": self.manager.application_window(w.id),
-                "icon": model.window(w.id).and_then(|w| w.icon.clone()),
-                "workspace": w.workspace,
-                "rect": [w.geometry.loc.x, w.geometry.loc.y, w.geometry.size.w, w.geometry.size.h],
-            })).collect::<Vec<_>>(),
+            "windows": self.manager.overview_windows().iter().map(|w| {
+                // An X11 window's frame (P-WM-10); all three null for a
+                // native window.
+                let x11_frame = self.manager.x11_frame_state(w.id);
+                serde_json::json!({
+                    "id": w.id,
+                    "app_id": app_of(w.id),
+                    "introspect_eligible": self.manager.is_introspect_eligible(w.id),
+                    "x11_window_id": self.manager.x11_window_id(w.id),
+                    // Whether a frames-client frame holds the window.
+                    "x11_framed": x11_frame.map(|(framed, _, _)| framed),
+                    // Its visible borders: left, right, top, bottom.
+                    "x11_frame_extents": x11_frame.map(|(_, extents, _)| extents),
+                    // The X11 window carrying the surface: `rect` grown
+                    // by the invisible borders (shadow, resize handles).
+                    "x11_buffer_rect": x11_frame.map(|(_, _, buffer)| buffer),
+                    "parent_window_id": self.manager.transient_parent(w.id),
+                    "application_window_id": self.manager.application_window(w.id),
+                    "icon": model.window(w.id).and_then(|w| w.icon.clone()),
+                    "workspace": w.workspace,
+                    "rect": [w.geometry.loc.x, w.geometry.loc.y, w.geometry.size.w, w.geometry.size.h],
+                })
+            }).collect::<Vec<_>>(),
             "previews": previews,
             "thumbnails": thumbnails,
             "workspace_placeholder": scene.as_ref().and_then(|s| s.placeholder).map(|(at, r)| serde_json::json!({
@@ -4940,6 +4958,18 @@ impl Runtime {
                     .next_deadline()
                     .saturating_duration_since(now));
             }
+            // The frames client's restart gate and its offers of unframed
+            // windows, and the end of a window's wait for its frame.
+            let frame_deadline = self.manager.x11_frame_deadline();
+            if let Some(ms) = self
+                .x11_frames
+                .next_wake_ms(system_now, frame_deadline.is_some())
+            {
+                due(Duration::from_millis(ms));
+            }
+            if let Some(deadline) = frame_deadline {
+                due(deadline.saturating_duration_since(now));
+            }
         }
         if let Some(ms) = self
             .ime
@@ -5325,6 +5355,10 @@ impl Runtime {
         if let Some(ime) = &mut self.ime {
             ime.set_ready_x11_display(ready_x11_display);
         }
+        // The frames client is an X11 client too, and X11 windows keep
+        // their title bars while the session is locked.
+        #[cfg(feature = "xwayland")]
+        self.x11_frames_tick(ready_x11_display);
         // Overview focus follows the hub flag (shell commands and
         // runtime triggers converge here); the next reconcile parks
         // or restores keyboard focus.
@@ -5424,6 +5458,8 @@ impl Runtime {
                 if let Some(ime) = &mut self.ime {
                     ime.set_ready_x11_display(None);
                 }
+                self.x11_frames.set_ready_x11_display(None);
+                self.manager.set_x11_frames_client(false);
                 self.manager.clear_x11_windows(&mut self.state);
                 self.xwayland.disconnected(now);
             }
@@ -5785,6 +5821,38 @@ impl Runtime {
         }
     }
 
+    /// Supervise the X11 frames client (P-WM-10) and serve it: publish the
+    /// title-bar settings its header bars read as XSETTINGS, and offer it
+    /// the windows that still want a frame (see [`crate::x11_frames`]).
+    #[cfg(feature = "xwayland")]
+    fn x11_frames_tick(&mut self, ready_x11_display: Option<u32>) {
+        let now_ms = crate::state::system_millis();
+        self.x11_frames.set_ready_x11_display(ready_x11_display);
+        self.x11_frames.poll(now_ms);
+        self.manager
+            .set_x11_frames_client(self.x11_frames.running());
+        let Some(xwm) = self.state.xwm.as_mut() else {
+            return;
+        };
+        if let Some(settings) = self.x11_frames.take_xsettings() {
+            let settings = settings.into_iter().map(|(name, value)| {
+                (
+                    name.to_owned(),
+                    smithay::xwayland::xwm::settings::Value::String(value),
+                )
+            });
+            if let Err(error) = xwm.set_xsettings(settings) {
+                eprintln!("tuna-compositor: x11 frames: XSETTINGS refused: {error}");
+            }
+        }
+        let window_waits = self.manager.x11_frame_deadline().is_some();
+        if self.x11_frames.offer_due(now_ms, window_waits) {
+            if let Err(error) = xwm.request_frames() {
+                eprintln!("tuna-compositor: x11 frames: offer refused: {error}");
+            }
+        }
+    }
+
     /// GNOME's focus policy (P-WM-09): install a completed settings read,
     /// then repick the pointer window (a crossing without motion) and run
     /// the pointer-rest and auto-raise timers. Native reads stay on the
@@ -5811,6 +5879,12 @@ impl Runtime {
             self.manager.set_focus_policy(policy);
             if let Some(ms) = raw.check_alive_timeout_ms {
                 self.manager.set_check_alive_timeout(ms);
+            }
+            // The title-bar keys of the same schema, for the GTK header
+            // bars of X11 frames.
+            #[cfg(feature = "xwayland")]
+            if let Some(titlebar) = raw.titlebar {
+                self.x11_frames.set_titlebar(titlebar);
             }
         }
         if !self.is_locked() {

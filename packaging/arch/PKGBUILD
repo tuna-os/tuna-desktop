@@ -40,6 +40,9 @@ depends=(
     'libdrm'
     'libinput'
     'libsecret'
+    'libx11'
+    'libxfixes'
+    'libxi'
     'libxkbcommon'
     'libxkbcommon-x11'
     'mesa'
@@ -54,7 +57,7 @@ optdepends=(
     'orca: GNOME Screen Reader activation and speech'
     'gnome-keyring: user network secret storage'
     'xdg-desktop-portal-gnome: screenshots and screen sharing for apps'
-    'xorg-xwayland: X11 application support'
+    'xorg-xwayland: X11 application support (tuna-x11-frames draws their title bars)'
     'ibus: input methods (tuna-ibus-bridge, as GNOME uses IBus)'
     'gst-plugin-pipewire: screen recording from the screenshot UI'
     'gst-plugins-good: screen recording (VP8 and WebM)'
@@ -90,12 +93,13 @@ build() {
     export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$srcdir/target}"
     export TUNA_VERSION="v${_semver}"
     cargo build --frozen --release \
-        -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-host -p tuna-shell-gtk
+        -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-host -p tuna-shell-gtk \
+        -p tuna-x11-frames
 }
 
 check() {
     local bin
-    for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge tuna-wallpaper-svg; do
+    for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge tuna-wallpaper-svg tuna-x11-frames; do
         local reported
         reported="$("${CARGO_TARGET_DIR:-$srcdir/target}/release/$bin" --version | awk '{print $NF}')"
         if [[ "$reported" != "$_semver" ]]; then
@@ -109,7 +113,7 @@ package() {
     local root target bin
     root="$(_srcroot)"
     target="${CARGO_TARGET_DIR:-$srcdir/target}/release"
-    for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge tuna-wallpaper-svg; do
+    for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge tuna-wallpaper-svg tuna-x11-frames; do
         install -Dm0755 "$target/$bin" "$pkgdir/usr/bin/$bin"
     done
     install -Dm0644 "$root/share/wayland-sessions/tuna.desktop" \

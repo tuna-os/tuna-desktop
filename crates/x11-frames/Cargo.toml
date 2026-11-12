@@ -1,0 +1,22 @@
+[package]
+name = "tuna-x11-frames"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Tuna Desktop's X11 frames client: GTK title bars for X11 windows, speaking Mutter 51's frames protocol"
+
+[[bin]]
+name = "tuna-x11-frames"
+path = "src/main.rs"
+
+[dependencies]
+# Same feature set as tuna-shell-gtk, so one gtk4 build serves both.
+gtk4 = { workspace = true, features = ["v4_14"] }
+libadwaita.workspace = true
+# `xlib`: GdkX11Display's Xlib connection and its `xevent` signal. The
+# frame windows, the save set and the error traps must all belong to
+# GDK's own connection. The feature brings x11-dl, re-exported as
+# `gdk4_x11::x11`: the Xlib bindings its types are written in.
+gdk4-x11.workspace = true
+# dlsym for the one XFixes 6 call x11-dl lacks; SIGTERM.
+libc = "0.2"
