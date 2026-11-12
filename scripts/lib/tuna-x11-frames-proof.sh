@@ -92,6 +92,10 @@ x11f_placed() {
 x11f_state_has() { x11f xprop -id "$1" _NET_WM_STATE 2>/dev/null | grep -q "$2"; }
 x11f_state_lacks() { ! x11f_state_has "$1" "$2"; }
 
+# The state (Normal, Iconic, Withdrawn) in WM_STATE of X11 window $1.
+x11f_wm_state() { x11f xprop -id "$1" WM_STATE 2>/dev/null | sed -n 's/.*window state: //p'; }
+x11f_wm_state_is() { [ "$(x11f_wm_state "$1")" = "$2" ]; }
+
 # Dump the frames client's accessible tree to $1 until jq filter $2 holds.
 x11f_a11y() {
     x11f_a11y_end=$(($(date +%s) + 20))
@@ -350,6 +354,53 @@ xdotool key Escape
 cstate '.layers | any(.namespace == "tuna-window-menu") | not' "window menu closed" 10 ||
     fail G-X11-FRAME-ACTIONS "Escape did not close the window menu"
 sleep 1
+# Minimize: the header bar's button asks with WM_CHANGE_STATE, and the
+# window manager tells the client its window is hidden as Mutter does
+# (meta_window_x11_set_wm_state, meta_window_x11_set_net_wm_state):
+# WM_STATE IconicState and _NET_WM_STATE_HIDDEN, on the frame too. Both
+# go when the switcher activates the window again (#1078).
+[ "$(x11f_wm_state "$x11f_client")" = Normal ] ||
+    fail G-X11-FRAME-ACTIONS "a shown window's WM_STATE is '$(x11f_wm_state "$x11f_client")', not Normal"
+x11f_state_lacks "$x11f_client" _NET_WM_STATE_HIDDEN ||
+    fail G-X11-FRAME-ACTIONS "a shown window is marked _NET_WM_STATE_HIDDEN"
+gsettings set org.gnome.desktop.wm.preferences button-layout 'appmenu:minimize,close'
+x11f_a11y "$ARTIFACTS/a11y-x11-frame-minimize.json" 'frame("Tuna Frame Renamed") | buttons | map(.name) | sort == ["Close", "Minimize"]' ||
+    fail G-X11-FRAME-ACTIONS "button-layout 'appmenu:minimize,close' gave the header bar no Minimize button"
+# shellcheck disable=SC2046 # "X Y" of the button's centre
+set -- $(x11f_button "$ARTIFACTS/a11y-x11-frame-minimize.json" "Tuna Frame Renamed" Minimize "$x11f_x" "$x11f_y")
+xdotool mousemove --window "$WID" "$1" "$2"
+sleep 0.3
+xdotool click 1
+cstate "(.minimized | index($x11f_probe) != null) and .focused != $x11f_probe" "probe minimized" 10 ||
+    fail G-X11-FRAME-ACTIONS "the Minimize button did not hide the window"
+x11f_until 5 x11f_wm_state_is "$x11f_client" Iconic ||
+    fail G-X11-FRAME-ACTIONS "the minimized window's WM_STATE is '$(x11f_wm_state "$x11f_client")', not Iconic"
+x11f_until 5 x11f_state_has "$x11f_client" _NET_WM_STATE_HIDDEN ||
+    fail G-X11-FRAME-ACTIONS "the minimized window is not marked _NET_WM_STATE_HIDDEN"
+x11f_until 5 x11f_state_has "$x11f_frame" _NET_WM_STATE_HIDDEN ||
+    fail G-X11-FRAME-ACTIONS "the minimized window's frame is not marked _NET_WM_STATE_HIDDEN"
+# Still managed, in its frame: hidden, not withdrawn.
+[ "$(x11f_frame_for "$(x11f_parent "$x11f_client")")" = "$x11f_client" ] ||
+    fail G-X11-FRAME-ACTIONS "the minimized window left its frame"
+sleep 1
+xdotool keydown Alt_L
+xdotool key Tab
+sleep 0.5
+xdotool keyup Alt_L
+cstate ".focused == $x11f_probe and (.minimized | index($x11f_probe) == null)" "probe restored" 10 ||
+    fail G-X11-FRAME-ACTIONS "the switcher did not bring the minimized window back"
+x11f_until 5 x11f_wm_state_is "$x11f_client" Normal ||
+    fail G-X11-FRAME-ACTIONS "the restored window's WM_STATE is '$(x11f_wm_state "$x11f_client")', not Normal"
+x11f_until 5 x11f_state_lacks "$x11f_client" _NET_WM_STATE_HIDDEN ||
+    fail G-X11-FRAME-ACTIONS "the restored window is still marked _NET_WM_STATE_HIDDEN"
+x11f_until 5 x11f_state_lacks "$x11f_frame" _NET_WM_STATE_HIDDEN ||
+    fail G-X11-FRAME-ACTIONS "the restored window's frame is still marked _NET_WM_STATE_HIDDEN"
+x11f_until 5 x11f_state_has "$x11f_frame" _NET_WM_STATE_FOCUSED ||
+    fail G-X11-FRAME-ACTIONS "the restored window's frame is not marked _NET_WM_STATE_FOCUSED"
+cstate ".windows[] | select(.id == $x11f_probe) | .rect == [$x11f_x, $x11f_y, $x11f_w, $x11f_h]" "restored in place" 5 ||
+    fail G-X11-FRAME-ACTIONS "the restored window is not where it was minimized"
+gsettings set org.gnome.desktop.wm.preferences button-layout 'appmenu:close'
+sleep 1
 # Close: the button the header bar draws, found where GTK reports it.
 x11f_a11y "$ARTIFACTS/a11y-x11-frame-close.json" 'frame("Tuna Frame Renamed") | buttons | map(.name) == ["Close"]' ||
     fail G-X11-FRAME-ACTIONS "the frame lost its Close button"
@@ -366,7 +417,7 @@ while kill -0 "$x11f_probe_pid" 2>/dev/null; do
         fail G-X11-FRAME-ACTIONS "the client did not exit on WM_DELETE_WINDOW"
     sleep 0.2
 done
-pass G-X11-FRAME-ACTIONS "the frame's title bar moves the window with the pointer, maximizes and restores on double click, resizes from its edge, opens the window menu, and its Close button closes the client"
+pass G-X11-FRAME-ACTIONS "the frame's title bar moves the window with the pointer, maximizes and restores on double click, resizes from its edge, opens the window menu; its Minimize button hides the window with WM_STATE Iconic and _NET_WM_STATE_HIDDEN on client and frame until it is activated again, and its Close button closes the client"
 
 # G-X11-FRAME-CSD: a window that draws its own decoration (GTK sets
 # _MOTIF_WM_HINTS decorations to 0) keeps it, and its popover, an
@@ -468,17 +519,22 @@ sleep 0.5
 x11f_recovery_mark="$(wc -c <"$LOG")"
 kill -KILL "$x11f_frames_pid"
 # The bare interval lasts the supervisor's restart delay: sample fast.
+# The frame's X11 window carried the Wayland surface and took it along:
+# each window has none until Xwayland made one for its bare wrapper (a
+# few frames; the compositor reports it as surface_rect), and a press
+# has nowhere to go before that. The click below is made once, on a
+# window seen bare with its surface.
 x11f_bare=""
 x11f_bare_end=$(($(date +%s) + 10))
 while [ "$(date +%s)" -le "$x11f_bare_end" ]; do
-    if jq -e "[.windows[] | select(.id == $x11f_xev or .id == $x11f_other)] | length == 2 and all(.[]; .x11_framed == false)" "$CSTATE" >/dev/null 2>&1 &&
-        cp "$CSTATE" "$ARTIFACTS/x11-frame-bare.json"; then
+    if cp "$CSTATE" "$ARTIFACTS/x11-frame-bare.json" 2>/dev/null &&
+        jq -e "[.windows[] | select(.id == $x11f_xev or .id == $x11f_other)] | length == 2 and all(.[]; .x11_framed == false and .surface_rect != null)" "$ARTIFACTS/x11-frame-bare.json" >/dev/null 2>&1; then
         x11f_bare=1
         break
     fi
     sleep 0.05
 done
-[ -n "$x11f_bare" ] || fail G-X11-FRAME-RECOVERY "the windows were never seen bare after the frames client was killed"
+[ -n "$x11f_bare" ] || fail G-X11-FRAME-RECOVERY "the windows were never seen bare, each with its surface again, after the frames client was killed"
 x11f_count="$(x11f_presses)"
 xdotool click 1
 scrot -o "$ARTIFACTS/20-x11-frame-bare.png" >/dev/null

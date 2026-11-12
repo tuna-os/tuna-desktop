@@ -2671,7 +2671,15 @@ impl Runtime {
                 // An X11 window's frame (P-WM-10); all three null for a
                 // native window.
                 let x11_frame = self.manager.x11_frame_state(w.id);
+                let surface = self.manager.surface_input_state(w.id);
                 serde_json::json!({
+                    // The window's surface, shadow included (null while
+                    // it has no buffer: an X11 window whose frame just
+                    // came or went), and the bounding box of its input
+                    // region (null: none set, the whole surface takes
+                    // input).
+                    "surface_rect": surface.map(|(rect, _)| rect),
+                    "input_rect": surface.and_then(|(_, input)| input),
                     "id": w.id,
                     "app_id": app_of(w.id),
                     "introspect_eligible": self.manager.is_introspect_eligible(w.id),
@@ -2760,6 +2768,28 @@ impl Runtime {
         });
         // Bottom-to-top stacking and GNOME's live focus policy (P-WM-09).
         doc["stacking"] = serde_json::json!(self.manager.stacking_order());
+        // Override-redirect X11 windows (menus, tooltips), bottom to top:
+        // drawn, never in `windows` or `stacking` (P-SY-04). `rect` is
+        // where the X server has the window, `owner` the window it shows
+        // with, `shown` whether it is on screen now.
+        #[cfg(feature = "xwayland")]
+        let x11_unmanaged = self
+            .manager
+            .x11_unmanaged_state()
+            .into_iter()
+            .map(|(xid, rect, owner, shown, kind)| {
+                serde_json::json!({
+                    "x11_window_id": xid,
+                    "rect": [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h],
+                    "owner": owner,
+                    "shown": shown,
+                    "type": kind,
+                })
+            })
+            .collect::<Vec<_>>();
+        #[cfg(not(feature = "xwayland"))]
+        let x11_unmanaged = Vec::<serde_json::Value>::new();
+        doc["x11_unmanaged"] = x11_unmanaged.into();
         let focus_policy = self.manager.focus_policy();
         doc["focus_policy"] = serde_json::json!({
             "focus_mode": focus_policy.mode.as_str(),
@@ -7623,9 +7653,22 @@ fn scene_elements(
                 .map(|e| (elements.len(), e, 1.0)),
         );
     }
+    // Unmanaged X11 windows (menus, tooltips) sit above every window and
+    // the shell's Top layer (the top bar), below its Overlay layer, where
+    // GNOME Shell stacks Mutter's top window group (windows/unmanaged.rs).
+    #[cfg(feature = "xwayland")]
+    let mut unmanaged = manager.x11_unmanaged_entries();
     // Layer shell above windows: panel strip, then overview, each with
     // its popups (toolkit popovers hang off layer surfaces).
-    for (surface, (x, y), _) in crate::layer::layer_layout(state) {
+    for (surface, (x, y), layer) in crate::layer::layer_layout(state) {
+        #[cfg(feature = "xwayland")]
+        if layer == smithay::wayland::shell::wlr_layer::Layer::Overlay {
+            for (surface, rect) in unmanaged.drain(..) {
+                tree(renderer, &mut elements, &surface, rect.loc, 1.0, 1.0);
+            }
+        }
+        #[cfg(not(feature = "xwayland"))]
+        let _ = layer;
         tree(renderer, &mut elements, &surface, (x, y).into(), 1.0, 1.0);
         for popup in crate::popup::placed_popups(&surface, (x, y).into(), false) {
             tree(
@@ -7645,6 +7688,10 @@ fn scene_elements(
                     .map(|e| (elements.len(), e, 1.0)),
             );
         }
+    }
+    #[cfg(feature = "xwayland")]
+    for (surface, rect) in unmanaged {
+        tree(renderer, &mut elements, &surface, rect.loc, 1.0, 1.0);
     }
     // `elements` accumulates bottom-to-top (windows, then
     // background-to-overlay layers); Smithay 0.7 draws the first
@@ -8142,6 +8189,10 @@ fn send_surface_scales(state: &State, manager: &WindowManager) {
         if let Some(surface) = window.wl_surface() {
             send(&surface, state.scale_for(geometry));
         }
+    }
+    #[cfg(feature = "xwayland")]
+    for (surface, rect) in manager.x11_unmanaged_entries() {
+        send(&surface, state.scale_for(rect));
     }
     for (surface, (x, y), _) in crate::layer::layer_layout(state) {
         send(

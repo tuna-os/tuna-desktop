@@ -290,6 +290,11 @@ pub fn drawn_roots(
             roots.push((popup.wl_surface().clone(), at));
         }
     }
+    // Unmanaged X11 windows (menus, tooltips) are drawn on the desktop.
+    #[cfg(feature = "xwayland")]
+    for (surface, rect) in manager.x11_unmanaged_entries() {
+        roots.push((surface, rect.loc));
+    }
     if let Some(icon) = state.dnd_icon() {
         roots.push((icon, manager.pointer_pos().to_i32_round()));
     }

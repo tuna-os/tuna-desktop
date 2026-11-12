@@ -241,6 +241,27 @@ G-X11-FRAME-CSD, G-X11-FRAME-RECOVERY, G-X11-RESTART), against a real
 Xwayland and tuna-x11-frames. The isolated diff is retained in
 X11-FRAMES-API-PATCH.diff; the pinned version stays 0.7.0.
 
+Issues #1076 and #1078 additionally change src/xwayland/xwm/mod.rs and
+surface.rs, additively. X11Wm::pointer_grabbed says whether an X11 client
+holds an active pointer grab (an open menu): a GrabPointer on the window
+manager's own never-mapped window answers AlreadyGrabbed when another
+client holds the pointer and NotViewable otherwise (dix GrabDevice tests
+them in that order), so the request never takes a grab. Roost uses it to
+hand a press outside every Xwayland surface to the X server while an
+override-redirect window shows, so the grabbing client learns of the click
+that dismisses its menu. X11Surface::set_minimized marks a mapped window
+minimized without unmapping it, as Mutter's meta_window_x11_set_wm_state
+and meta_window_x11_set_net_wm_state do: WM_STATE IconicState or
+NormalState on the client (the new public wm_state_property gives the two
+CARD32) and _NET_WM_STATE_HIDDEN through the existing set_suspended, which
+already mirrors _NET_WM_STATE onto a frame. set_mapped and every other
+existing path are unchanged. The pure test of wm_state_property is in
+crates/compositor/src/xwayland.rs (frame_tests); the live paths are gated
+by scripts/tuna-gtk-shell-proof (G-X11-MENU's clicks outside the menu,
+G-X11-FRAME-ACTIONS' minimize and restore). The isolated diff, on top of
+X11-FRAMES-API-PATCH.diff, is retained in X11-UNMANAGED-API-PATCH.diff;
+the pinned version stays 0.7.0.
+
 Issue #364 additionally changes `src/wayland/input_method/{mod.rs,
 input_method_handle.rs,input_method_keyboard_grab.rs}`. Registry visibility
 and forced binds both enforce the compositor's input-method admission

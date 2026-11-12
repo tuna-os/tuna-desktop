@@ -390,31 +390,6 @@ impl X11Frame {
         .size
     }
 
-    /// Where `pos` lies on the surface of a window whose frame rectangle
-    /// is `frame`, when it is outside that rectangle but inside the
-    /// invisible borders around it: the shadow of a frame or of a
-    /// client-decorated window, part of which takes pointer input as the
-    /// resize handles (GTK's input shape). Mutter picks a window's actor
-    /// over its whole buffer, clipped to the surface's input region; the
-    /// caller checks that region at the returned surface-local point.
-    /// `None` inside the frame rectangle, outside the buffer, and for a
-    /// window without invisible borders.
-    pub fn invisible_border_point(
-        &self,
-        frame: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
-        pos: smithay::utils::Point<f64, smithay::utils::Logical>,
-    ) -> Option<smithay::utils::Point<i32, smithay::utils::Logical>> {
-        if self.extents.invisible.is_zero() {
-            return None;
-        }
-        let point = smithay::utils::Point::<i32, smithay::utils::Logical>::from((
-            pos.x.floor() as i32,
-            pos.y.floor() as i32,
-        ));
-        let buffer = self.buffer_rect(frame);
-        (buffer.contains(point) && !frame.contains(point)).then(|| point - buffer.loc)
-    }
-
     /// The frame rectangle after the window went from `old` to this
     /// frame: the same origin, sized so the application keeps its client
     /// size (a floating window grows by the title bar when it is framed).
@@ -492,6 +467,13 @@ pub enum X11ManagerEvent {
     Menu(u32, i32, i32),
     /// The window's frame was adopted or lost, or its borders changed.
     FrameChanged(u32),
+    /// An override-redirect window (a menu, a tooltip, a dropdown) was
+    /// mapped by its client. The window manager has no say in it; the
+    /// compositor draws it where it is (`crate::windows`, unmanaged).
+    UnmanagedMapped(Box<smithay::xwayland::X11Surface>),
+    /// A mapped override-redirect window moved, resized or restacked
+    /// itself (X11 window id, the sibling it now sits directly above).
+    UnmanagedConfigured(u32, Option<u32>),
 }
 
 /// Spawn the compatibility server and hook its event source into the
@@ -700,14 +682,20 @@ mod handlers {
                 }
 
                 fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {
-                    // Never managed (no intercept on override-redirect).
+                    // Nothing to draw until it maps
+                    // (mapped_override_redirect_window).
                 }
 
                 fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
                     on_map_request($state(self), window);
                 }
 
-                fn mapped_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+                fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+                    push(
+                        $state(self),
+                        X11ManagerEvent::UnmanagedMapped(Box::new(window)),
+                    );
+                }
 
                 fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
                     push($state(self), X11ManagerEvent::Unmapped(window.window_id()));
@@ -733,10 +721,19 @@ mod handlers {
                 fn configure_notify(
                     &mut self,
                     _xwm: XwmId,
-                    _window: X11Surface,
+                    window: X11Surface,
                     _geometry: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
-                    _above: Option<X11Window>,
+                    above: Option<X11Window>,
                 ) {
+                    // A managed window is where the manager put it. An
+                    // override-redirect window moved, resized or restacked
+                    // itself: its handle already has the new rectangle.
+                    if window.is_override_redirect() {
+                        push(
+                            $state(self),
+                            X11ManagerEvent::UnmanagedConfigured(window.window_id(), above),
+                        );
+                    }
                 }
 
                 fn resize_request(
@@ -1202,7 +1199,9 @@ mod identity_tests {
 mod frame_tests {
     use super::{x11_wants_frame, X11Frame};
     use smithay::utils::{Logical, Rectangle, Size};
-    use smithay::xwayland::xwm::{addresses_window, FrameBorder, FrameExtents, WmWindowType};
+    use smithay::xwayland::xwm::{
+        addresses_window, wm_state_property, FrameBorder, FrameExtents, WmWindowType,
+    };
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
         Rectangle::new((x, y).into(), (w, h).into())
@@ -1410,46 +1409,6 @@ mod frame_tests {
     }
 
     #[test]
-    fn the_invisible_border_is_part_of_the_surface_outside_the_window() {
-        let frame = gtk_frame();
-        let window = rect(100, 200, 640, 527);
-        let at = |x: f64, y: f64| frame.invisible_border_point(window, (x, y).into());
-        // Inside the frame rectangle: the window itself, not its border.
-        assert_eq!(at(100.0, 200.0), None);
-        assert_eq!(at(739.9, 726.9), None);
-        // Just outside each edge, in surface coordinates (the buffer
-        // starts 25 px left of and 22 px above the window).
-        assert_eq!(at(99.5, 300.0), Some((24, 122).into()));
-        assert_eq!(at(740.0, 300.0), Some((665, 122).into()));
-        assert_eq!(at(400.0, 199.0), Some((325, 21).into()));
-        assert_eq!(at(400.0, 727.0), Some((325, 549).into()));
-        // The corners of the shadow belong to it too.
-        assert_eq!(at(75.0, 178.0), Some((0, 0).into()));
-        assert_eq!(at(764.9, 754.9), Some((689, 576).into()));
-        // Past the shadow: not this window's surface.
-        assert_eq!(at(74.9, 300.0), None);
-        assert_eq!(at(765.0, 300.0), None);
-        assert_eq!(at(400.0, 177.9), None);
-        assert_eq!(at(400.0, 755.0), None);
-        // A maximized frame and a bare window have no invisible border.
-        let flat = X11Frame {
-            extents: FrameExtents {
-                visible: gtk_frame().extents.visible,
-                invisible: FrameBorder::default(),
-            },
-            framed: true,
-        };
-        assert_eq!(
-            flat.invisible_border_point(window, (99.0, 300.0).into()),
-            None
-        );
-        assert_eq!(
-            X11Frame::default().invisible_border_point(window, (99.0, 300.0).into()),
-            None
-        );
-    }
-
-    #[test]
     fn window_geometry_is_the_surface_minus_the_shadow() {
         let frame = gtk_frame();
         assert_eq!(
@@ -1512,5 +1471,13 @@ mod frame_tests {
         assert!(!addresses_window(other, client, Some(frame)));
         // A window without a frame answers to its own id alone.
         assert!(!addresses_window(frame, client, None));
+    }
+
+    #[test]
+    fn a_minimized_window_s_wm_state_is_iconic_without_an_icon_window() {
+        // ICCCM 4.1.3.1: NormalState 1, IconicState 3, then the icon
+        // window (None), as Mutter's set_wm_state_on_xwindow writes them.
+        assert_eq!(wm_state_property(true), [3, 0]);
+        assert_eq!(wm_state_property(false), [1, 0]);
     }
 }

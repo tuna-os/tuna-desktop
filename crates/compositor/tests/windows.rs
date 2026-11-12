@@ -31,13 +31,17 @@ use tuna_compositor::TestCompositor;
 use tuna_shell_control::SwitcherAction;
 use wayland_client::{
     protocol::{
+        wl_buffer::WlBuffer,
         wl_callback::WlCallback,
         wl_compositor::WlCompositor,
         wl_display::WlDisplay,
         wl_keyboard::{Event as KeyEvent, KeyState as ClientKeyState, WlKeyboard},
         wl_pointer::{ButtonState as ClientButtonState, Event as PointerEvent, WlPointer},
+        wl_region::WlRegion,
         wl_registry::WlRegistry,
         wl_seat::WlSeat,
+        wl_shm::WlShm,
+        wl_shm_pool::WlShmPool,
         wl_surface::WlSurface,
     },
     Connection, Dispatch, EventQueue, QueueHandle, WEnum,
@@ -74,6 +78,8 @@ const BTN_LEFT: u32 = 0x110;
 #[derive(Default)]
 struct Client {
     compositor: Option<WlCompositor>,
+    /// For the tests that commit a buffer.
+    shm: Option<WlShm>,
     seat: Option<WlSeat>,
     xdg_base: Option<XdgWmBase>,
     dialogs: Option<XdgWmDialogV1>,
@@ -174,6 +180,9 @@ impl Dispatch<WlRegistry, ()> for Client {
                 "wl_compositor" => {
                     state.compositor =
                         Some(registry.bind::<WlCompositor, _, _>(name, version.min(6), qh, ()));
+                }
+                "wl_shm" => {
+                    state.shm = Some(registry.bind::<WlShm, _, _>(name, version.min(1), qh, ()));
                 }
                 "wl_seat" => {
                     // The test seat always offers keyboard and pointer, so
@@ -405,6 +414,10 @@ empty_dispatch!(WlDisplay);
 empty_dispatch!(WlCompositor);
 empty_dispatch!(WlSurface);
 empty_dispatch!(WlSeat);
+empty_dispatch!(WlShm);
+empty_dispatch!(WlShmPool);
+empty_dispatch!(WlBuffer);
+empty_dispatch!(WlRegion);
 empty_dispatch!(ZwlrLayerShellV1);
 empty_dispatch!(ZwpPointerGesturesV1);
 
@@ -7034,5 +7047,283 @@ mod unresponsive_windows {
         let later = timeout + Duration::from_secs(60);
         f.manager.run_alive_checks(&mut f.comp.state, later, true);
         assert!(f.manager.take_close_dialogs().is_empty());
+    }
+}
+
+/// The invisible border of a client-decorated window (#1079, P-WM-04):
+/// a GTK4 or libadwaita window is a surface larger than its window
+/// geometry, with its shadow around it, and its resize handles are the
+/// part of that shadow inside the surface's input region. The pointer
+/// there belongs to the window, as in Mutter, which picks a surface by
+/// its input region.
+mod invisible_border {
+    use std::os::fd::AsFd;
+
+    use wayland_client::protocol::wl_shm::Format;
+    use wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge;
+
+    use super::*;
+
+    /// The window geometry both windows commit.
+    const WINDOW: (i32, i32) = (400, 300);
+    /// The shadow around it: the surface is larger by this on each side.
+    const SHADOW: i32 = 30;
+    /// How much of the shadow, next to the window, takes input.
+    const HANDLE: i32 = 10;
+
+    /// What a surface says about pointer input.
+    #[derive(Clone, Copy)]
+    enum Input {
+        /// No input region: the whole surface takes input (the
+        /// protocol's default).
+        Whole,
+        /// The window and `HANDLE` px of shadow around it, as GTK sets.
+        Handles,
+        /// An empty region: no input anywhere.
+        Empty,
+    }
+
+    /// Make `client`'s window client-decorated: a buffer with `SHADOW`
+    /// px around the `WINDOW` window geometry and the given input region.
+    fn decorate(
+        comp: &mut TestCompositor,
+        conn: &Connection,
+        queue: &mut EventQueue<Client>,
+        client: &mut Client,
+        input: Input,
+    ) {
+        let qh = queue.handle();
+        let (w, h) = (WINDOW.0 + 2 * SHADOW, WINDOW.1 + 2 * SHADOW);
+        let stride = w * 4;
+        let file = tempfile::tempfile().unwrap();
+        file.set_len((stride * h) as u64).unwrap();
+        let pool = client
+            .shm
+            .as_ref()
+            .unwrap()
+            .create_pool(file.as_fd(), stride * h, &qh, ());
+        let buffer = pool.create_buffer(0, w, h, stride, Format::Argb8888, &qh, ());
+        let surface = client.surface.as_ref().unwrap();
+        client
+            .xdg_surface
+            .as_ref()
+            .unwrap()
+            .set_window_geometry(SHADOW, SHADOW, WINDOW.0, WINDOW.1);
+        let region = client.compositor.as_ref().unwrap().create_region(&qh, ());
+        match input {
+            Input::Whole => {}
+            Input::Handles => {
+                region.add(
+                    SHADOW - HANDLE,
+                    SHADOW - HANDLE,
+                    WINDOW.0 + 2 * HANDLE,
+                    WINDOW.1 + 2 * HANDLE,
+                );
+                surface.set_input_region(Some(&region));
+            }
+            Input::Empty => surface.set_input_region(Some(&region)),
+        }
+        region.destroy();
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        sync_client(comp, conn, queue, client);
+    }
+
+    /// Give window `id` the rectangle its client committed as its window
+    /// geometry, starting at `(x, y)`.
+    fn place(f: &mut Fixture, id: u64, x: i32, y: i32) {
+        assert!(f.manager.resize_window(id, WINDOW.0, WINDOW.1));
+        let at = f.manager.geometry(id).unwrap().loc;
+        assert!(f.manager.move_window(id, x - at.x, y - at.y));
+    }
+
+    /// Two client-decorated windows. Alpha's rectangle is
+    /// (100,100)-(500,400). Beta's is (450,150)-(850,450), on top: its
+    /// left edge crosses alpha, so beta's shadow (from x 420) and its
+    /// handles (from x 440) lie over alpha's window.
+    fn decorated(alpha: Input, beta: Input) -> Fixture {
+        let mut f = two_windows();
+        decorate(
+            &mut f.comp,
+            &f.conn_a,
+            &mut f.queue_a,
+            &mut f.client_a,
+            alpha,
+        );
+        decorate(
+            &mut f.comp,
+            &f.conn_b,
+            &mut f.queue_b,
+            &mut f.client_b,
+            beta,
+        );
+        f.manager.reconcile(&mut f.comp.state);
+        sync_client(&mut f.comp, &f.conn_a, &mut f.queue_a, &mut f.client_a);
+        sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+        let (alpha, beta) = (f.id_a, f.id_b);
+        place(&mut f, alpha, 100, 100);
+        place(&mut f, beta, 450, 150);
+        assert!(f.manager.focus(&mut f.comp.state, Some(f.id_b)));
+        f.manager.reconcile(&mut f.comp.state);
+        for id in [f.id_a, f.id_b] {
+            let size = f.manager.geometry(id).unwrap().size;
+            assert_eq!((size.w, size.h), WINDOW, "the window is its geometry");
+        }
+        assert_eq!(top(&f), Some(f.id_b));
+        f
+    }
+
+    fn at(f: &Fixture, x: f64, y: f64) -> Option<u64> {
+        f.manager.window_at((x, y).into())
+    }
+
+    #[test]
+    fn inside_its_rectangle_a_window_takes_the_pointer() {
+        let f = decorated(Input::Handles, Input::Handles);
+        assert_eq!(at(&f, 300.0, 250.0), Some(f.id_a));
+        assert_eq!(at(&f, 100.0, 100.0), Some(f.id_a));
+        assert_eq!(at(&f, 600.0, 300.0), Some(f.id_b));
+        assert_eq!(at(&f, 849.9, 449.9), Some(f.id_b));
+        // Where both rectangles cover the point, the higher one.
+        assert_eq!(at(&f, 470.0, 200.0), Some(f.id_b));
+    }
+
+    #[test]
+    fn the_invisible_border_is_part_of_the_surface_outside_the_window() {
+        let f = decorated(Input::Handles, Input::Handles);
+        // Just outside each of alpha's edges clear of beta, within the
+        // 10 px of shadow its input region covers.
+        assert_eq!(at(&f, 99.5, 250.0), Some(f.id_a), "left");
+        assert_eq!(at(&f, 90.0, 250.0), Some(f.id_a), "left, outermost");
+        assert_eq!(at(&f, 300.0, 99.0), Some(f.id_a), "top");
+        assert_eq!(at(&f, 300.0, 409.9), Some(f.id_a), "bottom");
+        assert_eq!(at(&f, 93.0, 93.0), Some(f.id_a), "top left corner");
+        assert_eq!(at(&f, 95.0, 405.0), Some(f.id_a), "bottom left corner");
+        // Beta's, the top window's.
+        assert_eq!(at(&f, 855.0, 300.0), Some(f.id_b), "right");
+        assert_eq!(at(&f, 600.0, 455.0), Some(f.id_b), "bottom");
+        assert_eq!(at(&f, 859.9, 459.9), Some(f.id_b), "bottom right corner");
+    }
+
+    #[test]
+    fn shadow_outside_the_input_region_falls_through() {
+        let f = decorated(Input::Handles, Input::Handles);
+        // Alpha's shadow past its handles (the surface starts at x 70,
+        // the input region at x 90): the desktop.
+        assert_eq!(at(&f, 89.9, 250.0), None);
+        assert_eq!(at(&f, 75.0, 250.0), None);
+        assert_eq!(at(&f, 300.0, 415.0), None);
+        assert_eq!(at(&f, 85.0, 85.0), None, "the shadow's corner");
+        // Past the surface altogether.
+        assert_eq!(at(&f, 69.0, 250.0), None);
+        assert_eq!(at(&f, 860.0, 300.0), None);
+        // Beta's shadow past its handles (x 420 to 440) lies over
+        // alpha's window: the pointer there is alpha's.
+        assert_eq!(at(&f, 430.0, 200.0), Some(f.id_a));
+        assert_eq!(at(&f, 439.9, 300.0), Some(f.id_a));
+    }
+
+    #[test]
+    fn a_higher_window_wins_with_its_rectangle_or_its_border() {
+        let f = decorated(Input::Handles, Input::Handles);
+        // Beta's handles (x 440 to 450) over alpha's window.
+        assert_eq!(at(&f, 445.0, 200.0), Some(f.id_b));
+        assert_eq!(at(&f, 440.0, 300.0), Some(f.id_b));
+        // Alpha's bottom handles (y 400 to 410) under beta's window.
+        assert_eq!(at(&f, 470.0, 405.0), Some(f.id_b));
+        // Alpha raised: its window and its handles win over beta's.
+        let mut f = f;
+        assert!(f.manager.focus(&mut f.comp.state, Some(f.id_a)));
+        assert_eq!(top(&f), Some(f.id_a));
+        assert_eq!(at(&f, 445.0, 200.0), Some(f.id_a));
+        assert_eq!(at(&f, 470.0, 405.0), Some(f.id_a));
+        // Alpha's right handles (x 500 to 510) over beta's window.
+        assert_eq!(at(&f, 505.0, 300.0), Some(f.id_a));
+        // Its shadow past them is beta's window again.
+        assert_eq!(at(&f, 515.0, 300.0), Some(f.id_b));
+    }
+
+    #[test]
+    fn an_empty_input_region_takes_nothing_outside_the_rectangle() {
+        let f = decorated(Input::Empty, Input::Handles);
+        assert_eq!(at(&f, 99.5, 250.0), None);
+        assert_eq!(at(&f, 93.0, 93.0), None);
+        // Its rectangle is still the window's: focus, raise and tiling
+        // go by the rectangle.
+        assert_eq!(at(&f, 300.0, 250.0), Some(f.id_a));
+    }
+
+    #[test]
+    fn a_surface_without_an_input_region_takes_input_all_over() {
+        let f = decorated(Input::Whole, Input::Handles);
+        // The whole shadow, to the surface's last pixel.
+        assert_eq!(at(&f, 75.0, 250.0), Some(f.id_a));
+        assert_eq!(at(&f, 70.0, 70.0), Some(f.id_a));
+        assert_eq!(at(&f, 69.9, 250.0), None);
+    }
+
+    #[test]
+    fn a_minimized_or_hidden_window_s_border_takes_nothing() {
+        let mut f = decorated(Input::Handles, Input::Handles);
+        assert!(f.manager.minimize(&mut f.comp.state, f.id_a));
+        assert_eq!(at(&f, 95.0, 250.0), None);
+        assert_eq!(at(&f, 300.0, 250.0), None);
+    }
+
+    #[test]
+    fn a_drag_from_the_border_resizes_the_window() {
+        let mut f = decorated(Input::Handles, Input::Handles);
+        let start = f.manager.geometry(f.id_b).unwrap();
+        // 4 px right of beta's right edge: the pointer enters beta's
+        // surface there and the press is beta's client's.
+        let grip: Point<f64, Logical> = (854.0, 300.0).into();
+        f.manager.pointer_motion(&mut f.comp.state, grip, 1);
+        f.manager
+            .pointer_button(&mut f.comp.state, BTN_LEFT, true, 2);
+        pump(&mut f.comp, &mut f.queue_b, &mut f.client_b, |c| {
+            c.pointer_press_serial.is_some()
+        });
+        assert!(f.client_b.pointer_enters > 0);
+        assert_eq!(f.client_b.pointer_buttons, [(BTN_LEFT, true)]);
+        // The client starts the resize from its right edge, as GTK does
+        // for a press on its handle.
+        f.client_b.toplevel.as_ref().unwrap().resize(
+            f.client_b.seat.as_ref().unwrap(),
+            f.client_b.pointer_press_serial.unwrap(),
+            ResizeEdge::Right,
+        );
+        sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+        f.manager.reconcile(&mut f.comp.state);
+        f.manager
+            .pointer_motion(&mut f.comp.state, grip + Point::from((50.0, 0.0)), 3);
+        f.manager
+            .pointer_button(&mut f.comp.state, BTN_LEFT, false, 4);
+        let now = f.manager.geometry(f.id_b).unwrap();
+        assert_eq!(now.loc, start.loc);
+        assert_eq!((now.size.w, now.size.h), (start.size.w + 50, start.size.h));
+    }
+
+    #[test]
+    fn a_click_in_the_far_shadow_reaches_the_window_underneath() {
+        let mut f = decorated(Input::Handles, Input::Handles);
+        assert_eq!(f.manager.model().focused(), Some(f.id_b));
+        // Beta's shadow past its handles, over alpha's window.
+        f.manager
+            .pointer_motion(&mut f.comp.state, (430.0, 200.0).into(), 1);
+        f.manager
+            .pointer_button(&mut f.comp.state, BTN_LEFT, true, 2);
+        f.manager
+            .pointer_button(&mut f.comp.state, BTN_LEFT, false, 3);
+        pump(&mut f.comp, &mut f.queue_a, &mut f.client_a, |c| {
+            c.pointer_buttons.len() >= 2
+        });
+        assert_eq!(
+            f.client_a.pointer_buttons,
+            [(BTN_LEFT, true), (BTN_LEFT, false)]
+        );
+        assert_eq!(f.manager.model().focused(), Some(f.id_a));
+        sync_client(&mut f.comp, &f.conn_b, &mut f.queue_b, &mut f.client_b);
+        assert!(f.client_b.pointer_buttons.is_empty());
+        assert_eq!(f.client_b.pointer_enters, 0);
     }
 }

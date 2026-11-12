@@ -74,24 +74,49 @@ does it:
   threshold), so the window does not trail the pointer.
 - The X11 window follows every move of its window, not only resizes: the
   header bar and X11 applications work in root coordinates.
-- The pointer reaches an X11 window's surface on the invisible border around
-  it, where the surface's input region covers it: the resize handles GTK
-  keeps in the shadow. Native windows are still picked by their rectangle
-  alone.
+- The pointer reaches a window's surface on the invisible border around it,
+  where the surface's input region covers it: the resize handles GTK keeps
+  in the shadow. This holds for every window, native ones too
+  (`WindowManager::window_at`; `G-RESIZE-BORDER`); shadow outside the input
+  region passes the pointer to what is beneath.
+- Minimizing an X11 window sets `WM_STATE` to IconicState and adds
+  `_NET_WM_STATE_HIDDEN` on the client and its frame, and restoring it
+  undoes both (`meta_window_x11_set_wm_state`,
+  `meta_window_x11_set_net_wm_state`). The window stays mapped: the overview
+  and the switcher still draw it.
 
 A window without a frame is wrapped in a window of its own depth and visual,
 so a client-decorated X11 window keeps the alpha channel its shadow is drawn
-in. Override-redirect windows are not managed and get no frame.
+in.
+
+Override-redirect windows (menus, tooltips, dropdowns) are not managed and get
+no frame. As Mutter does for its unmanaged windows, the compositor draws each
+one where the X server has it (`crates/compositor/src/windows/unmanaged.rs`):
+above every window and the top bar, below the shell's own menus and dialogs
+(GNOME Shell's place for Mutter's top window group), with the window it
+belongs to (`WM_TRANSIENT_FOR`, else the same client process), and not in the
+overview or behind the lock screen. It takes the pointer by its input region
+and nothing else: no keyboard focus, no entry in the window list, the
+overview, the switcher or a workspace. Screenshots, screen casts and the
+magnifier draw the same scene and so include it. An X11 pointer grab promises
+its client every press; Xwayland hears only of presses on its own surfaces,
+so while such a window shows and a client holds the grab
+(`X11Wm::pointer_grabbed`), a press on a native window or the desktop is
+handed to the X server instead and dismisses the menu, as on an X server.
+Presses on the shell's own surfaces stay the shell's: a menu stays open
+through a click on the top bar, as in GNOME.
 
 `scripts/tuna-gtk-shell-proof` gates all of this in the nested session
 (`G-X11-FRAME`, `G-X11-FRAME-ACTIONS`, `G-X11-FRAME-CSD`,
-`G-X11-FRAME-RECOVERY`, and the frames client's part of `G-X11-DEMAND` and
-`G-X11-RESTART`); `--x11-frames-only` runs the four frame gates alone. They
-read the X server with `xprop` and `xwininfo`, the frames client's
-accessible tree, the output's pixels, and the compositor's state file, where
-each X11 window carries `x11_framed`, `x11_frame_extents` (left, right, top,
-bottom) and `x11_buffer_rect` (the X11 window carrying the surface: `rect`
-plus the invisible borders).
+`G-X11-FRAME-RECOVERY`, `G-X11-MENU`, `G-X11-TOOLTIP`, and the frames
+client's part of `G-X11-DEMAND` and `G-X11-RESTART`); `--x11-frames-only`
+runs the frame, menu and tooltip gates alone. They read the X server with
+`xprop` and `xwininfo`, the frames client's accessible tree, the output's
+pixels, and the compositor's state file, where each X11 window carries
+`x11_framed`, `x11_frame_extents` (left, right, top, bottom) and
+`x11_buffer_rect` (the X11 window carrying the surface: `rect` plus the
+invisible borders), every window `surface_rect` and `input_rect`, and
+`x11_unmanaged` lists the override-redirect windows drawn.
 
 On server/manager failure the compositor removes the old source, compatibility
 windows and client, then retries on the same display with the existing bounded

@@ -200,8 +200,12 @@ frame gates of the full GTK proof alone (`G-X11-FRAME`,
 `G-X11-FRAME-ACTIONS`, `G-X11-FRAME-CSD`, `G-X11-FRAME-RECOVERY`; P-WM-10):
 real X11 clients on the session's own Xwayland, the frames client
 `tuna-x11-frames` beside the compositor, and the real pointer on the title
-bar. It needs `xclock`, `xeyes`, `xev` (x11-apps), `xprop` and `xwininfo`
-(x11-utils). CI runs this slice too, with its freshly built binaries.
+bar. After them it runs `G-X11-MENU` and `G-X11-TOOLTIP` (P-SY-04: a GTK3
+program's menus and tooltip, override-redirect windows, drawn and driven
+with the real pointer) and `G-RESIZE-BORDER` (P-WM-04: a GTK4 window resized
+from the invisible border outside its edge). It needs `xclock`, `xeyes`,
+`xev` (x11-apps), `xprop` and `xwininfo` (x11-utils), and GTK 3 for Python
+(gir1.2-gtk-3.0). CI runs this slice too, with its freshly built binaries.
 
 Every build uses its own checkout's `target/` (an inherited
 `CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one) and no

@@ -356,6 +356,16 @@ pub fn addresses_window(target: X11Window, client: X11Window, frame: Option<X11W
     target == client || frame == Some(target)
 }
 
+/// The two `CARD32` of a managed window's ICCCM `WM_STATE` property
+/// (section 4.1.3.1): `IconicState` or `NormalState`, and no icon window
+/// (Mutter's `set_wm_state_on_xwindow`: "Mutter doesn't use icon windows,
+/// so data\[1\] should be None").
+pub fn wm_state_property(iconic: bool) -> [u32; 2] {
+    const NORMAL_STATE: u32 = 1;
+    const ICONIC_STATE: u32 = 3;
+    [if iconic { ICONIC_STATE } else { NORMAL_STATE }, x11rb::NONE]
+}
+
 fn connection_error(error: ReplyOrIdError) -> ConnectionError {
     match error {
         ReplyOrIdError::ConnectionError(error) => error,
@@ -1343,6 +1353,37 @@ impl X11Surface {
             self.change_net_state(&[], &[self.atoms._NET_WM_STATE_HIDDEN])?;
         }
         Ok(())
+    }
+
+    /// Marks a mapped window minimized or restored without unmapping it,
+    /// for a compositor that keeps drawing a minimized window's surface
+    /// (in an overview, a switcher, the minimize animation).
+    ///
+    /// Mutter's `meta_window_x11_set_wm_state` and
+    /// `meta_window_x11_set_net_wm_state`: `WM_STATE` on the client is
+    /// `IconicState` while the window is hidden and `NormalState` again
+    /// when it shows, and `_NET_WM_STATE` gains or loses
+    /// `_NET_WM_STATE_HIDDEN`, on the client and on its frame. That is how
+    /// an X11 client knows to pause what nobody sees, and how a pager
+    /// shows the window's state. A window that is not mapped keeps the
+    /// `WM_STATE` [`set_mapped`](Self::set_mapped) gave it.
+    pub fn set_minimized(&self, minimized: bool) -> Result<(), ConnectionError> {
+        let managed = {
+            let state = self.state.lock().unwrap();
+            state.mapped && state.mapped_onto.is_some() && !state.override_redirect
+        };
+        if managed {
+            let conn = self.conn.upgrade().ok_or(ConnectionError::UnknownError)?;
+            conn.change_property32(
+                PropMode::REPLACE,
+                self.window,
+                self.atoms.WM_STATE,
+                self.atoms.WM_STATE,
+                &wm_state_property(minimized),
+            )?;
+            conn.flush()?;
+        }
+        self.set_suspended(minimized)
     }
 
     /// Sets the window as activated or not.

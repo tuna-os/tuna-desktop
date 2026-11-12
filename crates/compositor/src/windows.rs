@@ -14,6 +14,8 @@
 
 mod alive;
 mod tablet_input;
+#[cfg(feature = "xwayland")]
+mod unmanaged;
 
 use std::collections::{HashMap, HashSet};
 
@@ -69,6 +71,7 @@ use smithay::{
     wayland::{
         compositor::with_states,
         seat::WaylandFocus,
+        shell::wlr_layer::Layer,
         shell::xdg::{ToplevelSurface, XdgToplevelSurfaceData},
     },
 };
@@ -366,6 +369,17 @@ struct GrabRaise {
     distance: f64,
 }
 
+/// What takes the pointer above every managed window
+/// ([`WindowManager::chrome_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chrome {
+    /// A layer-shell surface of the shell.
+    Layer,
+    /// An override-redirect X11 window ([`unmanaged`]).
+    #[cfg(feature = "xwayland")]
+    Unmanaged,
+}
+
 pub struct WindowManager {
     /// Active interactive move/resize, if any (#58).
     grab: Option<PointerGrab>,
@@ -403,6 +417,11 @@ pub struct WindowManager {
     /// Whether a frames client runs: without one no map waits.
     #[cfg(feature = "xwayland")]
     x11_frames_client: bool,
+    /// Mapped override-redirect X11 windows (menus, tooltips), bottom to
+    /// top: drawn and given the pointer, never managed (see
+    /// [`unmanaged`]).
+    #[cfg(feature = "xwayland")]
+    x11_unmanaged: Vec<X11Surface>,
     /// Model ids bottom-to-top; focus raises to the top.
     stacking: Vec<u64>,
     // Explicit activation history is independent of raising transient families.
@@ -722,6 +741,8 @@ impl WindowManager {
             x11_awaiting_frame: Vec::new(),
             #[cfg(feature = "xwayland")]
             x11_frames_client: false,
+            #[cfg(feature = "xwayland")]
+            x11_unmanaged: Vec::new(),
             stacking: Vec::new(),
             focus_history: Vec::new(),
             cascade: 0,
@@ -1069,6 +1090,48 @@ impl WindowManager {
         }
         let _ = id;
         None
+    }
+
+    /// Where window `id`'s surface lies and takes input, for diagnostic
+    /// journeys, never authority: the rectangle of its buffer (the
+    /// window's rectangle grown by its client-side shadow) and the
+    /// bounding box of what its input region adds, both in global logical
+    /// coordinates. No input rectangle when the surface set no region (it
+    /// takes input all over); nothing before the first buffer, or while
+    /// an X11 window has no surface (between the frame it lost or gained
+    /// and the X11 window that carries its surface next).
+    pub fn surface_input_state(&self, id: u64) -> Option<([i32; 4], Option<[i32; 4]>)> {
+        use smithay::wayland::compositor::{RectangleKind, SurfaceAttributes};
+        let window = self.windows.get(&id)?;
+        let surface = window.surface.wl_surface()?;
+        let origin = crate::popup::surface_origin(&surface, window.geometry.loc);
+        let size = buffer_size(&surface)?;
+        let input = with_states(&surface, |states| {
+            states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .current()
+                .input_region
+                .as_ref()
+                .map(|region| {
+                    region
+                        .rects
+                        .iter()
+                        .filter(|(kind, _)| matches!(kind, RectangleKind::Add))
+                        .map(|(_, rect)| *rect)
+                        .reduce(|all, rect| all.merge(rect))
+                        .unwrap_or_default()
+                })
+        });
+        let global = |rect: Rectangle<i32, Logical>| {
+            [
+                origin.x + rect.loc.x,
+                origin.y + rect.loc.y,
+                rect.size.w,
+                rect.size.h,
+            ]
+        };
+        Some((global(Rectangle::from_size(size)), input.map(global)))
     }
 
     /// Whether window `id` is an X11 window (through Xwayland).
@@ -1467,11 +1530,11 @@ impl WindowManager {
         })
     }
 
-    /// Wayland surfaces of mapped X11 windows, for frame production.
-    /// The state's toplevel list only covers native windows, and
-    /// Xwayland paces its content commits on frame callbacks, so
-    /// without these an X11 window presents nothing and renders
-    /// invisible. (xwayland feature only.)
+    /// Wayland surfaces of mapped X11 windows, managed and unmanaged,
+    /// for frame production. The state's toplevel list only covers
+    /// native windows, and Xwayland paces its content commits on frame
+    /// callbacks, so without these an X11 window presents nothing and
+    /// renders invisible. (xwayland feature only.)
     #[cfg(feature = "xwayland")]
     pub fn x11_surfaces(&self) -> Vec<WlSurface> {
         self.windows
@@ -1483,6 +1546,7 @@ impl WindowManager {
                     .wl_surface()
                     .map(|surface| surface.into_owned())
             })
+            .chain(self.x11_unmanaged_surfaces())
             .collect()
     }
 
@@ -1604,6 +1668,8 @@ impl WindowManager {
         self.drain_pointer_warps(state);
         #[cfg(feature = "xwayland")]
         self.sync_seat_focus(state);
+        #[cfg(feature = "xwayland")]
+        self.sync_x11_minimized();
         // Overview focus parks last so newly mapped windows never
         // hold focus past this tick while the overview is open.
         self.reconcile_overview_focus(state);
@@ -2153,6 +2219,7 @@ impl WindowManager {
         }
         self.x11_awaiting_frame.clear();
         self.x11_frames.clear();
+        self.x11_unmanaged_clear();
         state.x11_events.clear();
     }
 
@@ -2344,39 +2411,6 @@ impl WindowManager {
         }
     }
 
-    /// Whether `pos`, outside the frame rectangle `frame` of window `id`,
-    /// is on the part of an X11 window's invisible border that takes
-    /// pointer input: the resize handles a frame (or a client-decorated
-    /// window) keeps in its shadow.
-    #[cfg(feature = "xwayland")]
-    fn x11_border_takes_input(
-        &self,
-        id: u64,
-        window: &ManagedWindow,
-        frame: Rectangle<i32, Logical>,
-        pos: Point<f64, Logical>,
-    ) -> bool {
-        let Some(point) = self
-            .x11_frames
-            .get(&id)
-            .and_then(|x11| x11.invisible_border_point(frame, pos))
-        else {
-            return false;
-        };
-        let Some(surface) = window.surface.wl_surface() else {
-            return false;
-        };
-        with_states(&surface, |states| {
-            states
-                .cached_state
-                .get::<smithay::wayland::compositor::SurfaceAttributes>()
-                .current()
-                .input_region
-                .as_ref()
-                .is_none_or(|region| region.contains(point))
-        })
-    }
-
     /// Give each X11 window's surface the window geometry an xdg client
     /// sets itself: the frame rectangle inside the buffer, which is
     /// larger by the shadow of the frame window (or of a client-decorated
@@ -2451,6 +2485,7 @@ impl WindowManager {
                 X11ManagerEvent::Unmapped(id) | X11ManagerEvent::Destroyed(id) => {
                     self.x11_awaiting_frame
                         .retain(|(waiting, _)| waiting.window_id() != id);
+                    self.x11_unmanaged_gone(id);
                     if let Some(model) = self.x11_index.get(&id).copied() {
                         self.unmap(state, model);
                     }
@@ -2557,9 +2592,42 @@ impl WindowManager {
                     }
                 }
                 X11ManagerEvent::FrameChanged(id) => self.x11_frame_changed(id),
+                X11ManagerEvent::UnmanagedMapped(surface) => self.x11_unmanaged_mapped(*surface),
+                X11ManagerEvent::UnmanagedConfigured(id, above) => {
+                    self.x11_unmanaged_configured(id, above);
+                }
             }
         }
         self.release_awaited_x11(state);
+    }
+
+    /// Tell each X11 client whether its window is hidden by a minimize,
+    /// its own or an ancestor's (`meta_window_showing_on_its_workspace`):
+    /// `WM_STATE` IconicState and `_NET_WM_STATE_HIDDEN` while it is,
+    /// NormalState without it once it shows again, the frame's
+    /// `_NET_WM_STATE` with the client's
+    /// (`meta_window_x11_set_wm_state`, `meta_window_x11_set_net_wm_state`).
+    /// Every path that hides or restores a window ends here: the frame's
+    /// button, the window menu, a shortcut, an activation.
+    #[cfg(feature = "xwayland")]
+    fn sync_x11_minimized(&self) {
+        if self.x11_index.is_empty() {
+            return;
+        }
+        let hidden = self.hidden_by_minimize();
+        for id in self.x11_index.values() {
+            let Some(surface) = self
+                .windows
+                .get(id)
+                .and_then(|window| window.surface.x11_surface())
+            else {
+                continue;
+            };
+            let minimized = hidden.contains(id);
+            if surface.is_minimized() != minimized && surface.set_minimized(minimized).is_err() {
+                eprintln!("tuna-compositor: window {id} X11 minimize state refused");
+            }
+        }
     }
 
     /// Give the seat to a window that was focused before it had a
@@ -3942,11 +4010,10 @@ impl WindowManager {
         crate::popup::popup_at(&placed, pos).cloned()
     }
 
-    /// The surface a press at `pos` would land on (layer or window).
+    /// The surface a press at `pos` would land on (layer, unmanaged X11
+    /// window or window).
     fn surface_for_click(&self, state: &State, pos: Point<f64, Logical>) -> Option<WlSurface> {
-        if let Some((surface, _)) =
-            crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
-        {
+        if let Some((surface, _, _)) = self.chrome_at(state, pos) {
             return Some(surface);
         }
         let id = self.window_at(pos)?;
@@ -3956,10 +4023,11 @@ impl WindowManager {
             .map(|s| s.into_owned())
     }
 
-    /// Topmost window containing `pos`, if any. Only the active
-    /// workspace is hit-testable; hidden workspaces never take focus.
-    /// An X11 window also takes the pointer on the resize handles in its
-    /// invisible border.
+    /// Topmost window taking the pointer at `pos`, if any: the first
+    /// one from the top whose rectangle contains it, or whose surface
+    /// takes input there outside its rectangle
+    /// ([`Self::border_takes_input`]). Only the active workspace is
+    /// hit-testable; hidden workspaces never take focus.
     pub fn window_at(&self, pos: Point<f64, Logical>) -> Option<u64> {
         let active = self.model.active_workspace();
         self.presentation_order().into_iter().rev().find(|id| {
@@ -3970,14 +4038,61 @@ impl WindowManager {
                             return false;
                         }
                         let frame = self.shifted(*id, w.geometry);
-                        #[cfg(feature = "xwayland")]
-                        if self.x11_border_takes_input(*id, w, frame, pos) {
-                            return true;
-                        }
-                        contains(frame, pos)
+                        contains(frame, pos) || Self::border_takes_input(w, frame, pos)
                     })
             })
         })
+    }
+
+    /// Whether `pos`, outside the rectangle `frame` of `window`, is on
+    /// the part of its surface that takes pointer input: the resize
+    /// handles a client-decorated window (every GTK4 and libadwaita
+    /// application, an X11 window's frame) keeps in the invisible border
+    /// around its window geometry, inside the shadow. Mutter picks a
+    /// surface by its input region (`meta-surface-actor.c`
+    /// `meta_surface_actor_pick`), so the pointer there is the window's
+    /// and the client shows its resize cursor and starts the resize.
+    /// Shadow outside the input region takes nothing: the pointer falls
+    /// through to what is beneath. A surface without an input region
+    /// takes input all over, as the protocol says; one with an empty
+    /// region takes none outside its rectangle.
+    fn border_takes_input(
+        window: &ManagedWindow,
+        frame: Rectangle<i32, Logical>,
+        pos: Point<f64, Logical>,
+    ) -> bool {
+        let Some(surface) = window.surface.wl_surface() else {
+            return false;
+        };
+        let origin = crate::popup::surface_origin(&surface, frame.loc);
+        let local = Point::<i32, Logical>::from((
+            (pos.x - f64::from(origin.x)).floor() as i32,
+            (pos.y - f64::from(origin.y)).floor() as i32,
+        ));
+        buffer_size(&surface).is_some_and(|size| Rectangle::from_size(size).contains(local))
+            && crate::layer::accepts_input(&surface, (local.x, local.y))
+    }
+
+    /// What lies above every managed window at `pos` and takes the
+    /// pointer there: a layer surface of the shell or an unmanaged X11
+    /// window, with its origin. Unmanaged X11 windows sit above the
+    /// shell's `Top` layer (the top bar) and below its `Overlay` layer
+    /// (its menus and dialogs), as GNOME Shell places Mutter's top window
+    /// group.
+    fn chrome_at(
+        &self,
+        state: &State,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<i32, Logical>, Chrome)> {
+        let layer =
+            crate::layer::topmost_layer_entry_at(state, pos.x.floor() as i32, pos.y.floor() as i32);
+        #[cfg(feature = "xwayland")]
+        if !matches!(layer, Some((_, _, Layer::Overlay))) {
+            if let Some((surface, origin)) = self.x11_unmanaged_at(pos) {
+                return Some((surface, origin, Chrome::Unmanaged));
+            }
+        }
+        layer.map(|(surface, origin, _)| (surface, origin.into(), Chrome::Layer))
     }
 
     /// Pointer motion: track the position, focus the window under the
@@ -4045,12 +4160,19 @@ impl WindowManager {
         if let Some(popup) = self.popup_at(state, pos) {
             return (Some((popup.surface, popup.origin.to_f64())), None);
         }
-        if let Some((surface, (ox, oy))) =
-            crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
-        {
+        if let Some((surface, origin, chrome)) = self.chrome_at(state, pos) {
+            // Shell chrome is no window: the pointer window becomes none.
+            // An unmanaged X11 window is none either, but on a client's
+            // menu or tooltip the pointer has not left the client's
+            // window as far as focus goes: no crossing.
+            let crossing = match chrome {
+                Chrome::Layer => Some(None),
+                #[cfg(feature = "xwayland")]
+                Chrome::Unmanaged => None,
+            };
             // Focus point is the surface origin: smithay reports
             // surface-local coordinates as event minus focus.
-            return (Some((surface, (ox as f64, oy as f64).into())), Some(None));
+            return (Some((surface, origin.to_f64())), crossing);
         }
         if self.overview_open {
             return (None, None);
@@ -4272,14 +4394,13 @@ impl WindowManager {
         if self.popup_at(state, pos).is_some() {
             return;
         }
-        let under =
-            if crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
-                .is_some()
-            {
-                None
-            } else {
-                self.window_at(pos)
-            };
+        let under = match self.chrome_at(state, pos) {
+            Some((_, _, Chrome::Layer)) => None,
+            // On a client's menu the pointer has not left the client.
+            #[cfg(feature = "xwayland")]
+            Some((_, _, Chrome::Unmanaged)) => return,
+            None => self.window_at(pos),
+        };
         self.pointer_crossing(state, under);
     }
 
@@ -4403,12 +4524,15 @@ impl WindowManager {
         // A blocked parent click activates its modal dialog and is consumed.
         // Do this before Super+drag so the parent cannot be moved through it.
         let strip_owned = self.grab.and_then(Self::strip_grab_owner).is_some();
+        // An X11 client's pointer grab takes a press on a native window
+        // or the desktop (the click outside a menu that closes it).
+        #[cfg(feature = "xwayland")]
+        if pressed && !strip_owned && self.x11_grab_press(state, button, time) {
+            return;
+        }
         if pressed && !self.overview_open && !strip_owned {
             let pos = self.pointer_pos;
-            if crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
-                .is_none()
-                && self.popup_at(state, pos).is_none()
-            {
+            if self.chrome_at(state, pos).is_none() && self.popup_at(state, pos).is_none() {
                 if let Some(id) = self.window_at(pos) {
                     if self.modal_target(id) != id {
                         // meta_window_handle_ungrabbed_event: every press
@@ -4432,10 +4556,7 @@ impl WindowManager {
         let mut press_raise = self.focus_policy.raise_on_click;
         if pressed && !self.overview_open && !strip_owned {
             let pos = self.pointer_pos;
-            if crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
-                .is_none()
-                && self.popup_at(state, pos).is_none()
-            {
+            if self.chrome_at(state, pos).is_none() && self.popup_at(state, pos).is_none() {
                 if let Some((id, frame)) = self
                     .window_at(pos)
                     .and_then(|id| Some((id, self.shifted(id, self.windows.get(&id)?.geometry))))
@@ -4506,10 +4627,13 @@ impl WindowManager {
         }
         if pressed && !on_popup {
             let pos = self.pointer_pos;
-            if let Some((surface, _)) =
-                crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
-            {
-                if !self.overview_open && crate::layer::surface_takes_keyboard_on_press(&surface) {
+            if let Some((surface, _, chrome)) = self.chrome_at(state, pos) {
+                // An unmanaged X11 window never takes the keyboard: its
+                // client's own grabs route keys on the X side.
+                if chrome == Chrome::Layer
+                    && !self.overview_open
+                    && crate::layer::surface_takes_keyboard_on_press(&surface)
+                {
                     let serial = SERIAL_COUNTER.next_serial();
                     if let Some(keyboard) = self.keyboard.clone() {
                         keyboard.set_focus(state, Some(surface.clone()), serial);
@@ -9133,15 +9257,19 @@ mod resize_tests {
     }
 }
 
+/// The size of a surface's committed buffer, in surface coordinates:
+/// the whole surface, shadow included. `None` before the first buffer.
+pub(crate) fn buffer_size(surface: &WlSurface) -> Option<Size<i32, Logical>> {
+    smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| s.surface_size())
+        .flatten()
+}
+
 /// The size a client committed for its window: its xdg window geometry,
 /// else its buffer's size. `None` before the first buffer.
 pub(crate) fn committed_size(
     surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
 ) -> Option<Size<i32, Logical>> {
-    let buffer = smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
-        s.surface_size()
-    })
-    .flatten()?;
+    let buffer = buffer_size(surface)?;
     let geometry = smithay::wayland::compositor::with_states(surface, |states| {
         states
             .cached_state
