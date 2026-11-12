@@ -15,7 +15,7 @@ FOCUS_OPERATIONS = {"arguments", "imports", "process-identity", "atspi-timeout",
                     "desktop-enumeration", "atspi-owner", "bus-connection", "bus-credentials",
                     "tree-cache", "tree-state", "tree-role", "tree-name", "tree-children",
                     "controlled-query", "catalog-receipt", "final-principal", "serialization",
-                    "tree-state-flags", "tree-public-control"}
+                    "tree-state-flags", "tree-public-control", "accounts-service"}
 
 
 def valid_focus_error(value):
