@@ -114,6 +114,7 @@ pub mod introspect;
 pub mod layer;
 pub mod lock;
 pub mod lockdown;
+pub(crate) mod lockdown_settings;
 mod logind_session;
 pub mod magnifier;
 pub mod menu_close;

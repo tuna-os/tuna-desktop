@@ -71,6 +71,37 @@ pub(crate) fn changed(fd: impl AsFd, wanted: &[&OsStr]) -> bool {
     hit
 }
 
+/// `poll(2)` on `fds` for at most `timeout` (`None`: until one is ready);
+/// how many are ready.
+pub(crate) fn poll_fds(
+    fds: &mut [rustix::event::PollFd<'_>],
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<usize> {
+    let timeout = timeout.map(|timeout| rustix::event::Timespec {
+        tv_sec: timeout.as_secs() as _,
+        tv_nsec: timeout.subsec_nanos() as _,
+    });
+    Ok(rustix::event::poll(fds, timeout.as_ref())?)
+}
+
+/// Whether any event source of the loop behind `events` (calloop's own
+/// descriptor) becomes ready within `timeout`. Nothing is dispatched or
+/// consumed: what is ready stays ready for the dispatch that follows, and
+/// a loop that stayed quiet has demonstrably received nothing, which is
+/// what lets its tick skip the work only an event could have caused
+/// (#503). Calloop's timers and idle callbacks are not descriptors and do
+/// not show here.
+pub(crate) fn ready_within(
+    events: impl AsFd,
+    timeout: std::time::Duration,
+) -> std::io::Result<bool> {
+    let mut fds = [rustix::event::PollFd::new(
+        &events,
+        rustix::event::PollFlags::IN,
+    )];
+    Ok(poll_fds(&mut fds, Some(timeout))? > 0)
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct Wake(Arc<Mutex<Option<calloop::ping::Ping>>>);
 impl std::fmt::Debug for Wake {
@@ -162,6 +193,48 @@ mod tests {
         signal_hook::low_level::raise(signal_hook::consts::SIGUSR2).unwrap();
         drain_signals(stream);
         assert!(stream.read(&mut probe).is_err(), "drained");
+    }
+
+    #[test]
+    fn a_quiet_loop_is_told_from_a_ready_one_without_dispatching_either() {
+        use std::time::{Duration, Instant};
+        let (wake, source) = Wake::new().unwrap();
+        let mut loop_ = calloop::EventLoop::<usize>::try_new().unwrap();
+        loop_
+            .handle()
+            .insert_source(source, |_, _, count| *count += 1)
+            .unwrap();
+        let mut count = 0;
+        loop_.dispatch(Some(Duration::ZERO), &mut count).unwrap();
+
+        // Quiet: the wait runs its whole time and reports nothing.
+        let started = Instant::now();
+        assert!(!ready_within(&loop_, Duration::from_millis(100)).unwrap());
+        assert!(started.elapsed() >= Duration::from_millis(100));
+
+        // A wake during the wait ends it, and nothing was dispatched.
+        let waker = wake.clone();
+        let signal = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            waker.signal();
+        });
+        let started = Instant::now();
+        assert!(ready_within(&loop_, Duration::from_secs(10)).unwrap());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the wake ended the wait"
+        );
+        signal.join().unwrap();
+        assert_eq!(count, 0, "the wait dispatched nothing");
+
+        // What is ready stays ready until the dispatch that delivers it.
+        assert!(ready_within(&loop_, Duration::ZERO).unwrap());
+        loop_.dispatch(Some(Duration::ZERO), &mut count).unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            !ready_within(&loop_, Duration::ZERO).unwrap(),
+            "a dispatched loop is quiet again"
+        );
     }
 }
 

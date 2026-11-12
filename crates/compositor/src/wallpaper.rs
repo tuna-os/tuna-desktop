@@ -125,14 +125,28 @@ struct CardCache {
 /// Most overview cards cached at once (active and neighbor sizes).
 const MAX_CARDS: usize = 4;
 
-/// Session wallpaper: polls the drop file, decodes on change. One
-/// cache slot per output size (multi-monitor): each output's
+/// The drop file as the compositor last read it.
+#[derive(Debug, Default)]
+enum DropFile {
+    /// Nobody reports its changes: it is read at every refresh.
+    #[default]
+    Unwatched,
+    /// Its directory is watched and it changed since it was last read.
+    Stale,
+    /// Its text since it last changed (`None`: absent or unreadable).
+    Read(Option<String>),
+}
+
+/// Session wallpaper: reads the drop file when it changes, decodes on
+/// change. One cache slot per output size (multi-monitor): each output's
 /// cover-crop is decoded once and reused while its size and the URI
 /// hold. Slots are area-capped individually and count-capped
 /// together, so extra outputs cannot grow memory without bound.
 #[derive(Debug, Default)]
 pub struct Wallpaper {
     wake: crate::wake::Wake,
+    /// The drop file's text, kept between its changes (#503).
+    drop_file: DropFile,
     current_uris: Vec<String>,
     loaded: Vec<Loaded>,
     /// Journey-only observation of the last attempted refresh, not a paint claim.
@@ -365,6 +379,31 @@ struct Paint {
 impl Wallpaper {
     pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
         self.wake.connect(wake);
+    }
+    /// The drop file's directory is watched: from now on the file is read
+    /// again only after [`drop_changed`](Self::drop_changed), not at
+    /// every refresh.
+    pub(crate) fn watch_drop(&mut self) {
+        self.drop_file = DropFile::Stale;
+    }
+    /// The drop file was written, replaced or removed.
+    pub(crate) fn drop_changed(&mut self) {
+        if !matches!(self.drop_file, DropFile::Unwatched) {
+            self.drop_file = DropFile::Stale;
+        }
+    }
+    /// Whether the picture last asked for is a slideshow: it changes with
+    /// the wall clock, which no event reports, so it is sampled by being
+    /// drawn.
+    pub(crate) fn follows_clock(&self) -> bool {
+        self.animation_samples.iter().any(|sample| {
+            self.current_uris.iter().any(|uri| {
+                sample
+                    .key
+                    .strip_prefix(uri.as_str())
+                    .is_some_and(|rest| rest.starts_with('\n'))
+            })
+        })
     }
     pub(crate) fn maintenance_deadline(&self) -> Option<std::time::Instant> {
         self.identities
@@ -871,8 +910,9 @@ impl Wallpaper {
         .ok()
     }
 
-    /// Re-read the drop file and start or collect the decode for
-    /// `output`; the current URI when there is a picture to show.
+    /// Read the drop file if it may have changed and start or collect the
+    /// decode for `output`; the current URI when there is a picture to
+    /// show.
     fn refresh(&mut self, output: Size<i32, Logical>, geometry: Geometry) -> Option<String> {
         self.refresh_picture(output, false, geometry)
     }
@@ -890,7 +930,30 @@ impl Wallpaper {
         }
         self.current_uris.clear();
         self.refresh_stage = Some("drop-open");
-        let text = crate::runtime_signal::read_bounded(&wallpaper_drop_path(), 16 * 1024).ok()?;
+        let read = || crate::runtime_signal::read_bounded(&wallpaper_drop_path(), 16 * 1024).ok();
+        // The text leaves the cache for the parse and returns after it.
+        let (text, watched) = match std::mem::take(&mut self.drop_file) {
+            DropFile::Unwatched => (read(), false),
+            DropFile::Stale => (read(), true),
+            DropFile::Read(text) => (text, true),
+        };
+        let key = text
+            .as_deref()
+            .and_then(|text| self.refresh_from_drop(text, output, lock, geometry));
+        if watched {
+            self.drop_file = DropFile::Read(text);
+        }
+        key
+    }
+
+    /// [`refresh_picture`](Self::refresh_picture) for the drop file's `text`.
+    fn refresh_from_drop(
+        &mut self,
+        text: &str,
+        output: Size<i32, Logical>,
+        lock: bool,
+        geometry: Geometry,
+    ) -> Option<String> {
         self.refresh_stage = Some("drop-parse-metadata");
         let mut lines = text.lines();
         let mut uri = lines.next().unwrap_or_default().trim().to_owned();
@@ -2362,6 +2425,73 @@ mod tests {
         }
     }
 
+    /// #503: a watched drop file is read when its change is reported, not
+    /// at every refresh; without a watch every refresh still reads it.
+    #[test]
+    fn a_watched_drop_file_is_read_again_only_when_it_changes() {
+        let _lock = RUNTIME_DIR_LOCK.lock().expect("runtime lock");
+        let dir = tempfile::TempDir::new().unwrap();
+        let _runtime = RuntimeDirGuard::point_at(dir.path());
+        let publish = |primary: [u8; 3]| {
+            let picture = PictureSettings {
+                placement: tuna_shell_control::background::Placement::None,
+                shading: tuna_shell_control::background::Shading::Horizontal,
+                primary,
+                secondary: [0, 0, 240],
+            };
+            let metadata = serde_json::to_string(&BackgroundMetadata {
+                version: 1,
+                desktop: picture,
+                lock: picture,
+            })
+            .unwrap();
+            std::fs::write(
+                wallpaper_drop_path(),
+                format!("\n#023c88\n#3584e4\n\n{metadata}\n"),
+            )
+            .unwrap();
+        };
+        let refresh = |wallpaper: &mut Wallpaper| wallpaper.refresh((8, 8).into(), test_geometry());
+
+        // Unwatched (no inotify, or a state document in the runtime dir):
+        // every refresh reads the file, as it always did.
+        let mut unwatched = Wallpaper::new();
+        publish([240, 0, 0]);
+        let red = refresh(&mut unwatched).expect("the drop names a colour");
+        publish([0, 240, 0]);
+        let green = refresh(&mut unwatched).expect("the drop names a colour");
+        assert_ne!(red, green, "an unwatched drop is read at every refresh");
+
+        // Watched: the first refresh reads it. A rewrite nobody reported
+        // shows that later refreshes do not touch the file.
+        let mut watched = Wallpaper::new();
+        watched.watch_drop();
+        assert_eq!(refresh(&mut watched).as_ref(), Some(&green));
+        publish([0, 0, 240]);
+        for _ in 0..3 {
+            assert_eq!(
+                refresh(&mut watched).as_ref(),
+                Some(&green),
+                "no change was reported, so the file is not read"
+            );
+        }
+        // The reported change is read at the next refresh.
+        watched.drop_changed();
+        let blue = refresh(&mut watched).expect("the drop names a colour");
+        assert_ne!(blue, green);
+
+        // A removed drop is no picture once its removal is reported, and a
+        // new one shows once that is.
+        std::fs::remove_file(wallpaper_drop_path()).unwrap();
+        assert_eq!(refresh(&mut watched).as_ref(), Some(&blue));
+        watched.drop_changed();
+        assert!(refresh(&mut watched).is_none());
+        publish([240, 0, 0]);
+        assert!(refresh(&mut watched).is_none());
+        watched.drop_changed();
+        assert_eq!(refresh(&mut watched), Some(red));
+    }
+
     #[test]
     fn no_picture_render_cache_tracks_real_color_shading_and_geometry() {
         let _lock = RUNTIME_DIR_LOCK.lock().expect("runtime lock");
@@ -2715,6 +2845,16 @@ mod tests {
             resampled(&mut wallpaper),
             "a wall-clock step re-samples immediately"
         );
+        // Such a picture changes with the clock, which no event reports,
+        // so the loop keeps drawing it; a still picture does not.
+        assert!(wallpaper.follows_clock());
+        std::fs::write(
+            wallpaper_drop_path(),
+            "file:///no-such-still-picture.png\n#023c88\n#3584e4\n",
+        )
+        .unwrap();
+        wallpaper.refresh((8, 8).into(), test_geometry());
+        assert!(!wallpaper.follows_clock());
     }
 
     #[test]

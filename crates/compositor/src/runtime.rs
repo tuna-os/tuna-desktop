@@ -74,25 +74,30 @@ mod osk;
 /// spins. The nested (winit) backend always runs at this pace.
 const FRAME_BUDGET: Duration = Duration::from_millis(16);
 
-/// Longest the native loop sleeps with nothing due (#503). Producers
-/// without an event source of their own (the XWayland supervisor's
-/// backoff, the X11 icon reader, a stalled client flush) are still
-/// served at least this often.
+/// Longest the native loop sleeps with nothing due (#503). When no event
+/// source fired in that time either, the tick that follows is an idle
+/// tick: it still serves what only a tick polls (a stalled client flush,
+/// the hub's token reissue, the supervisors), but it neither rebuilds
+/// nor draws the scene, which nothing can have changed. A
+/// producer that changes what is drawn must therefore wake the loop (an
+/// event source or [`crate::wake::Wake`]) or report its deadline to
+/// `producer_wake`.
 const IDLE_WAKE: Duration = Duration::from_millis(500);
+
+/// How long the loop may sleep, and what kind of sleep that is.
+#[derive(Debug, Clone, Copy)]
+struct NextWake {
+    /// The longest sleep before the next tick.
+    after: Duration,
+    /// Nothing is due within `after`, which is the [`IDLE_WAKE`]
+    /// fallback: a tick that no event source precedes is an idle tick.
+    idle: bool,
+}
 
 /// Display-rate ticks continue this long after the last input event or
 /// power-on (#503): an animation whose first steps draw nothing new still
 /// advances. A queued frame alone does not extend it.
 const ACTIVITY_LINGER: Duration = Duration::from_millis(500);
-
-/// Administrative lockdown (#357): how often the tick polls the live
-/// `disable-lock-screen` key. Each poll spawns one background reader at
-/// most and drains completed reads without waiting (see
-/// `ControlHub::refresh_lockdown`), skipped without a session bus; the
-/// shell enforces its own surface immediately, so this backstop's short
-/// lag fails safe (an extra lock in the window still needs auth to
-/// unlock, and unlocks never come from policy).
-const LOCKDOWN_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Wake the native loop for requests on already accepted Wayland clients.
 /// The listening socket only signals new connections. The display owns the
@@ -644,8 +649,9 @@ pub struct Runtime {
     /// Worker threads (idle watches, Orca, wallpaper, Night Light, IME,
     /// X11 icons, PAM, logind) ping the loop through this (#503).
     wake: crate::wake::Wake,
-    /// Last live lockdown refresh (see [`LOCKDOWN_REFRESH_INTERVAL`]).
-    lockdown_refresh_at: Instant,
+    /// The live `disable-lock-screen` key (#357), watched on its own GIO
+    /// thread: a change wakes the loop, nothing polls it.
+    lockdown_settings: crate::lockdown_settings::LockdownSettings,
     /// GNOME's remembered Num Lock (#346): restore once, save changes.
     numlock: crate::numlock::NumlockMemory,
     /// On-demand XWayland server supervisor. Idle until the first X11
@@ -656,6 +662,10 @@ pub struct Runtime {
     /// Cloned from the owned event loop at launch; `'static`
     /// because the loop outlives the runtime in `run`.
     loop_handle: LoopHandle<'static, Runtime>,
+    /// Calloop timers armed through [`Runtime::arm_timer`] and not fired
+    /// yet. They are not descriptors, so the idle wait cannot see one
+    /// fall due: while any is armed the loop keeps dispatching.
+    loop_timers: usize,
     /// A hardware button release that would end a direct strip move or
     /// resize, held until the current dispatch finishes (see the input
     /// source in `launch`).
@@ -1420,10 +1430,11 @@ impl Runtime {
                     wake.signal()
                 })
             },
+            lockdown_settings: crate::lockdown_settings::LockdownSettings::start(&wake),
             wake,
-            lockdown_refresh_at: Instant::now(),
             xwayland: XWaylandSupervisor::new(),
             loop_handle,
+            loop_timers: 0,
             #[cfg(feature = "drm")]
             strip_release_held: None,
             #[cfg(feature = "xwayland")]
@@ -1527,6 +1538,7 @@ impl Runtime {
         color_share.set_wake(&runtime.wake);
         runtime.orca.set_wake(&runtime.wake);
         runtime.idle_monitor.set_wake(&runtime.wake);
+        runtime.session_manager.set_wake(&runtime.wake);
         if let Some(ime) = &runtime.ime {
             ime.set_wake(&runtime.wake);
         }
@@ -1540,11 +1552,11 @@ impl Runtime {
                 .iter()
                 .any(|key| std::env::var_os(key).is_some());
         // The shell's idle-blank settings and wallpaper drop live in the
-        // runtime dir: any change there wakes the loop, and the blank
-        // file is read again only when it changed. A state document the
-        // tick itself rewrites there would wake the loop on its own
-        // writes, so then the dir is not watched and the blank file is
-        // read on every tick.
+        // runtime dir: any change there wakes the loop, and either file
+        // is read again only when one of them changed. A state document
+        // the tick itself rewrites there would wake the loop on its own
+        // writes, so then the dir is not watched and both files are read
+        // on every tick.
         if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|dir| state_dir.as_deref() != Some(std::path::Path::new(dir)))
         {
@@ -1555,15 +1567,22 @@ impl Runtime {
                         .handle()
                         .insert_source(watch, |_, fd, rt: &mut Runtime| {
                             let blank = std::ffi::OsStr::new(crate::wake::IDLE_BLANK_FILE);
-                            if crate::wake::changed(&*fd, &[blank]) {
+                            let paper = std::ffi::OsStr::new(crate::wallpaper::WALLPAPER_FILE);
+                            // One answer for both: either changes rarely,
+                            // and reading the other again is one open.
+                            if crate::wake::changed(&*fd, &[blank, paper]) {
                                 rt.blank_stale = true;
+                                rt.wallpaper.drop_changed();
                             }
                             Ok(calloop::PostAction::Continue)
                         })
                         .map_err(|e| e.to_string())
                 });
             match watched {
-                Ok(_) => runtime.blank_watched = true,
+                Ok(_) => {
+                    runtime.blank_watched = true;
+                    runtime.wallpaper.watch_drop();
+                }
                 Err(error) => {
                     eprintln!("tuna-compositor: runtime dir watch unavailable: {error}")
                 }
@@ -4827,24 +4846,21 @@ impl Runtime {
     /// signals, runtime files and worker threads wake it earlier through
     /// their event sources; this covers what only time moves, and
     /// coalesced motion falling due.
-    fn next_wake(&self) -> Duration {
+    fn next_wake(&self) -> NextWake {
         let wake = self.producer_wake();
-        self.motion_wake().map_or(wake, |due| wake.min(due))
+        match self.motion_wake() {
+            Some(due) => NextWake {
+                after: wake.after.min(due),
+                idle: false,
+            },
+            None => wake,
+        }
     }
 
-    /// The timed producers' earliest wake.
-    fn producer_wake(&self) -> Duration {
-        #[cfg(feature = "drm")]
-        let native = matches!(self.backend, Backend::Drm(_));
-        #[cfg(not(feature = "drm"))]
-        let native = false;
-        // The nested backend has no Wayland readiness source.
-        if !native || self.proof_polling {
-            return FRAME_BUDGET;
-        }
-        let now = Instant::now();
-        let clock = self.animation_clock.now();
-        if now.saturating_duration_since(self.active_at) < ACTIVITY_LINGER
+    /// Whether anything on screen moves or was just touched: the loop
+    /// keeps the display rate and every tick draws.
+    fn in_motion(&self, now: Instant, clock: Duration) -> bool {
+        now.saturating_duration_since(self.active_at) < ACTIVITY_LINGER
             || self.overview_motion.animating()
             || self.manager.workspace_slide().running()
             || self.manager.strip_animating()
@@ -4873,14 +4889,36 @@ impl Runtime {
                 .unlock_worker
                 .as_ref()
                 .is_some_and(|worker| worker.phase.load(std::sync::atomic::Ordering::Acquire) != 1)
-        {
-            return FRAME_BUDGET;
+    }
+
+    /// The timed producers' earliest wake.
+    fn producer_wake(&self) -> NextWake {
+        let moving = NextWake {
+            after: FRAME_BUDGET,
+            idle: false,
+        };
+        #[cfg(feature = "drm")]
+        let native = matches!(self.backend, Backend::Drm(_));
+        #[cfg(not(feature = "drm"))]
+        let native = false;
+        // The nested backend has no Wayland readiness source.
+        if !native || self.proof_polling {
+            return moving;
+        }
+        let now = Instant::now();
+        if self.in_motion(now, self.animation_clock.now()) {
+            return moving;
         }
         // Timed producers are served no more often than the display
         // rate: a gate that is due but cannot act yet (the IME bridge
         // while locked, say) costs what the fixed loop did, never a spin.
         let mut wake = IDLE_WAKE;
-        let mut due = |after: Duration| wake = wake.min(after.max(FRAME_BUDGET));
+        // Whether any of them is due by the time the fallback wake fires.
+        let mut timed = false;
+        let mut due = |after: Duration| {
+            timed |= after <= IDLE_WAKE;
+            wake = wake.min(after.max(FRAME_BUDGET));
+        };
         // An inhibited session neither blanks nor locks; its end is
         // handled by the tick that sees it.
         if !self.idle_inhibited {
@@ -4934,11 +4972,13 @@ impl Runtime {
                     due(Duration::from_millis(ms));
                 }
             }
-            if self.state.xwm.is_some() {
-                due(self
-                    .x11_icon_reader
-                    .next_deadline()
-                    .saturating_duration_since(now));
+            // Only a server that did not answer is asked again on a timer.
+            if let Some(retry) = self
+                .x11_icon_reader
+                .next_deadline()
+                .filter(|_| self.state.xwm.is_some())
+            {
+                due(retry.saturating_duration_since(now));
             }
         }
         if let Some(ms) = self
@@ -4962,14 +5002,75 @@ impl Runtime {
         if let Some(ms) = self.shell_retry_ms {
             due(Duration::from_millis(ms));
         }
+        // The input aids' timers: Slow Keys, the Shift-hold shortcut, Mouse
+        // Keys motion, hover and secondary clicks.
+        if let Some(after) = self.input_aids.next_due() {
+            due(after);
+        }
         // A command frame already buffered is applied on the next pass.
-        match self.control.next_poll(self.manager.model()) {
-            Some(after) => wake.min(after),
+        let after = match self.control.next_poll(self.manager.model()) {
+            Some(after) => {
+                timed = true;
+                wake.min(after)
+            }
             None => wake,
+        };
+        NextWake {
+            after,
+            // The idle wait watches descriptors only and an idle tick
+            // does not draw: a pending calloop timer, shell files nobody
+            // reports (the tick reads them instead) and a wallpaper that
+            // follows the clock all keep the loop to its full ticks.
+            idle: !timed
+                && self.loop_timers == 0
+                && self.blank_watched
+                && !self.wallpaper.follows_clock(),
         }
     }
 
+    /// Run `fire` once, `after` from now, on the loop's own timer. Timers
+    /// are armed only here, where they are counted for `producer_wake`.
+    fn arm_timer(
+        &mut self,
+        after: Duration,
+        fire: impl FnOnce(&mut Runtime) + 'static,
+    ) -> Result<(), String> {
+        let mut fire = Some(fire);
+        let armed = self.loop_handle.insert_source(
+            calloop::timer::Timer::from_duration(after),
+            move |_, _, rt: &mut Runtime| {
+                rt.loop_timers = rt.loop_timers.saturating_sub(1);
+                if let Some(fire) = fire.take() {
+                    fire(rt);
+                }
+                calloop::timer::TimeoutAction::Drop
+            },
+        );
+        match armed {
+            Ok(_) => {
+                self.loop_timers += 1;
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// The tick after a dispatch: everything, the frame included.
     fn tick(&mut self) -> Result<bool, RuntimeError> {
+        self.run_tick(false)
+    }
+
+    /// The tick after a wait that no event source and no deadline ended
+    /// (#503, see [`IDLE_WAKE`]). Nothing was received and nothing was
+    /// due, so the scene is the last frame's: it is neither rebuilt nor
+    /// drawn, and the wallpaper is not looked at. Only what reaches a
+    /// socket between the end of that wait and this tick reading it, or
+    /// what the tick's own polls set moving, is drawn at once.
+    fn idle_tick(&mut self) -> Result<bool, RuntimeError> {
+        self.run_tick(true)
+    }
+
+    fn run_tick(&mut self, idle: bool) -> Result<bool, RuntimeError> {
         if self.blank_stale || !self.blank_watched {
             self.blank_stale = false;
             if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -4981,7 +5082,8 @@ impl Runtime {
         // Motion folded since the last frame reaches the window manager
         // now, before client requests and this tick's frame.
         self.flush_motion_if_due();
-        self.display
+        let requests = self
+            .display
             .dispatch_clients(&mut self.state)
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         // Smithay has stored this dispatch's selections: copy a new one,
@@ -5060,6 +5162,8 @@ impl Runtime {
                 .set_seat_touch_mode(drm.touch_mode().touch_mode());
         }
         let outcome = self.control.poll(self.manager.model_mut());
+        // What reached a socket after an idle wait ended (`idle_tick`).
+        let arrived = requests > 0 || outcome.received;
         for workspace in outcome.departed_workspaces.iter().copied() {
             self.manager.keep_departed_workspace_alive(workspace);
         }
@@ -5190,12 +5294,11 @@ impl Runtime {
             self.overview_search = false;
             self.overview_app_grid = false;
         }
-        // Administrative lockdown (#357 follow-up): poll the live key
-        // on a slow tick without blocking (background read plus drain);
-        // the shell maps it onto its idle sender too.
-        if self.lockdown_refresh_at.elapsed() >= LOCKDOWN_REFRESH_INTERVAL {
-            self.control.refresh_lockdown();
-            self.lockdown_refresh_at = Instant::now();
+        // Administrative lockdown (#357): the live key arrives from its
+        // settings watch, which wakes the loop when it changes; the shell
+        // maps the same key onto its idle sender too.
+        if let Some(disabled) = self.lockdown_settings.poll() {
+            self.control.set_lock_screen_disabled(disabled);
         }
         // GNOME's remembered Num Lock (#346): apply the restore once it
         // lands and save every change, as mutter does.
@@ -5425,6 +5528,7 @@ impl Runtime {
                     ime.set_ready_x11_display(None);
                 }
                 self.manager.clear_x11_windows(&mut self.state);
+                self.x11_icon_reader.reset();
                 self.xwayland.disconnected(now);
             }
             let pending = &mut self.pending_x11_client;
@@ -5481,19 +5585,22 @@ impl Runtime {
         self.privacy_screen_tick();
         self.publish_display_state();
         self.publish_overview_previews();
-        let strip_was_animating = self.manager.strip_animating();
-        self.render()?;
-        // Rendering advances the strip's springs. Publish the terminal frame
-        // before the motion scheduler goes idle; the pre-render snapshot can
-        // otherwise retain the previous frame's residual indefinitely. With
-        // motion disabled, publish the instant frame's actual render count too.
-        let strip_lands_immediately = self.manager.session_mode()
-            == crate::windows::SessionMode::Scroll
-            && !self.input_settings.motion.allows_motion();
-        if (strip_was_animating || strip_lands_immediately) && !self.manager.strip_animating() {
-            self.publish_state();
+        if !idle || arrived || self.in_motion(Instant::now(), self.animation_clock.now()) {
+            let strip_was_animating = self.manager.strip_animating();
+            self.render()?;
+            // Rendering advances the strip's springs. Publish the terminal
+            // frame before the motion scheduler goes idle; the pre-render
+            // snapshot can otherwise retain the previous frame's residual
+            // indefinitely. With motion disabled, publish the instant
+            // frame's actual render count too.
+            let strip_lands_immediately = self.manager.session_mode()
+                == crate::windows::SessionMode::Scroll
+                && !self.input_settings.motion.allows_motion();
+            if (strip_was_animating || strip_lands_immediately) && !self.manager.strip_animating() {
+                self.publish_state();
+            }
+            self.screencast_tick();
         }
-        self.screencast_tick();
         // Send what this tick queued for the shell now, not at the next
         // wake, which may be far off (#503).
         self.control.flush(self.manager.model());
@@ -8367,15 +8474,36 @@ fn run_loop(
             Ok(calloop::PostAction::Continue)
         })
         .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-    let mut wait = Duration::ZERO;
+    let mut next = NextWake {
+        after: Duration::ZERO,
+        idle: false,
+    };
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             runtime.shutdown_colord();
             return Ok(runtime.stats);
         }
-        let dispatched = event_loop
-            .dispatch(Some(wait), &mut runtime)
-            .map_err(|e| RuntimeError::Loop(e.to_string()));
+        // Nothing is due (#503): learn whether any source fires before the
+        // fallback wake without dispatching it. If none does, nothing was
+        // received and the tick is an idle one; the loop is not dispatched
+        // then, so nothing arriving meanwhile is consumed behind its back.
+        let (quiet, wait) = if next.idle {
+            match crate::wake::ready_within(&event_loop, next.after) {
+                Ok(true) => (false, Duration::ZERO),
+                Ok(false) => (true, Duration::ZERO),
+                // Interrupted: wait in the dispatch itself, as ever.
+                Err(_) => (false, next.after),
+            }
+        } else {
+            (false, next.after)
+        };
+        let dispatched = if quiet {
+            Ok(())
+        } else {
+            event_loop
+                .dispatch(Some(wait), &mut runtime)
+                .map_err(|e| RuntimeError::Loop(e.to_string()))
+        };
         #[cfg(feature = "drm")]
         if let Some(monitor) = &sleep_monitor {
             let (lock, wake) = monitor.take();
@@ -8387,7 +8515,13 @@ fn run_loop(
             Some(crate::logind_session::Request::Unlock) => runtime.unlock_for_logind(),
             None => {}
         }
-        let ticked = dispatched.and_then(|_| runtime.tick());
+        let ticked = dispatched.and_then(|_| {
+            if quiet {
+                runtime.idle_tick()
+            } else {
+                runtime.tick()
+            }
+        });
         #[cfg(feature = "drm")]
         if let Some(session) = &mut logind_session {
             session.report_locked(runtime.is_locked());
@@ -8397,10 +8531,14 @@ fn run_loop(
         });
         match ticked {
             Ok(true) => {
-                wait = runtime.next_wake();
+                next = runtime.next_wake();
                 if let Some(delay) = probe_delay {
-                    wait =
-                        wait.min(delay.clamp(Duration::from_millis(1), Duration::from_millis(100)));
+                    next = NextWake {
+                        after: next
+                            .after
+                            .min(delay.clamp(Duration::from_millis(1), Duration::from_millis(100))),
+                        idle: false,
+                    };
                 }
                 continue;
             }
