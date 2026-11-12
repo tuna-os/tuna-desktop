@@ -126,6 +126,14 @@ until it has read and clicked the bare windows, so it does not have to catch
 them within the 500 ms restart delay. The hold ends with the click: the window
 manager offers its windows to a starting frames client for ten seconds only.
 
+The proof's session names a launcher of its own in `TUNA_X11_FRAMES`
+(`x11f_launcher` in `scripts/lib/tuna-x11-frames-proof.sh`). It starts the
+`tuna-x11-frames` the supervisor would have started, as the same process.
+`G-X11-FRAME-RECOVERY` holds that start after it killed the frames client,
+until it has read and clicked the bare windows, so it does not have to catch
+them within the 500 ms restart delay. The hold ends with the click: the window
+manager offers its windows to a starting frames client for ten seconds only.
+
 On server/manager failure the compositor removes the old source, compatibility
 windows and client, then retries on the same display with the existing bounded
 restart budget (initial attempt plus three retries, 500 ms exponential backoff
