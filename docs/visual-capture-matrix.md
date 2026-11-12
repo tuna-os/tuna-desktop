@@ -1,7 +1,7 @@
 # Visual capture coverage matrix
 
 Per-feature visual capture of Tuna Desktop v1 from the frozen Wave 3
-integration head. Every one of the 72 parity-ledger rows
+integration head. Every one of the 83 parity-ledger rows
 (`docs/parity-ledger.md`) and all 46 walkthrough entries
 (`docs/walkthrough.tsv`) maps below to the capture stage(s) that collect
 it, or to an explicit reason nested fixtures cannot show it. Checked by
