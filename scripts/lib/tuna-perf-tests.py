@@ -860,6 +860,23 @@ class Accounting(unittest.TestCase):
                     self.assertEqual(guest.diagnostic_counter([token], 0, maximum), expected)
             self.assertIsNone(guest.diagnostic_counter([], 0, maximum))
 
+    def test_a_process_row_carries_the_kernels_pss_breakdown_when_it_gives_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            split = self.process(root, 1, 0, 1000, 60, 55)
+            (split / 'smaps_rollup').write_text(
+                'Rss: 90 kB\nPss: 60 kB\nPss_Dirty: 31 kB\nPss_Anon: 30 kB\nPss_File: 20 kB\n'
+                'Pss_Shmem: 10 kB\nPrivate_Dirty: 28 kB\n')
+            self.process(root, 2, 0, 1000, 10, 56)  # an older kernel: Pss and Rss only
+            result = guest.sample(1000, root)
+            rows = {row['pid']: row for row in result['processes']}
+            self.assertEqual({key: rows[1][key] for key in ('pss_kib', 'rss_kib', 'pss_anon_kib', 'pss_file_kib',
+                                                           'pss_shmem_kib', 'private_dirty_kib')},
+                             dict(pss_kib=60, rss_kib=90, pss_anon_kib=30, pss_file_kib=20,
+                                  pss_shmem_kib=10, private_dirty_kib=28))
+            self.assertFalse({'pss_anon_kib', 'pss_file_kib', 'pss_shmem_kib', 'private_dirty_kib'} & rows[2].keys())
+            self.assertEqual((result['pss_kib'], result['unreadable']), (70, []))
+
     def test_failure_metadata_capture_does_not_change_accounting(self):
         for flags, threads in (('4194308', '3'), ('private', '-1')):
             with self.subTest(flags=flags), tempfile.TemporaryDirectory() as directory:
