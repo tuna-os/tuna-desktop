@@ -35,9 +35,9 @@ pub const MAX_TITLE_LEN: usize = 512;
 
 pub mod layer_namespaces;
 pub use layer_namespaces::{
-    APP_GRID_NAMESPACE, BANNER_NAMESPACE, DISPLAY_CHANGE_NAMESPACE, DOCK_NAMESPACE,
-    END_SESSION_NAMESPACE, FOLDER_DIALOG_NAMESPACE, GTK_BANNERS_NAMESPACE, GTK_PANEL_NAMESPACE,
-    IBUS_CANDIDATES_NAMESPACE, KBD_A11Y_NAMESPACE, MOUNT_OPERATION_NAMESPACE,
+    APP_GRID_NAMESPACE, BANNER_NAMESPACE, CLOSE_DIALOG_NAMESPACE, DISPLAY_CHANGE_NAMESPACE,
+    DOCK_NAMESPACE, END_SESSION_NAMESPACE, FOLDER_DIALOG_NAMESPACE, GTK_BANNERS_NAMESPACE,
+    GTK_PANEL_NAMESPACE, IBUS_CANDIDATES_NAMESPACE, KBD_A11Y_NAMESPACE, MOUNT_OPERATION_NAMESPACE,
     NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OSK_NAMESPACE, OVERVIEW_NAMESPACE, PAD_OSD_NAMESPACE,
     PANEL_NAMESPACE, POINTER_A11Y_NAMESPACE, POLKIT_NAMESPACE, PREVIEW_CHROME_NAMESPACE,
     SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
@@ -207,18 +207,31 @@ impl ProtocolVersion {
     /// Positional postcard peers must ship together.
     /// `0.46` appends compositor-to-shell `SeatTouchMode` (the seat's
     /// touch-mode, which picks the unlock dialog's hint text, #502).
+    /// Positional postcard peers must ship together.
     /// `0.47` appends `opacity` to `SwitcherThumbnail` (the switcher's
     /// window images fade with their GTK frame, altTab.js 51
     /// THUMBNAIL_FADE_TIME and switcherPopup.js POPUP_FADE_OUT_TIME) and
     /// the shell-to-compositor `CloseMenuUnanimated` command (panelMenu.js
     /// 51 `vfunc_hide`: a hidden panel button's menu closes without
     /// BoxPointer's close). Positional postcard peers must ship together.
-    /// `0.48` appends GNOME's per-class `custom-accel-config` curves and the
+    /// `0.48` appends the compositor-to-shell `WorkspaceProgress` message
+    /// (a finger-following workspace swipe's position, for the Activities
+    /// dots, #596). Positional postcard peers must ship together.
+    /// `0.49` appends the compositor-to-shell `OverviewSwipe` message (the
+    /// overview controls state a touchpad swipe holds or settles, so the
+    /// shell's app grid follows it, #593). Positional postcard peers must
+    /// ship together.
+    /// `0.50` appends mutter's close dialog for windows that stopped
+    /// answering pings (#1035): compositor-to-shell `ShowCloseDialog` and
+    /// `HideCloseDialog`, and the shell-to-compositor `RespondCloseDialog`
+    /// (gnome-shell's Force Quit / Wait). Positional postcard peers must
+    /// ship together.
+    /// `0.51` appends GNOME's per-class `custom-accel-config` curves and the
     /// touchpad `disable-while-typing-timeout` to InputSettings (#343).
     /// Positional postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 48,
+        minor: 51,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -511,7 +524,29 @@ pub enum CommandKind {
     /// compositor draws no BoxPointer close for the panel popup that goes
     /// next (or drops the one it just started).
     CloseMenuUnanimated,
+    /// Since 0.50: the answer of the close dialog shown for `window`
+    /// (`meta_close_dialog_response`, gnome-shell 51 `closeDialog.js`
+    /// `_onClose`/`_onWait`). Denied for an unknown window or while
+    /// locked; ignored for a window whose dialog is no longer shown.
+    RespondCloseDialog {
+        window: WindowId,
+        response: CloseDialogResponse,
+    },
 }
+
+/// mutter 51 `MetaCloseDialogResponse`: what the user chose in the dialog
+/// shown for a window that stopped answering pings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloseDialogResponse {
+    /// `META_CLOSE_DIALOG_RESPONSE_WAIT`: hide the dialog and show it
+    /// again after `check-alive-timeout` unless the window answered.
+    Wait,
+    /// `META_CLOSE_DIALOG_RESPONSE_FORCE_CLOSE`: `meta_window_kill`.
+    ForceClose,
+}
+
+/// Largest window rectangle side a [`Message::ShowCloseDialog`] carries.
+pub const MAX_CLOSE_DIALOG_SIDE: i32 = 16384;
 
 /// One on-screen keyboard action (gnome-shell 51 `KeyboardController`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1111,7 +1146,71 @@ pub enum Message {
     /// and in each handshake snapshot, only to peers advertising
     /// minor >= 46.
     SeatTouchMode { touch_mode: bool },
+    /// Since 0.48: where a finger-following workspace swipe holds the
+    /// workspace strip, so the Activities dots follow it (GNOME 51
+    /// `workspaceAnimation.js:255-268` binds the primary monitor's swipe
+    /// progress to the shared workspaces adjustment that `panel.js`
+    /// `WorkspaceIndicators` reads). `position` is a fractional workspace
+    /// index in [`WORKSPACE_PROGRESS_SCALE`]ths; `duration_us` is 0 while
+    /// the fingers hold it and, on release, how long the strip takes to
+    /// settle there (ease-out-cubic, already scaled by the motion policy).
+    /// Sent only on swipe begin, update and release, to peers advertising
+    /// minor >= 48.
+    WorkspaceProgress { position: u32, duration_us: u32 },
+    /// Since 0.49: where a touchpad swipe holds GNOME 51's overview
+    /// controls state (`ControlsState`: 0 hidden, 1 window picker, 2 app
+    /// grid; overviewControls.js:33-37), in [`OVERVIEW_STATE_SCALE`]ths.
+    /// The swipe spans all three states (overviewControls.js:757-797,
+    /// overview.js:355-397), so above the window picker the shell's app
+    /// grid follows the fingers. `settle_us` is `None` while the fingers
+    /// hold it; on release `state` is where it settles and `settle_us`
+    /// how long the ease-out-cubic takes (already scaled by the motion
+    /// policy, 0 with animations off). Sent on every overview swipe
+    /// phase, only to peers advertising minor >= 49.
+    OverviewSwipe { state: u32, settle_us: Option<u32> },
+    /// Since 0.50: `window` stopped answering pings for
+    /// `org.gnome.mutter check-alive-timeout` (mutter 51
+    /// `meta_display_ping_timeout` → `meta_window_show_close_dialog`):
+    /// show gnome-shell's close dialog ("“%s” Is Not Responding", Force
+    /// Quit / Wait) over it. `app_id` names the app (Shell.WindowTracker
+    /// resolves its desktop entry, else the window-backed app's name).
+    /// The rectangle is the window's frame in logical pixels local to
+    /// the output `connector` (`None`: the primary output); it is sent
+    /// again whenever the window moves, so the dialog follows it, as a
+    /// child of the window actor does in GNOME. Bounded by
+    /// [`MAX_TITLE_LEN`] and [`MAX_CLOSE_DIALOG_SIDE`]. Sent only to
+    /// peers advertising minor >= 50, never while locked.
+    ShowCloseDialog {
+        window: WindowId,
+        app_id: Option<String>,
+        connector: Option<String>,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+    /// Since 0.50: hide `window`'s close dialog: it answered a ping
+    /// (`meta_window_set_alive (TRUE)`), went away, left the screen, or
+    /// the session locked. Sent only to peers advertising minor >= 50.
+    HideCloseDialog { window: WindowId },
 }
+
+/// [`Message::WorkspaceProgress`] positions are workspace indices times
+/// this.
+pub const WORKSPACE_PROGRESS_SCALE: u32 = 10_000;
+/// The highest [`Message::WorkspaceProgress`] position: workspace 1024.
+pub const MAX_WORKSPACE_PROGRESS: u32 = 1024 * WORKSPACE_PROGRESS_SCALE;
+/// The longest [`Message::WorkspaceProgress`] settle: a minute, far past
+/// GNOME's 400 ms swipe ceiling times any sane slow-down factor.
+pub const MAX_WORKSPACE_PROGRESS_US: u32 = 60_000_000;
+
+/// [`Message::OverviewSwipe`] states are `ControlsState` values times this.
+pub const OVERVIEW_STATE_SCALE: u32 = 10_000;
+/// The highest [`Message::OverviewSwipe`] state: `ControlsState.APP_GRID`.
+pub const MAX_OVERVIEW_STATE: u32 = 2 * OVERVIEW_STATE_SCALE;
+/// The longest [`Message::OverviewSwipe`] settle: a minute, far past
+/// GNOME's swipe ceiling times any sane slow-down factor.
+pub const MAX_OVERVIEW_SETTLE_US: u32 = 60_000_000;
 
 /// The click a hover (dwell) makes: GNOME's dwell click types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1296,11 +1395,11 @@ pub struct InputSettings {
     /// placement, else mutter's first-fit from the work area's corner.
     #[serde(default = "default_center_new_windows")]
     pub center_new_windows: bool,
-    /// Since 0.48: each pointer class's `custom-accel-config`, used when
+    /// Since 0.51: each pointer class's `custom-accel-config`, used when
     /// that class's `accel-profile` is `custom`.
     #[serde(default)]
     pub custom_accel: CustomAccelConfigs,
-    /// Since 0.48: touchpad `disable-while-typing-timeout`, milliseconds.
+    /// Since 0.51: touchpad `disable-while-typing-timeout`, milliseconds.
     #[serde(default = "default_disable_while_typing_timeout_ms")]
     pub disable_while_typing_timeout_ms: u32,
 }
@@ -2363,6 +2462,47 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         Message::PadOsdInput { .. }
         | Message::ClosePadOsd { .. }
         | Message::SeatTouchMode { .. } => {}
+        Message::WorkspaceProgress {
+            position,
+            duration_us,
+        } if *position > MAX_WORKSPACE_PROGRESS || *duration_us > MAX_WORKSPACE_PROGRESS_US => {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ));
+        }
+        Message::OverviewSwipe { state, settle_us }
+            if *state > MAX_OVERVIEW_STATE
+                || settle_us.is_some_and(|us| us > MAX_OVERVIEW_SETTLE_US) =>
+        {
+            return Err(DecodeError::Malformed(
+                postcard::Error::DeserializeBadEncoding,
+            ));
+        }
+        Message::WorkspaceProgress { .. } => {}
+        Message::OverviewSwipe { .. } => {}
+        Message::ShowCloseDialog {
+            app_id,
+            connector,
+            x,
+            y,
+            width,
+            height,
+            ..
+        } => {
+            for text in [app_id, connector].into_iter().flatten() {
+                check_title(text)?;
+            }
+            if !(1..=MAX_CLOSE_DIALOG_SIDE).contains(width)
+                || !(1..=MAX_CLOSE_DIALOG_SIDE).contains(height)
+                || x.checked_add(*width).is_none()
+                || y.checked_add(*height).is_none()
+            {
+                return Err(DecodeError::Malformed(
+                    postcard::Error::DeserializeBadEncoding,
+                ));
+            }
+        }
+        Message::HideCloseDialog { .. } => {}
     }
     Ok(())
 }
@@ -2636,11 +2776,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_48() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 48));
-        // A 0.47 shell still negotiates; a newer minor does not.
-        assert!(ProtocolVersion::new(0, 47).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 49).is_compatible_with(&CURRENT_VERSION));
+    fn current_version_is_0_51() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 51));
+        // A 0.50 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 50).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 52).is_compatible_with(&CURRENT_VERSION));
     }
 
     #[test]
@@ -4043,5 +4183,165 @@ mod switcher_fade_and_menu_close_wire_tests {
         };
         let frame = encode_frame(&command);
         assert_eq!(decode_frame(&frame).unwrap(), command);
+    }
+
+    #[test]
+    fn workspace_progress_follows_seat_touch_mode_and_is_bounded() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 256];
+        let touch = tag(postcard::to_slice(
+            &Message::SeatTouchMode { touch_mode: true },
+            &mut buffer,
+        )
+        .unwrap());
+        let progress = Message::WorkspaceProgress {
+            position: 12_500,
+            duration_us: 0,
+        };
+        assert_eq!(
+            tag(postcard::to_slice(&progress, &mut buffer).unwrap()),
+            touch + 1
+        );
+        assert_eq!(decode_frame(&encode_frame(&progress)).unwrap(), progress);
+        for (position, duration_us) in [
+            (MAX_WORKSPACE_PROGRESS + 1, 0),
+            (10_000, MAX_WORKSPACE_PROGRESS_US + 1),
+        ] {
+            let bad = Message::WorkspaceProgress {
+                position,
+                duration_us,
+            };
+            assert!(
+                decode_frame(&encode_frame(&bad)).is_err(),
+                "{position} {duration_us}"
+            );
+        }
+    }
+
+    #[test]
+    fn overview_swipe_follows_workspace_progress_and_is_bounded() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 256];
+        let progress = tag(postcard::to_slice(
+            &Message::WorkspaceProgress {
+                position: 0,
+                duration_us: 0,
+            },
+            &mut buffer,
+        )
+        .unwrap());
+        for settle_us in [None, Some(0), Some(180_000)] {
+            let swipe = Message::OverviewSwipe {
+                state: 15_000,
+                settle_us,
+            };
+            assert_eq!(
+                tag(postcard::to_slice(&swipe, &mut buffer).unwrap()),
+                progress + 1
+            );
+            assert_eq!(decode_frame(&encode_frame(&swipe)).unwrap(), swipe);
+        }
+        for (state, settle_us) in [
+            (MAX_OVERVIEW_STATE + 1, None),
+            (OVERVIEW_STATE_SCALE, Some(MAX_OVERVIEW_SETTLE_US + 1)),
+        ] {
+            let bad = Message::OverviewSwipe { state, settle_us };
+            assert!(
+                decode_frame(&encode_frame(&bad)).is_err(),
+                "{state} {settle_us:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod close_dialog_wire_tests {
+    use super::*;
+
+    fn show(width: i32, height: i32) -> Message {
+        Message::ShowCloseDialog {
+            window: 7,
+            app_id: Some("org.gnome.TextEditor".into()),
+            connector: Some("DP-1".into()),
+            x: 40,
+            y: 80,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn close_dialog_messages_follow_overview_swipe_and_are_bounded() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 256];
+        let swipe = tag(postcard::to_slice(
+            &Message::OverviewSwipe {
+                state: 0,
+                settle_us: None,
+            },
+            &mut buffer,
+        )
+        .unwrap());
+        let shown = show(800, 600);
+        assert_eq!(
+            tag(postcard::to_slice(&shown, &mut buffer).unwrap()),
+            swipe + 1
+        );
+        let hidden = Message::HideCloseDialog { window: 7 };
+        assert_eq!(
+            tag(postcard::to_slice(&hidden, &mut buffer).unwrap()),
+            swipe + 2
+        );
+        for message in [shown, hidden] {
+            assert_eq!(decode_frame(&encode_frame(&message)).unwrap(), message);
+        }
+        for bad in [
+            show(0, 600),
+            show(800, -1),
+            show(MAX_CLOSE_DIALOG_SIDE + 1, 600),
+            Message::ShowCloseDialog {
+                window: 7,
+                app_id: None,
+                connector: None,
+                x: i32::MAX,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        ] {
+            assert!(decode_frame(&encode_frame(&bad)).is_err(), "{bad:?}");
+        }
+        let long = Message::ShowCloseDialog {
+            window: 7,
+            app_id: Some("a".repeat(MAX_TITLE_LEN + 1)),
+            connector: None,
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        assert!(matches!(
+            decode_frame(&encode_frame(&long)),
+            Err(DecodeError::TitleTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn respond_close_dialog_follows_close_menu_unanimated() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 64];
+        let menu = tag(postcard::to_slice(&CommandKind::CloseMenuUnanimated, &mut buffer).unwrap());
+        for response in [CloseDialogResponse::Wait, CloseDialogResponse::ForceClose] {
+            let kind = CommandKind::RespondCloseDialog {
+                window: 3,
+                response,
+            };
+            assert_eq!(
+                tag(postcard::to_slice(&kind, &mut buffer).unwrap()),
+                menu + 1
+            );
+            let command = Message::Command { id: 11, kind };
+            assert_eq!(decode_frame(&encode_frame(&command)).unwrap(), command);
+        }
     }
 }

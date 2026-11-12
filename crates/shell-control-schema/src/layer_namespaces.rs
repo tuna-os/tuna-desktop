@@ -66,3 +66,6 @@ pub const DISPLAY_CHANGE_NAMESPACE: &str = "tuna-display-change";
 pub const PAD_OSD_NAMESPACE: &str = "tuna-pad-osd";
 /// GTK on-screen keyboard surface (#349); never takes keyboard focus.
 pub const OSK_NAMESPACE: &str = "tuna-osk";
+/// GTK close dialog over a window that stopped answering pings
+/// (gnome-shell's CloseDialog, "“%s” Is Not Responding").
+pub const CLOSE_DIALOG_NAMESPACE: &str = "tuna-close-dialog";

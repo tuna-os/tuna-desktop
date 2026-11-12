@@ -16,6 +16,11 @@ before decoding.
   `ProtocolVersion::CURRENT` in `src/lib.rs`, whose doc comment lists every
   minor; the wire-change rules are in the
   [API stability policy](../../docs/api-stability.md#shell-control-protocol-tuna-shell-control).
+- Workspace swipe progress (0.48): `Message::WorkspaceProgress { position,
+  duration_us }` (peers >=48 only) carries a finger-following workspace
+  swipe's position in `WORKSPACE_PROGRESS_SCALE`ths of a workspace on begin,
+  each update and release (with the settle duration), so the shell's
+  Activities dots follow the fingers as GNOME 51's do.
 - Display-change confirmation (0.42): `Message::ConfirmDisplayChange
   { timeout_secs }` (sent only to peers advertising minor >=42) asks the shell
   for GNOME's "Keep these display settings?" dialog; the shell answers with
@@ -33,6 +38,19 @@ before decoding.
 - Dash targets: `WindowIconGeometry`, `MAX_WINDOW_ICON_GEOMETRIES`, and
   appended `CommandKind::SetWindowIconGeometries` full replacements. Unknown
   windows are ignored by the compositor; an empty list selects monitor fallback.
+- Overview swipe (0.49): `Message::OverviewSwipe { state, settle_us }`
+  (peers >=49 only) carries GNOME's overview controls state while a
+  touchpad swipe holds it (`settle_us: None`) and where and how fast its
+  release settles, in `OVERVIEW_STATE_SCALE`ths up to `MAX_OVERVIEW_STATE`
+  (the app grid); the shell's app grid follows it above the window picker.
+- Close dialog (0.50): `Message::ShowCloseDialog { window, app_id,
+  connector, x, y, width, height }` (peers >=50 only) asks for gnome-shell's
+  "“%s” Is Not Responding" dialog over a window that missed mutter's
+  `check-alive-timeout`, resent as the window moves; `HideCloseDialog
+  { window }` dismisses it (a late pong, the window gone or hidden, the
+  lock). The shell answers `CommandKind::RespondCloseDialog { window,
+  response }` with `CloseDialogResponse::ForceClose` or `Wait`. Texts are
+  bounded by `MAX_TITLE_LEN`, sides by `MAX_CLOSE_DIALOG_SIDE`.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
   `ErrorKind`.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,
@@ -42,9 +60,15 @@ before decoding.
   `touchpad`, `mouse`, `trackball` and `pointing_stick` groups
   (`TouchpadSettings`, `MouseSettings`, `TrackballSettings`,
   `PointingStickSettings`) carry GNOME 51's per-device-class peripherals
-  keys. Every acceleration key uses `PointerAccelProfile`: the compositor
-  supports default, flat, and adaptive; custom curves are unsupported and
-  fall back to the device default.
+  keys. Every acceleration key uses `PointerAccelProfile`: default, flat,
+  adaptive, and custom.
+- Custom acceleration and typing timeout (0.51): `InputSettings::custom_accel`
+  (`CustomAccelConfigs`, one `CustomAccelCurve { step, speeds }` per pointer
+  class, GNOME's `custom-accel-config`) and
+  `InputSettings::disable_while_typing_timeout_ms` are appended after
+  `center_new_windows`. A class whose profile is `Custom` gets its curve
+  after `CustomAccelCurve::or_mutter_fallback`; a curve libinput rejects
+  leaves the device default. Positional: both peers ship together.
 - Tokens and secrets: `ActivationToken`, `TokenMeta`, `Secret`.
 - Switcher and keybindings: `SwitcherAction`, `SwitcherKey`,
   `SwitcherThumbnail`, `WindowAction`, `Accelerator`, and the `MOD_*` and

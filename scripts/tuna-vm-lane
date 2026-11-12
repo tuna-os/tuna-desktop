@@ -1219,7 +1219,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                                                         restored_middle, restored_wheel),
                                    label="pointer-live-restored")
             pointer_live.append({"restored": restored["state"]["input_devices"]})
-            # GNOME's custom acceleration curve (protocol 0.48). A current
+            # GNOME's custom acceleration curve (protocol 0.51). A current
             # build reports per-device availability. The curve reaches
             # libinput as the custom profile; a curve libinput rejects leaves
             # the device default (Mutter's set_device_accel_profile); a curve
@@ -2141,10 +2141,21 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                                "devices": mice, "original_handler": original_mouse,
                                "restoration": restoration}, stream, indent=2)
 
-    # Same ordinary nonfullscreen Wayland principal must demonstrate the
-    # barrier before and after real persistent constraint ownership.
+    # One ordinary Wayland principal demonstrates real persistent pointer
+    # constraints. Ordinary clients cannot bind layer-shell (#1048), so it is
+    # a fullscreen xdg_toplevel at the output origin (surface-local equals
+    # global). The shell's panel stays above it, so its 64x64 constraint
+    # region is entered below the bar. GNOME's inFullscreen guard keeps the
+    # hot corner closed over it (WindowManager::fullscreen_at, checked in
+    # crates/compositor/src/runtime.rs before any corner open): the corner
+    # must stay closed while it is focused, and the genuine pressure
+    # positives run once it has quit.
+    PRINCIPAL_SETUP = (96, 96)
+    PRINCIPAL_ENTRY = (8, 48)
     constraint_observations = []
     principal = None
+    principal_size = None
+    principal_quit = False
     constraint_primary_error = None
     def constraint_snapshot(label, action="status"):
         value = agent.run("constraint-" + action)
@@ -2182,55 +2193,82 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         # A distinct real tablet position forces a new absolute device event
         # even when it remembers an earlier corner position after relative
         # motion. This is focus setup, never pressure or native rearm proof.
-        corner_move(64, 64)
+        corner_move(*PRINCIPAL_SETUP)
         await_state(lambda value: value["state"]["pointer_position"] is not None
-                    and 63 < value["state"]["pointer_position"][0] < 65
-                    and 63 < value["state"]["pointer_position"][1] < 65
+                    and 95 < value["state"]["pointer_position"][0] < 97
+                    and 95 < value["state"]["pointer_position"][1] < 97
                     and value["state"]["native_relative_motion_count"] == before,
                     label=label + "-distinct-tablet-position-delivered")
-        local = await_client(lambda value: value["entered"] == 1 and 63 < value["local"][0] < 65
-                             and 63 < value["local"][1] < 65,
+        local = await_client(lambda value: value["entered"] == 1 and 95 < value["local"][0] < 97
+                             and 95 < value["local"][1] < 97,
                              label + "-distinct-original-principal")
         global_state = agent.run("inventory")
         position = global_state["state"]["pointer_position"]
-        if (position is None or not all(63 < coordinate < 65 for coordinate in position)
-                or local["buffer_size"] != [128, 128] or not local["configure_events"]):
-            raise RuntimeError("actual original layer origin/configuration receipt unavailable")
+        if (position is None or not all(95 < coordinate < 97 for coordinate in position)
+                or local["fullscreen"] != 1 or local["buffer_size"] != principal_size
+                or any(abs(position[i] - local["local"][i]) > 1 for i in range(2))):
+            raise RuntimeError("actual original fullscreen origin/configuration receipt unavailable")
         # Retain both actual coordinate spaces, including wire quantization;
         # this precedes pressure and every real constraint creation.
         origin_receipt = {"global": position, "local": local["local"],
                           "global_minus_local": [position[i] - local["local"][i] for i in range(2)],
                           "client": local, "state": global_state}
-        constraint_observations.append({"label": label + "-actual-layer-origin", **origin_receipt})
-        with open(os.path.join(evidence, label + "-actual-layer-origin.json"), "w") as stream:
+        constraint_observations.append({"label": label + "-actual-fullscreen-origin", **origin_receipt})
+        with open(os.path.join(evidence, label + "-actual-fullscreen-origin.json"), "w") as stream:
             json.dump(origin_receipt, stream, indent=2)
-        corner_move(0, 10)
+        corner_move(*PRINCIPAL_ENTRY)
         await_state(lambda value: value["state"]["pointer_position"] is not None
-                    and value["state"]["pointer_position"][0] == 0
-                    and 1 < value["state"]["pointer_position"][1] < 32, label=label + "-pointer")
-        return await_client(lambda value: value["entered"] == 1 and value["local"][0] == 0
-                            and 1 < value["local"][1] < 32, label + "-actual-enter")
+                    and 7 < value["state"]["pointer_position"][0] < 9
+                    and 47 < value["state"]["pointer_position"][1] < 49, label=label + "-pointer")
+        return await_client(lambda value: value["entered"] == 1 and 7 < value["local"][0] < 9
+                            and 47 < value["local"][1] < 49, label + "-actual-enter")
     def leave_original(label):
-        # Actual observed approach within the same 128x128 surface. Large
+        # Actual observed approach within the same fullscreen surface. Large
         # acceleration must not silently turn this into another principal.
         for step in range(4):
             relative_receipt(20, 20, label + "-step-" + str(step))
             position = agent.run("inventory")["state"]["pointer_position"]
-            if not position or not 0 <= position[0] < 128 or not 0 <= position[1] < 128:
+            if (not position or not 0 <= position[0] < principal_size[0]
+                    or not 0 <= position[1] < principal_size[1]):
                 raise RuntimeError("native leave lost original principal geometry")
             if position[0] > 32 and position[1] > 32:
                 constraint_snapshot(label + "-left-both")
                 return
         raise RuntimeError("genuine native motion did not leave both barriers")
+    def leave_barriers(label):
+        # Native motion only: the panel, not the principal (if any), is
+        # under the corner, so no client relative receipt is required.
+        for step in range(4):
+            corner_move(20, 20, relative=True)
+            position = agent.run("inventory")["state"]["pointer_position"]
+            if position and position[0] > 32 and position[1] > 32:
+                corner_observations.append({"label": label + "-left-both", "pointer_position": position})
+                return
+        raise RuntimeError("genuine native motion did not leave both barriers: " + label)
+    def fullscreen_corner_negative(label):
+        # GNOME's inFullscreen guard: genuine native pressure at the corner
+        # over the focused fullscreen principal never opens the overview.
+        corner_move(-2000, 0, relative=True)
+        corner_move(0, -2000, relative=True)
+        corner_move(-200, 0, relative=True)
+        for index in range(10):
+            if agent.run("inventory")["state"]["overview_open"]:
+                raise RuntimeError("hot corner opened over the fullscreen principal")
+            time.sleep(0.05)
+        observe_corner(label, False)
+        if constraint_snapshot(label + "-principal")["fullscreen"] != 1:
+            raise RuntimeError("original principal left fullscreen during the corner negative")
+        # Genuine native leaving resets both held barriers.
+        leave_barriers(label + "-leave")
     def genuine_positive(label):
-        enter_original(label)
-        relative_receipt(-200, 0, label)
+        # The principal has quit: genuine native crossing into the corner
+        # opens the overview again.
+        corner_move(-2000, 0, relative=True)
+        corner_move(0, -2000, relative=True)
         observe_corner(label, True)
         qmp.keys("esc")
         observe_corner(label + "-escape-close", False)
-        # Genuine native leaving resets both held barriers. No absolute
-        # warp can serve as the rearm evidence after destruction.
-        leave_original(label + "-leave")
+        leave_barriers(label + "-leave")
     if older_guest:
         # No pointer instrumentation exists to observe, so the constraint
         # proof cannot run; no constraint principal is ever started.
@@ -2243,12 +2281,16 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
             started = agent.run("constraint-start")
             principal = started["principal"]
             constraint_observations.append({"label":"original-start", **started})
-            await_client(lambda value: value["configured"] > 0 and all(value["globals"].values())
-                         and value["buffer_size"] == [128, 128] and value["configure_events"]
-                         and all(event["chosen"] == [128, 128]
-                                 and all(dimension in (0, 128) for dimension in event["raw"])
-                                 for event in value["configure_events"]), "actual-layer-admission")
-            genuine_positive("constraint-original-unconstrained-positive")
+            admitted = await_client(lambda value: value["configured"] > 0 and all(value["globals"].values())
+                         and value["fullscreen"] == 1 and value["configure_events"]
+                         and value["buffer_size"] == value["configure_events"][-1]["chosen"]
+                         and all(dimension >= 128 for dimension in value["buffer_size"])
+                         and all(event["chosen"] == [dimension or 128 for dimension in event["raw"]]
+                                 for event in value["configure_events"]), "actual-fullscreen-admission")
+            principal_size = admitted["buffer_size"]
+            enter_original("constraint-original-unconstrained")
+            relative_receipt(-200, 0, "constraint-original-unconstrained")
+            fullscreen_corner_negative("constraint-original-fullscreen-corner-negative")
             for mode in ("lock", "confine"):
                 original = enter_original(mode + "-principal")
                 start_position = agent.run("inventory")["state"]["pointer_position"]
@@ -2272,7 +2314,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                         raise RuntimeError("real locked pointer moved")
                     if mode == "confine" and (not position or not 0 <= position[0] < 64 or not 0 <= position[1] < 64
                                              or not 0 <= actual["local"][0] < 64 or not 0 <= actual["local"][1] < 64):
-                        raise RuntimeError("real confined pointer escaped its committed layer region")
+                        raise RuntimeError("real confined pointer escaped its committed region")
                     time.sleep(0.05)
                 frame(mode + "-actual-constrained-negative")
                 # Real committed empty region causes observed deactivation;
@@ -2282,14 +2324,13 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                 relative_receipt(-200, 0, mode + "-empty-region-motion")
                 await_client(lambda value: value["unlocked" if mode == "lock" else "unconfined"] > deactivated_count,
                              mode + "-actual-deactivation")
-                # Empty regions no longer own motion. Preserve any actual
-                # unconstrained activation, close it with balanced real input,
-                # and observe the same original surface before restoring.
+                # Empty regions no longer own motion. The guard keeps the
+                # corner closed over the fullscreen principal; observe the
+                # same original surface before restoring.
                 empty_state = agent.run("inventory")
                 constraint_snapshot(mode + "-deactivated-desktop")
                 if empty_state["state"]["overview_open"]:
-                    qmp.keys("esc")
-                    observe_corner(mode + "-empty-overview-close", False)
+                    raise RuntimeError("hot corner opened over the fullscreen principal")
                 enter_original(mode + "-persistent-original-reenter")
                 active_count = activated["locked" if mode == "lock" else "confined"]
                 constraint_snapshot(mode + "-restore-region-commit", "restore")
@@ -2299,23 +2340,25 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                 destroyed = constraint_snapshot(mode + "-destroy-roundtrip", "destroy")
                 if destroyed["constraint_id"] or destroyed["mode"]:
                     raise RuntimeError("original constraint survived real destruction")
-                # Entirely relative leave, approach and crossing: unchanged
-                # original surface receives genuine native payloads again.
+                # Entirely relative leave and approach: the unchanged
+                # original surface receives genuine native payloads again,
+                # and the corner stays closed over it.
                 leave_original(mode + "-destroyed-leave")
                 relative_receipt(-2000, 0, mode + "-relative-left-edge")
-                relative_receipt(0, -2000, mode + "-relative-cross-positive")
-                observe_corner(mode + "-destroyed-original-positive", True)
-                qmp.keys("esc")
-                observe_corner(mode + "-destroyed-escape-close", False)
-                leave_original(mode + "-post-positive-leave")
+                fullscreen_corner_negative(mode + "-destroyed-fullscreen-corner-negative")
+            constraint_snapshot("constraint-principal-quit", "quit")
+            principal_quit = True
+            for name in ("unconstrained", "lock-destroyed", "confine-destroyed"):
+                genuine_positive("constraint-released-" + name + "-positive")
             record("V-HOT-CORNER-CONSTRAINTS", True,
-                   "same actual session layer principal receives relative payloads; real persistent lock/confine activates, suppresses pressure, deactivates/reactivates on committed region updates, and destruction restores actual native pressure")
+                   "same actual fullscreen session principal receives relative payloads; real persistent lock/confine activates, keeps the pointer and overview still, deactivates/reactivates on committed region updates; GNOME's fullscreen guard keeps the corner closed over the principal before constraints and after each destruction, and genuine native pressure opens it once the principal quits")
         except Exception as error:
             constraint_primary_error = {"type": type(error).__name__, "message": str(error)}
             raise
         finally:
             finish_constraint_proof(agent, qmp, original_mouse, evidence,
-                {"principal": principal, "observations": constraint_observations,
+                {"principal": principal, "principal_quit": principal_quit,
+                 "observations": constraint_observations,
                  "devices": mice, "relative_inputs": corner_inputs,
                  "primary_error": constraint_primary_error})
 
@@ -3865,10 +3908,13 @@ def finish_orca_activation(agent, evidence, observations):
 def finish_constraint_proof(agent, qmp, original_mouse, evidence, report):
     """Retain all cleanup outcomes without replacing an original proof error."""
     cleanup_errors = []
-    try:
-        agent.run("constraint-quit")
-    except Exception as error:
-        cleanup_errors.append({"action": "constraint-quit", "message": str(error)})
+    # The proof itself quits the fullscreen principal before its pressure
+    # positives; quitting it again would only fail on a gone process.
+    if not report.get("principal_quit"):
+        try:
+            agent.run("constraint-quit")
+        except Exception as error:
+            cleanup_errors.append({"action": "constraint-quit", "message": str(error)})
     try:
         restored = restore_corner_mouse(qmp, original_mouse)
         with open(os.path.join(evidence, "hot-corner-constraint-mouse-restoration.json"), "w") as stream:
