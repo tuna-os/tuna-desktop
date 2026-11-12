@@ -144,6 +144,7 @@ changes or the session locks (`mutter.rs:1339-1392`). Capture paths also
 refuse locked frames. Full detail and the qualification evidence:
 [capture admission and revocation](capture-security.md),
 [remote desktop](remote-desktop.md),
+[input capture](input-capture.md),
 [screenshot consent](portal-screenshot-consent.md).
 
 ### Privileged Wayland globals
@@ -163,6 +164,7 @@ Each interface checks its caller itself. The main policies:
 | Interface | Served by | Caller policy |
 |---|---|---|
 | `org.gnome.Mutter.ScreenCast`, `.RemoteDesktop`, `org.gnome.Shell.Screenshot`, `org.tuna.Screenshot` | compositor | Shell PID or authenticated installed portal. Denied while locked. |
+| `org.gnome.Mutter.InputCapture` | compositor | `CreateSession`: authenticated installed portal only (`Authority::admit_portal`), not the shell PID. Session methods: the unique owner, denied while locked. Lock closes every session at once; owner loss within the 100 ms scan. No input is captured while locked ([input capture](input-capture.md)). |
 | `org.gnome.Mutter.ServiceChannel` | compositor | Same-user caller. Typed connections require the installed provider for that type. |
 | `org.gnome.Shell.Introspect` | compositor | Shell PID or authenticated installed portal (`capture_security::Authority::admit`). Denied while locked. `TUNA_INTROSPECT_UNRESTRICTED=1` (test/development "unsafe mode") allows metadata only while unlocked (`introspect.rs`). |
 | `/org/gnome/Shell/Introspect` on `org.gnome.Shell` | GTK shell relays to the compositor | The shell holds no window data and decides nothing: it forwards each call to the compositor's `org.tuna.Introspect` with the original caller's unique name. The compositor answers only when the relay is the supervised shell's PID and the original caller passes the `org.gnome.Shell.Introspect` rule above (`Authority::admit_forwarded`; `shell-gtk/src/introspect_forward.rs`). |
