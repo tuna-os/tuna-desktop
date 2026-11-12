@@ -173,19 +173,7 @@ impl WifiMenu {
         let device_path = device.clone();
         get_all(&conn, &device_path, WIRELESS, move |props| {
             let Some(props) = props else { return };
-            let paths = |key: &str| -> Vec<String> {
-                props
-                    .lookup_value(key, None)
-                    .and_then(|v| v.get::<Vec<glib::variant::ObjectPath>>())
-                    .map(|p| p.into_iter().map(|p| p.as_str().to_owned()).collect())
-                    .unwrap_or_default()
-            };
-            let ap_paths = paths("AccessPoints");
-            let active = props
-                .lookup_value("ActiveAccessPoint", None)
-                .and_then(|v| v.get::<glib::variant::ObjectPath>())
-                .map(|p| p.as_str().to_owned())
-                .filter(|p| p != "/");
+            let (ap_paths, active) = wireless_state(&props);
             let seen = Rc::new(RefCell::new(Seen {
                 active,
                 ..Seen::default()
@@ -193,10 +181,8 @@ impl WifiMenu {
             let conn3 = conn2.clone();
             let device2 = device.clone();
             get_all(&conn2, &device2, DEVICE, move |dev| {
-                let conns: Vec<String> = dev
-                    .and_then(|d| d.lookup_value("AvailableConnections", None))
-                    .and_then(|v| v.get::<Vec<glib::variant::ObjectPath>>())
-                    .map(|p| p.into_iter().map(|p| p.as_str().to_owned()).collect())
+                let conns = dev
+                    .map(|d| object_paths(&d, "AvailableConnections"))
                     .unwrap_or_default();
                 let left = Rc::new(Cell::new(ap_paths.len() + conns.len() + 1));
                 let done = {
@@ -220,27 +206,7 @@ impl WifiMenu {
                     let p = path.clone();
                     get_all(&conn3, &path, AP, move |props| {
                         if let Some(props) = props {
-                            let u = |k: &str| {
-                                props
-                                    .lookup_value(k, None)
-                                    .and_then(|v| v.get::<u32>())
-                                    .unwrap_or(0)
-                            };
-                            seen.borrow_mut().aps.push(AccessPoint {
-                                path: p,
-                                ssid: props
-                                    .lookup_value("Ssid", None)
-                                    .and_then(|v| v.get::<Vec<u8>>())
-                                    .unwrap_or_default(),
-                                strength: props
-                                    .lookup_value("Strength", None)
-                                    .and_then(|v| v.get::<u8>())
-                                    .unwrap_or(0),
-                                flags: u("Flags"),
-                                wpa_flags: u("WpaFlags"),
-                                rsn_flags: u("RsnFlags"),
-                                mode: u("Mode"),
-                            });
+                            seen.borrow_mut().aps.push(access_point(p, &props));
                         }
                         done();
                     });
@@ -259,19 +225,7 @@ impl WifiMenu {
                         5000,
                         None::<&gio::Cancellable>,
                         move |reply| {
-                            // a{sa{sv}}: find the 802-11-wireless
-                            // section, then its ssid.
-                            let ssid = reply.ok().and_then(|v| {
-                                let settings = v.child_value(0);
-                                let wifi = settings.iter().find_map(|entry| {
-                                    (entry.child_value(0).str() == Some("802-11-wireless"))
-                                        .then(|| entry.child_value(1))
-                                })?;
-                                glib::VariantDict::new(Some(&wifi))
-                                    .lookup_value("ssid", None)?
-                                    .get::<Vec<u8>>()
-                            });
-                            if let Some(ssid) = ssid {
+                            if let Some(ssid) = reply.ok().as_ref().and_then(saved_ssid) {
                                 seen.borrow_mut().known.push((ssid, p));
                             }
                             done();
@@ -356,11 +310,7 @@ impl WifiMenu {
         let active = networks.iter().find(|n| n.active);
         let on = self.enabled.get();
         tile.show_state(on, active.filter(|_| on).map(|n| n.name.as_str()));
-        tile.icon.set_icon_name(Some(match (on, active) {
-            (false, _) => "network-wireless-disabled-symbolic",
-            (true, Some(net)) => logic::signal_icon(net.strength),
-            (true, None) => "network-wireless-signal-none-symbolic",
-        }));
+        tile.icon.set_icon_name(Some(tile_icon(on, active)));
     }
 
     /// A saved network activates its connection; an open one gets a
@@ -375,8 +325,8 @@ impl WifiMenu {
         let (Some(dev), Some(ap)) = (path(&device), path(&net.ap)) else {
             return;
         };
-        match (&net.connection, net.security) {
-            (Some(saved), _) => {
+        match activation(net) {
+            Activation::Saved(saved) => {
                 let (Some(saved), Some(none)) = (path(saved), path("/")) else {
                     return;
                 };
@@ -394,7 +344,7 @@ impl WifiMenu {
                 );
             }
             // GNOME's agent (network_agent.rs) asks for the password.
-            (None, WifiSecurity::Open | WifiSecurity::Personal) => {
+            Activation::New => {
                 let empty: std::collections::HashMap<
                     String,
                     std::collections::HashMap<String, glib::Variant>,
@@ -412,13 +362,100 @@ impl WifiMenu {
                     |_| {},
                 );
             }
-            (None, WifiSecurity::Enterprise) => {
+            Activation::Settings => {
                 let _ = tuna_shell_host::apps::application_command("gnome-control-center")
                     .args(["wifi", "connect-8021x-wifi", &device, &net.ap])
                     .spawn();
             }
         }
     }
+}
+
+/// The tile's icon: disabled, the connected network's signal, or none.
+fn tile_icon(enabled: bool, active: Option<&WifiNetwork>) -> &'static str {
+    match (enabled, active) {
+        (false, _) => "network-wireless-disabled-symbolic",
+        (true, Some(net)) => logic::signal_icon(net.strength),
+        (true, None) => "network-wireless-signal-none-symbolic",
+    }
+}
+
+/// What picking a network asks for (network.js `WirelessNetwork.activate`).
+#[derive(Debug, PartialEq, Eq)]
+enum Activation<'a> {
+    /// `ActivateConnection` of its saved connection.
+    Saved(&'a str),
+    /// `AddAndActivateConnection`; the secret agent asks for a password.
+    New,
+    /// 802.1X without a saved connection: Settings' connect dialog.
+    Settings,
+}
+
+fn activation(net: &WifiNetwork) -> Activation<'_> {
+    match (&net.connection, net.security) {
+        (Some(saved), _) => Activation::Saved(saved),
+        (None, WifiSecurity::Open | WifiSecurity::Personal) => Activation::New,
+        (None, WifiSecurity::Enterprise) => Activation::Settings,
+    }
+}
+
+/// An object-path array property (absent or mistyped: none).
+fn object_paths(props: &glib::VariantDict, key: &str) -> Vec<String> {
+    props
+        .lookup_value(key, None)
+        .and_then(|v| v.get::<Vec<glib::variant::ObjectPath>>())
+        .map(|p| p.into_iter().map(|p| p.as_str().to_owned()).collect())
+        .unwrap_or_default()
+}
+
+/// The Wi-Fi device's access points and its active one ("/" is none).
+fn wireless_state(props: &glib::VariantDict) -> (Vec<String>, Option<String>) {
+    let active = props
+        .lookup_value("ActiveAccessPoint", None)
+        .and_then(|v| v.get::<glib::variant::ObjectPath>())
+        .map(|p| p.as_str().to_owned())
+        .filter(|p| p != "/");
+    (object_paths(props, "AccessPoints"), active)
+}
+
+/// One access point from its properties; absent or mistyped ones read
+/// as zero (an empty SSID is a hidden network the menu skips).
+fn access_point(path: String, props: &glib::VariantDict) -> AccessPoint {
+    let u = |k: &str| {
+        props
+            .lookup_value(k, None)
+            .and_then(|v| v.get::<u32>())
+            .unwrap_or(0)
+    };
+    AccessPoint {
+        path,
+        ssid: props
+            .lookup_value("Ssid", None)
+            .and_then(|v| v.get::<Vec<u8>>())
+            .unwrap_or_default(),
+        strength: props
+            .lookup_value("Strength", None)
+            .and_then(|v| v.get::<u8>())
+            .unwrap_or(0),
+        flags: u("Flags"),
+        wpa_flags: u("WpaFlags"),
+        rsn_flags: u("RsnFlags"),
+        mode: u("Mode"),
+    }
+}
+
+/// A saved connection's Wi-Fi SSID from `GetSettings`' `(a{sa{sv}})`:
+/// the 802-11-wireless section's ssid; none for other connections.
+fn saved_ssid(reply: &glib::Variant) -> Option<Vec<u8>> {
+    let settings = reply
+        .try_child_value(0)
+        .filter(|v| v.type_().as_str() == "a{sa{sv}}")?;
+    let wifi = settings.iter().find_map(|entry| {
+        (entry.child_value(0).str() == Some("802-11-wireless")).then(|| entry.child_value(1))
+    })?;
+    glib::VariantDict::new(Some(&wifi))
+        .lookup_value("ssid", None)?
+        .get::<Vec<u8>>()
 }
 
 /// `org.freedesktop.DBus.Properties.GetAll` as a dict, or `None`.
@@ -446,4 +483,320 @@ fn get_all(
             )
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PSK: u32 = 0x188; // pair/group CCMP + PSK
+    const EAP: u32 = 0x288; // pair/group CCMP + 802.1X
+    const PRIVACY: u32 = 0x1;
+
+    fn ap_props(ssid: &[u8], strength: u8, flags: u32, wpa: u32, rsn: u32) -> glib::VariantDict {
+        let props = glib::VariantDict::new(None);
+        props.insert_value("Ssid", &ssid.to_variant());
+        props.insert_value("Strength", &strength.to_variant());
+        props.insert_value("Flags", &flags.to_variant());
+        props.insert_value("WpaFlags", &wpa.to_variant());
+        props.insert_value("RsnFlags", &rsn.to_variant());
+        props.insert_value("Mode", &2u32.to_variant());
+        props
+    }
+
+    fn ap(path: &str, ssid: &[u8], strength: u8, rsn: u32) -> AccessPoint {
+        let flags = if rsn != 0 { PRIVACY } else { 0 };
+        access_point(path.into(), &ap_props(ssid, strength, flags, 0, rsn))
+    }
+
+    fn settings(sections: &[(&str, &[(&str, glib::Variant)])]) -> glib::Variant {
+        let map: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, glib::Variant>,
+        > = sections
+            .iter()
+            .map(|(name, keys)| {
+                (
+                    (*name).to_owned(),
+                    keys.iter()
+                        .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+        (map,).to_variant()
+    }
+
+    fn names(nets: &[WifiNetwork]) -> Vec<&str> {
+        nets.iter().map(|n| n.name.as_str()).collect()
+    }
+
+    #[test]
+    fn access_point_properties_parse_and_default_to_zero() {
+        let parsed = ap("/ap/1", b"Cafe", 64, PSK);
+        assert_eq!(
+            parsed,
+            AccessPoint {
+                path: "/ap/1".into(),
+                ssid: b"Cafe".to_vec(),
+                strength: 64,
+                flags: PRIVACY,
+                wpa_flags: 0,
+                rsn_flags: PSK,
+                mode: 2,
+            }
+        );
+        // Missing or mistyped properties (a broken NetworkManager) read
+        // as a hidden, open, zero-strength access point: never shown.
+        let junk = glib::VariantDict::new(None);
+        junk.insert_value("Ssid", &"Cafe".to_variant());
+        junk.insert_value("Strength", &64u32.to_variant());
+        let junk = access_point("/ap/2".into(), &junk);
+        assert!(junk.ssid.is_empty());
+        assert_eq!(junk.strength, 0);
+        assert!(logic::wifi_networks(&[junk], None, &[]).is_empty());
+    }
+
+    #[test]
+    fn device_state_reads_active_access_point_and_list() {
+        let props = glib::VariantDict::new(None);
+        let paths = |p: &[&str]| -> Vec<glib::variant::ObjectPath> {
+            p.iter()
+                .map(|p| glib::variant::ObjectPath::try_from(*p).unwrap())
+                .collect()
+        };
+        props.insert_value("AccessPoints", &paths(&["/ap/1", "/ap/2"]).to_variant());
+        props.insert_value(
+            "ActiveAccessPoint",
+            &glib::variant::ObjectPath::try_from("/ap/2")
+                .unwrap()
+                .to_variant(),
+        );
+        assert_eq!(
+            wireless_state(&props),
+            (vec!["/ap/1".into(), "/ap/2".into()], Some("/ap/2".into()))
+        );
+        // NetworkManager's "/" means not connected.
+        props.insert_value(
+            "ActiveAccessPoint",
+            &glib::variant::ObjectPath::try_from("/")
+                .unwrap()
+                .to_variant(),
+        );
+        assert_eq!(wireless_state(&props).1, None);
+        // Strings where object paths belong are not access points.
+        props.insert_value("AccessPoints", &vec!["/ap/1"].to_variant());
+        props.insert_value("ActiveAccessPoint", &"/ap/1".to_variant());
+        assert_eq!(wireless_state(&props), (Vec::new(), None));
+        assert!(wireless_state(&glib::VariantDict::new(None)).0.is_empty());
+    }
+
+    #[test]
+    fn saved_connections_match_by_wireless_ssid_only() {
+        let wifi = settings(&[
+            ("connection", &[("id", "Home".to_variant())]),
+            (
+                "802-11-wireless",
+                &[("ssid", b"Home\xff".to_vec().to_variant())],
+            ),
+        ]);
+        assert_eq!(saved_ssid(&wifi), Some(b"Home\xff".to_vec()));
+        // An ethernet profile, a wifi section without an SSID, a
+        // string SSID, or a wrong-shaped reply match no network.
+        let ethernet = settings(&[
+            ("connection", &[("id", "Home".to_variant())]),
+            ("802-3-ethernet", &[("ssid", b"Home".to_vec().to_variant())]),
+        ]);
+        let no_ssid = settings(&[(
+            "802-11-wireless",
+            &[("mode", "infrastructure".to_variant())],
+        )]);
+        let string_ssid = settings(&[("802-11-wireless", &[("ssid", "Home".to_variant())])]);
+        for reply in [
+            ethernet,
+            no_ssid,
+            string_ssid,
+            ("x",).to_variant(),
+            true.to_variant(),
+        ] {
+            assert_eq!(saved_ssid(&reply), None, "{reply}");
+        }
+    }
+
+    #[test]
+    fn networks_dedupe_by_ssid_keeping_the_strongest_access_point() {
+        let aps = [
+            ap("/ap/1", b"Mesh", 30, PSK),
+            ap("/ap/2", b"Mesh", 85, PSK),
+            ap("/ap/3", b"Mesh", 60, PSK),
+            // Same name, different security: GNOME lists it separately.
+            ap("/ap/4", b"Mesh", 50, 0),
+            // Hidden networks are not listed.
+            ap("/ap/5", b"", 99, PSK),
+        ];
+        let nets = logic::wifi_networks(&aps, Some("/ap/1"), &[]);
+        assert_eq!(names(&nets), ["Mesh", "Mesh"]);
+        let secure = &nets[0];
+        assert_eq!((secure.ap.as_str(), secure.strength), ("/ap/2", 85));
+        assert!(secure.active, "connected through a weaker access point");
+        assert_eq!(
+            signal_icon_of(secure),
+            "network-wireless-signal-excellent-symbolic"
+        );
+        assert_eq!(nets[1].security, WifiSecurity::Open);
+        assert!(!nets[1].active);
+    }
+
+    fn signal_icon_of(net: &WifiNetwork) -> &'static str {
+        tile_icon(true, Some(net))
+    }
+
+    #[test]
+    fn networks_sort_saved_then_strength_then_secure_then_name() {
+        let aps = [
+            ap("/ap/1", b"zeta", 40, 0),
+            ap("/ap/2", b"Alpha", 40, 0),
+            ap("/ap/3", b"Strong", 90, PSK),
+            ap("/ap/4", b"Locked", 40, PSK),
+            ap("/ap/5", b"Saved", 10, PSK),
+        ];
+        let known = [(b"Saved".to_vec(), "/conn/1".to_owned())];
+        let nets = logic::wifi_networks(&aps, None, &known);
+        // network.js `WirelessNetwork.compare`.
+        assert_eq!(names(&nets), ["Saved", "Strong", "Locked", "Alpha", "zeta"]);
+        assert_eq!(nets[0].connection.as_deref(), Some("/conn/1"));
+    }
+
+    #[test]
+    fn non_utf8_ssids_are_shown_and_grouped_by_their_bytes() {
+        let latin1 = b"Caf\xe9".to_vec();
+        let other = b"Caf\xe8".to_vec();
+        let aps = [
+            ap("/ap/1", &latin1, 50, PSK),
+            ap("/ap/2", &other, 40, PSK),
+            ap("/ap/3", &latin1, 70, PSK),
+        ];
+        let known = [(latin1.clone(), "/conn/1".to_owned())];
+        let nets = logic::wifi_networks(&aps, None, &known);
+        assert_eq!(nets.len(), 2, "two SSIDs, even if they render alike");
+        assert_eq!(nets[0].ssid, latin1);
+        assert_eq!(nets[0].ap, "/ap/3");
+        assert_eq!(nets[0].connection.as_deref(), Some("/conn/1"));
+        assert!(nets[0].name.starts_with("Caf") && !nets[0].name.is_empty());
+        assert!(
+            nets[1].connection.is_none(),
+            "a saved profile names exact bytes"
+        );
+    }
+
+    #[test]
+    fn security_classification_follows_nm_flags() {
+        let of = |flags, wpa, rsn| WifiSecurity::of(flags, wpa, rsn);
+        assert_eq!(of(0, 0, 0), WifiSecurity::Open);
+        assert_eq!(of(PRIVACY, 0, 0), WifiSecurity::Personal, "WEP");
+        assert_eq!(of(PRIVACY, 0x14a, 0), WifiSecurity::Personal, "WPA1-PSK");
+        assert_eq!(of(PRIVACY, 0, PSK), WifiSecurity::Personal, "WPA2-PSK");
+        assert_eq!(of(PRIVACY, 0, 0x488), WifiSecurity::Personal, "WPA3-SAE");
+        assert_eq!(of(PRIVACY, 0x24a, 0), WifiSecurity::Enterprise, "WPA1-EAP");
+        assert_eq!(of(PRIVACY, 0, EAP), WifiSecurity::Enterprise, "WPA2-EAP");
+        assert_eq!(
+            of(PRIVACY, 0, 0x388),
+            WifiSecurity::Enterprise,
+            "PSK+EAP mixed"
+        );
+        assert_eq!(of(PRIVACY, 0, 0x888), WifiSecurity::Open, "OWE");
+        assert_eq!(of(0, 0, 0x1088), WifiSecurity::Open, "OWE transition");
+        assert_eq!(
+            of(PRIVACY, 0, 0x988),
+            WifiSecurity::Personal,
+            "OWE with PSK"
+        );
+        assert!(!WifiSecurity::Open.secure());
+        assert!(WifiSecurity::Personal.secure() && WifiSecurity::Enterprise.secure());
+    }
+
+    #[test]
+    fn signal_icons_switch_at_gnomes_thresholds() {
+        // network.js `signalToIcon`: <20 none, <40 weak, <50 ok,
+        // <80 good, else excellent.
+        let cases = [
+            (0, "none"),
+            (19, "none"),
+            (20, "weak"),
+            (39, "weak"),
+            (40, "ok"),
+            (49, "ok"),
+            (50, "good"),
+            (79, "good"),
+            (80, "excellent"),
+            (100, "excellent"),
+            (255, "excellent"),
+        ];
+        for (strength, level) in cases {
+            assert_eq!(
+                logic::signal_icon(strength),
+                format!("network-wireless-signal-{level}-symbolic"),
+                "{strength}"
+            );
+        }
+    }
+
+    #[test]
+    fn tile_icon_follows_radio_and_connection() {
+        let net = |strength| WifiNetwork {
+            name: "Home".into(),
+            ssid: b"Home".to_vec(),
+            ap: "/ap/1".into(),
+            strength,
+            security: WifiSecurity::Personal,
+            active: true,
+            connection: None,
+        };
+        assert_eq!(
+            tile_icon(false, Some(&net(90))),
+            "network-wireless-disabled-symbolic"
+        );
+        assert_eq!(tile_icon(false, None), "network-wireless-disabled-symbolic");
+        assert_eq!(
+            tile_icon(true, None),
+            "network-wireless-signal-none-symbolic"
+        );
+        assert_eq!(
+            tile_icon(true, Some(&net(45))),
+            "network-wireless-signal-ok-symbolic"
+        );
+    }
+
+    #[test]
+    fn picking_a_network_activates_saved_creates_new_or_opens_settings() {
+        let net = |security, connection: Option<&str>| WifiNetwork {
+            name: "Net".into(),
+            ssid: b"Net".to_vec(),
+            ap: "/ap/1".into(),
+            strength: 50,
+            security,
+            active: false,
+            connection: connection.map(Into::into),
+        };
+        // A saved profile always activates, 802.1X included.
+        for security in [
+            WifiSecurity::Open,
+            WifiSecurity::Personal,
+            WifiSecurity::Enterprise,
+        ] {
+            assert_eq!(
+                activation(&net(security, Some("/conn/1"))),
+                Activation::Saved("/conn/1")
+            );
+        }
+        assert_eq!(activation(&net(WifiSecurity::Open, None)), Activation::New);
+        assert_eq!(
+            activation(&net(WifiSecurity::Personal, None)),
+            Activation::New
+        );
+        assert_eq!(
+            activation(&net(WifiSecurity::Enterprise, None)),
+            Activation::Settings
+        );
+    }
 }
