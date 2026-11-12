@@ -310,6 +310,27 @@ pub fn current_exe_dir() -> Option<std::path::PathBuf> {
         .and_then(|exe| exe.parent().map(|dir| dir.to_owned()))
 }
 
+/// `GL_RENDERER` of the compositor's own context.
+fn gl_renderer_name(renderer: &mut GlesRenderer) -> Option<String> {
+    use smithay::backend::renderer::gles::ffi;
+    renderer
+        .with_context(|gl| {
+            // SAFETY: the renderer's context is current inside
+            // `with_context`; GL_RENDERER is static, NUL-terminated GL
+            // state, or null on error.
+            unsafe {
+                let name = gl.GetString(ffi::RENDERER);
+                (!name.is_null()).then(|| {
+                    std::ffi::CStr::from_ptr(name.cast())
+                        .to_string_lossy()
+                        .into_owned()
+                })
+            }
+        })
+        .ok()
+        .flatten()
+}
+
 /// Whether a session runs X11 apps (#59): `TUNA_XWAYLAND=1` forces it,
 /// `TUNA_XWAYLAND=0` turns it off, and otherwise it is on whenever an
 /// `Xwayland` binary is on `PATH`, as GNOME 51 runs X11 apps
@@ -1213,6 +1234,26 @@ impl Runtime {
                 Backend::Drm(drm) => drm.renderer.dmabuf_formats().into_iter().collect(),
             };
             state.enable_dmabuf(formats);
+        }
+        // On software GL the shell draws with cairo. Telling it here saves
+        // it a GL context of its own made only to read GL_RENDERER, which
+        // would keep Mesa, LLVM and llvmpipe's threads in the shell for
+        // good (#503). On a GPU nothing is set and GSK chooses as before.
+        {
+            use tuna_shell_control::gl;
+            let gl_renderer = match &mut backend {
+                Backend::Winit(winit) => gl_renderer_name(winit.renderer()),
+                #[cfg(feature = "drm")]
+                Backend::Drm(drm) => gl_renderer_name(&mut drm.renderer),
+            };
+            let chosen = std::env::var_os(gl::GSK_RENDERER_ENV).is_some();
+            if let Some(gsk) = gl::shell_gsk_renderer(chosen, gl_renderer.as_deref()) {
+                eprintln!(
+                    "tuna-compositor: OpenGL is {}; the shell draws with {gsk}",
+                    gl_renderer.as_deref().unwrap_or_default()
+                );
+                shell.set_env(gl::GSK_RENDERER_ENV, gsk);
+            }
         }
 
         // org.gnome.Mutter.ScreenCast and DisplayConfig (#61): screen

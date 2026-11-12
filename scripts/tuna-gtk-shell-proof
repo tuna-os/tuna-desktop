@@ -5,9 +5,9 @@
 #   scripts/tuna-gtk-shell-proof [--display :N] [--artifacts DIR]
 #   --screenshot-keys-only runs panel readiness and actual keyboard captures only.
 #   --a11y-focus-only runs panel readiness, G-FOCUS-RING, G-FOCUS-RING-TIMEOUT,
-#   G-A11Y-MENU-RESTART and G-SHELL-STABLE only.
+#   G-A11Y-MENU-CLOSE-STABLE, G-A11Y-MENU-RESTART and G-SHELL-STABLE only.
 #   --grid-hover-only runs panel readiness, G-GRID-HOVER, G-GRID-REORDER,
-#   and G-SHELL-STABLE only.
+#   G-GRID-ON-DEMAND and G-SHELL-STABLE only.
 #   --keyboard-routes-only runs panel readiness and the P-A11Y-02 keyboard
 #   route gates (G-PANEL-MENU-KEYS, G-QS-MENU-KEY, G-NOTIFICATION-KEYS,
 #   G-SCREENSHOT-CTRL-C) only.
@@ -18,6 +18,8 @@
 # on a private session bus with the AT-SPI accessibility bus, then:
 #   G-PANEL     the panel maps (frame differs from the bare session)
 #   A11Y-PANEL  the panel controls are exposed to screen readers by name
+#   G-SHELL-CAIRO on software GL the compositor starts the shell with
+#               GSK_RENDERER=cairo and the shell loads no Mesa rasterizer (#503)
 #   G-CAL-EVENTS the calendar server's events for today list in the date
 #               menu's events card, timed as GNOME formats them
 #   G-CAL-OPEN  clicking the clock opens the calendar popover (xdg popup
@@ -33,6 +35,10 @@
 #   G-GRID-DRAG-PAGE a dragged app held at the grid's edge turns the page
 #   G-GRID-REORDER  an app dropped on a tile's edge moves there (saved
 #                   to app-picker-layout)
+#   G-GRID-ON-DEMAND the app grid's tiles exist only while it shows: none
+#                   on the window picker or after close; a held swipe up
+#                   and Show Apps list an app installed meanwhile; Down
+#                   and Right walk the tiles (#503)
 #   G-FOLDER-DND    dragging an app onto another makes a GNOME folder of
 #                   them; dragging one out of the folder dialog removes it
 #   G-APP-GRID-PAGES enough apps page the grid: indicators and arrows show,
@@ -367,6 +373,11 @@
 #   G-FOCUS-RING-TIMEOUT keyboard-focus-visible-timeout clears a real
 #                  key's indication at the toolkit's 3 s by default, at
 #                  2 s and 5 s when set, never at 0, with focus kept
+#   G-A11Y-MENU-CLOSE-STABLE two readers walk the shell's whole AT-SPI tree
+#                  in a loop across 20 rounds of the window menu, quick
+#                  settings, the calendar and a banner opening and closing;
+#                  the shell process survives and no accessible object path
+#                  is NULL (#1077, GNOME/gtk#8444)
 #   G-A11Y-MENU-RESTART a menu row toggled with real keys persists across
 #                  one deliberate shell restart and the restarted menu
 #                  follows the settings live
@@ -817,6 +828,83 @@ esac
 pass G-GRID-REORDER "an app dropped on a tile's edge takes its place and the grid is saved as GNOME saves it"
 xdotool key Escape
 cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-GRID-REORDER "overview stayed open"; }
+}
+
+# G-GRID-ON-DEMAND (#503): the app grid's tiles (one per installed app)
+# exist only while the grid shows. Opening the overview on the window
+# picker builds none; the grid a held swipe up draws part way, and Show
+# Apps, list an app installed while the overview was closed; Down from
+# the search entry focuses a tile and Right the next; closing drops them.
+# A hidden window is not in the accessible tree, so building and dropping
+# are read from the shell's grid trace (TUNA_GRID_TRACE).
+grid_traced() {
+    tail -c +"$(($1 + 1))" "$LOG" | grep -c -- "grid-anim $2" || true
+}
+grid_tiles() {
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-$1.json" 20 ||
+        fail G-GRID-ON-DEMAND "accessibility dump failed ($1)"
+}
+grid_focused_tile() {
+    jq -r '[.[] | select(.focused and .showing and (.role == "push button" or .role == "button") and (.name | startswith("AAA Move")))][0].name // empty' "$1"
+}
+grid_swipe() {
+    grid_swipe_sequence=$((grid_swipe_sequence + 1))
+    printf '{"phase":"%s","dy":%s,"time":%s,"sequence":%s}\n' \
+        "$1" "$2" "$3" "$grid_swipe_sequence" >"$TUNA_PROOF_SWIPE_INPUT.tmp"
+    mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+    cstate ".proof_swipe_sequence == $grid_swipe_sequence" "swipe phase consumed" 5 ||
+        fail G-GRID-ON-DEMAND "the compositor never read synthetic swipe phase $grid_swipe_sequence"
+    sleep 0.2
+}
+grid_on_demand_proof() {
+grid_swipe_sequence=9000
+printf '[Desktop Entry]\nName=AAA Move Late\nExec=true\nType=Application\n' \
+    >"$XDG_DATA_HOME/applications/tuna-move-Late.desktop"
+sleep 1.5
+xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
+grid_mark="$(wc -c <"$LOG")"
+xdotool key Super_L
+cstate '.overview_open and .overview_progress == 1 and (.overview_app_grid | not)' "window picker" ||
+    fail G-GRID-ON-DEMAND "Super did not open the overview on the window picker"
+sleep 1
+[ "$(grid_traced "$grid_mark" grid-build)" = 0 ] ||
+    fail G-GRID-ON-DEMAND "opening the overview on the window picker built app grid tiles nobody sees"
+# Fingers held up from the window picker draw the grid part way
+# (overviewControls.js `_updateAppDisplayVisibility`), before Show Apps.
+grid_swipe begin 0 80000
+grid_swipe update -90 80010
+cstate '.touchpad_swipe.active and .overview_state > 1.299 and .overview_state < 1.301 and (.layers | any(.namespace == "tuna-shell-appgrid"))' "app grid held part way" ||
+    fail G-GRID-ON-DEMAND "a held swipe up from the window picker did not draw the app grid"
+[ "$(grid_traced "$grid_mark" grid-build)" = 1 ] ||
+    fail G-GRID-ON-DEMAND "the held swipe built the grid $(grid_traced "$grid_mark" grid-build) times, not once"
+grid_tiles swipe-held
+button_showing "$ARTIFACTS/a11y-grid-swipe-held.json" "AAA Move Late" ||
+    fail G-GRID-ON-DEMAND "the held grid lacks the app installed while the overview was closed"
+grid_swipe update -60 80020
+grid_swipe end 0 80030
+cstate '.overview_open and .overview_state == 2 and .overview_app_grid and (.layers | any(.namespace == "tuna-shell-appgrid"))' "app grid settled" ||
+    fail G-GRID-ON-DEMAND "the swipe did not settle on the app grid"
+sleep 1
+xdotool key Down
+sleep 0.6
+grid_tiles key-down
+grid_first="$(grid_focused_tile "$ARTIFACTS/a11y-grid-key-down.json")"
+[ -n "$grid_first" ] || fail G-GRID-ON-DEMAND "Down from the search entry focused no grid tile"
+button_showing "$ARTIFACTS/a11y-grid-key-down.json" "AAA Move Late" ||
+    fail G-GRID-ON-DEMAND "Show Apps lacks the app installed while the overview was closed"
+xdotool key Right
+sleep 0.6
+grid_tiles key-right
+grid_second="$(grid_focused_tile "$ARTIFACTS/a11y-grid-key-right.json")"
+[ -n "$grid_second" ] && [ "$grid_second" != "$grid_first" ] ||
+    fail G-GRID-ON-DEMAND "Right did not move the focus from '$grid_first' to the next tile (got '$grid_second')"
+xdotool key Escape
+cstate '.overview_open | not' "closed" 3 || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-GRID-ON-DEMAND "overview stayed open"; }
+sleep 1
+[ "$(grid_traced "$grid_mark" grid-drop)" = 1 ] ||
+    fail G-GRID-ON-DEMAND "the app grid's tiles outlived the overview"
+rm -f "$XDG_DATA_HOME/applications/tuna-move-Late.desktop"
+pass G-GRID-ON-DEMAND "no grid tiles on the window picker or after close; a held swipe and Show Apps list an app installed meanwhile; Down and Right walk the tiles"
 }
 
 . "$ROOT/scripts/lib/tuna-screenshot-keys-proof.sh"
@@ -1337,6 +1425,29 @@ fi
 # controls; that also proves the accessible tree.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel.json" 60 ||
     fail A11Y-PANEL "shell never registered on the accessibility bus"
+# G-SHELL-CAIRO (#503): a compositor on software GL tells its shell to
+# draw with cairo (GSK_RENDERER in the shell's environment), so the shell
+# makes no GL context of its own to find out and never loads Mesa's
+# rasterizer, LLVM or llvmpipe's threads. The proof's own Xvfb is always
+# software GL; on another display the compositor's word is taken.
+if [ "$INSTALLED_PACKAGE" = 0 ] && [ "$GRID_CANCEL_ONLY" = 0 ]; then
+    if grep -q 'tuna-compositor: OpenGL is .*; the shell draws with cairo' "$LOG"; then
+        cairo_shell="$(a11y_shell_pid)" || fail G-SHELL-CAIRO "expected exactly one owned shell"
+        tr '\0' '\n' <"/proc/$cairo_shell/environ" | grep -qx 'GSK_RENDERER=cairo' ||
+            fail G-SHELL-CAIRO "the shell was not started with GSK_RENDERER=cairo"
+        if grep -q 'tuna-shell-gtk: OpenGL is' "$LOG"; then
+            fail G-SHELL-CAIRO "the shell still made a GL context to read GL_RENDERER"
+        fi
+        if grep -E -q 'libgallium|libLLVM|_dri\.so' "/proc/$cairo_shell/maps"; then
+            fail G-SHELL-CAIRO "the shell loaded Mesa's rasterizer: $(grep -E -o 'libgallium[^ ]*|libLLVM[^ ]*|[a-z0-9_-]*_dri\.so' "/proc/$cairo_shell/maps" | sort -u | tr '\n' ' ')"
+        fi
+        pass G-SHELL-CAIRO "on software GL the compositor starts the shell with GSK_RENDERER=cairo; the shell maps no Mesa rasterizer"
+    elif [ -n "$OWNED_XVFB" ] && [ -z "${GSK_RENDERER:-}" ]; then
+        fail G-SHELL-CAIRO "the compositor on Xvfb's software GL did not choose cairo for its shell"
+    else
+        pass G-SHELL-CAIRO "the session chose its own renderer or OpenGL is not software; nothing to set"
+    fi
+fi
 if [ "$KEYBOARD_ROUTES_ONLY" = 1 ]; then
     cstate '.active_workspace != null and .locked == false' "keyboard routes desktop ready" ||
         fail G-PANEL-MENU-KEYS "desktop never became ready"
@@ -1384,6 +1495,7 @@ if [ "$A11Y_FOCUS_ONLY" = 1 ]; then
     # The startup cover must be gone before frames are read.
     sleep 3
     a11y_focus_ring_proof
+    if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_transient_stable_proof; fi
     if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_menu_restart_proof; fi
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
@@ -1395,6 +1507,7 @@ if [ "$GRID_HOVER_ONLY" = 1 ]; then
     # Let the startup cover settle before opening the grid.
     sleep 3
     grid_hover_proof
+    grid_on_demand_proof
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
     exit 0
@@ -2928,6 +3041,7 @@ rm -f "$XDG_DATA_HOME"/applications/tuna-drag-*.desktop
 sleep 1.5
 
 grid_hover_proof
+grid_on_demand_proof
 # Moving an item to another page leaves its old page short; a catalog
 # rebuild must respect those saved page boundaries instead of flattening.
 "$PY" "$ROOT/scripts/lib/grid-target-settled-tests.py" >"$ARTIFACTS/grid-target-settled-tests.log" 2>&1 ||
@@ -11835,6 +11949,7 @@ pass A11Y-GOLDEN "panel, calendar, quick settings and overview trees match their
 # admits. The installed run keeps its original shell for
 # G-INSTALLED-STABLE, so it proves only the focus indication.
 a11y_focus_ring_proof
+if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_transient_stable_proof; fi
 if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_menu_restart_proof; fi
 
 grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
