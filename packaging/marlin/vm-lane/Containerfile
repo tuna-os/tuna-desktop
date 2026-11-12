@@ -43,7 +43,7 @@ COPY packaging/marlin/vm-lane/tuna-vm-constraints.c /build/tuna-vm-constraints.c
 COPY packaging/marlin/vm-lane/tuna-vm-constraints-build /build/tuna-vm-constraints-build
 COPY packaging/marlin/vm-lane/tuna-vm-sandbox-client.c /build/tuna-vm-sandbox-client.c
 COPY packaging/marlin/vm-lane/tuna-vm-flatpak-build /build/tuna-vm-flatpak-build
-RUN pacman -S --needed --noconfirm gcc pkgconf wayland wayland-protocols wlr-protocols flatpak ostree \
+RUN pacman -S --needed --noconfirm gcc pkgconf wayland wayland-protocols flatpak ostree \
     && TUNA_CI_ONLY=1 /build/tuna-vm-constraints-build \
     && TUNA_CI_ONLY=1 /build/tuna-vm-flatpak-build
 
