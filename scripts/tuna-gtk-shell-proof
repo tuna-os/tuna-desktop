@@ -450,8 +450,11 @@
 # Frames and accessibility dumps land in the artifacts dir; assertions in
 # assertions.txt for the parity ledger.
 set -eu
-if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
-    TUNA_PROOF_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+# One owned session on a private bus (#1082): tuna-proof-session ends every
+# process this run started once it exits, on pass, on a failed gate and on a
+# signal, and fails the proof if one is still alive afterwards.
+if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ]; then
+    TUNA_PROOF_PRIVATE_BUS=1 exec "$(dirname -- "$0")/lib/tuna-proof-session" --bus -- "$0" "$@"
 fi
 unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -670,11 +673,6 @@ cleanup() {
     if [ -n "$OCCLUSION_PIDS" ]; then kill $OCCLUSION_PIDS 2>/dev/null || true; fi
     # shellcheck disable=SC2086
     if [ -n "$IME_PIDS" ]; then kill $IME_PIDS 2>/dev/null || true; fi
-    # The bridge daemonized ibus-daemon for this session's display.
-    if [ -n "${SOCKET_NAME:-}" ] && command -v ibus >/dev/null 2>&1; then
-        env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" \
-            ibus exit >/dev/null 2>&1 || true
-    fi
     if [ -n "$SCREENSAVER_PID" ]; then kill "$SCREENSAVER_PID" 2>/dev/null || true; fi
     if [ -n "$CAL_PID" ]; then kill "$CAL_PID" 2>/dev/null || true; fi
     for gsd_pid in $GSD_MEDIA_KEYS_PID $MPRIS_PID $GSD_BUS_PID $PW_PULSE_PID; do
@@ -697,11 +695,22 @@ cleanup() {
     if [ -n "$PW_PIDS" ]; then kill $PW_PIDS 2>/dev/null || true; fi
     for portal_pid in $PORTAL_PIDS; do kill "$portal_pid" 2>/dev/null || true; done
     if [ -n "${AT_SPI_PID:-}" ]; then kill "$AT_SPI_PID" 2>/dev/null || true; fi
+    # By PID, not over a bus that may be gone (#1082): the bridge's
+    # `ibus-daemon --daemonize` (`ibus exit` needs IBus's bus) and the AT-SPI
+    # registry, which outlives its accessibility bus.
+    cleanup_status=0
+    "$ROOT/scripts/lib/tuna-proof-session" --stop ibus-daemon at-spi2-registryd || cleanup_status=1
     rm -rf "${PIPEWIRE_RUNTIME_DIR:-/nonexistent}"
     if [ -n "$OWNED_RUNTIME" ]; then rm -rf "$OWNED_RUNTIME"; fi
     if [ -n "$SYSBUS_PID" ]; then kill "$SYSBUS_PID" 2>/dev/null || true; fi
+    # Nothing this run started may outlive it: a daemon that escapes the
+    # cleanup above fails the proof (tuna-proof-session then stops it).
+    "$ROOT/scripts/lib/tuna-proof-session" --check || cleanup_status=1
+    [ "$cleanup_status" = 0 ] || exit 1
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # Drive compositor animation time (TUNA_ANIMATION_CLOCK): the first
 # write freezes it, later writes move it to that moment plus N ms, and
 # removing the file resumes real time.

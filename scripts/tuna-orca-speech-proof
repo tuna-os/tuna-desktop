@@ -39,8 +39,8 @@
 # Writes assertions.txt for the parity ledger.
 set -eu
 
-if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
-    TUNA_PROOF_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ]; then
+    TUNA_PROOF_PRIVATE_BUS=1 exec "$(dirname -- "$0")/lib/tuna-proof-session" --bus -- "$0" "$@"
 fi
 unset CDPATH
 # Speech is logged as UTF-8 text: the password field's bullets included.

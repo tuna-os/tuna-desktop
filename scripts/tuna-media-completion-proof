@@ -61,7 +61,7 @@ def main():
              XDG_RUNTIME_DIR=str(fixture/'runtime'), XDG_CONFIG_HOME=str(fixture/'config'),
              XDG_CACHE_HOME=str(fixture/'cache'), XDG_DATA_HOME=str(fixture/'data'))
     env.pop('WAYLAND_DISPLAY',None);env.pop('WAYLAND_SOCKET',None)
-    argv=['dbus-run-session','--',str(binary),FILTER,'--exact','--ignored','--test-threads=1','--nocapture']
+    argv=[str(root/'scripts/lib/tuna-proof-session'),'--bus','--',str(binary),FILTER,'--exact','--ignored','--test-threads=1','--nocapture']
     with (args.artifacts/'output.txt').open('w') as out:
         child=subprocess.Popen(argv,env=env,stdin=subprocess.DEVNULL,stdout=out,stderr=subprocess.STDOUT,start_new_session=True)
         try:status=child.wait(timeout=60)

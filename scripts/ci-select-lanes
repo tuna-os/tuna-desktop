@@ -13,7 +13,8 @@ what its changed files (`git diff --name-only HEAD^1 HEAD` on the merge
 commit, or --changed) can affect:
 
 - shared CI inputs (this script, the Cargo workspace manifests, vendored
-  third-party crates, the nested-session launcher, and a ci.yml edit
+  third-party crates, the nested-session launcher, the proof session
+  helper and its preflight, and a ci.yml edit
   outside the lane jobs or to a job that is not a lane) run every lane; with
   --base a ci.yml edit to lane jobs runs only those lanes;
 - docs and other non-runtime files (including tooling of other workflows,
@@ -78,6 +79,9 @@ FULL = [
     "Cargo.lock",
     "third-party/*",
     "scripts/tuna-nested",
+    # Every nested proof runs in this session helper and its preflight.
+    "scripts/lib/tuna-proof-session",
+    "scripts/lib/tuna-proof-preflight",
 ]
 
 PACKAGE_CONSUMERS = ["arch-package", "portal-security", "remote-security",

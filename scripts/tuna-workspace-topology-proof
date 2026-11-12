@@ -5,7 +5,7 @@ Scoped empty-workspace counts and dynamic compaction. Explicit schema fixtures
 are recorded when installed schemas are absent. No installed Settings panel,
 window movement, multiple-output, startup-sequence or full parity claim.
 
-Run under dbus-run-session. --bin-dir points to a Cargo target/debug directory.
+Run under scripts/lib/tuna-proof-session --bus. --bin-dir points to a Cargo target/debug directory.
 Uses a private display, settings, runtime directory, and manual animation clock.
 This is local rendering evidence, not a GNOME paired benchmark or v1 verdict.
 """
@@ -22,6 +22,12 @@ import gi
 from gi.repository import Gio, GLib
 import time
 from PIL import Image
+import sys
+if __name__ == "__main__" and not os.environ.get("TUNA_PROOF_PRIVATE_BUS"):
+    # One owned session on a private bus: nothing this run starts outlives it (#1082).
+    session = str(Path(__file__).resolve().parent / "lib/tuna-proof-session")
+    os.execve(session, [session, "--bus", "--", sys.executable, *sys.argv],
+              os.environ | {"TUNA_PROOF_PRIVATE_BUS": "1"})
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument("--bin-dir", type=Path, required=True)
 p.add_argument("--artifacts", type=Path, required=True)

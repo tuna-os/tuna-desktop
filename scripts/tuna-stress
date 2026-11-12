@@ -354,9 +354,10 @@ def main():
         if not 1 <= args.rounds <= 5000:
             parser.error("--rounds must be between 1 and 5000")
         if not os.environ.get("TUNA_STRESS_PRIVATE_BUS"):
-            os.execvpe("dbus-run-session", ["dbus-run-session", "--", sys.executable,
-                       str(Path(__file__).resolve()), *sys.argv[1:]],
-                       os.environ | {"TUNA_STRESS_PRIVATE_BUS": "1"})
+            session = str(Path(__file__).resolve().parent / "lib/tuna-proof-session")
+            os.execve(session, [session, "--bus", "--", sys.executable,
+                                str(Path(__file__).resolve()), *sys.argv[1:]],
+                      os.environ | {"TUNA_STRESS_PRIVATE_BUS": "1"})
         run(args)
 
 

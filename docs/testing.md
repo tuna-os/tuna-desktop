@@ -442,6 +442,32 @@ and writes frames, logs, and usually an `assertions.txt` into the
 artifacts directory. A nonzero exit is a failure; the frames are for human
 review. CI shellchecks each script before running it.
 
+Every nested proof that starts a private bus, AT-SPI bus, IBus, PipeWire,
+Xvfb or other helper daemons runs as one owned session in
+`scripts/lib/tuna-proof-session` (#1082): the proof re-runs itself under
+it (`--bus` gives it the private session bus `dbus-run-session` used to).
+The helper is the subreaper of the session and marks every process with
+`TUNA_PROOF_SESSION`, so daemons that detach (`ibus-daemon --daemonize`,
+`dbus-daemon --fork`) stay findable. When the proof exits, passing,
+failing or stopped by INT/TERM/HUP (forwarded to it, with
+`TUNA_PROOF_SESSION_GRACE` seconds for its own cleanup), the helper stops
+what is left by PID, never over a bus: everything but message buses, then
+the remaining buses, then the private session bus, each with TERM, a
+bounded wait and KILL. A process still alive after KILL fails the proof.
+The gtk-shell proof also checks after its own cleanup
+(`tuna-proof-session --check`) that nothing it started escaped it, and
+fails naming what did.
+
+Before starting, the helper runs `scripts/lib/tuna-proof-preflight`. It
+reports session daemons that earlier proofs left running for this user
+(processes whose run has ended, or orphaned buses, IBus, AT-SPI, PipeWire
+and X servers carrying a proof's environment) and the user's inotify
+instances against `fs.inotify.max_user_instances`. With fewer than
+`TUNA_PROOF_INOTIFY_NEED` (32) free it refuses to start (exit 75) and says
+what to stop: at the limit GIO has no file monitors, so the shell misses
+new `.desktop` files and keyfile settings and gates fail for reasons
+unrelated to the change under test.
+
 The native grid-drag cancellation proof holds the pointer button until both
 the compositor reports cancellation and a fresh, complete, owner-bound AT-SPI
 tree restores the normal page arrow without a drag preview. Widget removal

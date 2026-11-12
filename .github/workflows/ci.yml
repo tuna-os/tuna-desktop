@@ -170,6 +170,8 @@ jobs:
         run: python3 scripts/tuna-maintained-media-refresh --verify-if-changed "$MEDIA_BASE_SHA"
       - run: python3 scripts/tests/test_disk_guard.py
       - run: python3 scripts/tests/test_reaper.py
+      # Nested proofs end every process they start, on pass, fail and signal (#1082).
+      - run: python3 scripts/tests/test_proof_session.py
       - run: python3 scripts/tests/test_local_timeout.py
       - run: /usr/bin/python3 scripts/tests/test_vm_strip_acceptance.py
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
@@ -850,7 +852,7 @@ jobs:
           /usr/bin/python3 scripts/tests/test_wellbeing_bundle.py
           /usr/bin/python3 scripts/tests/test_wellbeing_bytecode_contract.py
       - name: Prove live wellbeing framebuffer and screenshot pixels
-        run: dbus-run-session -- /usr/bin/python3 scripts/tuna-wellbeing-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --build-receipt "$RUNNER_TEMP/native-minimize/build.json" --artifacts "$RUNNER_TEMP/native-wellbeing" --display :111
+        run: /usr/bin/python3 scripts/tuna-wellbeing-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --build-receipt "$RUNNER_TEMP/native-minimize/build.json" --artifacts "$RUNNER_TEMP/native-wellbeing" --display :111
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:

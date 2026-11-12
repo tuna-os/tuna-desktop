@@ -265,6 +265,8 @@ Options a proof script reads from your environment:
 | `TUNA_STUB_SERVICES` | `scripts/lib/tuna-service-stubs.py:38`, `:587` | Comma-separated system services to stub: `nm`, `bluez`, `ppd`, `logind`, `polkit`, `gdm`. |
 | `TUNA_POLKIT_TEST_PASSWORD` | `scripts/lib/tuna-polkit-helper-stub.py:8-18` | Password the stub polkit helper accepts (default `tuna-proof`). |
 | `TUNA_REQUIRE_IBUS`, `TUNA_REQUIRE_WAYLAND_INFO`, `TUNA_REQUIRE_GSD_MEDIA_KEYS` | `scripts/tuna-gtk-shell-proof` | `1` fails the matching stage when its tool is missing instead of skipping it. |
+| `TUNA_PROOF_SESSION_GRACE` | `scripts/lib/tuna-proof-session` | Seconds (default 10) a stopped proof has for its own cleanup, and teardown waits after TERM before KILL. |
+| `TUNA_PROOF_INOTIFY_NEED` | `scripts/lib/tuna-proof-preflight` | Free inotify instances (default 32) a proof needs; with fewer it refuses to start. |
 | `TUNA_WALKTHROUGH_REPO_ROOT` | `scripts/tuna-walkthrough:393` | Repository the walkthrough freshness check reads. |
 | `TUNA_TRACE_WORK_DEADLINE` | `scripts/lib/perf_operation_budget.py:44-48` | Deadline handed from a performance script to its helpers. |
 | `XDG_STATE_HOME` | `scripts/tuna-nested` | Parent of the default artifacts directory, `$XDG_STATE_HOME/tuna-nested/<socket>`. |
@@ -272,7 +274,8 @@ Options a proof script reads from your environment:
 The other `TUNA_*` names in `scripts/` are set by a proof for its own child
 processes and are not options: the `TUNA_*_PRIVATE_BUS` and
 `TUNA_A11Y_PRIVATE_SESSION` markers that stop a script re-running itself
-under `dbus-run-session`, the `TUNA_STUB_*_LOG` call logs, the
+under `scripts/lib/tuna-proof-session`, that helper's `TUNA_PROOF_SESSION`
+run marker and `TUNA_PROOF_SESSION_BUS_PID`, the `TUNA_STUB_*_LOG` call logs, the
 `TUNA_TEST_*` controls for `scripts/lib/tuna-test-window.py`,
 `TUNA_FLASH_PROOF_ARTIFACTS` and `TUNA_PROOF_SOURCE_SHA` for proof helper
 scripts, and the ownership markers `TUNA_GRID_COMPARISON_OWNER` and
