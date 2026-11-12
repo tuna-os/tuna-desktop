@@ -237,4 +237,83 @@ class ReferencePolicy(unittest.TestCase):
                 self.assertEqual(result.stdout,base if status==0 else '')
 
 
+class ArchiveDownloader(unittest.TestCase):
+    """packaging/marlin/perf/tuna-pacman-fetch against a real local HTTP server."""
+    FETCH = ROOT/'packaging/marlin/perf/tuna-pacman-fetch'
+    BODY = bytes(range(256)) * 64
+
+    def serve(self, handler):
+        import socket, threading
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(8)
+        requests = []
+
+        def run():
+            while True:
+                try: conn, _ = listener.accept()
+                except OSError: return
+                with conn:
+                    data = b''
+                    while b'\r\n\r\n' not in data:
+                        chunk = conn.recv(4096)
+                        if not chunk: break
+                        data += chunk
+                    requests.append(data.decode('latin1'))
+                    handler(conn, requests)
+        threading.Thread(target=run, daemon=True).start()
+        self.addCleanup(listener.close)
+        return listener.getsockname()[1], requests
+
+    def fetch(self, port, out):
+        environment = dict(os.environ, TUNA_PACMAN_FETCH_DELAY='0', TUNA_PACMAN_FETCH_ATTEMPTS='4')
+        return subprocess.run([str(self.FETCH), str(out), f'http://127.0.0.1:{port}/extra.db'],
+                              env=environment, capture_output=True, text=True, timeout=60)
+
+    def test_a_transfer_cut_off_part_way_is_resumed_to_the_complete_file(self):
+        body = self.BODY
+
+        def handler(conn, requests):
+            request = requests[-1]
+            if len(requests) == 1:
+                # The archive's failure: headers promise the whole file, the
+                # connection ends after a third of it (curl exit 18).
+                conn.sendall(f'HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n'.encode()
+                             + body[:len(body)//3])
+                return
+            start = int(request.split('Range: bytes=', 1)[1].split('-', 1)[0])
+            rest = body[start:]
+            conn.sendall(f'HTTP/1.1 206 Partial Content\r\nContent-Length: {len(rest)}\r\n'
+                         f'Content-Range: bytes {start}-{len(body)-1}/{len(body)}\r\nConnection: close\r\n\r\n'.encode() + rest)
+        port, requests = self.serve(handler)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)/'extra.db'
+            result = self.fetch(port, out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(out.read_bytes(), body)
+        self.assertEqual(len(requests), 2)
+        self.assertIn(f'Range: bytes={len(body)//3}-', requests[1])
+        self.assertIn('curl exit 18', result.stderr)
+
+    def test_a_missing_file_is_reported_at_once_without_retries(self):
+        def handler(conn, requests):
+            conn.sendall(b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+        port, requests = self.serve(handler)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.fetch(port, Path(tmp)/'extra.db')
+        self.assertEqual(result.returncode, 22, result.stderr)
+        self.assertEqual(len(requests), 1)
+
+    def test_a_server_that_always_cuts_off_fails_after_the_bounded_attempts(self):
+        body = self.BODY
+
+        def handler(conn, requests):
+            conn.sendall(f'HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n'.encode())
+        port, requests = self.serve(handler)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.fetch(port, Path(tmp)/'extra.db')
+        self.assertEqual(result.returncode, 18, result.stderr)
+        self.assertEqual(len(requests), 4)
+
+
 if __name__=='__main__':unittest.main()
