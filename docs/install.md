@@ -25,6 +25,8 @@ curl -fsSL https://raw.githubusercontent.com/tuna-os/tuna-desktop/main/scripts/t
 
 This downloads Corral (checksum-verified), pulls and cosign-verifies the published TunaOS image, and launches Tuna Desktop in local QEMU with a local-only browser console over noVNC. Stop anytime with Ctrl-C. See `scripts/try-tuna-desktop` for options (`TRY_TUNA_MEM`, `TRY_TUNA_PORT`, etc.).
 
+If it stops with `no signatures published for ...`, the pipeline published that build unsigned: the script checks signatures before the multi-GB download and refuses an image that cannot pass verification. Retry when a signed build publishes, or set `TRY_TUNA_IMAGE` to a signed build.
+
 ## From the Debian-format package
 
 The package ships the preferred GTK shell beside the compositor. The first
