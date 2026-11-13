@@ -88,6 +88,7 @@ pub mod animation_clock;
 mod auth_owner;
 mod bell;
 pub mod capture_security;
+mod client_listener;
 pub mod clipboard_manager;
 pub mod color_manager;
 mod constraint_motion;
@@ -117,6 +118,7 @@ pub mod lock;
 pub mod lockdown;
 mod logind_session;
 pub mod magnifier;
+pub mod malloc;
 pub mod menu_close;
 pub mod minimize;
 pub mod modal_dim;
@@ -127,6 +129,7 @@ pub mod native_output;
 mod native_repaint;
 pub mod night_light;
 pub(crate) mod night_light_settings;
+pub mod nofile;
 pub mod numlock;
 mod occlusion;
 pub mod orca;
@@ -155,6 +158,7 @@ mod sandbox_identity;
 pub mod screencast;
 pub mod screenshot;
 pub mod screenshot_flash;
+pub mod security_listener;
 pub mod session_lock;
 pub mod session_manager;
 pub mod session_services;
@@ -304,6 +308,9 @@ pub struct State {
     /// Client window-state requests awaiting the manager's next
     /// `reconcile` drain (002 window actions).
     pub(crate) window_requests: Vec<(wl_surface::WlSurface, WindowRequest)>,
+    /// Serial of the latest pointer button press sent to a client: Mutter's
+    /// `grab_serial`, which xdg_toplevel.show_window_menu must name.
+    pub(crate) pointer_press_serial: Option<Serial>,
     /// Exact native parent at role destruction, consumed on the next reconcile.
     /// Smithay clears role data immediately after `toplevel_destroyed` returns.
     pub(crate) closed_toplevel_parents:
@@ -698,13 +705,32 @@ impl XdgShellHandler for State {
 
     /// Queue a window-menu request (header-bar right click) for the
     /// manager drain; the shell draws GNOME's window menu there.
+    ///
+    /// Mutter (xdg_toplevel_show_window_menu) shows the menu only for the
+    /// serial of the latest press, with the pointer still on this surface
+    /// or one of its subsurfaces (meta_wayland_pointer_get_grab_info, not
+    /// requiring the button to be held: GTK asks on press and the release
+    /// may already be in). Anything else, such as a client with no input
+    /// at all, is ignored instead of opening a modal menu.
     fn show_window_menu(
         &mut self,
         surface: ToplevelSurface,
-        _seat: wl_seat::WlSeat,
-        _serial: Serial,
+        seat: wl_seat::WlSeat,
+        serial: Serial,
         location: smithay::utils::Point<i32, smithay::utils::Logical>,
     ) {
+        if !self.seat.owns(&seat) || self.pointer_press_serial != Some(serial) {
+            return;
+        }
+        let Some(mut focus) = self.seat.get_pointer().and_then(|p| p.current_focus()) else {
+            return;
+        };
+        while focus != *surface.wl_surface() {
+            let Some(parent) = smithay::wayland::compositor::get_parent(&focus) else {
+                return;
+            };
+            focus = parent;
+        }
         self.window_requests.push((
             surface.wl_surface().clone(),
             WindowRequest::Menu(location.x, location.y),
@@ -1149,10 +1175,13 @@ pub struct TestCompositor {
     security_listeners: calloop::EventLoop<'static, SecurityListenerData>,
     /// Clients accepted on security-context listeners, in accept order.
     security_clients: Vec<Client>,
+    /// Accept attempts on security-context listeners that failed.
+    security_accept_failures: u32,
 }
 
-/// What a test's security-context listener needs to admit a client.
-type SecurityListenerData = (DisplayHandle, Vec<Client>);
+/// What a test's security-context listener needs to admit a client, and
+/// its count of failed accepts.
+type SecurityListenerData = (DisplayHandle, Vec<Client>, u32);
 
 impl Default for TestCompositor {
     fn default() -> Self {
@@ -1205,6 +1234,7 @@ impl State {
             outputs: Vec::new(),
             retired_output_globals: Vec::new(),
             window_requests: Vec::new(),
+            pointer_press_serial: None,
             closed_toplevel_parents: std::collections::HashMap::new(),
             pongs: Vec::new(),
             protocols: protocols::Protocols::new(dh),
@@ -1594,6 +1624,7 @@ impl TestCompositor {
             state,
             security_listeners: calloop::EventLoop::try_new().unwrap(),
             security_clients: Vec::new(),
+            security_accept_failures: 0,
         }
     }
 
@@ -1638,10 +1669,15 @@ impl TestCompositor {
         for (source, context) in self.state.take_security_contexts() {
             listeners
                 .insert_source(
-                    source,
-                    move |stream, _, (dh, accepted): &mut SecurityListenerData| {
-                        let data = ClientState::security_context(&stream, context.clone());
-                        accepted.push(dh.insert_client(stream, Arc::new(data)).unwrap());
+                    security_listener::RestingListener::new(source),
+                    move |accept, _, (dh, accepted, failures): &mut SecurityListenerData| {
+                        match accept {
+                            security_listener::Accept::Client(stream) => {
+                                let data = ClientState::security_context(&stream, context.clone());
+                                accepted.push(dh.insert_client(stream, Arc::new(data)).unwrap());
+                            }
+                            security_listener::Accept::Failed { .. } => *failures += 1,
+                        }
                     },
                 )
                 .map_err(|error| error.error)
@@ -1650,11 +1686,12 @@ impl TestCompositor {
         let mut data = (
             self.display.handle(),
             std::mem::take(&mut self.security_clients),
+            self.security_accept_failures,
         );
         self.security_listeners
             .dispatch(std::time::Duration::ZERO, &mut data)
             .unwrap();
-        self.security_clients = data.1;
+        (_, self.security_clients, self.security_accept_failures) = data;
         self.display.flush_clients().unwrap();
     }
 
@@ -1674,6 +1711,13 @@ impl TestCompositor {
             .iter()
             .filter_map(|client| client.get_data::<ClientState>()?.security_context.clone())
             .collect()
+    }
+
+    /// How many accept attempts on security-context listeners have failed
+    /// so far. Each one rests its listener for
+    /// [`security_listener::REST`] (#1071).
+    pub fn security_accept_failures(&self) -> u32 {
+        self.security_accept_failures
     }
 
     /// Seat input at `now`, as the runtime's input path reports it to
