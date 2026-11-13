@@ -5,6 +5,8 @@ on:
     - cron: '41 3 * * *'
   workflow_dispatch:
   pull_request:
+    # Draft pull requests skip the stress jobs; marking one ready starts them.
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'scripts/tuna-stress'
       - 'scripts/tuna-hotplug-stress'
@@ -22,6 +24,7 @@ concurrency:
 
 jobs:
   churn:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-26.04
     timeout-minutes: 90
     steps:
@@ -59,6 +62,7 @@ jobs:
     # instance (Linux 6.19+, so the 26.04 image's 7.0 kernel) whose B and
     # C connectors are plugged and unplugged under a hardware session with
     # the GTK shell and real GTK clients. See docs/testing.md.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
