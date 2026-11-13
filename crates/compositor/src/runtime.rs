@@ -92,6 +92,63 @@ struct NextWake {
     /// Nothing is due within `after`, which is the [`IDLE_WAKE`]
     /// fallback: a tick that no event source precedes is an idle tick.
     idle: bool,
+    /// Nothing moves and no calloop timer is armed: a wake that finds
+    /// only page flips ready before `after` ends is served by
+    /// [`Runtime::dispatch_flips`] and [`Runtime::flip_tick`] (#503).
+    flips: bool,
+}
+
+/// The DRM device's events (#503), on a loop of their own that the main
+/// loop holds as one descriptor. A full dispatch serves them as before.
+/// A wait that finds only them ready serves them alone, as Mutter's frame
+/// clock idles after a presentation that leaves nothing to draw:
+/// whatever else arrives meanwhile stays pending for the full tick that
+/// follows, as after an idle wait.
+#[cfg(feature = "drm")]
+struct FlipLoop {
+    events: EventLoop<'static, Runtime>,
+    /// The nested loop's descriptor in the main loop.
+    token: calloop::RegistrationToken,
+}
+
+#[cfg(feature = "drm")]
+impl FlipLoop {
+    fn new(
+        source: smithay::backend::drm::DrmDeviceNotifier,
+        main: &LoopHandle<'static, Runtime>,
+    ) -> Result<Self, RuntimeError> {
+        use std::os::fd::AsFd;
+        let events: EventLoop<'static, Runtime> =
+            EventLoop::try_new().map_err(|e| RuntimeError::Loop(e.to_string()))?;
+        events
+            .handle()
+            .insert_source(source, |event, metadata, rt: &mut Runtime| {
+                let flip = match &mut rt.backend {
+                    Backend::Drm(drm) => drm.on_drm_event(event, metadata),
+                    Backend::Winit(_) => None,
+                };
+                match flip {
+                    Some(flip) => rt.page_flipped(flip),
+                    // An error or an unknown CRTC: let a full render look.
+                    None => rt.flip_changed = true,
+                }
+            })
+            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+        let fd = events
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+        let token = main
+            .insert_source(
+                calloop::generic::Generic::new(fd, calloop::Interest::READ, calloop::Mode::Level),
+                |_, _, rt: &mut Runtime| {
+                    rt.dispatch_flips();
+                    Ok(calloop::PostAction::Continue)
+                },
+            )
+            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+        Ok(Self { events, token })
+    }
 }
 
 /// Display-rate ticks continue this long after the last input event or
@@ -666,6 +723,19 @@ pub struct Runtime {
     /// yet. They are not descriptors, so the idle wait cannot see one
     /// fall due: while any is armed the loop keeps dispatching.
     loop_timers: usize,
+    /// The DRM device's page-flip events, on a loop of their own so that a
+    /// wake that brought nothing else is served without a full tick
+    /// ([`FlipLoop`]).
+    #[cfg(feature = "drm")]
+    flips: Option<FlipLoop>,
+    /// What the last page-flip dispatch changed must be drawn: it applied
+    /// commits a fifo barrier or commit timer held back, delivered an
+    /// event other than a completed flip, or freed an output whose frame
+    /// the last render had to defer.
+    flip_changed: bool,
+    /// The last render left an output without the frame it needed,
+    /// because that output's previous flip was still pending.
+    frame_owed: bool,
     /// A hardware button release that would end a direct strip move or
     /// resize, held until the current dispatch finishes (see the input
     /// source in `launch`).
@@ -944,6 +1014,8 @@ impl Runtime {
         }
         let event_loop = EventLoop::try_new().map_err(|e| RuntimeError::Loop(e.to_string()))?;
         let choice = session.backend.resolve(has_host_display());
+        #[cfg(feature = "drm")]
+        let mut flips = None;
         let backend = match choice {
             #[cfg(feature = "drm")]
             BackendChoice::Drm => {
@@ -965,17 +1037,7 @@ impl Runtime {
                         rt.on_session_event(event);
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-                handle
-                    .insert_source(sources.drm, |event, metadata, rt: &mut Runtime| {
-                        let flip = match &mut rt.backend {
-                            Backend::Drm(drm) => drm.on_drm_event(event, metadata),
-                            Backend::Winit(_) => None,
-                        };
-                        if let Some(flip) = flip {
-                            rt.page_flipped(flip);
-                        }
-                    })
-                    .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                flips = Some(FlipLoop::new(sources.drm, &handle)?);
                 if let Some(udev) = sources.udev {
                     handle
                         .insert_source(udev, |event, _, rt: &mut Runtime| {
@@ -1437,6 +1499,10 @@ impl Runtime {
             xwayland: XWaylandSupervisor::new(),
             loop_handle,
             loop_timers: 0,
+            #[cfg(feature = "drm")]
+            flips,
+            flip_changed: false,
+            frame_owed: false,
             #[cfg(feature = "drm")]
             strip_release_held: None,
             #[cfg(feature = "xwayland")]
@@ -3760,6 +3826,7 @@ impl Runtime {
                     scale,
                     blank_alpha: 0.0,
                     tint: color_effect.as_ref(),
+                    opaque: false,
                 },
                 &[],
                 &[],
@@ -4000,6 +4067,7 @@ impl Runtime {
                                 scale: view.scale,
                                 blank_alpha,
                                 tint: color_effect.as_ref(),
+                                opaque: false,
                             },
                             &decor,
                             &previews,
@@ -4038,6 +4106,7 @@ impl Runtime {
                         // Captures stay untinted, like GNOME's (gamma
                         // applies past the framebuffer).
                         tint: color_effect.as_ref(),
+                        opaque: false,
                     },
                     &decor,
                     &previews,
@@ -4880,6 +4949,7 @@ impl Runtime {
             Some(due) => NextWake {
                 after: wake.after.min(due),
                 idle: false,
+                flips: false,
             },
             None => wake,
         }
@@ -4924,6 +4994,7 @@ impl Runtime {
         let moving = NextWake {
             after: FRAME_BUDGET,
             idle: false,
+            flips: false,
         };
         #[cfg(feature = "drm")]
         let native = matches!(self.backend, Backend::Drm(_));
@@ -5043,16 +5114,17 @@ impl Runtime {
             }
             None => wake,
         };
+        // The idle wait watches descriptors only and an idle tick does not
+        // draw: a pending calloop timer, shell files nobody reports (the
+        // tick reads them instead) and a wallpaper that follows the clock
+        // all keep the loop to its full ticks.
+        let quiet = self.loop_timers == 0 && self.blank_watched && !self.wallpaper.follows_clock();
         NextWake {
             after,
-            // The idle wait watches descriptors only and an idle tick
-            // does not draw: a pending calloop timer, shell files nobody
-            // reports (the tick reads them instead) and a wallpaper that
-            // follows the clock all keep the loop to its full ticks.
-            idle: !timed
-                && self.loop_timers == 0
-                && self.blank_watched
-                && !self.wallpaper.follows_clock(),
+            idle: !timed && quiet,
+            // A timed producer falls due only when `after` ends: a page
+            // flip before then changes nothing it serves.
+            flips: quiet,
         }
     }
 
@@ -5098,7 +5170,24 @@ impl Runtime {
         self.run_tick(true)
     }
 
+    /// The tick after page flips served alone ([`Runtime::dispatch_flips`],
+    /// #503): what they presented is sent to the clients, and a full tick
+    /// follows only when they changed something to draw. Nothing else was
+    /// received, and whatever arrives meanwhile is still pending for the
+    /// next wait, which ends at once.
+    fn flip_tick(&mut self) -> Result<bool, RuntimeError> {
+        if std::mem::take(&mut self.flip_changed) {
+            return self.tick();
+        }
+        self.display
+            .flush_clients()
+            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        Ok(!self.exit)
+    }
+
     fn run_tick(&mut self, idle: bool) -> Result<bool, RuntimeError> {
+        // A full tick draws what the page flips it follows changed.
+        self.flip_changed = false;
         if self.blank_stale || !self.blank_watched {
             self.blank_stale = false;
             if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -5638,6 +5727,57 @@ impl Runtime {
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         Ok(!self.exit)
+    }
+
+    /// Serve the DRM device's pending events, and nothing else (#503).
+    /// What they change is noted in `flip_changed`: commits a refresh
+    /// cycle released, or an output freed for the frame the last render
+    /// had to defer.
+    #[cfg(feature = "drm")]
+    fn dispatch_flips(&mut self) {
+        let Some(mut flips) = self.flips.take() else {
+            return;
+        };
+        let commits = self.state.commit_count;
+        if let Err(error) = flips.events.dispatch(Some(Duration::ZERO), self) {
+            eprintln!("tuna-compositor: drm: page flip dispatch: {error}");
+            self.flip_changed = true;
+        }
+        self.flips = Some(flips);
+        if self.state.commit_count != commits || self.frame_owed {
+            self.flip_changed = true;
+        }
+    }
+
+    /// Whether, of everything the main loop watches, only the DRM device
+    /// has events ready (#503): the page flips can then be served alone.
+    /// The flip loop's descriptor leaves the main loop's set for the check.
+    #[cfg(feature = "drm")]
+    fn flips_alone(&self, events: &EventLoop<'static, Runtime>) -> bool {
+        let Some(flips) = &self.flips else {
+            return false;
+        };
+        if !crate::wake::ready_within(&flips.events, Duration::ZERO).unwrap_or(false) {
+            return false;
+        }
+        let handle = events.handle();
+        if handle.disable(&flips.token).is_err() {
+            return false;
+        }
+        let others = crate::wake::ready_within(events, Duration::ZERO);
+        if let Err(error) = handle.enable(&flips.token) {
+            eprintln!("tuna-compositor: drm: page flips unwatched: {error}");
+            return false;
+        }
+        matches!(others, Ok(false))
+    }
+
+    #[cfg(not(feature = "drm"))]
+    fn dispatch_flips(&mut self) {}
+
+    #[cfg(not(feature = "drm"))]
+    fn flips_alone(&self, _events: &EventLoop<'static, Runtime>) -> bool {
+        false
     }
 
     /// A page flip completed (hardware): mark what the frame drew
@@ -6333,14 +6473,12 @@ impl Runtime {
                         blank_alpha,
                         accent,
                         decor: decor.clone(),
-                        above: elements.above,
-                        effects: elements
-                            .brightness
-                            .iter()
-                            .copied()
-                            .chain(elements.snapshots.iter().map(|s| s.2))
-                            .map(f32::to_bits)
-                            .chain(self.night_light.effect_bits())
+                        under_tile: elements.under_tile(),
+                        dimmed: elements.dimmed(),
+                        effects: self
+                            .night_light
+                            .effect_bits()
+                            .into_iter()
                             .chain(wellbeing.bits())
                             .chain(zoom_plan.iter().flat_map(|plan| plan.signature_bits()))
                             .collect(),
@@ -6419,6 +6557,7 @@ impl Runtime {
                                             scale: view.scale,
                                             blank_alpha,
                                             tint: night_tint.as_ref(),
+                                            opaque: false,
                                         },
                                         &decor,
                                         &previews,
@@ -6459,6 +6598,7 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: night_tint.as_ref(),
+                                        opaque: false,
                                     },
                                     &decor,
                                     &previews,
@@ -6532,11 +6672,14 @@ impl Runtime {
                     rects.iter().position(|r| r.contains(*at)).unwrap_or(0)
                 };
                 let mut queued = false;
+                let mut owed = false;
                 let mut cursor_presented = false;
                 for (index, out) in outputs.iter_mut().enumerate() {
                     // Display-paced: one frame in flight per output; a
-                    // switched-off CRTC gets none (#340).
+                    // switched-off CRTC gets none (#340). Its flip lets
+                    // the next render look again.
                     if out.pending || !out.enabled {
+                        owed |= out.pending && out.enabled;
                         continue;
                     }
                     let size = out.size;
@@ -6679,16 +6822,14 @@ impl Runtime {
                         blank_alpha,
                         accent,
                         decor: decor.clone(),
-                        above: elements.above,
-                        effects: elements
-                            .brightness
-                            .iter()
-                            .copied()
-                            .chain(elements.snapshots.iter().map(|s| s.2))
-                            .map(f32::to_bits)
-                            // Night Light gains: a temperature step
-                            // repaints, an unchanged filter sleeps.
-                            .chain(self.night_light.effect_bits())
+                        under_tile: elements.under_tile(),
+                        dimmed: elements.dimmed(),
+                        // Night Light gains: a temperature step
+                        // repaints, an unchanged filter sleeps.
+                        effects: self
+                            .night_light
+                            .effect_bits()
+                            .into_iter()
                             .chain(wellbeing.bits())
                             .chain(zoom_plan.iter().flat_map(|plan| plan.signature_bits()))
                             .collect(),
@@ -6781,6 +6922,7 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: output_tint,
+                                        opaque: false,
                                     },
                                     &decor,
                                     &previews,
@@ -6826,6 +6968,9 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: output_tint,
+                                        // GLES places opaque regions right only without a transform.
+                                        opaque: crate::orientation::render_transform(out.transform)
+                                            == Transform::Normal,
                                     },
                                     &decor,
                                     &previews,
@@ -6895,6 +7040,7 @@ impl Runtime {
                     // animations wake the loop, as Mutter's frame clock
                     // idles between a client's frames.
                 }
+                self.frame_owed = owed;
                 queued
             }
         };
@@ -7228,6 +7374,32 @@ impl Scene {
             dim_program: None,
             owners: vec![None; above],
         }
+    }
+
+    /// How many surfaces draw beneath the tile preview. Only this changes
+    /// the drawing order between scene passes; surfaces that come and go
+    /// in front of the preview, as every surface does without a dragged
+    /// window, are the damage tracker's.
+    fn under_tile(&self) -> usize {
+        self.elements.len().saturating_sub(self.above)
+    }
+
+    /// The dimmed surfaces and snapshots, by element id, with their
+    /// brightness ([`crate::native_repaint::FrameSignature::dimmed`]).
+    fn dimmed(&self) -> Vec<(smithay::backend::renderer::element::Id, u32)> {
+        use smithay::backend::renderer::element::Element;
+        self.elements
+            .iter()
+            .zip(&self.brightness)
+            .filter(|(_, brightness)| **brightness != 1.0)
+            .map(|(element, brightness)| (element.id().clone(), brightness.to_bits()))
+            .chain(
+                self.snapshots
+                    .iter()
+                    .filter(|(_, _, brightness)| *brightness != 1.0)
+                    .map(|(_, element, brightness)| (element.id().clone(), brightness.to_bits())),
+            )
+            .collect()
     }
 }
 
@@ -7831,6 +8003,9 @@ struct Target<'a> {
     blank_alpha: f32,
     /// Scene wellbeing effect and output temperature; captures use unity temperature.
     tint: Option<&'a FrameColor>,
+    /// Draw what elements declare opaque without blending: only a frame
+    /// rendered without a transform (`draw_planned`).
+    opaque: bool,
 }
 
 fn draw_scene(
@@ -7852,6 +8027,7 @@ fn draw_scene(
         scale,
         blank_alpha,
         tint,
+        opaque,
     } = target;
     let recolor = |color| tint.map_or(color, |tint| tint.color(color));
     let background = recolor(background);
@@ -7933,7 +8109,7 @@ fn draw_scene(
         frame.clear(background, &clear).map_err(error)?;
     }
     set_tint(frame, 1.0);
-    draw_planned::<GlesRenderer, _>(frame, 1.0, paper, &paper_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, paper, &paper_plan, opaque).map_err(error)?;
     frame.clear_tex_program_override();
     for ((color, _), rects) in decor.iter().zip(decor_plan.iter().rev()) {
         if !rects.is_empty() {
@@ -7943,21 +8119,36 @@ fn draw_scene(
     // Surfaces carry logical sizes: draw them at the output scale. The
     // wallpaper above is already sized in physical pixels.
     set_tint(frame, 1.0);
-    draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan, opaque)
+        .map_err(error)?;
     frame.clear_tex_program_override();
-    draw_slots(frame, scale, scene, &under, &under_plan, tint).map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan).map_err(error)?;
-    draw_slots(frame, scale, scene, &over, &over_plan, tint).map_err(error)?;
+    draw_slots(frame, scale, scene, &under, &under_plan, tint, opaque).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan, opaque).map_err(error)?;
+    draw_slots(frame, scale, scene, &over, &over_plan, tint, opaque).map_err(error)?;
     set_tint(frame, 1.0);
-    draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan, opaque).map_err(error)?;
     frame.clear_tex_program_override();
-    draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan).map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.effects.textures, &effect_textures_plan)
+    draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan, opaque)
         .map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.effects.solids, &effect_solids_plan)
+    draw_planned::<GlesRenderer, _>(
+        frame,
+        1.0,
+        &scene.effects.textures,
+        &effect_textures_plan,
+        opaque,
+    )
+    .map_err(error)?;
+    draw_planned::<GlesRenderer, _>(
+        frame,
+        1.0,
+        &scene.effects.solids,
+        &effect_solids_plan,
+        opaque,
+    )
+    .map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, flashes, &flash_plan, opaque).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan, opaque)
         .map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, flashes, &flash_plan).map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan).map_err(error)?;
     let mut scene_visible = vec![false; scene.elements.len()];
     for (slot, shown) in over
         .iter()
@@ -8109,6 +8300,7 @@ fn draw_slots(
     slots: &[SceneSlot],
     plan: &[Vec<Rectangle<i32, smithay::utils::Physical>>],
     tint: Option<&FrameColor>,
+    opaque: bool,
 ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
     use crate::occlusion::draw_planned;
     for (slot, visible) in slots.iter().zip(plan).rev() {
@@ -8140,6 +8332,7 @@ fn draw_slots(
                 scale,
                 std::slice::from_ref(&scene.elements[index]),
                 visible,
+                opaque,
             ),
             SceneSlot::Bell(k) => draw_planned::<GlesRenderer, _>(
                 frame,
@@ -8158,12 +8351,14 @@ fn draw_slots(
                     )
                 }),
                 visible,
+                opaque,
             ),
             SceneSlot::Snapshot(k) => draw_planned::<GlesRenderer, _>(
                 frame,
                 1.0,
                 std::slice::from_ref(&scene.snapshots[k].1),
                 visible,
+                opaque,
             ),
         };
         frame.clear_tex_program_override();
@@ -8505,6 +8700,7 @@ fn run_loop(
     let mut next = NextWake {
         after: Duration::ZERO,
         idle: false,
+        flips: false,
     };
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -8515,17 +8711,29 @@ fn run_loop(
         // fallback wake without dispatching it. If none does, nothing was
         // received and the tick is an idle one; the loop is not dispatched
         // then, so nothing arriving meanwhile is consumed behind its back.
-        let (quiet, wait) = if next.idle {
+        // Likewise when only page flips arrived before anything fell due:
+        // they are served alone, and an idle tick follows.
+        let waited = Instant::now();
+        let (quiet, flips, wait) = if next.idle || next.flips {
             match crate::wake::ready_within(&event_loop, next.after) {
-                Ok(true) => (false, Duration::ZERO),
-                Ok(false) => (true, Duration::ZERO),
+                Ok(true) => (
+                    false,
+                    next.flips
+                        && (next.idle || waited.elapsed() < next.after)
+                        && runtime.flips_alone(&event_loop),
+                    Duration::ZERO,
+                ),
+                Ok(false) => (next.idle, false, Duration::ZERO),
                 // Interrupted: wait in the dispatch itself, as ever.
-                Err(_) => (false, next.after),
+                Err(_) => (false, false, next.after),
             }
         } else {
-            (false, next.after)
+            (false, false, next.after)
         };
         let dispatched = if quiet {
+            Ok(())
+        } else if flips {
+            runtime.dispatch_flips();
             Ok(())
         } else {
             event_loop
@@ -8546,6 +8754,8 @@ fn run_loop(
         let ticked = dispatched.and_then(|_| {
             if quiet {
                 runtime.idle_tick()
+            } else if flips {
+                runtime.flip_tick()
             } else {
                 runtime.tick()
             }
@@ -8566,6 +8776,7 @@ fn run_loop(
                             .after
                             .min(delay.clamp(Duration::from_millis(1), Duration::from_millis(100))),
                         idle: false,
+                        flips: false,
                     };
                 }
                 continue;

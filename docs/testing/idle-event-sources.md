@@ -35,6 +35,24 @@ The loop keeps to full ticks, as before, while a calloop timer is armed
 there), while the runtime directory is not watched, and while the wallpaper is
 a slideshow, which follows the wall clock.
 
+## Page-flip ticks
+
+The DRM device's events have an event loop of their own, which the main loop
+holds as one descriptor (`FlipLoop`). A full dispatch serves them as before.
+When the loop waits itself (nothing moves, no calloop timer is armed, the
+runtime directory is watched, no slideshow) and the wait ends with only the
+DRM device ready, before any timed producer is due, the page flips are served
+alone (`Runtime::dispatch_flips`): their presentation feedback and released
+commits reach the clients, and no tick runs (`Runtime::flip_tick`). A full
+tick follows only when the flips changed something: a refresh cycle applied a
+commit that a fifo barrier or commit timer held back, an event was not a
+completed flip, or the last render had to leave an output without its frame
+because that output's previous flip was pending. Whatever else arrives
+meanwhile stays pending for the full tick that follows, as after an idle
+wait. This is Mutter's frame clock going idle after a presentation that
+leaves nothing to draw: a client committing ten times a second costs ten
+ticks, not twenty (#503).
+
 ## Event sources
 
 | Producer | Source |
@@ -43,9 +61,10 @@ a slideshow, which follows the wall clock.
 | Shell control | Hub epoll set (`control_readiness`): listener and every accepted socket from accept on |
 | Child exits (shell, IME/XIM, Orca, XWayland, bell player), SIGTERM, SIGINT | One signal-hook socket pair (`wake::signal_source`) |
 | Idle-blank file, wallpaper drop | inotify on `XDG_RUNTIME_DIR` (`wake::file_watch`); each file is read again only after a change there. Not watched when the state document is written there; then both are read every tick |
+| Wallpaper picture | inotify on the picture's directory, each symbolic link's on the way and the file itself, placed by the observation worker before it reads anything, which then waits on it (`wallpaper::SourceWatch`); one wake per change, then one observation |
 | `org.gnome.desktop.lockdown` `disable-lock-screen` | GSettings `changed` on an owned GIO thread (`lockdown_settings`), then the `wake::Wake` ping; no `gsettings` process |
 | X11 window icons | `PropertyNotify` for `_NET_WM_ICON` and `WM_HINTS` on the icon worker's own X connection (`x11_icons`), then the `wake::Wake` ping; the worker is told of the windows only when they change |
-| Worker threads: IdleMonitor registrations, `org.gnome.SessionManager` inhibitors (taken, released or their owner gone), Orca watchers and departures, wallpaper identity/decode/card, Night Light, focus policy and tablet settings, IME address probe, PAM, logind sleep | One per-runtime coalesced `wake::Wake` ping; completion wakes fire after the result is published, including on unwind |
+| Worker threads: IdleMonitor registrations, `org.gnome.SessionManager` inhibitors (taken, released or their owner gone), Orca watchers and departures, wallpaper identity/decode/card and source watch, Night Light, focus policy and tablet settings, IME address probe, PAM, logind sleep | One per-runtime coalesced `wake::Wake` ping; completion wakes fire after the result is published, including on unwind |
 | KMS presentation | DRM page-flip source |
 
 The colord thread is not part of the loop. It blocks on its channel: colord
@@ -63,9 +82,11 @@ casts, or a PAM worker that has not published its terminal phase.
 
 Otherwise the earliest of, never sooner than one frame: the lock timeout and
 idle-blank threshold (16 ms during the blank fade; none while an inhibitor is
-held), IdleMonitor, idle-notify and Orca deadlines, workspace leases, wallpaper
-source re-observation, Night Light preview expiry and settings re-read, the
-focus-policy and tablet settings re-reads, focus and alive-check deadlines,
+held), IdleMonitor, idle-notify and Orca deadlines, workspace leases, the
+wallpaper's safety re-observation (every 5 s, only for a source no watch
+vouches for and for a slideshow), Night Light preview expiry and settings
+re-read, the focus-policy and tablet settings re-reads, focus and alive-check
+deadlines,
 the window-session save, the lock conversation's deadline, bell player limit,
 XWayland restart backoff, the X11 icon retry (only while the X server did not
 answer), IME restart gates (not while locked), the hidden-window and
