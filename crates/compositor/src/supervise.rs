@@ -426,6 +426,7 @@ impl ShellDriver {
         let env = &self.env;
         let mut remake = || {
             let mut command = Command::new(bin);
+            crate::nofile::restore_in_child(&mut command);
             command.env("WAYLAND_DISPLAY", wayland_display);
             // The shell's IBus panel must discover this session's private bus,
             // rather than inherit an outer session's explicit address.
