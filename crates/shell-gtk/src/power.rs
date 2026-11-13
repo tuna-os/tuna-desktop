@@ -889,6 +889,7 @@ impl PowerUi {
         let updates_check = gtk::CheckButton::with_label(INSTALL_UPDATES);
         updates_check.set_halign(gtk::Align::Center);
         updates_check.set_visible(false);
+        crate::ibus_property_menu::expose_toggle_action(&updates_check);
         let battery_warning = gtk::Label::new(Some(LOW_BATTERY_WARNING));
         battery_warning.add_css_class("end-session-dialog-battery-warning");
         battery_warning.set_wrap(true);
