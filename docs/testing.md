@@ -215,6 +215,18 @@ without the unrelated earlier gates. It adds no target motion or timing
 relaxation. CI runs this slice with its freshly built compositor and shell;
 the no-post-start-motion wire tests establish the precise protocol ordering.
 
+`scripts/tuna-gtk-shell-proof --search-leak-only --artifacts DIR` runs
+G-SEARCH-LEAK (#1084): after five warm-up searches, 50 overview searches
+with results (`TUNA_SEARCH_LEAK_SEARCHES` sets the count), each typed with
+real keys and closed with Escape, must leave the shell's
+`memfd:gdk-wayland` mappings and the shell's and compositor's open
+descriptors exactly where they were. `scripts/lib/tuna-resource-sample.py`
+reads them from `/proc` and leaves `search-leak-{before,after}.json` in the
+artifacts. The compositor side is `cargo test -p tuna-compositor --test
+buffer_release`: an uploaded `wl_shm` buffer comes back with
+`wl_buffer.release` at once, as Mutter's do, and its pool closes once the
+client destroys it and the surface moves on to another buffer.
+
 Every build uses its own checkout's `target/` (an inherited
 `CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one) and no
 incremental state, with half the host's CPUs as jobs. Builds from every

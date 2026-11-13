@@ -6239,6 +6239,9 @@ impl Runtime {
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => &mut drm.renderer,
         };
+        // Before anything is drawn or skipped: this tick's commits reach
+        // their textures, and their shm buffers go back to the clients.
+        crate::buffer_upload::upload_committed(renderer, &mut self.state);
         self.manager.step_modal_dim(
             now,
             self.input_settings.motion,

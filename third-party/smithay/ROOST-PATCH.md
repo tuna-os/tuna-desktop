@@ -222,6 +222,27 @@ the parent's list likewise returns an error instead of unwrapping.
 The real-client regression in crates/compositor/tests/popups.rs covers
 both requests and confirms another client is still served afterward.
 
+Issue #1084 changes src/backend/renderer/utils/wayland.rs: the additive
+RendererSurfaceState::release_imported_shm_buffer sends wl_buffer.release
+for the attached wl_shm buffer once the given renderer context has
+imported it, instead of when another buffer replaces it. Mutter copies
+SHM buffers when it applies a commit and never holds them
+(meta-wayland-surface.c, buffer_held), and GTK's cairo renderer before
+4.22 depends on that: when its surface changes size it forgets the buffers
+still attached and never frees them on a late release (GTK 8a39f8e6), so
+every resize of a cairo-drawn surface leaked one shm pool in the client and
+its descriptor in the compositor. The buffer stays attached (the surface
+stays mapped and draws from its texture); a per-buffer flag keeps the
+release from being sent twice and is cleared when the same buffer is
+attached again, so each commit gets one release. Existing APIs and the
+drop-time release of buffers nobody imported are unchanged. Roost calls it
+for every committed surface tree right after importing it with its only
+renderer (crates/compositor/src/buffer_upload.rs); real socketpair tests in
+crates/compositor/tests/buffer_release.rs cover a resized layer surface,
+re-attached and replaced buffers, a destroyed surface, and a toplevel with
+a subsurface. The isolated diff is retained in SHM-EARLY-RELEASE-PATCH.diff;
+the pinned version stays 0.7.0.
+
 Issue #364 additionally changes `src/wayland/input_method/{mod.rs,
 input_method_handle.rs,input_method_keyboard_grab.rs}`. Registry visibility
 and forced binds both enforce the compositor's input-method admission
