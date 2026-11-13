@@ -152,10 +152,7 @@ pub struct Wallpaper {
     /// Journey-only observation of the last attempted refresh, not a paint claim.
     refresh_stage: Option<&'static str>,
     identities: Vec<IdentitySnapshot>,
-    identity_pending: Vec<(
-        String,
-        std::sync::mpsc::Receiver<std::sync::Arc<SourceObservation>>,
-    )>,
+    identity_pending: Vec<(String, std::sync::mpsc::Receiver<Observed>)>,
     animation_samples: Vec<AnimationSample>,
     paint_state: Option<serde_json::Value>,
     image_cache: std::sync::Arc<BackgroundCaches>,
@@ -309,6 +306,23 @@ struct Pending {
     result: std::sync::mpsc::Receiver<Option<Vec<u8>>>,
 }
 
+/// The whole buffer when no pixel of `pixels` (`Argb8888`, alpha in each
+/// fourth byte) lets anything through, as every picture GNOME composes
+/// over its background colour is (#503): drawing culls what lies beneath
+/// it, and on a target without a transform draws it without blending,
+/// as Mutter's background actor is drawn.
+fn opaque_region(
+    pixels: &[u8],
+    size: (i32, i32),
+) -> Option<Vec<Rectangle<i32, smithay::utils::Buffer>>> {
+    pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .all(|pixel| pixel[3] == u8::MAX)
+        .then(|| vec![Rectangle::from_size(size.into())])
+}
+
 /// Most cached sizes at once; each slot holds at most
 /// `MAX_WALLPAPER_AREA` pixels, so the cache stays bounded while
 /// covering the common multi-output case.
@@ -319,6 +333,257 @@ struct IdentitySnapshot {
     uri: String,
     value: std::sync::Arc<SourceObservation>,
     observed: std::time::Instant,
+    /// What reports a change to what `value` read (`None`: nothing could
+    /// be watched).
+    watch: Option<SourceWatch>,
+}
+
+impl IdentitySnapshot {
+    /// Observed again on a timer ([`SAFETY_RECHECK`]): a slideshow, or a
+    /// source no complete watch vouches for.
+    fn timed(&self) -> bool {
+        self.value.timeline.is_some() || !self.watch.as_ref().is_some_and(|watch| watch.complete)
+    }
+}
+
+/// One finished observation and the watch on what it read.
+type Observed = (std::sync::Arc<SourceObservation>, Option<SourceWatch>);
+
+/// How long an observation goes unrepeated when no watch vouches for it:
+/// a source on a filesystem inotify does not report every change of (a
+/// network or FUSE mount), one whose watch could not be placed, and a
+/// slideshow, whose pictures follow the clock. Five seconds is GIO's poll
+/// interval for a file it cannot monitor (`gpollfilemonitor.c`,
+/// `POLL_TIME_SECS`), and each repetition reads and hashes every file
+/// the source names, which on a network mount is traffic.
+const SAFETY_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Most inotify watches one source places: the picture's directory, each
+/// symbolic link's on the way to it and the picture itself, for the
+/// source and each slideshow picture.
+const MAX_SOURCE_WATCHES: usize = 64;
+
+/// The inotify watch on what one source observation read (#503), as
+/// GNOME's `background.js` monitors its file with a `Gio.FileMonitor`:
+/// each directory holding the file or a symbolic link on the way to it,
+/// for that name being written, replaced, renamed over, re-permissioned
+/// or removed, and the file itself, for writes through another link to
+/// it. A thread waits on it and wakes the loop once per change; the
+/// next refresh observes the source again.
+#[derive(Debug)]
+struct SourceWatch {
+    changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Every path read is on a filesystem inotify vouches for, and every
+    /// watch was placed: no timed re-observation is needed.
+    complete: bool,
+    /// Closing it ends the waiting thread.
+    _stop: std::os::unix::net::UnixStream,
+}
+
+impl SourceWatch {
+    /// Whether a change was reported since the last call.
+    fn take_changed(&self) -> bool {
+        self.changed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    fn pending(&self) -> bool {
+        self.changed.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Watches being placed, on the observation worker, before each path is
+/// read ([`SourceObservation::observe_watched`]).
+struct WatchSet {
+    fd: Option<std::os::fd::OwnedFd>,
+    /// Per watch descriptor, the names in that directory that matter;
+    /// empty for a watch on the file itself.
+    names: Vec<(i32, Vec<OsString>)>,
+    complete: bool,
+}
+
+impl WatchSet {
+    fn new() -> Self {
+        use rustix::fs::inotify;
+        let fd = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK).ok();
+        Self {
+            complete: fd.is_some(),
+            fd,
+            names: Vec::new(),
+        }
+    }
+
+    fn place(&mut self, path: &std::path::Path, name: Option<&std::ffi::OsStr>) -> bool {
+        use rustix::fs::inotify::{self, WatchFlags};
+        let Some(fd) = &self.fd else {
+            return false;
+        };
+        let mask = if name.is_some() {
+            WatchFlags::CLOSE_WRITE
+                | WatchFlags::MODIFY
+                | WatchFlags::ATTRIB
+                | WatchFlags::CREATE
+                | WatchFlags::DELETE
+                | WatchFlags::MOVED_FROM
+                | WatchFlags::MOVED_TO
+                | WatchFlags::DELETE_SELF
+                | WatchFlags::MOVE_SELF
+                | WatchFlags::ONLYDIR
+        } else {
+            WatchFlags::CLOSE_WRITE
+                | WatchFlags::MODIFY
+                | WatchFlags::ATTRIB
+                | WatchFlags::DELETE_SELF
+                | WatchFlags::MOVE_SELF
+        };
+        let known = self.names.len();
+        if known >= MAX_SOURCE_WATCHES {
+            return false;
+        }
+        let Ok(wd) = inotify::add_watch(fd, path, mask) else {
+            return false;
+        };
+        // A directory watched again returns its descriptor again.
+        let entry = match self.names.iter().position(|(known, _)| *known == wd) {
+            Some(at) => &mut self.names[at].1,
+            None => {
+                self.names.push((wd, Vec::new()));
+                &mut self.names[known].1
+            }
+        };
+        if let Some(name) = name {
+            if !entry.iter().any(|known| known == name) {
+                entry.push(name.to_owned());
+            }
+        }
+        true
+    }
+
+    /// Watch `path`: the directory entry of the path, of every symbolic
+    /// link it resolves through and of the file it ends at, and the file.
+    fn add(&mut self, path: &std::path::Path) {
+        let mut path = path.to_path_buf();
+        // Linux follows at most 40 links.
+        for _ in 0..40 {
+            let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+                self.complete = false;
+                return;
+            };
+            let dir = if dir.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                dir
+            };
+            if !self.place(dir, Some(name)) || !crate::wake::inotify_reliable(dir) {
+                self.complete = false;
+            }
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    let Ok(target) = std::fs::read_link(&path) else {
+                        self.complete = false;
+                        return;
+                    };
+                    path = dir.join(target);
+                }
+                Ok(_) => {
+                    // A missing file is reported by its directory entry.
+                    if !self.place(&path, None) {
+                        self.complete = false;
+                    }
+                    return;
+                }
+                Err(_) => return,
+            }
+        }
+        self.complete = false;
+    }
+
+    /// The loop's handle, and the thread's end of the watch.
+    fn split(self, wake: crate::wake::Wake) -> (Option<SourceWatch>, Option<WatchWaiter>) {
+        let Some(fd) = self.fd else {
+            return (None, None);
+        };
+        let Ok((stop, stopped)) = std::os::unix::net::UnixStream::pair() else {
+            return (None, None);
+        };
+        let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            Some(SourceWatch {
+                changed: changed.clone(),
+                complete: self.complete,
+                _stop: stop,
+            }),
+            Some(WatchWaiter {
+                fd,
+                names: self.names,
+                changed,
+                stopped,
+                wake,
+            }),
+        )
+    }
+}
+
+/// The observation worker's thread, kept to wait on its watch.
+struct WatchWaiter {
+    fd: std::os::fd::OwnedFd,
+    names: Vec<(i32, Vec<OsString>)>,
+    changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stopped: std::os::unix::net::UnixStream,
+    wake: crate::wake::Wake,
+}
+
+impl WatchWaiter {
+    /// Report changes until the watch's owner drops it, or until the
+    /// watch is lost (a watched directory or file went away, its
+    /// filesystem was unmounted, the queue overflowed): the change is
+    /// reported then, and the re-observation places a new watch.
+    fn run(self) {
+        use rustix::event::{PollFd, PollFlags};
+        use rustix::fs::inotify::{self, ReadFlags};
+        use std::os::unix::ffi::OsStrExt;
+        loop {
+            let mut fds = [
+                PollFd::new(&self.fd, PollFlags::IN),
+                PollFd::new(&self.stopped, PollFlags::IN),
+            ];
+            match crate::wake::poll_fds(&mut fds, None) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return,
+                Ok(_) if !fds[1].revents().is_empty() => return,
+                Ok(_) => {}
+            }
+            let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
+            let mut events = inotify::Reader::new(&self.fd, &mut buf);
+            let (mut hit, mut lost) = (false, false);
+            while let Ok(event) = events.next() {
+                let flags = event.events();
+                lost |= flags.intersects(
+                    ReadFlags::QUEUE_OVERFLOW
+                        | ReadFlags::IGNORED
+                        | ReadFlags::UNMOUNT
+                        | ReadFlags::DELETE_SELF
+                        | ReadFlags::MOVE_SELF,
+                );
+                hit |= match self.names.iter().find(|(wd, _)| *wd == event.wd()) {
+                    // The file itself.
+                    Some((_, names)) if names.is_empty() => true,
+                    Some((_, names)) => event.file_name().is_some_and(|name| {
+                        names
+                            .iter()
+                            .any(|known| known.as_bytes() == name.to_bytes())
+                    }),
+                    None => false,
+                };
+            }
+            if (hit || lost) && !self.changed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                self.wake.signal();
+            }
+            if lost {
+                return;
+            }
+        }
+    }
 }
 
 type ImageCache = std::sync::Mutex<Vec<(FileIdentity, std::sync::Arc<image::RgbaImage>)>>;
@@ -405,6 +670,10 @@ impl Wallpaper {
             })
         })
     }
+    /// When a current source is next observed again on a timer: only one
+    /// no watch vouches for, or a slideshow ([`SAFETY_RECHECK`]). A
+    /// watched picture is observed again when its watch reports a change,
+    /// which wakes the loop itself (#503).
     pub(crate) fn maintenance_deadline(&self) -> Option<std::time::Instant> {
         self.identities
             .iter()
@@ -415,16 +684,23 @@ impl Wallpaper {
                     .iter()
                     .any(|(uri, _)| uri == &item.uri)
             })
-            .map(|item| {
-                let deadline = item.observed + std::time::Duration::from_secs(1);
+            .filter_map(|item| {
                 let now = std::time::Instant::now();
+                let deadline = if item.watch.as_ref().is_some_and(SourceWatch::pending) {
+                    // Reported, but refresh has not run since.
+                    now
+                } else if item.timed() {
+                    item.observed + SAFETY_RECHECK
+                } else {
+                    return None;
+                };
                 // An unsupported render size must not spin on a deadline that
                 // refresh could not service: retry one display frame later.
-                if deadline <= now {
+                Some(if deadline <= now {
                     now + std::time::Duration::from_millis(16)
                 } else {
                     deadline
-                }
+                })
             })
             .min()
     }
@@ -495,10 +771,10 @@ impl Wallpaper {
                 Ok(value) => Some(value),
                 Err(std::sync::mpsc::TryRecvError::Empty) => None,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    Some(std::sync::Arc::new(SourceObservation::default()))
+                    Some((std::sync::Arc::new(SourceObservation::default()), None))
                 }
             };
-            if let Some(value) = result {
+            if let Some((value, watch)) = result {
                 let (completed, _) = self.identity_pending.remove(index);
                 self.identities.retain(|snapshot| snapshot.uri != completed);
                 if self.identities.len() >= MAX_WALLPAPER_SLOTS {
@@ -508,6 +784,7 @@ impl Wallpaper {
                     uri: completed,
                     value,
                     observed: std::time::Instant::now(),
+                    watch,
                 });
             } else {
                 index += 1;
@@ -516,7 +793,8 @@ impl Wallpaper {
         let snapshot = self.identities.iter().find(|snapshot| snapshot.uri == uri);
         let value = snapshot.map(|snapshot| snapshot.value.clone());
         let due = snapshot.is_none_or(|snapshot| {
-            snapshot.observed.elapsed() >= std::time::Duration::from_secs(1)
+            snapshot.watch.as_ref().is_some_and(SourceWatch::pending)
+                || (snapshot.timed() && snapshot.observed.elapsed() >= SAFETY_RECHECK)
         });
         if due
             && self.identity_pending.len() < MAX_WALLPAPER_SLOTS
@@ -528,17 +806,34 @@ impl Wallpaper {
             let (send, result) = std::sync::mpsc::channel();
             let path = uri.to_owned();
             let completion = self.wake.completion();
+            let wake = self.wake.clone();
             if std::thread::Builder::new()
                 .name("tuna-wallpaper-identity".into())
                 .spawn(move || {
-                    let _completion = completion;
+                    let completion = completion;
                     // Drop the result sender before the completion wake, including unwind.
                     let result_sender = send;
-                    let observed = std::sync::Arc::new(SourceObservation::observe(&path));
-                    let _ = result_sender.send(observed);
+                    // Watch first: a change while reading is reported.
+                    let mut watch = WatchSet::new();
+                    let observed = std::sync::Arc::new(SourceObservation::observe_watched(
+                        &path,
+                        &mut |path| watch.add(path),
+                    ));
+                    let (handle, waiter) = watch.split(wake);
+                    let _ = result_sender.send((observed, handle));
+                    drop(result_sender);
+                    drop(completion);
+                    // The same thread then waits on the watch.
+                    if let Some(waiter) = waiter {
+                        waiter.run();
+                    }
                 })
                 .is_ok()
             {
+                // This observation answers whatever the old watch reported.
+                if let Some(watch) = snapshot.and_then(|snapshot| snapshot.watch.as_ref()) {
+                    watch.take_changed();
+                }
                 self.identity_pending.push((uri.to_owned(), result));
             }
         }
@@ -649,7 +944,7 @@ impl Wallpaper {
                 (output.w, output.h),
                 1,
                 Transform::Normal,
-                None,
+                opaque_region(pixels, (output.w, output.h)),
             )
         });
         self.loaded.push(Loaded {
@@ -890,7 +1185,7 @@ impl Wallpaper {
                     (w, h),
                     1,
                     Transform::Normal,
-                    None,
+                    opaque_region(&pixels, (w, h)),
                 ),
             ));
         }
@@ -1451,7 +1746,17 @@ impl FileIdentity {
 /// This entire observer executes on a bounded worker, including timezone
 /// calendar conversion and every referenced image's arbitrary-path metadata.
 impl SourceObservation {
+    #[cfg(test)]
     fn observe(uri: &str) -> Self {
+        Self::observe_watched(uri, &mut |_| {})
+    }
+
+    /// Observe `uri`, handing `watch` every path before it is read: a
+    /// change after that is reported by the watch, never lost (#503).
+    fn observe_watched(uri: &str, watch: &mut dyn FnMut(&std::path::Path)) -> Self {
+        if let Some(path) = wallpaper_uri_to_path(uri) {
+            watch(&path);
+        }
         let identity = FileIdentity::for_uri(uri);
         let mut observed = Self {
             identity: identity.clone(),
@@ -1502,6 +1807,7 @@ impl SourceObservation {
                 if observed.references.len() >= 128 {
                     return observed;
                 }
+                watch(path);
                 observed
                     .references
                     .push((path.clone(), FileIdentity::for_path(path)));
@@ -1859,6 +2165,7 @@ mod tests {
             uri: "old".into(),
             value: std::sync::Arc::new(SourceObservation::observe("old")),
             observed: std::time::Instant::now() - std::time::Duration::from_secs(3),
+            watch: None,
         });
         assert!(wallpaper.refresh((8, 8).into(), test_geometry()).is_none());
         assert_eq!(wallpaper.maintenance_deadline(), None);
@@ -1871,6 +2178,7 @@ mod tests {
             uri: "old".into(),
             value: std::sync::Arc::new(super::SourceObservation::observe("old")),
             observed: now - std::time::Duration::from_secs(3),
+            watch: None,
         });
         assert_eq!(wallpaper.maintenance_deadline(), None);
         wallpaper.current_uris.push("old".into());
@@ -1881,6 +2189,182 @@ mod tests {
         let (_send, receive) = std::sync::mpsc::channel();
         wallpaper.identity_pending.push(("old".into(), receive));
         assert_eq!(wallpaper.maintenance_deadline(), None);
+    }
+
+    /// A 2x2 picture of one colour: every colour encodes to the same length.
+    fn solid_png(path: &std::path::Path, rgb: [u8; 3]) {
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
+            .save(path)
+            .expect("write test png");
+    }
+
+    /// The desktop key once it differs from `previous`, within `within`.
+    fn key_within(
+        wallpaper: &mut Wallpaper,
+        previous: Option<&str>,
+        within: std::time::Duration,
+    ) -> Option<String> {
+        let end = std::time::Instant::now() + within;
+        loop {
+            if let Some(key) = wallpaper.refresh((8, 8).into(), test_geometry()) {
+                if previous != Some(key.as_str()) {
+                    return Some(key);
+                }
+            }
+            if std::time::Instant::now() >= end {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A picture replaced, rewritten in place (same length, the old
+    /// modification time put back), renamed over, or reached through a
+    /// symbolic link that is pointed elsewhere, is observed again on the
+    /// watch's report, within the second the old timed re-observation
+    /// allowed; until then nothing is due on a timer (#503).
+    #[test]
+    fn watched_picture_changes_are_observed_on_their_event() {
+        type Change = fn(&std::path::Path, &std::path::Path);
+        let changes: [(&str, Change); 4] = [
+            ("replaced", |dir, picture| {
+                std::fs::remove_file(picture).unwrap();
+                solid_png(&dir.join("wall.png"), [0, 0, 240]);
+            }),
+            ("rewritten in place", |_, picture| {
+                let before = std::fs::metadata(picture).unwrap().modified().unwrap();
+                let replacement = picture.with_file_name("staging.png");
+                solid_png(&replacement, [0, 0, 240]);
+                let bytes = std::fs::read(&replacement).unwrap();
+                std::fs::remove_file(&replacement).unwrap();
+                assert_eq!(
+                    bytes.len() as u64,
+                    std::fs::metadata(picture).unwrap().len()
+                );
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(picture)
+                    .unwrap();
+                std::io::Write::write_all(&mut file, &bytes).unwrap();
+                file.set_times(std::fs::FileTimes::new().set_modified(before))
+                    .unwrap();
+            }),
+            ("renamed over", |dir, picture| {
+                let replacement = dir.join("replacement.png");
+                solid_png(&replacement, [0, 0, 240]);
+                std::fs::rename(replacement, picture).unwrap();
+            }),
+            ("symlink retargeted", |dir, picture| {
+                let other = dir.join("pictures/other.png");
+                solid_png(&other, [0, 0, 240]);
+                let link = dir.join("link.tmp");
+                std::os::unix::fs::symlink(&other, &link).unwrap();
+                std::fs::rename(link, picture).unwrap();
+            }),
+        ];
+        let _lock = RUNTIME_DIR_LOCK.lock().expect("runtime lock");
+        for (case, change) in changes {
+            let dir = tempfile::TempDir::new().unwrap();
+            if !crate::wake::inotify_reliable(dir.path()) {
+                eprintln!(
+                    "skipped: {} is not on a local filesystem",
+                    dir.path().display()
+                );
+                return;
+            }
+            let _runtime = RuntimeDirGuard::point_at(dir.path());
+            let picture = dir.path().join("wall.png");
+            if case == "symlink retargeted" {
+                std::fs::create_dir(dir.path().join("pictures")).unwrap();
+                let first = dir.path().join("pictures/first.png");
+                solid_png(&first, [240, 0, 0]);
+                std::os::unix::fs::symlink(&first, &picture).unwrap();
+            } else {
+                solid_png(&picture, [240, 0, 0]);
+            }
+            std::fs::write(
+                wallpaper_drop_path(),
+                format!("file://{}\n#023c88\n", picture.display()),
+            )
+            .unwrap();
+            let mut wallpaper = Wallpaper::new();
+            let initial = key_within(&mut wallpaper, None, std::time::Duration::from_secs(3))
+                .unwrap_or_else(|| panic!("{case}: the first observation never completed"));
+            assert_eq!(
+                wallpaper.maintenance_deadline(),
+                None,
+                "{case}: a watched picture is observed again on events only"
+            );
+            change(dir.path(), &picture);
+            assert!(
+                key_within(
+                    &mut wallpaper,
+                    Some(&initial),
+                    std::time::Duration::from_secs(1)
+                )
+                .is_some(),
+                "{case}: the change was not observed within a second"
+            );
+        }
+    }
+
+    /// An unchanged watched picture is never read again: no observation
+    /// worker starts over three of the old one-second periods.
+    #[test]
+    fn an_unchanged_watched_picture_is_not_observed_again() {
+        let _lock = RUNTIME_DIR_LOCK.lock().expect("runtime lock");
+        let dir = tempfile::TempDir::new().unwrap();
+        if !crate::wake::inotify_reliable(dir.path()) {
+            eprintln!(
+                "skipped: {} is not on a local filesystem",
+                dir.path().display()
+            );
+            return;
+        }
+        let _runtime = RuntimeDirGuard::point_at(dir.path());
+        let picture = dir.path().join("wall.png");
+        solid_png(&picture, [240, 0, 0]);
+        std::fs::write(
+            wallpaper_drop_path(),
+            format!("file://{}\n#023c88\n", picture.display()),
+        )
+        .unwrap();
+        let mut wallpaper = Wallpaper::new();
+        let key = key_within(&mut wallpaper, None, std::time::Duration::from_secs(3))
+            .expect("the first observation never completed");
+        let observed = wallpaper.identities[0].observed;
+        // An unrelated file in the same directory is not the picture.
+        std::fs::write(dir.path().join("notes.txt"), "unrelated").unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < end {
+            assert_eq!(
+                wallpaper.refresh((8, 8).into(), test_geometry()).as_deref(),
+                Some(key.as_str())
+            );
+            assert!(wallpaper.identity_pending.is_empty(), "observed again");
+            assert_eq!(wallpaper.identities[0].observed, observed);
+            assert_eq!(wallpaper.maintenance_deadline(), None);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Without a watch (a URI no file stands behind, or a filesystem
+    /// inotify cannot vouch for) the source is observed again on the
+    /// safety timer, not every second.
+    #[test]
+    fn an_unwatched_source_is_observed_again_on_the_safety_timer() {
+        let now = std::time::Instant::now();
+        let mut wallpaper = Wallpaper::new();
+        wallpaper.current_uris.push("old".into());
+        wallpaper.identities.push(IdentitySnapshot {
+            uri: "old".into(),
+            value: std::sync::Arc::new(SourceObservation::observe("old")),
+            observed: now,
+            watch: None,
+        });
+        let deadline = wallpaper.maintenance_deadline().unwrap();
+        assert!(deadline >= now + SAFETY_RECHECK);
+        assert!(deadline <= std::time::Instant::now() + SAFETY_RECHECK);
     }
     use super::*;
     use std::sync::Mutex;

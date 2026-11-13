@@ -71,6 +71,24 @@ pub(crate) fn changed(fd: impl AsFd, wanted: &[&OsStr]) -> bool {
     hit
 }
 
+/// Whether inotify sees every change to files in `dir`: only on a local
+/// filesystem. Another host writing to a network mount, or a FUSE daemon
+/// changing what it serves, raises no event here (GIO polls such mounts
+/// for the same reason).
+pub(crate) fn inotify_reliable(dir: &Path) -> bool {
+    const LOCAL: [u32; 8] = [
+        0x0000_EF53, // ext2, ext3, ext4
+        0x9123_683E, // btrfs
+        0x5846_5342, // xfs
+        0x0102_1994, // tmpfs
+        0xF2F5_2010, // f2fs
+        0x794C_7630, // overlayfs
+        0x2FC1_2FC1, // zfs
+        0xCA45_1A4E, // bcachefs
+    ];
+    rustix::fs::statfs(dir).is_ok_and(|fs| LOCAL.contains(&(fs.f_type as u32)))
+}
+
 /// `poll(2)` on `fds` for at most `timeout` (`None`: until one is ready);
 /// how many are ready.
 pub(crate) fn poll_fds(
