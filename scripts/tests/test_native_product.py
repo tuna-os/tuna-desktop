@@ -26,7 +26,9 @@ import maintained_media
 import native_product as product
 from vm_gnome_reference import cosign_argv
 
-IMAGE = 'sha256:' + 'a' * 64
+# Actual Podman prints '{{.Id}}' as bare hex; product identities carry 'sha256:'.
+PODMAN_ID = 'a' * 64
+IMAGE = 'sha256:' + PODMAN_ID
 BASENAME = 'tuna-desktop-0.1.0-1-x86_64.pkg.tar.zst'
 
 
@@ -211,7 +213,7 @@ class NativeProductTests(unittest.TestCase):
         calls = []
         def native(root, *args):
             calls.append(args)
-            return IMAGE if args[:2] == ('image', 'inspect') else ''
+            return PODMAN_ID if args[:2] == ('image', 'inspect') else ''
         with patch.object(product, 'podman', side_effect=native):
             result = product.select(self.root, profile, self.out, self.package, api=api, **self.selection_args)
         return result, calls
@@ -334,11 +336,43 @@ class NativeProductTests(unittest.TestCase):
 
     def test_loaded_image_identity_is_checked_before_tagging(self):
         api = capsule(self.original)
-        with patch.object(product, 'podman', return_value='sha256:' + 'b' * 64) as native:
+        with patch.object(product, 'podman', return_value='b' * 64) as native:
             with self.assertRaisesRegex(ValueError, 'loaded Podman image ID differs'):
                 product.select(self.root, 'distribution', self.out, self.package, api=api, **self.selection_args)
         self.assertEqual(native.call_count, 2)
         self.assertFalse(self.out.exists())
+
+    def test_selected_tag_identity_is_checked_after_tagging(self):
+        api = capsule(self.original)
+        answers = iter(('', PODMAN_ID, '', 'b' * 64))
+        with patch.object(product, 'podman', side_effect=lambda root, *args: next(answers)) as native:
+            with self.assertRaisesRegex(ValueError, 'selected Podman tag differs'):
+                product.select(self.root, 'distribution', self.out, self.package, api=api, **self.selection_args)
+        self.assertEqual([call.args[1] for call in native.call_args_list], ['load', 'image', 'tag', 'image'])
+        self.assertFalse(self.out.exists())
+
+    def test_actual_podman_id_format_is_canonicalized_without_admitting_another_image(self):
+        # Regression: every Main retention compared bare '{{.Id}}' output with
+        # the 'sha256:' product ID and failed although the image was identical.
+        for observed in (PODMAN_ID, IMAGE):
+            with self.subTest(observed=observed), patch.object(product, 'podman', return_value=observed) as native:
+                self.assertEqual(product.podman_image_id(self.root, IMAGE), IMAGE)
+                native.assert_called_once_with(self.root, 'image', 'inspect', IMAGE, '--format', '{{.Id}}')
+        env = {'GITHUB_REF': 'refs/heads/main', 'GITHUB_SHA': self.original['commit'],
+               'GITHUB_RUN_ID': '100', 'GITHUB_RUN_ATTEMPT': '1'}
+        for observed, message in (('b' * 64, 'retained actual Podman image differs'),
+                                  ('sha256:' + 'b' * 64, 'retained actual Podman image differs'),
+                                  (PODMAN_ID[:12], 'full immutable Podman image ID required'),
+                                  (PODMAN_ID.upper(), 'full immutable Podman image ID required'),
+                                  (PODMAN_ID + '\n' + PODMAN_ID, 'full immutable Podman image ID required'),
+                                  (product.IMAGE_TAG, 'full immutable Podman image ID required'),
+                                  ('', 'full immutable Podman image ID required')):
+            with self.subTest(observed=observed), patch.dict(os.environ, env), \
+                    patch.object(product, 'podman', return_value=observed), \
+                    self.assertRaisesRegex(ValueError, message):
+                product.retain(self.root, 'distribution', self.out, IMAGE,
+                               self.package, BASENAME, self.original['commit'])
+            self.assertFalse(self.out.exists())
 
     def test_strict_actual_git_refs_origin_and_tree(self):
         for ref in ('HEAD~1', 'abc', '-x', 'A' * 40):
@@ -364,7 +398,7 @@ class NativeProductTests(unittest.TestCase):
         env = {'GITHUB_REPOSITORY': product.REPOSITORY, 'GITHUB_EVENT_NAME': 'push',
                'GITHUB_REF': 'refs/heads/main', 'GITHUB_SHA': current['commit'], 'GITHUB_WORKFLOW': 'ci',
                'GITHUB_RUN_ID': '100', 'GITHUB_RUN_ATTEMPT': '3'}
-        with patch.dict(os.environ, env), patch.object(product, 'podman', return_value=IMAGE):
+        with patch.dict(os.environ, env), patch.object(product, 'podman', return_value=PODMAN_ID):
             result = product.retain(self.root, 'distribution', self.out, IMAGE,
                                     self.out / 'tuna.pkg.tar.zst', BASENAME, self.original['commit'])
         self.assertEqual(archive.stat().st_ino, archive_inode)
@@ -459,7 +493,7 @@ class NativeProductTests(unittest.TestCase):
             return real_run(arguments, **kwargs)
         env = {'GITHUB_REF': 'refs/heads/main', 'GITHUB_SHA': self.original['commit'],
                'GITHUB_RUN_ID': '100', 'GITHUB_RUN_ATTEMPT': '1'}
-        with patch.dict(os.environ, env), patch.object(product, 'podman', return_value=IMAGE), \
+        with patch.dict(os.environ, env), patch.object(product, 'podman', return_value=PODMAN_ID), \
                 patch.object(product.subprocess, 'run', side_effect=native_process):
             retained = product.retain(self.root, 'distribution', self.out, IMAGE,
                                       self.package, BASENAME, self.original['commit'])
@@ -635,10 +669,15 @@ class ActualPodmanLoadControl(unittest.TestCase):
                 subprocess.run(['sudo', 'podman', 'build', '--network=none', '--pull=never', '-t', tag, str(root)], check=True)
                 image = product.podman(root, 'image', 'inspect', tag, '--format', '{{.Id}}')
                 self.assertTrue(product.hex_value(image, 64))
-                subprocess.run(['sudo', 'podman', 'save', '--format', 'oci-archive', '--output', str(root / 'actual.oci.tar'), image], check=True)
+                canonical = 'sha256:' + image
+                self.assertEqual(product.podman_image_id(root, tag), canonical)
+                # Retention exports and checks by the canonical ID, exactly as here.
+                self.assertEqual(product.podman_image_id(root, canonical), canonical)
+                subprocess.run(['sudo', 'podman', 'save', '--format', 'oci-archive', '--output', str(root / 'actual.oci.tar'), canonical], check=True)
                 subprocess.run(['sudo', 'podman', 'rmi', tag], check=True)
                 product.podman(root, 'load', '--input', root / 'actual.oci.tar')
                 self.assertEqual(product.podman(root, 'image', 'inspect', image, '--format', '{{.Id}}'), image)
+                self.assertEqual(product.podman_image_id(root, canonical), canonical)
             finally:
                 subprocess.run(['sudo', 'podman', 'rmi', image or tag], check=False, stdout=subprocess.DEVNULL)
 

@@ -118,11 +118,29 @@ where
                 }
             }
             xdg_toplevel::Request::SetMaxSize { width, height } => {
+                // As Mutter's xdg_toplevel_set_max_size; a negative
+                // size used to panic in `Size::new`.
+                if width < 0 || height < 0 {
+                    toplevel.post_error(
+                        xdg_toplevel::Error::InvalidSize,
+                        format!("invalid negative max size requested {width} x {height}"),
+                    );
+                    return;
+                }
                 with_toplevel_pending_state(data, |toplevel_data| {
                     toplevel_data.max_size = (width, height).into();
                 });
             }
             xdg_toplevel::Request::SetMinSize { width, height } => {
+                // As Mutter's xdg_toplevel_set_min_size; a negative
+                // size used to panic in `Size::new`.
+                if width < 0 || height < 0 {
+                    toplevel.post_error(
+                        xdg_toplevel::Error::InvalidSize,
+                        format!("invalid negative min size requested {width} x {height}"),
+                    );
+                    return;
+                }
                 with_toplevel_pending_state(data, |toplevel_data| {
                     toplevel_data.min_size = (width, height).into();
                 });
