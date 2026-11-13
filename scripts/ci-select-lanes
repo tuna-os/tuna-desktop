@@ -178,6 +178,7 @@ NO_LANE = [
     "scripts/tuna-coverage-report",
     "scripts/tuna-stress",
     "scripts/tuna-hotplug-stress",
+    "scripts/lib/tuna_process_metrics.py",
     "scripts/lib/vm_release*",
     "scripts/lib/vm_firstboot_diagnosis.py",
 ]

@@ -42,6 +42,9 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts/lib"))
+from tuna_process_metrics import largest_rises, metrics, tree  # noqa: E402
+
 SELF = str(Path(__file__).resolve())
 PHASES = ("churn", "popup", "protocol", "dbus", "scale", "services", "input", "swipe",
           "lock", "shell")
@@ -253,75 +256,6 @@ def input_worker(state_path, app_id, width, height, grab):
 
 
 # --- harness -------------------------------------------------------------------
-
-def tree(root_pid):
-    pairs = subprocess.check_output(["ps", "-eo", "pid=,ppid="], text=True)
-    children = {root_pid}
-    edges = [tuple(map(int, line.split())) for line in pairs.splitlines()]
-    while True:
-        expanded = children | {pid for pid, parent in edges if parent in children}
-        if expanded == children:
-            return children
-        children = expanded
-
-
-def mapping_kind(name):
-    if not name:
-        return "anon"
-    if name.startswith(("memfd:", "/memfd:", "/dev/shm/", "/SYSV")):
-        return "shm"
-    if name.startswith("/dev/dri/"):
-        return "gpu"
-    if name.startswith("["):
-        return name.strip("[]").split(":")[0]
-    return "file"
-
-
-def process_memory(pid):
-    """PSS by mapping kind, so growth names its owner: heap, shm pools, GPU or files."""
-    kinds, name = {}, ""
-    for line in Path(f"/proc/{pid}/smaps").read_text().splitlines():
-        head = line.split(None, 1)[0]
-        if not head.endswith(":"):
-            fields = line.split(None, 5)
-            name = fields[5].strip() if len(fields) > 5 else ""
-        elif head == "Pss:":
-            kind = mapping_kind(name)
-            kinds[kind] = kinds.get(kind, 0) + int(line.split()[1])
-    return kinds
-
-
-def metrics(root_pid):
-    pss, rss, fds, maps = 0, 0, 0, 0
-    processes = tree(root_pid)
-    compositor_fds = 0
-    per_process = {}
-    for pid in processes:
-        proc = Path(f"/proc/{pid}")
-        try:
-            values = {}
-            for line in (proc / "smaps_rollup").read_text().splitlines():
-                parts = line.split()
-                if parts[0] in ("Pss:", "Rss:"):
-                    values[parts[0]] = int(parts[1])
-            count = len(list((proc / "fd").iterdir()))
-            mappings = (proc / "maps").read_text().count("\n")
-            comm = (proc / "comm").read_text().strip()
-            kinds = process_memory(pid)
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        pss += values.get("Pss:", 0)
-        rss += values.get("Rss:", 0)
-        fds += count
-        maps += mappings
-        if pid == root_pid:
-            compositor_fds = count
-        per_process[f"{comm}:{pid}"] = {"pss_kib": values.get("Pss:", 0), "fds": count,
-                                        "maps": mappings, "pss_by_kind_kib": kinds}
-    return {"elapsed_s": time.monotonic(), "pss_kib": pss, "rss_kib": rss, "fds": fds,
-            "maps": maps, "compositor_fds": compositor_fds, "processes": len(processes),
-            "per_process": per_process}
-
 
 def owned_pids(runtime_dir):
     """Processes started with this run's private runtime directory."""
@@ -1375,23 +1309,15 @@ class Stress:
 
     def largest_rise(self):
         """The phase whose end sample rose most over its start, with the process and kind."""
-        def by_kind(sample):
-            totals = {}
-            for key, process in sample["per_process"].items():
-                comm = key.rsplit(":", 1)[0]
-                for kind, kib in process["pss_by_kind_kib"].items():
-                    totals[(comm, kind)] = totals.get((comm, kind), 0) + kib
-            return totals
         starts = {s["phase"].removesuffix(":start"): s for s in self.samples if s["phase"].endswith(":start")}
         ends = {s["phase"]: s for s in self.samples if s["phase"] in starts}
         rises = [(ends[p]["pss_kib"] - starts[p]["pss_kib"], p) for p in ends]
         if not rises:
             return "no phase samples"
         rise, phase = max(rises)
-        before, after = by_kind(starts[phase]), by_kind(ends[phase])
-        parts = sorted(((after.get(k, 0) - before.get(k, 0), k) for k in after | before), reverse=True)[:3]
         return f"{phase} +{rise >> 10} MiB (" + ", ".join(
-            f"{comm} {kind} {delta >> 10:+} MiB" for delta, (comm, kind) in parts) + ")"
+            f"{comm} {kind} {delta >> 10:+} MiB"
+            for delta, comm, kind in largest_rises(starts[phase], ends[phase], 3)) + ")"
 
     # -- run --
 
