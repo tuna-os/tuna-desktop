@@ -2751,12 +2751,16 @@ pass G-OV-SEARCH "typing in the overview lists matching apps"
 scrot "$ARTIFACTS/10-search.png" >/dev/null
 # GNOME Shell's caret is steady (StEntry, ClutterText): with the search
 # entry focused and nothing changing, the overview draws no frames (#503).
-# A blinking GTK caret would redraw the entry at the display rate.
-search_still_frames="$(jq .rendered_frames "$CSTATE")"
-sleep 1.5
-[ "$(jq .rendered_frames "$CSTATE")" = "$search_still_frames" ] ||
-    fail G-OV-SEARCH-STILL "the compositor drew frames while the focused overview search sat unchanged"
-pass G-OV-SEARCH-STILL "the focused overview search sits still: no frames while nothing changes"
+# A blinking GTK caret would redraw the entry at the display rate. The
+# grid-cancel comparison's old role runs pinned pre-#503 binaries through
+# this stage, so the gate belongs to the current build only.
+if [ "$GRID_CANCEL_OLD_NEGATIVE" != 1 ]; then
+    search_still_frames="$(jq .rendered_frames "$CSTATE")"
+    sleep 1.5
+    [ "$(jq .rendered_frames "$CSTATE")" = "$search_still_frames" ] ||
+        fail G-OV-SEARCH-STILL "the compositor drew frames while the focused overview search sat unchanged"
+    pass G-OV-SEARCH-STILL "the focused overview search sits still: no frames while nothing changes"
+fi
 
 xdotool key Return
 end=$(($(date +%s) + 15))
