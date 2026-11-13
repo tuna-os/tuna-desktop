@@ -183,7 +183,14 @@ class FprintdMock(unittest.TestCase):
         context = GLib.MainContext.default()
 
         def pump_for(count):
-            return wait_until(lambda: context.iteration(False) or len(signals) >= count)
+            # Dispatch whatever is pending, then ask whether enough signals
+            # arrived; handling some unrelated event is not an arrival.
+            def arrived():
+                while context.iteration(False):
+                    pass
+                return len(signals) >= count
+            if not wait_until(arrived):
+                self.fail(f"waited 5 s for {count} fprintd signals, saw {len(signals)}: {signals}")
 
         self.assertEqual(self.refused(owner, "VerifyStart", GLib.Variant("(s)", ("any",))),
                          "net.reactivated.Fprint.Error.ClaimDevice")
@@ -199,13 +206,13 @@ class FprintdMock(unittest.TestCase):
                                       iface="net.reactivated.Fprint.Test"),
                          "net.reactivated.Fprint.Test.Error.NotVerifying")
         self.call(owner, "VerifyStart", GLib.Variant("(s)", ("any",)))
-        self.assertTrue(pump_for(1))
+        pump_for(1)
         self.assertEqual(signals[0], ("VerifyFingerSelected", ("any",)))
         self.assertEqual(self.refused(owner, "VerifyStart", GLib.Variant("(s)", ("any",))),
                          "net.reactivated.Fprint.Error.AlreadyInUse")
         self.press(other, "verify-retry-scan", False)
         self.press(other, "verify-no-match", True)
-        self.assertTrue(pump_for(3))
+        pump_for(3)
         self.assertEqual(signals[1:3], [("VerifyStatus", ("verify-retry-scan", False)),
                                         ("VerifyStatus", ("verify-no-match", True))])
         # Finished, but still the current action until VerifyStop.
@@ -216,8 +223,12 @@ class FprintdMock(unittest.TestCase):
                          "net.reactivated.Fprint.Error.AlreadyInUse")
         self.call(owner, "VerifyStop")
         self.call(owner, "VerifyStart", GLib.Variant("(s)", ("any",)))
+        # The mock announces the finger from an idle after replying, as
+        # fprintd does; a Press handled first would signal ahead of it.
+        pump_for(4)
+        self.assertEqual(signals[3], ("VerifyFingerSelected", ("any",)))
         self.press(other, "verify-match", True)
-        self.assertTrue(pump_for(5))
+        pump_for(5)
         self.assertEqual(signals[4], ("VerifyStatus", ("verify-match", True)))
         self.call(owner, "VerifyStop")
         self.call(owner, "Release")
