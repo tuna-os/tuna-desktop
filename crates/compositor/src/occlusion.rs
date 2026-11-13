@@ -252,7 +252,8 @@ impl FrameCost {
 /// How often a hidden window's surfaces get frame callbacks (#503).
 /// Mutter sends an obscured surface none until it shows again; a slow
 /// beat instead keeps clients that wait on a callback before acting on
-/// anything (a configure's commit, a hidden video's position) live.
+/// anything (a configure's commit, a hidden video's position) live,
+/// until they are told they are suspended (`crate::suspend`).
 pub(crate) const HIDDEN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(995);
 
 /// Windows something on screen shows: drawn on some output, or in the

@@ -29,15 +29,17 @@ casts, or a PAM worker that has not published its terminal phase.
 
 Otherwise the earliest of, never sooner than one frame: the lock timeout and
 idle-blank threshold (16 ms during the blank fade; none while an inhibitor is
-held), IdleMonitor and Orca deadlines, workspace leases, wallpaper source
-re-observation, Night Light preview expiry, bell player limit, XWayland restart
-backoff, X11 icon probe, IME restart gates (not while locked), the hidden-window
-frame beat, shell restart backoff, and the control hub's `next_poll` (at once
-for a buffered frame, 16 ms while a handshake or broadcast is owed).
+held), IdleMonitor and Orca deadlines, workspace leases, a hidden window's
+3 s to suspension, wallpaper source re-observation, Night Light preview expiry,
+bell player limit, XWayland restart backoff, X11 icon probe, IME restart gates
+(not while locked), the hidden-window frame beat, shell restart backoff, and
+the control hub's `next_poll` (at once for a buffered frame, 16 ms while a
+handshake or broadcast is owed).
 
 The end of an idle inhibitor restarts the idle clock, so a session that slept
 through the inhibited stretch never locks the moment it ends. Hidden windows'
-frame callbacks wait for the hidden beat and never force a repaint.
+frame callbacks wait for the hidden beat and never force a repaint; suspended
+windows told so get none (see `suspended` in [protocols](../protocols.md)).
 
 ## Qualification
 

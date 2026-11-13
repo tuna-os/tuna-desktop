@@ -857,7 +857,10 @@ behind opaque surfaces (`culled_windows`). Both cover the whole output, so
 a frame that repaints only the panel or the cursor still lists the windows
 it leaves on screen as drawn. `throttled_windows` lists the windows
 whose frame callbacks run at the hidden rate (about 1 Hz): off the scene
-or wholly culled, unless the overview, the switcher or a cast shows them.
+or wholly culled, unless the overview, the switcher or a cast shows them;
+every window while locked. After 3 s hidden a window is suspended
+(`suspended_windows`, the xdg_toplevel `suspended` state) and a client
+told so gets no frame callbacks until it shows again.
 Proof `G-OCCLUSION-CULL` fullscreens an opaque window over another and
 requires the lower one to be culled and throttled, then drawn at full
 rate again once the upper window's translucent shadow returns.

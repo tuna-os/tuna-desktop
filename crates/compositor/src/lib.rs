@@ -169,6 +169,7 @@ pub mod spring;
 pub mod state;
 mod state_snapshot;
 pub mod supervise;
+mod suspend;
 pub mod tablet;
 pub mod tablet_actions;
 pub(crate) mod tablet_settings;

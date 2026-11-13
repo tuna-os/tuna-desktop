@@ -63,7 +63,7 @@ and this page together.
 | wl_output | 4 | one per connected output |
 | wl_data_device_manager | 3 | |
 | zwp_primary_selection_device_manager_v1 | 1 | |
-| xdg_wm_base | 6 | popups with positioner constraints and grabs |
+| xdg_wm_base | 6 | popups with positioner constraints and grabs; toplevels are told `suspended` as in Mutter ([below](#suspended-windows)) |
 | zxdg_output_manager_v1 | 3 | |
 | zwlr_layer_shell_v1 | 4 | Tuna Desktop's own shell draws through it. Only the supervised shell's connection may bind it: the native connection whose peer pid is the shell child the compositor spawned and still holds (`tuna-shell-gtk`, or the legacy `tuna-shell-host`), the same identity the session lock and control socket check. Every other client's registry omits it and a blind bind by name is a protocol error (#1048; `ClientState::admit_supervised_shell`, `layer::is_shell_peer`) |
 | zwp_linux_dmabuf_v1 | 3 | only when the renderer reports formats |
@@ -123,6 +123,33 @@ presentation-time, fifo and commit-timing follow the frame path
   primary output's page flip; nested, each frame) on every surface that
   receives frame callbacks, drawn or not, so a client on a hidden
   workspace never stalls.
+
+### Suspended windows
+
+The `xdg_toplevel` `suspended` state (xdg-shell v6) follows Mutter's
+window suspend state (`update_suspend_state` in `src/core/window.c`,
+`crates/compositor/src/suspend.rs`):
+
+- A window is shown while a frame draws any of it: on the active
+  workspace (or both during a workspace slide), not minimized, and not
+  wholly under opaque windows; while the overview, the window switcher
+  or a cast shows window clones, every window is. While the screen is
+  locked none is (GNOME Shell hides its window group under the lock).
+- A window not shown for 3 s (Mutter's `SUSPEND_HIDDEN_TIMEOUT_S`) gets a
+  configure with `suspended`. It gets one without it as soon as it is
+  shown again, before the frame that draws it (a culled window uncovered
+  by a moving window is told right after that frame).
+- Only a change of state is configured; a client older than v6 is never
+  told, and keeps the hidden windows' frame callbacks.
+- A hidden window gets frame callbacks about once a second; once told it
+  is suspended, none, as Mutter sends hidden surfaces none, until it is
+  shown again. A configure it has not acknowledged keeps full-rate
+  callbacks meanwhile.
+- `suspended_windows` in the compositor state lists the suspended
+  windows.
+
+Activation changes are configured the same way: a window losing focus
+gets one configure, never a second identical one.
 
 ### Keyboard shortcuts inhibit
 
