@@ -2906,27 +2906,25 @@ impl Runtime {
             .map(|(name, cost)| (name.clone(), cost.to_json()))
             .collect::<serde_json::Map<_, _>>()
             .into();
-        // Windows whose frame callbacks run at the hidden rate.
-        doc["throttled_windows"] = if self.overview_motion.progress() > 0.0
+        // Windows whose frame callbacks run at the hidden rate, or not at
+        // all once suspended.
+        let clones_shown = self.overview_motion.progress() > 0.0
             || !self.switcher_thumbnails.is_empty()
-            || !self.casts.is_empty()
-        {
-            serde_json::json!([])
-        } else {
-            let scene: Vec<u64> = self
-                .manager
-                .render_entries()
-                .iter()
-                .map(|(id, _, _)| *id)
-                .collect();
-            let shown = crate::occlusion::shown_windows(&scene, self.frame_costs.values());
-            serde_json::json!(snapshot
-                .windows
-                .iter()
-                .map(|w| w.id)
-                .filter(|id| !shown.contains(id))
-                .collect::<Vec<_>>())
-        };
+            || !self.casts.is_empty();
+        let shown = shown_ids(
+            &self.manager,
+            &self.frame_costs,
+            clones_shown,
+            self.is_locked(),
+        );
+        doc["throttled_windows"] = serde_json::json!(snapshot
+            .windows
+            .iter()
+            .map(|w| w.id)
+            .filter(|id| !shown.contains(id))
+            .collect::<Vec<_>>());
+        // Windows in Mutter's suspend state (xdg_toplevel `suspended`).
+        doc["suspended_windows"] = serde_json::json!(self.manager.suspended_windows());
         doc["wallpaper_diagnostics"] = if self.is_locked() {
             serde_json::Value::Null
         } else {
@@ -5081,6 +5079,8 @@ impl Runtime {
             self.state.protocols.idle_notifier.next_deadline(),
             self.orca.next_deadline(),
             self.manager.workspace_lease_deadline(),
+            // Mutter's 3 s from hidden to suspended (#503).
+            self.manager.suspend_deadline(),
             self.wallpaper.maintenance_deadline(),
             // Night Light (#339): exact preview expiry (or its past-due
             // restoring obligation) and the bounded settings re-read.
@@ -6314,6 +6314,12 @@ impl Runtime {
         // scene hides: their frame callbacks keep full rate then.
         let clones_shown =
             overview.is_some() || !self.switcher_thumbnails.is_empty() || !self.casts.is_empty();
+        // Mutter's suspend state (#503): a window this frame is about to
+        // show (a workspace slide or the overview starting, unminimized,
+        // unlocked) resumes before the frame draws it. Culling is the
+        // last frame's; the update after drawing catches what it changed.
+        let shown = shown_ids(&self.manager, &self.frame_costs, clones_shown, locked);
+        self.manager.update_suspended(&shown, Instant::now());
         // The pointer is the compositor's to draw (#342): hidden while
         // locked or blanked, as the software pointer always was.
         let cursor_shown = !locked && blank_alpha < 1.0;
@@ -6349,10 +6355,7 @@ impl Runtime {
         // Hidden windows' frame callbacks wait for the hidden beat; by
         // themselves they never make an unchanged output repaint.
         #[cfg(feature = "drm")]
-        let throttled = throttled_surfaces(
-            &self.state,
-            &hidden_surfaces(&self.manager, &self.frame_costs, clones_shown),
-        );
+        let throttled = throttled_surfaces(&self.state, &hidden_surfaces(&self.manager, &shown));
         // DisplayConfig PowerSaveMode (#355): the scene advanced above as
         // Mutter's stage does, but nothing is scanned out; frames complete
         // on the slow dummy page flip instead.
@@ -7085,7 +7088,9 @@ impl Runtime {
                 queued
             }
         };
-        let hidden = hidden_surfaces(&self.manager, &self.frame_costs, clones_shown);
+        let shown = shown_ids(&self.manager, &self.frame_costs, clones_shown, locked);
+        self.manager.update_suspended(&shown, Instant::now());
+        let hidden = hidden_surfaces(&self.manager, &shown);
         let throttled = throttled_surfaces(&self.state, &hidden);
         if queued {
             // A pending page flip is not another rendered frame.
@@ -7103,13 +7108,21 @@ impl Runtime {
     /// [`HIDDEN_FRAME_INTERVAL`](crate::occlusion::HIDDEN_FRAME_INTERVAL),
     /// without a scanout (#503). Mutter sends an obscured surface none;
     /// the slow beat keeps clients live that wait on a callback before
-    /// acting on anything.
+    /// acting on anything, until they are told they are suspended: like
+    /// Mutter's, those get none until they resume (a configure they still
+    /// have to acknowledge keeps them at full rate meanwhile).
     fn hidden_frame_beat(
         &mut self,
         throttled: &[smithay::reexports::wayland_server::protocol::wl_surface::WlSurface],
     ) {
         let now = Instant::now();
-        self.hidden_waiting = crate::frame_timing::pending_callbacks(throttled);
+        let suspended = self.manager.told_suspended_surfaces();
+        let throttled: Vec<_> = throttled
+            .iter()
+            .filter(|surface| !suspended.contains(surface))
+            .cloned()
+            .collect();
+        self.hidden_waiting = crate::frame_timing::pending_callbacks(&throttled);
         if !self.hidden_waiting
             || self.hidden_beat.is_some_and(|last| {
                 now.saturating_duration_since(last) < crate::occlusion::HIDDEN_FRAME_INTERVAL
@@ -7121,7 +7134,7 @@ impl Runtime {
             return;
         };
         let time = Duration::from(self.state.presentation_now());
-        for surface in throttled {
+        for surface in &throttled {
             send_frames_surface_tree(surface, &output, time, Some(Duration::ZERO), |_, _| {
                 Some(output.clone())
             });
@@ -8448,25 +8461,39 @@ fn send_surface_scales(state: &State, manager: &WindowManager) {
     }
 }
 
-/// Root surfaces of the managed windows nothing on screen shows (#503),
-/// whose frame callbacks drop to [`HIDDEN_FRAME_INTERVAL`](crate::occlusion::HIDDEN_FRAME_INTERVAL).
-/// Empty while window clones or casts show every window. A toplevel the
-/// window manager does not track (not yet mapped, or not a managed
-/// window) is never throttled.
-fn hidden_surfaces(
+/// Windows something on screen shows (#503): none while locked (GNOME
+/// Shell hides its window group under the lock screen), every window
+/// while window clones (overview, switcher) or casts show them, else the
+/// scene less what the last frame wholly culled
+/// ([`shown_windows`](crate::occlusion::shown_windows)).
+fn shown_ids(
     manager: &WindowManager,
     costs: &std::collections::BTreeMap<String, FrameCost>,
     clones_shown: bool,
-) -> Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface> {
-    if clones_shown {
+    locked: bool,
+) -> Vec<u64> {
+    if locked {
         return Vec::new();
+    }
+    if clones_shown {
+        return manager.window_ids().collect();
     }
     let scene: Vec<u64> = manager
         .render_entries()
         .iter()
         .map(|(id, _, _)| *id)
         .collect();
-    let shown = crate::occlusion::shown_windows(&scene, costs.values());
+    crate::occlusion::shown_windows(&scene, costs.values())
+}
+
+/// Root surfaces of the managed windows not `shown` (#503), whose frame
+/// callbacks drop to [`HIDDEN_FRAME_INTERVAL`](crate::occlusion::HIDDEN_FRAME_INTERVAL).
+/// A toplevel the window manager does not track (not yet mapped, or not
+/// a managed window) is never throttled.
+fn hidden_surfaces(
+    manager: &WindowManager,
+    shown: &[u64],
+) -> Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface> {
     manager
         .window_ids()
         .filter(|id| !shown.contains(id))

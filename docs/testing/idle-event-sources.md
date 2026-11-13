@@ -82,7 +82,8 @@ casts, or a PAM worker that has not published its terminal phase.
 
 Otherwise the earliest of, never sooner than one frame: the lock timeout and
 idle-blank threshold (16 ms during the blank fade; none while an inhibitor is
-held), IdleMonitor, idle-notify and Orca deadlines, workspace leases, the
+held), IdleMonitor, idle-notify and Orca deadlines, workspace leases, a hidden
+window's 3 s to suspension, the
 wallpaper's safety re-observation (every 5 s, only for a source no watch
 vouches for and for a slideshow), Night Light preview expiry and settings
 re-read, the focus-policy and tablet settings re-reads, focus and alive-check
@@ -97,7 +98,8 @@ frame, 16 ms while a handshake or broadcast is owed).
 
 The end of an idle inhibitor restarts the idle clock, so a session that slept
 through the inhibited stretch never locks the moment it ends. Hidden windows'
-frame callbacks wait for the hidden beat and never force a repaint.
+frame callbacks wait for the hidden beat and never force a repaint; suspended
+windows told so get none (see `suspended` in [protocols](../protocols.md)).
 
 ## Periodic work that remains at idle
 

@@ -148,8 +148,10 @@ drawn frame (`FrameCost` in `crates/compositor/src/occlusion.rs`):
 | `culled_windows` | Window ids entirely hidden behind opaque surfaces |
 
 `throttled_windows` sits next to it. It lists windows whose frame callbacks
-run at the hidden rate (about 1 Hz). [docs/testing.md](testing.md#frame-cost)
-covers both fields and the `G-OCCLUSION-CULL` proof that checks them.
+run at the hidden rate (about 1 Hz), or not at all once `suspended_windows`
+lists them and their client was told ([protocols](protocols.md#suspended-windows)).
+[docs/testing.md](testing.md#frame-cost) covers both fields and the
+`G-OCCLUSION-CULL` proof that checks them.
 
 ```bash
 TUNA_COMPOSITOR_STATE="$PWD/state.json" target/release/tuna-compositor \
