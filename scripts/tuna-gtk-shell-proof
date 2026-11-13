@@ -11280,15 +11280,8 @@ end_open battery-prepared "Power Off…" 'any(.[]; .showing and .name == "Instal
     fail G-END-SESSION-BATTERY "with a prepared update and a low battery Power Off… did not offer the unchecked update box"
 hidden "$ARTIFACTS/a11y-end-battery-prepared.json" "$WARNING" ||
     fail G-END-SESSION-BATTERY "the warning showed with no update to install"
-# GTK 4.14's GtkCheckButton exposes no AT-SPI action (only GtkButton,
-# entries, expanders, switches and swatches do), so the box is clicked
-# with the pointer, as a user does. The dialog is a full-output overlay,
-# so its window coordinates are output coordinates.
-update_box="$(jq -er '[.[] | select(.showing and .name == "Install pending software updates"
-        and ((.bounds[2] // 0) > 0) and ((.bounds[3] // 0) > 0))][0].bounds
-    | "\((.[0] + .[2] / 2) | floor) \((.[1] + .[3] / 2) | floor)"' "$ARTIFACTS/a11y-end-battery-prepared.json")" ||
-    fail G-END-SESSION-BATTERY "the update box has no on-screen bounds"
-xdotool mousemove --window "$WID" $update_box click 1
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-end-battery-check.json" 20 \
+    --press "Install pending software updates" || fail G-END-SESSION-BATTERY "could not check the update box"
 end_dump_until end-battery-checked "any(.[]; .showing and .name == \"$WARNING\")
     and any(.[]; .showing and .name == \"Install Updates & Power Off\")" 5 ||
     fail G-END-SESSION-BATTERY "checking the update box did not show the low-battery warning and GNOME's title"
