@@ -32,12 +32,28 @@ class MappingKinds(unittest.TestCase):
 
 class LiveTree(unittest.TestCase):
     def test_a_process_tree_is_sampled_per_process(self):
-        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
-                                 stdin=subprocess.PIPE)
+        # The child reports ready only once its interpreter has loaded, so
+        # its own mappings stop changing before it is sampled.
+        child = subprocess.Popen([sys.executable, "-c",
+                                  "import sys; print('ready', flush=True); sys.stdin.read()"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         try:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
             self.assertEqual(pm.tree(os.getpid()) & {os.getpid(), child.pid},
                              {os.getpid(), child.pid})
             value = pm.metrics(child.pid)
+            # smaps and smaps_rollup are separate reads, and shared pages'
+            # PSS moves whenever another process maps or drops the same
+            # libraries (CI: 2898 vs 2844 KiB). Compare the per-mapping
+            # kinds only with a rollup that held still across the smaps read.
+            for _ in range(20):
+                before = pm.rollup(child.pid)["pss_kib"]
+                kinds = pm.process_memory(child.pid)
+                after = pm.rollup(child.pid)["pss_kib"]
+                if before == after:
+                    break
+            else:
+                self.fail("the child's PSS never held still across one smaps read")
         finally:
             child.stdin.close()
             child.wait()
@@ -50,13 +66,13 @@ class LiveTree(unittest.TestCase):
         self.assertGreater(process["pss_kib"], 0)
         self.assertGreaterEqual(process["fds"], 3)
         self.assertGreater(process["maps"], 0)
-        # The kernel's split and the per-mapping kinds both add up to PSS
-        # (each smaps line rounds down, so allow a KiB per mapping).
+        # The kernel's split adds up to PSS within one rollup read.
         split = process["pss_anon_kib"] + process["pss_file_kib"] + process["pss_shmem_kib"]
         self.assertAlmostEqual(split, process["pss_kib"], delta=8)
         self.assertGreater(process["pss_anon_kib"], 0)
-        self.assertAlmostEqual(sum(process["pss_by_kind_kib"].values()), process["pss_kib"],
-                               delta=process["maps"])
+        # The per-mapping kinds add up to PSS (each smaps line rounds down,
+        # so allow a KiB per mapping).
+        self.assertAlmostEqual(sum(kinds.values()), before, delta=process["maps"])
         self.assertIn("file", process["pss_by_kind_kib"])
 
     def test_a_process_that_exited_is_left_out(self):
