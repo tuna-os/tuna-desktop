@@ -43,7 +43,11 @@ base, and picks the proof lanes the change can affect:
   lanes whose artifacts it needs. `scripts/ci-select-lanes` (`OWNED` and
   `NO_LANE`) is the authoritative, ordered mapping.
 - a lane's own proof script, reference fixtures or packaging: that lane
-  (plus the lanes whose artifacts it needs).
+  (plus the lanes whose artifacts it needs). A `scripts/tests/` file edit
+  selects the lane whose job runs that file (for example `gtk-shell` for
+  `test_notify_callback_contract.py`); a test only `check` runs selects none.
+  `WorkflowSync.test_lane_run_tests_select_their_lane` fails when a lane job
+  runs a test the selector does not map.
 - a packaged conffile (`share/pam.d/`, installed as `/etc/pam.d/tuna-lock`):
   `journey`, whose disposable Debian lifecycle fails when its bytes drift
   from the released package's, plus the core lanes and every package
@@ -1051,10 +1055,24 @@ show:
   never exits or panics and the shell never exits.
 
 `H-GROWTH` bounds the compositor and shell as the churn lane does: final
-PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32.
-Pull requests and dispatches run 4 rounds, nightly 30. The artifacts keep
-the compositor, shell and client logs, every step's outputs and window
-rectangles (`report.json`), the metrics and the state at a failure.
+PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32. Each
+round's sample in `metrics.jsonl` and `report.json` has, per process, the
+kernel's `Pss_Anon`/`Pss_File`/`Pss_Shmem` split, PSS by mapping kind
+(heap, anonymous, shared memory, GPU, files), fds and mappings
+(`scripts/lib/tuna_process_metrics.py`, shared with `scripts/tuna-stress`);
+the gate's line names the processes and kinds that rose most since round
+0. `smaps-round0-*` and `smaps-final-*` are each process's mappings after
+the first and the last round, `state-round0.json` the compositor state
+after the first, and every step in `report.json` has each process's PSS.
+Pull requests and dispatches run 4 rounds, nightly 30; a dispatch's
+`hotplug_rounds` input (and `churn_rounds` for the churn lane) runs
+another count, and its `hotplug_heaptrack` input runs the storm a second
+time with `--heaptrack`: the compositor and the shell record their
+allocation backtraces (`heaptrack/heaptrack-<name>-<pid>.zst`, read with
+`heaptrack_print`). That run is a diagnostic, since the profiler's memory
+counts in its `H-GROWTH`. The artifacts keep the compositor, shell and
+client logs, every step's outputs and window rectangles (`report.json`),
+the metrics and the state at a failure.
 
 To run it on a host with Linux 6.19+ and sudo, after building
 `tuna-compositor` and `tuna-shell-gtk`:

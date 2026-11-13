@@ -184,6 +184,7 @@ jobs:
       - run: python3 scripts/tests/test_reaper.py
       # Nested proofs end every process they start, on pass, fail and signal (#1082).
       - run: python3 scripts/tests/test_proof_session.py
+      - run: python3 scripts/tests/test_process_metrics.py
       - run: python3 scripts/tests/test_local_timeout.py
       - run: /usr/bin/python3 scripts/tests/test_vm_strip_acceptance.py
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
