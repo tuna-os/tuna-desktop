@@ -279,3 +279,21 @@ Such a late request receives a tracked inert child without metadata; its
 release and parent teardown cannot unset the compositor owner. The returned-
 key consumer exercises this race with actual standard requests and verifies
 continued physical-key delivery to the compositor grab.
+
+Issue #1088 changes src/wayland/shell/xdg/handlers/surface/toplevel.rs:
+the xdg_toplevel's destructor now also drops the xdg_dialog_v1 handle its
+user data keeps, as it already drops the decoration's. The dialog object's
+own user data is the ToplevelSurface (the xdg_toplevel and its
+wl_surface), so the two held each other and only xdg_dialog_v1.destroy
+broke the cycle. GTK 4 creates an xdg_dialog_v1 for every toplevel, and an
+app that exits (or is killed) just disconnects: every such window's
+wl_surface, its role data and the textures its frames were uploaded to
+stayed allocated for the rest of the session, about 1.65 MB per closed
+libadwaita window. Upstream master has the same cycle. The dialog
+object itself stays usable until its client destroys it (its requests
+only touch the surface's role data, which outlives the role). Real
+socketpair tests in crates/compositor/tests/window_teardown.rs close
+windows with and without an xdg_dialog_v1 by destroying every object and
+by disconnecting, and check that each surface's server-side data is
+dropped. The isolated diff is retained in XDG-DIALOG-CYCLE-PATCH.diff; the
+pinned version stays 0.7.0.
