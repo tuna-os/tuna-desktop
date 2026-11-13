@@ -2280,6 +2280,17 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         with open(os.path.join(evidence, f"{label}gpu-trace-wake.json"), "w") as stream:
             json.dump({"log": os.path.basename(gpu_log), "offset": wake_trace_offset}, stream, indent=2)
         qmp.cmd("system_wakeup")
+        # A Linux 7.3 guest's restored virtio-serial port never learns that the
+        # host chardev is open, so qemu-ga replies stall until it reconnects
+        # (PR runs 43385429967 et al.: inventory started, no guest-exec-status
+        # ever arrived). Reopen the transport only: no guest-exec, no state
+        # read, so the inventory below is still the first observation after wake.
+        woke = time.monotonic()
+        connections = agent.reopen_after_wake(timeout=20, attempt=2)
+        with open(os.path.join(evidence, f"{label}wake-transport.json"), "w") as stream:
+            json.dump({"connections": connections, "seconds": round(time.monotonic() - woke, 3),
+                       "scope": "QGA chardev reconnect and guest-sync only; no guest-exec or guest state"},
+                      stream, indent=2)
         # The first response after wake must already be locked. Waiting for a
         # later transition would hide an exposed desktop during resume.
         resumed = inventory(f"{label}first-resume")

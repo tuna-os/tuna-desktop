@@ -3766,6 +3766,33 @@ class S3AbsoluteDeadline(unittest.TestCase):
             self.assertEqual(scope['inventory']('ordinary'),{})
         self.assertEqual(calls,[(('inventory',),{})])
 
+    def test_wake_reopens_qga_transport_before_first_resume_inventory(self):
+        # PR runs 43385429967 et al. (guest Linux 7.3.4): the first post-wake
+        # guest-exec acknowledgement never arrived. The real suspend statements
+        # from system_wakeup to the first-resume inventory must reopen the
+        # transport first, without any guest-exec in between.
+        source = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+        lifecycle = next(n for n in ast.parse(source.read_text()).body
+                         if isinstance(n, ast.FunctionDef) and n.name == "run_lifecycle")
+        check = next(n for n in lifecycle.body if isinstance(n, ast.FunctionDef) and n.name == "suspend_and_check")
+        wake = next(i for i, n in enumerate(check.body) if "system_wakeup" in ast.dump(n))
+        first = next(i for i, n in enumerate(check.body) if "first-resume" in ast.dump(n))
+        events = []
+        agent = SimpleNamespace(
+            reopen_after_wake=lambda **kw: events.append(("reopen", kw)) or 2,
+            run=lambda *a, **kw: events.append(("guest-exec", a)))
+        with tempfile.TemporaryDirectory() as tmp:
+            scope = dict(qmp=SimpleNamespace(cmd=lambda name, **kw: events.append(("qmp", name))),
+                         agent=agent, evidence=tmp, label="", time=lane.time, os=lane.os, json=json,
+                         inventory=lambda label: events.append(("inventory", label)) or {"state": {"locked": True}})
+            exec(compile(ast.Module(body=check.body[wake:first + 1], type_ignores=[]), str(source), "exec"), scope)
+            with open(os.path.join(tmp, "wake-transport.json")) as stream:
+                receipt = json.load(stream)
+        self.assertEqual(events, [("qmp", "system_wakeup"), ("reopen", {"timeout": 20, "attempt": 2}),
+                                  ("inventory", "first-resume")])
+        self.assertEqual(receipt["connections"], 2)
+        self.assertIn("no guest-exec", receipt["scope"])
+
 
 class ShippedSnapshotInventory(unittest.TestCase):
     # Run 37696030597: the graphical PAM login produced a real login
