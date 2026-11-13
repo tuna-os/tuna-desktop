@@ -36,6 +36,31 @@ pub use toplevel::{get_parent, send_toplevel_configure};
 mod popup;
 pub use popup::{make_popup_handle, send_popup_configure};
 
+/// Whether `surface` is `start` or one of the popup ancestors of `start`.
+/// The existing popup graph is acyclic (each new edge is checked here), so
+/// the walk ends.
+fn popup_chain_contains(start: &wl_surface::WlSurface, surface: &wl_surface::WlSurface) -> bool {
+    let mut current = start.clone();
+    loop {
+        if current == *surface {
+            return true;
+        }
+        if !current.alive() || compositor::get_role(&current) != Some(XDG_POPUP_ROLE) {
+            return false;
+        }
+        let parent = compositor::with_states(&current, |states| {
+            states
+                .data_map
+                .get::<XdgPopupSurfaceData>()
+                .and_then(|attributes| attributes.lock().unwrap().parent.clone())
+        });
+        match parent {
+            Some(parent) => current = parent,
+            None => return false,
+        }
+    }
+}
+
 /// User data of XdgSurface
 #[derive(Debug)]
 pub struct XdgSurfaceUserData {
@@ -160,14 +185,31 @@ where
                     .lock()
                     .unwrap();
 
-                let parent_surface = parent.map(|parent| {
-                    let parent_data = parent.data::<XdgSurfaceUserData>().unwrap();
-                    parent_data.wl_surface.clone()
-                });
-
                 // We now can assign a role to the surface
                 let surface = &data.wl_surface;
                 let shell = &data.wm_base;
+
+                // Mutter (meta-wayland-xdg-shell.c,
+                // xdg_surface_constructor_get_popup) refuses a parent without
+                // an xdg role. A popup must also not be its own ancestor:
+                // find_popup_root_surface and friends walk the parent chain
+                // until it leaves the popups, so a cycle hung the compositor.
+                let parent_surface = match parent {
+                    Some(parent) => {
+                        let parent_data = parent.data::<XdgSurfaceUserData>().unwrap();
+                        if !parent_data.has_active_role.load(Ordering::Acquire)
+                            || popup_chain_contains(&parent_data.wl_surface, surface)
+                        {
+                            shell.post_error(
+                                xdg_wm_base::Error::InvalidPopupParent,
+                                "Invalid popup parent: it has no xdg role or descends from this popup.",
+                            );
+                            return;
+                        }
+                        Some(parent_data.wl_surface.clone())
+                    }
+                    None => None,
+                };
 
                 let attributes = XdgPopupSurfaceRoleAttributes {
                     parent: parent_surface,
