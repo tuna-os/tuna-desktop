@@ -965,10 +965,11 @@ fn trusted_sender(peer: Option<&Peer>, sender: Option<&str>) -> bool {
 
 /// GTK's AT-SPI bridge gives GtkCheckButton no Action (only GtkButton,
 /// GtkSwitch, GtkExpander and entries get one), so assistive technology could
-/// read these toggles but not operate them. A widget-local action group is
+/// read a check box but not operate it. A widget-local action group is
 /// what GTK exports for any other widget; its one action clicks the button,
-/// and GTK withholds it while the button is insensitive.
-fn expose_toggle_action(button: &gtk::CheckButton) {
+/// and GTK withholds it while the button is insensitive. The end-session
+/// dialog's update box needs the same.
+pub(crate) fn expose_toggle_action(button: &gtk::CheckButton) {
     let toggle = gio::SimpleAction::new("toggle", None);
     let weak = button.downgrade();
     toggle.connect_activate(move |_, _| {
