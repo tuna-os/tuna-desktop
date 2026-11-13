@@ -179,6 +179,10 @@ jobs:
           python3 scripts/lib/tuna-perf-payload.py copy --package tuna.pkg.tar.zst --report perf-artifacts/package-payload.json --out perf-artifacts/package-copy.json
           package_sha=$(jq -r '.package.sha256' perf-artifacts/package-payload.json)
           sha256sum tuna.pkg.tar.zst > perf-artifacts/package.sha256
+          # The reference base is the one platform manifest the recipe pins; the
+          # moving Marlin tag outruns the pinned Arch snapshot (run 43009988803).
+          base_image=$(sed -n 's/^ARG BASE_IMAGE=//p' packaging/marlin/perf/Containerfile.baseline)
+          [[ "$base_image" =~ ^ghcr\.io/tuna-os/marlin@sha256:[0-9a-f]{64}$ ]] || { echo 'performance reference base is not one pinned platform digest' >&2; exit 2; }
           # One coherent distribution upgrade supplies BOTH explicit profiles.
           sudo podman build -f packaging/marlin/perf/Containerfile.baseline --target gnome-baseline -t localhost/marlin-gnome51-coherent:base . 2>&1 | tee perf-artifacts/coherent-build.log
           coherent_image=$(sudo podman inspect localhost/marlin-gnome51-coherent:base --format '{{.Id}}')
@@ -223,7 +227,8 @@ jobs:
             python3 scripts/lib/tuna-perf-payload.py runtime --runtime "$profile_artifacts/runtime-versions" --report perf-artifacts/package-payload.json --out "$profile_artifacts/installed-runtime.json"
             sudo podman rm "$container"
             trap - EXIT
-            sudo podman inspect ghcr.io/tuna-os/marlin:gnome --format '{{.Digest}}' | tee base-digest
+            sudo podman inspect "$base_image" --format '{{.Digest}}' | tee base-digest
+            [[ "$(cat base-digest)" == "${base_image#*@}" ]] || { echo 'built reference base differs from the pinned platform digest' >&2; exit 2; }
             sudo podman run --rm "localhost/marlin-tuna-preview:$profile" gnome-shell --version | tee "$profile_artifacts/gnome-version"
             grep -Eq '^GNOME Shell 51([. ]|$)' "$profile_artifacts/gnome-version"
             sudo podman run --rm "localhost/marlin-tuna-preview:$profile" pacman -Q | tee "$profile_artifacts/baseline-packages.txt"
