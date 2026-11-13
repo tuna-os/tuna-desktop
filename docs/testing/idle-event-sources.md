@@ -179,6 +179,7 @@ the portal publisher sleeping until a setting or a bus set changes, at most
 one wake-up a second (`privacy_portal::tests`, shell), the IBus bridge's
 wait (`tuna-ibus-bridge` `tests::the_loop_sleeps_until_the_socket_or_glib_has_something`)
 and the PipeWire socket watch (`services::pipewire_socket_tests`).
+
 The nested (winit) backend never takes the idle path: `producer_wake` answers
 one frame for it before any deadline is read, so no Xvfb proof exercises an
 idle tick, and none can regress on one. Only `--backend drm` does. On
