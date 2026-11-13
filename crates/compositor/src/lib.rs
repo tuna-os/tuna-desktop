@@ -115,6 +115,7 @@ pub mod introspect;
 pub mod layer;
 pub mod lock;
 pub mod lockdown;
+pub(crate) mod lockdown_settings;
 mod logind_session;
 pub mod magnifier;
 pub mod malloc;
@@ -221,6 +222,9 @@ pub(crate) struct OutputEntry {
 pub struct State {
     /// Surface commits/destruction invalidate the pointer's scene pick.
     pub(crate) pointer_scene_dirty: bool,
+    /// Surface commits applied so far, whatever applied them: a client
+    /// request, or a refresh cycle releasing a held-back one.
+    pub(crate) commit_count: u64,
     pub(crate) window_icons: window_icons::WindowIcons,
     compositor_state: CompositorState,
     shm_state: ShmState,
@@ -806,6 +810,7 @@ impl CompositorHandler for State {
 
     fn commit(&mut self, surface: &wl_surface::WlSurface) {
         self.pointer_scene_dirty = true;
+        self.commit_count = self.commit_count.wrapping_add(1);
         on_commit_buffer_handler::<State>(surface);
         self.window_icons.commit(surface);
         self.popups.commit(surface);
@@ -1227,6 +1232,7 @@ impl State {
             popup_refocus: false,
             window_origins: std::collections::HashMap::new(),
             pointer_scene_dirty: true,
+            commit_count: 0,
             initial_outputs: std::collections::HashMap::new(),
             outputs: Vec::new(),
             retired_output_globals: Vec::new(),
