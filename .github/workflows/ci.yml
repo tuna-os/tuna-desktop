@@ -55,9 +55,19 @@ jobs:
           CI_ROUND_ROBIN_SIZE: ${{ vars.CI_ROUND_ROBIN_SIZE }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           DRAFT: ${{ github.event.pull_request.draft }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Draft pull requests: check only. Their proof lanes run when the
-          # pull request is marked ready for review.
+          # pull request is marked ready for review. The event's draft flag
+          # is from when the event fired: a push just before "ready for
+          # review" queues a run that still says draft and, by superseding
+          # the ready_for_review run, left #958 with no proof lanes at all.
+          # Ask for the pull request's current state instead.
+          if [ "$DRAFT" = true ]; then
+            DRAFT=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .draft) || DRAFT=true
+          fi
           if [ "$DRAFT" = true ]; then
             echo 'lanes=[]' >> "$GITHUB_OUTPUT"
           elif [ -n "$BASE_SHA" ]; then
