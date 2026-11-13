@@ -1,0 +1,12 @@
+diff --git a/third-party/smithay/src/wayland/shm/handlers.rs b/third-party/smithay/src/wayland/shm/handlers.rs
+index 61cf4fbf..54dd9cc0 100644
+--- a/third-party/smithay/src/wayland/shm/handlers.rs
++++ b/third-party/smithay/src/wayland/shm/handlers.rs
+@@ -190,6 +190,7 @@ where
+             Request::Resize { size } => {
+                 if size <= 0 {
+                     pool.post_error(wl_shm::Error::InvalidFd, "invalid wl_shm_pool size");
++                    return;
+                 }
+ 
+                 if let Err(err) = arc_pool.resize(NonZeroUsize::try_from(size as usize).unwrap()) {

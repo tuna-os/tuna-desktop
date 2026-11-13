@@ -33,7 +33,7 @@ use smithay::{
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::Display,
     utils::{Logical, Point, Rectangle, Transform},
-    wayland::{seat::WaylandFocus, socket::ListeningSocketSource},
+    wayland::seat::WaylandFocus,
 };
 
 use crate::control::{ControlHub, PeerGate};
@@ -1168,24 +1168,26 @@ impl Runtime {
                 )
                 .map_err(|e| RuntimeError::Loop(e.to_string()))?;
         }
-        let socket = ListeningSocketSource::with_name(&session.socket_name)
-            .map_err(|e| RuntimeError::Socket(e.to_string()))?;
-        event_loop
-            .handle()
-            .insert_source(socket, |stream, _, runtime: &mut Runtime| {
+        // A failed accept (descriptors exhausted by a client flood) rests
+        // the socket instead of ending the session (#203).
+        crate::client_listener::listen(
+            &event_loop.handle(),
+            &session.socket_name,
+            |stream, runtime: &mut Runtime| {
                 let mut client_data = ClientState::native_connection(&stream);
                 // Layer-shell is the supervised shell's alone (#1048).
                 client_data.admit_supervised_shell(&stream, runtime.shell.child_pid());
-                if let Ok(client) = runtime
+                if runtime
                     .display
                     .handle()
                     .insert_client(stream, Arc::new(client_data))
+                    .is_ok()
                 {
-                    let _ = client;
                     runtime.stats.clients += 1;
                 }
-            })
-            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+            },
+        )
+        .map_err(|e| RuntimeError::Socket(e.to_string()))?;
 
         // The shell offers power actions only on a hardware session: in
         // the nested preview, logind's session is the host's, so Log Out
@@ -1946,8 +1948,9 @@ impl Runtime {
         self.state.set_shortcut_inhibition_locked(false);
         self.overlay.hide();
         // The lock held the keyboard (`hold_lock_focus`); hand it back,
-        // as GNOME's unlock returns focus to the focused window.
-        self.manager.restore_keyboard_owner(&mut self.state);
+        // as GNOME's unlock returns focus to the focused window: to a
+        // popup grab that outlived the lock first.
+        self.manager.refocus_after_lock(&mut self.state);
     }
 
     /// logind's `Lock` signal (`loginctl lock-session`): `screenShield.js`
@@ -2458,12 +2461,16 @@ impl Runtime {
     /// last call on the loop (wp_security_context_v1, #1046): a client
     /// it accepts joins the display inside that context, so no
     /// privileged global admits it. The listener goes once its creator
-    /// closes the context's close fd.
+    /// closes the context's close fd. A connection that cannot be accepted
+    /// (no descriptor left) rests the listener instead of ending the loop
+    /// (#1071, `security_listener`).
     fn admit_security_contexts(&mut self) {
+        use crate::security_listener::{Accept, RestingListener, REST};
         for (source, context) in self.state.take_security_contexts() {
-            let inserted =
-                self.loop_handle
-                    .insert_source(source, move |stream, _, runtime: &mut Runtime| {
+            let inserted = self.loop_handle.insert_source(
+                RestingListener::new(source),
+                move |accept, _, runtime: &mut Runtime| match accept {
+                    Accept::Client(stream) => {
                         let data = ClientState::security_context(&stream, context.clone());
                         if runtime
                             .display
@@ -2473,7 +2480,19 @@ impl Runtime {
                         {
                             runtime.stats.clients += 1;
                         }
-                    });
+                    }
+                    // Said once per run of failures, not at every retry.
+                    Accept::Failed {
+                        error,
+                        repeated: false,
+                    } => eprintln!(
+                        "tuna-compositor: cannot accept a client on a security context \
+                         listener ({error}); it rests {} ms and retries",
+                        REST.as_millis()
+                    ),
+                    Accept::Failed { repeated: true, .. } => {}
+                },
+            );
             if let Err(error) = inserted {
                 eprintln!(
                     "tuna-compositor: security context listener not added: {}",
@@ -2844,6 +2863,15 @@ impl Runtime {
         doc["magnifier"] = self.magnifier.diagnostics();
         doc["screen_reader_pid"] = serde_json::json!(self.orca.pid());
         doc["screen_reader_state"] = serde_json::json!(self.orca.state());
+        // Shell supervision (#203's crash-loop stress): the supervised
+        // shell's PID, restarts spent from its budget, and whether the
+        // compositor's recovery overlay is up.
+        doc["shell"] = serde_json::json!({
+            "pid": self.shell.child_pid(),
+            "restarts_used": self.shell.restarts_used(),
+            "max_restarts": self.shell.policy().max_attempts,
+            "overlay_visible": self.overlay.visible,
+        });
         doc["a11y_keyboard"] = self
             .a11y_keyboard
             .as_ref()
