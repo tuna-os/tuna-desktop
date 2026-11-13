@@ -860,6 +860,25 @@ class Accounting(unittest.TestCase):
                     self.assertEqual(guest.diagnostic_counter([token], 0, maximum), expected)
             self.assertIsNone(guest.diagnostic_counter([], 0, maximum))
 
+    def test_a_gnome_sized_sample_fits_the_hosts_observer_record_bound(self):
+        # Stock GNOME runs ~90 session processes; with the PSS breakdown its
+        # records reached 33149 bytes and the host refused every stock pair
+        # (run 43449826443). 100 processes with wide values and the record's
+        # other fields (1 KiB) must still fit.
+        import perf_budget
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index in range(100):
+                path = self.process(root, 100000 + index, 99999, 1000, 0, 1234567 + index)
+                (path / 'smaps_rollup').write_text(
+                    'Rss: 412345 kB\nPss: 312345 kB\nPss_Anon: 212345 kB\nPss_File: 99999 kB\n'
+                    'Pss_Shmem: 12345 kB\nPrivate_Dirty: 212345 kB\n')
+                (path / 'cmdline').write_bytes(b'/usr/libexec/gsd-screensaver-proxy\0')
+            result = guest.sample(1000, root)
+            self.assertEqual(result['process_count'], 100)
+            size = len(json.dumps(result, separators=(',', ':')))
+            self.assertLessEqual(size + 1024, perf_budget.OBSERVER_RECORD_BYTES)
+
     def test_a_process_row_carries_the_kernels_pss_breakdown_when_it_gives_one(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
