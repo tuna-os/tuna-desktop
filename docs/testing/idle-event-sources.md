@@ -73,6 +73,30 @@ one scan per burst of writes. A store on a filesystem inotify cannot vouch for
 (anything but a local one), one that holds a symbolic link, or one without a
 watch is still scanned every 500 ms.
 
+The Mutter D-Bus thread is not part of the loop either (#503). Its
+revocation scan runs every 100 ms only while a ScreenCast session, a
+RemoteDesktop grant or an InputCapture session exists (the bound on stream
+teardown after a lock or an owner leaving); with none it blocks on
+`mutter::ScanWake`, which creating one of them notifies. The orientation
+sensor client (`orientation::SensorPoller`) shares that thread: one
+system-bus connection hears `NameOwnerChanged` for `net.hadess.SensorProxy`
+and the sensor's `PropertiesChanged`, as mutter's `MetaOrientationManager`
+does, and the orientation-lock and power-save flags notify the same wake
+when they change (`orientation::ChangeHook`). The sensor is read only after
+one of these. Fallbacks, each documented in the source: a connection whose
+match rules cannot be added (or whose signal thread ended) polls as before,
+a present sensor every 100 ms and an absent service through a new connection
+every 5 s; a failed claim is retried every 100 ms; no system bus is retried
+every 5 s.
+
+## Shell-side sources
+
+| Worker | Source | Former poll |
+| --- | --- | --- |
+| `tuna-privacy-portal` (portal `Lockdown` publisher) | Its own GLib main loop: `changed` on one held `org.gnome.desktop.privacy` GSettings, the staged wake of a bus-originated set (`LockdownBus::on_staged`), `g_bus_watch_name` for the backend name vanishing. Retries every 100 ms only while a staged set was refused or the name could not be taken with no other owner | 100 ms sleep, three new `GSettings` per pass |
+| `tuna-ibus-bridge` main loop | One `poll` over the Wayland socket and GLib's own descriptors with GLib's timeout (`g_main_context_prepare`/`query`/`check`/`dispatch`); IBus signals and the bus closing wake GLib's descriptors. A departed IBus is still looked for with its 250 ms → 5 s backoff | 50 ms poll timeout |
+| PipeWire monitor (`pw-dump --monitor`) restart | With no PipeWire socket (`PIPEWIRE_REMOTE`, `PIPEWIRE_RUNTIME_DIR`/`XDG_RUNTIME_DIR`), a GLib directory monitor (inotify) restarts it when the socket is created. A socket that exists (a failure of another kind) or a directory that cannot be watched keeps the 2 s retry | a `pw-dump` process every 2 s |
+
 ## Time-driven wakes (`next_wake`)
 
 Frame pace while: activity linger, overview/strip/workspace/size-change/window
@@ -122,13 +146,16 @@ the first rows; it is a single noisy host, not the paired GNOME lane:
 | Source | Period | Work per wake | Event that could replace it |
 | --- | --- | --- | --- |
 | `Wallpaper::maintenance_deadline` | 1 s while a picture is set | A full tick, a `tuna-wallpaper-identity` thread that reads and SHA-256-hashes the whole source file, then a second full tick for its completion | inotify on the source file and its directory, with the hash only after an event; a deadline for slideshow steps |
-| Mutter D-Bus thread scan (`mutter::start`) | 100 ms | Three mutex snapshots of the remote, cast and input-capture sessions; owner checks when any exist | Block while no session exists; `NameOwnerChanged` for owners; the lock through a channel |
-| `orientation::SensorPoller` (same scan) | 100 ms with iio-sensor-proxy, 5 s without | `HasAccelerometer` and `AccelerometerOrientation` through a new proxy each; without the service a new system-bus connection per retry | `PropertiesChanged` and `NameOwnerChanged` on one connection, as Mutter does |
+| Mutter D-Bus thread scan (`mutter::start`) | 100 ms only while a session, grant or capture exists; none at idle since #503 | Three mutex snapshots of the remote, cast and input-capture sessions; owner checks when any exist | `NameOwnerChanged` for owners while sessions exist |
+| `orientation::SensorPoller` | None since #503 while its signals are subscribed; the former 100 ms / 5 s polling only as the fallback above | One read after each signal or flag change | Done (#503) |
 | Settings re-reads: Night Light, focus policy, tablet (with a tablet) | 5 s each | A full tick, an idle source on the reader's GIO thread, a second full tick for the completion | Their `changed` subscriptions already deliver changes; the re-read only heals a lost signal or a failed first read |
 | Control hub token reissue | 15 s | `model.reissue` and a delta per window, on the next tick | A deadline in `next_poll` |
 | Idle fallback | 500 ms when nothing else is due | An idle tick: polls, no frame | Nothing to replace; it is the safety net |
 | Hidden-window beat | 995 ms while a hidden window waits on a frame callback | Frame callbacks to hidden surfaces | None (deliberate, as a throttle) |
 | Orca name watch | 1 s while the screen reader runs | One bus query | `NameOwnerChanged` |
+| `blocking` crate pool threads (zbus connects through `blocking::unblock`) | 500 ms per pool thread, for the life of the process (two in the compositor, one in the shell on the vkms replica) | A condvar timeout with no work; `blocking` 1.7 only retires threads above its limit | Connecting the bus socket ourselves and handing zbus the stream (`Builder::unix_stream`) at every connection site |
+| Shell brightness (`brightness_service::start`, `services::brightness`) | 500 ms each | A backlight inventory under `/sys/class/backlight` plus the slider's re-read | Kernel `backlight` uevents (every sysfs write and hotkey change emits one) and output-inventory changes; fixture roots (`TUNA_BACKLIGHT_ROOT`) would keep the poll |
+| Blanked or locked desktop (measured 2026-11-13, idle-delay 30 s, vkms) | Shell main thread about 65 wake-ups a second, compositor main thread about 88 (against 7 and 38 awake) | Not attributed yet: the shell's main loop wakes at frame pace while the screen is blanked | Mutter stops the frame clock while outputs are off |
 
 ## Qualification
 
@@ -142,6 +169,16 @@ its store on change events only (`color_manager::tests`), the watched
 wallpaper drop (`wallpaper::tests`), the wake on a changed
 `org.gnome.SessionManager` inhibitor (`session_manager::tests`) and the input
 aids' deadlines (`input_aids::tests`, `pointer_aids::tests`).
+
+The #503 idle-pollers lane added: the Mutter scan's wait
+(`mutter::tests::the_scan_waits_for_a_notify_or_its_deadline`), the sensor
+client following `NameOwnerChanged`, `PropertiesChanged` and flag changes
+on a private bus with no read in between
+(`orientation::tests::the_sensor_client_reads_on_signals_and_flag_changes_only`),
+the portal publisher sleeping until a setting or a bus set changes, at most
+one wake-up a second (`privacy_portal::tests`, shell), the IBus bridge's
+wait (`tuna-ibus-bridge` `tests::the_loop_sleeps_until_the_socket_or_glib_has_something`)
+and the PipeWire socket watch (`services::pipewire_socket_tests`).
 
 The nested (winit) backend never takes the idle path: `producer_wake` answers
 one frame for it before any deadline is read, so no Xvfb proof exercises an
