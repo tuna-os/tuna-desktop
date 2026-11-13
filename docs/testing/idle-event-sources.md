@@ -97,7 +97,6 @@ every 5 s.
 | `tuna-ibus-bridge` main loop | One `poll` over the Wayland socket and GLib's own descriptors with GLib's timeout (`g_main_context_prepare`/`query`/`check`/`dispatch`); IBus signals and the bus closing wake GLib's descriptors. A departed IBus is still looked for with its 250 ms → 5 s backoff | 50 ms poll timeout |
 | PipeWire monitor (`pw-dump --monitor`) restart | With no PipeWire socket (`PIPEWIRE_REMOTE`, `PIPEWIRE_RUNTIME_DIR`/`XDG_RUNTIME_DIR`), a GLib directory monitor (inotify) restarts it when the socket is created. A socket that exists (a failure of another kind) or a directory that cannot be watched keeps the 2 s retry | a `pw-dump` process every 2 s |
 
-
 ## Time-driven wakes (`next_wake`)
 
 Frame pace while: activity linger, overview/strip/workspace/size-change/window
