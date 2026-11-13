@@ -281,7 +281,9 @@ class ProofSession(unittest.TestCase):
         self.assertEqual(status, 0, result)
         self.assertTrue((self.dir / "pids.activated").read_text().split(), "the service was never activated")
         self.assertEqual((self.dir / "pids.check").read_text().strip(), "0", result)
-        self.assertIn("left behind: sleep(", result)
+        # dbus-daemon's own forked activation helper may be listed too
+        # (CI job 131655113567: "left behind: dbus-daemon(47555) sleep(47556)").
+        self.assertRegex(result, r"left behind:.*\bsleep\(\d+\)")
         self.assertEqual(with_token(self.token), [], result)
 
     def test_check_outside_a_session_refuses(self):
