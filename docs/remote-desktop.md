@@ -139,6 +139,9 @@ It requires actual Cancel/Allow, a linked PipeWire frame, foreign input denial,
 legacy and EIS keyboard/button delivery, node removal after Close/client/backend
 loss/EIS disconnect/lock, and new-session lock denial. Candidate commit, runtime
 versions, consent screenshots, input logs and frame evidence accompany the run.
+A failed run names the failing command or the wait that expired and prints the
+end of each component log; the complete logs stay in the `remote-security`
+artifact, and the exit status is the proof's.
 
 The libei sender keeps its EIS descriptor open until the parent observes fresh
 keyboard and button delivery in that actual GTK client, then acknowledges the
