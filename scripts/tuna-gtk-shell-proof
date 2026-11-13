@@ -117,6 +117,8 @@
 #                    (tests/protocols/gnome51-globals.tsv, P-SY-06)
 #   G-OV-SHELL-UI  the overview shows the search entry and the dash
 #   G-OV-SEARCH typing lists matching apps (#57)
+#   G-OV-SEARCH-STILL the focused, unchanged overview search draws no
+#               frames: the shell's caret is steady, as GNOME's (#503)
 #   G-OV-LAUNCH Enter launches the top result and closes the overview
 #   G-OV-APPGRID Show Apps opens the app grid
 #   G-X11-APP      XWayland is on by default: an X11 app launched from
@@ -2747,6 +2749,14 @@ showing "$ARTIFACTS/a11y-search.json" "Tuna Probe" ||
     fail G-OV-SEARCH "typing did not list the probe app"
 pass G-OV-SEARCH "typing in the overview lists matching apps"
 scrot "$ARTIFACTS/10-search.png" >/dev/null
+# GNOME Shell's caret is steady (StEntry, ClutterText): with the search
+# entry focused and nothing changing, the overview draws no frames (#503).
+# A blinking GTK caret would redraw the entry at the display rate.
+search_still_frames="$(jq .rendered_frames "$CSTATE")"
+sleep 1.5
+[ "$(jq .rendered_frames "$CSTATE")" = "$search_still_frames" ] ||
+    fail G-OV-SEARCH-STILL "the compositor drew frames while the focused overview search sat unchanged"
+pass G-OV-SEARCH-STILL "the focused overview search sits still: no frames while nothing changes"
 
 xdotool key Return
 end=$(($(date +%s) + 15))
