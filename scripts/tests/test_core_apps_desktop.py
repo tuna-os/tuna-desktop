@@ -1,7 +1,10 @@
 """Host Files-cell matching regressions; no VM qualification."""
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -1076,6 +1079,38 @@ class PickerFilterDiagnostic(unittest.TestCase):
         self.assertEqual(clicked, [[6]])
         self.assertEqual(keys, [('esc',)])
         self.assertNotIn('picker-diagnostic-error', retained)
+
+
+class InstalledModulePrecedence(unittest.TestCase):
+    """The Core guest runs the clock modules its own fixture admits.
+
+    The ordinary lane image installs standalone copies of `autotz.py` and
+    `geoclue_fixture.py` beside `native_session.py` for the `autotz` row,
+    while `fixture_members('core-apps')` binds only `/usr/libexec/tuna-core-apps`.
+    Source layout and import order only; no image or VM qualification.
+    """
+    def test_shared_session_directory_never_shadows_core_modules(self):
+        lane = ROOT / 'packaging' / 'marlin' / 'vm-lane'
+        with tempfile.TemporaryDirectory() as scratch:
+            core = Path(scratch) / 'tuna-core-apps'
+            session = Path(scratch) / 'tuna-native-session'
+            ignore = shutil.ignore_patterns('__pycache__')
+            shutil.copytree(lane / 'core-apps', core, ignore=ignore)
+            shutil.copytree(lane / 'tuna-native-session', session, ignore=ignore)
+            for name in ('autotz.py', 'geoclue_fixture.py'):
+                shutil.copy(lane / 'core-apps' / name, session / name)
+            # tuna-vm-lifecycle's `core-apps` action: its directory, then guest.
+            program = ('import importlib, json, sys\n'
+                       'sys.path.insert(0, sys.argv[1])\n'
+                       'import guest\n'
+                       'names = ("basic", "autotz", "geoclue_fixture", "native_session")\n'
+                       'print(json.dumps({name: importlib.import_module(name).__file__ for name in names}))\n')
+            resolved = json.loads(subprocess.run(
+                [sys.executable, '-B', '-c', program, str(core)],
+                check=True, capture_output=True, text=True, timeout=30).stdout)
+        self.assertEqual({name: Path(path).parent.name for name, path in resolved.items()},
+                         {'basic': 'tuna-core-apps', 'autotz': 'tuna-core-apps',
+                          'geoclue_fixture': 'tuna-core-apps', 'native_session': 'tuna-native-session'})
 
 
 if __name__ == '__main__':

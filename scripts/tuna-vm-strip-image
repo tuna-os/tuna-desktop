@@ -25,7 +25,7 @@ def main():
     parser.add_argument('--image-id')
     parser.add_argument('--base-image')
     parser.add_argument('--out')
-    parser.add_argument('--fixture', choices=('lifecycle', 'core-apps'), default='lifecycle')
+    parser.add_argument('--fixture', choices=('lifecycle', 'autotz', 'core-apps'), default='lifecycle')
     args = parser.parse_args()
     if args.canonical_image_id is not None:
         if args.fixture != 'lifecycle' or args.inspection_program or any(getattr(args, name) is not None for name in

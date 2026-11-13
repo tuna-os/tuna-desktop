@@ -1,5 +1,6 @@
-# Full Core dependencies and preboot role preparation never affect ordinary
-# lifecycle rows or the independently routed native clock fixture.
+# Full Core dependencies never affect ordinary lifecycle rows or the
+# independently routed native clock fixture. The account's wheel role comes
+# from that ordinary fixture layer; this layer requires it and changes none.
 ARG BASE_IMAGE=localhost/marlin-tuna-vm:ci
 FROM ${BASE_IMAGE}
 ARG CORE_APPS=1

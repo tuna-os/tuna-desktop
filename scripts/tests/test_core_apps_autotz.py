@@ -1,6 +1,7 @@
 """Semantic validator controls, not installed-image or automatic-timezone evidence."""
 import copy
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "lib" / "core_apps_autotz.py"
@@ -174,6 +176,169 @@ class AutomaticTimezoneSemanticControls(unittest.TestCase):
             {"delta_seconds": 121, "stale_delta_seconds": 3600}, exclude_stale=True))
 
 
+class LocaltimeStateControls(unittest.TestCase):
+    """Real temporary files and mocked D-Bus, not native timezone evidence."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.localtime = self.root / "localtime"
+        self.zones = self.root / "zoneinfo"
+        for zone in ("UTC", "America/New_York", "Pacific/Auckland"):
+            path = self.zones / zone
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(("fixture-zone:" + zone).encode())
+        self.zone = "UTC"
+
+        def path(value):
+            return {"/etc/localtime": self.localtime,
+                    "/usr/share/zoneinfo": self.zones}.get(str(value), Path(value))
+
+        patches = (
+            mock.patch.object(GUEST, "Path", side_effect=path),
+            mock.patch.object(GUEST, "_call", side_effect=lambda *a, **k: ({"Timezone": self.zone},)),
+            mock.patch.object(GUEST, "_digest",
+                              side_effect=lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()),
+            mock.patch.object(GUEST, "_gio", return_value=(mock.Mock(), mock.Mock())),
+        )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.context = object()
+        self.state = {"original": {"timedate": self.snapshot(),
+                                   "settings": {"master": False, "automatic": False}}}
+
+    def snapshot(self):
+        return GUEST._timedate(object())
+
+    def set_timezone(self, context, argv, **kwargs):
+        if argv[0] == "busctl":
+            self.zone = argv[-2]
+            self.localtime.unlink(missing_ok=True)
+            self.localtime.symlink_to(self.zones / self.zone)
+
+    def test_absent_localtime_saves_explicit_default_utc_without_fabricated_digest(self):
+        self.assertEqual(self.snapshot()["localtime"],
+                         {"present": False, "resolved": None,
+                          "sha256": None, "matches_zone": False})
+        self.assertEqual(self.snapshot()["zone"], "UTC")
+        GUEST._digest.assert_not_called()
+
+    def test_absence_cannot_prove_automatic_or_manual_zone(self):
+        observed = observation()
+        for zone in (AUTOTZ.MANUAL_ZONE, AUTOTZ.AUTOMATIC_ZONE):
+            observed["timedate"] = dict(self.snapshot(), zone=zone)
+            self.assertFalse(AUTOTZ.local_zone(observed, zone))
+        self.assertFalse(AUTOTZ.positive_ready(observed, observed["gsd"]))
+
+    def test_absence_disagreeing_with_timedate1_fails(self):
+        for zone in ("Etc/UTC", "America/New_York", "Pacific/Auckland"):
+            self.zone = zone
+            with self.subTest(zone=zone), self.assertRaisesRegex(RuntimeError, "disagrees"):
+                self.snapshot()
+
+    def test_dangling_symlink_is_not_implicit_utc(self):
+        self.localtime.symlink_to(self.root / "missing-zone")
+        with self.assertRaises(FileNotFoundError):
+            self.snapshot()
+
+    def test_missing_zoneinfo_is_still_fatal(self):
+        self.localtime.write_bytes(b"fixture-zone:UTC")
+        (self.zones / "UTC").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.snapshot()
+
+    def test_unreadable_localtime_is_still_fatal(self):
+        self.localtime.symlink_to(self.zones / "UTC")
+        with mock.patch.object(GUEST, "_digest", side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                self.snapshot()
+
+    def test_present_symlink_and_regular_file_keep_real_hash_evidence(self):
+        for zone in ("UTC", "America/New_York"):
+            self.zone = zone
+            for symlink in (True, False):
+                self.localtime.unlink(missing_ok=True)
+                if symlink:
+                    self.localtime.symlink_to(self.zones / zone)
+                else:
+                    self.localtime.write_bytes((self.zones / zone).read_bytes())
+                with self.subTest(zone=zone, symlink=symlink):
+                    actual = self.snapshot()["localtime"]
+                    self.assertTrue(actual["present"])
+                    self.assertTrue(actual["matches_zone"])
+                    self.assertEqual(actual["sha256"],
+                                     hashlib.sha256((self.zones / zone).read_bytes()).hexdigest())
+        self.localtime.write_bytes(b"wrong-zone")
+        self.assertFalse(self.snapshot()["localtime"]["matches_zone"])
+
+    def test_cleanup_restores_actual_absence_and_readback_after_utc_write(self):
+        self.zone = "America/New_York"
+        self.localtime.symlink_to(self.zones / self.zone)
+        with mock.patch.object(GUEST, "_command", side_effect=self.set_timezone) as command, \
+                mock.patch.object(GUEST, "_stop_monitor"), \
+                mock.patch.object(GUEST, "_settings", return_value=self.state["original"]["settings"]), \
+                mock.patch.object(GUEST, "_persist"), \
+                mock.patch.object(GUEST, "_snapshot",
+                                  side_effect=lambda *a, **k: {"timedate": self.snapshot()}):
+            restored = GUEST._restore(self.context, self.root, self.state)
+        self.assertTrue(restored["restored"])
+        self.assertTrue(self.state["restore"]["restored"])
+        self.assertEqual(restored["timedate"]["localtime"],
+                         self.state["original"]["timedate"]["localtime"])
+        self.assertFalse(self.localtime.exists())
+        self.assertFalse(self.localtime.is_symlink())
+        writes = [call.args[1] for call in command.call_args_list
+                  if call.args[1][0] == "busctl"]
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][-3:], ["sb", "UTC", "false"])
+
+    def test_cleanup_does_not_remove_an_original_explicit_utc_file(self):
+        self.localtime.symlink_to(self.zones / "UTC")
+        self.state["original"]["timedate"] = self.snapshot()
+        with mock.patch.object(GUEST, "_command", side_effect=self.set_timezone):
+            GUEST._restore_timezone(self.context, self.root, self.state)
+        self.assertTrue(self.localtime.is_symlink())
+        self.assertEqual(self.snapshot()["localtime"],
+                         self.state["original"]["timedate"]["localtime"])
+
+    def test_cleanup_already_absent_utc_needs_no_file_removal(self):
+        with mock.patch.object(GUEST, "_command"):
+            GUEST._restore_timezone(self.context, self.root, self.state)
+        self.assertEqual(self.snapshot()["localtime"],
+                         self.state["original"]["timedate"]["localtime"])
+
+    def test_cleanup_wrong_returned_zone_cannot_remove_file(self):
+        self.zone = "America/New_York"
+        self.localtime.symlink_to(self.zones / self.zone)
+        with mock.patch.object(GUEST, "_command"):
+            with self.assertRaisesRegex(RuntimeError, "did not return to UTC"):
+                GUEST._restore_timezone(self.context, self.root, self.state)
+        self.assertEqual(self.localtime.resolve(), self.zones / self.zone)
+
+    def test_cleanup_preserves_mismatched_file_and_reports_failure(self):
+        def wrong_file(context, argv, **kwargs):
+            if argv[0] == "busctl":
+                self.localtime.write_bytes(b"not-the-utc-zone")
+
+        with mock.patch.object(GUEST, "_command", side_effect=wrong_file), \
+                mock.patch.object(GUEST, "_stop_monitor"), \
+                mock.patch.object(GUEST, "_settings", return_value=self.state["original"]["settings"]), \
+                mock.patch.object(GUEST, "_persist"):
+            with self.assertRaisesRegex(RuntimeError, "restoration failed"):
+                GUEST._restore(self.context, self.root, self.state)
+        self.assertFalse(self.state["restore"]["restored"])
+        self.assertEqual(self.localtime.read_bytes(), b"not-the-utc-zone")
+
+    def test_failed_cleanup_write_cannot_remove_file_or_claim_restoration(self):
+        self.localtime.symlink_to(self.zones / "America/New_York")
+        with mock.patch.object(GUEST, "_command", side_effect=RuntimeError("write failed")):
+            with self.assertRaisesRegex(RuntimeError, "write failed"):
+                GUEST._restore_timezone(self.context, self.root, self.state)
+        self.assertEqual(self.localtime.resolve(), self.zones / "America/New_York")
+
+
 class OriginalMonitorLifetimeControls(unittest.TestCase):
     """Exercise real Linux processes/clock; these are not native-app receipts."""
 
@@ -315,6 +480,158 @@ class OriginalMonitorLifetimeControls(unittest.TestCase):
             self.assertTrue(GUEST._read_json(directory / "ready.json")["ready"])
             with self.assertRaisesRegex(RuntimeError, "unevaluable"):
                 GUEST._require_live_monitor(GUEST._monitor_status(directory, state))
+
+    def test_unevaluable_status_names_its_causal_origin(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            state = {"monitor": dict(self.monitor, nonce="b" * 32),
+                     "nonce": "a" * 32, "boot_id": self.monitor["boot_id"]}
+            status = GUEST._monitor_status(directory, state)
+            self.assertFalse(status["live"])
+            functions = [(site["module"], site["function"]) for site in status["unevaluable_sites"]]
+            self.assertEqual(functions, [("autotz.py", "_monitor_status")])
+            with self.assertRaisesRegex(RuntimeError, "unevaluable") as raised:
+                GUEST._require_live_monitor(status)
+            self.assertEqual(raised.exception.autotz_cause_sites, status["unevaluable_sites"])
+
+    @unittest.skipUnless(os.geteuid() == 0, "production control files require root ownership")
+    def test_dead_monitor_origin_is_the_liveness_check(self):
+        impossible = int(Path("/proc/sys/kernel/pid_max").read_text().strip())
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            state = {"monitor": dict(self.monitor, pid=impossible),
+                     "nonce": self.monitor["nonce"], "boot_id": self.monitor["boot_id"]}
+            GUEST._write_json(directory / "ready.json", dict(self.ready, pid=impossible))
+            status = GUEST._monitor_status(directory, state)
+            self.assertFalse(status["live"])
+            functions = [(site["module"], site["function"]) for site in status["unevaluable_sites"]]
+            self.assertEqual(functions, [("autotz.py", "_monitor_status"),
+                                         ("autotz.py", "_monitor_liveness")])
+
+    @unittest.skipUnless(os.geteuid() == 0, "production control files require root ownership")
+    def test_error_and_ended_deaths_raise_distinct_reasons(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            state = {"monitor": dict(self.monitor),
+                     "nonce": self.monitor["nonce"], "boot_id": self.monitor["boot_id"]}
+            GUEST._write_json(directory / "ready.json", dict(self.ready))
+            GUEST._write_json(directory / "monitor-ended.json", {"epoch": 1.0})
+            status = GUEST._monitor_status(directory, state)
+            self.assertFalse(status["live"])
+            self.assertEqual(status["unevaluable_reason"],
+                             "owned monitor ended before its observation completed")
+            GUEST._write_json(directory / "monitor-error.json", {"error": "boom", "epoch": 1.0})
+            status = GUEST._monitor_status(directory, state)
+            self.assertEqual(status["unevaluable_reason"], "owned monitor recorded an error")
+
+    @unittest.skipUnless(os.geteuid() == 0, "production control files require root ownership")
+    def test_traffic_tail_relays_last_records(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            state = {"monitor": dict(self.monitor),
+                     "nonce": self.monitor["nonce"], "boot_id": self.monitor["boot_id"]}
+            GUEST._write_json(directory / "ready.json", dict(self.ready))
+            log = directory / "monitor-traffic.jsonl"
+            lines = [json.dumps({"in": True, "t": "call", "n": index}) for index in range(10)]
+            lines.insert(3, "not-json{")
+            log.write_text("\n".join(lines) + "\n")
+            log.chmod(0o600)
+            status = GUEST._monitor_status(directory, state)
+            self.assertEqual([record["n"] for record in status["traffic_tail"]],
+                             [3, 4, 5, 6, 7, 8, 9])
+            with self.assertRaisesRegex(RuntimeError, "traffic_tail"):
+                GUEST._require_live_monitor(dict(status, live=False))
+
+    def test_failure_receipt_appends_validated_cause_sites(self):
+        guest_dir = str(Path(GUEST.__file__).resolve().parent.parent / "tuna-native-session")
+        sys.path.insert(0, guest_dir)
+        try:
+            import autotz_guest
+        finally:
+            sys.path.remove(guest_dir)
+            sys.modules.pop("autotz_guest", None)
+            sys.modules.pop("native_session", None)
+        cause = [{"module": "autotz.py", "line": 490, "function": "_monitor_liveness"},
+                 {"module": "autotz.py", "line": 655, "function": "_proc_identity"}]
+        error = RuntimeError("unevaluable")
+        error.autotz_cause_sites = cause
+        receipt = autotz_guest.error_receipt(error, ["autotz", "configure"])
+        self.assertEqual(receipt["sites"], cause)
+        error = RuntimeError("unevaluable")
+        error.autotz_cause_sites = cause + [{"module": "evil.py", "line": 1, "function": "f"},
+                                            {"module": "autotz.py", "line": 0, "function": "f"},
+                                            {"module": "autotz.py", "line": 1, "function": "bad-name!"},
+                                            "not-a-site",
+                                            {"module": "autotz.py", "line": 491, "function": "_monitor_status",
+                                             "extra": 1}]
+        receipt = autotz_guest.error_receipt(error, ["autotz", "watch-start"])
+        self.assertEqual(receipt["sites"], cause)
+        error = RuntimeError("unevaluable")
+        error.autotz_cause_sites = [{"module": "autotz.py", "line": 100 + index,
+                                     "function": "frame%d" % index} for index in range(5)]
+        receipt = autotz_guest.error_receipt(error, ["autotz", "snapshot"])
+        self.assertEqual(len(receipt["sites"]), 4)
+        self.assertEqual(receipt["sites"][0]["line"], 101)
+
+    def test_failure_receipt_carries_bounded_message(self):
+        guest_dir = str(Path(GUEST.__file__).resolve().parent.parent / "tuna-native-session")
+        sys.path.insert(0, guest_dir)
+        try:
+            import autotz_guest
+        finally:
+            sys.path.remove(guest_dir)
+            sys.modules.pop("autotz_guest", None)
+            sys.modules.pop("native_session", None)
+        receipt = autotz_guest.error_receipt(RuntimeError("owned monitor recorded an error"),
+                                             ["autotz", "configure"])
+        self.assertEqual(receipt["exception_type"], "RuntimeError")
+        self.assertEqual(receipt["message"], "owned monitor recorded an error")
+        receipt = autotz_guest.error_receipt(RuntimeError("x" * 5000), ["autotz", "snapshot"])
+        self.assertEqual(receipt["message"], "x" * 2000)
+
+
+class FilterAction(unittest.TestCase):
+    DESTINATIONS = {"org.freedesktop.timedate1", ":1.10"}
+    GEO = {"org.freedesktop.GeoClue2", ":1.246"}
+    OWNER = ":1.246"
+
+    def decide(self, kind, sender=None, destination=None, path=None, interface=None, member=None):
+        return GUEST._filter_action(kind, sender, destination, path, interface, member,
+                                    self.DESTINATIONS, self.GEO, self.OWNER)
+
+    def test_observation_traffic_is_queued(self):
+        self.assertEqual(self.decide("call", sender=":1.815", destination=":1.246",
+                                     path="/org/freedesktop/GeoClue2/Manager",
+                                     interface="org.freedesktop.GeoClue2.Manager",
+                                     member="GetClient"), "queue")
+        self.assertEqual(self.decide("call", sender=":1.9", destination="org.freedesktop.timedate1",
+                                     path="/org/freedesktop/timedate1",
+                                     interface="org.freedesktop.timedate1",
+                                     member="SetTimezone"), "queue")
+        for kind in ("return", "error", "signal"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.decide(kind, sender=":1.246", destination=":1.815"), "queue")
+
+    def test_unmatched_calls_are_dropped_before_dispatch(self):
+        # Observed kill: the monitor passed the GeoClue Agent GetAll through
+        # to GDBus dispatch, which auto-replied an error the bus kills for.
+        self.assertEqual(self.decide("call", sender=":1.815", destination=":1.108",
+                                     path="/org/freedesktop/GeoClue2/Agent",
+                                     interface="org.freedesktop.DBus.Properties",
+                                     member="GetAll"), "drop")
+        self.assertEqual(self.decide("call", sender=":1.9", destination=":1.10",
+                                     path="/org/freedesktop/timedate1",
+                                     interface="org.freedesktop.timedate1",
+                                     member="SetTime"), "drop")
+
+    def test_bus_control_traffic_still_passes(self):
+        self.assertEqual(self.decide("return", sender="org.freedesktop.DBus",
+                                     destination=":1.814"), "pass")
+        self.assertEqual(self.decide("signal", sender="org.freedesktop.DBus",
+                                     destination=":1.814",
+                                     path="/org/freedesktop/DBus",
+                                     interface="org.freedesktop.DBus", member="NameLost"), "pass")
+        self.assertEqual(self.decide("?", sender=":1.1"), "pass")
 
 
 if __name__ == "__main__":

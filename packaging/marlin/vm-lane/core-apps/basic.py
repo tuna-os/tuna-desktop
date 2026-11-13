@@ -6,7 +6,9 @@ import signal
 import sys
 import time
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tuna-native-session'))
+# Own admitted modules stay ahead of the shared native-session directory.
+sys.path[:0] = [str(Path(__file__).resolve().parent),
+                str(Path(__file__).resolve().parent.parent / 'tuna-native-session')]
 from native_session import digest, process
 
 

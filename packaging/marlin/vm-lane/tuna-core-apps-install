@@ -70,13 +70,12 @@ def main():
     original = output('pacman', '-Q', 'tuna-desktop').strip()
     uid = int(output('id', '-u', 'tuna-test').strip())
     account_groups_before = output('id', '-nG', 'tuna-test').split()
-    if uid != 1000 or 'wheel' in account_groups_before:
-        raise RuntimeError('Core-only preboot standard-user role baseline differs')
-    subprocess.run(['usermod', '--append', '--groups', 'wheel', 'tuna-test'], check=True)
-    account_groups_after = output('id', '-nG', 'tuna-test').split()
-    if (set(account_groups_after) - set(account_groups_before) != {'wheel'}
-            or set(account_groups_before) - set(account_groups_after)):
-        raise RuntimeError('Core-only preboot primary-admin role delta differs')
+    # The ordinary lane fixture creates this account in GNOME's privileged
+    # group (packaging/marlin/vm-lane/Containerfile; the native
+    # automatic-timezone row needs it as well). This layer requires that
+    # role and changes no membership; it is re-read after installation.
+    if uid != 1000 or 'wheel' not in account_groups_before:
+        raise RuntimeError('lane fixture preboot UID1000 primary-admin role baseline differs')
     # Use the base/current fixture's existing sync databases. No extra -Sy,
     # guessed mirror fallback, root PackageKit transaction or shipping default.
     subprocess.run(['pacman', '-S', '--needed', '--noconfirm', *APPS, *TOOLS], check=True)
@@ -139,8 +138,9 @@ def main():
     environment = Path('/usr/share/tuna-vm/environment.conf')
     with environment.open('a') as stream:
         stream.write('SANE_CONFIG_DIR=/home/tuna-test/tuna-core-apps/media-sane\n')
-    groups = output('id', '-nG', 'tuna-test').split()
-    if output('id', '-u', 'tuna-test').strip() != '1000' or 'wheel' not in groups:
+    groups = account_groups_after = output('id', '-nG', 'tuna-test').split()
+    if (output('id', '-u', 'tuna-test').strip() != '1000' or 'wheel' not in groups
+            or set(account_groups_after) != set(account_groups_before)):
         raise RuntimeError('declared nonroot primary-admin fixture role differs')
     policy_files = {}
     for directory in (Path('/usr/share/polkit-1/rules.d'), Path('/etc/polkit-1/rules.d')):
@@ -168,7 +168,7 @@ def main():
                     'groups_before': account_groups_before, 'groups_after': account_groups_after,
                     'added_groups': sorted(set(account_groups_after) - set(account_groups_before)),
                     'removed_groups': sorted(set(account_groups_before) - set(account_groups_after)),
-                    'role_change_before_boot': True, 'policy_authorization_bypassed': False,
+                    'role_from_lane_fixture_before_boot': True, 'policy_authorization_bypassed': False,
                     'scenario': 'ordinary-nonroot-primary-admin',
                     'scope': 'explicit fixture; not GIS, sudo, standard-user or policy authorization proof'},
         'stock_effective_polkit_rule_sha256': policy_files,

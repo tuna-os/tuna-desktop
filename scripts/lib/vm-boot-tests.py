@@ -698,6 +698,19 @@ class OrcaFixturePackages(unittest.TestCase):
                       "/usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token", source)
         # Fixture setup policy only, not a genuine reader or translated-label proof.
 
+    def test_desktop_fixture_user_holds_datetime_privileged_group(self):
+        # The ordinary session user seeds the manual timezone baseline and
+        # gsd-datetime applies the automatic zone; both need GNOME's
+        # privileged group (wheel), otherwise SetTimezone hangs on an
+        # unanswered polkit challenge until the command timeout. The
+        # datetime proof judges actual membership, so this pins the grant.
+        source = (Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/Containerfile").read_text()
+        creations = [line.strip() for line in source.splitlines()
+                     if "useradd" in line and "tuna-test" in line]
+        self.assertEqual(len(creations), 1)
+        self.assertIn("-G wheel", creations[0])
+        # Image recipe policy only, not a guest group-membership proof.
+
     def run_builder_admission(self, upgraded="2.58.9", failed=False):
         source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/orca51/build"
         with tempfile.TemporaryDirectory() as temporary:

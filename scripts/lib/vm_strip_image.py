@@ -6,20 +6,35 @@ from pathlib import Path
 import re
 
 def fixture_members(fixture):
-    """Fixed source observers required by this branch's native consumer."""
+    """Fixed immutable installed observer set, never a caller-selected list.
+
+    `autotz` is the standalone native clock consumer; `core-apps` is the
+    full native Core consumer with its own installed copy of the clock
+    modules. Neither admits the other's members.
+    """
     if fixture == 'lifecycle':
         return {}
+    directory = 'packaging/marlin/vm-lane/'
+    if fixture == 'autotz':
+        members = {'/usr/libexec/tuna-native-session/' + name:
+                   directory + 'tuna-native-session/' + name
+                   for name in ('native_session.py', 'autotz_guest.py')}
+        members.update({'/usr/libexec/tuna-native-session/' + name:
+                        directory + 'core-apps/' + name
+                        for name in ('autotz.py', 'geoclue_fixture.py')})
+        members['/usr/libexec/tuna-geoclue-agent-policy'] = 'packaging/marlin/tuna-geoclue-agent-policy'
+        return members
     if fixture != 'core-apps':
         raise ValueError('unknown native image fixture')
     members = {
-        '/usr/libexec/tuna-core-apps-install': 'packaging/marlin/vm-lane/tuna-core-apps-install',
+        '/usr/libexec/tuna-core-apps-install': directory + 'tuna-core-apps-install',
         '/usr/libexec/tuna-geoclue-agent-policy': 'packaging/marlin/tuna-geoclue-agent-policy',
         '/usr/libexec/tuna-native-session/native_session.py':
-            'packaging/marlin/vm-lane/tuna-native-session/native_session.py'}
+            directory + 'tuna-native-session/native_session.py'}
     for name in ('guest', 'native', 'basic', 'data', 'media', 'system', 'web',
                  'autotz', 'geoclue_fixture'):
         members['/usr/libexec/tuna-core-apps/' + name + '.py'] = (
-            'packaging/marlin/vm-lane/core-apps/' + name + '.py')
+            directory + 'core-apps/' + name + '.py')
     return members
 
 

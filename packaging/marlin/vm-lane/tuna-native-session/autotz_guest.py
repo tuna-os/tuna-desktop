@@ -89,7 +89,20 @@ def error_receipt(error, arguments):
     sites = [{'module': Path(frame.filename).name, 'line': frame.lineno, 'function': frame.name}
              for frame in traceback.extract_tb(error.__traceback__)
              if Path(frame.filename).resolve().parent == directory][-4:]
-    result = {'domain': domain, 'operation': operation, 'exception_type': type(error).__name__, 'sites': sites}
+    cause = getattr(error, 'autotz_cause_sites', None)
+    if type(cause) is list:
+        # The causal origin (a caught liveness failure) displaces generic
+        # outer frames; validated to the same bounded shape as live frames.
+        for site in cause:
+            if (type(site) is dict and set(site) == {'module', 'line', 'function'}
+                    and site['module'] in MEMBERS and type(site['line']) is int
+                    and 1 <= site['line'] <= 100000 and type(site['function']) is str
+                    and re.fullmatch(r'(?:[A-Za-z_][A-Za-z0-9_]{0,127}|<module>|<listcomp>|<dictcomp>|<genexpr>)',
+                                     site['function'])):
+                sites.append(site)
+        sites = sites[-4:]
+    result = {'domain': domain, 'operation': operation, 'exception_type': type(error).__name__,
+              'message': str(error)[:2000], 'sites': sites}
     for name in ('errno', 'returncode'):
         value = getattr(error, name, None)
         if type(value) is int and -4095 <= value <= 4095:

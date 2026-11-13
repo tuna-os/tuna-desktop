@@ -12,7 +12,10 @@ import stat
 import subprocess
 import sys
 import traceback
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tuna-native-session'))
+# The lane image also installs standalone copies of the clock observers
+# beside native_session.py; this consumer's own admitted modules win.
+sys.path[:0] = [str(Path(__file__).resolve().parent),
+                str(Path(__file__).resolve().parent.parent / 'tuna-native-session')]
 from native_session import NativeSession, digest, process
 
 APP_PACKAGES = {
@@ -83,10 +86,11 @@ def desktop(operation, arguments, context):
         role = installation['account']
         if (context.uid != 1000 or role['uid'] != context.uid or 'wheel' not in groups
                 or set(role['groups_after']) != set(groups)
-                or role['added_groups'] != ['wheel'] or role['removed_groups'] != []
-                or 'wheel' in role['groups_before'] or role['role_change_before_boot'] is not True
+                or set(role['groups_before']) != set(groups)
+                or role['added_groups'] != [] or role['removed_groups'] != []
+                or role['role_from_lane_fixture_before_boot'] is not True
                 or role['policy_authorization_bypassed'] is not False):
-            raise RuntimeError('declared Core-only preboot UID1000 primary-admin role/delta differs')
+            raise RuntimeError('declared lane-fixture preboot UID1000 primary-admin role differs')
         observer_files = [MODULE.parent / (name + '.py') for name in
                           ('guest', 'native', 'basic', 'data', 'media', 'system', 'web', 'autotz', 'geoclue_fixture')]
         observer_files.extend(Path('/usr/libexec') / name

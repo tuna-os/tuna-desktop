@@ -533,6 +533,29 @@ commands (`down N`, `move DX DY MS`, `hold MS`, `up`, `swipe N DX DY MS
 [PAUSE]`, `scroll`, `tap`, `click`) on stdin, in millimetres and
 milliseconds. Other phases can import `create_touchpad()` from it.
 
+Private colord startup failures in `D-COLORD` retain `colord-startup.txt`:
+the intended user/group, private bus and binary identity, boundary markers
+before namespace creation, tmpfs mount, privilege drop and daemon exec, the
+actual mounted store ownership/mode, and wrapper/supervisor/child PIDs.
+When the wrapper has exited (its world-readable `/proc` entry is gone or a
+zombie; never an unprivileged `kill -0`, which a live root-owned sudo wrapper
+answers with EPERM), the harness waits once and retains its exact shell
+status separately from the supervisor's observed child status. A status
+above 128 includes a possible signal mapping, not an assertion of cause.
+Otherwise readiness still fails at the unchanged 30-second deadline, after
+writing the same receipt.
+`colord.log` contains only the daemon's original stdout/stderr;
+`colord-launch.log` contains launcher errors. Failure receipts also include
+bounded raw kernel journal/ring-buffer output with reader statuses (including
+permission/unavailability errors). These records do not diagnose an OOM or
+authentication failure by themselves; ring-buffer output can predate startup.
+The real private-bus readiness assertion remains mandatory, without restart,
+store permission changes or an authentication bypass.
+
+The startup boundary regression tests use fake sudo/unshare/mount/setpriv
+and daemon commands, not a real privileged mount:
+`python3 -m unittest discover -s scripts/tests -p test_colord_startup.py`.
+
 ## GNOME Core applications: installed-image evidence
 
 `tuna-app-content` qualifies nested Chromium content, not the 28 Core
@@ -620,11 +643,12 @@ The recovered current-build producer payload lives in
 `packaging/marlin/vm-lane/core-apps/`. It uses the existing native
 QMP/QGA/GDM lifecycle, not a second VM producer. Its explicit CI-only
 `CORE_APPS=1` image installs the 28 original distro applications and retains
-the installed package delta. Only that layer changes the preboot UID 1000
-account from its actual standard-user group baseline to `wheel`, recording
-both group sets and the exact delta; it does not install authorization rules
-or replace stock polkit/consent. The two ordinary lifecycle rows keep their
-original standard-user role.
+the installed package delta. The UID 1000 account's `wheel` membership comes
+from the ordinary fixture layer (`useradd -G wheel`, shared with the native
+automatic-timezone row); the Core layer requires that baseline, records both
+group sets and that it changed none, and does not install authorization rules
+or replace stock polkit/consent. The two ordinary lifecycle rows use that
+same account.
 
 The private `TUNA_COMPOSITOR_STATE` opt-in additionally exposes per-live-binding
 **server emission**, not application-consumption, counters at the actual

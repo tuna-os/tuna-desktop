@@ -68,7 +68,8 @@ jobs:
           else
             scripts/ci-select-lanes >> "$GITHUB_OUTPUT"
           fi
-          # marlin-vm legs: a pull request runs the primary lifecycle leg only;
+          # marlin-vm legs: a pull request runs the primary lifecycle leg and
+          # the required native automatic-timezone leg (one boot, no tour);
           # the Orca 51 leg and the paired GNOME/Tuna references run on main,
           # schedule and dispatch (each leg rebuilds the image and boots a VM
           # for ~30 hosted minutes). The native Core consumer is not a member
@@ -76,7 +77,7 @@ jobs:
           # image job, parallel legs and join (core-apps-image, core-apps-leg,
           # native-core-apps), on a pull request only when the change touches
           # its source, guest observers or image transport.
-          primary='{"profile":"lifecycle","orca":"distribution","artifact":"marlin-vm"}'
+          primary='{"profile":"lifecycle","orca":"distribution","artifact":"marlin-vm"},{"profile":"autotz","orca":"distribution","artifact":"marlin-vm-autotz"}'
           extra='{"profile":"lifecycle","orca":"upstream51","artifact":"marlin-vm-orca51"},{"profile":"gnome-reference","session":"gnome","orca":"distribution","artifact":"native-gnome51-reference"},{"profile":"tuna-reference","session":"tuna","orca":"distribution","artifact":"native-tuna-reference"}'
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             legs="$primary"
@@ -675,7 +676,9 @@ jobs:
         with:
           tool: gtk4-layer-shell
           version: 4867d7b85cdf1e829fc1fd6f1d5f04c42cc99389
-      - run: shellcheck scripts/ci-install-vkms scripts/tuna-drm-smoke scripts/tuna-frame-pacer-build
+      - run: shellcheck scripts/ci-install-vkms scripts/tuna-drm-smoke scripts/lib/colord-startup.sh scripts/tuna-frame-pacer-build
+      - run: bash -n scripts/tuna-drm-smoke scripts/lib/colord-startup.sh
+      - run: python3 scripts/tests/test_colord_startup.py
       - run: scripts/ci-install-vkms
       - run: scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts
       - uses: actions/upload-artifact@v7.0.2
@@ -1690,7 +1693,7 @@ jobs:
         with:
           cosign-release: v3.1.4
       - name: Resolve and verify the current native media base before product selection
-        if: matrix.profile == 'lifecycle'
+        if: matrix.profile == 'lifecycle' || matrix.profile == 'autotz'
         run: &vm-native-base |
           sudo apt-get install -y --no-install-recommends skopeo
           mkdir -p vm-lane-artifacts/native-base
@@ -1729,8 +1732,20 @@ jobs:
             --expected-base-index "$(cat /mnt/vm/base-index-digest)" \
             --expected-base-platform "$(cat /mnt/vm/base-digest)" \
             --base-evidence vm-lane-artifacts/native-base --github-output "$GITHUB_OUTPUT"
+      # The automatic-timezone fixture image is never a retained product: its
+      # admission binds the extra installed observers, so it is always built
+      # fresh from this run's package and checkout.
+      - name: Use this run's package for the fresh automatic-timezone image
+        id: autotz-product
+        if: matrix.profile == 'autotz'
+        run: |
+          shopt -s nullglob
+          packages=(arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)
+          test "${#packages[@]}" -eq 1
+          echo "package_path=${packages[0]}" >> "$GITHUB_OUTPUT"
+          echo "product_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Verify the original paired reference base before building or booting
-        if: matrix.profile != 'lifecycle'
+        if: matrix.profile != 'lifecycle' && matrix.profile != 'autotz'
         run: |
           sudo apt-get install -y --no-install-recommends skopeo
           mkdir -p vm-lane-artifacts/reference-base
@@ -1752,7 +1767,7 @@ jobs:
           python3 scripts/lib/vm_gnome_reference.py verify-base --out vm-lane-artifacts/reference-base
           sudo podman pull --platform linux/amd64 "$platform"
       - name: Build the paired native reference fixture
-        if: matrix.profile != 'lifecycle'
+        if: matrix.profile != 'lifecycle' && matrix.profile != 'autotz'
         env:
           REFERENCE_SESSION: ${{ matrix.session }}
         run: |
@@ -1765,9 +1780,9 @@ jobs:
           printf '%s\n' sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e8636e44c3f > /mnt/vm/base-digest
           sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id
       - name: Build the Marlin Tuna Desktop image and the VM test layer
-        if: matrix.profile == 'lifecycle' && steps.native-product.outputs.restored == 'false'
+        if: (matrix.profile == 'lifecycle' && steps.native-product.outputs.restored == 'false') || matrix.profile == 'autotz'
         env:
-          PRODUCT_PACKAGE: ${{ steps.native-product.outputs.package_path }}
+          PRODUCT_PACKAGE: ${{ steps.native-product.outputs.package_path || steps.autotz-product.outputs.package_path }}
         run: &vm-build-fixture |
           sudo podman pull --platform linux/amd64 "ghcr.io/tuna-os/marlin@$(cat /mnt/vm/base-digest)"
           if [[ -n "$PRODUCT_PACKAGE" ]]; then
@@ -1796,7 +1811,7 @@ jobs:
       # Final overlay follows every fixture branch and every Syu.
       # FROM receives an immutable prior image ID, never a mutable tag.
       - name: Overlay the reference GDM 51 on the final fixture image
-        if: matrix.profile == 'lifecycle' && steps.native-product.outputs.restored == 'false'
+        if: (matrix.profile == 'lifecycle' && steps.native-product.outputs.restored == 'false') || matrix.profile == 'autotz'
         run: &vm-build-gdm51 |
           mkdir -p vm-lane-artifacts/gdm51
           cp gdm51-artifacts/manifest.json gdm51-artifacts/build-provenance.json vm-lane-artifacts/gdm51/
@@ -1816,7 +1831,7 @@ jobs:
           trap - EXIT
           sudo chown -R "$(id -u):$(id -g)" vm-lane-artifacts/gdm51
       - name: Inspect the actual final native image without rebuilding it
-        if: matrix.profile == 'lifecycle'
+        if: matrix.profile == 'lifecycle' || matrix.profile == 'autotz'
         run: &vm-inspect-image |
           sudo podman image inspect localhost/marlin-tuna-vm:ci --format '{{.Id}}' > /mnt/vm/image-id-observed
           scripts/tuna-vm-strip-image --canonical-image-id "$(cat /mnt/vm/image-id-observed)" | tee /mnt/vm/image-id
@@ -1829,11 +1844,11 @@ jobs:
           sudo podman run --rm localhost/marlin-tuna-vm:ci sh -c 'bootc --version; ls -ld /home; ls /usr/lib/bootc/install/ && cat /usr/lib/bootc/install/*' || true
           df -h / /mnt
       - name: Bind installed acceptance to the original package and immutable final image
-        if: matrix.profile == 'lifecycle'
+        if: matrix.profile == 'lifecycle' || matrix.profile == 'autotz'
         env:
-          IMAGE_FIXTURE: lifecycle
-          PRODUCT_PACKAGE: ${{ steps.native-product.outputs.package_path }}
-          PRODUCT_COMMIT: ${{ steps.native-product.outputs.product_commit }}
+          IMAGE_FIXTURE: ${{ matrix.profile }}
+          PRODUCT_PACKAGE: ${{ steps.native-product.outputs.package_path || steps.autotz-product.outputs.package_path }}
+          PRODUCT_COMMIT: ${{ steps.native-product.outputs.product_commit || steps.autotz-product.outputs.product_commit }}
           PRODUCT_ORIGIN: ${{ steps.native-product.outputs.product_origin_path }}
         run: &vm-bind-image |
           image_id=$(cat /mnt/vm/image-id)
@@ -1915,8 +1930,19 @@ jobs:
             --expect-source-inputs "$(python3 scripts/lib/maintained_media.py source-inputs)" \
             --expect-image "$(cat /mnt/vm/image-id)" \
             --expect-package "$(sha256sum "$PRODUCT_PACKAGE" | cut -d' ' -f1)"
+      - name: Required independent native automatic timezone
+        if: matrix.profile == 'autotz'
+        env:
+          PRODUCT_COMMIT: ${{ steps.autotz-product.outputs.product_commit }}
+        run: >-
+          scripts/tuna-vm-lane --profile autotz --require-kvm --boots 1
+          --disk /mnt/vm/disk.raw --out vm-lane-artifacts
+          --strip-image vm-lane-artifacts/strip-image.json
+          --meta "base_image=ghcr.io/tuna-os/marlin:gnome@$(cat /mnt/vm/base-digest)"
+          --meta "test_image_id=$(cat /mnt/vm/image-id)"
+          --meta "commit=$PRODUCT_COMMIT"
       - name: Observe the actual paired native switcher member
-        if: matrix.profile != 'lifecycle'
+        if: matrix.profile != 'lifecycle' && matrix.profile != 'autotz'
         env:
           REFERENCE_PROFILE: ${{ matrix.profile }}
         run: >-

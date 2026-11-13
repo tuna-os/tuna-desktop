@@ -2736,6 +2736,14 @@ def main():
         except Exception as error:
             print(json.dumps({"core_apps_error": core_apps_guest.error_receipt(error, sys.argv[2:])}))
             raise SystemExit(1) from None
+    elif action == "autotz":
+        sys.path.insert(0, "/usr/libexec/tuna-native-session")
+        import autotz_guest
+        try:
+            result = autotz_guest.execute(sys.argv[2:], OWNER, inventory, STATE)
+        except Exception as error:
+            print(json.dumps({"autotz_error": autotz_guest.error_receipt(error, sys.argv[2:])}))
+            raise SystemExit(1) from None
     elif action == "greeter-prompt":
         print(json.dumps(greeter_prompt()))
         return

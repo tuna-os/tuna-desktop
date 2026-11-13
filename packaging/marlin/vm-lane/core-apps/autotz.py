@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import xml.etree.ElementTree as ET
 
 UNIT = 'org.gnome.SettingsDaemon.Datetime.service'
@@ -220,10 +221,20 @@ def _timedate(bus):
     if not isinstance(zone, str) or not zone or '..' in Path(zone).parts or Path(zone).is_absolute():
         raise RuntimeError('actual timedate1 Timezone malformed')
     localtime = Path('/etc/localtime')
+    try:
+        localtime.lstat()
+    except FileNotFoundError:
+        # systemd/glibc define an absent localtime as UTC. A dangling symlink
+        # is not absence: lstat succeeds and the mandatory digest below fails.
+        if zone != 'UTC':
+            raise RuntimeError('missing /etc/localtime disagrees with timedate1 Timezone')
+        return {'zone': zone, 'epoch': time.time(),
+                'localtime': {'present': False, 'resolved': None,
+                              'sha256': None, 'matches_zone': False}}
     zonefile = Path('/usr/share/zoneinfo') / zone
     actual_digest = _digest(localtime)
     return {'zone': zone, 'epoch': time.time(),
-            'localtime': {'resolved': str(localtime.resolve(strict=True)),
+            'localtime': {'present': True, 'resolved': str(localtime.resolve(strict=True)),
                           'sha256': actual_digest, 'matches_zone': actual_digest == _digest(zonefile)}}
 
 
@@ -490,8 +501,18 @@ def _monitor_liveness(monitor, readiness, *, expected_uid=0):
 
 def _require_live_monitor(monitor):
     if monitor is None or monitor.get('ready') is not True or monitor.get('live') is not True:
-        raise RuntimeError('automatic-timezone observation unevaluable: original monitor is not live: ' +
-                           json.dumps(monitor))
+        summary = {'reason': monitor.get('unevaluable_reason') if isinstance(monitor, dict) else None,
+                   'error': monitor.get('error') if isinstance(monitor, dict) else None,
+                   'ended': monitor.get('ended') if isinstance(monitor, dict) else None,
+                   'traffic_tail': monitor.get('traffic_tail') if isinstance(monitor, dict) else None}
+        error = RuntimeError('automatic-timezone observation unevaluable: original monitor is not live: ' +
+                             json.dumps(summary) + ' :: ' + json.dumps(monitor))
+        cause = monitor.get('unevaluable_sites') if isinstance(monitor, dict) else None
+        if cause:
+            # The bounded failure record follows the causal chain: the true
+            # origin (liveness line) displaces the generic requirement frame.
+            error.autotz_cause_sites = cause
+        raise error
 
 
 def _monitor_status(directory, state):
@@ -507,17 +528,33 @@ def _monitor_status(directory, state):
         result['error'] = _read_json(directory / 'monitor-error.json')
     if (directory / 'monitor-ended.json').exists():
         result['ended'] = _read_json(directory / 'monitor-ended.json')
+    traffic = directory / 'monitor-traffic.jsonl'
+    if traffic.exists():
+        tail = []
+        with open(traffic, 'r', encoding='utf-8', errors='replace') as stream:
+            for line in stream.read().splitlines()[-8:]:
+                try:
+                    tail.append(json.loads(line))
+                except ValueError:
+                    continue
+        result['traffic_tail'] = tail
     try:
         if (monitor.get('nonce') != state['nonce'] or monitor.get('boot_id') != state['boot_id']
                 or monitor.get('argv', [])[-2:] != ['--monitor', state['nonce']]):
             raise RuntimeError('original monitor belongs to another boot/run/nonce')
-        if 'error' in result or 'ended' in result:
-            raise RuntimeError('owned monitor has failed or ended')
+        if 'error' in result:
+            raise RuntimeError('owned monitor recorded an error')
+        if 'ended' in result:
+            raise RuntimeError('owned monitor ended before its observation completed')
         result['liveness'] = _monitor_liveness(monitor, result.get('readiness'))
         result['ready'] = True
         result['live'] = True
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         result['unevaluable_reason'] = str(error)
+        result['unevaluable_sites'] = [
+            {'module': Path(frame.filename).name, 'line': frame.lineno, 'function': frame.name}
+            for frame in traceback.extract_tb(error.__traceback__)
+            if Path(frame.filename).resolve().parent == Path(__file__).resolve().parent][-2:]
     return result
 
 
@@ -742,6 +779,29 @@ def _watch_start(context, directory, state):
         os.close(output)
 
 
+def _filter_action(kind, sender, destination, path, interface, member,
+                   destinations, geo_destinations, geo_owner):
+    """What the monitor filter does with one incoming message.
+
+    A monitor must never answer: an eavesdropped call that reaches GDBus
+    dispatch triggers an automatic UnknownMethod/UnknownObject error
+    reply, and the bus kills monitors that send. Queue observation
+    traffic for the worker, drop every other call, and pass
+    returns/errors/signals so synchronous bus calls still complete.
+    """
+    relevant = (
+        kind == 'call'
+        and (destination in geo_destinations
+             or (destination in destinations and path == TIME_PATH
+                 and interface == TIME_NAME and member == 'SetTimezone'))
+    ) or (sender == geo_owner and kind in ('return', 'error', 'signal'))
+    if relevant:
+        return 'queue'
+    if kind == 'call':
+        return 'drop'
+    return 'pass'
+
+
 def _monitor(nonce):
     # A kernel alarm also bounds connection setup or a wedged GLib/GIO callback.
     signal.alarm(MONITOR_SECONDS)
@@ -786,7 +846,10 @@ def _monitor(nonce):
                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     geo_descriptor = os.open(directory / 'geoclue.jsonl',
                              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    traffic_descriptor = os.open(directory / 'monitor-traffic.jsonl',
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     lock = threading.Lock()
+    traffic_count = 0
     loop = GLib.MainLoop()
     queued = 0
     event_count = 0
@@ -1008,20 +1071,34 @@ def _monitor(nonce):
         return GLib.SOURCE_REMOVE
 
     def received(connection, message, incoming, user_data):
-        nonlocal queued
+        nonlocal queued, traffic_count
+        kinds = {Gio.DBusMessageType.METHOD_CALL: 'call',
+                 Gio.DBusMessageType.METHOD_RETURN: 'return',
+                 Gio.DBusMessageType.ERROR: 'error',
+                 Gio.DBusMessageType.SIGNAL: 'signal'}
+        kind = kinds.get(message.get_message_type(), '?')
+        with lock:
+            if traffic_count < 1024:
+                record = {'in': bool(incoming), 't': kind, 'n': message.get_serial()}
+                for key, value in (('s', message.get_sender()),
+                                   ('d', message.get_destination()),
+                                   ('p', message.get_path()),
+                                   ('i', message.get_interface()),
+                                   ('m', message.get_member())):
+                    if value is not None:
+                        record[key] = value
+                raw = (json.dumps(record, separators=(',', ':')) + '\n').encode()
+                if os.write(traffic_descriptor, raw) == len(raw):
+                    traffic_count += 1
         if not incoming:
             return message
-        kind = message.get_message_type()
-        relevant = (
-            kind == Gio.DBusMessageType.METHOD_CALL
-            and (message.get_destination() in geo_destinations
-                 or (message.get_destination() in destinations and message.get_path() == TIME_PATH
-                     and message.get_interface() == TIME_NAME and message.get_member() == 'SetTimezone'))
-        ) or (message.get_sender() == geo_service['unique_owner']
-              and kind in (Gio.DBusMessageType.METHOD_RETURN, Gio.DBusMessageType.ERROR,
-                           Gio.DBusMessageType.SIGNAL))
-        if not relevant:
+        action = _filter_action(kind, message.get_sender(), message.get_destination(),
+                                message.get_path(), message.get_interface(), message.get_member(),
+                                destinations, geo_destinations, geo_service['unique_owner'])
+        if action == 'pass':
             return message
+        if action == 'drop':
+            return None
         # GDBus filters run on the shared I/O worker: never call_sync here, even on another connection.
         with lock:
             if queued >= 256:
@@ -1076,6 +1153,27 @@ def _monitor(nonce):
         credentials.close_sync(None)
         os.close(descriptor)
         os.close(geo_descriptor)
+        os.close(traffic_descriptor)
+
+
+def _restore_timezone(context, directory, state):
+    original = state['original']['timedate']
+    _command(context, ['busctl', '--system', 'call', TIME_NAME, TIME_PATH, TIME_NAME,
+                       'SetTimezone', 'sb', original['zone'], 'false'],
+             directory=directory, state=state)
+    if original['localtime']['present'] is False:
+        # SetTimezone("UTC") normally creates a UTC symlink. Restore the actual
+        # initial absence, not just equivalent wall time, only after readback.
+        if original['zone'] != 'UTC':
+            raise RuntimeError('saved absent localtime is not systemd default UTC')
+        Gio, _ = _gio()
+        actual = _timedate(Gio.bus_get_sync(Gio.BusType.SYSTEM, None))
+        if actual['zone'] != 'UTC':
+            raise RuntimeError('cleanup timezone did not return to UTC')
+        if actual['localtime']['present']:
+            if not actual['localtime']['matches_zone']:
+                raise RuntimeError('cleanup localtime does not match UTC')
+            Path('/etc/localtime').unlink()
 
 
 def _restore(context, directory, state):
@@ -1093,9 +1191,7 @@ def _restore(context, directory, state):
         except Exception as error:
             errors.append({'operation': 'disable-' + key, 'error': str(error)})
     try:
-        _command(context, ['busctl', '--system', 'call', TIME_NAME, TIME_PATH, TIME_NAME,
-                           'SetTimezone', 'sb', state['original']['timedate']['zone'], 'false'],
-                 directory=directory, state=state)
+        _restore_timezone(context, directory, state)
     except Exception as error:
         errors.append({'operation': 'restore-timezone-cleanup-only', 'error': str(error)})
     for key in _setting_order(state['original']['settings']):

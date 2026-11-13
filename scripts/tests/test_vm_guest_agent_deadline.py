@@ -12,7 +12,7 @@ import time
 import unittest
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
-from vm_guest_agent import GuestAgent
+from vm_guest_agent import GuestAgent, valid_autotz_error
 
 
 class Tests(unittest.TestCase):
@@ -217,20 +217,27 @@ class Tests(unittest.TestCase):
             actor.command('guest-ping')
         self.assertTrue(actor.poisoned)
 
-    def test_run_includes_initial_exec_time_in_all_status_deadlines(self):
+    def test_caller_deadline_caps_longer_nested_command(self):
         actor, _ = self.actor()
-        seen = []
-        def command(name, **kwargs):
-            seen.append(kwargs['deadline'])
-            if name == 'guest-exec':
-                time.sleep(.015)
-                return {'pid': 51}
-            return {'exited': True, 'exitcode': 0, 'out-data': 'e30='}
-        with mock.patch.object(actor, 'command', side_effect=command):
-            self.assertEqual(actor.run('inventory', timeout=.1), {})
-        self.assertEqual(len(set(seen)), 1)
-        self.assertIsNone(actor.pending_guest_pid)
-        self.assertEqual(actor.guest_exec_state, 'none')
+        began = time.monotonic()
+        actor._caller_deadline = began + .05
+        with self.assertRaises(TimeoutError):
+            actor.command('guest-ping', deadline=began + 30)
+        self.assertLess(time.monotonic() - began, .7)
+        self.assertTrue(actor.poisoned)
+
+    def test_autotz_diagnostics_reject_private_or_unbounded_fields(self):
+        value = {'domain': 'autotz', 'operation': 'snapshot',
+                 'exception_type': 'RuntimeError',
+                 'sites': [{'module': 'autotz.py', 'line': 42, 'function': 'dispatch'}]}
+        self.assertTrue(valid_autotz_error(value))
+        self.assertTrue(valid_autotz_error({**value, 'message': 'bounded guest detail'}))
+        self.assertTrue(valid_autotz_error({**value, 'message': 'x' * 2000}))
+        for key, invalid in (('traceback', 'private'), ('operation', '../private'),
+                             ('sites', value['sites'] * 5), ('errno', True),
+                             ('message', 'x' * 2001), ('message', 42)):
+            with self.subTest(key=key):
+                self.assertFalse(valid_autotz_error({**value, key: invalid}))
 
     def test_reference_invalid_operation_never_starts_guest_child(self):
         actor, _ = self.actor()

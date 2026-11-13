@@ -13,12 +13,13 @@ No autologin or initial session exists: the lane drives GDM's user list and
 types the fixture password exactly as the published-flavor nightly does
 (`V-GREETER-LIST`, `V-GDM-FALLBACK`, `V-GDM-LOGIN`;
 `docs/marlin-tuna-nightly.md`), from the same `scripts/tuna-vm-lane` code.
-Logout must return to that GDM greeter. This changes neither the shipped
-preview image nor the two ordinary lifecycle profiles; the independent
-paired DEV profiles below are separate members of the same existing VM
-producer. GDM's session worker opens a journal stream for
-`gdm-wayland-session`, forwarded to the
-serial port. The fixture's session environment comes from `environment.d`,
+Logout must return to that GDM greeter. The ordinary two lifecycle/Orca rows
+retain five pristine boots, the default GPU, fresh-account journeys and all
+aggregate gates. These ordinary lifecycle fixtures do not change the shipped
+preview image; the independent paired DEV profiles below are separate members
+of the same existing VM producer. GDM's session worker opens a journal stream
+for `gdm-wayland-session`, forwarded to the serial port. The fixture's
+session environment comes from `environment.d`,
 which gdm-wayland-session imports from the user manager; the per-login Orca
 test secret comes from a user environment generator.
 The ordinary CLI profile is `--profile lifecycle` (the default); its two
@@ -40,18 +41,21 @@ the original same-run `arch-package` producer:
 | `core-apps-leg` (`native-core-apps-<leg>`) | One boot per leg: loads that archive, requires the exact image ID, repeats the admission, installs it with bootc and runs only its leg |
 | `native-core-apps` | Joins every leg's receipt and is the only place `V-CORE-APPS` is stated |
 
-This branch exposes only `--profile lifecycle` and `--profile core-apps`: it
-has no Colour, protocol or reference-pair dependency. Full Core does not gate
-the independently routed native AutoTZ clock branch.
+The consumer's legs use only `--profile core-apps`: it has no Colour, protocol
+or reference-pair dependency. Full Core does not gate the independently routed
+`marlin-vm-autotz` row ([below](#required-independent-native-automatic-timezone)),
+whose `--profile autotz` boot uses the ordinary fixture image without this layer.
 
 `core-apps-image` adds `Containerfile.core-apps` after the ordinary fixture
 layer, with the same build, GDM overlay, inspection and admission steps as
 the lifecycle rows (shared `&vm-…` run blocks in `ci.yml`).
 Only that layer installs all 28 original applications and their full domain
 dependencies through the guarded installer, with `CORE_APPS=1` and the actual
-`CORE_APPS_SOURCE_COMMIT`. The installer records the standard UID1000 account
-baseline and the preboot addition of only `wheel`; it adds no polkit rules.
-The two lifecycle/Orca rows retain their standard account, five pristine boots,
+`CORE_APPS_SOURCE_COMMIT`. The ordinary fixture layer already creates the
+UID1000 account in `wheel` (the native automatic-timezone row needs it too);
+the installer requires that baseline, records that it changed no group, and
+adds no polkit rules.
+The two lifecycle/Orca rows retain that same account, five pristine boots,
 default GPU, feature tour, fresh-account journeys and aggregate gates.
 Normal preview installation still invokes the packaged GeoClue policy helper
 after package installation, before the fixtures are layered.
@@ -185,6 +189,37 @@ records `acquisition`, `qualification_mode: "strict"`, `waived_assertions: []`
 and `skipped_assertions: []`; the nightly/repeat receipts preserve and
 classify every actual boot ([receipt contract](marlin-tuna-nightly.md)).
 
+## Required independent native automatic timezone
+
+Whenever `marlin-vm` is selected, its matrix also requires `marlin-vm-autotz`.
+This uses the same original package producer and VM image recipe, with
+`--profile autotz --require-kvm --boots 1`: one pristine snapshot boot,
+stock GDM and the original non-root standard account, unchanged default GPU,
+and no disposable disk or full Core application installer/inventory.
+There is no dispatch, secret or repository-variable waiver.
+The leg never reuses a retained native product: that capsule's receipt binds
+only the lifecycle members, so this image is always built fresh from the
+same run's package and checkout.
+
+The final immutable image receipt binds the exact executing source commit,
+original package hash and original installed ELF hashes, lifecycle helper,
+normal GeoClue policy helper and four fixed native-session observers:
+`native_session.py`, `autotz_guest.py`, `autotz.py`, `geoclue_fixture.py`.
+The latter two are installed from the clock-only source files, not the
+full Core guest. The ordinary preview policy invocation remains unchanged.
+This is same-run source/image admission, **not signed release proof**.
+
+The root `autotz DOMAIN OPERATION JSON` route delegates to the installed
+standalone observer. QGA acquisition and nested commands share finite
+absolute deadlines; reconnecting cannot renew them. Failure diagnostics
+contain only bounded domain/operation/type/sites and optional numeric codes,
+never raw arguments or exception text. Unconfirmed guest-child retirement
+remains fatal. `V-AUTOTZ` requires the consumer's explicit complete qualified
+result; an exception, missing native session or missing result fails the
+row and therefore the existing aggregate CI gate. The consumer retains its
+actual original-shell AddAgent, source/provider, daemon location/timezone
+and panel-clock gates and restoration requirements. Routing implementation
+alone claims no native runtime qualification.
 
 ## Record-free fresh accounts (tunaOS#4092)
 
