@@ -907,7 +907,10 @@ class Stress:
                           "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem",
                           GLib.Variant("(s)", (conn.get_unique_name(),)))
                 items.append(conn)
-            names = {conn.get_unique_name() for conn in items}
+            # The watcher publishes an item as bus name + object path, as
+            # the AppIndicator extension's does; a bare bus name registers
+            # its /StatusNotifierItem.
+            names = {conn.get_unique_name() + "/StatusNotifierItem" for conn in items}
             self.wait_for(lambda: names <= set(registered()), "100 tray items registered", 30)
             for conn in items:
                 conn.close_sync(None)

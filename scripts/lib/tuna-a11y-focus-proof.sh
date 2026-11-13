@@ -8,6 +8,10 @@ A11Y_INTERFACE=org.gnome.desktop.a11y.interface
 # Log byte range of the one deliberate shell restart G-SHELL-STABLE admits.
 A11Y_RESTART_FROM=""
 A11Y_RESTART_TO=""
+# Layer namespaces of the transient surfaces G-A11Y-MENU-CLOSE-STABLE
+# watches (tuna_shell_control::layer_namespaces).
+WINDOW_MENU_LAYER=tuna-window-menu
+BANNERS_LAYER=tuna-shell-banners
 
 # "x,y,w,h" of the first showing node named $2 with role $3 in dump $1:
 # a panel control's focusable pill. The panel is the top layer, so window
@@ -224,6 +228,102 @@ a11y_menu_restart_proof() {
     a11y_indicator_wait hidden cleared "$new_shell" ||
         fail G-A11Y-MENU-RESTART "the restarted indicator did not hide once nothing was enabled"
     pass G-A11Y-MENU-RESTART "a menu row toggled with real keys persists across one shell restart; the restarted menu shows it checked and still follows the settings live"
+}
+
+# Whether layer $1 is mapped, per the compositor.
+a11y_layer() {
+    cstate ".layers | any(.namespace == \"$1\")$2" "layer $1$2" 10
+}
+
+# G-A11Y-MENU-CLOSE-STABLE (#1077): two readers walk the shell's whole
+# AT-SPI tree in a tight loop (child count, then each child by index, as a
+# screen reader's flat review does) across 20 rounds of the transient
+# surfaces opening and closing with real input: the window menu
+# (Alt+Space, Escape), quick settings and the calendar (panel clicks,
+# Escape), and a notification banner (Notify, CloseNotification). Each
+# hide makes the readers' child counts stale, the read that ended the
+# shell on GTK before 4.25 (GNOME/gtk#8444). The shell process must be the
+# same one afterwards, the readers must have kept reading and have seen
+# every surface up, and the log must hold no object-path critical.
+a11y_transient_stable_proof() {
+    xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
+    cstate '(.overview_open | not) and (.locked | not)' "desktop for transient surfaces" ||
+        fail G-A11Y-MENU-CLOSE-STABLE "the overview or lock screen was still up"
+    stable_shell="$(a11y_shell_pid)" || fail G-A11Y-MENU-CLOSE-STABLE "expected exactly one owned shell"
+    stable_socket="${SOCKET_NAME:-$(sed -n 's/.*nested session on \([^ ]*\) .*/\1/p' "$LOG" | head -1)}"
+    # A window of the proof's own to open the window menu on.
+    WAYLAND_DISPLAY="$stable_socket" "$PY" "$ROOT/scripts/lib/tuna-test-window.py" Stable "#613583" \
+        >"$ARTIFACTS/window-Stable.log" 2>&1 &
+    stable_window=$!
+    cstate '.focused_app_id == "tuna-test-stable"' "window for the window menu" ||
+        fail G-A11Y-MENU-CLOSE-STABLE "the test window never took focus"
+    sleep 1
+    stable_stop="$ARTIFACTS/a11y-stable-stop"
+    rm -f "$stable_stop"
+    stable_readers=""
+    for _reader in 1 2; do
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-tree-reader.py" tuna-shell-gtk "$stable_shell" "$stable_stop" \
+            "$ARTIFACTS/a11y-stable-reader-$_reader.json" \
+            "Hide" "Dark Style" "Previous month" "Stable banner" >&2 &
+        stable_readers="$stable_readers $!"
+    done
+    sleep 2
+    for _round in $(seq 1 20); do
+        cstate '.focused_app_id == "tuna-test-stable"' "window focus (round $_round)" ||
+            fail G-A11Y-MENU-CLOSE-STABLE "the test window lost focus before round $_round"
+        xdotool key alt+space
+        a11y_layer "$WINDOW_MENU_LAYER" "" ||
+            fail G-A11Y-MENU-CLOSE-STABLE "Alt+Space opened no window menu (round $_round)"
+        sleep 0.3
+        xdotool key Escape
+        a11y_layer "$WINDOW_MENU_LAYER" " | not" ||
+            fail G-A11Y-MENU-CLOSE-STABLE "the window menu stayed up (round $_round)"
+        xdotool mousemove --window "$WID" $((WIDTH - 50)) 16 click 1
+        sleep 0.8
+        xdotool key Escape
+        sleep 0.5
+        xdotool mousemove --window "$WID" $((WIDTH / 2)) 16 click 1
+        sleep 0.8
+        xdotool key Escape
+        sleep 0.5
+        xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
+        stable_note="$(kr_notify "Stable banner" "Round $_round")"
+        [ -n "$stable_note" ] ||
+            fail G-A11Y-MENU-CLOSE-STABLE "the notification service refused a banner (round $_round)"
+        a11y_layer "$BANNERS_LAYER" "" ||
+            fail G-A11Y-MENU-CLOSE-STABLE "no banner showed (round $_round)"
+        sleep 0.3
+        gdbus call --session --dest org.freedesktop.Notifications \
+            --object-path /org/freedesktop/Notifications \
+            --method org.freedesktop.Notifications.CloseNotification "$stable_note" >/dev/null ||
+            fail G-A11Y-MENU-CLOSE-STABLE "CloseNotification failed (round $_round)"
+        a11y_layer "$BANNERS_LAYER" " | not" ||
+            fail G-A11Y-MENU-CLOSE-STABLE "the banner stayed up (round $_round)"
+        [ "$(a11y_shell_pid || true)" = "$stable_shell" ] ||
+            fail G-A11Y-MENU-CLOSE-STABLE "the shell exited while its tree was read (round $_round)"
+    done
+    : >"$stable_stop"
+    for _reader in $stable_readers; do
+        wait "$_reader" ||
+            fail G-A11Y-MENU-CLOSE-STABLE "a reader lost the shell on the accessibility bus"
+    done
+    kill "$stable_window" 2>/dev/null || true
+    for _reader in 1 2; do
+        jq -e '(.lost | not) and .passes >= 20
+               and ([.seen["Hide"], .seen["Dark Style"], .seen["Previous month"], .seen["Stable banner"]] | all(. > 0))' \
+            "$ARTIFACTS/a11y-stable-reader-$_reader.json" >/dev/null || {
+            cat "$ARTIFACTS/a11y-stable-reader-$_reader.json" >&2
+            fail G-A11Y-MENU-CLOSE-STABLE "reader $_reader did not keep reading across every surface"
+        }
+    done
+    if grep -q 'g_variant_new_object_path' "$LOG"; then
+        fail G-A11Y-MENU-CLOSE-STABLE "an accessible object path was NULL while the tree was read"
+    fi
+    [ "$(a11y_shell_pid || true)" = "$stable_shell" ] ||
+        fail G-A11Y-MENU-CLOSE-STABLE "the shell exited while its tree was read"
+    cstate '.windows | any(.app_id == "tuna-test-stable") | not' "test window gone" ||
+        fail G-A11Y-MENU-CLOSE-STABLE "the test window stayed"
+    pass G-A11Y-MENU-CLOSE-STABLE "two readers walked the whole tree across 20 rounds of the window menu, quick settings, the calendar and a banner opening and closing; the shell stayed up"
 }
 
 # The shell must survive the journey: a crash the supervisor quietly

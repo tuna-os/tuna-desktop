@@ -286,6 +286,11 @@ impl<T> Default for SizeChanges<T> {
 }
 
 impl<T> SizeChanges<T> {
+    /// Whether a request or a running change still names window `id`.
+    pub fn holds(&self, id: u64) -> bool {
+        self.entries.contains_key(&id) || self.requests.iter().any(|r| r.id == id)
+    }
+
     /// Queue a layout change. Several before one frame fold into one:
     /// the first old geometry, the last new one.
     pub fn request(&mut self, id: u64, old: Rect, new: Rect) {

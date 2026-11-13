@@ -3165,6 +3165,31 @@ class TourViewPredicates(unittest.TestCase):
                 Path(recorder.dir) / "f000000.png"))
             recorder.close()
 
+    def test_a_slow_decode_of_a_still_captured_in_time_does_not_miss_the_view(self):
+        # CI runs 43217494460, 43244398470: the switcher was ready and its
+        # still captured inside the 10 s view, but ffmpeg got only the
+        # leftover milliseconds to decode it (TimeoutExpired).
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        pixels = tour_frame(self.NAVY, self.SWITCHER)
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(
+                header + pixels if args["format"] == "ppm" else tour_png(pixels))
+        now = [0.0]
+        real_run = lane.subprocess.run
+        def slow_decode(argv, **kwargs):
+            if argv[0] == "ffmpeg":
+                now[0] += 20.0
+            return real_run(argv, **kwargs)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(lane.time, "monotonic", lambda: now[0]), \
+                patch.object(lane.subprocess, "run", slow_decode):
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=5, settle=0))
+            receipt = recorder.still_confirmations["alt-tab"]
+            self.assertTrue(receipt["evidence"]["within_deadline"])
+            self.assertTrue(receipt["evidence"]["exact_png"])
+            recorder.close()
+
     def test_exact_overview_png_is_confirmed_without_changing_calibrated_floors(self):
         pixels = tour_frame(self.GREY, [(180, 108, 1100, 660, self.NAVY),
                                        (440, 420, 840, 670, self.WHITE)])
@@ -3765,6 +3790,33 @@ class S3AbsoluteDeadline(unittest.TestCase):
             exec(compile(ast.Module(body=[inventory],type_ignores=[]),str(source),'exec'),scope)
             self.assertEqual(scope['inventory']('ordinary'),{})
         self.assertEqual(calls,[(('inventory',),{})])
+
+    def test_wake_reopens_qga_transport_before_first_resume_inventory(self):
+        # PR runs 43385429967 et al. (guest Linux 7.3.4): the first post-wake
+        # guest-exec acknowledgement never arrived. The real suspend statements
+        # from system_wakeup to the first-resume inventory must reopen the
+        # transport first, without any guest-exec in between.
+        source = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+        lifecycle = next(n for n in ast.parse(source.read_text()).body
+                         if isinstance(n, ast.FunctionDef) and n.name == "run_lifecycle")
+        check = next(n for n in lifecycle.body if isinstance(n, ast.FunctionDef) and n.name == "suspend_and_check")
+        wake = next(i for i, n in enumerate(check.body) if "system_wakeup" in ast.dump(n))
+        first = next(i for i, n in enumerate(check.body) if "first-resume" in ast.dump(n))
+        events = []
+        agent = SimpleNamespace(
+            reopen_after_wake=lambda **kw: events.append(("reopen", kw)) or 2,
+            run=lambda *a, **kw: events.append(("guest-exec", a)))
+        with tempfile.TemporaryDirectory() as tmp:
+            scope = dict(qmp=SimpleNamespace(cmd=lambda name, **kw: events.append(("qmp", name))),
+                         agent=agent, evidence=tmp, label="", time=lane.time, os=lane.os, json=json,
+                         inventory=lambda label: events.append(("inventory", label)) or {"state": {"locked": True}})
+            exec(compile(ast.Module(body=check.body[wake:first + 1], type_ignores=[]), str(source), "exec"), scope)
+            with open(os.path.join(tmp, "wake-transport.json")) as stream:
+                receipt = json.load(stream)
+        self.assertEqual(events, [("qmp", "system_wakeup"), ("reopen", {"timeout": 20, "attempt": 2}),
+                                  ("inventory", "first-resume")])
+        self.assertEqual(receipt["connections"], 2)
+        self.assertIn("no guest-exec", receipt["scope"])
 
 
 class ShippedSnapshotInventory(unittest.TestCase):
