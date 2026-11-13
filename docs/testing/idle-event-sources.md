@@ -97,7 +97,6 @@ every 5 s.
 | `tuna-ibus-bridge` main loop | One `poll` over the Wayland socket and GLib's own descriptors with GLib's timeout (`g_main_context_prepare`/`query`/`check`/`dispatch`); IBus signals and the bus closing wake GLib's descriptors. A departed IBus is still looked for with its 250 ms → 5 s backoff | 50 ms poll timeout |
 | PipeWire monitor (`pw-dump --monitor`) restart | With no PipeWire socket (`PIPEWIRE_REMOTE`, `PIPEWIRE_RUNTIME_DIR`/`XDG_RUNTIME_DIR`), a GLib directory monitor (inotify) restarts it when the socket is created. A socket that exists (a failure of another kind) or a directory that cannot be watched keeps the 2 s retry | a `pw-dump` process every 2 s |
 
-
 ## Time-driven wakes (`next_wake`)
 
 Frame pace while: activity linger, overview/strip/workspace/size-change/window
@@ -180,7 +179,6 @@ the portal publisher sleeping until a setting or a bus set changes, at most
 one wake-up a second (`privacy_portal::tests`, shell), the IBus bridge's
 wait (`tuna-ibus-bridge` `tests::the_loop_sleeps_until_the_socket_or_glib_has_something`)
 and the PipeWire socket watch (`services::pipewire_socket_tests`).
-
 The nested (winit) backend never takes the idle path: `producer_wake` answers
 one frame for it before any deadline is read, so no Xvfb proof exercises an
 idle tick, and none can regress on one. Only `--backend drm` does. On
