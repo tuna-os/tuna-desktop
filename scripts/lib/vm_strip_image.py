@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 import re
 
-
 PROTOCOL_MEMBERS = ('/usr/libexec/tuna-explicit-sync-client',
                     '/usr/libexec/tuna-background-effect-client',
                     '/usr/share/tuna-explicit-sync/protocol-xml.sha256',
@@ -17,13 +16,24 @@ PROTOCOL_INPUTS = ('scripts/tuna-explicit-sync-build',
 
 
 def fixture_members(fixture):
+    """Fixed immutable installed observer set, never a caller-selected list."""
     if fixture == 'lifecycle':
         return {}
-    if fixture != 'explicit-sync':
+    if fixture == 'explicit-sync':
+        return {'/usr/libexec/tuna-vm-explicit-sync': 'scripts/lib/tuna-explicit-sync-guest.py',
+                '/usr/libexec/background_effect_oracle.py': 'scripts/lib/background_effect_oracle.py',
+                '/usr/share/tuna-explicit-sync/native-build.json': 'native-protocol-build.json'}
+    if fixture != 'autotz':
         raise ValueError('unknown native image fixture')
-    return {'/usr/libexec/tuna-vm-explicit-sync': 'scripts/lib/tuna-explicit-sync-guest.py',
-            '/usr/libexec/background_effect_oracle.py': 'scripts/lib/background_effect_oracle.py',
-            '/usr/share/tuna-explicit-sync/native-build.json': 'native-protocol-build.json'}
+    directory = 'packaging/marlin/vm-lane/'
+    members = {'/usr/libexec/tuna-native-session/' + name:
+               directory + 'tuna-native-session/' + name
+               for name in ('native_session.py', 'autotz_guest.py')}
+    members.update({'/usr/libexec/tuna-native-session/' + name:
+                    directory + 'core-apps/' + name
+                    for name in ('autotz.py', 'geoclue_fixture.py')})
+    members['/usr/libexec/tuna-geoclue-agent-policy'] = 'packaging/marlin/tuna-geoclue-agent-policy'
+    return members
 
 
 def canonical_image_id(observed):

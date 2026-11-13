@@ -178,15 +178,47 @@ def valid_tour_public_ui_error(value):
 
 # Lifecycle actions whose failure prints one bounded, validated record on
 # stdout; any other action's output (and every stderr) stays private.
+def valid_autotz_error(value):
+    required = {"domain", "operation", "exception_type", "sites"}
+    if type(value) is not dict or not required <= set(value) or not set(value) <= required | {"errno", "returncode", "message"}:
+        return False
+    if "message" in value and (type(value["message"]) is not str or len(value["message"]) > 2000):
+        return False
+    if value["domain"] not in ("autotz", "desktop", "arguments"):
+        return False
+    if type(value["operation"]) is not str or not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", value["operation"]):
+        return False
+    types = {"RuntimeError", "ValueError", "TypeError", "KeyError", "IndexError", "AttributeError",
+             "OSError", "FileNotFoundError", "PermissionError", "ProcessLookupError",
+             "JSONDecodeError", "UnicodeDecodeError", "CalledProcessError", "TimeoutExpired",
+             "TimeoutError", "StopIteration", "Error"}
+    if type(value["exception_type"]) is not str or value["exception_type"] not in types:
+        return False
+    if type(value["sites"]) is not list or len(value["sites"]) > 4:
+        return False
+    for site in value["sites"]:
+        if type(site) is not dict or set(site) != {"module", "line", "function"}:
+            return False
+        if type(site["module"]) is not str or site["module"] not in {"native_session.py", "autotz_guest.py", "autotz.py", "geoclue_fixture.py"}:
+            return False
+        if type(site["line"]) is not int or not 1 <= site["line"] <= 100000:
+            return False
+        if type(site["function"]) is not str or not re.fullmatch(r"(?:[A-Za-z_][A-Za-z0-9_]{0,127}|<module>|<listcomp>|<dictcomp>|<genexpr>)", site["function"]):
+            return False
+    return all(type(value[key]) is int and -4095 <= value[key] <= 4095
+               for key in ("errno", "returncode") if key in value)
+
+
 FAILURE_RECORDS = {"orca-read": ("orca_read_error", valid_orca_read_error),
                    "strip-stop": ("strip_stop_error", valid_strip_stop_error),
                    "delayed-auth-state": ("delayed_auth_error", valid_delayed_auth_error),
                    "inventory": ("inventory_error", valid_inventory_error),
+                   "autotz": ("autotz_error", valid_autotz_error),
                    "tour-public-ui": ("tour_public_ui_error", valid_tour_public_ui_error),
                    "explicit-sync": ("explicit_sync_error", valid_tour_public_ui_error)}
 # Records that must be the whole output and are logged before raising, so a
 # caller's cleanup failure cannot hide them.
-LOGGED_FAILURE_RECORDS = {"delayed-auth-state", "inventory", "explicit-sync"}
+LOGGED_FAILURE_RECORDS = {"delayed-auth-state", "inventory", "autotz", "explicit-sync"}
 def speech_failure_diagnostic(encoded):
     if not isinstance(encoded, str) or len(encoded) > 5464:
         return None
@@ -255,7 +287,7 @@ class GuestAgent:
 
     def __init__(self, path, *, deadline=None):
         if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
-            raise ValueError("finite absolute guest-agent acquisition/command deadline required")
+            raise ValueError("finite absolute guest-agent deadline required")
         self._caller_deadline = deadline
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.buffer = bytearray()

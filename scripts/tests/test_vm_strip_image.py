@@ -126,6 +126,45 @@ class Tests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'build inputs'):
                 admission(package, observed, *args, fixture='explicit-sync')
 
+    def test_native_autotz_requires_every_original_observer(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            sources = {'/usr/libexec/' + name: 'packaging/marlin/vm-lane/' + name
+                       for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus')}
+            sources.update(fixture_members('autotz'))
+            expected = {'/usr/bin/tuna-compositor': 'a' * 64}
+            for installed, source in sources.items():
+                path = root / source
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source)
+                expected[installed] = hashlib.sha256(source.encode()).hexdigest()
+            inventory = root / 'scripts/lib/maintained-media.tsv'
+            inventory.parent.mkdir(parents=True)
+            inventory.write_bytes(INVENTORY.read_bytes())
+            def git(*arguments):
+                return subprocess.check_output(['git', '-C', str(root), *arguments],
+                                               text=True, stderr=subprocess.PIPE).strip()
+            git('init', '-q')
+            git('config', 'user.name', 'Controlled immutable image admission')
+            git('config', 'user.email', 'controlled@example.invalid')
+            git('add', '.')
+            git('commit', '-qm', 'Actual fixture source snapshot')
+            package = {'package': {'sha256': 'b' * 64}, 'required_members':
+                       {'usr/bin/tuna-compositor': {'sha256': 'a' * 64}}}
+            observed = {'schema': 1, 'image_id': 'sha256:' + 'c' * 64, 'member_sha256': expected}
+            args = (root, git('rev-parse', 'HEAD'), observed['image_id'],
+                    'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'e' * 64)
+            self.assertFalse(admission(package, observed, *args, fixture='autotz')['installed_signed_release_qualified'])
+            for installed in sources:
+                missing = copy.deepcopy(observed)
+                del missing['member_sha256'][installed]
+                with self.subTest(installed=installed), self.assertRaises(ValueError):
+                    admission(package, missing, *args, fixture='autotz')
+                altered = copy.deepcopy(observed)
+                altered['member_sha256'][installed] = 'f' * 64
+                with self.assertRaises(ValueError):
+                    admission(package, altered, *args, fixture='autotz')
+
 
 
 if __name__ == '__main__':
