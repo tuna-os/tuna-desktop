@@ -306,7 +306,7 @@ OWNED_PROOFS = [
     "tuna-capture", "tuna-minimize-proof", "tuna-modal-dim-proof", "tuna-window-lifecycle-proof",
     "tuna-workspace-topology-proof", "tuna-wellbeing-proof", "tuna-session-restore-proof",
     "tuna-screenshot-flash-proof", "tuna-motion-barriers-proof", "tuna-stress",
-    "tuna-media-completion-proof", "lib/tuna-sound-consumers-proof.py",
+    "tuna-media-completion-proof", "lib/tuna-sound-consumers-proof.py", "tuna-shell-memory-profile",
 ]
 # dbus-run-session stays only where something else owns every process:
 # inside a podman container, or under auth_proof_process.bounded_command's
