@@ -1500,6 +1500,16 @@ impl Wallpaper {
                     if self.cards.len() >= MAX_CARDS {
                         self.cards.remove(0);
                     }
+                    // What the card names opaque (#503): the backdrop is
+                    // not painted under it, and drawn pixel for pixel it
+                    // is drawn without blending.
+                    let opaque = card
+                        .opaque
+                        .iter()
+                        .map(|&[x, y, w, h]| {
+                            Rectangle::new((x as i32, y as i32).into(), (w as i32, h as i32).into())
+                        })
+                        .collect();
                     self.cards.push(CardCache {
                         key: pending.key,
                         buffer: MemoryRenderBuffer::from_slice(
@@ -1508,7 +1518,7 @@ impl Wallpaper {
                             (card.width as i32, card.height as i32),
                             1,
                             Transform::Normal,
-                            None,
+                            Some(opaque),
                         ),
                         margin: card.margin as i32,
                     });

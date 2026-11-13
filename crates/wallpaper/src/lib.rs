@@ -301,6 +301,10 @@ pub struct Card {
     pub width: u32,
     pub height: u32,
     pub margin: u32,
+    /// Where the card is opaque with [`OPAQUE_MARGIN`] to spare, as
+    /// (x, y, w, h) in the buffer: the rows between the rounded corners,
+    /// and over and under them the columns between the corners.
+    pub opaque: Vec<[u32; 4]>,
 }
 
 /// GNOME's overview workspace card (`.workspace-background`): the part
@@ -386,12 +390,88 @@ pub fn card(
             out[i + 3] = (a * 255.0).round() as u8;
         }
     }
+    let opaque = opaque_rects(&out, cw, ch, OPAQUE_MARGIN);
     Some(Card {
         pixels: out,
         width: cw,
         height: ch,
         margin,
+        opaque,
     })
+}
+
+/// How many opaque pixels lie between a [`Card::opaque`] rectangle and
+/// the nearest pixel that lets anything through. A card drawn scaled
+/// (an overview transition) rounds the rectangles out to whole output
+/// pixels, and a pixel at their edge filters in the texel beside it:
+/// with eight texels to spare the rectangles hold only opaque pixels at
+/// any scale from 2/15 up, well under the smallest a card is drawn at.
+pub const OPAQUE_MARGIN: u32 = 8;
+
+/// The opaque pixels of a rounded shape in `pixels` (`width` x `height`,
+/// alpha in each fourth byte) with only opaque pixels within `margin` of
+/// them, as at most three rectangles (x, y, w, h): the rows as wide as
+/// the shape's middle row, and over and under them the columns every
+/// row up to the shape's edge has. Read from the pixels themselves, so
+/// no rectangle comes nearer than that to a pixel that lets anything
+/// through.
+fn opaque_rects(pixels: &[u8], width: u32, height: u32, margin: u32) -> Vec<[u32; 4]> {
+    // A row's opaque pixels when they are one run: (start, end).
+    let run = |y: u32| {
+        let alpha = |x: u32| pixels[((y * width + x) * 4 + 3) as usize];
+        let start = (0..width).find(|x| alpha(*x) == u8::MAX)?;
+        let end = (start..width)
+            .find(|x| alpha(*x) != u8::MAX)
+            .unwrap_or(width);
+        (end..width)
+            .all(|x| alpha(x) != u8::MAX)
+            .then_some((start, end))
+    };
+    let rows: Vec<Option<(u32, u32)>> = (0..height).map(run).collect();
+    // The same with `margin` to spare: inside the runs of every row
+    // within `margin`, and `margin` in from their ends.
+    let spared = |y: u32| {
+        let (first, last) = (y.checked_sub(margin)?, y.checked_add(margin)?);
+        let mut columns = (0, width);
+        for near in first..=last {
+            let (start, end) = (*rows.get(near as usize)?)?;
+            columns = (columns.0.max(start), columns.1.min(end));
+        }
+        let columns = (columns.0 + margin, columns.1.checked_sub(margin)?);
+        (columns.0 < columns.1).then_some(columns)
+    };
+    let runs: Vec<Option<(u32, u32)>> = (0..height).map(spared).collect();
+    let middle = height / 2;
+    let Some(Some(band)) = runs.get(middle as usize).copied() else {
+        return Vec::new();
+    };
+    let same = |y: &u32| runs[*y as usize] == Some(band);
+    let top = (0..middle).rev().take_while(same).last().unwrap_or(middle);
+    let bottom = (middle..height).take_while(same).last().unwrap_or(middle) + 1;
+    let mut rects = vec![[band.0, top, band.1 - band.0, bottom - top]];
+    // The rows from the band out to the shape's edge, and the columns
+    // all of them have.
+    let mut cap = |outward: &mut dyn Iterator<Item = u32>| {
+        let (mut first, mut last, mut columns) = (u32::MAX, 0, band);
+        for y in outward {
+            let Some((start, end)) = runs[y as usize] else {
+                break;
+            };
+            let narrowed = (columns.0.max(start), columns.1.min(end));
+            if narrowed.0 >= narrowed.1 {
+                break;
+            }
+            columns = narrowed;
+            first = first.min(y);
+            last = last.max(y);
+        }
+        if first <= last {
+            rects.push([columns.0, first, columns.1 - columns.0, last - first + 1]);
+        }
+    };
+    cap(&mut (0..top).rev());
+    cap(&mut (bottom..height));
+    rects
 }
 
 /// How much of the pixel centered at (`x`, `y`) lies inside a `w` x `h`
@@ -559,6 +639,51 @@ mod tests {
             below > above && below > 0,
             "shadow {above} above, {below} below"
         );
+    }
+
+    #[test]
+    fn cards_name_only_opaque_pixels_opaque() {
+        let shadow = Shadow {
+            dy: 4.0,
+            blur: 16.0,
+            spread: 4.0,
+            alpha: 0.2,
+        };
+        let c = card(None, (0, 0, 0, 0), [10, 20, 30], 100, 60, 20.0, shadow).unwrap();
+        let alpha = |x: u32, y: u32| c.pixels[((y * c.width + x) * 4 + 3) as usize];
+        let m = c.margin;
+        // Exactly: the rows between the corners at full width, and the
+        // columns between the corners over and under them.
+        assert_eq!(
+            opaque_rects(&c.pixels, c.width, c.height, 0),
+            [
+                [m, m + 20, 100, 20],
+                [m + 20, m, 60, 20],
+                [m + 20, m + 40, 60, 20]
+            ]
+        );
+        assert!(alpha(m - 1, m + 30) < 255 && alpha(m + 50, m - 1) < 255);
+        // As the card names them, with the margin to spare all round.
+        let spare = OPAQUE_MARGIN;
+        assert_eq!(
+            c.opaque,
+            [
+                [m + spare, m + 20 + spare, 100 - 2 * spare, 20 - 2 * spare],
+                [m + 20 + spare, m + spare, 60 - 2 * spare, 20],
+                [m + 20 + spare, m + 40 - spare, 60 - 2 * spare, 20]
+            ]
+        );
+        for [x, y, w, h] in &c.opaque {
+            for py in y - spare..y + h + spare {
+                for px in x - spare..x + w + spare {
+                    assert_eq!(alpha(px, py), 255, "{px},{py}");
+                }
+            }
+        }
+        // A shape without an opaque middle row names nothing, and one too
+        // small for the margin neither.
+        assert!(opaque_rects(&[0, 0, 0, 254], 1, 1, 0).is_empty());
+        assert!(opaque_rects(&[0, 0, 0, 255], 1, 1, 1).is_empty());
     }
 
     #[test]

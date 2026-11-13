@@ -226,3 +226,23 @@ Such a late request receives a tracked inert child without metadata; its
 release and parent teardown cannot unset the compositor owner. The returned-
 key consumer exercises this race with actual standard requests and verifies
 continued physical-key delivery to the compositor grab.
+
+Issue #503 additionally changes GlesFrame::render_texture_from_to in
+src/backend/renderer/gles/mod.rs: a texture drawn texel for pixel (the
+source size, turned by the buffer transform, equals the destination size,
+and the source starts at a whole texel) is sampled with GL_NEAREST for that
+draw, whatever filters the renderer is set to. Every sample of such a draw
+lands on a texel centre, so nearest and linear name the same texel, and
+nearest does not fetch and weigh the three texels around it: on llvmpipe
+the four gathers of a bilinear fetch are most of the fragment work, and
+nearly everything a desktop draws outside an animation is unscaled. Mutter
+does the same for unscaled shaped textures and backgrounds
+(meta-shaped-texture.c, meta-background-content.c). The renderer's
+configured filters are restored after the draw; scaled, stretched or
+sub-texel-shifted draws keep them. GL tests in unscaled_nearest_tests
+(surfaceless Mesa EGL) read the filter each draw leaves on the texture and
+the pixels it produces: an unscaled, a cropped and a quarter-turned draw
+are nearest and show only source texels, while shrunk, grown, one-axis
+stretched and half-texel-shifted draws stay linear and filtered. The
+isolated diff is retained in UNSCALED-NEAREST-PATCH.diff; the pinned
+version stays 0.7.0.
