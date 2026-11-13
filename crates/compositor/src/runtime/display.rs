@@ -100,6 +100,7 @@ impl Runtime {
             return;
         }
         self.display_published = Some(key);
+        self.wallpaper.monitors_changed();
         self.display_share.publish(self.display_state());
     }
 
