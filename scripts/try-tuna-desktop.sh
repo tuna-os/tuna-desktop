@@ -158,6 +158,26 @@ fi
 # Sigstore, GitHub Actions OIDC — see tunaos docs/INSTALL.md "Verifying
 # downloads"). The VM boots image@digest, so a tag move mid-drive cannot
 # change what is running.
+#
+# The pinned digest check below is authoritative. The remote tag check first
+# is a fast gate: a build the pipeline published without signatures can never
+# pass the pinned check, so fail in seconds instead of after a multi-GB pull.
+COSIGN_IDENTITY="https://github.com/tuna-os/tunaOS/.github/workflows/reusable-build-image.yml@refs/heads/main"
+COSIGN_ISSUER="https://token.actions.githubusercontent.com"
+note "checking published signatures for $IMAGE..."
+COSIGN_OUT="$(mktemp "${TMPDIR:-/tmp}/try-tuna-cosign.XXXXXX")"
+if cosign verify "$IMAGE" \
+  --certificate-identity "$COSIGN_IDENTITY" \
+  --certificate-oidc-issuer "$COSIGN_ISSUER" >"$COSIGN_OUT" 2>&1; then
+  note "published signatures present."
+else
+  if grep -q "no signatures found" "$COSIGN_OUT"; then
+    rm -f "$COSIGN_OUT"
+    die "no signatures published for $IMAGE — the pipeline published this build unsigned (see the latest tuna-os/tunaOS Build Marlin run), so it cannot pass verification; refusing a multi-GB download of an image that cannot boot. Retry when a signed build publishes, or set TRY_TUNA_IMAGE to a signed build."
+  fi
+  note "warning: pre-pull signature check was inconclusive — proceeding; the pinned digest is still verified after download."
+fi
+rm -f "$COSIGN_OUT"
 note "pulling $IMAGE..."
 podman pull "$IMAGE" >/dev/null || die "image pull failed: $IMAGE"
 DIGEST="$(podman image inspect --format '{{.Digest}}' "$IMAGE" 2>/dev/null)" || die "could not inspect digest for $IMAGE"
@@ -166,8 +186,8 @@ BASE="${IMAGE%%:*}"
 PINNED="${BASE}@${DIGEST}"
 note "pinned: $PINNED"
 cosign verify "$PINNED" \
-  --certificate-identity "https://github.com/tuna-os/tunaOS/.github/workflows/reusable-build-image.yml@refs/heads/main" \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" >/dev/null \
+  --certificate-identity "$COSIGN_IDENTITY" \
+  --certificate-oidc-issuer "$COSIGN_ISSUER" >/dev/null \
   || die "cosign verification failed for $PINNED — refusing to boot an unverified image"
 note "signature verified."
 
