@@ -85,6 +85,6 @@ wayland-protocols-misc = { version = "=0.3.12", features = ["client"] }
 tempfile = "3"
 # Peer-to-peer links let tests watch real D-Bus signals without a bus.
 zbus = { workspace = true, features = ["p2p"] }
-# Smithay's test renderer reads shm buffers as an upload does, without GL
-# (tests/buffer_release.rs).
+# Smithay's test renderer imports shm buffers as an upload does, without GL
+# (tests/buffer_release.rs, tests/window_teardown.rs).
 smithay = { workspace = true, features = ["renderer_test"] }
