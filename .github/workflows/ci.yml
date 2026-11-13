@@ -980,7 +980,7 @@ jobs:
           if exit_status != 0 or not unchanged or '1 passed; 0 failed; 0 ignored' not in text or 'COUNTDOWN-OSD pass ' not in text:
               raise RuntimeError('actual admitted countdown OSD test did not pass')
           PY
-      - name: Prove real GTK OSD fade-out, panel menu close/switch (#501) and lock curtain (#502)
+      - name: Prove real GTK OSD fade-out, panel menu close/switch (#501), lock curtain (#502) and a settled lock screen's idle frame clock (#1122)
         run: |
           /usr/bin/python3 - <<'PY'
           import hashlib, json, os, pathlib, signal, subprocess
@@ -996,6 +996,7 @@ jobs:
               ('menu-motion', 'TUNA_REQUIRE_MENU_MOTION=1', 'transient::gtk_menu_tests::actual_gtk_menus_close_at_once_and_switch_fade_only', 'MENU-MOTION pass ', 'actual GTK widgets, frame clock and GLib timers under private X11; Wayland layer-shell and the compositor-drawn close are proven by G-TRANSIENT-CLOSE-CLOCK'),
               ('popup-submenu', 'TUNA_REQUIRE_MENU_MOTION=1', 'transient::gtk_menu_tests::actual_gtk_popup_submenus_ease_open_and_closed', 'POPUP-SUBMENU pass ', 'actual GTK widgets, frame clock and GLib timers under private X11 (PopupSubMenu height and arrow, #501); the NetworkManager and IBus menus holding them are not driven by a proof'),
               ('lock-curtain', 'TUNA_REQUIRE_LOCK_CURTAIN=1', 'lock_curtain::gtk_curtain_tests::actual_gtk_curtain_pages_follow_progress_and_policy', 'LOCK-CURTAIN pass ', 'actual GTK widget allocation, focus and frame clock under private X11; the session-lock surface, real input and frozen-clock frames are proven by G-LOCK-CURTAIN-CLOCK, G-LOCK-CURTAIN-POLICY and G-LOCK-CURTAIN-DRAG'),
+              ('lock-idle-frames', 'TUNA_REQUIRE_LOCK_IDLE_FRAMES=1', 'lock::auth_transport_ui_tests::actual_gtk_settled_lock_screen_requests_no_frames', 'LOCK-IDLE-FRAMES pass ', 'actual GTK lock window, frame clock and layout under private X11; the session-lock surface and compositor-side frame callbacks are measured on the vkms replica (#1122)'),
           ]
           for name, admit, test, marker, scope in proofs:
               artifacts = pathlib.Path('gtk-shell-artifacts') / name

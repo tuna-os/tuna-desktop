@@ -36,6 +36,10 @@
 #              keybinding actions, strip keybindings, the pad OSD in the
 #              GTK shell (help button, org.gnome.Shell.Wacom.PadOsd),
 #              hotplug, and nothing reaching the client while locked
+#   D-POWER-SAVE gsd-power's blank of the locked session: DisplayConfig
+#              PowerSaveMode 3 turns the connector off and the main loop
+#              all but sleeps (#1122); 0 relights it with a full repaint
+#              of the still lock screen at once (#355)
 #   D-TOUCHPAD-SWIPE an emulated (uinput) Synaptics clickpad through real
 #              libinput (P-IN-02, #593): three-finger swipes up/down open
 #              and close the overview following the fingers, left/right
@@ -63,7 +67,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --seconds) SECONDS_UP="$2"; shift 2 ;;
-        --help|-h) sed -n '2,53p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,57p' "$0"; exit 0 ;;
         *) echo "tuna-drm-smoke: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -958,6 +962,49 @@ emu tool out
 sleep 0.5
 client "r['event'] != 'ready'" 1 && fail D-TABLET "the pen reached the client while locked: $(tail -2 "$CLIENT_LOG")"
 pass D-TABLET "relative mapping moved from the cursor; unplug/replug; nothing reached the client while locked"
+
+# Blanked while locked (#355, #1122), as gsd-power blanks an idle locked
+# session: DisplayConfig PowerSaveMode 3 turns the CRTC off and the main
+# loop sleeps but for Mutter's 100 ms dummy flip and the hidden windows'
+# beat (a display-rate loop wakes it about 60 times a second); 0 lights
+# the CRTC again with a full repaint at once, although nothing on the
+# still lock screen or behind it changed.
+power_save_set() {
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.freedesktop.DBus.Properties.Set \
+        org.gnome.Mutter.DisplayConfig PowerSaveMode "<int32 $1>" >/dev/null
+}
+# The compositor main thread's sleeps so far (each one a wake).
+main_wakes() {
+    sed -n 's/^voluntary_ctxt_switches:[[:space:]]*//p' "/proc/$COMP_PID/task/$COMP_PID/status"
+}
+CONNECTOR_SYSFS="/sys/class/drm/$(basename "$CARD")-$CONNECTOR/enabled"
+[ "$(cat "$CONNECTOR_SYSFS")" = enabled ] || fail D-POWER-SAVE "$CONNECTOR was not lit before blanking"
+power_save_set 3 || fail D-POWER-SAVE "PowerSaveMode 3 refused"
+state '.power_save_mode == 3' || fail D-POWER-SAVE "the compositor did not apply PowerSaveMode 3"
+[ "$(cat "$CONNECTOR_SYSFS")" = disabled ] || fail D-POWER-SAVE "PowerSaveMode 3 left $CONNECTOR lit"
+# Past the input linger and the last frames' callbacks.
+sleep 2
+blank_frames=$(jq -er '.rendered_frames' "$CSTATE")
+wakes_before=$(main_wakes)
+sleep 5
+blank_wakes=$((($(main_wakes) - wakes_before) / 5))
+[ "$blank_wakes" -le 25 ] ||
+    fail D-POWER-SAVE "a blanked, locked session's main loop woke $blank_wakes times a second"
+[ "$(jq -er '.rendered_frames' "$CSTATE")" = "$blank_frames" ] ||
+    fail D-POWER-SAVE "frames were scanned out while PowerSaveMode was 3"
+power_save_set 0 || fail D-POWER-SAVE "PowerSaveMode 0 refused"
+unblanked_at=$(date +%s%3N)
+until [ "$(cat "$CONNECTOR_SYSFS")" = enabled ] &&
+    jq -e ".power_save_mode == 0 and .rendered_frames > $blank_frames" "$CSTATE" >/dev/null 2>&1; do
+    [ $(($(date +%s%3N) - unblanked_at)) -le 2000 ] ||
+        fail D-POWER-SAVE "PowerSaveMode 0 did not repaint and relight $CONNECTOR within 2 s"
+    sleep 0.02
+done
+repaint_ms=$(($(date +%s%3N) - unblanked_at))
+state '.locked' 1 || fail D-POWER-SAVE "the session unlocked"
+pass D-POWER-SAVE "locked and blanked: $CONNECTOR off, $blank_wakes main-loop wakes/s, no scanout; PowerSaveMode 0 relit it with a full repaint in ${repaint_ms} ms"
 
 kill "$CLIENT_PID" 2>/dev/null || true
 CLIENT_PID=""
