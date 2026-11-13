@@ -46,6 +46,7 @@ RUN set -eux; \
         *) exit 1 ;; \
     esac \
     && pacman -U --noconfirm /tmp/tuna.pkg.tar.zst \
+    && TUNA_IMAGE_BUILD=1 /usr/libexec/tuna-geoclue-agent-policy \
     && if test "$PERF_PINNED_BASELINE" = false; then \
         /usr/libexec/tuna-image-kernels preview; \
     else /usr/libexec/tuna-pinned-baseline; fi \

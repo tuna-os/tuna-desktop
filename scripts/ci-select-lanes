@@ -110,6 +110,7 @@ OWNED = [
     ("scripts/tuna-app-content", ["app-content"]),
     ("scripts/tuna-scroll-proof", ["scroll-proof"]),
     ("scripts/tuna-drm-smoke", ["drm-smoke"]),
+    ("scripts/lib/colord-startup.sh", ["drm-smoke"]),
     ("scripts/tuna-orca-speech-proof", ["orca-speech"]),
     ("scripts/lib/tuna-orca-speech.py", ["orca-speech"]),
     ("scripts/tuna-frame-pacer-build", ["drm-smoke"]),
