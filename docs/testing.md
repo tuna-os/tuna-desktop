@@ -43,7 +43,11 @@ base, and picks the proof lanes the change can affect:
   lanes whose artifacts it needs. `scripts/ci-select-lanes` (`OWNED` and
   `NO_LANE`) is the authoritative, ordered mapping.
 - a lane's own proof script, reference fixtures or packaging: that lane
-  (plus the lanes whose artifacts it needs).
+  (plus the lanes whose artifacts it needs). A `scripts/tests/` file edit
+  selects the lane whose job runs that file (for example `gtk-shell` for
+  `test_notify_callback_contract.py`); a test only `check` runs selects none.
+  `WorkflowSync.test_lane_run_tests_select_their_lane` fails when a lane job
+  runs a test the selector does not map.
 - a packaged conffile (`share/pam.d/`, installed as `/etc/pam.d/tuna-lock`):
   `journey`, whose disposable Debian lifecycle fails when its bytes drift
   from the released package's, plus the core lanes and every package
