@@ -162,6 +162,72 @@ class ActualRecordQualification(unittest.TestCase):
             self.assertEqual(observer.profiles('tuna_test'), {'tuna_test_arm':{'hits':12,'misses':0}})
 
 
+# Contiguous verbatim lines of run 43224217367, repeat-2/gnome/kernel-vblank-trace.txt.
+REENTRY_43224217367 = b'''\
+   kworker/u16:4-84      [001] .....   134.161689: tuna_vblank_486e88873cc9183b_flush: (virtio_gpu_crtc_atomic_flush+0x4/0xb0 [virtio_gpu]) crtc=0xffff8eb897e40040 object=39 pipe=0 dev=0xffff8eb896e08000 minor=1 commit=0xffff8eb8a4e09700
+   kworker/u16:4-84      [001] d.h2.   134.161711: hrtimer_expire_entry: hrtimer=00000000194832d4 function=drm_vblank_timer_function now=134161709553
+   kworker/u16:4-84      [001] d.h3.   134.161714: drm_vblank_event: crtc=0, seq=9826, time=134161690381, high-prec=true
+   kworker/u16:4-84      [001] d.h2.   134.161715: hrtimer_expire_exit: hrtimer=00000000194832d4
+   kworker/u16:4-84      [001] d.h3.   134.161715: hrtimer_start: hrtimer=00000000194832d4 function=drm_vblank_timer_function expires=134175024807 softexpires=134175024807 mode=ABS was_armed=0
+   kworker/u16:4-84      [001] d..1.   134.161729: tuna_vblank_486e88873cc9183b_arm: (drm_crtc_arm_vblank_event+0x4/0x80) crtc=0xffff8eb897e40040 object=39 pipe=0 dev=0xffff8eb896e08000 minor=1 event=0xffff8eb896e48200 file=0xffff8eb8a526d800 userdata=0x55f218bc6c00
+'''
+# Contiguous verbatim lines of run 42807208426, repeat-2/gnome: the IRQ precedes
+# the interrupted handler's own record, reserved after the IRQ returns.
+REENTRY_42807208426 = b'''\
+   kworker/u16:4-85      [001] d.h2.   139.079461: hrtimer_expire_entry: hrtimer=00000000b927d468 function=drm_vblank_timer_function now=139079459206
+   kworker/u16:4-85      [001] d.h3.   139.079465: drm_vblank_event: crtc=0, seq=10152, time=139079438640, high-prec=true
+   kworker/u16:4-85      [001] d.h2.   139.079466: hrtimer_expire_exit: hrtimer=00000000b927d468
+   kworker/u16:4-85      [001] d.h3.   139.079467: hrtimer_start: hrtimer=00000000b927d468 function=drm_vblank_timer_function expires=139092773066 softexpires=139092773066 mode=ABS was_armed=0
+   kworker/u16:4-85      [001] .....   139.079479: tuna_vblank_ac5abe8e98bab67d_timeout: (drm_crtc_vblank_get_vblank_timeout+0x4/0x150) crtc=0xffff8c7896c40040 object=39 pipe=0 dev=0xffff8c789510f000 minor=1 output=0xffffd2ff408a7e08
+'''
+
+
+class ProbeLoss(unittest.TestCase):
+    DEFINITIONS = ['p:tuna_test/tuna_test_timer drm_vblank_timer_function timer=$arg1:x64',
+                   'r64:tuna_test/tuna_test_timer_return drm_vblank_timer_function restart=$retval:s32',
+                   'p:tuna_test/tuna_test_flush virtio_gpu_crtc_atomic_flush crtc=$arg1:x64']
+
+    def test_every_miss_is_named_and_none_is_tolerated(self):
+        before = {name: {'hits': 2, 'misses': 0} for name in ('tuna_test_timer', 'tuna_test_timer_return', 'tuna_test_flush')}
+        self.assertEqual(observer.profile_errors(before, before, self.DEFINITIONS), ([], {}))
+        after = dict(before, tuna_test_timer={'hits': 9, 'misses': 1}, tuna_test_timer_return={'hits': 9, 'misses': 1})
+        errors, misses = observer.profile_errors(before, after, self.DEFINITIONS)
+        self.assertEqual(misses, {'tuna_test_timer': 1, 'tuna_test_timer_return': 1})
+        self.assertIn('actual kprobe missed 1 hit(s): tuna_test_timer (', errors[0])
+        self.assertIn('another kprobe handler runs on that CPU', errors[0])
+        self.assertIn('actual kretprobe missed 1 hit(s): tuna_test_timer_return (', errors[1])
+        errors, _ = observer.profile_errors(before, {'tuna_test_timer': {'hits': 1, 'misses': 0}}, self.DEFINITIONS)
+        self.assertEqual(errors, ['actual probe hit counter regressed: tuna_test_timer',
+                                  'actual probe profile disappeared during capture: tuna_test_timer_return',
+                                  'actual probe profile disappeared during capture: tuna_test_flush'])
+
+    def test_irq_after_process_context_record_locates_reentered_flush(self):
+        located = observer.locate_reentrant_misses(REENTRY_43224217367, 'tuna_vblank_486e88873cc9183b')
+        self.assertEqual(len(located), 1)
+        self.assertEqual((located[0]['cpu'], located[0]['irq_timestamp'], located[0]['interrupted_pid']), (1, '134.161711', 84))
+        self.assertEqual([probe['event'] for probe in located[0]['interrupted_probe_candidates']],
+                         ['tuna_vblank_486e88873cc9183b_flush'])
+        self.assertTrue(located[0]['process_context_kprobe_reentered'])
+        error, = observer.reentry_errors(located)
+        self.assertIn('IRQ re-entered a process-context ftrace kprobe handler on the same vCPU', error)
+
+    def test_irq_before_its_handler_record_locates_reentered_timeout(self):
+        located = observer.locate_reentrant_misses(REENTRY_42807208426, 'tuna_vblank_ac5abe8e98bab67d')
+        self.assertEqual([probe['event'] for probe in located[0]['interrupted_probe_candidates']],
+                         ['tuna_vblank_ac5abe8e98bab67d_timeout'])
+
+    def test_recorded_timer_irq_and_unattributed_irq_are_distinct(self):
+        recorded = REENTRY_43224217367.replace(
+            b'drm_vblank_event: crtc=0, seq=9826, time=134161690381, high-prec=true',
+            b'tuna_vblank_486e88873cc9183b_timer: (drm_vblank_timer_function+0x4/0xe0) timer=0xffff8eb883457f60')
+        self.assertEqual(observer.locate_reentrant_misses(recorded, 'tuna_vblank_486e88873cc9183b'), [])
+        # Without an adjacent IRQs-enabled probe record the handler is not named.
+        bare = b'\n'.join(REENTRY_43224217367.splitlines()[1:4]) + b'\n'
+        located = observer.locate_reentrant_misses(bare, 'tuna_vblank_486e88873cc9183b')
+        self.assertFalse(located[0]['process_context_kprobe_reentered'])
+        self.assertIn('no adjacent process-context probe record', observer.reentry_errors(located)[0])
+
+
 class Retention(unittest.TestCase):
     def test_actual_guest_probe_accepts_only_fixed_bounded_discovery_action(self):
         import base64
@@ -212,7 +278,7 @@ class Retention(unittest.TestCase):
             return {'kernel_trace':{'index':index,'data':base64.b64encode(value).decode()}}
         with tempfile.TemporaryDirectory() as tmp, patch.object(host,'guest_probe',side_effect=probe):
             out=Path(tmp)
-            with self.assertRaises(ValueError):host.retain_kernel_trace(None,out,metadata)
+            with self.assertRaisesRegex(ValueError, 'reports actual loss.*actual dropped events'):host.retain_kernel_trace(None,out,metadata)
             self.assertEqual((out/'kernel-vblank-trace.txt').read_bytes(),raw)
             self.assertEqual((out/'kernel-vblank-formats.json').read_bytes(),formats)
             self.assertEqual(json.loads((out/'kernel-vblank-source.json').read_text()),metadata)
