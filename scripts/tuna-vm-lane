@@ -4074,8 +4074,8 @@ def repeat_boots(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--profile", choices=("lifecycle", "gnome-reference", "tuna-reference"), default="lifecycle",
-                    help="explicit paired DEV member; ordinary Tuna lifecycle remains the default")
+    ap.add_argument("--profile", choices=("lifecycle", "autotz", "gnome-reference", "tuna-reference"), default="lifecycle",
+                    help="ordinary lifecycle (default), required independent native automatic-timezone consumer, or explicit paired DEV member")
     ap.add_argument("--reference-base-evidence",
                     help="actual normal-CI raw index and successful platform cosign verification directory")
     ap.add_argument("--disk", required=True)
@@ -4115,9 +4115,13 @@ def main():
                      "skipped_assertions", "assertions", "tour", "lane"}
     if any(kv.partition("=")[0] in reserved_meta for kv in a.meta):
         ap.error("--meta cannot override qualification policy, assertions, tour or lane")
+    if a.profile == "autotz":
+        if (not a.require_kvm or not a.strip_image or a.tour or a.boots != 1
+                or a.soak or a.fresh_accounts or a.published or a.strip_edge):
+            ap.error("native autotz requires KVM, exact installed image admission and one pristine boot")
     if a.fresh_gdm_trace and not a.fresh_accounts:
         ap.error("--fresh-gdm-trace requires --fresh-accounts")
-    if a.profile != "lifecycle":
+    if a.profile in ("gnome-reference", "tuna-reference"):
         if not a.reference_base_evidence:
             ap.error("the paired consumer requires --reference-base-evidence")
         if (not a.require_kvm or a.tour or a.boots != 1 or a.soak or a.fresh_accounts
@@ -4143,8 +4147,8 @@ def main():
     if a.strip_edge and not a.strip_image:
         ap.error("--strip-edge requires exact installed image admission")
     if a.strip_image:
-        if not a.tour:
-            ap.error("--strip-image requires --tour lifecycle")
+        if not a.tour and a.profile != "autotz":
+            ap.error("--strip-image requires --tour lifecycle or explicit native autotz consumer")
         with open(a.strip_image, "rb") as stream:
             raw = stream.read(1048577)
         if len(raw) > 1048576:
@@ -4286,6 +4290,18 @@ def main():
             finally:
                 if agent is not None:
                     agent.close()
+            if a.profile == "autotz":
+                try:
+                    if not manager_ready:
+                        raise RuntimeError("original installed native session owner admission failed")
+                    from core_apps_autotz import run_native
+                    factory = lambda *, deadline: guest_agent.GuestAgent(agent_path, deadline=deadline)
+                    consumer = run_native(qmp, factory, out, strip_image)
+                    record("V-AUTOTZ", isinstance(consumer, dict) and consumer.get("qualified") is True,
+                           "required independent native automatic-timezone consumer completed")
+                except Exception as error:
+                    record("V-AUTOTZ", False,
+                           f"native automatic-timezone consumer failed: {type(error).__name__}: {error}")
             if a.soak and manager_ready:
                 run_soak(qmp, vm, agent_path, out, record, a.soak, a.soak_warmup, a.soak_interval,
                          a.soak_revision)
@@ -4352,6 +4368,8 @@ def main():
            "tuna-shell-gtk started under supervision" if shell
            else "no tuna-shell-gtk: keybindings line")
     results.setdefault("V-PANEL", (False, "session never came up, no screendump checked"))
+    if a.profile == "autotz":
+        results.setdefault("V-AUTOTZ", (False, "native session never admitted; required consumer did not run"))
     if a.soak:
         results.setdefault("V-SOAK", (False, "the session never became ready, so the soak did not run"))
     # GDM starting its greeter on the login VT takes DRM master from the
@@ -4390,6 +4408,7 @@ def main():
                                   text=True).stdout.splitlines()[0]
     manifest = {
         "lane": "marlin-vm",
+        "profile": a.profile,
         **mode,
         "orca_contract": a.orca_contract,
         "session": ("published Tuna Desktop flavor" if a.published else "source-built Tuna Desktop")

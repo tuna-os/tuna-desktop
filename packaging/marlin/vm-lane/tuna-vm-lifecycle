@@ -2732,10 +2732,18 @@ def main():
     # guest agent only ever executes this lifecycle path.
     if action.startswith("app-"):
         os.execv("/usr/libexec/tuna-vm-app-integration", ["tuna-vm-app-integration", *sys.argv[1:]])
-    if action == "greeter-prompt":
+    if action == "autotz":
+        sys.path.insert(0, "/usr/libexec/tuna-native-session")
+        import autotz_guest
+        try:
+            result = autotz_guest.execute(sys.argv[2:], OWNER, inventory, STATE)
+        except Exception as error:
+            print(json.dumps({"autotz_error": autotz_guest.error_receipt(error, sys.argv[2:])}))
+            raise SystemExit(1) from None
+    elif action == "greeter-prompt":
         print(json.dumps(greeter_prompt()))
         return
-    if action == "background-diagnostics":
+    elif action == "background-diagnostics":
         inventory()  # Verify the original actual login owner before re-exec.
         result = json.loads(call(sys.executable, __file__, "background-user-diagnostics", user=True))
     elif action == "inventory":

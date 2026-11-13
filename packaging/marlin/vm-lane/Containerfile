@@ -62,6 +62,8 @@ COPY packaging/marlin/vm-lane/tuna-vm-app-integration /usr/libexec/tuna-vm-app-i
 
 COPY packaging/marlin/vm-lane/tunaos /tmp/tunaos
 COPY packaging/marlin/vm-lane/tuna-vm-lifecycle /usr/libexec/tuna-vm-lifecycle
+COPY packaging/marlin/vm-lane/tuna-native-session/native_session.py packaging/marlin/vm-lane/tuna-native-session/autotz_guest.py /usr/libexec/tuna-native-session/
+COPY packaging/marlin/vm-lane/core-apps/autotz.py packaging/marlin/vm-lane/core-apps/geoclue_fixture.py /usr/libexec/tuna-native-session/
 COPY packaging/marlin/vm-lane/tuna-vm-gdm-trace /usr/libexec/tuna-vm-gdm-trace
 COPY scripts/lib/gnome-brightness-proof.py /usr/libexec/tuna-brightness-proof
 COPY scripts/lib/tuna-datetime-proof.py /usr/libexec/tuna-datetime-proof
@@ -119,7 +121,7 @@ RUN mkdir -p /usr/share/tuna-vm \
     && test "$(readlink -f /etc/systemd/system/display-manager.service)" = /usr/lib/systemd/system/gdm.service \
     && ! grep -Eiq '^[[:space:]]*(AutomaticLoginEnable|TimedLoginEnable)[[:space:]]*=[[:space:]]*(true|yes|y|1)[[:space:]]*$' /etc/gdm/custom.conf \
     && grep -qx 'FallbackSession=tuna' /etc/gdm/custom.conf \
-    && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test \
+    && useradd -M -d /home/tuna-test -s /bin/bash -U -G wheel tuna-test \
     && echo 'tuna-test:tuna' | chpasswd \
     && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-fresh-accounts /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-shell-focus \
          /usr/libexec/tuna-vm-picker /usr/libexec/tuna-vm-introspect-watch /usr/libexec/tuna-vm-app-integration \
