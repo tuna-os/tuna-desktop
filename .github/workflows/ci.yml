@@ -55,9 +55,19 @@ jobs:
           CI_ROUND_ROBIN_SIZE: ${{ vars.CI_ROUND_ROBIN_SIZE }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           DRAFT: ${{ github.event.pull_request.draft }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Draft pull requests: check only. Their proof lanes run when the
-          # pull request is marked ready for review.
+          # pull request is marked ready for review. The event's draft flag
+          # is from when the event fired: a push just before "ready for
+          # review" queues a run that still says draft and, by superseding
+          # the ready_for_review run, left #958 with no proof lanes at all.
+          # Ask for the pull request's current state instead.
+          if [ "$DRAFT" = true ]; then
+            DRAFT=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .draft) || DRAFT=true
+          fi
           if [ "$DRAFT" = true ]; then
             echo 'lanes=[]' >> "$GITHUB_OUTPUT"
           elif [ -n "$BASE_SHA" ]; then
@@ -198,6 +208,7 @@ jobs:
       - run: python3 scripts/lib/a11y-focus-proof-tests.py
       - run: /usr/bin/python3 scripts/tests/test_grid_cancel_proof.py
       - run: /usr/bin/python3 scripts/tests/test_grid_cancel_comparison.py
+      - run: python3 scripts/tests/test_remote_security_failure_report.py
       - run: python3 scripts/lib/pam-helper-source-tests.py
       - run: python3 scripts/lib/minimize-body-pixel-tests.py
       - run: python3 scripts/lib/media-causal-trace-tests.py
@@ -1287,6 +1298,7 @@ jobs:
           path: ${{ runner.temp }}/remote-package
       - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends podman zstd shellcheck
       - run: shellcheck scripts/tuna-remote-security tests/remote-desktop-reference/run.sh
+      - run: python3 scripts/tests/test_remote_security_failure_report.py
       - name: Test packaged compositor with actual GNOME 51 RemoteDesktop consent and libei input
         run: |
           mkdir -p "$RUNNER_TEMP/remote-candidate"

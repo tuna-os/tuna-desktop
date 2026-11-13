@@ -3082,6 +3082,27 @@ done
 # before admitting the active first-page tree, within the same preview budget.
 xdotool mousemove --window "$WID" "$grid_neutral_x" "$grid_neutral_y"
 grid_peek_end=$(($(date +%s) + 10))
+# Old observation role only; the fixed role and the full gate stay parked.
+# The pinned old source predates #674: its GtkFixed hint is measured by the
+# preview icons sliding in from outside the clip, so during that 150 ms slide
+# the "10%" hint is several times wider (700-1000+ px in #674). The one
+# motion that parks the pointer can land in it; the old pager then counts the
+# pointer as dwelling on the next-page hint, and because a parked pointer
+# sends no further motion nothing re-evaluates that before the 1 s dwell
+# turns the page (main run 43259379979: "actual carousel page changed before
+# Escape", page 2 mid-slide with only the previous-page hint). Deliver a real
+# motion inside the same admitted gap after the slide and well inside the
+# dwell, so the old pager tests its settled hint. Admitted points keep 3 px
+# from every tile and hint, so the adjacent pixel is in the gap too. Every
+# later check is unchanged: a page that turns anyway still fails the
+# first-page comparison, and the preview budget still starts at the park.
+grid_cancel_old_settle() {
+    [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || return 0
+    xdotool mousemove --window "$WID" $((grid_neutral_x + 1)) "$grid_neutral_y"
+    xdotool mousemove --window "$WID" "$grid_neutral_x" "$grid_neutral_y"
+}
+if [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ]; then sleep 0.3; fi
+grid_cancel_old_settle
 until grid_cancel_dump "$ARTIFACTS/a11y-folder-page-peek.json" &&
     showing "$ARTIFACTS/a11y-folder-page-peek.json" "Next page preview" &&
     ! showing "$ARTIFACTS/a11y-folder-page-peek.json" "Next Page" &&
@@ -3107,6 +3128,7 @@ read -r grid_neutral_x grid_neutral_y <<EOF
 $neutral_coordinates
 EOF
 xdotool mousemove --window "$WID" "$grid_neutral_x" "$grid_neutral_y"
+grid_cancel_old_settle
 grid_neutral_wait=$((grid_peek_end - $(date +%s)))
 if [ "$grid_neutral_wait" -lt 0 ] ||
     ! cstate ".client_dnd_active == true and .overview_open and .overview_app_grid and (.locked == false) and (.pointer_position == [$grid_neutral_x, $grid_neutral_y])" "real folder drag active at observed neutral point" "$grid_neutral_wait"; then
