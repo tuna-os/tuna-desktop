@@ -20,6 +20,7 @@ import zipfile
 
 from maintained_media import required_source_inputs
 from vm_gnome_reference import validate_platform_verification
+from vm_strip_image import canonical_image_id
 
 REPOSITORY = 'tuna-os/tuna-desktop'
 ORIGIN = 'https://github.com/' + REPOSITORY + '.git'
@@ -396,6 +397,16 @@ def podman(root, *args):
     return command(root, 'sudo', 'podman', *args)
 
 
+def podman_image_id(root, reference):
+    """Full canonical ID of the image `reference` names in actual root Podman storage.
+
+    Podman prints '{{.Id}}' as bare 64-hex, including for a 'sha256:<hex>'
+    lookup, while product identities carry the prefix. Only a full ID is
+    admitted, so equality remains equality of the whole immutable digest.
+    """
+    return canonical_image_id(podman(root, 'image', 'inspect', reference, '--format', '{{.Id}}'))
+
+
 def restore_metadata(root, directory, files):
     for name in files:
         if name.startswith('gdm51/'):
@@ -533,10 +544,10 @@ def select(root, profile, out, current_package, *, expected_base_index, expected
                             and os.environ.get('GITHUB_EVENT_NAME') in ('push', 'pull_request', 'workflow_dispatch', 'schedule'),
                             'OCI load is allowed only in the ordinary native CI job')
                     podman(root, 'load', '--input', directory / 'product-image.oci.tar')
-                    loaded = podman(root, 'image', 'inspect', provenance['image_id'], '--format', '{{.Id}}')
-                    require(loaded == provenance['image_id'], 'actual loaded Podman image ID differs')
+                    require(podman_image_id(root, provenance['image_id']) == provenance['image_id'],
+                            'actual loaded Podman image ID differs')
                     podman(root, 'tag', provenance['image_id'], IMAGE_TAG)
-                    require(podman(root, 'image', 'inspect', IMAGE_TAG, '--format', '{{.Id}}') == provenance['image_id'],
+                    require(podman_image_id(root, IMAGE_TAG) == provenance['image_id'],
                             'actual selected Podman tag differs')
                     directory.rename(out)
                 restore_metadata(root, out, provenance['files'])
@@ -596,8 +607,7 @@ def retain(root, profile, out, image_id, package, basename, product_commit):
     require(original['required_source_inputs_sha256'] == current['required_source_inputs_sha256'],
             'original product source is not equivalent to qualification source')
     run = qualification_environment(current)
-    require(podman(root, 'image', 'inspect', image_id, '--format', '{{.Id}}') == image_id,
-            'retained actual Podman image differs')
+    require(podman_image_id(root, image_id) == image_id, 'retained actual Podman image differs')
     out.mkdir(parents=True, exist_ok=True)
     selection_path = out / 'selection.json'
     selected = json_object(selection_path.read_bytes()) if selection_path.exists() else None

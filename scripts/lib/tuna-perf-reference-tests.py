@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -14,6 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT/'scripts/lib'))
 import gnome_reference as policy
+import vm_gnome_reference as vm_reference
 
 
 def load(name, path):
@@ -198,6 +200,120 @@ class ReferencePolicy(unittest.TestCase):
         diagnostic=source.rsplit('FROM ',1)[1]
         self.assertIn("pacman -Q mutter | grep -qx 'mutter 51.0-1.7'",diagnostic)
         self.assertIn('sha256sum -c sha256sums',diagnostic)
+
+    def test_reference_base_is_one_pinned_platform_under_the_pinned_snapshot(self):
+        # Runs 43009988803/43209624981: the moving marlin:gnome tag carried
+        # openssl-3, which archive snapshot 2026/10/13 cannot replace, so the
+        # snapshot's openssl could not be installed over its libraries.
+        recipe=ROOT/'packaging/marlin/perf/Containerfile.baseline'
+        source=recipe.read_text()
+        bases=[line for line in source.splitlines() if line.startswith('ARG BASE_IMAGE')]
+        self.assertEqual(bases,['ARG BASE_IMAGE='+vm_reference.BASE_REPOSITORY+'@'+vm_reference.PINNED_PLATFORM])
+        self.assertIn('\nARG ARCH_ARCHIVE_SNAPSHOT=2026/10/13\nFROM ${BASE_IMAGE} AS gnome-baseline\n',source)
+        self.assertIn('pacman -Syyuu --noconfirm gnome-shell mutter gdm',source)
+        self.assertIn("gnome-shell --version | grep -qx 'GNOME Shell 51.0'",source)
+        workflow=(ROOT/'.github/workflows/performance-baseline.yml').read_text()
+        build=workflow.split('      - name: Build one shared preview payload\n',1)[1].split('      - name: ',1)[0]
+        self.assertNotIn('marlin:gnome',workflow)
+        self.assertNotIn('--build-arg BASE_IMAGE=ghcr',build)
+        self.assertNotIn('--build-arg "BASE_IMAGE=ghcr',build)
+        select=[line.strip() for line in build.splitlines() if line.strip().startswith(('base_image=','[[ "$base_image" =~'))]
+        self.assertEqual(len(select),2)
+        self.assertLess(build.index(select[1]),build.index('sudo podman build'))
+        recorded='sudo podman inspect "$base_image" --format \'{{.Digest}}\' | tee base-digest\n'
+        self.assertIn(recorded,build)
+        self.assertIn('[[ "$(cat base-digest)" == "${base_image#*@}" ]] ||',build.split(recorded,1)[1].splitlines()[0])
+        pinned=vm_reference.BASE_REPOSITORY+'@'+vm_reference.PINNED_PLATFORM
+        for base,status in ((pinned,0),('ghcr.io/tuna-os/marlin:gnome',2),(pinned[:-1],2),
+                            ('ghcr.io/tuna-os/marlin:gnome@'+vm_reference.PINNED_PLATFORM,2),
+                            ('ghcr.io/other/marlin@'+vm_reference.PINNED_PLATFORM,2)):
+            with self.subTest(base=base), tempfile.TemporaryDirectory() as root:
+                copy_=Path(root)/'packaging/marlin/perf/Containerfile.baseline'
+                copy_.parent.mkdir(parents=True)
+                copy_.write_text(source.replace(bases[0],'ARG BASE_IMAGE='+base))
+                result=subprocess.run(['bash','-euo','pipefail','-c','\n'.join(select)+'\nprintf %s "$base_image"'],
+                                      cwd=root,text=True,capture_output=True)
+                self.assertEqual(result.returncode,status,result.stderr)
+                self.assertEqual(result.stdout,base if status==0 else '')
+
+
+class ArchiveDownloader(unittest.TestCase):
+    """packaging/marlin/perf/tuna-pacman-fetch against a real local HTTP server."""
+    FETCH = ROOT/'packaging/marlin/perf/tuna-pacman-fetch'
+    BODY = bytes(range(256)) * 64
+
+    def serve(self, handler):
+        import socket, threading
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(8)
+        requests = []
+
+        def run():
+            while True:
+                try: conn, _ = listener.accept()
+                except OSError: return
+                with conn:
+                    data = b''
+                    while b'\r\n\r\n' not in data:
+                        chunk = conn.recv(4096)
+                        if not chunk: break
+                        data += chunk
+                    requests.append(data.decode('latin1'))
+                    handler(conn, requests)
+        threading.Thread(target=run, daemon=True).start()
+        self.addCleanup(listener.close)
+        return listener.getsockname()[1], requests
+
+    def fetch(self, port, out):
+        environment = dict(os.environ, TUNA_PACMAN_FETCH_DELAY='0', TUNA_PACMAN_FETCH_ATTEMPTS='4')
+        return subprocess.run([str(self.FETCH), str(out), f'http://127.0.0.1:{port}/extra.db'],
+                              env=environment, capture_output=True, text=True, timeout=60)
+
+    def test_a_transfer_cut_off_part_way_is_resumed_to_the_complete_file(self):
+        body = self.BODY
+
+        def handler(conn, requests):
+            request = requests[-1]
+            if len(requests) == 1:
+                # The archive's failure: headers promise the whole file, the
+                # connection ends after a third of it (curl exit 18).
+                conn.sendall(f'HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n'.encode()
+                             + body[:len(body)//3])
+                return
+            start = int(request.split('Range: bytes=', 1)[1].split('-', 1)[0])
+            rest = body[start:]
+            conn.sendall(f'HTTP/1.1 206 Partial Content\r\nContent-Length: {len(rest)}\r\n'
+                         f'Content-Range: bytes {start}-{len(body)-1}/{len(body)}\r\nConnection: close\r\n\r\n'.encode() + rest)
+        port, requests = self.serve(handler)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)/'extra.db'
+            result = self.fetch(port, out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(out.read_bytes(), body)
+        self.assertEqual(len(requests), 2)
+        self.assertIn(f'Range: bytes={len(body)//3}-', requests[1])
+        self.assertIn('curl exit 18', result.stderr)
+
+    def test_a_missing_file_is_reported_at_once_without_retries(self):
+        def handler(conn, requests):
+            conn.sendall(b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+        port, requests = self.serve(handler)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.fetch(port, Path(tmp)/'extra.db')
+        self.assertEqual(result.returncode, 22, result.stderr)
+        self.assertEqual(len(requests), 1)
+
+    def test_a_server_that_always_cuts_off_fails_after_the_bounded_attempts(self):
+        body = self.BODY
+
+        def handler(conn, requests):
+            conn.sendall(f'HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n'.encode())
+        port, requests = self.serve(handler)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.fetch(port, Path(tmp)/'extra.db')
+        self.assertEqual(result.returncode, 18, result.stderr)
+        self.assertEqual(len(requests), 4)
 
 
 if __name__=='__main__':unittest.main()
