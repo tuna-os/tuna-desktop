@@ -3842,7 +3842,11 @@ def native_media_source(out, image, owner):
     from maintained_media import git_source, required_source_inputs
     from vm_strip_image import validate_base_origin, validate_product_origin
     def git(*arguments):
-        return subprocess.check_output(["git", "-C", root, *arguments], text=True, timeout=5).strip()
+        # A bound on a local git command, not a gate deadline: on a loaded
+        # runner `git diff HEAD` refreshes a cold index of the whole
+        # checkout and took over 5 s (release run 43440000569), which
+        # failed V-LIFECYCLE without anything being wrong with the tree.
+        return subprocess.check_output(["git", "-C", root, *arguments], text=True, timeout=120).strip()
     head, tree = git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
     if (head != image.get("capture_commit") or head != os.environ.get("GITHUB_SHA")
             or not re.fullmatch("[0-9a-f]{40}", head) or not re.fullmatch("[0-9a-f]{40}", tree)
