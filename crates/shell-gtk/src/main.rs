@@ -2090,6 +2090,18 @@ fn build(app: &adw::Application) {
             std::mem::forget(iface);
         }
     }
+    // GNOME Shell's carets never blink: StEntry shows ClutterText's
+    // cursor on key focus in and hides it on focus out (st-entry.c:551,
+    // :559, hidden until focus :1086), and ClutterText
+    // (clutter/pango/clutter-text.c) has only a static cursor-visible
+    // flag; neither reads the desktop's cursor-blink keys, which are for
+    // applications. GTK's blink fades the caret on every frame until its
+    // timeout, so a focused shell entry (overview search, lock password,
+    // run dialog) would redraw and commit at the display rate (#503).
+    // The setting is this process's: launched apps keep their own.
+    if let Some(gtk_settings) = gtk::Settings::default() {
+        gtk_settings.set_gtk_cursor_blink(false);
+    }
     // The shell chrome is always dark, as in GNOME.
     adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
 
