@@ -112,7 +112,7 @@ tuna-compositor --backend winit --socket tuna-test --shell-bin tuna-shell-gtk
 ## Stopping a session
 
 - **Log Out** in the shell's power menu sends `SIGTERM` to the compositor
-  (`crates/shell-gtk/src/power.rs:196-211`).
+  (`crates/shell-gtk/src/power.rs:273-285`).
 - The compositor shuts down cleanly on `SIGTERM`, `SIGINT` and `SIGHUP`: it
   stops the shell and its other children, stops `tuna-session.target`, starts
   `gnome-session-shutdown.target` and releases the leader FIFO, then logs
@@ -131,7 +131,18 @@ tuna-compositor --backend winit --socket tuna-test --shell-bin tuna-shell-gtk
 Power Off, Restart and Suspend in the power menu go to logind. They are only
 offered in a hardware session: in a nested one (`TUNA_SESSION_KIND` other than
 `hardware`) they would act on your host machine
-(`crates/shell-gtk/src/power.rs:169-172`, `:209-216`).
+(`crates/shell-gtk/src/power.rs:158-170`, `:202-205`).
+
+**Switch User…** sits under Log Out in a hardware session's power menu, as in
+GNOME 51. It shows only when AccountsService reports more than one user
+(`HasMultipleUsers`), your graphical session's logind seat can hold several
+sessions (`CanMultiSession`), the session is not locked, and
+`org.gnome.desktop.lockdown disable-user-switching` is off. Choosing it locks
+the screen (unless `disable-lock-screen` is set, as in GNOME), then, as libgdm
+does, activates GDM's login screen already on the seat or, on `seat0`, asks GDM
+for a new one (`CreateTransientDisplay`). If that fails, the shell logs
+`switch user failed` and you stay in your session, still locked
+(`crates/shell-gtk/src/user_switch.rs`).
 
 ## Logs
 

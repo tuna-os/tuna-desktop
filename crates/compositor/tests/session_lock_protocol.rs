@@ -1,5 +1,6 @@
 //! Real ext-session-lock clients; runtime PID/PAM policy is tested separately.
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
+use smithay::reexports::wayland_server::Resource;
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 use tuna_compositor::TestCompositor;
@@ -15,12 +16,20 @@ use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_surface_v1::{self, ExtSessionLockSurfaceV1},
     ext_session_lock_v1::{self, ExtSessionLockV1},
 };
+use wayland_protocols::wp::presentation_time::client::{
+    wp_presentation::WpPresentation,
+    wp_presentation_feedback::{self, WpPresentationFeedback},
+};
 
 #[derive(Default)]
 struct Client {
     globals: HashMap<String, (u32, u32)>,
+    /// Every wl_output global name, in announcement order.
+    outputs: Vec<u32>,
     events: Vec<(u32, bool)>,
     configured: Vec<(u32, u32)>,
+    /// Presentation feedback by tag: Some(seq) presented, None discarded.
+    presented: HashMap<u32, Option<u64>>,
 }
 impl Dispatch<WlRegistry, ()> for Client {
     fn event(
@@ -37,6 +46,9 @@ impl Dispatch<WlRegistry, ()> for Client {
             version,
         } = event
         {
+            if interface == "wl_output" {
+                state.outputs.push(name);
+            }
             state.globals.insert(interface, (name, version));
         }
     }
@@ -77,10 +89,32 @@ impl Dispatch<ExtSessionLockSurfaceV1, ()> for Client {
         }
     }
 }
+impl Dispatch<WpPresentationFeedback, u32> for Client {
+    fn event(
+        state: &mut Self,
+        _: &WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        tag: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wp_presentation_feedback::Event::Presented { seq_hi, seq_lo, .. } => {
+                let seq = (u64::from(seq_hi) << 32) | u64::from(seq_lo);
+                state.presented.insert(*tag, Some(seq));
+            }
+            wp_presentation_feedback::Event::Discarded => {
+                state.presented.insert(*tag, None);
+            }
+            _ => {}
+        }
+    }
+}
 wayland_client::delegate_noop!(Client: ignore WlCompositor);
 wayland_client::delegate_noop!(Client: ignore WlOutput);
 wayland_client::delegate_noop!(Client: ignore WlSurface);
 wayland_client::delegate_noop!(Client: ignore ExtSessionLockManagerV1);
+wayland_client::delegate_noop!(Client: ignore WpPresentation);
 
 struct Peer {
     conn: Connection,
@@ -371,4 +405,309 @@ fn unapproved_release_is_a_protocol_error_without_clearing_the_owner() {
     assert_eq!(comp.state.lock_surface_for("fixture").unwrap(), original);
     assert_eq!(comp.state.lock_surfaces(), vec![original]);
     assert!(!comp.state.take_client_unlock());
+}
+
+fn read_errors(peer: &mut Peer) -> Option<wayland_client::backend::protocol::ProtocolError> {
+    let _ = peer.queue.flush();
+    if let Some(guard) = peer.queue.prepare_read() {
+        let _ = guard.read();
+    }
+    let _ = peer.queue.dispatch_pending(&mut peer.client);
+    peer.conn.protocol_error()
+}
+
+#[test]
+fn a_finished_lock_does_not_reserve_its_output_for_the_next_lock() {
+    // The shell creates lock surfaces before Locked (GTK does). If that
+    // first request is refused (lockdown policy) and the shell later
+    // locks again with its same wl_output, the retry must work: a stale
+    // reservation would be a duplicate_output error, disconnecting the
+    // whole shell.
+    let mut comp = compositor();
+    let mut peer = connect(&mut comp);
+    let manager: ExtSessionLockManagerV1 = peer.bind(1);
+    let compositor: WlCompositor = peer.bind(6);
+    let output: WlOutput = peer.bind(4);
+    let first = manager.lock(&peer.queue.handle(), 30);
+    let first_surface = compositor.create_surface(&peer.queue.handle(), ());
+    let first_role = first.get_lock_surface(&first_surface, &output, &peer.queue.handle(), ());
+    pump(&mut comp, &mut peer);
+    let pending = comp.state.take_lock_request().unwrap().0;
+    comp.state.resolve_lock_request(pending, false);
+    pump(&mut comp, &mut peer);
+    assert_eq!(peer.client.events, vec![(30, false)]);
+    first_role.destroy();
+    first_surface.destroy();
+    first.destroy();
+
+    let second = manager.lock(&peer.queue.handle(), 31);
+    let surface = compositor.create_surface(&peer.queue.handle(), ());
+    let _role = second.get_lock_surface(&surface, &output, &peer.queue.handle(), ());
+    pump(&mut comp, &mut peer);
+    assert!(
+        read_errors(&mut peer).is_none(),
+        "retry must not be a protocol error"
+    );
+    let pending = comp.state.take_lock_request().unwrap().0;
+    comp.state.resolve_lock_request(pending, true);
+    pump(&mut comp, &mut peer);
+    assert_eq!(peer.client.events, vec![(30, false), (31, true)]);
+    assert_eq!(
+        comp.state
+            .lock_surface_for("fixture")
+            .as_ref()
+            .map(|s| s.id().protocol_id()),
+        Some(surface.id().protocol_id())
+    );
+}
+
+#[test]
+fn a_superseded_pending_lock_does_not_reserve_its_output_for_its_replacement() {
+    // Two lock triggers in quick succession (idle, then Super+L): the
+    // second request finishes the first, and the replacement's lock
+    // surface for the same output must be accepted.
+    let mut comp = compositor();
+    let mut peer = connect(&mut comp);
+    let manager: ExtSessionLockManagerV1 = peer.bind(1);
+    let compositor: WlCompositor = peer.bind(6);
+    let output: WlOutput = peer.bind(4);
+    let first = manager.lock(&peer.queue.handle(), 40);
+    let first_surface = compositor.create_surface(&peer.queue.handle(), ());
+    let _first_role = first.get_lock_surface(&first_surface, &output, &peer.queue.handle(), ());
+    pump(&mut comp, &mut peer);
+    let second = manager.lock(&peer.queue.handle(), 41);
+    pump(&mut comp, &mut peer);
+    assert_eq!(peer.client.events, vec![(40, false)]);
+    let surface = compositor.create_surface(&peer.queue.handle(), ());
+    let _role = second.get_lock_surface(&surface, &output, &peer.queue.handle(), ());
+    pump(&mut comp, &mut peer);
+    assert!(read_errors(&mut peer).is_none());
+    let pending = comp.state.take_lock_request().unwrap().0;
+    comp.state.resolve_lock_request(pending, true);
+    pump(&mut comp, &mut peer);
+    assert_eq!(peer.client.events, vec![(40, false), (41, true)]);
+    assert_eq!(comp.state.lock_surfaces().len(), 1);
+    assert_eq!(
+        comp.state
+            .lock_surface_for("fixture")
+            .as_ref()
+            .map(|s| s.id().protocol_id()),
+        Some(surface.id().protocol_id())
+    );
+}
+
+#[test]
+fn one_lock_object_cannot_cover_one_output_twice() {
+    // The per-lock duplicate_output rule still holds: two curtains for
+    // one output would leave the compositor guessing which to show.
+    let mut comp = compositor();
+    let mut peer = connect(&mut comp);
+    let manager: ExtSessionLockManagerV1 = peer.bind(1);
+    let compositor: WlCompositor = peer.bind(6);
+    let output: WlOutput = peer.bind(4);
+    let lock = manager.lock(&peer.queue.handle(), 50);
+    let first = compositor.create_surface(&peer.queue.handle(), ());
+    let _first_role = lock.get_lock_surface(&first, &output, &peer.queue.handle(), ());
+    let second = compositor.create_surface(&peer.queue.handle(), ());
+    let _second_role = lock.get_lock_surface(&second, &output, &peer.queue.handle(), ());
+    peer.queue.flush().unwrap();
+    for _ in 0..10 {
+        comp.pump();
+    }
+    let error = read_errors(&mut peer).expect("duplicate_output");
+    assert_eq!(error.code, 3, "ext_session_lock_v1.error.duplicate_output");
+    assert!(!comp.state.has_lock_surfaces());
+}
+
+fn add_output(comp: &mut TestCompositor, name: &str, size: (i32, i32), scale: f64) {
+    let output = Output::new(
+        name.into(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Tuna Desktop".into(),
+            model: "Test".into(),
+        },
+    );
+    output.change_current_state(
+        Some(Mode {
+            size: size.into(),
+            refresh: 60_000,
+        }),
+        None,
+        Some(Scale::Fractional(scale)),
+        None,
+    );
+    output.create_global::<tuna_compositor::State>(&comp.display.handle());
+    let logical = (
+        (f64::from(size.0) / scale).round() as i32,
+        (f64::from(size.1) / scale).round() as i32,
+    );
+    comp.state
+        .add_output(name, Some(output), logical.0, logical.1);
+}
+
+#[test]
+fn every_output_gets_its_own_curtain_sized_to_that_output() {
+    // A lock surface smaller than its output would leave session
+    // content visible around it, and one keyed to the wrong output
+    // would leave another monitor uncovered.
+    let mut comp = compositor();
+    add_output(&mut comp, "second", (3840, 2160), 2.0);
+    let mut peer = connect(&mut comp);
+    assert_eq!(peer.client.outputs.len(), 2);
+    let manager: ExtSessionLockManagerV1 = peer.bind(1);
+    let compositor: WlCompositor = peer.bind(6);
+    let outputs: Vec<WlOutput> = peer
+        .client
+        .outputs
+        .clone()
+        .into_iter()
+        .map(|name| peer.registry.bind(name, 4, &peer.queue.handle(), ()))
+        .collect();
+    pump(&mut comp, &mut peer);
+    let lock = manager.lock(&peer.queue.handle(), 60);
+    let surfaces: Vec<WlSurface> = outputs
+        .iter()
+        .map(|output| {
+            let surface = compositor.create_surface(&peer.queue.handle(), ());
+            let role = lock.get_lock_surface(&surface, output, &peer.queue.handle(), ());
+            std::mem::forget(role);
+            surface
+        })
+        .collect();
+    pump(&mut comp, &mut peer);
+    let pending = comp.state.take_lock_request().unwrap().0;
+    comp.state.resolve_lock_request(pending, true);
+    pump(&mut comp, &mut peer);
+    assert!(read_errors(&mut peer).is_none());
+    // Logical size: physical mode over the output's own scale.
+    let mut configured = peer.client.configured.clone();
+    configured.sort();
+    assert_eq!(configured, vec![(1000, 600), (1920, 1080)]);
+    let fixture = comp.state.lock_surface_for("fixture").unwrap();
+    let second = comp.state.lock_surface_for("second").unwrap();
+    assert_ne!(fixture, second);
+    let ids: Vec<u32> = surfaces.iter().map(|s| s.id().protocol_id()).collect();
+    assert!(ids.contains(&fixture.id().protocol_id()));
+    assert!(ids.contains(&second.id().protocol_id()));
+    assert_eq!(comp.state.lock_surfaces().len(), 2);
+}
+
+#[test]
+fn destroying_a_granted_lock_without_unlock_is_an_error_and_never_unlocks() {
+    // ext-session-lock: a client that crashes or misbehaves while the
+    // session is locked must leave it locked (the compositor keeps its
+    // own curtain up), never reveal the session.
+    let mut comp = compositor();
+    let mut peer = connect(&mut comp);
+    let (lock, _role, _surface) = pending_surface(&mut comp, &mut peer, 70);
+    let pending = comp.state.take_lock_request().unwrap().0;
+    comp.state.resolve_lock_request(pending, true);
+    pump(&mut comp, &mut peer);
+    assert_eq!(peer.client.events, vec![(70, true)]);
+    lock.destroy();
+    peer.queue.flush().unwrap();
+    for _ in 0..10 {
+        comp.pump();
+    }
+    let error = read_errors(&mut peer).expect("invalid_destroy");
+    assert_eq!(error.code, 0, "ext_session_lock_v1.error.invalid_destroy");
+    for _ in 0..10 {
+        comp.pump();
+    }
+    assert!(
+        !comp.state.take_client_unlock(),
+        "a destroyed lock is not an unlock request"
+    );
+    assert!(comp.state.take_lock_request().is_none());
+}
+
+#[test]
+fn unlock_before_locked_is_rejected_and_requests_nothing() {
+    let mut comp = compositor();
+    let mut peer = connect(&mut comp);
+    let manager: ExtSessionLockManagerV1 = peer.bind(1);
+    let lock = manager.lock(&peer.queue.handle(), 80);
+    pump(&mut comp, &mut peer);
+    // Still pending: the runtime has not decided.
+    lock.unlock_and_destroy();
+    peer.queue.flush().unwrap();
+    for _ in 0..10 {
+        comp.pump();
+    }
+    let error = read_errors(&mut peer).expect("invalid_unlock");
+    assert_eq!(error.code, 1, "ext_session_lock_v1.error.invalid_unlock");
+    assert!(!comp.state.take_client_unlock());
+    assert!(!comp.state.has_lock_surfaces());
+}
+
+#[test]
+fn relocking_after_unlock_needs_a_fresh_approval() {
+    // The owner of a previous lock holds no standing grant: its next
+    // lock and lock surfaces stay hidden until the runtime approves
+    // that request too.
+    let mut comp = compositor();
+    let mut peer = connect(&mut comp);
+    let (lock, role, surface) = pending_surface(&mut comp, &mut peer, 90);
+    let pending = comp.state.take_lock_request().unwrap().0;
+    comp.state.resolve_lock_request(pending, true);
+    pump(&mut comp, &mut peer);
+    lock.unlock_and_destroy();
+    role.destroy();
+    surface.destroy();
+    pump(&mut comp, &mut peer);
+    assert!(comp.state.take_client_unlock());
+    assert!(!comp.state.has_lock_surfaces());
+
+    let (_lock, _role, surface) = pending_surface(&mut comp, &mut peer, 91);
+    assert!(
+        read_errors(&mut peer).is_none(),
+        "same output, new lock object"
+    );
+    assert!(
+        !comp.state.has_lock_surfaces(),
+        "the previous approval does not carry over"
+    );
+    assert_eq!(peer.client.events, vec![(90, true)]);
+    let pending = comp.state.take_lock_request().unwrap().0;
+    comp.state.resolve_lock_request(pending, true);
+    pump(&mut comp, &mut peer);
+    assert_eq!(peer.client.events, vec![(90, true), (91, true)]);
+    assert_eq!(
+        comp.state
+            .lock_surface_for("fixture")
+            .map(|s| s.id().protocol_id()),
+        Some(surface.id().protocol_id())
+    );
+    assert!(
+        !comp.state.take_client_unlock(),
+        "the earlier unlock request was consumed and the new grant reset it"
+    );
+}
+
+#[test]
+fn only_the_approved_lock_screen_is_presented_while_locked() {
+    // Frames drawn while locked show the lock surface and nothing else:
+    // a pending (unapproved) curtain is not drawn, so its presentation
+    // feedback must not claim it reached the screen.
+    let mut comp = compositor();
+    let manager = comp.window_manager();
+    let mut peer = connect(&mut comp);
+    let presentation: WpPresentation = peer.bind(2);
+    let (_lock, _role, surface) = pending_surface(&mut comp, &mut peer, 100);
+    let _feedback = presentation.feedback(&surface, &peer.queue.handle(), 1);
+    surface.commit();
+    pump(&mut comp, &mut peer);
+    assert!(read_errors(&mut peer).is_none());
+    tuna_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, true, 1);
+    pump(&mut comp, &mut peer);
+    assert_eq!(peer.client.presented.get(&1), None, "not drawn yet");
+
+    let pending = comp.state.take_lock_request().unwrap().0;
+    comp.state.resolve_lock_request(pending, true);
+    pump(&mut comp, &mut peer);
+    tuna_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, true, 2);
+    pump(&mut comp, &mut peer);
+    assert_eq!(peer.client.presented.get(&1), Some(&Some(2)));
 }

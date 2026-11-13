@@ -17,9 +17,14 @@ use wayland_client::{
         wl_compositor::WlCompositor,
         wl_registry::{self, WlRegistry},
         wl_seat::WlSeat,
+        wl_subcompositor::WlSubcompositor,
+        wl_subsurface::WlSubsurface,
         wl_surface::WlSurface,
     },
     Connection, Dispatch, EventQueue, QueueHandle,
+};
+use wayland_protocols::wp::commit_timing::v1::client::{
+    wp_commit_timer_v1::WpCommitTimerV1, wp_commit_timing_manager_v1::WpCommitTimingManagerV1,
 };
 use wayland_protocols::wp::fifo::v1::client::{
     wp_fifo_manager_v1::WpFifoManagerV1, wp_fifo_v1::WpFifoV1,
@@ -64,6 +69,8 @@ struct Client {
     globals: HashMap<String, (u32, u32)>,
     clock_id: Option<u32>,
     fates: HashMap<u32, Fate>,
+    /// Presented feedback's (tv_sec, tv_nsec, flags), by tag.
+    presented_at: HashMap<u32, (u64, u32, u32)>,
     inhibitor_active: Option<bool>,
     handle: Option<String>,
 }
@@ -173,10 +180,19 @@ impl Dispatch<WpPresentationFeedback, u32> for Client {
                 refresh,
                 seq_hi,
                 seq_lo,
-                ..
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+                flags,
             } => {
                 let seq = (u64::from(seq_hi) << 32) | u64::from(seq_lo);
                 state.fates.insert(*tag, Fate::Presented { seq, refresh });
+                let sec = (u64::from(tv_sec_hi) << 32) | u64::from(tv_sec_lo);
+                let flags = match flags {
+                    wayland_client::WEnum::Value(kind) => kind.bits(),
+                    wayland_client::WEnum::Unknown(bits) => bits,
+                };
+                state.presented_at.insert(*tag, (sec, tv_nsec, flags));
             }
             wp_presentation_feedback::Event::Discarded => {
                 state.fates.insert(*tag, Fate::Discarded);
@@ -228,6 +244,10 @@ wayland_client::delegate_noop!(Client: ignore WlSeat);
 wayland_client::delegate_noop!(Client: ignore XdgToplevel);
 wayland_client::delegate_noop!(Client: ignore WpFifoManagerV1);
 wayland_client::delegate_noop!(Client: ignore WpFifoV1);
+wayland_client::delegate_noop!(Client: ignore WpCommitTimingManagerV1);
+wayland_client::delegate_noop!(Client: ignore WpCommitTimerV1);
+wayland_client::delegate_noop!(Client: ignore WlSubcompositor);
+wayland_client::delegate_noop!(Client: ignore WlSubsurface);
 wayland_client::delegate_noop!(Client: ignore ZwpKeyboardShortcutsInhibitManagerV1);
 wayland_client::delegate_noop!(Client: ignore XdgSystemBellV1);
 wayland_client::delegate_noop!(Client: ignore XdgWmDialogV1);
@@ -954,4 +974,337 @@ fn child_mapping_and_closing_cannot_restore_hidden_parent() {
     assert!(manager.is_minimized(parent_id));
     assert!(manager.visible_windows().is_empty());
     assert_eq!(manager.model().focused(), None);
+}
+
+// --- Frame timing (#728): commit-timing, fifo while hidden, presentation
+// timestamps. ---
+
+use smithay::utils::{Monotonic, Time};
+use std::time::Duration;
+use tuna_compositor::frame_timing::{frame_roots, pending_frame_work, present_nested_frame};
+
+const REFRESH_60HZ: Duration = Duration::from_nanos(16_666_666);
+
+fn set_timestamp(timer: &WpCommitTimerV1, at: Duration) {
+    let secs = at.as_secs();
+    timer.set_timestamp((secs >> 32) as u32, secs as u32, at.subsec_nanos());
+}
+
+fn now(comp: &TestCompositor) -> Duration {
+    Duration::from(comp.state.presentation_now())
+}
+
+/// Advance a refresh cycle at `at` on every frame root, as a page flip
+/// with that vblank time would.
+fn refresh_at(comp: &mut TestCompositor, manager: &WindowManager, at: Duration) {
+    let roots = frame_roots(&comp.state, manager);
+    comp.state
+        .refresh_cycle(&roots, Time::<Monotonic>::from(at), REFRESH_60HZ);
+}
+
+fn protocol_error(peer: &mut Peer) -> Option<u32> {
+    let _ = peer.queue.flush();
+    if let Some(guard) = peer.queue.prepare_read() {
+        let _ = guard.read();
+    }
+    let _ = peer.queue.dispatch_pending(&mut peer.client);
+    peer._conn.protocol_error().map(|error| error.code)
+}
+
+/// The buffer scale the compositor has applied for the only window.
+fn applied_scale(comp: &TestCompositor, manager: &WindowManager) -> i32 {
+    let roots = frame_roots(&comp.state, manager);
+    assert_eq!(roots.len(), 1);
+    smithay::wayland::compositor::with_states(&roots[0], |states| {
+        states
+            .cached_state
+            .get::<smithay::wayland::compositor::SurfaceAttributes>()
+            .current()
+            .buffer_scale
+    })
+}
+
+#[test]
+fn a_timed_update_waits_for_the_refresh_whose_presentation_reaches_it() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let presentation: WpPresentation = peer.bind(2);
+    let timing: WpCommitTimingManagerV1 = peer.bind(1);
+    let (surface, _toplevel) = window(&mut peer, "player");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let timer = timing.get_timer(&surface, &peer.qh(), ());
+    let target = now(&comp) + Duration::from_secs(30);
+    set_timestamp(&timer, target);
+    let _feedback = presentation.feedback(&surface, &peer.qh(), 10);
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+
+    // Frames before the target leave the update held, and the held
+    // timer keeps refresh work owed so the compositor keeps cycling.
+    present_nested_frame(&mut comp.state, &manager, false, 1);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(peer.client.fates.get(&10), None, "not before its time");
+    assert!(pending_frame_work(&frame_roots(&comp.state, &manager)));
+
+    // A refresh whose next presentation lands 1 ns short: still held.
+    refresh_at(
+        &mut comp,
+        &manager,
+        target - REFRESH_60HZ - Duration::from_nanos(1),
+    );
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    present_nested_frame(&mut comp.state, &manager, false, 2);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(peer.client.fates.get(&10), None);
+
+    // The refresh whose next presentation is exactly the target
+    // releases it; the following frame shows it.
+    refresh_at(&mut comp, &manager, target - REFRESH_60HZ);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    present_nested_frame(&mut comp.state, &manager, false, 3);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        peer.client.fates.get(&10),
+        Some(&Fate::Presented {
+            seq: 3,
+            refresh: 16_666_666
+        })
+    );
+    assert!(!pending_frame_work(&frame_roots(&comp.state, &manager)));
+}
+
+#[test]
+fn a_timestamp_in_the_past_applies_on_the_very_next_refresh() {
+    // Zero is the earliest representable time: the update must not be
+    // held, or wrap into the far future.
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let presentation: WpPresentation = peer.bind(2);
+    let timing: WpCommitTimingManagerV1 = peer.bind(1);
+    let (surface, _toplevel) = window(&mut peer, "late");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let timer = timing.get_timer(&surface, &peer.qh(), ());
+    set_timestamp(&timer, Duration::ZERO);
+    surface.set_buffer_scale(2);
+    let _feedback = presentation.feedback(&surface, &peer.qh(), 11);
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    present_nested_frame(&mut comp.state, &manager, false, 1);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(applied_scale(&comp, &manager), 2, "released by refresh 1");
+    present_nested_frame(&mut comp.state, &manager, false, 2);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(matches!(
+        peer.client.fates.get(&11),
+        Some(Fate::Presented { seq: 2, .. })
+    ));
+}
+
+#[test]
+fn timed_updates_apply_in_commit_order_not_timestamp_order() {
+    // A later commit with an earlier timestamp must not overtake the
+    // update queued before it: content updates apply in order.
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let presentation: WpPresentation = peer.bind(2);
+    let timing: WpCommitTimingManagerV1 = peer.bind(1);
+    let (surface, _toplevel) = window(&mut peer, "ordered");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let timer = timing.get_timer(&surface, &peer.qh(), ());
+    let base = now(&comp);
+    set_timestamp(&timer, base + Duration::from_secs(20));
+    surface.set_buffer_scale(2);
+    let _first = presentation.feedback(&surface, &peer.qh(), 20);
+    surface.commit();
+    set_timestamp(&timer, base + Duration::from_secs(10));
+    surface.set_buffer_scale(3);
+    let _second = presentation.feedback(&surface, &peer.qh(), 21);
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(protocol_error(&mut peer), None);
+
+    refresh_at(&mut comp, &manager, base + Duration::from_secs(15));
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        applied_scale(&comp, &manager),
+        1,
+        "the second update's time came, but the first is still due later"
+    );
+
+    refresh_at(&mut comp, &manager, base + Duration::from_secs(25));
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(applied_scale(&comp, &manager), 3, "both applied, in order");
+    present_nested_frame(&mut comp.state, &manager, false, 1);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        peer.client.fates.get(&20),
+        Some(&Fate::Discarded),
+        "superseded before it was ever shown"
+    );
+    assert!(matches!(
+        peer.client.fates.get(&21),
+        Some(Fate::Presented { seq: 1, .. })
+    ));
+}
+
+#[test]
+fn a_timestamp_with_a_whole_second_of_nanoseconds_is_invalid() {
+    // commit-timing-v1: invalid tv_nsec is an invalid_timestamp error
+    // (Mutter: nsec > 999999999). Accepting it would order the update
+    // up to four seconds away from what the client meant.
+    let (mut comp, mut manager) = compositor();
+    for (nsec, error) in [
+        (999_999_999, None),
+        (1_000_000_000, Some(0)),
+        (u32::MAX, Some(0)),
+    ] {
+        let mut peer = connect(&mut comp, &mut manager);
+        let timing: WpCommitTimingManagerV1 = peer.bind(1);
+        let (surface, _toplevel) = window(&mut peer, "bad clock");
+        pump(&mut comp, &mut manager, &mut [&mut peer]);
+        let timer = timing.get_timer(&surface, &peer.qh(), ());
+        timer.set_timestamp(0, 1, nsec);
+        surface.commit();
+        peer.queue.flush().unwrap();
+        for _ in 0..ROUNDS {
+            comp.pump();
+        }
+        assert_eq!(protocol_error(&mut peer), error, "tv_nsec {nsec}");
+    }
+}
+
+#[test]
+fn fifo_keeps_advancing_behind_the_lock_screen() {
+    // While locked no window is drawn, yet a FIFO client (a game, a
+    // Vulkan FIFO swapchain) must keep making progress instead of
+    // blocking until unlock.
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let presentation: WpPresentation = peer.bind(2);
+    let fifo_manager: WpFifoManagerV1 = peer.bind(1);
+    let (surface, _toplevel) = window(&mut peer, "game");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let fifo = fifo_manager.get_fifo(&surface, &peer.qh(), ());
+    fifo.set_barrier();
+    surface.commit();
+    fifo.wait_barrier();
+    surface.set_buffer_scale(2);
+    let _feedback = presentation.feedback(&surface, &peer.qh(), 30);
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(applied_scale(&comp, &manager), 1, "held behind the barrier");
+
+    present_nested_frame(&mut comp.state, &manager, true, 1);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(applied_scale(&comp, &manager), 2, "released while locked");
+    assert_eq!(
+        peer.client.fates.get(&30),
+        None,
+        "applied but not shown: its feedback waits for a real presentation"
+    );
+
+    present_nested_frame(&mut comp.state, &manager, false, 2);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(matches!(
+        peer.client.fates.get(&30),
+        Some(Fate::Presented { seq: 2, .. })
+    ));
+}
+
+#[test]
+fn nested_presentation_is_timed_on_the_monotonic_clock_without_hardware_claims() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let presentation: WpPresentation = peer.bind(2);
+    let (surface, _toplevel) = window(&mut peer, "video");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let _feedback = presentation.feedback(&surface, &peer.qh(), 40);
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let monotonic = || {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: a valid timespec out-pointer.
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) },
+            0
+        );
+        Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    };
+    let before = monotonic();
+    // Beyond 32 bits, as a long-running vblank counter gets.
+    let seq = (1u64 << 32) + 7;
+    present_nested_frame(&mut comp.state, &manager, false, seq);
+    let after = monotonic();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        peer.client.fates.get(&40),
+        Some(&Fate::Presented {
+            seq,
+            refresh: 16_666_666
+        }),
+        "the high sequence word survives"
+    );
+    let (sec, nsec, flags) = peer.client.presented_at[&40];
+    assert!(nsec < 1_000_000_000, "normalized timespec");
+    let at = Duration::new(sec, nsec);
+    assert!(
+        before <= at && at <= after,
+        "{at:?} on CLOCK_MONOTONIC between {before:?} and {after:?}"
+    );
+    assert_eq!(
+        flags, 0,
+        "a host swap is neither vsync'd, hardware-clocked nor hardware-completed"
+    );
+}
+
+#[test]
+fn a_superseded_feedback_is_discarded_instead_of_left_waiting() {
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let presentation: WpPresentation = peer.bind(2);
+    let (surface, _toplevel) = window(&mut peer, "fast");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let _first = presentation.feedback(&surface, &peer.qh(), 50);
+    surface.commit();
+    let _second = presentation.feedback(&surface, &peer.qh(), 51);
+    surface.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    present_nested_frame(&mut comp.state, &manager, false, 9);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(peer.client.fates.get(&50), Some(&Fate::Discarded));
+    assert!(matches!(
+        peer.client.fates.get(&51),
+        Some(Fate::Presented { seq: 9, .. })
+    ));
+}
+
+#[test]
+fn a_subsurface_feedback_is_presented_with_its_parent() {
+    // Video players put the video in a subsurface: its feedback must
+    // be paid when the window that contains it is drawn.
+    let (mut comp, mut manager) = compositor();
+    let mut peer = connect(&mut comp, &mut manager);
+    let presentation: WpPresentation = peer.bind(2);
+    let subcompositor: WlSubcompositor = peer.bind(1);
+    let compositor: WlCompositor = peer.bind(6);
+    let (parent, _toplevel) = window(&mut peer, "mpv");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let child = compositor.create_surface(&peer.qh(), ());
+    let _subsurface = subcompositor.get_subsurface(&child, &parent, &peer.qh(), ());
+    let _feedback = presentation.feedback(&child, &peer.qh(), 60);
+    child.commit();
+    parent.commit();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    present_nested_frame(&mut comp.state, &manager, true, 1);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(peer.client.fates.get(&60), None, "not drawn while locked");
+    present_nested_frame(&mut comp.state, &manager, false, 2);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(matches!(
+        peer.client.fates.get(&60),
+        Some(Fate::Presented { seq: 2, .. })
+    ));
 }
