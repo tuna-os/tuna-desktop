@@ -239,9 +239,10 @@ values.
 The comparison runs in the `Marlin performance samples` workflow
 (`.github/workflows/performance-baseline.yml`):
 
-1. It builds one Marlin image upgraded to GNOME Shell 51.0 from a pinned
-   Arch Linux Archive snapshot (`packaging/marlin/perf/Containerfile.baseline`),
-   then installs a Tuna Desktop package from a trusted main CI run on top.
+1. It builds one image from a pinned Marlin platform digest, synced to GNOME
+   Shell 51.0 from a pinned Arch Linux Archive snapshot
+   (`packaging/marlin/perf/Containerfile.baseline`), then installs a Tuna
+   Desktop package from a trusted main CI run on top.
 2. `scripts/tuna-perf-profile-pairs diagnostic`, then `stock`, run three
    alternating GNOME/Tuna pairs per profile. Each session uses
    `scripts/tuna-vm-perf` in the same QEMU/KVM profile (6 GiB, four vCPUs,

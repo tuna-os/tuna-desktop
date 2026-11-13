@@ -81,7 +81,9 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - name: Validate compact disk export request
         env:
           EXPORT_ONLY: ${{ inputs.export_only }}
@@ -177,6 +179,10 @@ jobs:
           python3 scripts/lib/tuna-perf-payload.py copy --package tuna.pkg.tar.zst --report perf-artifacts/package-payload.json --out perf-artifacts/package-copy.json
           package_sha=$(jq -r '.package.sha256' perf-artifacts/package-payload.json)
           sha256sum tuna.pkg.tar.zst > perf-artifacts/package.sha256
+          # The reference base is the one platform manifest the recipe pins; the
+          # moving Marlin tag outruns the pinned Arch snapshot (run 43009988803).
+          base_image=$(sed -n 's/^ARG BASE_IMAGE=//p' packaging/marlin/perf/Containerfile.baseline)
+          [[ "$base_image" =~ ^ghcr\.io/tuna-os/marlin@sha256:[0-9a-f]{64}$ ]] || { echo 'performance reference base is not one pinned platform digest' >&2; exit 2; }
           # One coherent distribution upgrade supplies BOTH explicit profiles.
           sudo podman build -f packaging/marlin/perf/Containerfile.baseline --target gnome-baseline -t localhost/marlin-gnome51-coherent:base . 2>&1 | tee perf-artifacts/coherent-build.log
           coherent_image=$(sudo podman inspect localhost/marlin-gnome51-coherent:base --format '{{.Id}}')
@@ -221,7 +227,8 @@ jobs:
             python3 scripts/lib/tuna-perf-payload.py runtime --runtime "$profile_artifacts/runtime-versions" --report perf-artifacts/package-payload.json --out "$profile_artifacts/installed-runtime.json"
             sudo podman rm "$container"
             trap - EXIT
-            sudo podman inspect ghcr.io/tuna-os/marlin:gnome --format '{{.Digest}}' | tee base-digest
+            sudo podman inspect "$base_image" --format '{{.Digest}}' | tee base-digest
+            [[ "$(cat base-digest)" == "${base_image#*@}" ]] || { echo 'built reference base differs from the pinned platform digest' >&2; exit 2; }
             sudo podman run --rm "localhost/marlin-tuna-preview:$profile" gnome-shell --version | tee "$profile_artifacts/gnome-version"
             grep -Eq '^GNOME Shell 51([. ]|$)' "$profile_artifacts/gnome-version"
             sudo podman run --rm "localhost/marlin-tuna-preview:$profile" pacman -Q | tee "$profile_artifacts/baseline-packages.txt"
@@ -248,7 +255,7 @@ jobs:
           PYKEY
           scripts/tuna-benchmark-disk-export --profile "$EXPORT_DISK" --ssh-public-key-file /mnt/perf/benchmark-ssh-key.pub
       - name: Upload compact benchmark disk and provenance
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7.0.2
         if: ${{ always() && (inputs.export_disk == 'stock' || inputs.export_disk == 'diagnostic') }}
         with:
           name: marlin-benchmark-disk-${{ inputs.export_disk }}
@@ -277,7 +284,7 @@ jobs:
           if [[ "$ENFORCE" != true ]]; then mode=(--report-only); fi
           scripts/tuna-perf-gate check --artifacts perf-artifacts --out perf-artifacts/perf-gate.json --markdown "$GITHUB_STEP_SUMMARY" "${mode[@]}"
       - name: Upload performance artifacts
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
           name: marlin-performance
