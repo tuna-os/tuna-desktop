@@ -123,6 +123,8 @@ MAX_THREADS_PER_SAMPLE = 128
 # smaps_rollup fields recorded beside Pss and Rss, and their sample keys.
 MEMORY_BREAKDOWN = (("Pss_Anon", "pss_anon_kib"), ("Pss_File", "pss_file_kib"),
                     ("Pss_Shmem", "pss_shmem_kib"), ("Private_Dirty", "private_dirty_kib"))
+# read_process() fields only released_by_exit() reads; samples leave them out.
+EXIT_RACE_FIELDS = ("stat_flags", "status_vmrss_present", "status_vmsize_present")
 
 
 def bounded_text(path, limit):
@@ -399,6 +401,17 @@ def sample(uid, proc=Path("/proc"), observer=None, thread_diagnostics=False):
     drm_errors = [{"pid": row["pid"], "error": error} for row in rows for error in row["drm_errors"]]
     gpu = {"clients": drm, "errors": drm_errors,
            "status": "incomplete" if drm_errors else ("available" if any(c["memory_bytes"] for c in drm) else "unavailable")}
+    # Every record stays under the host's observer bound
+    # (perf_budget.OBSERVER_RECORD_BYTES) with GNOME's ~90 session processes
+    # and the memory breakdown: the exit-race fields serve only
+    # released_by_exit() above, and each process's DRM errors are in
+    # drm_memory with its pid. A process without DRM clients lists none.
+    for row in rows:
+        for key in EXIT_RACE_FIELDS:
+            del row[key]
+        del row["drm_errors"]
+        if not row["drm_clients"]:
+            del row["drm_clients"]
     return {"uid": uid, "processes": rows, "unreadable": errors, "drm_memory": gpu,
             "failure_evidence": failures, "failure_evidence_overflow": failure_overflow,
             "pss_kib": sum(row["pss_kib"] for row in rows),

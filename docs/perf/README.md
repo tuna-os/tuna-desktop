@@ -197,7 +197,12 @@ Identities also retain unsigned 32-bit `stat_flags`, nonnegative signed 32-bit
 `stat_num_threads`, and numeric `status_vmrss_present`/`status_vmsize_present`
 (1 for an exact field label, 0 for absent). Malformed/out-of-range stat metadata
 is null; status presence is null for records exceeding 16,384 characters.
-These reuse the existing proc reads without changing their input limits.
+These reuse the existing proc reads without changing their input limits. Sample
+process rows leave the three exit-race fields out, carry `drm_clients` only for
+processes that hold DRM clients, and list DRM read errors once in `drm_memory`
+with their PID. GNOME's ~90 session processes, with the PSS breakdown, then fit
+the host's 32 KiB observer-record bound (`perf_budget.OBSERVER_RECORD_BYTES`).
+Stock run 43449826443 refused every GNOME session at 33,149 bytes.
 Presence does not validate field values, and no memory fallback is derived
 from them. One combination does classify an exit: when `smaps_rollup` fails
 with ESRCH and the re-read shows the same UID and start ticks with `PF_EXITING`
