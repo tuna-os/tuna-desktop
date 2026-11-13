@@ -17,16 +17,10 @@ use tuna_compositor::runtime::NestedSession;
 const RETRY_ROUNDS: usize = 500;
 const RETRY_SLEEP: Duration = Duration::from_millis(5);
 
-/// Path of the sibling `tuna-compositor` binary: the test executable lives
-/// in `target/<profile>/deps/`, the binary in `target/<profile>/`.
-fn compositor_bin() -> std::path::PathBuf {
-    let mut dir = std::env::current_exe().expect("test executable path");
-    dir.pop();
-    if dir.file_name().is_some_and(|n| n == "deps") {
-        dir.pop();
-    }
-    dir.join("tuna-compositor")
-}
+/// The `tuna-compositor` binary Cargo built for this integration test. Its
+/// location relative to the test executable is not stable across Cargo
+/// releases (1.100 moved test executables into the build directory).
+const COMPOSITOR_BIN: &str = env!("CARGO_BIN_EXE_tuna-compositor");
 
 /// Keep real child launches independent of the invoking user's migration state.
 /// Retain the owner until the child exits so its private roots remain available.
@@ -86,13 +80,7 @@ fn launch_smoke_binds_private_socket_or_skips_without_backend() {
         .unwrap()
         .as_nanos();
     let socket_name = format!("tuna-test-{}-{nanos}", std::process::id());
-    let bin = compositor_bin();
-    assert!(
-        bin.is_file(),
-        "missing sibling binary {}; run `cargo build -p tuna-compositor --bins` first",
-        bin.display()
-    );
-    let mut command = Command::new(bin);
+    let mut command = Command::new(COMPOSITOR_BIN);
     let private_root = private_launch_env(&mut command);
     let mut child = command
         .args([
@@ -192,7 +180,7 @@ fn sighup_ends_the_session_through_teardown() {
         .unwrap()
         .as_nanos();
     let socket_name = format!("tuna-hup-{}-{nanos}", std::process::id());
-    let mut command = Command::new(compositor_bin());
+    let mut command = Command::new(COMPOSITOR_BIN);
     let private_root = private_launch_env(&mut command);
     let mut child = command
         .args([
