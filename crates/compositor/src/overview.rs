@@ -1390,13 +1390,15 @@ impl OverviewMotion {
         scene
     }
 
-    /// The overview as drawn this frame from its resting `base`.
+    /// The overview as drawn this frame from its resting `base`, on an
+    /// `output` whose work area starts `work_top` down.
     pub fn scene(
         &self,
         base: &OverviewLayout,
         drag: Option<(u64, Point<f64, Logical>)>,
         pointer: Point<f64, Logical>,
         output: Rectangle<i32, Logical>,
+        work_top: i32,
         windows: &[OverviewWindow],
     ) -> OverviewLayout {
         let mut scene = self.settled_scene(base, drag, pointer);
@@ -1412,7 +1414,7 @@ impl OverviewMotion {
         }
         let progress = self.progress.value();
         if progress < 1.0 {
-            return transition(&scene, progress, output, windows);
+            return transition(&scene, progress, output, work_top, windows);
         }
         scene
     }
@@ -1503,19 +1505,33 @@ fn lerp_rect(
 
 /// The overview part-way open (GNOME's transition): at drawn progress
 /// `p` (0 the desktop, 1 the overview) the active workspace card grows
-/// out of the whole output and each window on it glides from where it
-/// sits on the desktop into its preview. Neighbouring cards and the
-/// thumbnails slide and fade in with progress; hover growth waits for completion.
+/// out of the work area (`output` below `work_top`) and each window on
+/// it glides from where it sits on the desktop into its preview.
+/// Neighbouring cards and the thumbnails slide and fade in with
+/// progress; hover growth waits for completion.
+///
+/// The card shows the desktop below the bar, so it starts as that part
+/// of the output and its picture lines up with the desktop's at both
+/// ends: GNOME's hidden-state workspace box is the work area
+/// (`overviewControls.js` `_computeWorkspacesBoxForState`) and the
+/// workspace background is allocated to it
+/// (`shell-workspace-background.c`).
 pub fn transition(
     layout: &OverviewLayout,
     p: f64,
     output: Rectangle<i32, Logical>,
+    work_top: i32,
     windows: &[OverviewWindow],
 ) -> OverviewLayout {
     if p >= 1.0 {
         return layout.clone();
     }
     let p = p.max(0.0);
+    let top = work_top.clamp(0, (output.size.h - 1).max(0));
+    let work_area = Rectangle::new(
+        (output.loc.x, output.loc.y + top).into(),
+        (output.size.w, output.size.h - top).into(),
+    );
     let slide = |card: &WorkspaceCard, thumbnail: bool| {
         let mut start = card.rect;
         if thumbnail {
@@ -1535,7 +1551,7 @@ pub fn transition(
             .filter(|c| c.active || p > 0.0)
             .map(|c| WorkspaceCard {
                 rect: if c.active {
-                    lerp_rect(output, c.rect, p)
+                    lerp_rect(work_area, c.rect, p)
                 } else {
                     slide(c, false)
                 },
@@ -2319,7 +2335,7 @@ mod tests {
             assert!(layout.cards.iter().all(|card| card.workspace < 4));
             show_placeholder(&mut layout, 4);
             assert!(layout.placeholder.is_none());
-            assert!(!transition(&layout, 0.5, output(), &windows).allow_workspace_insertion);
+            assert!(!transition(&layout, 0.5, output(), 32, &windows).allow_workspace_insertion);
         }
         let single = layout_with_policy(output(), 24, &[0], 0, &[], false);
         assert_eq!(single.cards.len(), 1);
@@ -2539,19 +2555,24 @@ mod tests {
         let windows = [win(1, 0, 320, 182, 640, 420)];
         let open = layout(output(), 32, &[0], 0, &windows);
         let target = open.previews.iter().find(|p| p.active).copied().unwrap();
-        // Closed: the card is the whole output, the window where it sits.
-        let closed = transition(&open, 0.0, output(), &windows);
+        // Closed: the card is the work area (GNOME's hidden-state
+        // workspace box), so its picture of the desktop below the bar
+        // lies where the desktop shows it; the window where it sits.
+        let closed = transition(&open, 0.0, output(), 32, &windows);
         assert_eq!(closed.cards.len(), 1);
-        assert_eq!(closed.cards[0].rect, output());
+        assert_eq!(
+            closed.cards[0].rect,
+            Rectangle::new((0, 32).into(), (1280, 768).into())
+        );
         assert_eq!(closed.previews[0].rect, windows[0].geometry);
         assert!((closed.previews[0].scale - 1.0).abs() < 1e-9);
         // Half way: half way between.
-        let half = transition(&open, 0.5, output(), &windows);
+        let half = transition(&open, 0.5, output(), 32, &windows);
         let mid_x = (windows[0].geometry.loc.x + target.rect.loc.x) / 2;
         assert!((half.previews[0].rect.loc.x - mid_x).abs() <= 1);
         assert!(half.previews[0].scale < 1.0 && half.previews[0].scale > target.scale);
         // Open: exactly the overview.
-        assert_eq!(transition(&open, 1.0, output(), &windows), open);
+        assert_eq!(transition(&open, 1.0, output(), 32, &windows), open);
         assert!((ease_out_quad(0.5) - 0.75).abs() < 1e-9);
         assert_eq!(ease_out_quad(2.0), 1.0);
     }
@@ -2564,7 +2585,7 @@ mod tests {
             assert_eq!(card.settled, card.rect.size);
         }
         for p in [0.0, 0.3, 0.7] {
-            let frame = transition(&open, p, output(), &windows);
+            let frame = transition(&open, p, output(), 32, &windows);
             for (drawn, settled) in [
                 (&frame.cards, &open.cards),
                 (&frame.thumbnails, &open.thumbnails),
@@ -2579,7 +2600,7 @@ mod tests {
             }
         }
         // The growing active card changes size; only its settled size is cached.
-        let closed = transition(&open, 0.0, output(), &windows);
+        let closed = transition(&open, 0.0, output(), 32, &windows);
         assert_ne!(closed.cards[0].rect.size, closed.cards[0].settled);
     }
 
@@ -2587,11 +2608,11 @@ mod tests {
     fn neighboring_workspaces_and_thumbnails_follow_intermediate_swipe_progress() {
         let windows = [win(1, 0, 320, 182, 640, 420), win(2, 1, 320, 182, 640, 420)];
         let open = layout(output(), 32, &[0, 1], 0, &windows);
-        let closed = transition(&open, 0.0, output(), &windows);
+        let closed = transition(&open, 0.0, output(), 32, &windows);
         assert!(closed.thumbnails.is_empty());
         assert_eq!(closed.cards.len(), 1);
-        let early = transition(&open, 0.25, output(), &windows);
-        let half = transition(&open, 0.5, output(), &windows);
+        let early = transition(&open, 0.25, output(), 32, &windows);
+        let half = transition(&open, 0.5, output(), 32, &windows);
         assert_eq!(half.cards.len(), open.cards.len());
         assert_eq!(half.thumbnails.len(), 3);
         assert_eq!(half.thumbnails[0].alpha, 0.5);
@@ -2609,7 +2630,7 @@ mod tests {
         assert_eq!(neighbor_preview.alpha, 0.5);
         let fill = thumbnail_decor(&half, BLUE)[0].0;
         assert!(fill[0] > 34.0 / 255.0 && fill[0] < 70.0 / 255.0);
-        assert_eq!(transition(&open, 1.0, output(), &windows), open);
+        assert_eq!(transition(&open, 1.0, output(), 32, &windows), open);
     }
 
     #[test]
@@ -3238,7 +3259,7 @@ mod tests {
         assert_eq!(motion.diagnostics()["morph"]["cause"], "app-grid");
         assert_eq!(motion.diagnostics()["morph"]["curve"], "ease-out-sine");
         motion.step_scene(125.0, &grid, cues(true, false), None, AWAY);
-        let mid = motion.scene(&grid, None, AWAY, output(), &windows);
+        let mid = motion.scene(&grid, None, AWAY, output(), 32, &windows);
         let p = ease_out_sine(0.5);
         let expect = lerp_rect(picker.cards[0].rect, grid.cards[0].rect, p);
         assert_eq!(mid.cards[0].rect, expect);
@@ -3247,7 +3268,10 @@ mod tests {
         let shown = mid.previews.iter().find(|p| p.id == 1).unwrap();
         assert_eq!(shown.rect, lerp_rect(from.rect, to.rect, p));
         motion.step_scene(125.0, &grid, cues(true, false), None, AWAY);
-        assert_eq!(motion.scene(&grid, None, AWAY, output(), &windows), grid);
+        assert_eq!(
+            motion.scene(&grid, None, AWAY, output(), 32, &windows),
+            grid
+        );
     }
 
     #[test]
@@ -3263,7 +3287,7 @@ mod tests {
         assert_eq!(d["morph"]["cause"], "workspace");
         assert_eq!(d["morph"]["curve"], "ease-out-cubic");
         motion.step_scene(125.0, &second, cues(false, false), None, AWAY);
-        let mid = motion.scene(&second, None, AWAY, output(), &windows);
+        let mid = motion.scene(&second, None, AWAY, output(), 32, &windows);
         let active = mid.cards.iter().find(|c| c.workspace == 1).unwrap().rect;
         let was = first.cards.iter().find(|c| c.workspace == 1).unwrap().rect;
         assert_eq!(
@@ -3279,7 +3303,7 @@ mod tests {
         motion.step_scene(0.0, &grown, cues(false, false), None, AWAY);
         assert_eq!(motion.diagnostics()["morph"]["cause"], "windows");
         motion.step_scene(NEW_PREVIEW_MS / 2.0, &grown, cues(false, false), None, AWAY);
-        let mid = motion.scene(&grown, None, AWAY, output(), &more);
+        let mid = motion.scene(&grown, None, AWAY, output(), 32, &more);
         let target = grown
             .previews
             .iter()
@@ -3307,7 +3331,7 @@ mod tests {
         assert_eq!(motion.diagnostics()["morph"]["cause"], "thumbnails");
         assert_eq!(motion.diagnostics()["morph"]["duration_ms"], 200.0);
         motion.step_scene(100.0, &after, cues(false, false), None, AWAY);
-        let mid = motion.scene(&after, None, AWAY, output(), &two);
+        let mid = motion.scene(&after, None, AWAY, output(), 32, &two);
         let full = after.thumbnails[0].rect;
         let shown = mid.thumbnails[0];
         assert!(shown.rect.size.w > 0 && shown.rect.size.w < full.size.w);
@@ -3327,21 +3351,27 @@ mod tests {
         opened(&mut motion);
         motion.step_scene(0.0, &base, cues(false, false), None, center);
         motion.step_scene(100.0, &base, cues(false, false), None, center);
-        let mid = motion.scene(&base, None, center, output(), &windows);
+        let mid = motion.scene(&base, None, center, output(), 32, &windows);
         assert_eq!(mid.hovered, Some(1));
         let g = (f64::from(HOVER_GROWTH) * ease_out_quad(0.5)).round() as i32;
         assert_eq!(mid.previews[0].rect.loc.x, rest.rect.loc.x - g);
         motion.step_scene(100.0, &base, cues(false, false), None, center);
         let mut full = base.clone();
         grow_hovered(&mut full, center);
-        assert_eq!(motion.scene(&base, None, center, output(), &windows), full);
+        assert_eq!(
+            motion.scene(&base, None, center, output(), 32, &windows),
+            full
+        );
         // Leaving shrinks it back over the same time.
         motion.step_scene(100.0, &base, cues(false, false), None, AWAY);
-        let leaving = motion.scene(&base, None, AWAY, output(), &windows);
+        let leaving = motion.scene(&base, None, AWAY, output(), 32, &windows);
         assert_eq!(leaving.hovered, None);
         assert!(leaving.previews[0].rect.size.w > rest.rect.size.w);
         motion.step_scene(100.0, &base, cues(false, false), None, AWAY);
-        assert_eq!(motion.scene(&base, None, AWAY, output(), &windows), base);
+        assert_eq!(
+            motion.scene(&base, None, AWAY, output(), 32, &windows),
+            base
+        );
     }
 
     #[test]
@@ -3365,7 +3395,7 @@ mod tests {
             Some((1, start)),
             pointer,
         );
-        let mid = motion.scene(&base, Some((1, start)), pointer, output(), &windows);
+        let mid = motion.scene(&base, Some((1, start)), pointer, output(), 32, &windows);
         let dragged = *mid.previews.last().unwrap();
         let mut full = base.clone();
         drag_preview(&mut full, 1, start, pointer);
@@ -3378,19 +3408,25 @@ mod tests {
         motion.step_scene(0.0, &base, cues(false, false), None, pointer);
         assert_eq!(motion.diagnostics()["morph"]["cause"], "snap-back");
         motion.step_scene(SNAP_BACK_MS / 2.0, &base, cues(false, false), None, pointer);
-        let home = motion.scene(&base, None, pointer, output(), &windows);
+        let home = motion.scene(&base, None, pointer, output(), 32, &windows);
         let gliding = home.previews.iter().find(|p| p.id == 1).unwrap();
         assert!(gliding.rect.loc.x > dragged.rect.loc.x && gliding.rect.loc.x < rest.rect.loc.x);
         motion.step_scene(SNAP_BACK_MS / 2.0, &base, cues(false, false), None, pointer);
-        assert_eq!(motion.scene(&base, None, pointer, output(), &windows), base);
+        assert_eq!(
+            motion.scene(&base, None, pointer, output(), 32, &windows),
+            base
+        );
         // Accepted without a change: back in place, fading in for 750 ms.
         motion.drag_revert(1, FULL);
         motion.step_scene(REVERT_MS / 2.0, &base, cues(false, false), None, pointer);
-        let fading = motion.scene(&base, None, pointer, output(), &windows);
+        let fading = motion.scene(&base, None, pointer, output(), 32, &windows);
         assert_eq!(fading.previews[0].rect, rest.rect);
         assert!((fading.previews[0].alpha - 0.75).abs() < 1e-6);
         motion.step_scene(REVERT_MS / 2.0, &base, cues(false, false), None, pointer);
-        assert_eq!(motion.scene(&base, None, pointer, output(), &windows), base);
+        assert_eq!(
+            motion.scene(&base, None, pointer, output(), 32, &windows),
+            base
+        );
     }
 
     #[test]
@@ -3401,7 +3437,7 @@ mod tests {
         opened(&mut motion);
         motion.step_scene(0.0, &base, cues(false, false), None, AWAY);
         motion.step_scene(125.0, &base, cues(false, true), None, AWAY);
-        let mid = motion.scene(&base, None, AWAY, output(), &windows);
+        let mid = motion.scene(&base, None, AWAY, output(), 32, &windows);
         assert!((mid.cards[0].alpha - 0.25).abs() < 1e-6);
         assert!((mid.previews[0].alpha - 0.25).abs() < 1e-6);
         assert!(!motion.search_covers());
@@ -3455,7 +3491,7 @@ mod tests {
         // must carry that alpha so nothing beneath it is culled.
         let windows = [win(1, 0, 320, 182, 640, 420), win(2, 1, 320, 182, 640, 420)];
         let open = layout(output(), 32, &[0, 1], 0, &windows);
-        let mid = transition(&open, 0.4, output(), &windows);
+        let mid = transition(&open, 0.4, output(), 32, &windows);
         for card in mid
             .cards
             .iter()
@@ -3473,7 +3509,7 @@ mod tests {
         opened(&mut motion);
         motion.step_scene(0.0, &open, cues(false, false), None, AWAY);
         motion.step_scene(60.0, &open, cues(false, true), None, AWAY);
-        let searching = motion.scene(&open, None, AWAY, output(), &windows);
+        let searching = motion.scene(&open, None, AWAY, output(), 32, &windows);
         assert!(searching.cards.iter().all(|c| c.alpha < 1.0));
         assert!(searching.thumbnails.iter().all(|c| c.alpha < 1.0));
         assert!(searching.previews.iter().all(|p| p.alpha < 1.0));
@@ -3484,7 +3520,7 @@ mod tests {
         motion.step_scene(0.0, &open, cues(false, false), None, AWAY);
         motion.step_scene(0.0, &fewer, cues(false, false), None, AWAY);
         motion.step_scene(50.0, &fewer, cues(false, false), None, AWAY);
-        let leaving = motion.scene(&fewer, None, AWAY, output(), &windows);
+        let leaving = motion.scene(&fewer, None, AWAY, output(), 32, &windows);
         assert!(leaving.thumbnails.iter().all(|t| t.alpha < 1.0));
         assert!(leaving
             .previews

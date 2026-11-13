@@ -304,6 +304,8 @@ impl Counter {
 struct Snapshot {
     output: Option<String>,
     buffer: MemoryRenderBuffer,
+    /// The picture's size: the old mode's, whatever the output is now.
+    size: Size<f64, Logical>,
 }
 
 /// Effects drawn over one output, above the scene and below the idle
@@ -480,6 +482,7 @@ impl Transitions {
                     Transform::Normal,
                     None,
                 ),
+                size: (f64::from(w), f64::from(h)).into(),
             })
             .collect();
         self.screen = Some((snapshots, self.now));
@@ -534,13 +537,17 @@ impl Transitions {
                 alpha,
                 snapshots.iter().find(|s| s.output.as_deref() == output),
             ) {
+                // The whole old picture over the output's new size, as
+                // GNOME's ScreenTransition is bound to the stage's: left
+                // to itself Smithay takes a source rectangle of the drawn
+                // size and would crop or clamp a picture of another mode.
                 overlay.textures.extend(
                     MemoryRenderBufferRenderElement::from_buffer(
                         renderer,
                         Point::<f64, Physical>::from((0.0, 0.0)),
                         &snapshot.buffer,
                         Some(alpha),
-                        None,
+                        Some(Rectangle::from_size(snapshot.size)),
                         Some((size.w, size.h).into()),
                         Kind::Unspecified,
                     )
@@ -562,6 +569,11 @@ impl Transitions {
                 })
                 .clone();
             let origin = view.physical(f64::from(corner.x), f64::from(corner.y));
+            // The whole box scaled, as GNOME scales the actor: left to
+            // itself Smithay would draw the top-left `side` pixels of
+            // the full-size box unscaled.
+            let whole =
+                Rectangle::from_size((f64::from(RIPPLE_SIZE), f64::from(RIPPLE_SIZE)).into());
             // Later rings draw above earlier ones: topmost first.
             for ring in (0..RIPPLES.len()).rev() {
                 let Some((scale, opacity)) = ripple_ring(ring, self.elapsed(at)) else {
@@ -578,7 +590,7 @@ impl Transitions {
                         Point::<f64, Physical>::from((f64::from(x), f64::from(origin.y))),
                         &texture,
                         Some(opacity as f32),
-                        None,
+                        Some(whole),
                         Some((side, side).into()),
                         Kind::Unspecified,
                     )
@@ -725,6 +737,116 @@ mod tests {
         assert_eq!(alpha(51, 51), 0, "outside the curve");
         let mirrored = ripple_pixels(52, true);
         assert_eq!(mirrored[(51 * 4 + 3) as usize], 51);
+    }
+
+    /// Headless GL harness: surfaceless EGL, or `None` when this
+    /// machine has no EGL (the test skips instead of failing).
+    #[cfg(feature = "drm")]
+    fn headless_renderer() -> Option<GlesRenderer> {
+        use smithay::backend::egl::native::EGLSurfacelessDisplay;
+        use smithay::backend::egl::{EGLContext, EGLDisplay};
+        let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.ok()?;
+        let context = EGLContext::new(&display).ok()?;
+        unsafe { GlesRenderer::new(context) }.ok()
+    }
+
+    /// The effects' textures over a `size` output at the origin, at
+    /// scale 1.
+    #[cfg(feature = "drm")]
+    fn textures(
+        fx: &mut Transitions,
+        renderer: &mut GlesRenderer,
+        size: (i32, i32),
+    ) -> Vec<MemoryRenderBufferRenderElement<GlesRenderer>> {
+        let view = View {
+            offset: (0, 0),
+            scale: 1.0,
+        };
+        let geometry = tuna_wallpaper::background::Geometry {
+            physical: [size.0 as u32, size.1 as u32],
+            origin: [0, 0],
+            desktop: [0, 0, size.0, size.1],
+            scale_bits: 1.0f64.to_bits(),
+        };
+        let mut wallpaper = crate::wallpaper::Wallpaper::new();
+        fx.overlay(
+            renderer,
+            &mut wallpaper,
+            view,
+            size.into(),
+            geometry,
+            None,
+            false,
+        )
+        .textures
+    }
+
+    /// GNOME scales the ripple actor: a ring is the whole box drawn at
+    /// the ring's size, not the box's top-left corner unscaled (#1106).
+    #[cfg(feature = "drm")]
+    #[test]
+    fn ripples_draw_the_whole_box_at_each_rings_scale() {
+        use smithay::backend::renderer::element::Element;
+        let Some(mut renderer) = headless_renderer() else {
+            eprintln!("ripple GL test skipped: no surfaceless EGL");
+            return;
+        };
+        let t = Duration::ZERO;
+        let whole = Rectangle::from_size((f64::from(RIPPLE_SIZE), f64::from(RIPPLE_SIZE)).into());
+        for mirrored in [false, true] {
+            let mut fx = Transitions::new(t);
+            fx.advance(t, false, false, true);
+            fx.ripple((200, 0).into(), mirrored);
+            fx.advance(at(t, 415), false, false, true);
+            let rings = textures(&mut fx, &mut renderer, (400, 300));
+            // Topmost first: the last ring, still small, down to the
+            // first, grown past the box.
+            let sides: Vec<i32> = (0..RIPPLES.len())
+                .rev()
+                .map(|ring| {
+                    let (scale, _) = ripple_ring(ring, 415.0).unwrap();
+                    (f64::from(RIPPLE_SIZE) * scale).round() as i32
+                })
+                .collect();
+            assert_eq!(sides, [7, 39, 62]);
+            assert_eq!(rings.len(), sides.len());
+            for (ring, side) in rings.iter().zip(sides) {
+                assert_eq!(ring.src(), whole, "a {side}px ring samples the whole box");
+                let x = if mirrored { 200 - side } else { 200 };
+                assert_eq!(
+                    ring.geometry(1.0.into()),
+                    Rectangle::new((x, 0).into(), (side, side).into())
+                );
+            }
+        }
+    }
+
+    /// GNOME's ScreenTransition is bound to the stage: the old picture
+    /// covers the output's new size whole, not cropped to it or clamped
+    /// at its edge (#1106).
+    #[cfg(feature = "drm")]
+    #[test]
+    fn a_monitor_change_fades_the_whole_old_picture_over_the_new_size() {
+        use smithay::backend::renderer::element::Element;
+        let Some(mut renderer) = headless_renderer() else {
+            eprintln!("monitor change GL test skipped: no surfaceless EGL");
+            return;
+        };
+        let t = Duration::ZERO;
+        let mut fx = Transitions::new(t);
+        fx.advance(t, false, false, true);
+        fx.screen_changed(vec![(None, 4, 2, vec![0; 32])]);
+        fx.advance(at(t, 100), false, false, true);
+        // The same mode, a larger one and a smaller one.
+        for size in [(4, 2), (8, 6), (2, 1)] {
+            let old = textures(&mut fx, &mut renderer, size);
+            assert_eq!(old.len(), 1);
+            assert_eq!(old[0].src(), Rectangle::from_size((4.0, 2.0).into()));
+            assert_eq!(
+                old[0].geometry(1.0.into()),
+                Rectangle::from_size(size.into())
+            );
+        }
     }
 
     #[test]

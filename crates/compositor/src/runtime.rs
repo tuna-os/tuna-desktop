@@ -3051,6 +3051,7 @@ impl Runtime {
             self.overview_dragged(),
             self.manager.pointer_pos(),
             output,
+            crate::windows::WORK_AREA_TOP,
             &self.manager.overview_windows(),
         )
     }
