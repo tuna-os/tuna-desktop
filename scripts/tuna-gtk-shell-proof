@@ -13,6 +13,9 @@
 #   --keyboard-routes-only runs panel readiness and the P-A11Y-02 keyboard
 #   route gates (G-PANEL-MENU-KEYS, G-QS-MENU-KEY, G-NOTIFICATION-KEYS,
 #   G-SCREENSHOT-CTRL-C) only.
+#   --search-leak-only runs panel readiness, G-SEARCH-LEAK (50 searches with
+#   results leave shm mappings and descriptors where they were, #1084) and
+#   G-SHELL-STABLE only.
 #   --window-leak-only runs panel readiness, G-WINDOW-LEAK (100 libadwaita
 #   windows opened and closed leave the compositor's memory within a fixed
 #   bound of its warm state, #1088) and G-SHELL-STABLE only.
@@ -117,6 +120,8 @@
 #                    (tests/protocols/gnome51-globals.tsv, P-SY-06)
 #   G-OV-SHELL-UI  the overview shows the search entry and the dash
 #   G-OV-SEARCH typing lists matching apps (#57)
+#   G-OV-SEARCH-STILL the focused, unchanged overview search draws no
+#               frames: the shell's caret is steady, as GNOME's (#503)
 #   G-OV-LAUNCH Enter launches the top result and closes the overview
 #   G-OV-APPGRID Show Apps opens the app grid
 #   G-X11-APP      XWayland is on by default: an X11 app launched from
@@ -479,6 +484,7 @@ A11Y_FOCUS_ONLY=0
 TRAY_ONLY=0
 GRID_HOVER_ONLY=0
 KEYBOARD_ROUTES_ONLY=0
+SEARCH_LEAK_ONLY=0
 WINDOW_LEAK_ONLY=0
 GRID_CANCEL_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
@@ -495,10 +501,11 @@ while [ $# -gt 0 ]; do
         --tray-only) TRAY_ONLY=1; shift ;;
         --grid-hover-only) GRID_HOVER_ONLY=1; shift ;;
         --keyboard-routes-only) KEYBOARD_ROUTES_ONLY=1; shift ;;
+        --search-leak-only) SEARCH_LEAK_ONLY=1; shift ;;
         --window-leak-only) WINDOW_LEAK_ONLY=1; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
-        --help|-h) sed -n '2,25p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,28p' "$0"; exit 0 ;;
         *) echo "tuna-gtk-shell-proof: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -955,6 +962,7 @@ pass G-GRID-ON-DEMAND "no grid tiles on the window picker or after close; a held
 . "$ROOT/scripts/lib/tuna-screenshot-keys-proof.sh"
 . "$ROOT/scripts/lib/tuna-a11y-focus-proof.sh"
 . "$ROOT/scripts/lib/tuna-keyboard-routes-proof.sh"
+. "$ROOT/scripts/lib/tuna-search-leak-proof.sh"
 . "$ROOT/scripts/lib/tuna-window-leak-proof.sh"
 
 # Compositor-side state (overview, focus, previews) for app stages.
@@ -1376,7 +1384,7 @@ MEDIA_SOURCE=0
 "$PY" "$ROOT/scripts/lib/gtk_media_source.py" invalidate "$ROOT" "$ARTIFACTS"
 if [ "$INSTALLED_PACKAGE" = 0 ] && [ "$SCREENSHOT_KEYS_ONLY" = 0 ] &&
    [ "$A11Y_FOCUS_ONLY" = 0 ] && [ "$KEYBOARD_ROUTES_ONLY" = 0 ] &&
-   [ "$GRID_CANCEL_ONLY" = 0 ] && [ "$WINDOW_LEAK_ONLY" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ] &&
+   [ "$GRID_CANCEL_ONLY" = 0 ] && [ "$SEARCH_LEAK_ONLY" = 0 ] && [ "$WINDOW_LEAK_ONLY" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ] &&
    [ -z "${TUNA_PROOF_SHELL_BIN:-}" ] && [ -z "${TUNA_SHELL_BIN:-}" ] &&
    [ -n "${GITHUB_RUN_ID:-}" ] && [ -n "${GITHUB_RUN_ATTEMPT:-}" ] &&
    [ -n "${GITHUB_SHA:-}" ]; then
@@ -1385,7 +1393,7 @@ if [ "$INSTALLED_PACKAGE" = 0 ] && [ "$SCREENSHOT_KEYS_ONLY" = 0 ] &&
 fi
 if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
     cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host
-    if [ "$SCREENSHOT_KEYS_ONLY" = 0 ] && [ "$A11Y_FOCUS_ONLY" = 0 ] && [ "$GRID_HOVER_ONLY" = 0 ] && [ "$WINDOW_LEAK_ONLY" = 0 ]; then
+    if [ "$SCREENSHOT_KEYS_ONLY" = 0 ] && [ "$A11Y_FOCUS_ONLY" = 0 ] && [ "$GRID_HOVER_ONLY" = 0 ] && [ "$SEARCH_LEAK_ONLY" = 0 ] && [ "$WINDOW_LEAK_ONLY" = 0 ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example icon-probe
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
     fi
@@ -1714,6 +1722,16 @@ if [ "$KEYBOARD_ROUTES_ONLY" = 1 ]; then
     keyboard_panel_menu_proof
     keyboard_notification_proof
     keyboard_screenshot_proof
+    exit 0
+fi
+if [ "$SEARCH_LEAK_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "search leak desktop ready" ||
+        fail G-SEARCH-LEAK "desktop never became ready"
+    # Let the startup cover settle before the first overview.
+    sleep 3
+    search_leak_proof
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
     exit 0
 fi
 if [ "$WINDOW_LEAK_ONLY" = 1 ]; then
@@ -2747,6 +2765,18 @@ showing "$ARTIFACTS/a11y-search.json" "Tuna Probe" ||
     fail G-OV-SEARCH "typing did not list the probe app"
 pass G-OV-SEARCH "typing in the overview lists matching apps"
 scrot "$ARTIFACTS/10-search.png" >/dev/null
+# GNOME Shell's caret is steady (StEntry, ClutterText): with the search
+# entry focused and nothing changing, the overview draws no frames (#503).
+# A blinking GTK caret would redraw the entry at the display rate. The
+# grid-cancel comparison's old role runs pinned pre-#503 binaries through
+# this stage, so the gate belongs to the current build only.
+if [ "$GRID_CANCEL_OLD_NEGATIVE" != 1 ]; then
+    search_still_frames="$(jq .rendered_frames "$CSTATE")"
+    sleep 1.5
+    [ "$(jq .rendered_frames "$CSTATE")" = "$search_still_frames" ] ||
+        fail G-OV-SEARCH-STILL "the compositor drew frames while the focused overview search sat unchanged"
+    pass G-OV-SEARCH-STILL "the focused overview search sits still: no frames while nothing changes"
+fi
 
 xdotool key Return
 end=$(($(date +%s) + 15))

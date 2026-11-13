@@ -3682,7 +3682,7 @@ mod tests {
         for _ in 0..4 {
             motion.step_progress(16.0, false, FULL);
             motion.step_scene(16.0, &gone, closing, None, AWAY);
-            let drawn = motion.scene(&gone, None, AWAY, no_output(), &windows);
+            let drawn = motion.scene(&gone, None, AWAY, no_output(), 0, &windows);
             assert!(drawable(&drawn), "{drawn:?}");
             assert_eq!(hit(&drawn, AWAY), OverviewHit::Dismiss);
             for (_, rects) in thumbnail_decor(&drawn, BLUE) {
@@ -3750,8 +3750,8 @@ mod tests {
                 show_placeholder(&mut dragged, 1);
                 drag_preview(&mut dragged, 1, AWAY, AWAY);
                 for scene in [
-                    transition(&picker, 0.5, output, &windows),
-                    transition(&grid, 0.5, output, &windows),
+                    transition(&picker, 0.5, output, work_top, &windows),
+                    transition(&grid, 0.5, output, work_top, &windows),
                     blend(&picker, &grid, 0.5),
                     blend(&grid, &picker, 0.5),
                     hovered,
