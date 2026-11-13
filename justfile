@@ -121,7 +121,11 @@ proof name *args: _disk _sccache
     export PATH="$shim:$PATH"
     # A positional artifact contract is stated in the script's first lines.
     if head -n 30 "$script" | grep -qE '\$\{1:\?|sys\.argv\[1\]'; then
-        set -- "$art"
+        if [ "{{name}}" = "minimize-ci-proof" ]; then
+            set -- "$art/native-minimize"
+        else
+            set -- "$art"
+        fi
     elif grep -q -- '--artifacts' "$script"; then
         set -- --artifacts "$art"
     else

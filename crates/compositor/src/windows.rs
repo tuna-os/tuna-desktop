@@ -4170,10 +4170,14 @@ impl WindowManager {
                     pointer.current_focus().is_some()
                 );
             }
+            let serial = SERIAL_COUNTER.next_serial();
+            if pressed {
+                state.pointer_press_serial = Some(serial);
+            }
             pointer.button(
                 state,
                 &ButtonEvent {
-                    serial: SERIAL_COUNTER.next_serial(),
+                    serial,
                     time,
                     button,
                     state: if pressed {
@@ -4247,8 +4251,8 @@ impl WindowManager {
     /// none is up (ext-session-lock-v1: nothing behind the lock has
     /// focus). Applications get wl_keyboard.leave as the session locks,
     /// as GNOME's lock screen takes focus, instead of keeping it until
-    /// the first key press; [`Self::restore_keyboard_owner`] hands it
-    /// back on unlock.
+    /// the first key press; [`Self::refocus_after_lock`] hands it back
+    /// on unlock.
     pub fn hold_lock_focus(
         &mut self,
         state: &mut State,
@@ -4285,6 +4289,26 @@ impl WindowManager {
             let focused = self.model.focused();
             self.apply_focus(state, focused);
         }
+    }
+
+    /// The lock lifted: give the keyboard back to what had it, as GNOME
+    /// Shell's `popModal` does (screenShield.js locks with a modal stage
+    /// grab, which revokes Mutter's Wayland popup grab without dismissing
+    /// it): the topmost popup of a grab that outlived the lock, else the
+    /// owner a popup grab hands back to (the parked overview, an
+    /// Exclusive layer, the focused window). Without this the keyboard
+    /// stayed on the destroyed lock surface until the next click.
+    pub fn refocus_after_lock(&mut self, state: &mut State) {
+        if let Some(top) = state.popup_grab.last().map(|p| p.wl_surface().clone()) {
+            if let Some(keyboard) = self.keyboard.clone() {
+                keyboard.set_focus(state, Some(top), SERIAL_COUNTER.next_serial());
+            }
+            return;
+        }
+        // No grab to return to: the owner has the keyboard back at once,
+        // and the next reconcile re-delivers pointer focus as after a grab.
+        self.restore_keyboard_owner(state);
+        state.popup_refocus = true;
     }
 
     /// Route one input event to the session-lock surface and nothing
@@ -4340,10 +4364,14 @@ impl WindowManager {
             } => {
                 if let Some(pointer) = self.pointer.clone() {
                     self.lock_pointer_enter(state, &pointer, surface, time);
+                    let serial = SERIAL_COUNTER.next_serial();
+                    if pressed {
+                        state.pointer_press_serial = Some(serial);
+                    }
                     pointer.button(
                         state,
                         &ButtonEvent {
-                            serial: SERIAL_COUNTER.next_serial(),
+                            serial,
                             time,
                             button,
                             state: if pressed {
