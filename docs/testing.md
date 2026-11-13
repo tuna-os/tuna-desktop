@@ -189,6 +189,22 @@ This matches Mutter 51's initial-focus path:
 [attaching the drag handler immediately invalidates focus](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-input.c#L288-L325),
 and [drag focus sends the destination its offer while restricting source-less drags to the origin client](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-data-device.c#L337-L397).
 
+`scripts/tuna-gtk-shell-proof --window-leak-only --artifacts DIR` runs
+G-WINDOW-LEAK (#1088): after five warm-up windows, 100 libadwaita windows
+(`TUNA_WINDOW_LEAK_WINDOWS` sets the count) are opened and closed, odd ones
+with Alt+F4 (the app destroys its window; the close effect plays) and even
+ones by killing the app (its connection closes with every object alive).
+The compositor's `Pss_Anon` must stay within 8 MiB, and its open
+descriptors within two, of the warm state, a bound independent of the
+number of windows; each window used to keep about 1.65 MB.
+`scripts/lib/tuna-resource-sample.py` reads them from `/proc` and leaves
+`window-leak-{before,after}.json` and `window-leak-diff.txt` in the
+artifacts. The compositor side is `cargo test -p tuna-compositor --test
+window_teardown`: a toplevel with and without an `xdg_dialog_v1`, a
+subsurface, a grabbing popup and uploaded shm buffers, closed by destroying
+every object or by disconnecting, must drop every surface's server-side
+data, and the window manager must name the window nowhere.
+
 `scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts DIR` runs the same
 held-button hover and persisted reorder assertions as the full GTK proof,
 without the unrelated earlier gates. It adds no target motion or timing
