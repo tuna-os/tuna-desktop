@@ -196,6 +196,7 @@ jobs:
       - run: python3 scripts/lib/a11y-focus-proof-tests.py
       - run: /usr/bin/python3 scripts/tests/test_grid_cancel_proof.py
       - run: /usr/bin/python3 scripts/tests/test_grid_cancel_comparison.py
+      - run: python3 scripts/tests/test_remote_security_failure_report.py
       - run: python3 scripts/lib/pam-helper-source-tests.py
       - run: python3 scripts/lib/minimize-body-pixel-tests.py
       - run: python3 scripts/lib/media-causal-trace-tests.py
@@ -1246,6 +1247,7 @@ jobs:
           path: ${{ runner.temp }}/remote-package
       - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends podman zstd shellcheck
       - run: shellcheck scripts/tuna-remote-security tests/remote-desktop-reference/run.sh
+      - run: python3 scripts/tests/test_remote_security_failure_report.py
       - name: Test packaged compositor with actual GNOME 51 RemoteDesktop consent and libei input
         run: |
           mkdir -p "$RUNNER_TEMP/remote-candidate"
