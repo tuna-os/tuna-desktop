@@ -72,7 +72,9 @@ def main(argv=None):
             return 0
         hosts = sorted({host for pair in pairs for desktop in perf_budget.DESKTOPS
                         if (host := perf_budget.host_cpu(pair[desktop]))})
-        summary = perf_budget.markdown(rows, pairs, budgets, comparison, refused, hosts)
+        processes = perf_budget.memory_processes(pairs)
+        memory = perf_budget.memory_criterion(rows, budgets.get("target_ratio", 1.0))
+        summary = perf_budget.markdown(rows, pairs, budgets, comparison, refused, hosts, processes)
         print(summary)
         if args.markdown:
             with open(args.markdown, "a") as stream:
@@ -85,7 +87,19 @@ def main(argv=None):
                                                                 "block_intervals": perf_budget.BOOTSTRAP_BLOCK,
                                                                 "level": perf_budget.CONFIDENCE},
                                                   "results": rows, "comparison": comparison,
-                                                  "attribution": perf_budget.attribution(comparison)}, indent=2))
+                                                  "unenforced": [row["metric"] for row in perf_budget.unenforced(rows)],
+                                                  "attribution": perf_budget.attribution(comparison),
+                                                  "memory": {"criterion": memory,
+                                                             "by_role_mib": perf_budget.memory_attribution(comparison),
+                                                             "by_process_mib": processes}}, indent=2))
+        # Neither a pass nor a failure: say so next to the exit status.
+        notes = [f"{row['metric']}: not enforced ({row.get('reason', 'within budget')})"
+                 for row in perf_budget.unenforced(rows)]
+        if not memory["enforced"]:
+            notes.append(f"memory: the v1 criterion (PSS ratio <= {memory['target_ratio']:.2f}) is not enforced; "
+                         "this result neither passes nor fails it")
+        if notes:
+            print("\n".join(notes), file=sys.stderr)
         problems = [f"{row['metric']}: {row['status']} ({row.get('reason', '')})"
                     for row in perf_budget.failed(rows)]
         if problems and args.report_only:

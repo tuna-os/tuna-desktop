@@ -120,6 +120,9 @@ def read_process(path):
 # Diagnostic-only limits; ordinary process CPU accounting remains unchanged.
 MAX_THREADS_PER_PROCESS = 32
 MAX_THREADS_PER_SAMPLE = 128
+# smaps_rollup fields recorded beside Pss and Rss, and their sample keys.
+MEMORY_BREAKDOWN = (("Pss_Anon", "pss_anon_kib"), ("Pss_File", "pss_file_kib"),
+                    ("Pss_Shmem", "pss_shmem_kib"), ("Private_Dirty", "private_dirty_kib"))
 
 
 def bounded_text(path, limit):
@@ -346,6 +349,12 @@ def sample(uid, proc=Path("/proc"), observer=None, thread_diagnostics=False):
             memory = dict(line.split(":", 1) for line in read_smaps_rollup(path).splitlines() if ":" in line)
             stage = "smaps_rollup_parse"
             row.update(pss_kib=int(memory["Pss"].split()[0]), rss_kib=int(memory["Rss"].split()[0]))
+            # Where a process's memory is (#503): its own heap and stacks,
+            # mapped files, or shm shared with the compositor. Kernels
+            # before 5.4 do not split Pss; the fields are then left out.
+            for field, key in MEMORY_BREAKDOWN:
+                if field in memory:
+                    row[key] = int(memory[field].split()[0])
             stage = "fd_enumeration"
             row["fds"] = len(list((path / "fd").iterdir()))
             stage = "drm_read"
