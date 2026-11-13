@@ -5,6 +5,8 @@ on:
     - cron: '23 3 * * *'
   workflow_dispatch:
   pull_request:
+    # Draft pull requests skip the fuzz job; marking one ready starts it.
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'fuzz/**'
       - 'crates/shell-control-schema/**'
@@ -19,6 +21,7 @@ concurrency:
 
 jobs:
   decoder:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     strategy:
