@@ -234,6 +234,27 @@ gnome-settings-daemon's xsettings plugin exits while another manager holds
 it. The isolated diff is retained in XKB-BELL-XSETTINGS-API-PATCH.diff; the
 pinned version stays 0.7.0.
 
+Issue #1084 changes src/backend/renderer/utils/wayland.rs: the additive
+RendererSurfaceState::release_imported_shm_buffer sends wl_buffer.release
+for the attached wl_shm buffer once the given renderer context has
+imported it, instead of when another buffer replaces it. Mutter copies
+SHM buffers when it applies a commit and never holds them
+(meta-wayland-surface.c, buffer_held), and GTK's cairo renderer before
+4.22 depends on that: when its surface changes size it forgets the buffers
+still attached and never frees them on a late release (GTK 8a39f8e6), so
+every resize of a cairo-drawn surface leaked one shm pool in the client and
+its descriptor in the compositor. The buffer stays attached (the surface
+stays mapped and draws from its texture); a per-buffer flag keeps the
+release from being sent twice and is cleared when the same buffer is
+attached again, so each commit gets one release. Existing APIs and the
+drop-time release of buffers nobody imported are unchanged. Roost calls it
+for every committed surface tree right after importing it with its only
+renderer (crates/compositor/src/buffer_upload.rs); real socketpair tests in
+crates/compositor/tests/buffer_release.rs cover a resized layer surface,
+re-attached and replaced buffers, a destroyed surface, and a toplevel with
+a subsurface. The isolated diff is retained in SHM-EARLY-RELEASE-PATCH.diff;
+the pinned version stays 0.7.0.
+
 Issue #364 additionally changes `src/wayland/input_method/{mod.rs,
 input_method_handle.rs,input_method_keyboard_grab.rs}`. Registry visibility
 and forced binds both enforce the compositor's input-method admission
@@ -291,3 +312,41 @@ Such a late request receives a tracked inert child without metadata; its
 release and parent teardown cannot unset the compositor owner. The returned-
 key consumer exercises this race with actual standard requests and verifies
 continued physical-key delivery to the compositor grab.
+
+Issue #1088 changes src/wayland/shell/xdg/handlers/surface/toplevel.rs:
+the xdg_toplevel's destructor now also drops the xdg_dialog_v1 handle its
+user data keeps, as it already drops the decoration's. The dialog object's
+own user data is the ToplevelSurface (the xdg_toplevel and its
+wl_surface), so the two held each other and only xdg_dialog_v1.destroy
+broke the cycle. GTK 4 creates an xdg_dialog_v1 for every toplevel, and an
+app that exits (or is killed) just disconnects: every such window's
+wl_surface, its role data and the textures its frames were uploaded to
+stayed allocated for the rest of the session, about 1.65 MB per closed
+libadwaita window. Upstream master has the same cycle. The dialog
+object itself stays usable until its client destroys it (its requests
+only touch the surface's role data, which outlives the role). Real
+socketpair tests in crates/compositor/tests/window_teardown.rs close
+windows with and without an xdg_dialog_v1 by destroying every object and
+by disconnecting, and check that each surface's server-side data is
+dropped. The isolated diff is retained in XDG-DIALOG-CYCLE-PATCH.diff; the
+pinned version stays 0.7.0.
+
+Issue #503 additionally changes GlesFrame::render_texture_from_to in
+src/backend/renderer/gles/mod.rs: a texture drawn texel for pixel (the
+source size, turned by the buffer transform, equals the destination size,
+and the source starts at a whole texel) is sampled with GL_NEAREST for that
+draw, whatever filters the renderer is set to. Every sample of such a draw
+lands on a texel centre, so nearest and linear name the same texel, and
+nearest does not fetch and weigh the three texels around it: on llvmpipe
+the four gathers of a bilinear fetch are most of the fragment work, and
+nearly everything a desktop draws outside an animation is unscaled. Mutter
+does the same for unscaled shaped textures and backgrounds
+(meta-shaped-texture.c, meta-background-content.c). The renderer's
+configured filters are restored after the draw; scaled, stretched or
+sub-texel-shifted draws keep them. GL tests in unscaled_nearest_tests
+(surfaceless Mesa EGL) read the filter each draw leaves on the texture and
+the pixels it produces: an unscaled, a cropped and a quarter-turned draw
+are nearest and show only source texels, while shrunk, grown, one-axis
+stretched and half-texel-shifted draws stay linear and filtered. The
+isolated diff is retained in UNSCALED-NEAREST-PATCH.diff; the pinned
+version stays 0.7.0.
