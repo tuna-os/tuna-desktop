@@ -20,6 +20,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gtk4::prelude::*;
+
+use crate::services::{self, WatchBus};
 use tuna_shell_host::lockdown::{LockdownBus, LOCKDOWN_NAME};
 use tuna_shell_host::settings::{
     SettingsBackend, DISABLE_CAMERA_KEY, DISABLE_MICROPHONE_KEY, DISABLE_SOUND_OUTPUT_KEY,
@@ -132,19 +134,19 @@ fn run(main_loop: &glib::MainLoop, address: Option<&str>, settings: Option<gio::
     let held_elsewhere = Rc::new(Cell::new(false));
     let appeared = {
         let held = held_elsewhere.clone();
-        move |_: gio::DBusConnection, _: &str, _: &str| held.set(true)
+        move || held.set(true)
     };
     let vanished = {
         let (held, wake) = (held_elsewhere.clone(), wake.clone());
-        move |_: gio::DBusConnection, _: &str| {
+        move || {
             held.set(false);
             let _ = wake.try_send(());
         }
     };
     let flags = gio::BusNameWatcherFlags::NONE;
     let watch = match address {
-        None => Some(gio::bus_watch_name(
-            gio::BusType::Session,
+        None => Some(services::bus_watch_name(
+            WatchBus::Type(gio::BusType::Session),
             LOCKDOWN_NAME,
             flags,
             appeared,
@@ -159,7 +161,13 @@ fn run(main_loop: &glib::MainLoop, address: Option<&str>, settings: Option<gio::
         )
         .ok()
         .map(|connection| {
-            gio::bus_watch_name_on_connection(&connection, LOCKDOWN_NAME, flags, appeared, vanished)
+            services::bus_watch_name(
+                WatchBus::Connection(&connection),
+                LOCKDOWN_NAME,
+                flags,
+                appeared,
+                vanished,
+            )
         }),
     };
     let backend = Held(settings.clone());
@@ -191,7 +199,7 @@ fn run(main_loop: &glib::MainLoop, address: Option<&str>, settings: Option<gio::
     });
     main_loop.run();
     if let Some(watch) = watch {
-        gio::bus_unwatch_name(watch);
+        watch.unwatch();
     }
     if let (Some(settings), Some(handler)) = (settings, handler) {
         settings.disconnect(handler);

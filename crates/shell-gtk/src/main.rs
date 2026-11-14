@@ -3505,15 +3505,15 @@ fn build(app: &adw::Application) {
                 }
             };
             let vanished = owner_changed.clone();
-            // Watched for the whole session (a WatcherId unwatches
+            // Watched for the whole session (a NameWatch unwatches
             // nothing when it drops): a restarted daemon takes its keys
             // back, a crashed one leaves the native subset.
-            let _ = gio::bus_watch_name(
-                gio::BusType::Session,
+            let _ = services::bus_watch_name(
+                services::WatchBus::Type(gio::BusType::Session),
                 keybindings::MEDIA_KEYS_DAEMON,
                 gio::BusNameWatcherFlags::NONE,
-                move |_, _, _| owner_changed(true),
-                move |_, _| vanished(false),
+                move || owner_changed(true),
+                move || vanished(false),
             );
         }
         for settings in [settings, wm_settings, mutter_settings, media_settings]

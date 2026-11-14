@@ -242,6 +242,67 @@ pub fn watch_name(conn: &gio::DBusConnection, name: &str, f: impl Fn(bool) + 'st
     );
 }
 
+/// Where [`bus_watch_name`] watches: a bus GLib connects to, or a
+/// connection the caller made.
+pub enum WatchBus<'a> {
+    Type(gio::BusType),
+    Connection(&'a gio::DBusConnection),
+}
+
+/// A `g_bus_watch_name` watch. Dropping it keeps watching; only
+/// [`NameWatch::unwatch`] stops.
+pub struct NameWatch(u32);
+
+impl NameWatch {
+    pub fn unwatch(self) {
+        unsafe { gio::ffi::g_bus_unwatch_name(self.0) }
+    }
+}
+
+/// `g_bus_watch_name`: `appeared` when `name` gains an owner, `vanished`
+/// when it has none. GLib calls the vanished handler with a NULL
+/// connection once the bus connection closes (session end) or could not
+/// be made, which `gio::bus_watch_name` unwraps and panics on; these
+/// handlers take no connection.
+pub fn bus_watch_name(
+    bus: WatchBus,
+    name: &str,
+    flags: gio::BusNameWatcherFlags,
+    appeared: impl Fn() + 'static,
+    vanished: impl Fn() + 'static,
+) -> NameWatch {
+    use glib::translate::{IntoGlib, ToGlibPtr};
+    let appeared = glib::Closure::new_local(move |_| {
+        appeared();
+        None
+    });
+    let vanished = glib::Closure::new_local(move |_| {
+        vanished();
+        None
+    });
+    let id = unsafe {
+        match bus {
+            WatchBus::Type(bus_type) => gio::ffi::g_bus_watch_name_with_closures(
+                bus_type.into_glib(),
+                name.to_glib_none().0,
+                flags.into_glib(),
+                appeared.to_glib_none().0,
+                vanished.to_glib_none().0,
+            ),
+            WatchBus::Connection(connection) => {
+                gio::ffi::g_bus_watch_name_on_connection_with_closures(
+                    connection.to_glib_none().0,
+                    name.to_glib_none().0,
+                    flags.into_glib(),
+                    appeared.to_glib_none().0,
+                    vanished.to_glib_none().0,
+                )
+            }
+        }
+    };
+    NameWatch(id)
+}
+
 fn dict_bool(d: &glib::VariantDict, key: &str) -> Option<bool> {
     d.lookup_value(key, None).and_then(|v| v.get::<bool>())
 }
@@ -1709,6 +1770,72 @@ mod pipewire_socket_tests {
                 let _watch = when_created(&socket, move || set.set(true)).unwrap();
                 run_until(&context, Duration::from_secs(5), &|| fired.get());
                 assert!(fired.get());
+            })
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bus_watch_tests {
+    use super::*;
+    use std::io::BufRead;
+    use std::time::{Duration, Instant};
+
+    /// Iterate the thread-default context until `done` or `limit`.
+    fn run_until(context: &glib::MainContext, limit: Duration, done: &dyn Fn() -> bool) {
+        let deadline = Instant::now() + limit;
+        while !done() && Instant::now() < deadline {
+            if !context.iteration(false) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    /// Session end: the bus goes away under a watch, and GLib reports the
+    /// name vanished with a NULL connection. gio's own watcher panicked
+    /// there (`tuna-privacy-portal` at logout, the lifecycle lane's
+    /// V-NOPANIC); this one reports it.
+    #[test]
+    fn a_closed_bus_reports_the_name_vanished() {
+        let mut daemon = std::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("the test needs dbus-daemon");
+        let mut address = String::new();
+        std::io::BufReader::new(daemon.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let connection = gio::DBusConnection::for_address_sync(
+                    address.trim(),
+                    gio::DBusConnectionFlags::AUTHENTICATION_CLIENT
+                        | gio::DBusConnectionFlags::MESSAGE_BUS_CONNECTION,
+                    None,
+                    None::<&gio::Cancellable>,
+                )
+                .unwrap();
+                let (appeared, vanished) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+                let watch = {
+                    let (appeared, vanished) = (appeared.clone(), vanished.clone());
+                    bus_watch_name(
+                        WatchBus::Connection(&connection),
+                        "org.freedesktop.DBus",
+                        gio::BusNameWatcherFlags::NONE,
+                        move || appeared.set(appeared.get() + 1),
+                        move || vanished.set(vanished.get() + 1),
+                    )
+                };
+                run_until(&context, Duration::from_secs(5), &|| appeared.get() > 0);
+                assert_eq!((appeared.get(), vanished.get()), (1, 0));
+
+                daemon.kill().unwrap();
+                daemon.wait().unwrap();
+                run_until(&context, Duration::from_secs(5), &|| vanished.get() > 0);
+                assert_eq!((appeared.get(), vanished.get()), (1, 1));
+                watch.unwatch();
             })
             .unwrap();
     }
