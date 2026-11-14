@@ -162,6 +162,7 @@ jobs:
       - run: python3 scripts/lib/rename-to-tuna-tests.py
       - run: scripts/rename-to-tuna --check --no-cargo
       - run: python3 scripts/lib/tuna-soak-tests.py
+      - run: python3 scripts/lib/tuna-resource-sample-tests.py
       - run: python3 scripts/lib/vm-boot-tests.py
       - run: python3 scripts/lib/ci-runner-guard-tests.py
       - run: python3 scripts/tests/test_ci_closed_pr_cleanup.py
@@ -291,6 +292,7 @@ jobs:
       - run: cargo test --locked --manifest-path third-party/smithay/Cargo.toml --no-default-features --features xwayland,wayland_frontend --lib cancellation_tests
       # GL tests on surfaceless Mesa (llvmpipe); libegl1/libgl1-mesa-dri above.
       - run: cargo test --locked --manifest-path third-party/smithay/Cargo.toml --no-default-features --features renderer_gl --lib per_frame_read_fence
+      - run: cargo test --locked --manifest-path third-party/smithay/Cargo.toml --no-default-features --features renderer_gl --lib unscaled_nearest
       - name: Check nested compositor without default features
         run: cargo check --locked -p tuna-compositor --no-default-features
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -1057,6 +1059,14 @@ jobs:
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts gtk-shell-artifacts/grid-hover
+      # Searches with results must hand their shm buffers back (#1084):
+      # the shell's GDK mappings and both processes' descriptors stay put.
+      - name: Overview searches leave no shm buffers behind
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: scripts/tuna-gtk-shell-proof --search-leak-only --artifacts gtk-shell-artifacts/search-leak
       # Native/X11 geometry and physical input at all required virtual scales.
       - run: |
           for scale in 1 1.25 1.5 2; do
