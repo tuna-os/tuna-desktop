@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - scripts/tuna-corral-visual-capture
+      - scripts/tuna-corral-journey
       - scripts/tuna-corral-guest-cpu
       - scripts/tuna-vm-perf
       - scripts/tuna-corral-perf-pairs

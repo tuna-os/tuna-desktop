@@ -82,6 +82,10 @@ package made it into a promoted Marlin image digest:
 - File or update an issue here noting which Tuna Desktop tag was in the bad
   digest, so the image-side rollback can cite the right component version
   when writing its own incident notes.
+- For the user, `sudo bootc rollback` and a reboot return to the previous
+  deployment. [upgrade-recovery.md](upgrade-recovery.md) is the proof that
+  this keeps their home, settings and shell state for a given pair of
+  digests; run it on the previous image and the candidate before promoting.
 
 ## 5. Update the public-facing trail
 
@@ -103,12 +107,12 @@ package made it into a promoted Marlin image digest:
 
 ## What this does not cover
 
-- Compositor crash recovery at runtime (supervisor restart budgets,
-  disconnect/reconnect, stale-revision snapshots) is a different problem,
-  already covered by the recovery contract tested in
-  `crates/compositor/tests/recovery.rs`. That's the compositor recovering
-  from a crash while running; this document is about recovering from
-  having published the wrong build in the first place.
+- Crash recovery at runtime (shell restart budgets, the recovery overlay,
+  disconnect/reconnect, stale-revision snapshots) is a different problem:
+  the recovery contract in `crates/compositor/tests/recovery.rs`, and on the
+  published image the crash steps of [upgrade-recovery.md](upgrade-recovery.md).
+  This document is about recovering from having published the wrong build
+  in the first place.
 - The Debian/Ubuntu package `.deb` rollback above does not apply to the
-  Marlin bootc image's own update/rollback mechanism, which is tracked
-  separately (public roadmap item 3) and not yet qualified end to end.
+  Marlin bootc image's own update/rollback mechanism; its user-state proof
+  is [upgrade-recovery.md](upgrade-recovery.md).
