@@ -23,6 +23,7 @@ rustix.workspace = true
 jiff.workspace = true
 xkbcommon.workspace = true
 zbus.workspace = true
+futures-lite = "2.6.1"
 image.workspace = true
 resvg.workspace = true
 rhai.workspace = true

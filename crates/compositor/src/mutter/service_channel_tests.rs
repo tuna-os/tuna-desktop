@@ -28,7 +28,7 @@ fn channel(comp: &crate::TestCompositor) -> ServiceChannel {
         clients: HashMap::new(),
     }
 }
-fn stream(fd: zbus::zvariant::OwnedFd) -> UnixStream {
+fn stream(fd: zbus::OwnedFd) -> UnixStream {
     UnixStream::from(std::os::fd::OwnedFd::from(fd))
 }
 #[test]
@@ -120,14 +120,14 @@ fn typed_service_limit_is_independent_of_ordinary_connections() {
 }
 #[test]
 fn window_tag_options_follow_mutter_types_and_bound_storage() {
-    let mut options = HashMap::from([("unknown".into(), OwnedValue::from(42u32))]);
+    let mut options = HashMap::from([("unknown".into(), OwnedVariant::from(42u32))]);
     assert_eq!(connection_window_tag(&options).unwrap(), None);
-    options.insert("window-tag".into(), OwnedValue::from(42u32));
+    options.insert("window-tag".into(), OwnedVariant::from(42u32));
     assert_eq!(connection_window_tag(&options).unwrap(), None);
     for tag in ["", "file-picker", &"a".repeat(1024)] {
         options.insert(
             "window-tag".into(),
-            OwnedValue::try_from(Value::from(tag)).unwrap(),
+            OwnedVariant::try_from(Variant::from(tag)).unwrap(),
         );
         assert_eq!(
             connection_window_tag(&options).unwrap().as_deref(),
@@ -136,7 +136,7 @@ fn window_tag_options_follow_mutter_types_and_bound_storage() {
     }
     options.insert(
         "window-tag".into(),
-        OwnedValue::try_from(Value::from("a".repeat(1025))).unwrap(),
+        OwnedVariant::try_from(Variant::from("a".repeat(1025))).unwrap(),
     );
     assert!(matches!(
         connection_window_tag(&options),

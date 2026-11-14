@@ -216,19 +216,20 @@ pub fn start() -> IdleMonitor {
     let _ = std::thread::Builder::new()
         .name("tuna-idle-monitor".into())
         .spawn(move || {
-            let conn = match zbus::blocking::connection::Builder::session()
-                .and_then(|b| b.serve_at(ROOT, zbus::fdo::ObjectManager))
-                .and_then(|b| b.serve_at(CORE, core))
-                .and_then(|b| b.build())
-            {
+            let conn = match zbus::block_on(
+                zbus::connection::Builder::session()
+                    .serve_at(ROOT, zbus::fdo::ObjectManager)
+                    .serve_at(CORE, core)
+                    .build(),
+            ) {
                 Ok(conn) => conn,
                 Err(e) => {
                     eprintln!("tuna-compositor: idle monitor: no session bus: {e}");
                     return;
                 }
             };
-            let flags = zbus::fdo::RequestNameFlags::DoNotQueue.into();
-            match conn.request_name_with_flags(NAME, flags) {
+            let flags = zbus::fdo::RequestNameFlags::DO_NOT_QUEUE;
+            match zbus::block_on(conn.request_name_with_flags(NAME, flags)) {
                 Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
                     eprintln!("tuna-compositor: serving {NAME}");
                 }
@@ -237,7 +238,7 @@ pub fn start() -> IdleMonitor {
                     return;
                 }
             }
-            let Ok(emitter) = SignalEmitter::new(conn.inner(), CORE) else {
+            let Ok(emitter) = SignalEmitter::new(&conn, CORE) else {
                 return;
             };
             for id in fired {

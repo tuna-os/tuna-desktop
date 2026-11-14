@@ -186,7 +186,7 @@ if it works. A crate promoted to the unstable or stable tier must declare
   - `postcard`, because its encoding is the control-protocol wire format;
   - `rustix`, `xkbcommon` and `freedesktop-desktop-entry`.
 - Other dependencies use ordinary caret requirements, for example
-  `zbus = "5"`, `gtk4 = "0.11"` and `rhai = "1.26"`, and float within
+  `zbus = "6"`, `gtk4 = "0.11"` and `rhai = "1.26"`, and float within
   those ranges through lockfile updates.
 - `smithay` and `reis` are patched to reviewed source snapshots in
   `third-party/` (`[patch.crates-io]` in `Cargo.toml`). Renovate is disabled

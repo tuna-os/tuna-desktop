@@ -259,30 +259,30 @@ pub fn start(authority: crate::capture_security::Authority) -> calloop::channel:
     let _ = std::thread::Builder::new()
         .name("tuna-screenshot".into())
         .spawn(move || {
-            let conn = match zbus::blocking::connection::Builder::session()
-                .and_then(|b| {
-                    b.serve_at(
+            let conn = match zbus::block_on(
+                zbus::connection::Builder::session()
+                    .serve_at(
                         PATH,
                         Service {
                             authority: authority.clone(),
                             to_loop: to_loop.clone(),
                         },
                     )
-                })
-                .and_then(|b| b.serve_at(PATH, WindowsService { to_loop, authority }))
-                .and_then(|b| b.build())
-            {
+                    .serve_at(PATH, WindowsService { to_loop, authority })
+                    .build(),
+            ) {
                 Ok(conn) => conn,
                 Err(e) => {
                     eprintln!("tuna-compositor: screenshot service: no session bus: {e}");
                     return;
                 }
             };
-            let flags = zbus::fdo::RequestNameFlags::DoNotQueue.into();
-            match conn.request_name_with_flags(NAME, flags) {
+            let flags = zbus::fdo::RequestNameFlags::DO_NOT_QUEUE;
+            match zbus::block_on(conn.request_name_with_flags(NAME, flags)) {
                 Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
                     eprintln!("tuna-compositor: screenshot service on {NAME}");
-                    // The connection serves from its own executor; keep it.
+                    // zbus's runtime keeps serving the connection in the
+                    // background while this thread parks; keep it alive.
                     loop {
                         std::thread::park();
                     }

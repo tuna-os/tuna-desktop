@@ -513,7 +513,7 @@ pub(crate) enum ConnectOutcome {
 
 /// Outcome of one raced bus setup (see [`build_attempt_connection`]).
 enum SetupOutcome {
-    /// The async build finished; convert to blocking at the call site.
+    /// The async build finished.
     Built(zbus::Connection),
     /// The build failed fast (no daemon, refused, unusable address).
     Failed,
@@ -680,18 +680,20 @@ fn confirm_connected(fd: libc::c_int) -> ConnectOutcome {
 /// Build one bus connection over the connected `sock` with setup bounded
 /// by `budget`: the async builder runs raced against a timer, so a
 /// blackholed handshake fails instead of hanging the caller. Dropping
-/// the raced build on timeout is safe cancellation: the builder starts
-/// its executor only after the build completes, and an unconfigured
-/// client holds no interfaces or names, so nothing lingers past the
-/// drop. Method calls on the built connection carry `call_bound` (never
-/// the full call timeout past the attempt deadline).
+/// the raced build on timeout is safe cancellation: the builder spawns
+/// the connection's tasks only as the build completes, and an
+/// unconfigured client holds no interfaces or names, so nothing lingers
+/// past the drop. Method calls on the built connection carry
+/// `call_bound` (never the full call timeout past the attempt deadline).
+/// The async-io timer runs on its own reactor, so it fires inside
+/// `zbus::block_on` like any other future.
 fn build_attempt_connection(
     sock: UnixStream,
     call_bound: Duration,
     budget: Duration,
 ) -> SetupOutcome {
-    let builder = zbus::connection::Builder::async_io_unix_stream(sock).method_timeout(call_bound);
-    async_io::block_on(async {
+    let builder = zbus::connection::Builder::unix_stream(sock).method_timeout(call_bound);
+    zbus::block_on(async {
         futures_lite::future::race(
             async move {
                 match builder.build().await {
@@ -932,7 +934,7 @@ impl WorkerKit {
         let _ = worker_shutdown.shutdown(std::net::Shutdown::Both);
         // ... close the private transport (uncontended: this worker is
         // its only sender, and its sends completed) ...
-        let _ = kit.attempt.conn.clone().close();
+        let _ = zbus::block_on(kit.attempt.conn.clone().close());
         // ... drop every application/zbus attempt handle (the peer
         // observes EOF), report (a late result finds the waiter gone
         // and applies nowhere), and signal full exit LAST — the reaper
@@ -965,7 +967,7 @@ struct ReaperKit {
 /// connection on this client's bus (the system bus in production).
 #[derive(Debug, Clone)]
 pub struct Fprintd {
-    conn: zbus::blocking::Connection,
+    conn: zbus::Connection,
     /// Bus this client targets: `None` is the system bus, `Some` is an
     /// explicit test-bus address (unit tests only).
     bus_address: Option<String>,
@@ -996,7 +998,7 @@ impl Fprintd {
         }
         match build_attempt_connection(sock, DBUS_CALL_TIMEOUT, budget) {
             SetupOutcome::Built(conn) => Some(Self {
-                conn: zbus::blocking::Connection::from(conn),
+                conn,
                 bus_address: None,
             }),
             SetupOutcome::Failed | SetupOutcome::TimedOut => None,
@@ -1047,34 +1049,44 @@ impl Fprintd {
     /// the public [`verify`](Self::verify) path with no environment
     /// override and no process-global mutation.
     #[cfg(test)]
-    pub(crate) fn for_test_address(address: &str, conn: zbus::blocking::Connection) -> Self {
+    pub(crate) fn for_test_address(address: &str, conn: zbus::Connection) -> Self {
         Self {
             conn,
             bus_address: Some(address.to_owned()),
         }
     }
 
-    fn manager(&self) -> Option<zbus::blocking::Proxy<'_>> {
-        zbus::blocking::Proxy::new(&self.conn, BUS_NAME, MANAGER_PATH, MANAGER_IFACE).ok()
+    fn manager(&self) -> Option<zbus::Proxy<'_>> {
+        zbus::block_on(zbus::Proxy::new(
+            &self.conn,
+            BUS_NAME,
+            MANAGER_PATH,
+            MANAGER_IFACE,
+        ))
+        .ok()
     }
 
     /// Default reader, else the first enumerated one, else none.
-    fn default_device(&self) -> Option<zbus::zvariant::OwnedObjectPath> {
+    fn default_device(&self) -> Option<zbus::OwnedObjectPath> {
         let manager = self.manager()?;
         if let Ok(path) =
-            manager.call::<_, _, zbus::zvariant::OwnedObjectPath>("GetDefaultDevice", &())
+            zbus::block_on(manager.call::<_, _, zbus::OwnedObjectPath>("GetDefaultDevice", &()))
         {
             return Some(path);
         }
-        let devices: Vec<zbus::zvariant::OwnedObjectPath> = manager.call("GetDevices", &()).ok()?;
+        let devices: Vec<zbus::OwnedObjectPath> =
+            zbus::block_on(manager.call("GetDevices", &())).ok()?;
         devices.into_iter().next()
     }
 
-    fn device_proxy<'a>(
-        &'a self,
-        path: &'a zbus::zvariant::OwnedObjectPath,
-    ) -> Option<zbus::blocking::Proxy<'a>> {
-        zbus::blocking::Proxy::new(&self.conn, BUS_NAME, path.as_str(), DEVICE_IFACE).ok()
+    fn device_proxy<'a>(&'a self, path: &'a zbus::OwnedObjectPath) -> Option<zbus::Proxy<'a>> {
+        zbus::block_on(zbus::Proxy::new(
+            &self.conn,
+            BUS_NAME,
+            path.as_str(),
+            DEVICE_IFACE,
+        ))
+        .ok()
     }
 
     /// Enrolled finger names for `user`; empty on any failure.
@@ -1086,8 +1098,7 @@ impl Fprintd {
             return Vec::new();
         };
         let name = effective_claim_name(user, process_user().as_deref());
-        device
-            .call::<_, _, Vec<String>>("ListEnrolledFingers", &(name,))
+        zbus::block_on(device.call::<_, _, Vec<String>>("ListEnrolledFingers", &(name,)))
             .unwrap_or_default()
     }
 
@@ -1100,9 +1111,9 @@ impl Fprintd {
             return Capability::unavailable();
         };
         let name = effective_claim_name(user, process_user().as_deref());
-        let enrolled = device
-            .call::<_, _, Vec<String>>("ListEnrolledFingers", &(name,))
-            .unwrap_or_default();
+        let enrolled =
+            zbus::block_on(device.call::<_, _, Vec<String>>("ListEnrolledFingers", &(name,)))
+                .unwrap_or_default();
         Capability {
             available: true,
             enrolled_fingers: enrolled,
@@ -1118,7 +1129,7 @@ impl Fprintd {
     /// Returns the outcome the caller reports.
     fn retire_unspawned(
         shutdown: &UnixStream,
-        conn: zbus::blocking::Connection,
+        conn: zbus::Connection,
         guard: ClaimGuard,
         outcome: VerifyOutcome,
     ) -> VerifyOutcome {
@@ -1309,7 +1320,7 @@ impl Fprintd {
         }
         let call_bound = DBUS_CALL_TIMEOUT.min(build_budget);
         let attempt_conn = match build_attempt_connection(sock, call_bound, build_budget) {
-            SetupOutcome::Built(conn) => zbus::blocking::Connection::from(conn),
+            SetupOutcome::Built(conn) => conn,
             // The raced build dropped its socket half; shut our retained
             // clones' socket down before they drop — every retirement
             // path leads with the fd shutdown.
@@ -1487,13 +1498,12 @@ impl Fprintd {
         };
         let name = effective_claim_name(user, process_user().as_deref()).to_owned();
         // No enrolled prints: do not claim someone else's reader time.
-        let enrolled: Vec<String> = device
-            .call("ListEnrolledFingers", &(&name,))
-            .unwrap_or_default();
+        let enrolled: Vec<String> =
+            zbus::block_on(device.call("ListEnrolledFingers", &(&name,))).unwrap_or_default();
         if enrolled.is_empty() {
             return VerifyOutcome::NotEnrolled;
         }
-        if device.call::<_, _, ()>("Claim", &(&name,)).is_err() {
+        if zbus::block_on(device.call::<_, _, ()>("Claim", &(&name,))).is_err() {
             return VerifyOutcome::Error;
         }
         let outcome = self.verify_claimed(&device, &path, deadline, progress);
@@ -1502,37 +1512,36 @@ impl Fprintd {
         // past the deadline the parent's shutdown fails them fast. The
         // transport itself retires in the worker after this returns:
         // cleanup is attempted BEFORE shutdown+close, never after.
-        let _: Result<(), _> = device.call("VerifyStop", &());
-        let _: Result<(), _> = device.call("Release", &());
+        let _: zbus::Result<()> = zbus::block_on(device.call("VerifyStop", &()));
+        let _: zbus::Result<()> = zbus::block_on(device.call("Release", &()));
         outcome
     }
 
     /// The claimed-device signal wait: subscribe before starting so no
     /// terminal signal is missed, then classify each `VerifyStatus`
-    /// until one ends the attempt, retries run out, the iterator ends,
+    /// until one ends the attempt, retries run out, the stream ends,
     /// or `deadline` passes. The wait runs on the worker thread itself,
-    /// straight off the iterator — no forwarder to strand. The iterator
-    /// ends when the daemon goes away or when our private connection
-    /// is shut down, which the deadline does, so a silent daemon delays
-    /// the worker past the deadline only by the shutdown propagation,
-    /// never forever.
+    /// awaiting the signal stream one item at a time — no forwarder to
+    /// strand. The stream ends when the daemon goes away or when our
+    /// private connection is shut down, which the deadline does, so a
+    /// silent daemon delays the worker past the deadline only by the
+    /// shutdown propagation, never forever.
     fn verify_claimed(
         &self,
-        device: &zbus::blocking::Proxy<'_>,
-        path: &zbus::zvariant::OwnedObjectPath,
+        device: &zbus::Proxy<'_>,
+        path: &zbus::OwnedObjectPath,
         deadline: Instant,
         progress: Option<&ProgressSink>,
     ) -> VerifyOutcome {
-        let mut signals = match device.receive_signal("VerifyStatus") {
-            Ok(signals) => signals,
+        use futures_lite::StreamExt;
+        let mut stream = match zbus::block_on(device.receive_signal("VerifyStatus")) {
+            Ok(stream) => stream,
             Err(_) => return VerifyOutcome::Error,
         };
-        if device
-            .call::<_, _, ()>("VerifyStart", &(VERIFY_ANY,))
-            .is_err()
-        {
+        if zbus::block_on(device.call::<_, _, ()>("VerifyStart", &(VERIFY_ANY,))).is_err() {
             return VerifyOutcome::Error;
         }
+        let mut signals = std::iter::from_fn(|| zbus::block_on(stream.next()));
         let Some(progress) = progress else {
             return drain_verify_signals_with(&mut signals, deadline, &mut |_| {});
         };
@@ -1548,20 +1557,22 @@ impl Fprintd {
     }
 
     /// The device's `scan-type` property is `swipe` (fprintd Device API).
-    fn scan_type_is_swipe(&self, path: &zbus::zvariant::OwnedObjectPath) -> bool {
-        let Ok(properties) = zbus::blocking::Proxy::new(
-            &self.conn,
-            BUS_NAME,
-            path.as_str(),
-            "org.freedesktop.DBus.Properties",
-        ) else {
-            return false;
-        };
-        properties
-            .call::<_, _, zbus::zvariant::OwnedValue>("Get", &(DEVICE_IFACE, "scan-type"))
-            .ok()
-            .and_then(|value| String::try_from(value).ok())
-            .is_some_and(|kind| kind == "swipe")
+    fn scan_type_is_swipe(&self, path: &zbus::OwnedObjectPath) -> bool {
+        zbus::block_on(async {
+            let properties = zbus::Proxy::new(
+                &self.conn,
+                BUS_NAME,
+                path.as_str(),
+                "org.freedesktop.DBus.Properties",
+            )
+            .await?;
+            properties
+                .call::<_, _, zbus::OwnedVariant>("Get", &(DEVICE_IFACE, "scan-type"))
+                .await
+        })
+        .ok()
+        .and_then(|value| String::try_from(value).ok())
+        .is_some_and(|kind| kind == "swipe")
     }
 }
 
@@ -1855,7 +1866,6 @@ mod tests {
             "net.reactivated.Fprint.Device",
             "VerifyStatus",
         )
-        .unwrap()
         .build(&(result.to_string(), done))
         .unwrap()
     }
@@ -1867,7 +1877,6 @@ mod tests {
             "net.reactivated.Fprint.Device",
             "VerifyStatus",
         )
-        .unwrap()
         .build(&"not-a-status-pair".to_string())
         .unwrap()
     }
@@ -2038,28 +2047,34 @@ mod tests {
 
     #[test]
     fn shutdown_releases_a_blocked_signal_wait() {
+        use futures_lite::StreamExt;
         // Live demonstration of the cancellation `verify` relies on: an
-        // fd-level shutdown releases a thread blocked in a signal
-        // iterator with `None`. Needs any message bus (the bus itself is
+        // fd-level shutdown releases a thread blocked on a signal
+        // stream with `None`. Needs any message bus (the bus itself is
         // the peer — never fprintd hardware); without one this proves
         // nothing and returns, like the other bus-dependent tests here.
-        let conn = zbus::blocking::Connection::system()
-            .or_else(|_| zbus::blocking::Connection::session())
-            .ok();
+        let conn = zbus::block_on(async {
+            match zbus::Connection::system().await {
+                Ok(conn) => Ok(conn),
+                Err(_) => zbus::Connection::session().await,
+            }
+        })
+        .ok();
         let Some(conn) = conn else { return };
-        let proxy = match zbus::blocking::Proxy::new(
+        let proxy = match zbus::block_on(zbus::Proxy::new(
             &conn,
             "org.freedesktop.DBus",
             "/org/freedesktop/DBus",
             "org.freedesktop.DBus",
-        ) {
+        )) {
             Ok(proxy) => proxy,
             Err(_) => return,
         };
-        let mut signals = match proxy.receive_signal("TunaNoSuchSignalForShutdownTest") {
-            Ok(signals) => signals,
-            Err(_) => return,
-        };
+        let mut signals =
+            match zbus::block_on(proxy.receive_signal("TunaNoSuchSignalForShutdownTest")) {
+                Ok(signals) => signals,
+                Err(_) => return,
+            };
         // A member no one ever emits: the wait below blocks until the
         // shutdown lands. The shutdown runs aside on a clone so the
         // production shape is exact (one thread blocked in `next`,
@@ -2070,14 +2085,14 @@ mod tests {
             .name("tuna-fprintd-test-shutdown".into())
             .spawn(move || {
                 std::thread::sleep(grace);
-                let _ = shutdown.close();
+                let _ = zbus::block_on(shutdown.close());
             })
             .unwrap();
         let start = Instant::now();
-        let item = signals.next();
+        let item = zbus::block_on(signals.next());
         let elapsed = start.elapsed();
         closer.join().unwrap();
-        assert!(item.is_none(), "shut connection ends the iterator");
+        assert!(item.is_none(), "shut connection ends the stream");
         assert!(
             elapsed < JOIN_BUDGET,
             "released within the join budget after shutdown"
@@ -2189,16 +2204,17 @@ mod tests {
         }
 
         /// One more peer on this bus (stub service, client outer handle).
-        fn connect(&self) -> zbus::blocking::Connection {
+        fn connect(&self) -> zbus::Connection {
             self.connect_with_timeout(Duration::from_secs(2))
         }
 
-        fn connect_with_timeout(&self, timeout: Duration) -> zbus::blocking::Connection {
-            zbus::blocking::connection::Builder::address(self.address.as_str())
-                .expect("test address parses")
-                .method_timeout(timeout)
-                .build()
-                .expect("test peer connects")
+        fn connect_with_timeout(&self, timeout: Duration) -> zbus::Connection {
+            zbus::block_on(
+                zbus::connection::Builder::address(self.address.as_str())
+                    .method_timeout(timeout)
+                    .build(),
+            )
+            .expect("test peer connects")
         }
     }
 
@@ -2411,12 +2427,11 @@ mod tests {
     // snake_case to PascalCase); the tests prove the wiring end to end.
     #[zbus::interface(name = "net.reactivated.Fprint.Manager")]
     impl StubManager {
-        fn get_default_device(&self) -> zbus::zvariant::OwnedObjectPath {
-            zbus::zvariant::OwnedObjectPath::try_from(STUB_DEVICE_PATH)
-                .expect("stub device path valid")
+        fn get_default_device(&self) -> zbus::OwnedObjectPath {
+            zbus::OwnedObjectPath::try_from(STUB_DEVICE_PATH).expect("stub device path valid")
         }
 
-        fn get_devices(&self) -> Vec<zbus::zvariant::OwnedObjectPath> {
+        fn get_devices(&self) -> Vec<zbus::OwnedObjectPath> {
             vec![self.get_default_device()]
         }
     }
@@ -2485,7 +2500,7 @@ mod tests {
     /// move: it owns a child process).
     struct FprintStub {
         bus: TestBus,
-        stub_conn: zbus::blocking::Connection,
+        stub_conn: zbus::Connection,
         shared: Arc<StubShared>,
     }
 
@@ -2506,9 +2521,7 @@ mod tests {
             // started private bus; allow CI process contention without
             // changing the client calls' two-second failure bound.
             let stub_conn = bus.connect_with_timeout(Duration::from_secs(10));
-            stub_conn
-                .request_name(BUS_NAME)
-                .expect("stub owns the fprintd name");
+            zbus::block_on(stub_conn.request_name(BUS_NAME)).expect("stub owns the fprintd name");
             let (start_tx, start_rx) = mpsc::channel();
             let (stop_tx, stop_rx) = mpsc::channel();
             let (release_tx, release_rx) = mpsc::channel();
@@ -2522,22 +2535,20 @@ mod tests {
                 release_tx,
             });
             assert!(
-                stub_conn
-                    .object_server()
-                    .at(MANAGER_PATH, StubManager)
-                    .expect("manager serves"),
+                zbus::block_on(stub_conn.object_server().at(MANAGER_PATH, StubManager))
+                    .expect("manager serves")
+                    .is_none(),
                 "manager serves"
             );
             assert!(
-                stub_conn
-                    .object_server()
-                    .at(
-                        STUB_DEVICE_PATH,
-                        StubDevice {
-                            shared: shared.clone()
-                        }
-                    )
-                    .expect("device serves"),
+                zbus::block_on(stub_conn.object_server().at(
+                    STUB_DEVICE_PATH,
+                    StubDevice {
+                        shared: shared.clone()
+                    }
+                ))
+                .expect("device serves")
+                .is_none(),
                 "device serves"
             );
             (
@@ -2567,15 +2578,14 @@ mod tests {
         /// Unique names currently on the private bus (the test's view of
         /// peer connect/disconnect — never a hardware claim).
         fn list_names(&self) -> Vec<String> {
-            let proxy = zbus::blocking::Proxy::new(
+            let proxy = zbus::block_on(zbus::Proxy::new(
                 &self.stub_conn,
                 "org.freedesktop.DBus",
                 "/org/freedesktop/DBus",
                 "org.freedesktop.DBus",
-            )
+            ))
             .expect("dbus proxy builds");
-            proxy
-                .call::<_, _, Vec<String>>("ListNames", &())
+            zbus::block_on(proxy.call::<_, _, Vec<String>>("ListNames", &()))
                 .expect("ListNames answers")
         }
     }
@@ -2585,7 +2595,7 @@ mod tests {
     /// Exits after `rounds` notifications (bounded wait each); the test
     /// joins it at the end.
     fn spawn_emitter(
-        conn: zbus::blocking::Connection,
+        conn: zbus::Connection,
         starts: mpsc::Receiver<()>,
         script: Vec<(String, bool)>,
         rounds: usize,
@@ -2598,13 +2608,13 @@ mod tests {
                         break;
                     }
                     for (result, done) in &script {
-                        conn.emit_signal(
+                        zbus::block_on(conn.emit_signal(
                             None::<()>,
                             STUB_DEVICE_PATH,
                             DEVICE_IFACE,
                             "VerifyStatus",
                             &(result.clone(), *done),
-                        )
+                        ))
                         .expect("stub emits VerifyStatus");
                     }
                 }
@@ -3582,12 +3592,12 @@ mod tests {
         // Independent observer: its own connection, so the dropped
         // attempt's name CAN vanish from its `ListNames` poll.
         let observer = bus.connect();
-        let proxy = zbus::blocking::Proxy::new(
+        let proxy = zbus::block_on(zbus::Proxy::new(
             &observer,
             "org.freedesktop.DBus",
             "/org/freedesktop/DBus",
             "org.freedesktop.DBus",
-        )
+        ))
         .expect("dbus proxy builds");
         // Production setup order against the test bus: bounded unix
         // connect, retain same-socket clones (guard + parent + observe),
@@ -3605,19 +3615,17 @@ mod tests {
         let guard_sock = sock.try_clone().expect("guard clone");
         let parent_shutdown = sock.try_clone().expect("parent clone");
         let observe = sock.try_clone().expect("observe clone");
-        let SetupOutcome::Built(built) =
+        let SetupOutcome::Built(conn) =
             build_attempt_connection(sock, DBUS_CALL_TIMEOUT, Duration::from_secs(10))
         else {
             panic!("attempt connection must build");
         };
-        let conn = zbus::blocking::Connection::from(built);
         let ours = conn
             .unique_name()
             .expect("connection has a unique name")
             .as_str()
             .to_owned();
-        let names: Vec<String> = proxy
-            .call::<_, _, Vec<String>>("ListNames", &())
+        let names: Vec<String> = zbus::block_on(proxy.call::<_, _, Vec<String>>("ListNames", &()))
             .expect("ListNames answers");
         assert!(
             names.iter().any(|listed| listed == &ours),
@@ -3652,9 +3660,9 @@ mod tests {
         );
         let deadline = Instant::now() + JOIN_BUDGET;
         loop {
-            let names: Vec<String> = proxy
-                .call::<_, _, Vec<String>>("ListNames", &())
-                .expect("ListNames answers");
+            let names: Vec<String> =
+                zbus::block_on(proxy.call::<_, _, Vec<String>>("ListNames", &()))
+                    .expect("ListNames answers");
             if !names.iter().any(|listed| listed == &ours) {
                 break;
             }
@@ -3908,15 +3916,14 @@ mod tests {
         // connection's name CAN vanish (a proxy cloned off `conn`
         // would pin the name on the bus past the drop).
         let observer = bus.connect();
-        let proxy = zbus::blocking::Proxy::new(
+        let proxy = zbus::block_on(zbus::Proxy::new(
             &observer,
             "org.freedesktop.DBus",
             "/org/freedesktop/DBus",
             "org.freedesktop.DBus",
-        )
+        ))
         .expect("dbus proxy builds");
-        let names: Vec<String> = proxy
-            .call::<_, _, Vec<String>>("ListNames", &())
+        let names: Vec<String> = zbus::block_on(proxy.call::<_, _, Vec<String>>("ListNames", &()))
             .expect("ListNames answers");
         let ours = conn
             .unique_name()
@@ -3947,9 +3954,9 @@ mod tests {
         // The connection dropped: its bus name vanishes.
         let deadline = Instant::now() + JOIN_BUDGET;
         loop {
-            let names: Vec<String> = proxy
-                .call::<_, _, Vec<String>>("ListNames", &())
-                .expect("ListNames answers");
+            let names: Vec<String> =
+                zbus::block_on(proxy.call::<_, _, Vec<String>>("ListNames", &()))
+                    .expect("ListNames answers");
             if !names.iter().any(|listed| listed == &ours) {
                 break;
             }
@@ -4370,21 +4377,20 @@ mod tests {
         assert!(capacity > 0, "send buffer capacity must be measurable");
         let observe = sock.try_clone().expect("observe clone");
         let rescue = sock.try_clone().expect("rescue clone");
-        let SetupOutcome::Built(async_conn) =
+        let SetupOutcome::Built(conn) =
             build_attempt_connection(sock, Duration::from_secs(5), Duration::from_secs(10))
         else {
             panic!("test connection must build pre-freeze");
         };
-        let conn = zbus::blocking::Connection::from(async_conn);
         // Liveness probe: the path works and the relay still forwards.
-        let probe = zbus::blocking::Proxy::new(
+        let probe = zbus::block_on(zbus::Proxy::new(
             &conn,
             "org.freedesktop.DBus",
             "/org/freedesktop/DBus",
             "org.freedesktop.DBus",
-        )
+        ))
         .expect("probe proxy builds");
-        let _: Vec<String> = probe.call("ListNames", &()).expect("path is live");
+        let _: Vec<String> = zbus::block_on(probe.call("ListNames", &())).expect("path is live");
         // The saturating send runs aside; its completion channel proves
         // parked (empty) versus released (error).
         let payload = "x".repeat(8 * 1024 * 1024);
@@ -4393,7 +4399,6 @@ mod tests {
             DEVICE_IFACE,
             "TunaBackpressureProbe",
         )
-        .expect("probe signal builds")
         .build(&payload)
         .expect("probe payload serializes");
         drop(payload);
@@ -4402,7 +4407,9 @@ mod tests {
         let sender = std::thread::Builder::new()
             .name("tuna-fprintd-test-big-send".into())
             .spawn(move || {
-                send_tx.send(send_conn.send(&big)).expect("send reports");
+                send_tx
+                    .send(zbus::block_on(send_conn.send(&big)))
+                    .expect("send reports");
             })
             .expect("big sender spawns");
         // The send MUST fill the transport: 8MB past a frozen drain.
@@ -4456,7 +4463,7 @@ mod tests {
         let closer = std::thread::Builder::new()
             .name("tuna-fprintd-test-stuck-close".into())
             .spawn(move || {
-                let _ = close_conn.close();
+                let _ = zbus::block_on(close_conn.close());
                 let _ = close_tx.send(());
             })
             .expect("closer spawns");

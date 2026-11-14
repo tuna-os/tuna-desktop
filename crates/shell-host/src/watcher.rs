@@ -14,6 +14,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use futures_lite::StreamExt;
+
 use crate::overview::{
     blit_glyph, glyph_index, put_pixel, ACCENT, BYTES_PER_PIXEL, DOT_GAP, DOT_MARGIN, DOT_SIZE,
     FONT_SCALE, GLYPH_ADVANCE,
@@ -457,8 +459,8 @@ pub fn argb_to_shm(argb: &[u8]) -> Vec<u8> {
 
 /// Parse one dbusmenu layout struct `(id, props, children)` into the
 /// root's visible children, recursively.
-pub fn parse_menu_layout(layout: &zbus::zvariant::OwnedValue) -> Vec<MenuNode> {
-    let Ok(root) = zbus::zvariant::Value::try_from(layout) else {
+pub fn parse_menu_layout(layout: &zbus::OwnedVariant) -> Vec<MenuNode> {
+    let Ok(root) = zbus::Variant::try_from(layout) else {
         return Vec::new();
     };
     match menu_node_fields(&root) {
@@ -470,27 +472,23 @@ pub fn parse_menu_layout(layout: &zbus::zvariant::OwnedValue) -> Vec<MenuNode> {
 /// A node struct's `(id, props, children)`, looking through the variant
 /// wrapper `av` children arrive in.
 fn menu_node_fields<'a>(
-    value: &'a zbus::zvariant::Value<'a>,
-) -> Option<(
-    i32,
-    &'a zbus::zvariant::Dict<'a, 'a>,
-    &'a zbus::zvariant::Array<'a>,
-)> {
-    use zbus::zvariant::Value;
+    value: &'a zbus::Variant<'a>,
+) -> Option<(i32, &'a zbus::Dict<'a, 'a>, &'a zbus::Array<'a>)> {
+    use zbus::Variant;
     let node = match value {
-        Value::Value(inner) => return menu_node_fields(inner),
-        Value::Structure(node) => node,
+        Variant::Variant(inner) => return menu_node_fields(inner),
+        Variant::Structure(node) => node,
         _ => return None,
     };
     match node.fields() {
-        [Value::I32(id), Value::Dict(props), Value::Array(children), ..] => {
+        [Variant::I32(id), Variant::Dict(props), Variant::Array(children), ..] => {
             Some((*id, props, children))
         }
         _ => None,
     }
 }
 
-fn menu_children(children: &zbus::zvariant::Array<'_>) -> Vec<MenuNode> {
+fn menu_children(children: &zbus::Array<'_>) -> Vec<MenuNode> {
     children
         .inner()
         .iter()
@@ -499,43 +497,40 @@ fn menu_children(children: &zbus::zvariant::Array<'_>) -> Vec<MenuNode> {
 }
 
 /// One property's value, looking through its variant wrapper.
-fn menu_prop<'a>(
-    props: &'a zbus::zvariant::Dict<'a, 'a>,
-    key: &str,
-) -> Option<&'a zbus::zvariant::Value<'a>> {
-    use zbus::zvariant::Value;
+fn menu_prop<'a>(props: &'a zbus::Dict<'a, 'a>, key: &str) -> Option<&'a zbus::Variant<'a>> {
+    use zbus::Variant;
     let (_, value) = props
         .iter()
-        .find(|(k, _)| matches!(k, Value::Str(k) if k.as_str() == key))?;
+        .find(|(k, _)| matches!(k, Variant::Str(k) if k.as_str() == key))?;
     Some(match value {
-        Value::Value(inner) => inner,
+        Variant::Variant(inner) => inner,
         other => other,
     })
 }
 
 // Values of the wrong type read as unset, as the extension's
 // `PropertyStore` (`dbusMenu.js` `MandatedTypes`) ignores them.
-fn menu_bool(props: &zbus::zvariant::Dict<'_, '_>, key: &str) -> Option<bool> {
+fn menu_bool(props: &zbus::Dict<'_, '_>, key: &str) -> Option<bool> {
     match menu_prop(props, key)? {
-        zbus::zvariant::Value::Bool(value) => Some(*value),
+        zbus::Variant::Bool(value) => Some(*value),
         _ => None,
     }
 }
 
-fn menu_str(props: &zbus::zvariant::Dict<'_, '_>, key: &str) -> String {
+fn menu_str(props: &zbus::Dict<'_, '_>, key: &str) -> String {
     match menu_prop(props, key) {
-        Some(zbus::zvariant::Value::Str(value)) => value.as_str().to_owned(),
+        Some(zbus::Variant::Str(value)) => value.as_str().to_owned(),
         _ => String::new(),
     }
 }
 
-fn menu_bytes(props: &zbus::zvariant::Dict<'_, '_>, key: &str) -> Vec<u8> {
+fn menu_bytes(props: &zbus::Dict<'_, '_>, key: &str) -> Vec<u8> {
     match menu_prop(props, key) {
-        Some(zbus::zvariant::Value::Array(bytes)) => bytes
+        Some(zbus::Variant::Array(bytes)) => bytes
             .inner()
             .iter()
             .map_while(|byte| match byte {
-                zbus::zvariant::Value::U8(byte) => Some(*byte),
+                zbus::Variant::U8(byte) => Some(*byte),
                 _ => None,
             })
             .collect(),
@@ -544,14 +539,14 @@ fn menu_bytes(props: &zbus::zvariant::Dict<'_, '_>, key: &str) -> Vec<u8> {
 }
 
 /// One node to a [`MenuNode`]; `None` for invisible or malformed nodes.
-fn parse_menu_node(value: &zbus::zvariant::Value<'_>) -> Option<MenuNode> {
+fn parse_menu_node(value: &zbus::Variant<'_>) -> Option<MenuNode> {
     let (id, props, children) = menu_node_fields(value)?;
     if !menu_bool(props, "visible").unwrap_or(true) {
         return None;
     }
     let state = matches!(
         menu_prop(props, "toggle-state"),
-        Some(zbus::zvariant::Value::I32(state)) if *state != 0
+        Some(zbus::Variant::I32(state)) if *state != 0
     );
     let toggle = match menu_str(props, "toggle-type").as_str() {
         "checkmark" => Toggle::Check(state),
@@ -625,7 +620,7 @@ pub enum Registration {
 /// `org.freedesktop.StatusNotifierItem-PID-ID`. `None` for anything else.
 pub fn parse_registration(service: &str, sender: &str) -> Option<Registration> {
     use zbus::names::BusName;
-    use zbus::zvariant::ObjectPath;
+    use zbus::ObjectPath;
     if service.starts_with('/') {
         ObjectPath::try_from(service).ok()?;
         BusName::try_from(sender).ok()?;
@@ -803,14 +798,14 @@ impl ItemMethods {
     }
 }
 
-type Props = std::collections::HashMap<String, zbus::zvariant::OwnedValue>;
+type Props = std::collections::HashMap<String, zbus::OwnedVariant>;
 
 /// One property of a `GetAll` reply, `None` when absent or mistyped.
 fn prop<T>(props: &Props, key: &str) -> Option<T>
 where
-    T: TryFrom<zbus::zvariant::Value<'static>>,
+    T: TryFrom<zbus::Variant<'static>>,
 {
-    let value: zbus::zvariant::Value<'static> = props.get(key)?.try_clone().ok()?.into();
+    let value: zbus::Variant<'static> = props.get(key)?.try_clone().ok()?.into();
     T::try_from(value).ok()
 }
 
@@ -818,7 +813,7 @@ where
 /// (`o`), some items send a plain string; libappindicator's
 /// `/NO_DBUSMENU` and an empty path mean no menu.
 fn menu_path_of(props: &Props) -> Option<String> {
-    let path = prop::<zbus::zvariant::OwnedObjectPath>(props, "Menu")
+    let path = prop::<zbus::OwnedObjectPath>(props, "Menu")
         .map(|path| path.as_str().to_owned())
         .or_else(|| prop::<String>(props, "Menu"))?;
     (!path.is_empty() && path != "/" && path != "/NO_DBUSMENU").then_some(path)
@@ -827,7 +822,7 @@ fn menu_path_of(props: &Props) -> Option<String> {
 /// D-Bus edge behind the host: owns the watcher role when the name
 /// is free and talks to the registered items.
 pub struct WatcherBus {
-    conn: Option<zbus::blocking::Connection>,
+    conn: Option<zbus::Connection>,
     state: Arc<Mutex<WatcherState>>,
 }
 
@@ -855,41 +850,33 @@ impl WatcherBus {
         if self.conn.is_some() {
             return true;
         }
-        let conn = match zbus::blocking::connection::Builder::session() {
-            Ok(builder) => builder.method_timeout(CALL_TIMEOUT),
-            Err(e) => {
-                eprintln!("tuna-shell-host: indicator bus unavailable: {e}");
-                return false;
-            }
-        };
         let watcher = Watcher {
             state: self.state.clone(),
         };
-        let conn = match conn.serve_at(WATCHER_PATH, watcher) {
-            Ok(conn) => conn,
-            Err(e) => {
-                eprintln!("tuna-shell-host: indicator serve failed: {e}");
-                return false;
-            }
-        };
-        let conn = match conn.build() {
+        let builder = zbus::connection::Builder::session()
+            .method_timeout(CALL_TIMEOUT)
+            .serve_at(WATCHER_PATH, watcher);
+        let conn = match zbus::block_on(builder.build()) {
             Ok(conn) => conn,
             Err(e) => {
                 eprintln!("tuna-shell-host: indicator connect failed: {e}");
                 return false;
             }
         };
-        let reply = conn
-            .request_name_with_flags(WATCHER_NAME, zbus::fdo::RequestNameFlags::DoNotQueue.into());
+        let reply = zbus::block_on(
+            conn.request_name_with_flags(WATCHER_NAME, zbus::fdo::RequestNameFlags::DO_NOT_QUEUE),
+        );
         match reply {
             Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
                 // Items waiting for a host (KStatusNotifierItem,
                 // libayatana-appindicator) register on this signal.
-                if let Ok(watcher) = conn.object_server().interface::<_, Watcher>(WATCHER_PATH) {
-                    let _ = zbus::block_on(Watcher::status_notifier_host_registered(
-                        watcher.signal_emitter(),
-                    ));
-                }
+                zbus::block_on(async {
+                    let server = conn.object_server();
+                    if let Ok(watcher) = server.interface::<_, Watcher>(WATCHER_PATH).await {
+                        let _ = Watcher::status_notifier_host_registered(watcher.signal_emitter())
+                            .await;
+                    }
+                });
                 self.conn = Some(conn);
                 true
             }
@@ -916,9 +903,11 @@ impl WatcherBus {
     /// registration, any item's change signal — `NewIcon`, `NewStatus`,
     /// `NewTitle`... — or a registered item's bus name losing its owner)
     /// and whenever a dbusmenu changes. The caller re-reads then,
-    /// instead of on a timer. The signal listeners block on their own
-    /// threads for the connection's life; `wake` runs on those and on
-    /// zbus's. Returns false without a connection
+    /// instead of on a timer. The signal listeners drive their streams
+    /// with [`zbus::block_on`] on their own threads for the connection's
+    /// life; `wake` runs on those and on zbus's, so it hands the change
+    /// on and never calls back into this edge (a nested
+    /// [`zbus::block_on`] panics). Returns false without a connection
     /// ([`WatcherBus::ensure`] first) or when the bus refuses the match
     /// rules, so the caller keeps polling.
     pub fn watch(&self, wake: impl Fn(Change) + Send + Sync + 'static) -> bool {
@@ -931,42 +920,36 @@ impl WatcherBus {
             Menus,
             Owners,
         }
-        let rules = (|| -> zbus::Result<_> {
-            let signals = |interface: &'static str| -> zbus::Result<zbus::MatchRule<'static>> {
-                Ok(zbus::MatchRule::builder()
+        let rules = zbus::block_on(async {
+            let signals = |interface: &'static str| {
+                zbus::MatchRule::builder()
                     .msg_type(zbus::message::Type::Signal)
-                    .interface(interface)?
-                    .build())
+                    .interface(interface)
+                    .build()
             };
             let owners = zbus::MatchRule::builder()
                 .msg_type(zbus::message::Type::Signal)
-                .sender("org.freedesktop.DBus")?
-                .interface("org.freedesktop.DBus")?
-                .member("NameOwnerChanged")?
-                .build();
-            Ok([
+                .sender("org.freedesktop.DBus")
+                .interface("org.freedesktop.DBus")
+                .member("NameOwnerChanged")
+                .build()?;
+            zbus::Result::Ok([
                 (
-                    zbus::blocking::MessageIterator::for_match_rule(
-                        signals(ITEM_INTERFACE)?,
-                        conn,
-                        None,
-                    )?,
+                    zbus::MessageStream::for_match_rule(signals(ITEM_INTERFACE)?, conn, None)
+                        .await?,
                     Listen::Items,
                 ),
                 (
-                    zbus::blocking::MessageIterator::for_match_rule(
-                        signals(MENU_INTERFACE)?,
-                        conn,
-                        None,
-                    )?,
+                    zbus::MessageStream::for_match_rule(signals(MENU_INTERFACE)?, conn, None)
+                        .await?,
                     Listen::Menus,
                 ),
                 (
-                    zbus::blocking::MessageIterator::for_match_rule(owners, conn, None)?,
+                    zbus::MessageStream::for_match_rule(owners, conn, None).await?,
                     Listen::Owners,
                 ),
             ])
-        })();
+        });
         let listeners = match rules {
             Ok(listeners) => listeners,
             Err(e) => {
@@ -978,47 +961,49 @@ impl WatcherBus {
         if let Ok(mut state) = self.state.lock() {
             state.wake = Some(wake.clone());
         }
-        for (messages, listen) in listeners {
+        for (mut messages, listen) in listeners {
             let (wake, state) = (wake.clone(), self.state.clone());
             let spawned = std::thread::Builder::new()
                 .name("tuna-tray-signals".into())
                 .spawn(move || {
-                    for message in messages {
-                        let Ok(message) = message else {
-                            continue;
-                        };
-                        let change = match listen {
-                            Listen::Items => Change::Items,
-                            Listen::Menus => {
-                                let header = message.header();
-                                let member = header.member().map(|m| m.as_str());
-                                if !matches!(
-                                    member,
-                                    Some("LayoutUpdated" | "ItemsPropertiesUpdated")
-                                ) {
-                                    continue;
+                    zbus::block_on(async move {
+                        while let Some(message) = messages.next().await {
+                            let Ok(message) = message else {
+                                continue;
+                            };
+                            let change = match listen {
+                                Listen::Items => Change::Items,
+                                Listen::Menus => {
+                                    let header = message.header();
+                                    let member = header.member().map(|m| m.as_str());
+                                    if !matches!(
+                                        member,
+                                        Some("LayoutUpdated" | "ItemsPropertiesUpdated")
+                                    ) {
+                                        continue;
+                                    }
+                                    let Some(sender) = header.sender() else {
+                                        continue;
+                                    };
+                                    Change::Menu(sender.as_str().to_owned())
                                 }
-                                let Some(sender) = header.sender() else {
-                                    continue;
-                                };
-                                Change::Menu(sender.as_str().to_owned())
-                            }
-                            Listen::Owners => {
-                                let Ok((name, _, new_owner)) =
-                                    message.body().deserialize::<(String, String, String)>()
-                                else {
-                                    continue;
-                                };
-                                let items =
-                                    state.lock().map(|s| s.items.clone()).unwrap_or_default();
-                                if !vanished_item(&items, &name, &new_owner) {
-                                    continue;
+                                Listen::Owners => {
+                                    let Ok((name, _, new_owner)) =
+                                        message.body().deserialize::<(String, String, String)>()
+                                    else {
+                                        continue;
+                                    };
+                                    let items =
+                                        state.lock().map(|s| s.items.clone()).unwrap_or_default();
+                                    if !vanished_item(&items, &name, &new_owner) {
+                                        continue;
+                                    }
+                                    Change::Items
                                 }
-                                Change::Items
-                            }
-                        };
-                        (wake.0)(change);
-                    }
+                            };
+                            (wake.0)(change);
+                        }
+                    })
                 });
             if let Err(e) = spawned {
                 eprintln!("tuna-shell-host: indicator signal thread: {e}");
@@ -1039,33 +1024,38 @@ impl WatcherBus {
         body: &B,
     ) -> Option<R>
     where
-        B: zbus::export::serde::Serialize + zbus::zvariant::DynamicType,
-        R: for<'d> zbus::export::serde::Deserialize<'d> + zbus::zvariant::Type,
+        B: zbus::export::serde::Serialize + zbus::DynamicType,
+        R: for<'d> zbus::export::serde::Deserialize<'d> + zbus::Type,
     {
         let conn = self.conn.as_ref()?;
         let (bus, _) = split_service(service);
-        let reply = conn
-            .call_method(Some(bus.as_str()), path, Some(interface), method, body)
-            .ok()?;
+        let reply = zbus::block_on(conn.call_method(
+            Some(bus.as_str()),
+            path,
+            Some(interface),
+            method,
+            body,
+        ))
+        .ok()?;
         reply.body().deserialize::<R>().ok()
     }
 
     /// Call an item method; true when it answered without an error.
     fn call_item<B>(&self, service: &str, method: &str, body: &B) -> bool
     where
-        B: zbus::export::serde::Serialize + zbus::zvariant::DynamicType,
+        B: zbus::export::serde::Serialize + zbus::DynamicType,
     {
         let Some(conn) = self.conn.as_ref() else {
             return false;
         };
         let (bus, path) = split_service(service);
-        conn.call_method(
+        zbus::block_on(conn.call_method(
             Some(bus.as_str()),
             path.as_str(),
             Some(ITEM_INTERFACE),
             method,
             body,
-        )
+        ))
         .is_ok()
     }
 
@@ -1145,19 +1135,18 @@ impl WatcherBus {
     pub fn menu_tree(&self, service: &str, menu_path: &str) -> Option<Vec<MenuNode>> {
         let conn = self.conn.as_ref()?;
         let (bus, _) = split_service(service);
-        let reply = conn
-            .call_method(
-                Some(bus.as_str()),
-                menu_path,
-                Some(MENU_INTERFACE),
-                "GetLayout",
-                &(0i32, -1i32, Vec::<String>::new()),
-            )
-            .ok()?;
+        let reply = zbus::block_on(conn.call_method(
+            Some(bus.as_str()),
+            menu_path,
+            Some(MENU_INTERFACE),
+            "GetLayout",
+            &(0i32, -1i32, Vec::<String>::new()),
+        ))
+        .ok()?;
         // The reply is `(u(ia{sv}av))`, a revision and the layout struct
         // (not a variant): read it dynamically and hand the struct on.
         let body = reply.body();
-        let top = body.deserialize::<zbus::zvariant::Structure>().ok()?;
+        let top = body.deserialize::<zbus::Structure>().ok()?;
         let layout = top.fields().get(1)?.try_to_owned().ok()?;
         Some(parse_menu_layout(&layout))
     }
@@ -1189,13 +1178,13 @@ impl WatcherBus {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
-        conn.call_method(
+        zbus::block_on(conn.call_method(
             Some(bus.as_str()),
             menu_path,
             Some(MENU_INTERFACE),
             "Event",
-            &(id, kind, zbus::zvariant::Value::I32(0), stamp),
-        )
+            &(id, kind, zbus::Variant::I32(0), stamp),
+        ))
         .is_ok()
     }
 
@@ -1241,13 +1230,13 @@ impl WatcherBus {
             .iter()
             .filter(|service| {
                 let (bus, _) = split_service(service);
-                conn.call_method(
+                zbus::block_on(conn.call_method(
                     Some("org.freedesktop.DBus"),
                     "/org/freedesktop/DBus",
                     Some("org.freedesktop.DBus"),
                     "GetNameOwner",
                     &(bus.as_str(),),
-                )
+                ))
                 .is_ok()
             })
             .cloned()
@@ -1276,18 +1265,21 @@ impl WatcherBus {
         let Some(conn) = self.conn.as_ref() else {
             return;
         };
-        let Ok(watcher) = conn.object_server().interface::<_, Watcher>(WATCHER_PATH) else {
-            return;
-        };
-        let emitter = watcher.signal_emitter();
-        for service in &removed {
-            let _ = zbus::block_on(Watcher::status_notifier_item_unregistered(emitter, service));
-        }
-        let _ = zbus::block_on(
-            watcher
+        zbus::block_on(async {
+            let server = conn.object_server();
+            let Ok(watcher) = server.interface::<_, Watcher>(WATCHER_PATH).await else {
+                return;
+            };
+            let emitter = watcher.signal_emitter();
+            for service in &removed {
+                let _ = Watcher::status_notifier_item_unregistered(emitter, service).await;
+            }
+            let _ = watcher
                 .get()
-                .registered_status_notifier_items_changed(emitter),
-        );
+                .await
+                .registered_status_notifier_items_changed(emitter)
+                .await;
+        });
     }
 }
 
@@ -1588,35 +1580,38 @@ mod tests {
 
     /// Test-only dbusmenu layout builder: mirrors the wire shape the
     /// parser reads (root node struct with id, `a{sv}` props, and an
-    /// `av` children array), built from [`zbus::zvariant::Value`].
+    /// `av` children array), built from [`zbus::Variant`].
     mod layout_fixture {
-        use zbus::zvariant::{Array, Dict, OwnedValue, Signature, Str, StructureBuilder, Value};
+        use zbus::{Array, Dict, OwnedVariant, Signature, Str, Structure, Variant};
 
-        fn str_value(text: &'static str) -> Value<'static> {
-            Value::Str(Str::from(text))
+        fn str_value(text: &'static str) -> Variant<'static> {
+            Variant::Str(Str::from(text))
         }
 
         /// One `(id, props, children)` node struct value.
         pub fn node(
             id: i32,
-            props: Vec<(&'static str, Value<'static>)>,
-            children: Vec<Value<'static>>,
-        ) -> Value<'static> {
+            props: Vec<(&'static str, Variant<'static>)>,
+            children: Vec<Variant<'static>>,
+        ) -> Variant<'static> {
             let mut dict = Dict::new(&Signature::Str, &Signature::Variant);
             for (key, value) in props {
-                dict.append(Value::Str(Str::from(key)), Value::Value(Box::new(value)))
-                    .expect("test props fit a{sv}");
+                dict.append(
+                    Variant::Str(Str::from(key)),
+                    Variant::Variant(Box::new(value)),
+                )
+                .expect("test props fit a{sv}");
             }
             let mut kids = Array::new(&Signature::Variant);
             for child in children {
-                kids.append(Value::Value(Box::new(child)))
+                kids.append(Variant::Variant(Box::new(child)))
                     .expect("test children fit av");
             }
-            Value::Structure(
-                StructureBuilder::new()
-                    .append_field(Value::I32(id))
-                    .append_field(Value::Dict(dict))
-                    .append_field(Value::Array(kids))
+            Variant::Structure(
+                Structure::builder()
+                    .append_field(Variant::I32(id))
+                    .append_field(Variant::Dict(dict))
+                    .append_field(Variant::Array(kids))
                     .build()
                     .expect("test node builds"),
             )
@@ -1627,7 +1622,7 @@ mod tests {
         /// but no `children-display` (shown as a plain row, as the
         /// extension does), and a submenu holding toggles, an icon, a
         /// mistyped property and a nested submenu.
-        pub fn layout() -> OwnedValue {
+        pub fn layout() -> OwnedVariant {
             let grandchild = node(61, vec![("label", str_value("Sub"))], Vec::new());
             let nested = node(
                 75,
@@ -1649,7 +1644,7 @@ mod tests {
                         vec![
                             ("label", str_value("Show _Hidden")),
                             ("toggle-type", str_value("checkmark")),
-                            ("toggle-state", Value::I32(1)),
+                            ("toggle-state", Variant::I32(1)),
                         ],
                         Vec::new(),
                     ),
@@ -1658,7 +1653,7 @@ mod tests {
                         vec![
                             ("label", str_value("Small")),
                             ("toggle-type", str_value("radio")),
-                            ("toggle-state", Value::I32(0)),
+                            ("toggle-state", Variant::I32(0)),
                         ],
                         Vec::new(),
                     ),
@@ -1667,7 +1662,7 @@ mod tests {
                         vec![
                             ("label", str_value("Large")),
                             ("toggle-type", str_value("radio")),
-                            ("toggle-state", Value::I32(1)),
+                            ("toggle-state", Variant::I32(1)),
                             ("icon-name", str_value("zoom-in-symbolic")),
                         ],
                         Vec::new(),
@@ -1689,8 +1684,8 @@ mod tests {
                         1,
                         vec![
                             ("label", str_value("Open")),
-                            ("enabled", Value::Bool(true)),
-                            ("visible", Value::Bool(true)),
+                            ("enabled", Variant::Bool(true)),
+                            ("visible", Variant::Bool(true)),
                             ("type", str_value("standard")),
                         ],
                         Vec::new(),
@@ -1699,7 +1694,7 @@ mod tests {
                         2,
                         vec![
                             ("label", str_value("Quit")),
-                            ("enabled", Value::Bool(false)),
+                            ("enabled", Variant::Bool(false)),
                         ],
                         Vec::new(),
                     ),
@@ -1716,7 +1711,7 @@ mod tests {
                         5,
                         vec![
                             ("label", str_value("Hidden")),
-                            ("visible", Value::Bool(false)),
+                            ("visible", Variant::Bool(false)),
                         ],
                         Vec::new(),
                     ),
@@ -1726,7 +1721,7 @@ mod tests {
                     options,
                 ],
             );
-            OwnedValue::try_from(root).expect("test layout converts")
+            OwnedVariant::try_from(root).expect("test layout converts")
         }
     }
 
@@ -1814,8 +1809,7 @@ mod tests {
 
     #[test]
     fn menu_layout_rejects_non_structures() {
-        let garbage =
-            zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Value::U32(7)).expect("converts");
+        let garbage = zbus::OwnedVariant::try_from(zbus::Variant::U32(7)).expect("converts");
         assert!(parse_menu_layout(&garbage).is_empty());
     }
 
@@ -1925,6 +1919,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
 
+        use futures_lite::StreamExt;
+
         use super::layout_fixture;
         use super::{
             argb_to_shm, menu_entries, parse_menu_layout, IndicatorIcon, IndicatorItem,
@@ -1996,8 +1992,8 @@ mod tests {
 
             #[zbus(property)]
             /// Typed `o`, as the StatusNotifierItem spec has it.
-            fn menu(&self) -> zbus::zvariant::OwnedObjectPath {
-                zbus::zvariant::OwnedObjectPath::try_from(MENU_PATH).expect("valid path")
+            fn menu(&self) -> zbus::OwnedObjectPath {
+                zbus::OwnedObjectPath::try_from(MENU_PATH).expect("valid path")
             }
 
             fn activate(&self, _x: i32, _y: i32) {
@@ -2028,24 +2024,23 @@ mod tests {
 
         type SpecLayout = (
             i32,
-            std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
-            Vec<zbus::zvariant::OwnedValue>,
+            std::collections::HashMap<String, zbus::OwnedVariant>,
+            Vec<zbus::OwnedVariant>,
         );
 
         /// The fixture's root node as the typed spec struct.
-        fn spec_layout(root: zbus::zvariant::OwnedValue) -> SpecLayout {
-            use zbus::zvariant::{Structure, Value};
-            let value: Value<'static> = root.into();
+        fn spec_layout(root: zbus::OwnedVariant) -> SpecLayout {
+            use zbus::{Structure, Variant};
+            let value: Variant<'static> = root.into();
             let root = Structure::try_from(value).expect("root struct");
             let mut fields = root.into_fields().into_iter();
             let id = i32::try_from(fields.next().expect("id")).expect("i32 id");
-            let props = std::collections::HashMap::<String, zbus::zvariant::OwnedValue>::try_from(
+            let props = std::collections::HashMap::<String, zbus::OwnedVariant>::try_from(
                 fields.next().expect("props"),
             )
             .expect("props dict");
-            let children =
-                Vec::<zbus::zvariant::OwnedValue>::try_from(fields.next().expect("children"))
-                    .expect("children array");
+            let children = Vec::<zbus::OwnedVariant>::try_from(fields.next().expect("children"))
+                .expect("children array");
             (id, props, children)
         }
 
@@ -2069,7 +2064,7 @@ mod tests {
                 true
             }
 
-            fn event(&self, id: i32, kind: String, _data: zbus::zvariant::OwnedValue, _stamp: u32) {
+            fn event(&self, id: i32, kind: String, _data: zbus::OwnedVariant, _stamp: u32) {
                 self.events.lock().expect("test lock").push((id, kind));
             }
         }
@@ -2136,37 +2131,29 @@ mod tests {
             let stub_icon = Arc::new(Mutex::new(String::new()));
             let scrolled = Arc::new(Mutex::new(Vec::new()));
             let events = Arc::new(Mutex::new(Vec::new()));
-            let mut stub: Option<zbus::blocking::Connection> = None;
+            let mut stub: Option<zbus::Connection> = None;
             for _ in 0..50 {
-                match zbus::blocking::connection::Builder::address(address.as_str()) {
-                    Ok(builder) => {
-                        match builder
-                            .serve_at(
-                                ITEM_PATH,
-                                StubItem {
-                                    activated: activated.clone(),
-                                    secondary: secondary.clone(),
-                                    icon_name: stub_icon.clone(),
-                                    scrolled: scrolled.clone(),
-                                },
-                            )
-                            .and_then(|builder| {
-                                builder.serve_at(
-                                    MENU_PATH,
-                                    StubMenu {
-                                        events: events.clone(),
-                                    },
-                                )
-                            })
-                            .and_then(|builder| builder.name(STUB_NAME))
-                            .and_then(|builder| builder.build())
-                        {
-                            Ok(conn) => {
-                                stub = Some(conn);
-                                break;
-                            }
-                            Err(_) => std::thread::sleep(Duration::from_millis(100)),
-                        }
+                let builder = zbus::connection::Builder::address(address.as_str())
+                    .serve_at(
+                        ITEM_PATH,
+                        StubItem {
+                            activated: activated.clone(),
+                            secondary: secondary.clone(),
+                            icon_name: stub_icon.clone(),
+                            scrolled: scrolled.clone(),
+                        },
+                    )
+                    .serve_at(
+                        MENU_PATH,
+                        StubMenu {
+                            events: events.clone(),
+                        },
+                    )
+                    .name(STUB_NAME);
+                match zbus::block_on(builder.build()) {
+                    Ok(conn) => {
+                        stub = Some(conn);
+                        break;
                     }
                     Err(_) => std::thread::sleep(Duration::from_millis(100)),
                 }
@@ -2190,27 +2177,35 @@ mod tests {
 
             // The watcher's own signals, read from a second client so
             // the stub can later leave the bus.
-            let observer = zbus::blocking::connection::Builder::address(address.as_str())
-                .and_then(|builder| builder.build())
-                .expect("observer connects");
+            let observer =
+                zbus::block_on(zbus::connection::Builder::address(address.as_str()).build())
+                    .expect("observer connects");
             let watcher_signals = zbus::MatchRule::builder()
                 .msg_type(zbus::message::Type::Signal)
                 .interface(WATCHER_NAME)
-                .expect("interface rule")
-                .build();
-            let signals =
-                zbus::blocking::MessageIterator::for_match_rule(watcher_signals, &observer, None)
-                    .expect("watcher signals subscribe");
+                .build()
+                .expect("interface rule");
+            let mut signals = zbus::block_on(zbus::MessageStream::for_match_rule(
+                watcher_signals,
+                &observer,
+                None,
+            ))
+            .expect("watcher signals subscribe");
             let (signal_tx, signal_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                for message in signals.flatten() {
-                    let header = message.header();
-                    let member = header.member().map(|m| m.to_string()).unwrap_or_default();
-                    let arg = message.body().deserialize::<(String,)>().ok().map(|a| a.0);
-                    if signal_tx.send((member, arg)).is_err() {
-                        return;
+                zbus::block_on(async move {
+                    while let Some(message) = signals.next().await {
+                        let Ok(message) = message else {
+                            continue;
+                        };
+                        let header = message.header();
+                        let member = header.member().map(|m| m.to_string()).unwrap_or_default();
+                        let arg = message.body().deserialize::<(String,)>().ok().map(|a| a.0);
+                        if signal_tx.send((member, arg)).is_err() {
+                            return;
+                        }
                     }
-                }
+                })
             });
             let next_signal = || signal_rx.recv_timeout(Duration::from_secs(10)).ok();
 
@@ -2238,13 +2233,18 @@ mod tests {
             // real item does: by name, again by name, and by its object
             // path alone (libayatana-appindicator's form). All three are
             // one item, announced once.
-            let watcher =
-                zbus::blocking::Proxy::new(&stub_conn, WATCHER_NAME, WATCHER_PATH, WATCHER_NAME)
-                    .expect("watcher proxy builds");
+            let watcher = zbus::block_on(zbus::Proxy::new(
+                &stub_conn,
+                WATCHER_NAME,
+                WATCHER_PATH,
+                WATCHER_NAME,
+            ))
+            .expect("watcher proxy builds");
             for registration in [named.as_str(), named.as_str(), ITEM_PATH] {
-                watcher
-                    .call::<&str, _, ()>("RegisterStatusNotifierItem", &(registration,))
-                    .expect("register over D-Bus");
+                zbus::block_on(
+                    watcher.call::<&str, _, ()>("RegisterStatusNotifierItem", &(registration,)),
+                )
+                .expect("register over D-Bus");
             }
             assert_eq!(bus.registered(), vec![service.clone()]);
             assert_eq!(
@@ -2254,23 +2254,30 @@ mod tests {
                     Some(service.clone())
                 ))
             );
-            let watched: Vec<String> = watcher
-                .get_property("RegisteredStatusNotifierItems")
-                .expect("watcher items property reads");
+            let watched: Vec<String> =
+                zbus::block_on(watcher.get_property("RegisteredStatusNotifierItems"))
+                    .expect("watcher items property reads");
             assert_eq!(watched, vec![service.clone()]);
-            assert!(watcher
-                .get_property::<bool>("IsStatusNotifierHostRegistered")
-                .expect("host property reads"));
+            assert!(
+                zbus::block_on(watcher.get_property::<bool>("IsStatusNotifierHostRegistered"))
+                    .expect("host property reads")
+            );
             // Unresolvable names and other hosts are refused.
-            assert!(watcher
-                .call::<&str, _, ()>("RegisterStatusNotifierItem", &("org.test.TunaGhost/Item",))
-                .is_err());
-            assert!(watcher
-                .call::<&str, _, ()>("RegisterStatusNotifierItem", &("not a name",))
-                .is_err());
-            assert!(watcher
-                .call::<&str, _, ()>("RegisterStatusNotifierHost", &("org.test.Host",))
-                .is_err());
+            assert!(zbus::block_on(
+                watcher.call::<&str, _, ()>(
+                    "RegisterStatusNotifierItem",
+                    &("org.test.TunaGhost/Item",)
+                )
+            )
+            .is_err());
+            assert!(zbus::block_on(
+                watcher.call::<&str, _, ()>("RegisterStatusNotifierItem", &("not a name",))
+            )
+            .is_err());
+            assert!(zbus::block_on(
+                watcher.call::<&str, _, ()>("RegisterStatusNotifierHost", &("org.test.Host",))
+            )
+            .is_err());
             assert_eq!(bus.registered(), vec![service.clone()]);
 
             let item: IndicatorItem = bus.fetch_item(&service).expect("stub item fetches");

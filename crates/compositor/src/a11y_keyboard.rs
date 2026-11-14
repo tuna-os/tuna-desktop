@@ -1,6 +1,7 @@
 //! GNOME's native KeyboardMonitor, restricted to our unreaped Orca child.
 //! Bus credentials are resolved off the seat thread. Signals are unicast and
 //! carry a lifetime/lock epoch; raw keys never cross the locked-session route.
+use futures_lite::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::process::{Child, Command};
 use std::sync::{mpsc, Arc, Mutex};
@@ -359,19 +360,25 @@ impl Monitor {
     }
     fn serve(&self, incoming: mpsc::Receiver<Event>) {
         let result = (|| -> zbus::Result<()> {
-            let conn = zbus::blocking::connection::Builder::session()?.build()?;
+            let conn = zbus::block_on(zbus::connection::Builder::session().build())?;
             // Install revocation before exporting a callable interface.
             let rule = zbus::MatchRule::builder()
                 .msg_type(zbus::message::Type::Signal)
-                .sender("org.freedesktop.DBus")?
-                .interface("org.freedesktop.DBus")?
-                .member("NameOwnerChanged")?
-                .build();
-            let changes = zbus::blocking::MessageIterator::for_match_rule(rule, &conn, Some(1024))?;
+                .sender("org.freedesktop.DBus")
+                .interface("org.freedesktop.DBus")
+                .member("NameOwnerChanged")
+                .build()?;
+            let mut changes = zbus::block_on(zbus::MessageStream::for_match_rule(
+                rule,
+                &conn,
+                std::num::NonZeroUsize::new(1024),
+            ))?;
             let watcher = self.clone();
             let watch_conn = conn.clone();
             std::thread::spawn(move || {
-                for change in changes {
+                // One item at a time: an Orca change makes its own
+                // `block_on` call below.
+                while let Some(change) = zbus::block_on(changes.next()) {
                     let Ok(change) = change else {
                         watcher.revoke_reader();
                         break;
@@ -383,13 +390,12 @@ impl Monitor {
                             let pid = if new.is_empty() {
                                 None
                             } else {
-                                zbus::blocking::fdo::DBusProxy::new(&watch_conn)
-                                    .ok()
-                                    .and_then(|dbus| {
-                                        zbus::names::BusName::try_from(new.as_str()).ok().and_then(
-                                            |owner| dbus.get_connection_unix_process_id(owner).ok(),
-                                        )
-                                    })
+                                zbus::block_on(async {
+                                    let dbus = fdo::DBusProxy::new(&watch_conn).await.ok()?;
+                                    let owner =
+                                        zbus::names::BusName::try_from(new.as_str()).ok()?;
+                                    dbus.get_connection_unix_process_id(owner).await.ok()
+                                })
                             };
                             let mut inner = watcher.inner.lock().unwrap();
                             if pid != Some(inner.pid) {
@@ -401,16 +407,17 @@ impl Monitor {
                     }
                 }
             });
-            if conn.request_name_with_flags(NAME, fdo::RequestNameFlags::DoNotQueue.into())?
-                != fdo::RequestNameReply::PrimaryOwner
+            if zbus::block_on(
+                conn.request_name_with_flags(NAME, fdo::RequestNameFlags::DO_NOT_QUEUE),
+            )? != fdo::RequestNameReply::PrimaryOwner
             {
                 self.inner.lock().unwrap().available = Availability::Conflict;
-                conn.close()?;
+                zbus::block_on(conn.close())?;
                 return Ok(());
             }
-            let exported = conn.object_server().at(PATH, self.clone());
+            let exported = zbus::block_on(conn.object_server().at(PATH, self.clone()));
             if let Err(error) = exported {
-                let _ = conn.close();
+                let _ = zbus::block_on(conn.close());
                 return Err(error);
             }
             self.inner.lock().unwrap().available = Availability::Ready;
@@ -454,7 +461,7 @@ impl Monitor {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
-            conn.close()?;
+            zbus::block_on(conn.close())?;
             delivery
         })();
         if result.is_err() {
@@ -548,8 +555,8 @@ impl Monitor {
     }
 }
 
-fn emit_key(conn: &zbus::blocking::Connection, owner: &str, key: Key) -> zbus::Result<()> {
-    conn.emit_signal(
+fn emit_key(conn: &Connection, owner: &str, key: Key) -> zbus::Result<()> {
+    zbus::block_on(conn.emit_signal(
         Some(owner),
         PATH,
         INTERFACE,
@@ -561,7 +568,7 @@ fn emit_key(conn: &zbus::blocking::Connection, owner: &str, key: Key) -> zbus::R
             key.unichar,
             key.keycode,
         ),
-    )
+    ))
 }
 /// One serialized emitter records only successfully disclosed custom presses.
 /// Reset is a reliable slot, not a raw queued event. Send completion/FIFO order

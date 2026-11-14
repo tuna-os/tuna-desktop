@@ -30,15 +30,15 @@ use tuna_compositor::mutter::WindowSnapshot;
 use tuna_shell_control::introspect::{
     FORWARDED_INTERFACE, GET_RUNNING_APPLICATIONS_FOR, GET_WINDOWS_FOR, INTERFACE, PATH,
 };
-use zbus::zvariant::OwnedValue;
+use zbus::OwnedVariant;
 
 const SHELL: &str = "org.gnome.Shell";
 const ACCESS_DENIED: &str = "org.freedesktop.DBus.Error.AccessDenied";
 const IMPOSTOR_ADDRESS: &str = "TUNA_INTROSPECT_TEST_IMPOSTOR_ADDRESS";
 const IMPOSTOR_VICTIM: &str = "TUNA_INTROSPECT_TEST_IMPOSTOR_VICTIM";
 
-type Apps = HashMap<String, HashMap<String, OwnedValue>>;
-type WindowList = HashMap<u64, HashMap<String, OwnedValue>>;
+type Apps = HashMap<String, HashMap<String, OwnedVariant>>;
+type WindowList = HashMap<u64, HashMap<String, OwnedVariant>>;
 
 fn window(id: u64, app: &str, sandboxed: Option<&str>, focused: bool) -> WindowSnapshot {
     WindowSnapshot {
@@ -129,7 +129,7 @@ struct Session {
     handle: introspect::Handle,
     authority: Authority,
     shell: Option<Shell>,
-    client: zbus::blocking::Connection,
+    client: zbus::Connection,
 }
 
 impl Drop for Session {
@@ -140,12 +140,13 @@ impl Drop for Session {
     }
 }
 
-fn connect(address: &str) -> zbus::blocking::Connection {
-    zbus::blocking::connection::Builder::address(address)
-        .unwrap()
-        .method_timeout(Duration::from_secs(5))
-        .build()
-        .unwrap()
+fn connect(address: &str) -> zbus::Connection {
+    zbus::block_on(
+        zbus::connection::Builder::address(address)
+            .method_timeout(Duration::from_secs(5))
+            .build(),
+    )
+    .unwrap()
 }
 
 fn session(windows: Vec<WindowSnapshot>) -> Session {
@@ -163,7 +164,7 @@ fn session(windows: Vec<WindowSnapshot>) -> Session {
     authority.publish(false, Some(std::process::id()));
     let handle = introspect::Handle::default();
     handle.publish(windows);
-    let builder = zbus::blocking::connection::Builder::address(address.as_str()).unwrap();
+    let builder = zbus::connection::Builder::address(address.as_str());
     assert!(introspect::serve(builder, &handle, authority.clone()).unwrap());
     let shell = Shell::start(&address);
     let client = connect(&address);
@@ -177,14 +178,16 @@ fn session(windows: Vec<WindowSnapshot>) -> Session {
     }
 }
 
-fn call_shell(client: &zbus::blocking::Connection, method: &str) -> zbus::Result<zbus::Message> {
-    client.call_method(Some(SHELL), PATH, Some(INTERFACE), method, &())
+fn call_shell(client: &zbus::Connection, method: &str) -> zbus::Result<zbus::Message> {
+    zbus::block_on(client.call_method(Some(SHELL), PATH, Some(INTERFACE), method, &()))
 }
 
 fn error_name(result: zbus::Result<zbus::Message>) -> String {
+    use zbus::DBusError as _;
     match result {
         Ok(_) => "answered".into(),
         Err(zbus::Error::MethodError(name, _, _)) => name.to_string(),
+        Err(zbus::Error::FDO(e)) => e.name().to_string(),
         Err(other) => format!("{other}"),
     }
 }
@@ -229,19 +232,19 @@ fn an_admitted_caller_reads_sandboxed_apps_and_windows_through_org_gnome_shell()
     );
 
     // The portal's GDBus proxy loads the properties with GetAll.
-    let properties = zbus::blocking::fdo::PropertiesProxy::builder(&session.client)
-        .destination(SHELL)
-        .unwrap()
-        .path(PATH)
-        .unwrap()
-        .build()
-        .unwrap();
+    let properties = zbus::block_on(
+        zbus::fdo::PropertiesProxy::builder(&session.client)
+            .destination(SHELL)
+            .path(PATH)
+            .build(),
+    )
+    .unwrap();
     let interface = zbus::names::InterfaceName::try_from(INTERFACE).unwrap();
-    let all = properties.get_all(interface.clone()).unwrap();
+    let all = zbus::block_on(properties.get_all(interface.clone())).unwrap();
     assert_eq!(u32::try_from(all["version"].clone()).unwrap(), 3);
     assert!(bool::try_from(all["AnimationsEnabled"].clone()).unwrap());
     assert!(all.contains_key("ScreenSize"));
-    let version = properties.get(interface, "version").unwrap();
+    let version = zbus::block_on(properties.get(interface, "version")).unwrap();
     assert_eq!(u32::try_from(version).unwrap(), 3);
 }
 
@@ -295,20 +298,19 @@ fn an_unadmitted_caller_is_denied_through_org_gnome_shell() {
 /// forwarded interface directly naming the admitted caller.
 fn impostor(address: &str, victim: &str) {
     let conn = connect(address);
-    conn.request_name("org.freedesktop.impl.portal.desktop.gnome")
-        .unwrap();
+    zbus::block_on(conn.request_name("org.freedesktop.impl.portal.desktop.gnome")).unwrap();
     for method in ["GetRunningApplications", "GetWindows"] {
         let answer = error_name(call_shell(&conn, method));
         println!("impostor: {method} {answer}");
     }
     for method in [GET_RUNNING_APPLICATIONS_FOR, GET_WINDOWS_FOR] {
-        let answer = error_name(conn.call_method(
+        let answer = error_name(zbus::block_on(conn.call_method(
             Some(tuna_shell_control::introspect::NAME),
             PATH,
             Some(FORWARDED_INTERFACE),
             method,
             &(victim,),
-        ));
+        )));
         println!("impostor: {method} {answer}");
     }
 }
@@ -336,31 +338,40 @@ fn a_locked_session_denies_the_list_through_org_gnome_shell() {
 #[test]
 fn compositor_change_signals_reach_subscribers_on_org_gnome_shell() {
     let session = session(vec![window(1, "org.gnome.TextEditor", None, true)]);
-    let owner = zbus::blocking::fdo::DBusProxy::new(&session.client)
-        .unwrap()
-        .get_name_owner(SHELL.try_into().unwrap())
-        .unwrap();
+    let owner = zbus::block_on(async {
+        zbus::fdo::DBusProxy::new(&session.client)
+            .await?
+            .get_name_owner(SHELL.try_into().unwrap())
+            .await
+    })
+    .unwrap();
     // The portal's proxy matches on the org.gnome.Shell owner.
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .sender(owner.as_str())
-        .unwrap()
         .path(PATH)
-        .unwrap()
         .interface(INTERFACE)
-        .unwrap()
-        .build();
-    let signals =
-        zbus::blocking::MessageIterator::for_match_rule(rule, &session.client, Some(16)).unwrap();
+        .build()
+        .unwrap();
+    let mut signals = zbus::block_on(zbus::MessageStream::for_match_rule(
+        rule,
+        &session.client,
+        std::num::NonZeroUsize::new(16),
+    ))
+    .unwrap();
     let (seen, received) = mpsc::channel();
     std::thread::spawn(move || {
-        for message in signals.flatten() {
-            let member = message.header().member().map(|m| m.to_string());
-            let sender = message.header().sender().map(|s| s.to_string());
-            if seen.send((member, sender)).is_err() {
-                break;
+        use futures_lite::StreamExt as _;
+        zbus::block_on(async move {
+            while let Some(message) = signals.next().await {
+                let Ok(message) = message else { continue };
+                let member = message.header().member().map(|m| m.to_string());
+                let sender = message.header().sender().map(|s| s.to_string());
+                if seen.send((member, sender)).is_err() {
+                    break;
+                }
             }
-        }
+        })
     });
     session.handle.publish(vec![
         window(1, "org.gnome.TextEditor", None, true),

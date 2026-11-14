@@ -10,7 +10,7 @@ use crate::windows::ManagerInput;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use zbus::blocking::Connection;
+use zbus::Connection;
 
 const IC: &str = "org.gnome.Mutter.InputCapture";
 const SESSION: &str = "org.gnome.Mutter.InputCapture.Session";
@@ -36,23 +36,30 @@ fn bus() -> Bus {
     Bus(child, address.trim().to_owned())
 }
 fn connect(bus: &Bus) -> Connection {
-    zbus::blocking::connection::Builder::address(bus.1.as_str())
-        .unwrap()
-        .method_timeout(Duration::from_secs(5))
-        .build()
-        .unwrap()
+    zbus::block_on(
+        zbus::connection::Builder::address(bus.1.as_str())
+            .method_timeout(Duration::from_secs(5))
+            .build(),
+    )
+    .unwrap()
 }
 fn session<B>(conn: &Connection, method: &str, body: &B) -> zbus::Result<zbus::Message>
 where
-    B: serde::Serialize + zbus::zvariant::DynamicType,
+    B: serde::Serialize + zbus::DynamicType,
 {
-    conn.call_method(Some(IC), PATH, Some(SESSION), method, body)
+    zbus::block_on(conn.call_method(Some(IC), PATH, Some(SESSION), method, body))
 }
+/// zbus 6 reports fdo-named error replies as `Error::FDO`, any other
+/// name as `Error::MethodError`.
 #[track_caller]
 fn assert_error(result: zbus::Result<zbus::Message>, name: &str) {
+    let expected = format!("org.freedesktop.DBus.Error.{name}");
     match result {
         Err(zbus::Error::MethodError(error, _, _)) => {
-            assert_eq!(error.as_str(), format!("org.freedesktop.DBus.Error.{name}"));
+            assert_eq!(error.as_str(), expected);
+        }
+        Err(zbus::Error::FDO(error)) => {
+            assert_eq!(zbus::DBusError::name(&*error).as_str(), expected);
         }
         other => panic!("expected {name}, got {other:?}"),
     }
@@ -62,21 +69,32 @@ fn signals(conn: &Connection) -> std::sync::mpsc::Receiver<(String, zbus::Messag
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .interface(SESSION)
-        .unwrap()
-        .build();
-    let iterator = zbus::blocking::MessageIterator::for_match_rule(rule, conn, Some(64)).unwrap();
+        .build()
+        .unwrap();
+    let mut stream = zbus::block_on(zbus::MessageStream::for_match_rule(
+        rule,
+        conn,
+        std::num::NonZeroUsize::new(64),
+    ))
+    .unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        for message in iterator.flatten() {
-            let member = message
-                .header()
-                .member()
-                .map(|m| m.to_string())
-                .unwrap_or_default();
-            if tx.send((member, message)).is_err() {
-                return;
+        use futures_lite::StreamExt as _;
+        zbus::block_on(async {
+            while let Some(message) = stream.next().await {
+                let Ok(message) = message else {
+                    continue;
+                };
+                let member = message
+                    .header()
+                    .member()
+                    .map(|m| m.to_string())
+                    .unwrap_or_default();
+                if tx.send((member, message)).is_err() {
+                    return;
+                }
             }
-        }
+        })
     });
     rx
 }
@@ -102,54 +120,50 @@ fn only_the_installed_portal_may_create_input_capture_sessions() {
     let (to_loop, _from_dbus) = calloop::channel::channel();
     let authority = crate::capture_security::Authority::default();
     let sessions: input_capture::CaptureSessions = Default::default();
-    let _server = zbus::blocking::connection::Builder::address(bus.1.as_str())
-        .unwrap()
-        .serve_at(
-            "/org/gnome/Mutter/InputCapture",
-            InputCapture {
-                authority: authority.clone(),
-                sessions: sessions.clone(),
-                outputs: Default::default(),
-                to_loop,
-                signals: crate::dbus_signals::SignalQueue::new("test-input-capture-signals"),
-                next_id: Arc::new(AtomicU64::new(1)),
-                scan: Default::default(),
-            },
-        )
-        .unwrap()
-        .name(IC)
-        .unwrap()
-        .build()
-        .unwrap();
+    let _server = zbus::block_on(
+        zbus::connection::Builder::address(bus.1.as_str())
+            .serve_at(
+                "/org/gnome/Mutter/InputCapture",
+                InputCapture {
+                    authority: authority.clone(),
+                    sessions: sessions.clone(),
+                    outputs: Default::default(),
+                    to_loop,
+                    signals: crate::dbus_signals::SignalQueue::new("test-input-capture-signals"),
+                    next_id: Arc::new(AtomicU64::new(1)),
+                    scan: Default::default(),
+                },
+            )
+            .name(IC)
+            .build(),
+    )
+    .unwrap();
     let caller = connect(&bus);
     let create = || {
-        caller.call_method(
+        zbus::block_on(caller.call_method(
             Some(IC),
             "/org/gnome/Mutter/InputCapture",
             Some(IC),
             "CreateSession",
             &(3u32,),
-        )
+        ))
     };
     // SupportedCapabilities: keyboard and pointer, as the XML numbers them.
-    let supported: OwnedValue = caller
-        .call_method(
-            Some(IC),
-            "/org/gnome/Mutter/InputCapture",
-            Some("org.freedesktop.DBus.Properties"),
-            "Get",
-            &(IC, "SupportedCapabilities"),
-        )
-        .unwrap()
-        .body()
-        .deserialize()
-        .unwrap();
+    let supported: OwnedVariant = zbus::block_on(caller.call_method(
+        Some(IC),
+        "/org/gnome/Mutter/InputCapture",
+        Some("org.freedesktop.DBus.Properties"),
+        "Get",
+        &(IC, "SupportedCapabilities"),
+    ))
+    .unwrap()
+    .body()
+    .deserialize()
+    .unwrap();
     assert_eq!(u32::try_from(supported).unwrap(), 3);
     assert_error(create(), "AccessDenied");
     // Owning the portal backend's name is not being the installed portal.
-    caller
-        .request_name("org.freedesktop.impl.portal.desktop.gnome")
-        .unwrap();
+    zbus::block_on(caller.request_name("org.freedesktop.impl.portal.desktop.gnome")).unwrap();
     assert_error(create(), "AccessDenied");
     authority.publish(true, None);
     assert_error(create(), "AccessDenied");
@@ -191,7 +205,7 @@ fn loop_requests(from_dbus: calloop::channel::Channel<ToLoop>) -> (Warps, Arc<At
 
 /// A receiver EIS client on `fd` that binds everything and reports
 /// what it receives.
-fn eis_receiver(fd: zbus::zvariant::OwnedFd) -> std::sync::mpsc::Receiver<String> {
+fn eis_receiver(fd: zbus::OwnedFd) -> std::sync::mpsc::Receiver<String> {
     use reis::event::{DeviceCapability, EiEvent};
     let stream = std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from(fd));
     let (tx, rx) = std::sync::mpsc::channel();
@@ -245,13 +259,13 @@ fn an_input_capture_session_follows_mutter_from_barrier_to_release() {
     let outputs: Outputs = Arc::new(Mutex::new(vec![monitor("DP-1", 0), monitor("DP-2", 1920)]));
     let (to_loop, from_dbus) = calloop::channel::channel();
     let (warps, stop) = loop_requests(from_dbus);
-    let server = zbus::blocking::connection::Builder::address(bus.1.as_str())
-        .unwrap()
-        .name(IC)
-        .unwrap()
-        .build()
-        .unwrap();
-    let emitter = SignalEmitter::new(server.inner(), PATH)
+    let server = zbus::block_on(
+        zbus::connection::Builder::address(bus.1.as_str())
+            .name(IC)
+            .build(),
+    )
+    .unwrap();
+    let emitter = SignalEmitter::new(&server, PATH)
         .unwrap()
         .to_owned()
         .set_destination(zbus::names::BusName::try_from(owner_name.clone()).unwrap());
@@ -266,19 +280,17 @@ fn an_input_capture_session_follows_mutter_from_barrier_to_release() {
     ));
     let mut router = Router::default();
     router.sessions().lock().unwrap().insert(1, shared.clone());
-    server
-        .object_server()
-        .at(
-            PATH,
-            CaptureSession {
-                shared: shared.clone(),
-                sessions: router.sessions(),
-                authority: authority.clone(),
-                outputs: outputs.clone(),
-                to_loop,
-            },
-        )
-        .unwrap();
+    zbus::block_on(server.object_server().at(
+        PATH,
+        CaptureSession {
+            shared: shared.clone(),
+            sessions: router.sessions(),
+            authority: authority.clone(),
+            outputs: outputs.clone(),
+            to_loop,
+        },
+    ))
+    .unwrap();
     let mine = signals(&owner);
     let theirs = signals(&foreign);
     let next = |member: &str| loop {
@@ -318,7 +330,7 @@ fn an_input_capture_session_follows_mutter_from_barrier_to_release() {
         .unwrap();
     assert_eq!(id, 1);
     assert_error(
-        session(&owner, "Release", &(HashMap::<&str, Value>::new(),)),
+        session(&owner, "Release", &(HashMap::<&str, Variant>::new(),)),
         "AccessDenied",
     );
     assert_error(session(&owner, "Disable", &()), "Failed");
@@ -331,7 +343,7 @@ fn an_input_capture_session_follows_mutter_from_barrier_to_release() {
     assert_error(session(&owner, "Enable", &()), "Failed");
 
     // A receiver EIS client gets a pointer and a keyboard.
-    let fd: zbus::zvariant::OwnedFd = session(&owner, "ConnectToEIS", &())
+    let fd: zbus::OwnedFd = session(&owner, "ConnectToEIS", &())
         .unwrap()
         .body()
         .deserialize()
@@ -392,12 +404,17 @@ fn an_input_capture_session_follows_mutter_from_barrier_to_release() {
 
     // Release: a malformed position is refused; a good one deactivates,
     // stops emulating and warps the pointer.
-    let position = |value: Value<'static>| HashMap::from([("cursor_position", value)]);
+    let position = |value: Variant<'static>| HashMap::from([("cursor_position", value)]);
     assert_error(
-        session(&owner, "Release", &(position(Value::from(7u32)),)),
+        session(&owner, "Release", &(position(Variant::from(7u32)),)),
         "InvalidArgs",
     );
-    session(&owner, "Release", &(position(Value::from((100.0, 200.0))),)).unwrap();
+    session(
+        &owner,
+        "Release",
+        &(position(Variant::from((100.0, 200.0))),),
+    )
+    .unwrap();
     let deactivated: u32 = next("Deactivated").body().deserialize().unwrap();
     assert_eq!(deactivated, 1);
     assert_eq!(eis.recv_timeout(Duration::from_secs(5)).unwrap(), "stop");
@@ -407,7 +424,7 @@ fn an_input_capture_session_follows_mutter_from_barrier_to_release() {
     }
     assert_eq!(*warps.lock().unwrap(), vec![(100.0, 200.0)]);
     assert_error(
-        session(&owner, "Release", &(HashMap::<&str, Value>::new(),)),
+        session(&owner, "Release", &(HashMap::<&str, Variant>::new(),)),
         "AccessDenied",
     );
     // The foreign connection heard none of it.

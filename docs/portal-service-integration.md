@@ -56,10 +56,11 @@ Every compositor service has the same shape; `screenshot.rs:255-294` is
 the smallest complete example, and `mutter.rs:1211-1405` the largest.
 
 1. **Own thread, own connection.** `start()` spawns a named thread. The
-   thread builds a `zbus::blocking` session connection and serves each
-   object with `serve_at`.
+   thread builds a session connection with `zbus::block_on` (zbus 6 has
+   no blocking API; its runtime keeps serving the connection after
+   `block_on` returns) and serves each object with `serve_at`.
 2. **Claim the name without queueing.** The thread calls
-   `request_name_with_flags(NAME, DoNotQueue)`. On anything but
+   `request_name_with_flags(NAME, DO_NOT_QUEUE)`. On anything but
    `PrimaryOwner` it logs `<name> is taken; … off` and the service stays
    down. Nested inside a real GNOME session, GNOME already owns these
    names, so Tuna Desktop's copies stay off and the host keeps working.

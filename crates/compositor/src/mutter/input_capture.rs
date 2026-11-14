@@ -33,8 +33,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use zbus::object_server::SignalEmitter;
-use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
-use zbus::{fdo, interface, ObjectServer};
+use zbus::{fdo, interface, ObjectServer, OwnedObjectPath, OwnedVariant, Variant};
 
 /// `SupportedCapabilities` as the XML documents it: 1 KEYBOARD,
 /// 2 POINTER (4 TOUCH is not captured, as mutter's event routing
@@ -917,15 +916,15 @@ impl CaptureSession {
 }
 
 /// `Release`'s `cursor_position` option, `(dd)`.
-fn cursor_position(options: &HashMap<String, OwnedValue>) -> fdo::Result<Option<(f64, f64)>> {
+fn cursor_position(options: &HashMap<String, OwnedVariant>) -> fdo::Result<Option<(f64, f64)>> {
     let Some(value) = options.get("cursor_position") else {
         return Ok(None);
     };
     let invalid = || fdo::Error::InvalidArgs("cursor_position must be (dd)".into());
-    let Value::Structure(position) = &**value else {
+    let Variant::Structure(position) = &**value else {
         return Err(invalid());
     };
-    let [Value::F64(x), Value::F64(y)] = position.fields() else {
+    let [Variant::F64(x), Variant::F64(y)] = position.fields() else {
         return Err(invalid());
     };
     super::remote_desktop::finite_pair(*x, *y)?;
@@ -976,7 +975,7 @@ impl CaptureSession {
     async fn connect_to_eis(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
-    ) -> fdo::Result<zbus::zvariant::OwnedFd> {
+    ) -> fdo::Result<zbus::OwnedFd> {
         self.admitted(&header)?;
         let (reply, answer) = std::sync::mpsc::channel();
         self.to_loop
@@ -996,7 +995,7 @@ impl CaptureSession {
     /// pointer to `cursor_position` when given.
     async fn release(
         &self,
-        options: HashMap<String, OwnedValue>,
+        options: HashMap<String, OwnedVariant>,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> fdo::Result<()> {
         self.admitted(&header)?;
@@ -1774,21 +1773,21 @@ mod tests {
 
     #[test]
     fn release_cursor_position_must_be_a_finite_pair() {
-        let options = |value: Value<'static>| {
+        let options = |value: Variant<'static>| {
             HashMap::from([(
                 "cursor_position".to_owned(),
-                OwnedValue::try_from(value).unwrap(),
+                OwnedVariant::try_from(value).unwrap(),
             )])
         };
         assert_eq!(cursor_position(&HashMap::new()).unwrap(), None);
         assert_eq!(
-            cursor_position(&options(Value::from((12.5, 40.0)))).unwrap(),
+            cursor_position(&options(Variant::from((12.5, 40.0)))).unwrap(),
             Some((12.5, 40.0))
         );
         for bad in [
-            Value::from((1u32, 2u32)),
-            Value::from(3.0),
-            Value::from((f64::NAN, 0.0)),
+            Variant::from((1u32, 2u32)),
+            Variant::from(3.0),
+            Variant::from((f64::NAN, 0.0)),
         ] {
             assert!(cursor_position(&options(bad)).is_err());
         }
