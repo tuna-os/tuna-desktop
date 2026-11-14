@@ -31,6 +31,31 @@ macro_rules! eprintln {
     }};
 }
 
+/// A GResource bundle built into the binary (`$OUT_DIR/$name`),
+/// pointer-aligned.
+///
+/// GResource copies data that is not pointer-aligned onto the heap
+/// (`g_resource_new_from_data`), and `include_bytes!` promises no
+/// alignment: the on-screen keyboard's layouts were a 1.4 MiB copy the
+/// shell kept for life. Aligned, the bundle stays in the binary's
+/// read-only pages.
+macro_rules! bundled_resource {
+    ($name:literal) => {{
+        #[repr(C, align(16))]
+        struct Aligned<T: ?Sized>(T);
+        static BUNDLE: &Aligned<[u8]> =
+            &Aligned(*include_bytes!(concat!(env!("OUT_DIR"), "/", $name)));
+        &BUNDLE.0
+    }};
+}
+
+/// Register a [`bundled_resource!`] with GLib.
+fn register_resource(bundle: &'static [u8]) -> Result<(), glib::Error> {
+    let resource = gio::Resource::from_data(&glib::Bytes::from_static(bundle))?;
+    gio::resources_register(&resource);
+    Ok(())
+}
+
 /// Serializes tests that share GLib's process-global dispatch state.
 ///
 /// GSettings `changed` delivery and default-`MainContext` ownership interact:
@@ -2043,11 +2068,11 @@ fn build(app: &adw::Application) {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
         // GNOME Shell's bundled icons (dark-mode, screenshooter...).
-        gio::resources_register_include!("icons.gresource").ok();
+        register_resource(bundled_resource!("icons.gresource")).ok();
         gtk::IconTheme::for_display(&display).add_resource_path("/org/tuna/Shell/icons");
     }
     // GNOME Shell's on-screen keyboard layouts and emoji list.
-    gio::resources_register_include!("osk-layouts.gresource").ok();
+    register_resource(bundled_resource!("osk-layouts.gresource")).ok();
     // GNOME's icon theme key, applied the way gnome-settings-daemon's
     // xsettings plugin applies it to GTK.
     if let (Some(gtk_settings), Some(iface)) =
@@ -2094,6 +2119,18 @@ fn build(app: &adw::Application) {
             std::mem::forget(iface);
         }
     }
+    // GNOME Shell's carets never blink: StEntry shows ClutterText's
+    // cursor on key focus in and hides it on focus out (st-entry.c:551,
+    // :559, hidden until focus :1086), and ClutterText
+    // (clutter/pango/clutter-text.c) has only a static cursor-visible
+    // flag; neither reads the desktop's cursor-blink keys, which are for
+    // applications. GTK's blink fades the caret on every frame until its
+    // timeout, so a focused shell entry (overview search, lock password,
+    // run dialog) would redraw and commit at the display rate (#503).
+    // The setting is this process's: launched apps keep their own.
+    if let Some(gtk_settings) = gtk::Settings::default() {
+        gtk_settings.set_gtk_cursor_blink(false);
+    }
     // The shell chrome is always dark, as in GNOME.
     adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
 
@@ -2108,6 +2145,8 @@ fn build(app: &adw::Application) {
     window.set_anchor(Edge::Right, true);
     window.auto_exclusive_zone_enable();
     window.set_keyboard_mode(KeyboardMode::OnDemand);
+    // A stale AT-SPI child index must resolve to a mapped window (#1077).
+    accessibility::keep_last_toplevel(&window);
 
     let pills = gtk::Box::new(gtk::Orientation::Horizontal, 5);
     pills.set_valign(gtk::Align::Center);

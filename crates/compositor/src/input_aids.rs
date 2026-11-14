@@ -385,6 +385,22 @@ impl InputAids {
         out
     }
 
+    /// When [`poll`](Self::poll) next has a timer to run, on the clock its
+    /// `now` is read from (#503): the loop sleeps until then instead of
+    /// meeting the timer on whatever tick comes next.
+    pub fn next_deadline(&self) -> Option<u64> {
+        let shift_hold = self.shift_held_since.map(|since| since + SHIFT_HOLD_MS);
+        let slow = self
+            .slow_pending
+            .iter()
+            .map(|(_, deadline)| *deadline)
+            .min();
+        [shift_hold, slow, self.mouse_next]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
     /// A stamp in the backend's base for an event made now.
     fn stamp(&self, now: u64) -> u32 {
         let (time, at) = self.anchor;
@@ -1201,6 +1217,40 @@ mod tests {
         run(&mut aids, &[(A, true, 2000)]);
         aids.configure(&KeyboardAids::default(), 2010);
         assert!(keys(&aids.poll(5000)).is_empty());
+    }
+
+    /// #503: the loop sleeps until the next timer instead of meeting it on
+    /// whatever tick comes next, so every pending timer names its time and
+    /// a served one stops being reported.
+    #[test]
+    fn pending_timers_report_when_they_are_due() {
+        let mut aids = with(KeyboardAids {
+            slow: true,
+            slow_delay_ms: 300,
+            ..KeyboardAids::default()
+        });
+        assert_eq!(aids.next_deadline(), None, "nothing is pending");
+        run(&mut aids, &[(A, true, 1000), (B, true, 1100)]);
+        assert_eq!(aids.next_deadline(), Some(1300), "the oldest press");
+        assert!(keys(&aids.poll(1299)).is_empty());
+        assert_eq!(keys(&aids.poll(1300)), vec![(A, true)]);
+        assert_eq!(aids.next_deadline(), Some(1400), "then the next one");
+        assert_eq!(keys(&aids.poll(1400)), vec![(B, true)]);
+        assert_eq!(aids.next_deadline(), None, "served timers are gone");
+        // A press released before its delay leaves no timer behind.
+        run(&mut aids, &[(A, false, 1500), (B, false, 1500)]);
+        run(&mut aids, &[(A, true, 2000), (A, false, 2100)]);
+        assert_eq!(aids.next_deadline(), None);
+
+        // The Shift-hold shortcut: due eight seconds into the hold.
+        let mut aids = with(KeyboardAids {
+            shortcuts: true,
+            ..KeyboardAids::default()
+        });
+        run(&mut aids, &[(SHIFT_LEFT, true, 500)]);
+        assert_eq!(aids.next_deadline(), Some(500 + SHIFT_HOLD_MS));
+        aids.poll(500 + SHIFT_HOLD_MS);
+        assert_eq!(aids.next_deadline(), None);
     }
 
     #[test]

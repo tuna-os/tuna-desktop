@@ -139,6 +139,9 @@ It requires actual Cancel/Allow, a linked PipeWire frame, foreign input denial,
 legacy and EIS keyboard/button delivery, node removal after Close/client/backend
 loss/EIS disconnect/lock, and new-session lock denial. Candidate commit, runtime
 versions, consent screenshots, input logs and frame evidence accompany the run.
+A failed run names the failing command or the wait that expired and prints the
+end of each component log; the complete logs stay in the `remote-security`
+artifact, and the exit status is the proof's.
 
 The libei sender keeps its EIS descriptor open until the parent observes fresh
 keyboard and button delivery in that actual GTK client, then acknowledges the
@@ -151,6 +154,12 @@ The real-libeis `tests/remote-desktop-reference/eis-lifetime.c` regression delay
 consumption beyond the former sleep, requires both evdev key/button pairs and
 the absolute pointer frame while connected, acknowledges them, then requires
 the actual disconnect. It runs before the nested portal journey.
+After the acknowledgement the probe reaps the sender (exit status 0) before it
+dispatches libeis again. libeis 1.6 answers each interface release, and a reply
+that meets the sender's closed socket makes it drop the client without a
+disconnect event; a dispatch during the sender's teardown could therefore read
+the releases and never see the disconnect request behind them (#1064). The
+unchanged two-second bound covers both the sender's exit and the event.
 The lifetime probe reserves its own `/dev/null` stdin before allocating the
 EIS and acknowledgement descriptors, including when the container inherited
 a closed stdin. Once its sender receipt is read, that pipe is removed from
