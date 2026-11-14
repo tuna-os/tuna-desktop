@@ -1,0 +1,153 @@
+#!/usr/bin/python3
+"""Distil a GNOME 51 motion capture into tests/gnome-reference/motion-reference.json.
+
+Usage: tuna-motion-reference [--capture DIR] [--out FILE]
+
+DIR is the output of `scripts/tuna-gnome-reference --motion` (motion.json,
+its frames and image.txt; default target/gnome-reference-motion). The
+reference keeps GNOME's actor values and the pixel probes measured on its
+frames, reduced by scripts/lib/motion_pairing.py to the numbers
+scripts/tuna-motion-pairing-proof measures on Tuna Desktop at the same
+animation times.
+"""
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(root / "scripts/lib"))
+import motion_pairing as mp  # noqa: E402
+
+p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+p.add_argument("--capture", type=Path, default=root / "target/gnome-reference-motion")
+p.add_argument("--out", type=Path, default=root / "tests/gnome-reference/motion-reference.json")
+a = p.parse_args()
+capture = json.loads((a.capture / "motion.json").read_text())
+frames = mp.Frames(a.capture)
+families = capture["families"]
+monitor_w = int(capture["monitor"].split("x")[0])
+
+
+def actor(sample, role):
+    found = [x for x in sample["actors"] if x["role"] == role]
+    if len(found) != 1:
+        raise SystemExit(f"expected one {role} actor, got {len(found)}")
+    return found[0]
+
+
+def transform(name, fam, role="window"):
+    first, last = fam["samples"][0], fam["samples"][-1]
+    if name.endswith("destroy") or name.endswith("destroy-undim"):
+        without, full = fam["settled_png"], first["png"]
+    else:
+        without, full = (capture["baseline_png"] if role == "window" else None), fam["settled_png"]
+    out = []
+    for s in fam["samples"]:
+        x = actor(s, role)
+        row = {"t_ms": s["t_ms"], "opacity": x["opacity"] / 255,
+               "rect": mp.normalise(x["extents"], x["buffer_rect"])}
+        if role == "window" and without:
+            row["body_alpha"] = mp.body_alpha(frames(s["png"]), frames(without), frames(full),
+                                              mp.frame_drawn(x["extents"], x["buffer_rect"], x["frame_rect"]),
+                                              x["frame_rect"])
+        out.append(row)
+    return out
+
+
+def dialog(name, fam):
+    rows = transform(name, fam, "dialog")
+    undimmed = fam["samples"][0]["png"] if "map" in name else fam["settled_png"]
+    for row, s in zip(rows, fam["samples"]):
+        parent = actor(s, "window")
+        row["multiplier"] = 1 + parent["dim"]["brightness"]
+        row["pixel_multiplier"] = mp.pixel_multiplier(frames(s["png"]), frames(undimmed),
+                                                      mp.parent_probe(parent["frame_rect"]))
+    return rows
+
+
+def minimize(name, fam):
+    motion = name in ("minimize", "unminimize")
+    if name == "unminimize":
+        without, full = fam["samples"][0]["png"], fam["settled_png"]
+    else:
+        without, full = fam["settled_png"], fam["samples"][0]["png"]
+    out = []
+    for s in fam["samples"]:
+        x = actor(s, "window")
+        row = {"t_ms": s["t_ms"], "opacity": x["opacity"] / 255}
+        if motion:
+            row["progress"] = mp.toward(x["extents"], x["buffer_rect"], mp.corner(monitor_w))
+        else:
+            row["rect"] = mp.normalise(x["extents"], x["buffer_rect"])
+        row["body_alpha"] = mp.body_alpha(frames(s["png"]), frames(without), frames(full),
+                                          mp.frame_drawn(x["extents"], x["buffer_rect"], x["frame_rect"]),
+                                          x["frame_rect"])
+        out.append(row)
+    return out
+
+
+def size(name, fam):
+    old = actor(fam["samples"][0], "clone")["extents"]
+    new = next(x for x in fam["settled"] if x["role"] == "window")["frame_rect"]
+    out = []
+    for s in fam["samples"]:
+        clone, win = actor(s, "clone"), actor(s, "window")
+        row = {"t_ms": s["t_ms"]}
+        row.update(mp.size_metrics(clone["extents"], clone["opacity"] / 255, win["frame_drawn"], old, new))
+        out.append(row)
+    return out, old, new
+
+
+reference = {
+    "gnome": {
+        "gnome_shell": capture["gnome_shell"],
+        "monitor": capture["monitor"],
+        "image": (a.capture / "image.txt").read_text().split(),
+        "motion_js_sha256": hashlib.sha256((root / "tests/gnome-reference/motion.js").read_bytes()).hexdigest(),
+        "source": "https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/ui/windowManager.js",
+    },
+    "tolerance": mp.TOLERANCE,
+    "families": {},
+}
+for name, fam in families.items():
+    cls = mp.family_class(name)
+    entry = {"class": cls, "transitions": fam["transitions"]}
+    if cls == "transform":
+        entry["samples"] = transform(name, fam)
+    elif cls == "dialog":
+        entry["samples"] = dialog(name, fam)
+    elif cls == "minimize":
+        entry["samples"] = minimize(name, fam)
+    elif cls == "size":
+        entry["samples"], entry["old_frame"], entry["new_frame"] = size(name, fam)
+    else:
+        if fam["transitions"]:
+            raise SystemExit(f"{name}: GNOME animated an effect expected to be instant")
+        entry["instant"] = True
+    reference["families"][name] = entry
+
+
+# Each frame must show the actor values recorded with it: where a probe
+# reads the window body, its opacity agrees with the actor's (a stale
+# frame would not).
+for name, entry in reference["families"].items():
+    for s in entry.get("samples", []):
+        for value, pixels, tol in (("opacity", "body_alpha", mp.TOLERANCE["body_alpha"]),
+                                   ("multiplier", "pixel_multiplier", mp.TOLERANCE["pixel_multiplier"])):
+            if s.get(pixels) is not None and abs(s[pixels] - s[value]) > tol:
+                raise SystemExit(f"{name} {s['t_ms']} ms: frame shows {pixels} {s[pixels]:.3f}, actor {value} {s[value]:.3f}")
+
+def rounded(value):
+    if isinstance(value, float):
+        return round(value, 5)
+    if isinstance(value, list):
+        return [rounded(v) for v in value]
+    if isinstance(value, dict):
+        return {k: rounded(v) for k, v in value.items()}
+    return value
+
+
+a.out.write_text(json.dumps(rounded(reference), indent=1) + "\n")
+print(f"tuna-motion-reference: {len(reference['families'])} GNOME {capture['gnome_shell']} families -> {a.out}")
