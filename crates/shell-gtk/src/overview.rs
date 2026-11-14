@@ -1782,11 +1782,7 @@ impl OverviewUi {
             // Settled short of the app grid it never showed.
             return;
         }
-        let Some(toggle) = me
-            .dash_row
-            .last_child()
-            .and_then(|w| w.downcast::<gtk::ToggleButton>().ok())
-        else {
+        let Some(toggle) = me.show_apps.as_ref().map(|(toggle, _)| toggle.clone()) else {
             return;
         };
         if toggle.is_active() == grid {
