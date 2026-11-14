@@ -5,17 +5,23 @@
 #   scripts/tuna-gtk-shell-proof [--display :N] [--artifacts DIR]
 #   --screenshot-keys-only runs panel readiness and actual keyboard captures only.
 #   --a11y-focus-only runs panel readiness, G-FOCUS-RING, G-FOCUS-RING-TIMEOUT,
-#   G-A11Y-MENU-RESTART and G-SHELL-STABLE only.
+#   G-A11Y-MENU-CLOSE-STABLE, G-A11Y-MENU-RESTART and G-SHELL-STABLE only.
 #   --tray-only runs panel readiness and the AppIndicator pointer, library,
 #   keyboard and X11 tray gates only.
 #   --grid-hover-only runs panel readiness, G-GRID-HOVER, G-GRID-REORDER,
-#   and G-SHELL-STABLE only.
+#   G-GRID-ON-DEMAND and G-SHELL-STABLE only.
 #   --keyboard-routes-only runs panel readiness and the P-A11Y-02 keyboard
 #   route gates (G-PANEL-MENU-KEYS, G-QS-MENU-KEY, G-NOTIFICATION-KEYS,
 #   G-SCREENSHOT-CTRL-C) only.
 #   --x11-frames-only runs panel readiness, the P-WM-10 X11 frame gates
 #   (G-X11-FRAME, G-X11-FRAME-ACTIONS, G-X11-FRAME-CSD,
 #   G-X11-FRAME-RECOVERY) and G-SHELL-STABLE only.
+#   --search-leak-only runs panel readiness, G-SEARCH-LEAK (50 searches with
+#   results leave shm mappings and descriptors where they were, #1084) and
+#   G-SHELL-STABLE only.
+#   --window-leak-only runs panel readiness, G-WINDOW-LEAK (100 libadwaita
+#   windows opened and closed leave the compositor's memory within a fixed
+#   bound of its warm state, #1088) and G-SHELL-STABLE only.
 #   --grid-cancel-only --grid-cancel-admission FILE is an exact CI comparison slice.
 #   --expect-grid-cancel-old-negative is permitted only in that admitted slice.
 #
@@ -23,6 +29,8 @@
 # on a private session bus with the AT-SPI accessibility bus, then:
 #   G-PANEL     the panel maps (frame differs from the bare session)
 #   A11Y-PANEL  the panel controls are exposed to screen readers by name
+#   G-SHELL-CAIRO on software GL the compositor starts the shell with
+#               GSK_RENDERER=cairo and the shell loads no Mesa rasterizer (#503)
 #   G-CAL-EVENTS the calendar server's events for today list in the date
 #               menu's events card, timed as GNOME formats them
 #   G-CAL-OPEN  clicking the clock opens the calendar popover (xdg popup
@@ -38,6 +46,10 @@
 #   G-GRID-DRAG-PAGE a dragged app held at the grid's edge turns the page
 #   G-GRID-REORDER  an app dropped on a tile's edge moves there (saved
 #                   to app-picker-layout)
+#   G-GRID-ON-DEMAND the app grid's tiles exist only while it shows: none
+#                   on the window picker or after close; a held swipe up
+#                   and Show Apps list an app installed meanwhile; Down
+#                   and Right walk the tiles (#503)
 #   G-FOLDER-DND    dragging an app onto another makes a GNOME folder of
 #                   them; dragging one out of the folder dialog removes it
 #   G-APP-GRID-PAGES enough apps page the grid: indicators and arrows show,
@@ -111,6 +123,8 @@
 #                    (tests/protocols/gnome51-globals.tsv, P-SY-06)
 #   G-OV-SHELL-UI  the overview shows the search entry and the dash
 #   G-OV-SEARCH typing lists matching apps (#57)
+#   G-OV-SEARCH-STILL the focused, unchanged overview search draws no
+#               frames: the shell's caret is steady, as GNOME's (#503)
 #   G-OV-LAUNCH Enter launches the top result and closes the overview
 #   G-OV-APPGRID Show Apps opens the app grid
 #   G-X11-APP      XWayland is on by default: an X11 app launched from
@@ -410,6 +424,11 @@
 #   G-FOCUS-RING-TIMEOUT keyboard-focus-visible-timeout clears a real
 #                  key's indication at the toolkit's 3 s by default, at
 #                  2 s and 5 s when set, never at 0, with focus kept
+#   G-A11Y-MENU-CLOSE-STABLE two readers walk the shell's whole AT-SPI tree
+#                  in a loop across 20 rounds of the window menu, quick
+#                  settings, the calendar and a banner opening and closing;
+#                  the shell process survives and no accessible object path
+#                  is NULL (#1077, GNOME/gtk#8444)
 #   G-A11Y-MENU-RESTART a menu row toggled with real keys persists across
 #                  one deliberate shell restart and the restarted menu
 #                  follows the settings live
@@ -483,6 +502,8 @@ TRAY_ONLY=0
 GRID_HOVER_ONLY=0
 KEYBOARD_ROUTES_ONLY=0
 X11_FRAMES_ONLY=0
+SEARCH_LEAK_ONLY=0
+WINDOW_LEAK_ONLY=0
 GRID_CANCEL_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
 GRID_CANCEL_ADMISSION=""
@@ -499,16 +520,18 @@ while [ $# -gt 0 ]; do
         --grid-hover-only) GRID_HOVER_ONLY=1; shift ;;
         --keyboard-routes-only) KEYBOARD_ROUTES_ONLY=1; shift ;;
         --x11-frames-only) X11_FRAMES_ONLY=1; shift ;;
+        --search-leak-only) SEARCH_LEAK_ONLY=1; shift ;;
+        --window-leak-only) WINDOW_LEAK_ONLY=1; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
-        --help|-h) sed -n '2,25p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,31p' "$0"; exit 0 ;;
         *) echo "tuna-gtk-shell-proof: unknown argument $1" >&2; exit 1 ;;
     esac
 done
 if [ "$GRID_HOVER_ONLY" = 1 ] && { [ "$SCREENSHOT_KEYS_ONLY" = 1 ] || [ "$A11Y_FOCUS_ONLY" = 1 ] || [ "$GRID_CANCEL_ONLY" = 1 ] || [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; }; then
     echo "--grid-hover-only cannot be combined with other focused or grid admission flags" >&2; exit 1
 fi
-if [ "$X11_FRAMES_ONLY" = 1 ] && { [ "$INSTALLED_PACKAGE" = 1 ] || [ "$SCREENSHOT_KEYS_ONLY" = 1 ] || [ "$A11Y_FOCUS_ONLY" = 1 ] || [ "$TRAY_ONLY" = 1 ] || [ "$GRID_HOVER_ONLY" = 1 ] || [ "$KEYBOARD_ROUTES_ONLY" = 1 ] || [ "$GRID_CANCEL_ONLY" = 1 ] || [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; }; then
+if [ "$X11_FRAMES_ONLY" = 1 ] && { [ "$INSTALLED_PACKAGE" = 1 ] || [ "$SCREENSHOT_KEYS_ONLY" = 1 ] || [ "$A11Y_FOCUS_ONLY" = 1 ] || [ "$TRAY_ONLY" = 1 ] || [ "$GRID_HOVER_ONLY" = 1 ] || [ "$KEYBOARD_ROUTES_ONLY" = 1 ] || [ "$SEARCH_LEAK_ONLY" = 1 ] || [ "$WINDOW_LEAK_ONLY" = 1 ] || [ "$GRID_CANCEL_ONLY" = 1 ] || [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; }; then
     echo "--x11-frames-only cannot be combined with other focused, installed or grid admission flags" >&2; exit 1
 fi
 if [ "$GRID_CANCEL_ONLY" = 1 ]; then
@@ -880,10 +903,90 @@ xdotool key Escape
 cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-GRID-REORDER "overview stayed open"; }
 }
 
+# G-GRID-ON-DEMAND (#503): the app grid's tiles (one per installed app)
+# exist only while the grid shows. Opening the overview on the window
+# picker builds none; the grid a held swipe up draws part way, and Show
+# Apps, list an app installed while the overview was closed; Down from
+# the search entry focuses a tile and Right the next; closing drops them.
+# A hidden window is not in the accessible tree, so building and dropping
+# are read from the shell's grid trace (TUNA_GRID_TRACE).
+grid_traced() {
+    tail -c +"$(($1 + 1))" "$LOG" | grep -c -- "grid-anim $2" || true
+}
+grid_tiles() {
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-$1.json" 20 ||
+        fail G-GRID-ON-DEMAND "accessibility dump failed ($1)"
+}
+grid_focused_tile() {
+    jq -r '[.[] | select(.focused and .showing and (.role == "push button" or .role == "button") and (.name | startswith("AAA Move")))][0].name // empty' "$1"
+}
+grid_swipe() {
+    grid_swipe_sequence=$((grid_swipe_sequence + 1))
+    printf '{"phase":"%s","dy":%s,"time":%s,"sequence":%s}\n' \
+        "$1" "$2" "$3" "$grid_swipe_sequence" >"$TUNA_PROOF_SWIPE_INPUT.tmp"
+    mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
+    cstate ".proof_swipe_sequence == $grid_swipe_sequence" "swipe phase consumed" 5 ||
+        fail G-GRID-ON-DEMAND "the compositor never read synthetic swipe phase $grid_swipe_sequence"
+    sleep 0.2
+}
+grid_on_demand_proof() {
+grid_swipe_sequence=9000
+printf '[Desktop Entry]\nName=AAA Move Late\nExec=true\nType=Application\n' \
+    >"$XDG_DATA_HOME/applications/tuna-move-Late.desktop"
+sleep 1.5
+xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
+grid_mark="$(wc -c <"$LOG")"
+xdotool key Super_L
+cstate '.overview_open and .overview_progress == 1 and (.overview_app_grid | not)' "window picker" ||
+    fail G-GRID-ON-DEMAND "Super did not open the overview on the window picker"
+sleep 1
+[ "$(grid_traced "$grid_mark" grid-build)" = 0 ] ||
+    fail G-GRID-ON-DEMAND "opening the overview on the window picker built app grid tiles nobody sees"
+# Fingers held up from the window picker draw the grid part way
+# (overviewControls.js `_updateAppDisplayVisibility`), before Show Apps.
+grid_swipe begin 0 80000
+grid_swipe update -90 80010
+cstate '.touchpad_swipe.active and .overview_state > 1.299 and .overview_state < 1.301 and (.layers | any(.namespace == "tuna-shell-appgrid"))' "app grid held part way" ||
+    fail G-GRID-ON-DEMAND "a held swipe up from the window picker did not draw the app grid"
+[ "$(grid_traced "$grid_mark" grid-build)" = 1 ] ||
+    fail G-GRID-ON-DEMAND "the held swipe built the grid $(grid_traced "$grid_mark" grid-build) times, not once"
+grid_tiles swipe-held
+button_showing "$ARTIFACTS/a11y-grid-swipe-held.json" "AAA Move Late" ||
+    fail G-GRID-ON-DEMAND "the held grid lacks the app installed while the overview was closed"
+grid_swipe update -60 80020
+grid_swipe end 0 80030
+cstate '.overview_open and .overview_state == 2 and .overview_app_grid and (.layers | any(.namespace == "tuna-shell-appgrid"))' "app grid settled" ||
+    fail G-GRID-ON-DEMAND "the swipe did not settle on the app grid"
+sleep 1
+xdotool key Down
+sleep 0.6
+grid_tiles key-down
+grid_first="$(grid_focused_tile "$ARTIFACTS/a11y-grid-key-down.json")"
+[ -n "$grid_first" ] || fail G-GRID-ON-DEMAND "Down from the search entry focused no grid tile"
+button_showing "$ARTIFACTS/a11y-grid-key-down.json" "AAA Move Late" ||
+    fail G-GRID-ON-DEMAND "Show Apps lacks the app installed while the overview was closed"
+xdotool key Right
+sleep 0.6
+grid_tiles key-right
+grid_second="$(grid_focused_tile "$ARTIFACTS/a11y-grid-key-right.json")"
+if [ -z "$grid_second" ] || [ "$grid_second" = "$grid_first" ]; then
+    fail G-GRID-ON-DEMAND "Right did not move the focus from '$grid_first' to the next tile (got '$grid_second')"
+fi
+xdotool key Escape
+cstate '.overview_open | not' "closed" 3 || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-GRID-ON-DEMAND "overview stayed open"; }
+sleep 1
+[ "$(grid_traced "$grid_mark" grid-drop)" = 1 ] ||
+    fail G-GRID-ON-DEMAND "the app grid's tiles outlived the overview"
+rm -f "$XDG_DATA_HOME/applications/tuna-move-Late.desktop"
+pass G-GRID-ON-DEMAND "no grid tiles on the window picker or after close; a held swipe and Show Apps list an app installed meanwhile; Down and Right walk the tiles"
+}
+
 . "$ROOT/scripts/lib/tuna-screenshot-keys-proof.sh"
 . "$ROOT/scripts/lib/tuna-a11y-focus-proof.sh"
 . "$ROOT/scripts/lib/tuna-keyboard-routes-proof.sh"
 . "$ROOT/scripts/lib/tuna-x11-frames-proof.sh"
+. "$ROOT/scripts/lib/tuna-search-leak-proof.sh"
+. "$ROOT/scripts/lib/tuna-window-leak-proof.sh"
 
 # Compositor-side state (overview, focus, previews) for app stages.
 CSTATE="$ARTIFACTS/compositor-state.json"
@@ -1305,6 +1408,7 @@ MEDIA_SOURCE=0
 if [ "$INSTALLED_PACKAGE" = 0 ] && [ "$SCREENSHOT_KEYS_ONLY" = 0 ] &&
    [ "$A11Y_FOCUS_ONLY" = 0 ] && [ "$KEYBOARD_ROUTES_ONLY" = 0 ] &&
    [ "$GRID_CANCEL_ONLY" = 0 ] && [ "$X11_FRAMES_ONLY" = 0 ] &&
+   [ "$SEARCH_LEAK_ONLY" = 0 ] && [ "$WINDOW_LEAK_ONLY" = 0 ] &&
    [ -z "${TUNA_PROOF_BIN_DIR:-}" ] &&
    [ -z "${TUNA_PROOF_SHELL_BIN:-}" ] && [ -z "${TUNA_SHELL_BIN:-}" ] &&
    [ -n "${GITHUB_RUN_ID:-}" ] && [ -n "${GITHUB_RUN_ATTEMPT:-}" ] &&
@@ -1316,7 +1420,7 @@ if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
     # tuna-x11-frames sits beside the compositor, which runs it for X11
     # windows' title bars (G-X11-FRAME).
     cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host -p tuna-x11-frames
-    if [ "$SCREENSHOT_KEYS_ONLY" = 0 ] && [ "$A11Y_FOCUS_ONLY" = 0 ] && [ "$GRID_HOVER_ONLY" = 0 ] && [ "$X11_FRAMES_ONLY" = 0 ]; then
+    if [ "$SCREENSHOT_KEYS_ONLY" = 0 ] && [ "$A11Y_FOCUS_ONLY" = 0 ] && [ "$GRID_HOVER_ONLY" = 0 ] && [ "$X11_FRAMES_ONLY" = 0 ] && [ "$SEARCH_LEAK_ONLY" = 0 ] && [ "$WINDOW_LEAK_ONLY" = 0 ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example icon-probe
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
     fi
@@ -1606,6 +1710,29 @@ tray_x11_gate() {
 # controls; that also proves the accessible tree.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel.json" 60 ||
     fail A11Y-PANEL "shell never registered on the accessibility bus"
+# G-SHELL-CAIRO (#503): a compositor on software GL tells its shell to
+# draw with cairo (GSK_RENDERER in the shell's environment), so the shell
+# makes no GL context of its own to find out and never loads Mesa's
+# rasterizer, LLVM or llvmpipe's threads. The proof's own Xvfb is always
+# software GL; on another display the compositor's word is taken.
+if [ "$INSTALLED_PACKAGE" = 0 ] && [ "$GRID_CANCEL_ONLY" = 0 ]; then
+    if grep -q 'tuna-compositor: OpenGL is .*; the shell draws with cairo' "$LOG"; then
+        cairo_shell="$(a11y_shell_pid)" || fail G-SHELL-CAIRO "expected exactly one owned shell"
+        tr '\0' '\n' <"/proc/$cairo_shell/environ" | grep -qx 'GSK_RENDERER=cairo' ||
+            fail G-SHELL-CAIRO "the shell was not started with GSK_RENDERER=cairo"
+        if grep -q 'tuna-shell-gtk: OpenGL is' "$LOG"; then
+            fail G-SHELL-CAIRO "the shell still made a GL context to read GL_RENDERER"
+        fi
+        if grep -E -q 'libgallium|libLLVM|_dri\.so' "/proc/$cairo_shell/maps"; then
+            fail G-SHELL-CAIRO "the shell loaded Mesa's rasterizer: $(grep -E -o 'libgallium[^ ]*|libLLVM[^ ]*|[a-z0-9_-]*_dri\.so' "/proc/$cairo_shell/maps" | sort -u | tr '\n' ' ')"
+        fi
+        pass G-SHELL-CAIRO "on software GL the compositor starts the shell with GSK_RENDERER=cairo; the shell maps no Mesa rasterizer"
+    elif [ -n "$OWNED_XVFB" ] && [ -z "${GSK_RENDERER:-}" ]; then
+        fail G-SHELL-CAIRO "the compositor on Xvfb's software GL did not choose cairo for its shell"
+    else
+        pass G-SHELL-CAIRO "the session chose its own renderer or OpenGL is not software; nothing to set"
+    fi
+fi
 SOCKET_NAME="$(sed -n 's/.*nested session on \([^ ]*\) .*/\1/p' "$LOG" | head -1)"
 [ -n "$SOCKET_NAME" ] || fail A11Y-PANEL "the nested session never logged its Wayland socket"
 if [ "$TRAY_ONLY" = 1 ]; then
@@ -1625,6 +1752,26 @@ if [ "$KEYBOARD_ROUTES_ONLY" = 1 ]; then
     keyboard_panel_menu_proof
     keyboard_notification_proof
     keyboard_screenshot_proof
+    exit 0
+fi
+if [ "$SEARCH_LEAK_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "search leak desktop ready" ||
+        fail G-SEARCH-LEAK "desktop never became ready"
+    # Let the startup cover settle before the first overview.
+    sleep 3
+    search_leak_proof
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
+if [ "$WINDOW_LEAK_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "window leak desktop ready" ||
+        fail G-WINDOW-LEAK "desktop never became ready"
+    # Let the startup cover settle before the first window.
+    sleep 3
+    window_leak_proof
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
     exit 0
 fi
 if [ "$SCREENSHOT_KEYS_ONLY" = 1 ]; then
@@ -1665,6 +1812,7 @@ if [ "$A11Y_FOCUS_ONLY" = 1 ]; then
     # The startup cover must be gone before frames are read.
     sleep 3
     a11y_focus_ring_proof
+    if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_transient_stable_proof; fi
     if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_menu_restart_proof; fi
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
@@ -1676,6 +1824,7 @@ if [ "$GRID_HOVER_ONLY" = 1 ]; then
     # Let the startup cover settle before opening the grid.
     sleep 3
     grid_hover_proof
+    grid_on_demand_proof
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
     exit 0
@@ -2661,6 +2810,18 @@ showing "$ARTIFACTS/a11y-search.json" "Tuna Probe" ||
     fail G-OV-SEARCH "typing did not list the probe app"
 pass G-OV-SEARCH "typing in the overview lists matching apps"
 scrot "$ARTIFACTS/10-search.png" >/dev/null
+# GNOME Shell's caret is steady (StEntry, ClutterText): with the search
+# entry focused and nothing changing, the overview draws no frames (#503).
+# A blinking GTK caret would redraw the entry at the display rate. The
+# grid-cancel comparison's old role runs pinned pre-#503 binaries through
+# this stage, so the gate belongs to the current build only.
+if [ "$GRID_CANCEL_OLD_NEGATIVE" != 1 ]; then
+    search_still_frames="$(jq .rendered_frames "$CSTATE")"
+    sleep 1.5
+    [ "$(jq .rendered_frames "$CSTATE")" = "$search_still_frames" ] ||
+        fail G-OV-SEARCH-STILL "the compositor drew frames while the focused overview search sat unchanged"
+    pass G-OV-SEARCH-STILL "the focused overview search sits still: no frames while nothing changes"
+fi
 
 xdotool key Return
 end=$(($(date +%s) + 15))
@@ -2980,6 +3141,27 @@ done
 # before admitting the active first-page tree, within the same preview budget.
 xdotool mousemove --window "$WID" "$grid_neutral_x" "$grid_neutral_y"
 grid_peek_end=$(($(date +%s) + 10))
+# Old observation role only; the fixed role and the full gate stay parked.
+# The pinned old source predates #674: its GtkFixed hint is measured by the
+# preview icons sliding in from outside the clip, so during that 150 ms slide
+# the "10%" hint is several times wider (700-1000+ px in #674). The one
+# motion that parks the pointer can land in it; the old pager then counts the
+# pointer as dwelling on the next-page hint, and because a parked pointer
+# sends no further motion nothing re-evaluates that before the 1 s dwell
+# turns the page (main run 43259379979: "actual carousel page changed before
+# Escape", page 2 mid-slide with only the previous-page hint). Deliver a real
+# motion inside the same admitted gap after the slide and well inside the
+# dwell, so the old pager tests its settled hint. Admitted points keep 3 px
+# from every tile and hint, so the adjacent pixel is in the gap too. Every
+# later check is unchanged: a page that turns anyway still fails the
+# first-page comparison, and the preview budget still starts at the park.
+grid_cancel_old_settle() {
+    [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || return 0
+    xdotool mousemove --window "$WID" $((grid_neutral_x + 1)) "$grid_neutral_y"
+    xdotool mousemove --window "$WID" "$grid_neutral_x" "$grid_neutral_y"
+}
+if [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ]; then sleep 0.3; fi
+grid_cancel_old_settle
 until grid_cancel_dump "$ARTIFACTS/a11y-folder-page-peek.json" &&
     showing "$ARTIFACTS/a11y-folder-page-peek.json" "Next page preview" &&
     ! showing "$ARTIFACTS/a11y-folder-page-peek.json" "Next Page" &&
@@ -3005,6 +3187,7 @@ read -r grid_neutral_x grid_neutral_y <<EOF
 $neutral_coordinates
 EOF
 xdotool mousemove --window "$WID" "$grid_neutral_x" "$grid_neutral_y"
+grid_cancel_old_settle
 grid_neutral_wait=$((grid_peek_end - $(date +%s)))
 if [ "$grid_neutral_wait" -lt 0 ] ||
     ! cstate ".client_dnd_active == true and .overview_open and .overview_app_grid and (.locked == false) and (.pointer_position == [$grid_neutral_x, $grid_neutral_y])" "real folder drag active at observed neutral point" "$grid_neutral_wait"; then
@@ -3229,6 +3412,7 @@ rm -f "$XDG_DATA_HOME"/applications/tuna-drag-*.desktop
 sleep 1.5
 
 grid_hover_proof
+grid_on_demand_proof
 # Moving an item to another page leaves its old page short; a catalog
 # rebuild must respect those saved page boundaries instead of flattening.
 "$PY" "$ROOT/scripts/lib/grid-target-settled-tests.py" >"$ARTIFACTS/grid-target-settled-tests.log" 2>&1 ||
@@ -12431,6 +12615,7 @@ pass A11Y-GOLDEN "panel, calendar, quick settings and overview trees match their
 # admits. The installed run keeps its original shell for
 # G-INSTALLED-STABLE, so it proves only the focus indication.
 a11y_focus_ring_proof
+if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_transient_stable_proof; fi
 if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_menu_restart_proof; fi
 
 grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
