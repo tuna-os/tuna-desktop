@@ -262,6 +262,21 @@ impl PointerAids {
         out
     }
 
+    /// When [`poll`](Self::poll) next has a timeout to run, on the clock
+    /// its `now` is read from (#503).
+    pub fn next_deadline(&self) -> Option<u64> {
+        let secondary = self
+            .secondary
+            .filter(|_| !self.secondary_ready)
+            .map(|(deadline, _)| deadline);
+        let dwell = self.dwell.map(|(deadline, _)| deadline);
+        let gesture = self.gesture.map(|(deadline, _)| deadline);
+        [secondary, self.rest, dwell, gesture]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
     fn stamp(&self, now: u64) -> u32 {
         let (time, at) = self.anchor;
         time.wrapping_add(now.saturating_sub(at) as u32)
@@ -576,6 +591,35 @@ mod tests {
             })
             .unwrap();
         assert_eq!(started, (500, (100.0, 100.0).into()));
+    }
+
+    /// #503: each pending timeout names its time, so the loop wakes for
+    /// it instead of meeting it on whatever tick comes next.
+    #[test]
+    fn pending_timeouts_report_when_they_are_due() {
+        let mut aids = dwell(window_mode());
+        assert_eq!(aids.next_deadline(), None, "a pointer that never moved");
+        aids.process(motion(100.0, 100.0, 0), 0);
+        // The pointer rests first, then the dwell runs, then nothing.
+        assert_eq!(aids.next_deadline(), Some(REST_MS));
+        assert!(aids.poll(REST_MS - 1, (100.0, 100.0).into()).is_empty());
+        aids.poll(REST_MS, (100.0, 100.0).into());
+        assert_eq!(aids.next_deadline(), Some(REST_MS + 500));
+        aids.poll(REST_MS + 500, (100.0, 100.0).into());
+        assert_eq!(aids.next_deadline(), None, "one click, no repeat");
+
+        // A held primary button: due when the hold runs out, once.
+        let mut aids = secondary();
+        aids.process(motion(50.0, 50.0, 0), 0);
+        assert_eq!(aids.next_deadline(), None);
+        aids.process(press(BUTTON_PRIMARY, true, 100), 100);
+        assert_eq!(aids.next_deadline(), Some(900));
+        aids.poll(900, (50.0, 50.0).into());
+        assert_eq!(
+            aids.next_deadline(),
+            None,
+            "a hold that ran out waits for the release, not for a timer"
+        );
     }
 
     #[test]

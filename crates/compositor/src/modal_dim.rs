@@ -43,6 +43,10 @@ impl Default for ModalDim {
     }
 }
 impl ModalDim {
+    /// Whether a dim transition still names window `id`.
+    pub fn holds(&self, id: u64) -> bool {
+        self.entries.contains_key(&id)
+    }
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }

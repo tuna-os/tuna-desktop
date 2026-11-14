@@ -102,8 +102,7 @@ format (status, context, decision, alternatives, consequences).
 Once a plan is approved and implementation starts:
 
 - **Sign off every commit.** This project uses the Developer Certificate of
-  Origin. Commit with `git commit -s` (or add `Signed-off-by:` by hand) —
-  every commit in this repository's history carries it.
+  Origin. Commit with `git commit -s` (or add `Signed-off-by:` by hand).
 - **CI must pass.** [.github/workflows/ci.yml](.github/workflows/ci.yml) runs
   the `check` job on every push and pull request:
   - `cargo fmt --all -- --check`
@@ -123,7 +122,7 @@ Once a plan is approved and implementation starts:
   (`scripts/ci-select-lanes`; see
   [docs/testing.md](docs/testing.md#which-lanes-a-pull-request-runs)).
 
-  Run the fast checks locally before pushing:
+  Run the fast checks locally before pushing (`just check` runs all three):
 
   ```sh
   cargo fmt --all -- --check
@@ -131,10 +130,13 @@ Once a plan is approved and implementation starts:
   cargo test --workspace
   ```
 
-  The journey jobs need system packages (`libxkbcommon-dev`,
-  `libgtk-4-dev`, `libadwaita-1-dev`, Xvfb, etc.) — see the `journey` and
-  `app-content` jobs in `ci.yml` for the exact list per platform; there's no
-  single local equivalent yet, so CI is authoritative for those.
+  The proof lanes also run locally: `just proof <name>` runs
+  `scripts/tuna-<name>` in a fresh home and runtime directory, for example
+  `just proof journey`. The [nested proofs table](docs/testing.md#nested-proofs)
+  lists each proof's command and the system packages it needs beyond the
+  [build prerequisites](docs/development.md#system-packages), and
+  [local iteration with `just`](docs/testing.md#local-iteration-with-just)
+  lists the other recipes.
 - **Update docs and ADRs alongside code.** If a change affects a decision
   recorded in `docs/adr/`, or the delivery tiers/requirement map in
   `docs/architecture.md` and `docs/roadmap.md`, update them in the same PR.

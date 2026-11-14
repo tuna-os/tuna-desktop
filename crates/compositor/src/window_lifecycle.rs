@@ -251,6 +251,18 @@ impl Lifecycle {
             || !self.restoring.is_empty()
             || !self.minimizing.is_empty()
     }
+    /// Whether per-window effect state still names window `id`. A running
+    /// destroy effect (a ghost) is not counted: it owns only its own
+    /// copy, and retires when the effect ends.
+    pub fn holds(&self, id: u64) -> bool {
+        self.known.contains(&id)
+            || self.cache.contains_key(&id)
+            || self.stack.contains(&id)
+            || self.opening.contains_key(&id)
+            || self.minimized.contains(&id)
+            || self.restoring.contains_key(&id)
+            || self.minimizing.contains_key(&id)
+    }
 
     pub fn opening_frame(&self, id: u64) -> Option<Frame> {
         let run = self.opening.get(&id)?;
