@@ -29,14 +29,18 @@
 //! };
 //! ```
 
-use std::{
-    collections::{HashMap, HashSet},
-    ops::Deref,
-};
+use std::{collections::HashMap, ops::Deref};
 
 use rand::distr::{Alphanumeric, SampleString};
-use wayland_protocols::xdg::foreign::zv2::server::{
-    zxdg_exporter_v2::ZxdgExporterV2, zxdg_imported_v2::ZxdgImportedV2, zxdg_importer_v2::ZxdgImporterV2,
+use wayland_protocols::xdg::foreign::{
+    zv1::server::{
+        zxdg_exporter_v1::ZxdgExporterV1, zxdg_imported_v1::ZxdgImportedV1,
+        zxdg_importer_v1::ZxdgImporterV1,
+    },
+    zv2::server::{
+        zxdg_exporter_v2::ZxdgExporterV2, zxdg_imported_v2::ZxdgImportedV2,
+        zxdg_importer_v2::ZxdgImporterV2,
+    },
 };
 use wayland_server::{backend::GlobalId, protocol::wl_surface::WlSurface, DisplayHandle, GlobalDispatch};
 
@@ -83,23 +87,36 @@ pub struct XdgImportedUserData {
     handle: XdgForeignHandle,
 }
 
+/// An import through either protocol version.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum Imported {
+    V1(ZxdgImportedV1),
+    V2(ZxdgImportedV2),
+}
+
 #[derive(Debug)]
 struct ExportedState {
     exported_surface: WlSurface,
-    requested_child: Option<(WlSurface, ZxdgImportedV2)>,
-    imported_by: HashSet<ZxdgImportedV2>,
+    /// Every live import of this export and the child it parents.
+    imported_by: HashMap<Imported, Option<WlSurface>>,
 }
 
-/// Tracks the list of exported surfaces
+/// Tracks the list of exported surfaces.
+///
+/// The zxdg_foreign v1 and v2 globals share one handle table, as in
+/// Mutter: a handle exported through either version imports through
+/// either (GTK 3 exports with v1, the portal imports with v2).
 #[derive(Debug)]
 pub struct XdgForeignState {
     exported: HashMap<XdgForeignHandle, ExportedState>,
     exporter: GlobalId,
     importer: GlobalId,
+    exporter_v1: GlobalId,
+    importer_v1: GlobalId,
 }
 
 impl XdgForeignState {
-    /// Creates a new xdg activation global.
+    /// Creates the xdg foreign v1 and v2 globals.
     ///
     /// In order to use this abstraction, your `D` type needs to implement [`XdgForeignHandler`].
     pub fn new<D>(display: &DisplayHandle) -> Self
@@ -107,15 +124,31 @@ impl XdgForeignState {
         D: XdgForeignHandler,
         D: GlobalDispatch<ZxdgExporterV2, ()>,
         D: GlobalDispatch<ZxdgImporterV2, ()>,
+        D: GlobalDispatch<ZxdgExporterV1, ()>,
+        D: GlobalDispatch<ZxdgImporterV1, ()>,
     {
         let exporter = display.create_global::<D, ZxdgExporterV2, _>(1, ());
         let importer = display.create_global::<D, ZxdgImporterV2, _>(1, ());
+        let exporter_v1 = display.create_global::<D, ZxdgExporterV1, _>(1, ());
+        let importer_v1 = display.create_global::<D, ZxdgImporterV1, _>(1, ());
 
         Self {
             exported: HashMap::new(),
             exporter,
             importer,
+            exporter_v1,
+            importer_v1,
         }
+    }
+
+    /// Returns the zxdg_exporter_v1 global.
+    pub fn exporter_v1_global(&self) -> GlobalId {
+        self.exporter_v1.clone()
+    }
+
+    /// Returns the zxdg_importer_v1 global.
+    pub fn importer_v1_global(&self) -> GlobalId {
+        self.importer_v1.clone()
     }
 
     /// Returns the xdg_exporter global.
@@ -176,6 +209,46 @@ macro_rules! delegate_xdg_foreign {
         $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
             [
                 __ZxdgImportedV2: $crate::wayland::xdg_foreign::XdgImportedUserData
+            ] => $crate::wayland::xdg_foreign::XdgForeignState
+        );
+
+        type __ZxdgExporterV1 =
+            $crate::reexports::wayland_protocols::xdg::foreign::zv1::server::zxdg_exporter_v1::ZxdgExporterV1;
+        type __ZxdgImporterV1 =
+            $crate::reexports::wayland_protocols::xdg::foreign::zv1::server::zxdg_importer_v1::ZxdgImporterV1;
+        type __ZxdgExportedV1 =
+            $crate::reexports::wayland_protocols::xdg::foreign::zv1::server::zxdg_exported_v1::ZxdgExportedV1;
+        type __ZxdgImportedV1 =
+            $crate::reexports::wayland_protocols::xdg::foreign::zv1::server::zxdg_imported_v1::ZxdgImportedV1;
+
+        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
+            [
+                __ZxdgExporterV1: ()
+            ] => $crate::wayland::xdg_foreign::XdgForeignState
+        );
+        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
+            [
+                __ZxdgImporterV1: ()
+            ] => $crate::wayland::xdg_foreign::XdgForeignState
+        );
+        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
+            [
+                __ZxdgExporterV1: ()
+            ] => $crate::wayland::xdg_foreign::XdgForeignState
+        );
+        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
+            [
+                __ZxdgImporterV1: ()
+            ] => $crate::wayland::xdg_foreign::XdgForeignState
+        );
+        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
+            [
+                __ZxdgExportedV1: $crate::wayland::xdg_foreign::XdgExportedUserData
+            ] => $crate::wayland::xdg_foreign::XdgForeignState
+        );
+        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
+            [
+                __ZxdgImportedV1: $crate::wayland::xdg_foreign::XdgImportedUserData
             ] => $crate::wayland::xdg_foreign::XdgForeignState
         );
     };

@@ -91,6 +91,7 @@ pub use device::{
     DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEvent, EventMetadata as DrmEventMetadata, PlaneClaim,
     Time as DrmEventTime, WeakDrmDeviceFd,
 };
+pub(crate) use device::PlaneClaimStorage;
 pub use drm::node::{CreateDrmNodeError, DrmNode, NodeType};
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 pub use error::AccessError as DrmAccessError;
