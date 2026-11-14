@@ -155,10 +155,8 @@ impl Runtime {
     /// timeout unless GNOME Shell's dialog keeps the change first.
     fn request_display_confirmation(&mut self, generation: u64) {
         let timeout = display_config::CONFIRMATION_TIMEOUT_SECS;
-        let timer = calloop::timer::Timer::from_duration(Duration::from_secs(timeout.into()));
-        if let Err(error) = self.loop_handle.insert_source(timer, move |_, _, rt| {
-            rt.display_confirmation_timed_out(generation);
-            calloop::timer::TimeoutAction::Drop
+        if let Err(error) = self.arm_timer(Duration::from_secs(timeout.into()), move |rt| {
+            rt.display_confirmation_timed_out(generation)
         }) {
             eprintln!("tuna-compositor: display confirmation timer: {error}");
         }
@@ -438,12 +436,10 @@ impl Runtime {
         if retired.is_empty() {
             return;
         }
-        let timer = calloop::timer::Timer::from_duration(Duration::from_secs(10));
-        if let Err(error) = self.loop_handle.insert_source(timer, move |_, _, rt| {
+        if let Err(error) = self.arm_timer(Duration::from_secs(10), move |rt| {
             for global in &retired {
                 rt.state.dh.remove_global::<State>(global.clone());
             }
-            calloop::timer::TimeoutAction::Drop
         }) {
             eprintln!("tuna-compositor: output global removal timer: {error}");
         }

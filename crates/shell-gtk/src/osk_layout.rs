@@ -483,9 +483,25 @@ pub(crate) mod tests {
     pub(crate) fn register() {
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
-            gio::resources_register_include!("osk-layouts.gresource")
+            crate::register_resource(bundled_resource!("osk-layouts.gresource"))
                 .expect("register osk-layouts.gresource");
         });
+    }
+
+    #[test]
+    fn the_bundled_resources_are_aligned_so_gresource_does_not_copy_them() {
+        // g_resource_new_from_data copies a bundle that is not
+        // pointer-aligned onto the heap, for the life of the process.
+        for bundle in [
+            bundled_resource!("osk-layouts.gresource"),
+            bundled_resource!("icons.gresource"),
+        ] {
+            assert!(!bundle.is_empty());
+            assert_eq!(
+                bundle.as_ptr() as usize % std::mem::align_of::<*const u8>(),
+                0
+            );
+        }
     }
 
     #[test]
