@@ -1,0 +1,157 @@
+diff --git a/src/backend/renderer/gles/mod.rs b/src/backend/renderer/gles/mod.rs
+index 3ed0e5078..746e5fb8d 100644
+--- a/src/backend/renderer/gles/mod.rs
++++ b/src/backend/renderer/gles/mod.rs
+@@ -2545,6 +2545,20 @@ impl GlesFrame<'_, '_> {
+             tex_mat = Matrix3::new(1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0) * tex_mat;
+         }
+ 
++        // Drawn texel for pixel, every sample lands on a texel centre: nearest draws the same
++        // picture without fetching and weighing the three texels around it, which is most of a
++        // software renderer's work per pixel. Mutter's shaped textures and background do the same.
++        let filters = (self.renderer.min_filter, self.renderer.max_filter);
++        let unscaled = transform.transform_size(src_size);
++        if unscaled.w == f64::from(dest.size.w)
++            && unscaled.h == f64::from(dest.size.h)
++            && src.loc.x.fract() == 0.0
++            && src.loc.y.fract() == 0.0
++        {
++            self.renderer.min_filter = TextureFilter::Nearest;
++            self.renderer.max_filter = TextureFilter::Nearest;
++        }
++
+         let render_texture = |renderer: &mut Self, damage: &[Rectangle<i32, Physical>]| {
+             let instances = damage.iter().flat_map(|rect| {
+                 let dest_size = dest.size;
+@@ -2628,6 +2642,8 @@ impl GlesFrame<'_, '_> {
+             Ok(())
+         };
+ 
++        (self.renderer.min_filter, self.renderer.max_filter) = filters;
++
+         // Return the damage(s) to be able to re-use the allocation(s)
+         std::mem::swap(&mut self.renderer.non_opaque_damage, &mut non_opaque_damage);
+         std::mem::swap(&mut self.renderer.opaque_damage, &mut opaque_damage);
+@@ -3462,3 +3478,122 @@ mod per_frame_read_fence_tests {
+         assert_eq!(first_pixel(&mut renderer, &mut target), [0, 255, 0, 255]);
+     }
+ }
++
++#[cfg(test)]
++mod unscaled_nearest_tests {
++    use super::*;
++    use crate::backend::egl::{native::EGLSurfacelessDisplay, EGLDisplay};
++
++    fn renderer() -> GlesRenderer {
++        let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.expect("surfaceless EGL display");
++        let context = EGLContext::new(&display).expect("EGL context");
++        unsafe { GlesRenderer::new(context) }.expect("GLES renderer")
++    }
++
++    /// A `w` x `h` texture of black and white texels in a checkerboard: any filtering between
++    /// two of them shows as a grey.
++    fn checkers(renderer: &mut GlesRenderer, w: i32, h: i32) -> GlesTexture {
++        let data: Vec<u8> = (0..h)
++            .flat_map(|y| (0..w).map(move |x| if (x + y) % 2 == 0 { 255 } else { 0 }))
++            .flat_map(|v| [v, v, v, 255])
++            .collect();
++        renderer
++            .import_memory(&data, Fourcc::Abgr8888, (w, h).into(), false)
++            .expect("texture upload")
++    }
++
++    /// Draws `src` of `texture` into a `dst`-sized target; returns the target's red channel and
++    /// the minification and magnification filters the draw left on the texture.
++    fn draw(
++        renderer: &mut GlesRenderer,
++        texture: &GlesTexture,
++        src: Rectangle<f64, BufferCoord>,
++        dst: Size<i32, Physical>,
++        transform: Transform,
++    ) -> (Vec<u8>, [u32; 2]) {
++        let mut target: GlesTexture = renderer
++            .create_buffer(Fourcc::Abgr8888, (dst.w, dst.h).into())
++            .expect("render target");
++        let mut filters = [0i32; 2];
++        {
++            let mut framebuffer = renderer.bind(&mut target).unwrap();
++            let mut frame = renderer.render(&mut framebuffer, dst, Transform::Normal).unwrap();
++            let area = Rectangle::from_size(dst);
++            Frame::render_texture_from_to(&mut frame, texture, src, area, &[area], &[], transform, 1.0)
++                .expect("draw");
++            unsafe {
++                let gl = &frame.renderer.gl;
++                gl.BindTexture(ffi::TEXTURE_2D, texture.0.texture);
++                gl.GetTexParameteriv(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, &mut filters[0]);
++                gl.GetTexParameteriv(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, &mut filters[1]);
++                gl.BindTexture(ffi::TEXTURE_2D, 0);
++            }
++            frame.finish().unwrap().wait().unwrap();
++        }
++        // The frame's own choice never outlives the draw.
++        assert_eq!(
++            (renderer.min_filter, renderer.max_filter),
++            (TextureFilter::Linear, TextureFilter::Linear)
++        );
++        let framebuffer = renderer.bind(&mut target).expect("bind");
++        let mapping = renderer
++            .copy_framebuffer(
++                &framebuffer,
++                Rectangle::from_size((dst.w, dst.h).into()),
++                Fourcc::Abgr8888,
++            )
++            .expect("read back");
++        let pixels = renderer.map_texture(&mapping).expect("map");
++        (
++            pixels.chunks_exact(4).map(|p| p[0]).collect(),
++            filters.map(|f| f as u32),
++        )
++    }
++
++    const NEAREST: [u32; 2] = [ffi::NEAREST, ffi::NEAREST];
++    const LINEAR: [u32; 2] = [ffi::LINEAR, ffi::LINEAR];
++
++    #[test]
++    fn unscaled_nearest_draws_texel_for_pixel_without_filtering() {
++        let mut renderer = renderer();
++        let texture = checkers(&mut renderer, 8, 6);
++        let whole = Rectangle::from_size((8.0, 6.0).into());
++        let (red, filters) = draw(&mut renderer, &texture, whole, (8, 6).into(), Transform::Normal);
++        assert_eq!(filters, NEAREST);
++        // The picture is the texture: a checkerboard, no grey.
++        assert!(red.iter().all(|v| *v == 0 || *v == 255), "{red:?}");
++        assert_eq!(red.iter().filter(|v| **v == 255).count(), 24);
++        for row in red.chunks_exact(8) {
++            assert!(row.windows(2).all(|pair| pair[0] != pair[1]), "{red:?}");
++        }
++        // A crop at whole texels, and a buffer turned a quarter, are texel for pixel too.
++        let crop = Rectangle::new((2.0, 1.0).into(), (4.0, 4.0).into());
++        let (red, filters) = draw(&mut renderer, &texture, crop, (4, 4).into(), Transform::Normal);
++        assert_eq!(filters, NEAREST);
++        assert!(red.iter().all(|v| *v == 0 || *v == 255), "{red:?}");
++        let (red, filters) = draw(&mut renderer, &texture, whole, (6, 8).into(), Transform::_90);
++        assert_eq!(filters, NEAREST);
++        assert!(red.iter().all(|v| *v == 0 || *v == 255), "{red:?}");
++    }
++
++    #[test]
++    fn unscaled_nearest_leaves_scaled_and_shifted_draws_filtered() {
++        let mut renderer = renderer();
++        let texture = checkers(&mut renderer, 8, 6);
++        let whole = Rectangle::from_size((8.0, 6.0).into());
++        // Shrunk, grown, and stretched along one axis only.
++        for dst in [(4, 3), (16, 12), (8, 12), (16, 6)] {
++            let (red, filters) = draw(&mut renderer, &texture, whole, dst.into(), Transform::Normal);
++            assert_eq!(filters, LINEAR, "{dst:?}");
++            assert!(red.iter().any(|v| *v != 0 && *v != 255), "{dst:?} {red:?}");
++        }
++        // The same size half a texel across: every pixel is the mean of two texels.
++        let shifted = Rectangle::new((0.5, 0.0).into(), (4.0, 6.0).into());
++        let (red, filters) = draw(&mut renderer, &texture, shifted, (4, 6).into(), Transform::Normal);
++        assert_eq!(filters, LINEAR);
++        assert!(red.iter().all(|v| (126..=129).contains(v)), "{red:?}");
++        // A quarter turn without the sizes swapped is a stretch.
++        let (_, filters) = draw(&mut renderer, &texture, whole, (8, 6).into(), Transform::_90);
++        assert_eq!(filters, LINEAR);
++    }
++}

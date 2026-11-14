@@ -7,6 +7,7 @@ import ast
 import base64
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -3201,18 +3202,44 @@ class TourViewPredicates(unittest.TestCase):
             Path(args["filename"]).write_bytes(
                 header + pixels if args["format"] == "ppm" else tour_png(pixels))
         budgets = []
-        original = lane.Recorder._exact_pixels
-        def spy(self, card, deadline):
-            budgets.append(deadline - lane.time.monotonic())
-            return original(self, card, deadline)
+        real_run = lane.subprocess.run
+        def spy(argv, **kwargs):
+            if argv[0] == "ffmpeg":
+                budgets.append(kwargs["timeout"])
+            return real_run(argv, **kwargs)
         with tempfile.TemporaryDirectory() as directory, \
-                patch.object(lane.Recorder, "_exact_pixels", spy):
+                patch.object(lane.subprocess, "run", spy):
             recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
             # A window this short left the decode milliseconds before; the
             # frame is retained inside it, so the decode keeps a full budget.
             self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=0.3, settle=0))
             self.assertGreater(budgets[0], 9.0)
             self.assertTrue(recorder.still_confirmations["alt-tab"]["confirmed"])
+            recorder.close()
+
+    def test_a_slow_decode_of_a_still_captured_in_time_does_not_miss_the_view(self):
+        # CI runs 43217494460, 43244398470: the switcher was ready and its
+        # still captured inside the 10 s view, but ffmpeg got only the
+        # leftover milliseconds to decode it (TimeoutExpired).
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        pixels = tour_frame(self.NAVY, self.SWITCHER)
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(
+                header + pixels if args["format"] == "ppm" else tour_png(pixels))
+        now = [0.0]
+        real_run = lane.subprocess.run
+        def slow_decode(argv, **kwargs):
+            if argv[0] == "ffmpeg":
+                now[0] += 20.0
+            return real_run(argv, **kwargs)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(lane.time, "monotonic", lambda: now[0]), \
+                patch.object(lane.subprocess, "run", slow_decode):
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=5, settle=0))
+            receipt = recorder.still_confirmations["alt-tab"]
+            self.assertTrue(receipt["evidence"]["within_deadline"])
+            self.assertTrue(receipt["evidence"]["exact_png"])
             recorder.close()
 
     def test_exact_overview_png_is_confirmed_without_changing_calibrated_floors(self):
@@ -3804,6 +3831,33 @@ class S3AbsoluteDeadline(unittest.TestCase):
                 self.assertFalse(accepted); self.assertFalse(receipt)
 
 
+    def test_wake_reopens_qga_transport_before_first_resume_inventory(self):
+        # PR runs 43385429967 et al. (guest Linux 7.3.4): the first post-wake
+        # guest-exec acknowledgement never arrived. The real suspend statements
+        # from system_wakeup to the first-resume inventory must reopen the
+        # transport first, without any guest-exec in between.
+        source = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+        lifecycle = next(n for n in ast.parse(source.read_text()).body
+                         if isinstance(n, ast.FunctionDef) and n.name == "run_lifecycle")
+        check = next(n for n in lifecycle.body if isinstance(n, ast.FunctionDef) and n.name == "suspend_and_check")
+        wake = next(i for i, n in enumerate(check.body) if "system_wakeup" in ast.dump(n))
+        first = next(i for i, n in enumerate(check.body) if "first-resume" in ast.dump(n))
+        events = []
+        agent = SimpleNamespace(
+            reopen_after_wake=lambda **kw: events.append(("reopen", kw)) or 2,
+            run=lambda *a, **kw: events.append(("guest-exec", a)))
+        with tempfile.TemporaryDirectory() as tmp:
+            scope = dict(qmp=SimpleNamespace(cmd=lambda name, **kw: events.append(("qmp", name))),
+                         agent=agent, evidence=tmp, label="", time=lane.time, os=lane.os, json=json,
+                         inventory=lambda label: events.append(("inventory", label)) or {"state": {"locked": True}})
+            exec(compile(ast.Module(body=check.body[wake:first + 1], type_ignores=[]), str(source), "exec"), scope)
+            with open(os.path.join(tmp, "wake-transport.json")) as stream:
+                receipt = json.load(stream)
+        self.assertEqual(events, [("qmp", "system_wakeup"), ("reopen", {"timeout": 20, "attempt": 2}),
+                                  ("inventory", "first-resume")])
+        self.assertEqual(receipt["connections"], 2)
+        self.assertIn("no guest-exec", receipt["scope"])
+
 
 class ShippedSnapshotInventory(unittest.TestCase):
     # Run 37696030597: the graphical PAM login produced a real login
@@ -4126,6 +4180,34 @@ class GdmSessionList(unittest.TestCase):
 
 
 class FixtureLoginSession(unittest.TestCase):
+    def fixture(self, name):
+        return (Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane" / name).read_text()
+
+    def test_both_fixtures_install_the_guest_helpers_the_lifecycle_runs(self):
+        # The strict published lifecycle (#994) runs the current build's probes:
+        # run 41388914137 stopped at brightness-contract because the published
+        # fixture lacked /usr/libexec/tuna-brightness-proof.
+        helpers = set(re.findall(r'"(/usr/libexec/[^"]+)"', self.fixture("tuna-vm-lifecycle")))
+        # The GDM trace serves only the current build's --fresh-accounts boot;
+        # the bounded soak runs only on the published image; the native-session
+        # modules (#1003) serve only the current build's `autotz` profile.
+        unused = {"Containerfile": {"/usr/libexec/tuna-soak/tuna-vm-soak"},
+                  "Containerfile.published": {"/usr/libexec/tuna-vm-gdm-trace",
+                                              "/usr/libexec/tuna-native-session"}}
+        # Orca's token-gated test presenter (orca-speech-trigger) reads the
+        # runtime token this user environment generator writes.
+        generator = "/usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token"
+        for name, skipped in unused.items():
+            with self.subTest(fixture=name):
+                containerfile = self.fixture(name)
+                # One source to a file, or several sources into a directory.
+                installed = {path.rstrip("/") for path in
+                             re.findall(r"^COPY (?:--\S+ )*\S+(?: \S+)* (\S+)$", containerfile, re.M)}
+                self.assertLessEqual((helpers - skipped) | {generator}, installed)
+                executable = containerfile.split("chmod 0755", 1)[1].split("&&", 1)[0]
+                for path in ("/usr/libexec/tuna-vm-lifecycle", "/usr/libexec/tuna-vm-input",
+                             "/usr/libexec/tuna-vm-shell-focus", generator):
+                    self.assertIn(path, executable)
 
     def test_tunaos_steps_use_installed_gdm_for_global_template_policy(self):
         source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tunaos"

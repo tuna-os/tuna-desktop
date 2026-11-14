@@ -312,7 +312,7 @@ class GuestAgent:
         if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
             raise ValueError("finite absolute guest-agent acquisition/command deadline required")
         self._caller_deadline = deadline
-        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._path = path
         self.buffer = bytearray()
         self.poisoned = False
         self.pending_guest_pid = None
@@ -320,10 +320,16 @@ class GuestAgent:
         self.command_nonce = f"tuna-qga-{time.time_ns()}"
         self.command_sequence = 0
         acquisition_deadline = time.monotonic() + 5
-        deadline = min(acquisition_deadline, deadline) if deadline is not None else acquisition_deadline
+        self._connect(min(acquisition_deadline, deadline) if deadline is not None else acquisition_deadline)
+
+    def _connect(self, deadline):
+        """Open one chardev connection and complete guest-sync-delimited; failure poisons it."""
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.buffer = bytearray()
+        self.poisoned = False
         try:
             self.socket.settimeout(self._remaining(deadline))
-            self.socket.connect(path)
+            self.socket.connect(self._path)
             nonce = time.time_ns() % (1 << 62)
             self._send(b"\xff" + json.dumps({"execute": "guest-sync-delimited",
                          "arguments": {"id": nonce}}).encode() + b"\n", deadline)
@@ -339,6 +345,43 @@ class GuestAgent:
         except BaseException:
             self._poison()
             raise
+
+    def reopen_after_wake(self, *, timeout, attempt):
+        """Reconnect the QGA chardev until one guest-sync completes after S3 wake.
+
+        Linux 7.3 virtcons_restore() (upstream 952261953cf7) refills the control
+        receive queue only after sending PORT_READY. QEMU answers PORT_READY with
+        its host-open event at once and drops it when that queue is empty, so the
+        restored guest port stays host-disconnected and every qemu-ga reply stalls.
+        Closing and reopening the host chardev makes QEMU send PORT_OPEN 0/1 again;
+        a connection opened after restore is delivered. Only the transport is
+        re-established: no guest-exec runs and no guest state is read.
+        Returns the number of connections opened.
+        """
+        for value in (timeout, attempt):
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError("finite positive guest-agent wake resynchronization bounds required")
+        if attempt > timeout:
+            raise ValueError("wake resynchronization attempt exceeds its total bound")
+        if (getattr(self, "guest_exec_state", "none") != "none"
+                or getattr(self, "pending_guest_pid", None) is not None):
+            raise RuntimeError("previous guest-exec retirement unconfirmed")
+        deadline = time.monotonic() + timeout
+        caller_deadline = getattr(self, "_caller_deadline", None)
+        if caller_deadline is not None:
+            deadline = min(deadline, caller_deadline)
+        connections = 0
+        while time.monotonic() < deadline:
+            self._poison()
+            connections += 1
+            try:
+                self._connect(min(deadline, time.monotonic() + attempt))
+            except TimeoutError:
+                continue
+            return connections
+        self._poison()
+        raise TimeoutError(f"guest-agent wake resynchronization: no guest-sync reply on "
+                           f"{connections} reopened connection(s) within {timeout:g}s")
 
     @staticmethod
     def _remaining(deadline):
@@ -471,6 +514,10 @@ class GuestAgent:
         try:
             pid = self.command("guest-exec", deadline=deadline, path=path,
                                arg=argv, **{"capture-output": True})["pid"]
+        except TimeoutError as error:
+            self._poison()
+            raise TimeoutError(f"guest lifecycle {action} timed out awaiting the guest-exec "
+                               f"acknowledgement; child start unconfirmed ({error})") from error
         except BaseException:
             self._poison()
             raise
@@ -482,6 +529,10 @@ class GuestAgent:
         while time.monotonic() < deadline:
             try:
                 status = self.command("guest-exec-status", pid=pid, deadline=deadline)
+            except TimeoutError as error:
+                self._poison()
+                raise TimeoutError(f"guest lifecycle {action} timed out awaiting guest-exec-status "
+                                   f"for pid {pid}; child retirement unconfirmed ({error})") from error
             except BaseException:
                 self._poison()
                 raise
