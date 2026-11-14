@@ -23,21 +23,21 @@ GNOME: 136 visible nodes; 9 named controls. Tuna Desktop: 15 named nodes in the 
 
 | GNOME named control | Tuna Desktop named node |
 | --- | --- |
-| push button: Files | frame: Top Bar |
-| push button: Text Editor | toggle button: Activities |
-| push button: Calculator | push button: Date and Time |
-| push button: tuna-test-beta | menu: Date and Time |
-| push button: tuna-test-gamma | push button: System |
-| push button: tuna-test-alpha | menu: System |
-| toggle button: Show Apps | frame: Search |
-| toggle button: Activities | entry: Search |
-| menu: System | frame: Dash |
-| — | push button: tuna-test-alpha |
-| — | push button: tuna-test-beta |
-| — | push button: tuna-test-gamma |
-| — | toggle button: Show Apps |
-| — | frame: Window Previews |
-| — | push button: Close |
+| push button: Files | frame: Search |
+| push button: Text Editor | entry: Search |
+| push button: Calculator | frame: Dash |
+| push button: tuna-test-beta | push button: tuna-test-alpha |
+| push button: tuna-test-gamma | push button: tuna-test-beta |
+| push button: tuna-test-alpha | push button: tuna-test-gamma |
+| toggle button: Show Apps | toggle button: Show Apps |
+| toggle button: Activities | frame: Window Previews |
+| menu: System | push button: Close |
+| — | frame: Top Bar |
+| — | toggle button: Activities |
+| — | push button: Date and Time |
+| — | menu: Date and Time |
+| — | push button: System |
+| — | menu: System |
 
 ## quick-settings
 
