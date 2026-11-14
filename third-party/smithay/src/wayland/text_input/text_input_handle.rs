@@ -209,6 +209,16 @@ where
             data.handle.increment_serial(resource);
         }
 
+        // Version 2: the action set is checked whatever the focus and
+        // whether or not an input method runs, as Mutter's
+        // text_input_set_available_actions does.
+        if let zwp_text_input_v3::Request::SetAvailableActions { available_actions } = &request {
+            if let Err(message) = check_available_actions(available_actions) {
+                resource.post_error(zwp_text_input_v3::Error::InvalidAction, message);
+                return;
+            }
+        }
+
         // Discard requsets without any active input method instance.
         if !data.input_method_handle.has_instance() {
             debug!("discarding text-input request without IME running");
@@ -323,6 +333,13 @@ where
             zwp_text_input_v3::Request::Destroy => {
                 // Nothing to do
             }
+            // Version 2: input-method-v2 carries neither available actions
+            // nor input-panel requests, so nothing reaches the input
+            // method; the compositor reads the panel requests before
+            // dispatching here.
+            zwp_text_input_v3::Request::SetAvailableActions { .. }
+            | zwp_text_input_v3::Request::ShowInputPanel
+            | zwp_text_input_v3::Request::HideInputPanel => {}
             _ => unreachable!(),
         }
     }
@@ -351,6 +368,23 @@ where
             data.input_method_handle.deactivate_input_method(state);
         }
     }
+}
+
+/// Mutter's text_input_set_available_actions: every entry of the
+/// uint32 array must be a known action other than none, each at most
+/// once; the error messages are Mutter's.
+fn check_available_actions(actions: &[u8]) -> Result<(), String> {
+    let mut seen = 0_u32;
+    for entry in actions.chunks_exact(4) {
+        let action = u32::from_ne_bytes([entry[0], entry[1], entry[2], entry[3]]);
+        match zwp_text_input_v3::Action::try_from(action) {
+            Ok(zwp_text_input_v3::Action::None) => return Err("Invalid 'none' action in set".into()),
+            Ok(_) if seen & (1 << action) != 0 => return Err(format!("Action {action} doubly set")),
+            Ok(_) => seen |= 1 << action,
+            Err(()) => return Err(format!("Unknown action {action} in set")),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

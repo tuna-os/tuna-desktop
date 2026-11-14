@@ -30,25 +30,15 @@ impl Runtime {
     /// screen), a pending input-panel request and touch-mode auto-show.
     pub(super) fn publish_on_screen_keyboard(&mut self) {
         let locked = self.is_locked();
-        let focus = self
-            .state
-            .seat
-            .get_keyboard()
-            .and_then(|k| k.current_focus());
-        let inputs = &mut self.state.protocols.text_inputs;
-        let show = inputs.take_show(focus.as_ref()) && !locked;
-        let field = if locked {
-            None
-        } else {
-            inputs.focus(focus.as_ref())
-        };
+        let (field, panel) = self.state.on_screen_keyboard(locked);
         #[allow(unused_mut)]
         let mut touch_auto = false;
         #[cfg(feature = "drm")]
         if let super::Backend::Drm(drm) = &self.backend {
             touch_auto = drm.touch_mode().auto();
         }
-        self.control.set_on_screen_keyboard(field, show, touch_auto);
+        self.control
+            .set_on_screen_keyboard(field, panel, touch_auto);
     }
 
     /// Type one action from the shell's keyboard. The hub refuses these

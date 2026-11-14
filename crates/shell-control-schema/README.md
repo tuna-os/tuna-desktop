@@ -51,6 +51,9 @@ before decoding.
   lock). The shell answers `CommandKind::RespondCloseDialog { window,
   response }` with `CloseDialogResponse::ForceClose` or `Wait`. Texts are
   bounded by `MAX_TITLE_LEN`, sides by `MAX_CLOSE_DIALOG_SIDE`.
+- Input-panel OFF (0.51): `Message::HideInputPanel` (peers >=51 only)
+  follows the `OnScreenKeyboard` update of a text-input-v3 version 2
+  client's `hide_input_panel`, so the shell's keyboard closes at once.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
   `ErrorKind`.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,
