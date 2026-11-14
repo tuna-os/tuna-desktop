@@ -3,7 +3,9 @@
 Every metric is measured on Tuna Desktop and on the GNOME 51 session of the
 same pair (same job, image and VM profile), so a budget is a ratio to GNOME
 plus an optional absolute ceiling. Budgets live in docs/perf/budgets.json and
-only ratchet tighter; see docs/perf/README.md.
+only ratchet tighter; see docs/perf/README.md. CPU, frame pacing, overview
+response and memory (PSS) are measured; a budget that is not enforced is
+reported as such and is never a pass.
 """
 import json
 import math
@@ -21,6 +23,16 @@ ROLES = ("compositor", "shell", "xwayland", "portals", "services", "apps")
 # live in gnome-shell, so the comparison is the same set of work.
 AGGREGATES = {"desktop": ("compositor", "shell"), "total": ROLES}
 MIN_PHASE_INTERVALS = 3
+# Memory is the proportional set size (PSS) of the session user's processes,
+# in MiB, over a phase's samples or the "whole" run. p50 is the gated
+# statistic: one transient spike does not move it. p95 is the near-peak.
+MEMORY_STATISTICS = ("p50", "p95")
+MEMORY_SCOPES = PHASES + ("whole",)
+# v1 requires memory no worse than GNOME 51 (docs/v1.md): what Tuna Desktop
+# owns and the whole user session, at idle and over the whole workload.
+MEMORY_CRITERION = ("pss.idle.desktop.p50", "pss.idle.total.p50",
+                    "pss.whole.desktop.p50", "pss.whole.total.p50")
+KIB_PER_MIB = 1024
 DESKTOPS = ("gnome", "tuna")
 # The notifications phase: one unmeasured warm-up round (the first banner,
 # notification source and lazily built widgets), then this many measured
@@ -138,6 +150,88 @@ def phase_cpu(samples, guest_phases):
     return result
 
 
+def pss_samples(samples):
+    """Per-sample PSS in MiB, from the per-process smaps_rollup reads.
+
+    Returns (begin_boottime, end_boottime, {role: MiB} or None, named,
+    {process name: MiB}). The two clocks bound the collection like a CPU
+    interval. Roles are None when the sample cannot stand for the session's
+    memory: the observer could not read a process, or a row lacks a whole
+    non-negative pss_kib. That is a failed measurement, never zero memory. A
+    sample is a snapshot, so a process counts from the first sample that sees
+    it and no longer once it has exited.
+    """
+    result = []
+    for sample in samples:
+        processes = sample.get("processes")
+        kib, names, named = dict.fromkeys(ROLES, 0), {}, True
+        valid = not sample.get("unreadable") and isinstance(processes, list)
+        for process in processes if valid else ():
+            value = process.get("pss_kib")
+            if type(value) is not int or value < 0:
+                valid = False
+                break
+            name = process_name(process)
+            if name is None:
+                named = False
+            else:
+                names[name] = names.get(name, 0) + value
+            kib[classify(name) or "apps"] += value
+        roles = None
+        if valid:
+            for aggregate, members in AGGREGATES.items():
+                kib[aggregate] = sum(kib[member] for member in members)
+            roles = {role: value / KIB_PER_MIB for role, value in kib.items()}
+        result.append((sample.get("cpu_interval_start_boottime_s"), sample.get("boottime_s"), roles, named,
+                       {name: value / KIB_PER_MIB for name, value in names.items()}))
+    return result
+
+
+def pss_scopes(samples, guest_phases):
+    """{scope: its pss_samples rows} for each measured phase and the "whole" run.
+
+    A phase takes the samples whose collection lies wholly inside it, the same
+    rule as its CPU intervals, and needs as many. "whole" takes every sample.
+    A scope with a failed sample is left out: it is missing, not smaller.
+    """
+    rows = pss_samples(samples)
+    scopes = {phase: [row for row in rows if row[0] is not None and row[1] is not None
+                      and start <= row[0] <= row[1] <= end]
+              for phase, (start, end) in phase_windows(guest_phases).items()}
+    scopes["whole"] = rows
+    return {scope: inside for scope, inside in scopes.items()
+            if len(inside) >= MIN_PHASE_INTERVALS and all(row[2] is not None for row in inside)}
+
+
+def pss_series(samples, guest_phases):
+    """{"pss.<scope>.<role>.<stat>": (stat, MiB per sample)} for every measured scope.
+
+    Roles are omitted (only "total" kept) when a process has no name.
+    """
+    series = {}
+    for scope, inside in pss_scopes(samples, guest_phases).items():
+        keys = ROLES + tuple(AGGREGATES) if all(row[3] for row in inside) else ("total",)
+        for key in keys:
+            values = [row[2][key] for row in inside]
+            for stat in MEMORY_STATISTICS:
+                series[f"pss.{scope}.{key}.{stat}"] = (stat, values)
+    return series
+
+
+def process_pss(samples, guest_phases):
+    """{scope: {process name: {stat: MiB}}} for the named processes of every measured scope.
+
+    Same-named processes are summed within a sample, and a sample without the
+    process counts as zero, so p50 is what it typically held over the scope.
+    """
+    result = {}
+    for scope, inside in pss_scopes(samples, guest_phases).items():
+        result[scope] = {name: {stat: STATISTICS[stat]([row[4].get(name, 0.0) for row in inside])
+                                for stat in MEMORY_STATISTICS}
+                         for name in sorted({name for row in inside for name in row[4]})}
+    return result
+
+
 def read_session(directory):
     directory = Path(directory)
     report = json.loads((directory / "report.json").read_text())
@@ -156,11 +250,12 @@ STATISTICS = {"mean": statistics.mean,
 def session_series(directory):
     """{metric: (statistic, observations)} behind each value of session_metrics.
 
-    CPU observations are the phase's whole 1 s intervals in order; a fixed
-    report value (frame pacing) is one observation with the "p95"/"p99" name.
+    CPU observations are the phase's whole 1 s intervals in order; memory
+    observations are the scope's per-sample PSS; a fixed report value (frame
+    pacing) is one observation with the "p95"/"p99" name.
     """
     report, samples, guest_phases, observations = read_session(directory)
-    series = {}
+    series = pss_series(samples, guest_phases)
     intervals = cpu_intervals(samples)
     for phase, (start, end) in phase_windows(guest_phases).items():
         inside = [row for row in intervals if start <= row[0] <= row[1] <= end]
@@ -290,7 +385,9 @@ def confidence(budgets, series, replicates=BOOTSTRAP_REPLICATES, seed=BOOTSTRAP_
     session, blocks of its intervals or observations, then recomputes the
     median over pairs of Tuna / max(GNOME, floor). The interval describes this
     run's measurement noise; it never changes a status, which stays on the
-    point estimate, so no budget is loosened by it.
+    point estimate, so no budget is loosened by it. Memory draws from its own
+    seeded stream: budgeting it left every CPU, pacing and response interval
+    of an artifact as it was.
     """
     floors = {}
     for metric, budget in budgets["metrics"].items():
@@ -298,17 +395,19 @@ def confidence(budgets, series, replicates=BOOTSTRAP_REPLICATES, seed=BOOTSTRAP_
         if usable and series and all(finite_number(value) for _, gnome, tuna in series
                                      for value in gnome[metric][1] + tuna[metric][1]):
             floors[metric] = budget.get("floor", 0)
-    rng = random.Random(seed)
     draws = {metric: [] for metric in floors}
-    for _ in range(replicates if floors else 0):
-        chosen = [series[rng.randrange(len(series))] for _ in series]
-        for metric, floor in floors.items():
-            ratios = []
-            for _, gnome, tuna in chosen:
-                (gnome_stat, gnome_values), (tuna_stat, tuna_values) = gnome[metric], tuna[metric]
-                ratios.append(ratio(STATISTICS[tuna_stat](resample(tuna_values, rng)),
-                                    STATISTICS[gnome_stat](resample(gnome_values, rng)), floor))
-            draws[metric].append(statistics.median(ratios))
+    for memory in (False, True):
+        family = {metric: floor for metric, floor in floors.items() if metric.startswith("pss.") is memory}
+        rng = random.Random(seed)
+        for _ in range(replicates if family else 0):
+            chosen = [series[rng.randrange(len(series))] for _ in series]
+            for metric, floor in family.items():
+                ratios = []
+                for _, gnome, tuna in chosen:
+                    (gnome_stat, gnome_values), (tuna_stat, tuna_values) = gnome[metric], tuna[metric]
+                    ratios.append(ratio(STATISTICS[tuna_stat](resample(tuna_values, rng)),
+                                        STATISTICS[gnome_stat](resample(gnome_values, rng)), floor))
+                draws[metric].append(statistics.median(ratios))
     tail = (1 - level) / 2
     return {metric: (percentile(sorted(values), tail), percentile(sorted(values), 1 - tail))
             for metric, values in draws.items()}
@@ -326,9 +425,11 @@ def evaluate(budgets, comparison, min_pairs=3, intervals=None):
     """Check every budget against the median over pairs of the Tuna/GNOME ratio.
 
     The median absorbs one disturbed pair; an enforced budget that is over its
-    ratio or ceiling, or has fewer than min_pairs measurements, fails. With
-    bootstrap intervals, a row records whether its decision is stable: the
-    whole interval lies on one side of the budget ratio.
+    ratio or ceiling, or has fewer than min_pairs measurements, fails. A
+    budget that is not enforced never fails and never passes: it warns, or is
+    "unenforced" when within its ratio and ceiling. With bootstrap intervals,
+    a row records whether its decision is stable: the whole interval lies on
+    one side of the budget ratio.
     """
     rows = []
     for metric, budget in sorted(budgets["metrics"].items()):
@@ -358,7 +459,7 @@ def evaluate(budgets, comparison, min_pairs=3, intervals=None):
         if reasons:
             row.update(status="fail" if row["enforced"] else "warn", reason="; ".join(reasons))
         else:
-            row["status"] = "pass"
+            row["status"] = "pass" if row["enforced"] else "unenforced"
         # The denominator floor stabilizes the regression budget, not the
         # match-or-beat target. A quiet but slower desktop must not claim parity.
         target_ratios = (v["tuna"] / v["gnome"] if v["gnome"] else
@@ -374,6 +475,37 @@ def evaluate(budgets, comparison, min_pairs=3, intervals=None):
 
 def failed(rows):
     return [row for row in rows if row["status"] in ("fail", "missing")]
+
+
+def unenforced(rows):
+    return [row for row in rows if not row["enforced"]]
+
+
+def memory_criterion(rows, target_ratio=1.0):
+    """How a result stands against v1's "memory no worse than GNOME 51".
+
+    The criterion is enforced only when every MEMORY_CRITERION metric has an
+    enforced budget no looser than the target ratio. Otherwise the gate's
+    exit status says nothing about memory, and the report must say so.
+    """
+    by_metric = {row["metric"]: row for row in rows}
+    metrics = {}
+    for metric in MEMORY_CRITERION:
+        row = by_metric.get(metric)
+        if row is None:
+            enforcement = "no budget"
+        elif not row["enforced"]:
+            enforcement = "not enforced"
+        elif row["max_ratio"] > target_ratio:
+            enforcement = f"enforced at {row['max_ratio']:.2f}, above the target"
+        else:
+            enforcement = "enforced"
+        row = row or {}
+        metrics[metric] = {"enforcement": enforcement, "gnome": row.get("gnome"), "tuna": row.get("tuna"),
+                           "ratio": row.get("ratio"), "meets_target": row.get("meets_target")}
+    return {"target_ratio": target_ratio,
+            "enforced": all(value["enforcement"] == "enforced" for value in metrics.values()),
+            "metrics": metrics}
 
 
 def propose(budgets, rows, margin=None, evidence=None):
@@ -462,8 +594,9 @@ def validate(budgets):
             problems.append(f"{metric}: metric name and budget object required")
             continue
         parts = metric.split(".")
-        known = (len(parts) == 4 and parts[0] == "cpu" and (parts[1] in PHASES or parts[1] == "whole")
-                 and parts[2] in ROLES + tuple(AGGREGATES) and parts[3] in ("mean", "p95", "p50")) or \
+        statistics_by_family = {"cpu": ("mean", "p95", "p50"), "pss": MEMORY_STATISTICS}
+        known = (len(parts) == 4 and parts[1] in MEMORY_SCOPES and parts[2] in ROLES + tuple(AGGREGATES)
+                 and parts[3] in statistics_by_family.get(parts[0], ())) or \
             metric in ("overview.response_ms.p50", "overview.response_ms.p95",
                        "frame_pacing.interval_ms.p95", "frame_pacing.interval_ms.p99")
         if not known:
@@ -494,12 +627,106 @@ def attribution(comparison):
     return result
 
 
-def markdown(rows, pairs, budgets, comparison=None, refused=(), hosts=()):
+def memory_attribution(comparison):
+    """{desktop: {scope: {stat: {role: MiB}}}}: median over pairs of each session's PSS statistic."""
+    result = {desktop: {} for desktop in DESKTOPS}
+    for scope in MEMORY_SCOPES:
+        for stat in MEMORY_STATISTICS:
+            for role in ROLES + tuple(AGGREGATES):
+                values = comparison.get(f"pss.{scope}.{role}.{stat}")
+                if not values:
+                    continue
+                for desktop in DESKTOPS:
+                    result[desktop].setdefault(scope, {}).setdefault(stat, {})[role] = \
+                        statistics.median(v[desktop] for v in values)
+    return result
+
+
+def memory_processes(pairs, scopes=("idle", "whole")):
+    """{desktop: {scope: [{"process", "role", "p50", "p95"}]}} in MiB, largest p50 first.
+
+    Each value is the median, over the pairs that measured the scope, of the
+    session's statistic; a pair that never saw the process counts as zero.
+    """
+    result = {}
+    for desktop in DESKTOPS:
+        sessions = []
+        for pair in pairs:
+            directory = Path(pair[desktop])
+            sessions.append(process_pss(json.loads((directory / "samples.json").read_text()),
+                                        json.loads((directory / "guest-phases.json").read_text())))
+        result[desktop] = {}
+        for scope in scopes:
+            measured = [session[scope] for session in sessions if scope in session]
+            rows = [{"process": name, "role": classify(name),
+                     **{stat: statistics.median(session.get(name, {}).get(stat, 0.0) for session in measured)
+                        for stat in MEMORY_STATISTICS}}
+                    for name in sorted({name for session in measured for name in session})]
+            if rows:
+                result[desktop][scope] = sorted(rows, key=lambda row: -row["p50"])
+    return result
+
+
+DESKTOP_TITLES = {"gnome": "GNOME 51", "tuna": "Tuna Desktop"}
+# Scopes of the summary's role table; the JSON result carries every phase.
+MEMORY_SUMMARY_SCOPES = ("idle", "settle", "whole")
+MEMORY_SUMMARY_PROCESSES = 8
+
+
+def memory_markdown(rows, budgets, comparison, processes):
+    target = budgets.get("target_ratio", 1.0)
+    criterion = memory_criterion(rows, target)
+    lines = ["", "### Memory (PSS) against the v1 criterion", "",
+             ("**The memory criterion is enforced.** " if criterion["enforced"] else
+              "**The memory criterion is not enforced by this gate.** ")
+             + f"v1 requires memory no worse than GNOME 51: a Tuna / GNOME PSS ratio <= {target:.2f} for the "
+             "desktop (compositor plus shell) and for the whole user session, at idle and over the whole run."
+             + ("" if criterion["enforced"] else
+                " This result neither passes nor fails that criterion, whatever the gate's exit status."), "",
+             f"| Metric | Enforcement | GNOME MiB | Tuna MiB | Ratio | Target <= {target:.2f} |",
+             "|---|---|---:|---:|---:|---|"]
+    for metric, value in criterion["metrics"].items():
+        def number(key, fmt):
+            return format(value[key], fmt) if value[key] is not None else "-"
+        met = {True: "met", False: "not met", None: "not measured"}[value["meets_target"]]
+        lines.append(f"| `{metric}` | {value['enforcement']} | {number('gnome', '.1f')} | {number('tuna', '.1f')} | "
+                     f"{number('ratio', '.2f')} | {met} |")
+    roles = ROLES + tuple(AGGREGATES)
+    by_role = memory_attribution(comparison)
+    scopes = [scope for scope in MEMORY_SUMMARY_SCOPES if all(scope in by_role[desktop] for desktop in DESKTOPS)]
+    if scopes:
+        lines += ["", "PSS by process role (MiB, median over pairs of each session's statistic). GNOME's compositor "
+                  "and shell are one process, so compare the `desktop` column.", "",
+                  "| Scope | Stat | Session | " + " | ".join(roles) + " |", "|---|---|---|" + "---:|" * len(roles)]
+    for scope in scopes:
+        for stat in MEMORY_STATISTICS:
+            gnome, tuna = (by_role[desktop][scope].get(stat, {}) for desktop in DESKTOPS)
+            for title, values, fmt in ((DESKTOP_TITLES["gnome"], gnome, ".1f"), (DESKTOP_TITLES["tuna"], tuna, ".1f"),
+                                       ("Tuna − GNOME", {role: tuna[role] - gnome[role]
+                                                         for role in gnome.keys() & tuna.keys()}, "+.1f")):
+                lines.append(f"| {scope} | {stat} | {title} | "
+                             + " | ".join(format(values[role], fmt) if role in values else "-" for role in roles) + " |")
+    for desktop in DESKTOPS:
+        largest = ((processes or {}).get(desktop) or {}).get("whole", [])[:MEMORY_SUMMARY_PROCESSES]
+        if not largest:
+            continue
+        lines += ["", f"{DESKTOP_TITLES[desktop]}: largest processes over the whole run (PSS MiB, median over pairs)",
+                  "", "| Process | Role | p50 | p95 |", "|---|---|---:|---:|"]
+        lines += [f"| `{row['process']}` | {row['role']} | {row['p50']:.1f} | {row['p95']:.1f} |" for row in largest]
+    return lines
+
+
+def markdown(rows, pairs, budgets, comparison=None, refused=(), hosts=(), processes=None):
     lines = ["## Performance budgets: Tuna Desktop vs GNOME 51", "",
              f"{len(pairs)} {budgets.get('profile', 'stock')} paired sessions. Ratio is the median over pairs of Tuna / GNOME "
              f"(target <= {budgets.get('target_ratio', 1.0):.2f}). Budgets: `docs/perf/budgets.json`. "
              f"The {CONFIDENCE:.0%} interval is a seeded block bootstrap over pairs and intervals; "
              "`unstable` marks a decision whose interval straddles the budget.", ""]
+    provisional = unenforced(rows)
+    if provisional:
+        lines += [f"{len(provisional)} of {len(rows)} budgets are not enforced: "
+                  + ", ".join(f"`{row['metric']}`" for row in provisional)
+                  + ". They are reported, cannot fail this gate and are not passes.", ""]
     if hosts:
         lines += ["Host CPU: " + ", ".join(f"`{host}`" for host in hosts) + ". Ratios differ by host class.", ""]
     for item in refused:
@@ -512,16 +739,22 @@ def markdown(rows, pairs, budgets, comparison=None, refused=(), hosts=()):
     for row in rows:
         def number(key, fmt):
             return format(row[key], fmt) if row.get(key) is not None else "-"
-        status = row["status"] + ("" if row["status"] == "pass" else f" ({row.get('reason', '')})")
+        if row["status"] == "pass":
+            status = "pass"
+        elif row["status"] == "unenforced":
+            status = "not enforced (within budget)"
+        else:
+            status = f"{row['status']} ({row.get('reason', '')})" + ("" if row["enforced"] else ", not enforced")
         if row.get("decision_stable") is False:
             status += ", unstable"
         interval = "{:.2f}–{:.2f}".format(*row["ci90"]) if row.get("ci90") else "-"
         lines.append(f"| `{row['metric']}` | {status} | {number('gnome', '.1f')} | {number('tuna', '.1f')} | "
                      f"{number('ratio', '.2f')} | {interval} | {row['max_ratio']:.2f} | {number('ceiling', '.1f')} |")
+    lines += memory_markdown(rows, budgets, comparison or {}, processes)
     for desktop, phases in attribution(comparison or {}).items():
         if not phases:
             continue
-        lines += ["", f"### {'GNOME 51' if desktop == 'gnome' else 'Tuna Desktop'}: mean CPU by process role "
+        lines += ["", f"### {DESKTOP_TITLES[desktop]}: mean CPU by process role "
                   "(% of one core, median over pairs)", "",
                   "| Phase | " + " | ".join(ROLES) + " |", "|---|" + "---:|" * len(ROLES)]
         for phase, roles in phases.items():
