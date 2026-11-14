@@ -8,6 +8,19 @@
 //! positions anything here; placement and rendering belong to later
 //! tasks. Behavioral reference: cosmic-comp's layer-shell handler (record
 //! on map, configure on map) with original code throughout.
+//!
+//! Admission (#1048): the global is visible, and bindable, only to the
+//! supervised shell's connection — the native connection whose peer is
+//! the shell child the runtime spawned and still holds ([`is_shell_peer`],
+//! the same pid identity the session lock and control socket use). Every
+//! other client's registry omits it and a blind bind by name is a protocol
+//! error. GNOME 51 has no client-placed shell layers at all; Mutter hides
+//! its privileged globals per client through a global filter
+//! (meta-wayland-filter-manager.c `global_filter_func`,
+//! meta-wayland-x11-interop.c `x11_interop_filter`), the model followed
+//! here. Recorded divergence: Mutter keys admission to a capability on a
+//! compositor-created client; ours is the accepted connection's pid
+//! until the shell gets an inherited socket (spek 004, ADR 0005).
 
 use smithay::{
     delegate_layer_shell,
@@ -38,6 +51,14 @@ pub use smithay::wayland::shell::wlr_layer::Layer;
 /// Shared with the shell-host: both the compositor and shell read these
 /// from the same source to prevent drift.
 pub use tuna_shell_control::{BANNER_NAMESPACE, OVERVIEW_NAMESPACE, PANEL_HEIGHT, PANEL_NAMESPACE};
+
+/// Whether a native connection's peer is the supervised shell: its pid is
+/// the shell child the runtime holds. An unknown pid on either side (no
+/// shell running, between restarts, or unreadable peer credentials) never
+/// matches.
+pub fn is_shell_peer(peer_pid: Option<u32>, shell_pid: Option<u32>) -> bool {
+    matches!((peer_pid, shell_pid), (Some(peer), Some(shell)) if peer == shell)
+}
 
 /// One layer surface's placement request, as committed.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -307,6 +328,7 @@ impl WlrLayerShellHandler for State {
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
+        self.pointer_scene_dirty = true;
         let gone = surface.wl_surface().clone();
         self.panel_surfaces.retain(|record| record.surface != gone);
         // Keep only the id (see `dead_layer_surfaces`): holding the
@@ -571,7 +593,18 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::{front_to_back, hit_layer_rect, press_takes_keyboard, KeyboardInteractivity};
+    use super::{
+        front_to_back, hit_layer_rect, is_shell_peer, press_takes_keyboard, KeyboardInteractivity,
+    };
+
+    #[test]
+    fn only_the_held_shell_child_is_a_shell_peer() {
+        assert!(is_shell_peer(Some(4242), Some(4242)));
+        assert!(!is_shell_peer(Some(4243), Some(4242)), "another process");
+        assert!(!is_shell_peer(Some(4242), None), "no shell running");
+        assert!(!is_shell_peer(None, Some(4242)), "unreadable peer");
+        assert!(!is_shell_peer(None, None));
+    }
 
     #[test]
     fn a_press_never_gives_the_keyboard_to_a_surface_that_wants_none() {

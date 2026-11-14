@@ -12,6 +12,7 @@
 //! and focused; titles are read from the surface role data; stacking is
 //! insertion order with focus raising to top. All code here is original.
 
+mod alive;
 mod tablet_input;
 
 use std::collections::{HashMap, HashSet};
@@ -28,18 +29,14 @@ pub(crate) fn trace_media(stage: &str, details: serde_json::Value, locked: bool)
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
         return;
     }
-    // One write per record, like the shell's: eprintln! of a JSON value
-    // issues many small writes that the shell's records on the same pipe
-    // can split (journey 38757056152 failed G-MEDIA-VOLUME on that).
-    let line = format!(
-        "tuna-media-diagnostic: {}\n",
+    eprintln!(
+        "tuna-media-diagnostic: {}",
         serde_json::json!({
             "actor": "compositor", "pid": std::process::id(), "stage": stage,
             "monotonic_ns": now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64,
             "details": details,
         })
     );
-    let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
 }
 
 fn media_trace_enabled() -> bool {
@@ -122,6 +119,16 @@ struct ManagedWindow {
     sticky: bool,
     /// Trusted cross-backend modal parent, pinned to a managed generation.
     x11_parent: Option<u64>,
+    /// The output this window returns to when it is connected (Mutter's
+    /// `preferred_logical_monitor`): where it was placed or the user
+    /// last moved it, kept while it waits on another output.
+    preferred_output: Option<String>,
+    /// Where the last output change put the window before the workarea
+    /// constraint moved it, and where the constraint put it (Mutter's
+    /// `unconstrained_rect`): the next output change starts from the
+    /// former while the window still sits at the latter, so a monitor
+    /// round trip returns it exactly.
+    unconstrained: Option<(Rectangle<i32, Logical>, Rectangle<i32, Logical>)>,
 }
 
 /// Compositor-side presentation layout (002 window actions).
@@ -576,11 +583,16 @@ pub struct WindowManager {
     /// Mutter's `pointer_window` at the last crossing (`Some(None)`: no
     /// window, i.e. the desktop or shell chrome); `None` before the first.
     pointer_window: Option<Option<u64>>,
+    /// Window-model and scene changes since the last completed pointer repick.
+    pointer_scene_revision: u64,
+    pointer_scene_dirty: std::cell::Cell<bool>,
     sticky_focus: Option<StickyFocus>,
     pointer_rest: Option<PointerRest>,
     /// Pending auto-raise `(window, due)`.
     auto_raise: Option<(u64, std::time::Instant)>,
     grab_raise: Option<GrabRaise>,
+    /// Mutter's alive checks and the close dialog (#1035).
+    alive: alive::AliveState,
 }
 
 impl WindowManager {
@@ -602,6 +614,11 @@ impl WindowManager {
 
     /// Output scale/mode changes alter logical workareas independently of client
     /// requests. Preserve fitting windows that were fully visible, once per change.
+    /// Output changes the runtime reports to
+    /// [`relocate_for_monitors_changed`](Self::relocate_for_monitors_changed)
+    /// are handled there, which takes over this baseline: this pass catches
+    /// the workarea changes nothing re-homed (the nested output's size and
+    /// scale, a sensor rotation).
     fn reconcile_floating_workareas(&mut self, state: &State) {
         if self.grab.is_some() {
             return;
@@ -613,46 +630,19 @@ impl WindowManager {
                 .iter()
                 .zip(&self.floating_workareas)
                 .all(|(output, (name, area))| {
-                    output.name == *name
-                        && *area
-                            == (
-                                output.loc.0,
-                                output.loc.1.saturating_add(WORK_AREA_TOP),
-                                output.size.w,
-                                output.size.h.saturating_sub(WORK_AREA_TOP),
-                            )
+                    output.name == *name && *area == floating_workarea(output.loc, output.size)
                 })
         {
             return;
         }
-        let current: Vec<_> = state
-            .outputs
-            .iter()
-            .map(|output| {
-                (
-                    output.name.clone(),
-                    (
-                        output.loc.0,
-                        output.loc.1.saturating_add(WORK_AREA_TOP),
-                        output.size.w,
-                        output.size.h.saturating_sub(WORK_AREA_TOP),
-                    ),
-                )
-            })
-            .collect();
+        let current = output_workareas(state);
         let mut moved = Vec::new();
         for (&id, window) in &mut self.windows {
             if window.layout != WindowLayout::Floating || window.unplaced {
                 continue;
             }
-            let rect = (
-                window.geometry.loc.x,
-                window.geometry.loc.y,
-                window.geometry.size.w,
-                window.geometry.size.h,
-            );
             if let Some((x, y, _, _)) = crate::output_constraints::reposition_on_output(
-                rect,
+                rect_tuple(window.geometry),
                 &self.floating_workareas,
                 &current,
             ) {
@@ -834,10 +824,13 @@ impl WindowManager {
             icon_geometries: Default::default(),
             focus_policy: Default::default(),
             pointer_window: None,
+            pointer_scene_revision: u64::MAX,
+            pointer_scene_dirty: std::cell::Cell::new(true),
             sticky_focus: None,
             pointer_rest: None,
             auto_raise: None,
             grab_raise: None,
+            alive: alive::AliveState::new(state),
         }
     }
 
@@ -845,6 +838,9 @@ impl WindowManager {
     /// after polling control). The next [`reconcile`](Self::reconcile)
     /// steers focus.
     pub fn set_overview_open(&mut self, open: bool) {
+        if self.overview_open != open {
+            self.pointer_scene_dirty.set(true);
+        }
         self.overview_open = open;
     }
 
@@ -888,6 +884,63 @@ impl WindowManager {
     /// Every managed window's id, in no particular order.
     pub fn window_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.windows.keys().copied()
+    }
+
+    /// Which of the manager's per-window structures still name window
+    /// `id`. Empty once a closed window is fully forgotten (#1088);
+    /// effect state the runtime steps every frame (map/close effects,
+    /// modal dimming) counts too.
+    pub fn window_references(&self, id: u64) -> Vec<&'static str> {
+        let mut held = Vec::new();
+        let mut check = |name, holds: bool| {
+            if holds {
+                held.push(name);
+            }
+        };
+        check("model", self.model.window(id).is_some());
+        check("windows", self.windows.contains_key(&id));
+        check(
+            "surface_index",
+            self.surface_index.values().any(|v| *v == id),
+        );
+        #[cfg(feature = "xwayland")]
+        check("x11_index", self.x11_index.values().any(|v| *v == id));
+        check("stacking", self.stacking.contains(&id));
+        check("focus_history", self.focus_history.contains(&id));
+        check(
+            "focus_awaits_surface",
+            self.focus_awaits_surface == Some(id),
+        );
+        check("x11_input_focus", self.x11_input_focus == Some(id));
+        check("pre_overview_focus", self.pre_overview_focus == Some(id));
+        check("overview_activated", self.overview_activated == Some(id));
+        check("activated", self.activated == Some(id));
+        check("pointer_window", self.pointer_window == Some(Some(id)));
+        check(
+            "pointer_rest",
+            self.pointer_rest.is_some_and(|r| r.window == Some(id)),
+        );
+        check("auto_raise", self.auto_raise.is_some_and(|(w, _)| w == id));
+        check("grab_raise", self.grab_raise.is_some_and(|g| g.id == id));
+        check(
+            "column_animations",
+            self.column_animations.contains_key(&id),
+        );
+        check("strip_hints", self.strip_hints.contains_key(&id));
+        check(
+            "strip_resize_heights",
+            self.strip_resize_heights.iter().any(|(w, _)| *w == id),
+        );
+        check("icon_geometries", self.icon_geometries.contains_key(&id));
+        check(
+            "menu_requests",
+            self.menu_requests.iter().any(|(w, _, _)| *w == id),
+        );
+        check("size_changes", self.size_changes.holds(id));
+        check("window_lifecycle", self.window_lifecycle.holds(id));
+        check("modal_dim", self.modal_dim.holds(id));
+        check("alive", self.alive_holds(id));
+        held
     }
 
     /// The Wayland surface of window `id`, if it has one.
@@ -1303,16 +1356,16 @@ impl WindowManager {
         output_width: i32,
         motion: tuna_shell_control::motion::MotionPolicy,
     ) {
-        let keep_alive = self
-            .workspace_tracker
-            .protected_workspaces(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        let keep_alive = self.workspace_tracker.occupying_workspaces(now);
+        let retained = self.workspace_tracker.retained_workspaces(now);
         if self.grab.is_some() || overview_dragging {
             return;
         }
         let previous_active = self.model.active_workspace();
         if let Some(indices) = self
             .model
-            .reconcile_dynamic_workspaces_with_remap(&keep_alive)
+            .reconcile_dynamic_workspaces_with_remap(&keep_alive, &retained)
         {
             self.workspace_tracker.remap(&indices);
             let active = self.model.active_workspace();
@@ -1530,29 +1583,7 @@ impl WindowManager {
         state.refresh_ime_cursor_origins();
         // Never pull focus out from under a live grab.
         if state.take_popup_refocus() && !state.popup_grab_active() {
-            // The grab stole keyboard from whoever held it: hand it back
-            // to the same owner — the parked overview first, then an
-            // Exclusive layer surface (the panel holding Ctrl+Alt+Tab
-            // focus keeps its keyboard across its own menus), and only
-            // then the focused window. Handing an Exclusive hold back
-            // to a window (or nothing) strands the panel inactive with
-            // GTK focus intact but no keyboard (G-PANEL-FOCUS).
-            if let Some(held) = self.overview_held.clone() {
-                let serial = SERIAL_COUNTER.next_serial();
-                if let Some(keyboard) = self.keyboard.clone() {
-                    keyboard.set_focus(state, Some(held.clone()), serial);
-                }
-                state.sync_selection_focus(Some(&held));
-            } else if let Some(exclusive) = crate::layer::exclusive_keyboard_layer(state) {
-                let serial = SERIAL_COUNTER.next_serial();
-                if let Some(keyboard) = self.keyboard.clone() {
-                    keyboard.set_focus(state, Some(exclusive.clone()), serial);
-                }
-                state.sync_selection_focus(Some(&exclusive));
-            } else {
-                let focused = self.model.focused();
-                self.apply_focus(state, focused);
-            }
+            self.restore_keyboard_owner(state);
             // The grab held pointer focus wherever the pointer went:
             // re-deliver it where the pointer is now, so the surface it
             // left hears the leave (a panel button drops its hover).
@@ -1640,6 +1671,9 @@ impl WindowManager {
         // hold focus past this tick while the overview is open.
         self.reconcile_overview_focus(state);
         self.reconcile_exclusive_layer(state);
+        // The shell's ext-foreign-toplevel-list follows the model as it
+        // stands after this tick's maps, title changes and unmaps (#1046).
+        state.sync_foreign_toplevels(self.model.revision(), self.model.windows());
         let _ = seen;
     }
 
@@ -1774,6 +1808,8 @@ impl WindowManager {
                 above: false,
                 sticky: false,
                 x11_parent: None,
+                preferred_output: None,
+                unconstrained: None,
             },
         );
         self.place_transient(surface, id);
@@ -1965,6 +2001,7 @@ impl WindowManager {
                     window.geometry = geometry;
                     window.unplaced = false;
                 }
+                self.note_preferred_output(state, id);
                 let parent = self.transient_parent(id);
                 if let Some(parent) = parent {
                     self.place_above(parent, id);
@@ -2147,6 +2184,8 @@ impl WindowManager {
                 above: false,
                 sticky: false,
                 x11_parent: None,
+                preferred_output: None,
+                unconstrained: None,
             },
         );
         if let Some(parent) = surface
@@ -2155,6 +2194,7 @@ impl WindowManager {
         {
             self.place_above(parent, id);
         }
+        self.note_preferred_output(state, id);
         self.finish_map(state, id);
         id
     }
@@ -2557,6 +2597,10 @@ impl WindowManager {
         // Alt+Tab) until the pointer moves.
         self.sticky_focus = (self.focus_policy.mode.follows_pointer() && id.is_some())
             .then_some(StickyFocus { distance: 0.0 });
+        // meta_window_activate_full ends with meta_window_check_alive.
+        if let Some(id) = id {
+            self.check_alive(id);
+        }
         true
     }
 
@@ -2740,6 +2784,7 @@ impl WindowManager {
     /// flag, and presentation state. X11 windows take the toolkit's
     /// X11 configure path with the same geometry and activation.
     fn configure(&self, id: u64, activated: bool) {
+        self.pointer_scene_dirty.set(true);
         let Some(window) = self.windows.get(&id) else {
             return;
         };
@@ -3302,6 +3347,15 @@ impl WindowManager {
         self.grab.is_some()
     }
 
+    /// The window owning a native move, not a pending client request or resize.
+    pub(crate) fn interactive_move_window(&self) -> Option<u64> {
+        match self.grab? {
+            PointerGrab::Move { id, .. } => Some(id),
+            PointerGrab::StripMove { owner, .. } => Some(owner.id),
+            _ => None,
+        }
+    }
+
     /// The pointer cursor of an interactive grab (#342): move, or
     /// resize from these xdg edges.
     pub fn grab_cursor(&self) -> Option<smithay::input::pointer::CursorIcon> {
@@ -3460,6 +3514,8 @@ impl WindowManager {
             return;
         }
         if let PointerGrab::Move { id, .. } = grab {
+            // A user move picks the output the window returns to.
+            self.note_preferred_output(state, id);
             if !self.workspace_policy.edge_tiling {
                 return;
             }
@@ -3633,71 +3689,62 @@ impl WindowManager {
             return;
         }
         self.sticky_motion(state, travelled);
-        // Popups paint over everything they hang off: they win first.
-        if let Some(popup) = self.popup_at(state, pos) {
-            if let Some(pointer) = self.pointer.clone() {
-                pointer.motion(
-                    state,
-                    Some((popup.surface, popup.origin.to_f64())),
-                    &MotionEvent {
-                        location: pos,
-                        serial: SERIAL_COUNTER.next_serial(),
-                        time,
-                    },
-                );
-                // wl_seat v5+: clients act on pointer events only at a
-                // frame boundary (GTK4 drops unframed clicks).
-                pointer.frame(state);
+        let (target, crossing) = self.pointer_pick(state, pos);
+        if let Some(pointer) = self.pointer.clone() {
+            pointer.motion(
+                state,
+                target,
+                &MotionEvent {
+                    location: pos,
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                },
+            );
+            // wl_seat v5+: clients act on pointer events only at a frame
+            // boundary (GTK4 drops unframed clicks).
+            pointer.frame(state);
+        }
+        if let Some(under) = crossing {
+            // events.c: motion over a window checks it is alive.
+            if let Some(id) = under {
+                self.check_alive(id);
             }
-            return;
+            self.pointer_crossing(state, under);
+        }
+    }
+
+    /// The surface the pointer at `pos` belongs to, with its origin, and
+    /// the window crossing it means (`None`: no crossing to report).
+    /// Popups paint over everything they hang off, so they win first;
+    /// layer-shell surfaces (panel, banners) paint over windows, so they
+    /// come next. Shell chrome is no window: GNOME's stage actors leave
+    /// Mutter's pointer window NULL. In the overview, windows are
+    /// previews the compositor draws: they never take pointer focus.
+    #[allow(clippy::type_complexity)]
+    fn pointer_pick(
+        &self,
+        state: &State,
+        pos: Point<f64, Logical>,
+    ) -> (
+        Option<(WlSurface, Point<f64, Logical>)>,
+        Option<Option<u64>>,
+    ) {
+        if let Some(popup) = self.popup_at(state, pos) {
+            return (Some((popup.surface, popup.origin.to_f64())), None);
         }
         if let Some((surface, (ox, oy))) =
             crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
         {
-            if let Some(pointer) = self.pointer.clone() {
-                // Focus point is the surface origin: smithay reports
-                // surface-local coordinates as event minus focus.
-                pointer.motion(
-                    state,
-                    Some((surface, (ox as f64, oy as f64).into())),
-                    &MotionEvent {
-                        location: pos,
-                        serial: SERIAL_COUNTER.next_serial(),
-                        time,
-                    },
-                );
-                // wl_seat v5+: clients act on pointer events only at a
-                // frame boundary (GTK4 drops unframed clicks).
-                pointer.frame(state);
-            }
-            // Shell chrome is no window: GNOME's stage actors (panel,
-            // banners) leave Mutter's pointer window NULL.
-            self.pointer_crossing(state, None);
-            return;
+            // Focus point is the surface origin: smithay reports
+            // surface-local coordinates as event minus focus.
+            return (Some((surface, (ox as f64, oy as f64).into())), Some(None));
         }
-        // In the overview, windows are previews the compositor draws:
-        // they never take pointer focus or events (GNOME shape).
         if self.overview_open {
-            if let Some(pointer) = self.pointer.clone() {
-                pointer.motion(
-                    state,
-                    None,
-                    &MotionEvent {
-                        location: pos,
-                        serial: SERIAL_COUNTER.next_serial(),
-                        time,
-                    },
-                );
-                pointer.frame(state);
-            }
-            return;
+            return (None, None);
         }
         // Pointer focus is the window under the pointer, or nothing over
         // the bare desktop. Keyboard focus follows it only in GNOME's
         // sloppy and mouse modes (pointer_crossing).
-        let Some(pointer) = self.pointer.clone() else {
-            return;
-        };
         let under = self.window_at(pos);
         let target = under
             // An attached modal dialog blocks pointer input to its parent,
@@ -3706,13 +3753,50 @@ impl WindowManager {
             .and_then(|id| self.windows.get(&id))
             .and_then(|window| {
                 let surface = window.surface.wl_surface()?.into_owned();
-                // Focus point is the surface origin: smithay reports
-                // surface-local coordinates as event minus focus. The
-                // window rect is its xdg geometry; the surface origin
+                // The window rect is its xdg geometry; the surface origin
                 // sits up-left of it by the client-side shadow.
                 let origin = crate::popup::surface_origin(&surface, window.geometry.loc);
                 Some((surface, (origin.x as f64, origin.y as f64).into()))
             });
+        (target, Some(under))
+    }
+
+    /// Clutter's repick of the pointer actor after the scene changed
+    /// under a stationary pointer (a window mapped, closed or restacked):
+    /// the surface now beneath it gets `wl_pointer.enter` without any
+    /// motion, as Mutter's meta_wayland_pointer_update does on the
+    /// repick, so a first click on a freshly mapped window lands there
+    /// (#425). An interactive move/resize, pointer constraint or a seat
+    /// grab (an implicit button press, drag-and-drop) keeps its focus.
+    fn repick_pointer_surface(&mut self, state: &mut State) {
+        // Picking builds the popup/layer presentation. Do not rebuild an
+        // unchanged scene on every idle tick, especially in click-focus
+        // mode. Buffer commits conservatively invalidate the pick too.
+        if !self.pointer_scene_dirty.get()
+            && !state.pointer_scene_dirty
+            && self.pointer_scene_revision == self.model.revision()
+            && !self.strip_animating()
+        {
+            return;
+        }
+        if self.grab.is_some() || self.pointer_constraint_owns_motion(state) {
+            return;
+        }
+        let Some(pointer) = self.pointer.clone() else {
+            return;
+        };
+        if pointer.is_grabbed() {
+            return;
+        }
+        self.pointer_scene_dirty.set(false);
+        state.pointer_scene_dirty = false;
+        self.pointer_scene_revision = self.model.revision();
+        let pos = self.pointer_pos;
+        let (target, _) = self.pointer_pick(state, pos);
+        if pointer.current_focus().as_ref() == target.as_ref().map(|(surface, _)| surface) {
+            return;
+        }
+        let time = std::time::Duration::from(state.presentation_now()).as_millis() as u32;
         pointer.motion(
             state,
             target,
@@ -3722,10 +3806,7 @@ impl WindowManager {
                 time,
             },
         );
-        // wl_seat v5+: clients act on pointer events only at a frame
-        // boundary (GTK4 drops unframed clicks).
         pointer.frame(state);
-        self.pointer_crossing(state, under);
     }
 
     /// GNOME's focus policy, as last read from its settings.
@@ -3867,8 +3948,10 @@ impl WindowManager {
 
     /// Clutter's repick after the scene changed under a stationary
     /// pointer (a window mapped, closed, restacked or the workspace
-    /// switched): a crossing without motion. Only pointer focus needs it.
+    /// switched): the surface beneath gets pointer enter, and in sloppy
+    /// or mouse focus mode the window crossing moves keyboard focus.
     pub fn repick_pointer_window(&mut self, state: &mut State) {
+        self.repick_pointer_surface(state);
         if !self.pointer_focus_active(state) {
             return;
         }
@@ -4015,6 +4098,9 @@ impl WindowManager {
             {
                 if let Some(id) = self.window_at(pos) {
                     if self.modal_target(id) != id {
+                        // meta_window_handle_ungrabbed_event: every press
+                        // focuses and checks the window is alive.
+                        self.check_alive(id);
                         self.apply_focus_raise(state, Some(id), self.focus_policy.raise_on_click);
                         self.swallowed_button = Some(button);
                         return;
@@ -4041,6 +4127,10 @@ impl WindowManager {
                     .window_at(pos)
                     .and_then(|id| Some((id, self.shifted(id, self.windows.get(&id)?.geometry))))
                 {
+                    // meta_window_handle_ungrabbed_event focuses the pressed
+                    // window and checks it is alive before its modifier
+                    // actions.
+                    self.check_alive(id);
                     let decision = self.focus_policy.press(
                         self.held_mods(),
                         button,
@@ -4145,10 +4235,14 @@ impl WindowManager {
                     pointer.current_focus().is_some()
                 );
             }
+            let serial = SERIAL_COUNTER.next_serial();
+            if pressed {
+                state.pointer_press_serial = Some(serial);
+            }
             pointer.button(
                 state,
                 &ButtonEvent {
-                    serial: SERIAL_COUNTER.next_serial(),
+                    serial,
                     time,
                     button,
                     state: if pressed {
@@ -4218,6 +4312,70 @@ impl WindowManager {
         pointer.frame(state);
     }
 
+    /// While locked, keyboard focus is the lock surface, or nobody when
+    /// none is up (ext-session-lock-v1: nothing behind the lock has
+    /// focus). Applications get wl_keyboard.leave as the session locks,
+    /// as GNOME's lock screen takes focus, instead of keeping it until
+    /// the first key press; [`Self::refocus_after_lock`] hands it back
+    /// on unlock.
+    pub fn hold_lock_focus(
+        &mut self,
+        state: &mut State,
+        surface: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    ) {
+        if let Some(keyboard) = self.keyboard.clone() {
+            if keyboard.current_focus().as_ref() != surface {
+                keyboard.set_focus(state, surface.cloned(), SERIAL_COUNTER.next_serial());
+            }
+        }
+    }
+
+    /// Hand the keyboard back to whoever owns it when nothing holds it
+    /// (after a popup grab, after unlock): the parked overview first,
+    /// then an Exclusive layer surface (the panel holding Ctrl+Alt+Tab
+    /// focus keeps its keyboard across its own menus), and only then the
+    /// focused window. Handing an Exclusive hold back to a window (or
+    /// nothing) strands the panel inactive with GTK focus intact but no
+    /// keyboard (G-PANEL-FOCUS).
+    pub fn restore_keyboard_owner(&mut self, state: &mut State) {
+        if let Some(held) = self.overview_held.clone() {
+            let serial = SERIAL_COUNTER.next_serial();
+            if let Some(keyboard) = self.keyboard.clone() {
+                keyboard.set_focus(state, Some(held.clone()), serial);
+            }
+            state.sync_selection_focus(Some(&held));
+        } else if let Some(exclusive) = crate::layer::exclusive_keyboard_layer(state) {
+            let serial = SERIAL_COUNTER.next_serial();
+            if let Some(keyboard) = self.keyboard.clone() {
+                keyboard.set_focus(state, Some(exclusive.clone()), serial);
+            }
+            state.sync_selection_focus(Some(&exclusive));
+        } else {
+            let focused = self.model.focused();
+            self.apply_focus(state, focused);
+        }
+    }
+
+    /// The lock lifted: give the keyboard back to what had it, as GNOME
+    /// Shell's `popModal` does (screenShield.js locks with a modal stage
+    /// grab, which revokes Mutter's Wayland popup grab without dismissing
+    /// it): the topmost popup of a grab that outlived the lock, else the
+    /// owner a popup grab hands back to (the parked overview, an
+    /// Exclusive layer, the focused window). Without this the keyboard
+    /// stayed on the destroyed lock surface until the next click.
+    pub fn refocus_after_lock(&mut self, state: &mut State) {
+        if let Some(top) = state.popup_grab.last().map(|p| p.wl_surface().clone()) {
+            if let Some(keyboard) = self.keyboard.clone() {
+                keyboard.set_focus(state, Some(top), SERIAL_COUNTER.next_serial());
+            }
+            return;
+        }
+        // No grab to return to: the owner has the keyboard back at once,
+        // and the next reconcile re-delivers pointer focus as after a grab.
+        self.restore_keyboard_owner(state);
+        state.popup_refocus = true;
+    }
+
     /// Route one input event to the session-lock surface and nothing
     /// else (ext-session-lock-v1): keys go to it with keyboard focus
     /// held there, the pointer acts on it at the output origin, and no
@@ -4271,10 +4429,14 @@ impl WindowManager {
             } => {
                 if let Some(pointer) = self.pointer.clone() {
                     self.lock_pointer_enter(state, &pointer, surface, time);
+                    let serial = SERIAL_COUNTER.next_serial();
+                    if pressed {
+                        state.pointer_press_serial = Some(serial);
+                    }
                     pointer.button(
                         state,
                         &ButtonEvent {
-                            serial: SERIAL_COUNTER.next_serial(),
+                            serial,
                             time,
                             button,
                             state: if pressed {
@@ -4580,6 +4742,7 @@ impl WindowManager {
     /// Always on Top windows stay above every other window: a stable
     /// partition of the stacking order.
     fn keep_above_on_top(&mut self) {
+        self.pointer_scene_dirty.set(true);
         let flags = self
             .windows
             .iter()
@@ -4888,8 +5051,9 @@ impl WindowManager {
 
     /// Ask a window's client to close (polite `close` request). The
     /// client unmaps itself; `reconcile` drops it on the next tick and
-    /// focus falls back. False for unknown ids.
-    pub fn close_window(&self, id: u64) -> bool {
+    /// focus falls back. False for unknown ids. Like `meta_window_delete`,
+    /// the request checks the window is alive.
+    pub fn close_window(&mut self, id: u64) -> bool {
         let Some(window) = self.windows.get(&id) else {
             return false;
         };
@@ -4906,11 +5070,12 @@ impl WindowManager {
             }
         }
         eprintln!("tuna-compositor: window {id} close requested");
+        self.check_alive(id);
         true
     }
 
     /// Close the focused window, if any.
-    pub fn close_focused(&self) -> bool {
+    pub fn close_focused(&mut self) -> bool {
         self.model.focused().is_some_and(|id| self.close_window(id))
     }
 
@@ -6113,103 +6278,144 @@ impl WindowManager {
         true
     }
 
-    /// Shift `geo` from the removed output's slice into the
-    /// survivor's, preserving size and clamping inside the survivor
-    /// bounds (an oversized window pins at the survivor origin).
-    fn shift_into_survivor(
+    /// The output a window is on in `outputs`: the one it overlaps
+    /// most, as Mutter's `meta_window_update_monitor` picks it
+    /// (`meta_monitor_manager_get_logical_monitor_from_rect`).
+    fn output_of(
         geo: Rectangle<i32, Logical>,
-        removed_loc: (i32, i32),
-        survivor_loc: (i32, i32),
-        survivor_size: Size<i32, Logical>,
-    ) -> Rectangle<i32, Logical> {
-        let x = (survivor_loc.0 + geo.loc.x - removed_loc.0).clamp(
-            survivor_loc.0,
-            (survivor_loc.0 + survivor_size.w - geo.size.w).max(survivor_loc.0),
-        );
-        let y = (survivor_loc.1 + geo.loc.y - removed_loc.1).clamp(
-            survivor_loc.1,
-            (survivor_loc.1 + survivor_size.h - geo.size.h).max(survivor_loc.1),
-        );
-        Rectangle {
-            loc: (x, y).into(),
-            size: geo.size,
+        outputs: &[(String, Rectangle<i32, Logical>)],
+    ) -> Option<&(String, Rectangle<i32, Logical>)> {
+        outputs
+            .iter()
+            .filter_map(|entry| {
+                let overlap = entry.1.intersection(geo)?;
+                Some((i64::from(overlap.size.w) * i64::from(overlap.size.h), entry))
+            })
+            .filter(|(area, _)| *area > 0)
+            .max_by_key(|(area, _)| *area)
+            .map(|(_, entry)| entry)
+    }
+
+    /// Remember the output a window is on as the one it prefers, as
+    /// Mutter does when it places a window and when the user moves it to
+    /// another monitor (`preferred_logical_monitor`).
+    fn note_preferred_output(&mut self, state: &State, id: u64) {
+        let outputs = state.output_slices();
+        let Some(window) = self.windows.get_mut(&id) else {
+            return;
+        };
+        if let Some((name, _)) = Self::output_of(window.geometry, &outputs) {
+            window.preferred_output = Some(name.clone());
         }
     }
 
-    /// Whether `geo`'s center sits inside the `(loc, size)` slice:
-    /// the test for "this window lives on that output".
-    fn center_in_slice(
-        geo: Rectangle<i32, Logical>,
-        loc: (i32, i32),
-        size: Size<i32, Logical>,
-    ) -> bool {
-        let (cx, cy) = (geo.loc.x + geo.size.w / 2, geo.loc.y + geo.size.h / 2);
-        cx >= loc.0 && cx < loc.0 + size.w && cy >= loc.1 && cy < loc.1 + size.h
+    /// The output a window last placed or moved by the user preferred
+    /// (`None` before its first placement).
+    pub fn preferred_output(&self, id: u64) -> Option<&str> {
+        self.windows.get(&id)?.preferred_output.as_deref()
     }
 
-    /// Migrate windows off a removed output onto a live one, before
-    /// its inventory entry drops: call this, then
-    /// [`State::remove_output`](crate::State::remove_output), then
-    /// [`reapply_derived_layouts`](Self::reapply_derived_layouts) when
-    /// the primary changed.
-    ///
-    /// Windows carry no output affinity (they live in workspaces),
-    /// so migration is geometric: floating windows centered on the
-    /// removed slice shift into the survivor slice (preferring the
-    /// primary) with size preserved. Derived layouts (maximized,
-    /// tiled, fullscreen, strip) are positional only through the
-    /// primary areas, so they move in the re-apply step after
-    /// failover — re-applying here would size them for the dying
-    /// primary. Stashed restore rects shift with their windows.
-    /// Focus and workspace membership never change, so no window is
-    /// lost — only positions move. Returns how many windows moved.
-    /// Unknown names and a missing survivor (removing the last
-    /// output) migrate nothing.
-    pub fn migrate_output_windows(&mut self, state: &mut State, removed: &str) -> usize {
-        let Some(gone) = state
-            .outputs
-            .iter()
-            .find(|entry| entry.name == removed)
-            .cloned()
-        else {
-            return 0;
+    /// After the outputs changed (hotplug, a new arrangement, mode or
+    /// scale), re-home the floating windows as Mutter's
+    /// `meta_window_update_for_monitors_changed` does: a window goes to
+    /// the output it prefers when that is connected (so it returns to a
+    /// monitor plugged back in), else stays on its output, else moves to
+    /// the primary; it keeps its relative place there
+    /// (`move_rect_between_rects`) and, wholly visible before, stays
+    /// wholly inside that output's workarea (`constrain_fully_onscreen`).
+    /// `before` is each output's rectangle before the change
+    /// ([`State::output_slices`]). Restore rects follow the same way.
+    /// Derived layouts (maximized, tiled, fullscreen, strip) are
+    /// re-resolved by
+    /// [`reapply_derived_layouts`](Self::reapply_derived_layouts).
+    /// Focus and workspaces never change: no window is lost. Returns
+    /// how many windows moved.
+    pub fn relocate_for_monitors_changed(
+        &mut self,
+        state: &State,
+        before: &[(String, Rectangle<i32, Logical>)],
+    ) -> usize {
+        let after = state.output_slices();
+        let primary = state.primary_output_name();
+        let find = |name: &str| after.iter().find(|(n, _)| n == name);
+        // meta_window_find_monitor_from_id: the preferred output, else
+        // the window's own, else the primary.
+        let target = |preferred: Option<&str>, old: &str| {
+            preferred
+                .and_then(find)
+                .or_else(|| find(old))
+                .or_else(|| primary.as_deref().and_then(find))
         };
-        let Some(live) = state
-            .outputs
-            .iter()
-            .find(|entry| entry.primary && entry.name != removed)
-            .or_else(|| state.outputs.iter().find(|entry| entry.name != removed))
-            .cloned()
-        else {
-            return 0;
+        // meta_window_move_between_rects: move_rect_between_rects on the
+        // unconstrained rect `free` of the window shown at `shown`, then
+        // the constraints (META_MOVE_RESIZE_CONSTRAIN) on the new layout.
+        let relocate = |shown: Rectangle<i32, Logical>,
+                        free: Rectangle<i32, Logical>,
+                        preferred: Option<&str>| {
+            let (old_name, old_rect) = Self::output_of(shown, before)?;
+            let (new_name, new_rect) = target(preferred, old_name)?;
+            if new_rect == old_rect {
+                return None;
+            }
+            let moved = move_rect_between_rects(free, *old_rect, *new_rect);
+            let constrained = crate::output_constraints::keep_fully_visible(
+                rect_tuple(shown),
+                floating_workarea((old_rect.loc.x, old_rect.loc.y), old_rect.size),
+                rect_tuple(moved),
+                floating_workarea((new_rect.loc.x, new_rect.loc.y), new_rect.size),
+            )
+            .map_or(moved, |(x, y, _, _)| {
+                Rectangle::new((x, y).into(), moved.size)
+            });
+            Some((new_name, moved, constrained))
         };
         let mut moved = 0;
+        let mut configure = Vec::new();
         let mut ids: Vec<u64> = self.windows.keys().copied().collect();
         ids.sort_unstable();
         for id in ids {
-            let Some(layout) = self.windows.get(&id).map(|window| window.layout) else {
+            let Some(window) = self.windows.get_mut(&id) else {
                 continue;
             };
-            if layout != WindowLayout::Floating {
-                continue;
+            if window.preferred_output.is_none() {
+                window.preferred_output =
+                    Self::output_of(window.geometry, before).map(|(name, _)| name.clone());
             }
+            let preferred = window.preferred_output.clone();
             let mut shifted = false;
-            if let Some(window) = self.windows.get_mut(&id) {
-                if Self::center_in_slice(window.geometry, gone.loc, gone.size) {
-                    window.geometry =
-                        Self::shift_into_survivor(window.geometry, gone.loc, live.loc, live.size);
+            if window.layout == WindowLayout::Floating {
+                let free = match window.unconstrained {
+                    Some((free, shown)) if shown == window.geometry => free,
+                    _ => window.geometry,
+                };
+                if let Some((output, free, geo)) =
+                    relocate(window.geometry, free, preferred.as_deref())
+                {
+                    eprintln!(
+                        "tuna-compositor: window {id} re-homed to {output} from {:?} to {:?}",
+                        window.geometry, geo
+                    );
+                    window.unconstrained = (free != geo).then_some((free, geo));
+                    window.geometry = geo;
+                    configure.push(id);
                     shifted = true;
                 }
-                if let Some(restore) = window.restore {
-                    if Self::center_in_slice(restore, gone.loc, gone.size) {
-                        window.restore = Some(Self::shift_into_survivor(
-                            restore, gone.loc, live.loc, live.size,
-                        ));
-                        shifted = true;
-                    }
+            }
+            if let Some(restore) = window.restore {
+                if let Some((_, _, geo)) = relocate(restore, restore, preferred.as_deref()) {
+                    window.restore = Some(geo);
+                    shifted = true;
                 }
             }
             moved += usize::from(shifted);
+        }
+        // This change is handled: the tick's workarea pass must not take
+        // it for a fresh one and clamp the re-homed windows into whichever
+        // output held their new place in the old layout (Mutter re-queues
+        // the constraints, which only see the new layout).
+        self.floating_workareas = output_workareas(state);
+        for id in configure {
+            self.configure(id, self.model.focused() == Some(id));
         }
         moved
     }
@@ -6640,58 +6846,25 @@ pub enum ManagerInput {
         /// Microseconds, the protocol's precision.
         utime: u64,
     },
-    /// Touchpad swipe gesture phases (#60). Three-finger swipes are
-    /// the shell's (overview, workspaces); others reach the client.
+    /// Touchpad swipe gesture phases (#60). Swipes of three or more
+    /// fingers are the shell's (overview, workspaces; see
+    /// [`crate::touchpad_swipe`]); others reach the client.
     SwipeBegin {
         fingers: u32,
         time: u32,
     },
     SwipeUpdate {
+        /// Accelerated, as clients receive it (pointer-gestures).
         delta: Point<f64, Logical>,
+        /// Unaccelerated, as GNOME's swipe trackers read it
+        /// (swipeTracker.js:142).
+        delta_unaccel: Point<f64, Logical>,
         time: u32,
     },
     SwipeEnd {
         cancelled: bool,
         time: u32,
     },
-}
-
-/// What a finished three-finger touchpad swipe does (GNOME 51).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SwipeAction {
-    /// Swipe up: open the overview.
-    OpenOverview,
-    /// Swipe down: close it.
-    CloseOverview,
-    /// Fingers move left: the next workspace slides in (content follows
-    /// the fingers, as on GNOME).
-    NextWorkspace,
-    /// Fingers move right: the previous workspace.
-    PreviousWorkspace,
-}
-
-/// Fingers GNOME reserves for its own swipes.
-pub const SHELL_SWIPE_FINGERS: u32 = 3;
-/// Distance a swipe must travel to act (logical pixels).
-pub const SWIPE_THRESHOLD: f64 = 100.0;
-
-/// Classify a finished swipe by its dominant axis; short swipes do
-/// nothing.
-pub fn swipe_action(dx: f64, dy: f64) -> Option<SwipeAction> {
-    if dx.abs().max(dy.abs()) < SWIPE_THRESHOLD {
-        return None;
-    }
-    Some(if dy.abs() >= dx.abs() {
-        if dy < 0.0 {
-            SwipeAction::OpenOverview
-        } else {
-            SwipeAction::CloseOverview
-        }
-    } else if dx < 0.0 {
-        SwipeAction::NextWorkspace
-    } else {
-        SwipeAction::PreviousWorkspace
-    })
 }
 
 /// X11 keycodes are kernel evdev numbers plus 8; the winit backend
@@ -7139,9 +7312,18 @@ impl WindowManager {
                             | K::CycleGroupBackward
                     ) {
                         if self.switcher_open {
-                            self.push_switcher(SwitcherAction::Cancel);
+                            // The open popup holds the keyboard (pushModal
+                            // leaves no NORMAL action mode), so the cycle
+                            // keybinding never fires: the popup's handler
+                            // passes the action on and only Escape or Tab
+                            // dismiss it (switcherPopup.js:211-219). GNOME's
+                            // default cycle-windows, Alt+Escape, cancels.
+                            if matches!(keycode, ESCAPE_KEYCODE | TAB_KEYCODE) {
+                                self.switcher_open = false;
+                                self.push_switcher(SwitcherAction::Cancel);
+                            }
+                            return;
                         }
-                        self.switcher_open = false;
                         self.push_switcher(SwitcherAction::Cycle {
                             forward: matches!(kind, K::CycleWindows | K::CycleGroup),
                             group: matches!(kind, K::CycleGroup | K::CycleGroupBackward),
@@ -7287,7 +7469,7 @@ impl WindowManager {
                     pointer.frame(state);
                 }
             }
-            ManagerInput::SwipeUpdate { delta, time } => {
+            ManagerInput::SwipeUpdate { delta, time, .. } => {
                 if let Some(pointer) = self.pointer.clone() {
                     pointer.gesture_swipe_update(
                         state,
@@ -7628,10 +7810,12 @@ impl WindowManager {
                     "tuna-compositor: workspace now {}",
                     self.model.active_workspace()
                 );
-                // GNOME's switcher popup, outside the overview.
-                if !self.overview_open {
-                    self.workspace_popups.push(self.workspace_popup());
-                }
+            }
+            // GNOME's switcher popup, outside the overview, even when the
+            // key cannot leave the first or last workspace
+            // (windowManager.js:1869-1880).
+            if !self.overview_open {
+                self.workspace_popups.push(self.workspace_popup());
             }
         } else if pressed
             && self.super_held
@@ -7901,6 +8085,69 @@ impl WindowManager {
         eprintln!("tuna-compositor: switcher {action:?}");
         self.switcher_queue.push(action);
     }
+}
+
+/// The workarea floating windows are kept wholly inside on an output at
+/// `loc` of `size`: the output minus the shell panel strip
+/// ([`WORK_AREA_TOP`]).
+fn floating_workarea(loc: (i32, i32), size: Size<i32, Logical>) -> crate::output_constraints::Rect {
+    (
+        loc.0,
+        loc.1.saturating_add(WORK_AREA_TOP),
+        size.w,
+        size.h.saturating_sub(WORK_AREA_TOP),
+    )
+}
+
+/// Every output's [`floating_workarea`], in registration order.
+fn output_workareas(state: &State) -> Vec<(String, crate::output_constraints::Rect)> {
+    state
+        .outputs
+        .iter()
+        .map(|output| {
+            (
+                output.name.clone(),
+                floating_workarea(output.loc, output.size),
+            )
+        })
+        .collect()
+}
+
+fn rect_tuple(rect: Rectangle<i32, Logical>) -> crate::output_constraints::Rect {
+    (rect.loc.x, rect.loc.y, rect.size.w, rect.size.h)
+}
+
+/// Mutter's `move_rect_between_rects` (window.c): a window that fits
+/// inside both monitors keeps its relative place in the free space
+/// around it; otherwise its centre keeps its relative place.
+fn move_rect_between_rects(
+    rect: Rectangle<i32, Logical>,
+    old: Rectangle<i32, Logical>,
+    new: Rectangle<i32, Logical>,
+) -> Rectangle<i32, Logical> {
+    let fits = old.contains_rect(rect)
+        && old.size.w > rect.size.w
+        && old.size.h > rect.size.h
+        && new.size.w >= rect.size.w
+        && new.size.h >= rect.size.h;
+    let (x, y) = if fits {
+        let rel_x = (rect.loc.x - old.loc.x) as f32 / (old.size.w - rect.size.w) as f32;
+        let rel_y = (rect.loc.y - old.loc.y) as f32 / (old.size.h - rect.size.h) as f32;
+        (
+            new.loc.x + (rel_x * (new.size.w - rect.size.w) as f32) as i32,
+            new.loc.y + (rel_y * (new.size.h - rect.size.h) as f32) as i32,
+        )
+    } else {
+        let rel_x = ((rect.loc.x - old.loc.x + rect.size.w / 2) as f32 / old.size.w as f32)
+            .clamp(f32::EPSILON, 1.0 - f32::EPSILON);
+        let rel_y = ((rect.loc.y - old.loc.y + rect.size.h / 2) as f32 / old.size.h as f32)
+            .clamp(f32::EPSILON, 1.0 - f32::EPSILON);
+        (
+            new.loc.x - rect.size.w / 2 + (rel_x * new.size.w as f32) as i32,
+            new.loc.y - rect.size.h / 2 + (rel_y * new.size.h as f32) as i32,
+        )
+    };
+    Rectangle::new((x, y).into(), rect.size)
 }
 
 /// Mutter's `find_next_cascade` (place.c): starting where the window

@@ -1,0 +1,12 @@
+[Unit]
+Description=Tuna CI NVMe scratch filesystem
+Before=k3s.service
+
+[Mount]
+What=/dev/vg1/tuna_ci_scratch
+Where=/var/lib/tuna-ci-scratch
+Type=ext4
+Options=noatime
+
+[Install]
+WantedBy=local-fs.target

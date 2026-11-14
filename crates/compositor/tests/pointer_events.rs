@@ -7,8 +7,10 @@
 //! client asserts both. Conventions follow `windows.rs`.
 
 use std::os::unix::net::UnixStream;
+use std::time::Instant;
 
 use smithay::utils::{Logical, Point};
+use tuna_compositor::motion_coalesce::MotionCoalescer;
 use tuna_compositor::windows::{AxisStop, ManagerInput, WindowManager, WHEEL_STEP_PX};
 use tuna_compositor::TestCompositor;
 use wayland_client::{
@@ -34,6 +36,15 @@ use wayland_protocols::xdg::shell::client::{
 
 const PUMP_ROUNDS: usize = 200;
 const BTN_LEFT: u32 = 0x110;
+
+/// One wl_pointer event as the client saw it, in arrival order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Wire {
+    Enter(f64, f64),
+    Motion(f64, f64),
+    Button(bool),
+    Frame,
+}
 
 #[derive(Default)]
 struct Client {
@@ -62,6 +73,8 @@ struct Client {
     stops: Vec<u32>,
     /// Every wl_pointer.axis_source, finger = 1.
     sources: Vec<u32>,
+    /// Motion, button and frame events, in order.
+    wire: Vec<Wire>,
 }
 
 impl Client {
@@ -189,10 +202,24 @@ impl Dispatch<WlPointer, ()> for Client {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            PointerEvent::Enter { surface, .. } => {
-                state.pointer_entered.push(surface.id().protocol_id())
+            PointerEvent::Enter {
+                surface,
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                state.pointer_entered.push(surface.id().protocol_id());
+                state.wire.push(Wire::Enter(surface_x, surface_y));
             }
-            PointerEvent::Frame => state.frames += 1,
+            PointerEvent::Frame => {
+                state.frames += 1;
+                state.wire.push(Wire::Frame);
+            }
+            PointerEvent::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => state.wire.push(Wire::Motion(surface_x, surface_y)),
             PointerEvent::Axis { axis, value, .. } => {
                 let axis = match axis {
                     wayland_client::WEnum::Value(a) => a as u32,
@@ -213,7 +240,9 @@ impl Dispatch<WlPointer, ()> for Client {
                 state: wayland_client::WEnum::Value(s),
                 ..
             } => {
-                if s == wayland_client::protocol::wl_pointer::ButtonState::Pressed {
+                let pressed = s == wayland_client::protocol::wl_pointer::ButtonState::Pressed;
+                state.wire.push(Wire::Button(pressed));
+                if pressed {
                     state.presses += 1;
                 } else {
                     state.releases += 1;
@@ -467,4 +496,129 @@ fn a_finished_finger_scroll_sends_axis_stop() {
     sync(&mut f);
     assert_eq!(f.client.frames, frames + 1);
     assert_eq!(f.client.stops, vec![0]);
+}
+
+/// What the runtime does with backend input (`runtime/motion.rs`):
+/// motion waits in the coalescer; anything else first delivers it.
+fn feed(f: &mut Fixture, queue: &mut MotionCoalescer, input: ManagerInput) {
+    if let Some(input) = queue.absorb(input) {
+        frame(f, queue);
+        f.manager.on_input(&mut f.comp.state, input);
+    }
+}
+
+/// The output frame: pending motion reaches the window manager.
+fn frame(f: &mut Fixture, queue: &mut MotionCoalescer) {
+    for input in queue.take(Instant::now()).into_iter().flatten() {
+        f.manager.on_input(&mut f.comp.state, input);
+    }
+}
+
+/// Focus the window with one delivered motion; returns the pointer's
+/// surface-local position there, and clears the wire log.
+fn focused(f: &mut Fixture, queue: &mut MotionCoalescer) -> (f64, f64) {
+    let at = inside(f);
+    feed(f, queue, ManagerInput::Motion { pos: at, time: 1 });
+    frame(f, queue);
+    sync(f);
+    let Some(&(Wire::Enter(x, y) | Wire::Motion(x, y))) = f
+        .client
+        .wire
+        .iter()
+        .rev()
+        .find(|event| matches!(event, Wire::Enter(..) | Wire::Motion(..)))
+    else {
+        panic!(
+            "the focusing motion reached the client: {:?}",
+            f.client.wire
+        );
+    };
+    f.client.wire.clear();
+    (x, y)
+}
+
+/// Mutter's stage folds a frame's consecutive motions into one
+/// (clutter-stage.c, _clutter_stage_process_queued_events): a flood
+/// within one frame reaches the client as one motion at the final
+/// position and one frame.
+#[test]
+fn motions_within_one_frame_reach_the_client_once_at_the_final_position() {
+    let mut f = fixture();
+    let mut queue = MotionCoalescer::new();
+    let (x, y) = focused(&mut f, &mut queue);
+    let at = inside(&f);
+    for i in 1..=200u32 {
+        let step = f64::from(i % 37);
+        feed(
+            &mut f,
+            &mut queue,
+            ManagerInput::Motion {
+                pos: at + Point::from((step, step / 2.0)),
+                time: 1 + i,
+            },
+        );
+    }
+    let last = f64::from(200 % 37);
+    sync(&mut f);
+    assert_eq!(f.client.wire, [], "nothing is sent before the frame");
+    frame(&mut f, &mut queue);
+    sync(&mut f);
+    assert_eq!(
+        f.client.wire,
+        [Wire::Motion(x + last, y + last / 2.0), Wire::Frame]
+    );
+}
+
+/// A button ends the motion run: the motion before it is delivered
+/// first and the press lands where that motion left the pointer; the
+/// motion after it waits for the frame.
+#[test]
+fn a_button_is_delivered_after_the_motion_before_it_and_at_its_position() {
+    let mut f = fixture();
+    let mut queue = MotionCoalescer::new();
+    let (x, y) = focused(&mut f, &mut queue);
+    let at = inside(&f);
+    let motion = |dx: f64, dy: f64, time| ManagerInput::Motion {
+        pos: at + Point::from((dx, dy)),
+        time,
+    };
+    feed(&mut f, &mut queue, motion(3.0, 4.0, 2));
+    feed(&mut f, &mut queue, motion(5.0, 6.0, 3));
+    feed(
+        &mut f,
+        &mut queue,
+        ManagerInput::Button {
+            button: BTN_LEFT,
+            pressed: true,
+            time: 4,
+        },
+    );
+    feed(&mut f, &mut queue, motion(9.0, 10.0, 5));
+    sync(&mut f);
+    // The press may refresh the pointer's focus (a re-sent motion at
+    // the same spot); what matters is order and position.
+    let wire = f.client.wire.clone();
+    assert_eq!(
+        wire[..2],
+        [Wire::Motion(x + 5.0, y + 6.0), Wire::Frame],
+        "the motion before the press arrives first: {wire:?}"
+    );
+    assert_eq!(
+        wire[wire.len() - 2..],
+        [Wire::Button(true), Wire::Frame],
+        "then the press, and nothing of the later motion: {wire:?}"
+    );
+    assert!(
+        wire.iter()
+            .all(|event| !matches!(event, Wire::Motion(..)) || *event == wire[0]),
+        "every motion before the press is at the press position: {wire:?}"
+    );
+    assert_eq!(f.manager.pointer_pos(), at + Point::from((5.0, 6.0)));
+    frame(&mut f, &mut queue);
+    sync(&mut f);
+    assert_eq!(
+        f.client.wire[wire.len()..],
+        [Wire::Motion(x + 9.0, y + 10.0), Wire::Frame],
+        "the later motion arrives at the frame"
+    );
 }

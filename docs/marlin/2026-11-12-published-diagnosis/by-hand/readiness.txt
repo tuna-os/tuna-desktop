@@ -1,0 +1,7 @@
+# 2026-11-12T16:41:12Z corral wait (journey provision) failed: running 'not found' for 900s; manual readiness:
+{'name': 'tuna-q-variant-diag-pub1112', 'context': 'karnataka-k3s', 'status': 'Running', 'ready': True, 'node': 'karnataka'}
+is-system-running=degraded
+gdm=active
+1 60578 gdm-greeter seat0 811  greeter       tty1 yes 12min ago
+booted ghcr.io/tuna-os/marlin@sha256:77b12bb074712cdf75d9b2af436900e44ddcfd5f910a98a76860e05e57ee30c5 sha256:87d2baf30fc72b96ec5d625b369090a7cd728c11b803042841220c922a68a977
+uid=1000(tuna-test) gid=1000(tuna-test) groups=1000(tuna-test)

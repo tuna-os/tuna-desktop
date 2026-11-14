@@ -22,14 +22,17 @@ GNOME settings daemons call.
     `.ServiceChannel` and `.ColorManager`, plus
     `org.gnome.SettingsDaemon.Color`: `mutter.rs`, `mutter/remote_desktop.rs`,
     `color_manager.rs`.
-  - `org.gnome.Shell.Introspect`: `introspect.rs`.
+  - `org.gnome.Shell.Introspect` and the private `org.tuna.Introspect`
+    (calls the GTK shell relays from `org.gnome.Shell`): `introspect.rs`.
   - `org.gnome.Shell.Screenshot` and the private `org.tuna.Screenshot`:
     `screenshot.rs`.
   - `org.gnome.Mutter.IdleMonitor`: `idle_monitor.rs`.
   - `org.gnome.SessionManager`: `session_manager.rs`.
   - `org.freedesktop.a11y.KeyboardMonitor`: `a11y_keyboard.rs`.
 - **The GTK shell** (`crates/shell-gtk`) serves interfaces backed by UI or
-  GSettings: `org.gnome.Shell` (`shell_dbus.rs`), the screen-saver API
+  GSettings: `org.gnome.Shell` (`shell_dbus.rs`, which also relays
+  `/org/gnome/Shell/Introspect` to the compositor as GNOME Shell serves it
+  under that name: `introspect_forward.rs`), the screen-saver API
   (`screensaver.rs`), the polkit agent (`polkit.rs`) and the NetworkManager
   secret agent (`network_agent.rs`). It also consumes system services for
   quick settings (`services.rs`) and search providers (`providers.rs`).
@@ -109,6 +112,16 @@ answers only NetworkManager's current unique owner.
 
 Search providers additionally cancel a query when a newer one starts
 (`providers.rs:1-13`).
+
+**Thunderbolt (`thunderbolt.rs`).** Like GNOME Shell's
+`status/thunderbolt.js`, the shell depends on boltd
+(`org.freedesktop.bolt` on the system bus, normally started by udev with
+`bolt.service`) for Thunderbolt devices. It enrols a newly connected
+device with `EnrollDevice(uid, "default", "none")` only when the session
+is unlocked and polkit already allows `org.freedesktop.bolt.enroll`;
+otherwise it posts GNOME's "Unknown" or "Unauthorized Thunderbolt
+device" notice. Without boltd the proxy has no owner, so nothing is
+enrolled, shown or logged.
 
 **Shared zbus edges (`shell-host`).** `NotificationBus` and `LockdownBus`
 expose `ensure()`, which tries to connect and own the name, and `poll()`.

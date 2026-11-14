@@ -837,13 +837,14 @@ impl PropertyMenu {
                     parent.append(&gtk::Separator::new(gtk::Orientation::Horizontal))
                 }
                 Kind::Menu => {
-                    let expander = gtk::Expander::new(Some(&p.label));
-                    expander.set_sensitive(p.sensitive);
-                    expander.set_tooltip_text(Some(&p.tooltip));
+                    // keyboard.js:1107's PopupSubMenuMenuItem for a property
+                    // menu: the submenu grows open and its arrow turns.
                     let child = gtk::Box::new(gtk::Orientation::Vertical, 4);
                     self.rows(&child, &p.children);
-                    expander.set_child(Some(&child));
-                    parent.append(&expander);
+                    let submenu = crate::transient::PopupSubmenu::new(&p.label, &child);
+                    submenu.set_sensitive(p.sensitive);
+                    submenu.header().set_tooltip_text(Some(&p.tooltip));
+                    parent.append(&submenu);
                 }
                 Kind::Toggle | Kind::Radio => {
                     let button = gtk::CheckButton::with_label(&p.label);
@@ -964,10 +965,11 @@ fn trusted_sender(peer: Option<&Peer>, sender: Option<&str>) -> bool {
 
 /// GTK's AT-SPI bridge gives GtkCheckButton no Action (only GtkButton,
 /// GtkSwitch, GtkExpander and entries get one), so assistive technology could
-/// read these toggles but not operate them. A widget-local action group is
+/// read a check box but not operate it. A widget-local action group is
 /// what GTK exports for any other widget; its one action clicks the button,
-/// and GTK withholds it while the button is insensitive.
-fn expose_toggle_action(button: &gtk::CheckButton) {
+/// and GTK withholds it while the button is insensitive. The end-session
+/// dialog's update box needs the same.
+pub(crate) fn expose_toggle_action(button: &gtk::CheckButton) {
     let toggle = gio::SimpleAction::new("toggle", None);
     let weak = button.downgrade();
     toggle.connect_activate(move |_, _| {

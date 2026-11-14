@@ -202,6 +202,21 @@ impl LeaseDevice {
         self.connectors.len()
     }
 
+    /// The CRTCs the live leases hold, which the desktop must not light.
+    pub fn leased_crtcs(&self) -> Vec<crtc::Handle> {
+        self.leases
+            .iter()
+            .flat_map(|lease| lease.crtcs().copied())
+            .collect()
+    }
+
+    /// The desktop's outputs changed (hotplug): its CRTCs and primary
+    /// planes are never leased.
+    pub fn set_desktop(&mut self, crtcs: Vec<crtc::Handle>, planes: Vec<plane::Handle>) {
+        self.desktop_crtcs = crtcs;
+        self.desktop_planes = planes;
+    }
+
     /// Mutter's `update_connectors`: offer new connectors for lease,
     /// withdraw vanished ones and end the leases holding them.
     pub fn update_connectors(&mut self) {

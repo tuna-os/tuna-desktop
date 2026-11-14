@@ -7,6 +7,7 @@ import sys
 import time
 import pyatspi
 from gi.repository import GLib
+from tuna_picker_progress import observe_modal_parent
 
 out = Path(sys.argv[1])
 request = json.loads(out.with_suffix(".waiting.json").read_text())
@@ -84,19 +85,14 @@ while time.monotonic() < end:
                             if before["clicks"] != 1 or before["pid"] != request["parent"]["pid"]:
                                 raise RuntimeError("Missing actual parent positive input control")
                             subprocess.run(["xdotool", "mousemove", "--window", windows[0], str(x), str(y), "click", "1"], check=True)
-                            probe_end = time.monotonic() + 2
-                            while time.monotonic() < probe_end:
-                                after = json.loads(input_path.read_text())
-                                fresh = json.loads(Path("/out/compositor-state.json").read_text())
-                                if after["clicks"] != 1 or fresh["focused"] != child["id"]:
-                                    raise RuntimeError("Actual modal parent click leaked input or stole dialog focus")
-                                if after["sequence"] >= before["sequence"] + 10:
-                                    out.with_suffix(".parent-blocked.json").write_text(json.dumps(
-                                        {"before": before, "after": after, "click": [x, y], "scene": fresh}, indent=2))
-                                    break
-                                time.sleep(.05)
-                            else:
-                                raise RuntimeError("Actual parent did not process fresh events after the modal probe")
+                            after, fresh = observe_modal_parent(
+                                lambda: json.loads(input_path.read_text()),
+                                lambda: json.loads(Path("/out/compositor-state.json").read_text()),
+                                before, child["id"], end,
+                                lambda receipt: out.with_suffix(".parent-probe.json").write_text(
+                                    json.dumps(dict(receipt, click=[x, y]), indent=2)))
+                            out.with_suffix(".parent-blocked.json").write_text(json.dumps(
+                                {"before": before, "after": after, "click": [x, y], "scene": fresh}, indent=2))
                             parent_checked = True
                             break
                 time.sleep(.05)
@@ -110,9 +106,14 @@ while time.monotonic() < end:
                        and window.get("app_id") == "org.gnome.Nautilus"]
             if len(focused) != 1:
                 raise RuntimeError("Request.Close proof lacks an actual focused Nautilus dialog")
-            out.with_suffix(".close-ready.json").write_text(json.dumps({
+            # The caller polls for this path and parses it at once: publish
+            # the complete document with a rename, never a partial write.
+            ready = out.with_suffix(".close-ready.json")
+            staged = ready.with_name(ready.name + ".tmp")
+            staged.write_text(json.dumps({
                 "dialog_id": focused[0]["id"], "provider": request["provider"], "scene": current,
             }, indent=2))
+            staged.replace(ready)
             print("actual Nautilus dialog ready for caller Request.Close")
             sys.exit(0)
         if request["method"] == "OpenFile" and request["decision"] == "grant" and not located:

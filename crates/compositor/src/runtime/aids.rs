@@ -43,6 +43,28 @@ impl RuntimeAids {
     fn active(&self) -> bool {
         self.engine.active() || self.pointer.active()
     }
+
+    /// How long until an aid's timer is due (Slow Keys, the Shift-hold
+    /// shortcut, Mouse Keys motion, hover and secondary clicks), for the
+    /// loop's wake (#503); `None` while none is pending. Only the engines
+    /// [`Runtime::poll_input_aids`] runs are asked: a timer nobody would
+    /// serve must not be reported as due.
+    pub(super) fn next_due(&self) -> Option<std::time::Duration> {
+        let engine = self
+            .engine
+            .active()
+            .then(|| self.engine.next_deadline())
+            .flatten();
+        let pointer = self
+            .pointer
+            .active()
+            .then(|| self.pointer.next_deadline())
+            .flatten();
+        let deadline = [engine, pointer].into_iter().flatten().min()?;
+        Some(std::time::Duration::from_millis(
+            deadline.saturating_sub(self.now_ms()),
+        ))
+    }
 }
 
 impl Runtime {
@@ -50,6 +72,17 @@ impl Runtime {
     /// aids first. Remote-desktop input does not come this way: GNOME's
     /// aids serve the person at the keyboard and pointer.
     pub(super) fn on_backend_input(&mut self, input: ManagerInput) {
+        // Raw events delimit motion runs before aids can consume them.
+        // In particular, Mouse Keys keyup must deliver its last queued
+        // movement before stopping the aid, not leave it for a later frame.
+        for motion in self
+            .motion_queue
+            .before_backend_input(&input)
+            .into_iter()
+            .flatten()
+        {
+            self.dispatch_manager_input(motion);
+        }
         if !self.input_aids.engine.active() {
             self.route_pointer_aids(input);
             return;
@@ -100,7 +133,7 @@ impl Runtime {
             self.apply_aid_effects(effects);
         }
         if self.input_aids.pointer.active() {
-            let pointer = self.manager.pointer_pos();
+            let pointer = self.pointer_pos_now();
             let effects = self.input_aids.pointer.poll(now, pointer);
             self.apply_pointer_effects(effects);
         }
@@ -152,7 +185,7 @@ impl Runtime {
                     self.apply_aid_effects(bells);
                 }
                 AidEffect::PointerMove { dx, dy, time } => {
-                    let pos = self.manager.pointer_pos();
+                    let pos = self.pointer_pos_now();
                     let pos = self.clamp_to_outputs(pos.x + dx, pos.y + dy);
                     self.route_pointer_aids(ManagerInput::Motion {
                         pos: pos.into(),
@@ -219,7 +252,7 @@ impl Runtime {
 
     /// Keep a Mouse Keys move on some output: the nearest point of the
     /// nearest output when it would leave them all.
-    fn clamp_to_outputs(&self, x: f64, y: f64) -> (f64, f64) {
+    pub(super) fn clamp_to_outputs(&self, x: f64, y: f64) -> (f64, f64) {
         let mut best = (x, y);
         let mut best_distance = f64::INFINITY;
         for output in &self.state.outputs {

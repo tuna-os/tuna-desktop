@@ -85,10 +85,12 @@ impl PowerSave {
 }
 
 /// The applied mode, published by the loop for DisplayConfig's getter and
-/// the orientation poller.
+/// the orientation sensor client.
 #[derive(Debug, Default)]
 pub struct PowerSaveShare {
     mode: AtomicI32,
+    /// Runs when the mode changes (the sensor client follows it).
+    pub changed: crate::orientation::ChangeHook,
 }
 
 impl PowerSaveShare {
@@ -101,7 +103,9 @@ impl PowerSaveShare {
     }
 
     pub fn publish(&self, mode: i32) {
-        self.mode.store(mode, Ordering::SeqCst);
+        if self.mode.swap(mode, Ordering::SeqCst) != mode {
+            self.changed.fire();
+        }
     }
 }
 

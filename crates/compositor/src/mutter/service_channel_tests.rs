@@ -1,5 +1,6 @@
 //! Real socket and protocol coverage of service-channel allocation and tags.
 use super::*;
+use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -67,12 +68,36 @@ fn service_connection_transports_real_sync_and_reclaims_disconnected_slots() {
         channel.open_connection(":1.2".into(), false, None, None),
         Err(fdo::Error::LimitsExceeded(_))
     ));
-    drop(sockets.pop());
+    // Drain pending display work so readiness below observes the disconnect.
     comp.pump();
+    let dropped_alive = channel.clients[":1.1"].last().unwrap().alive.clone();
+    drop(sockets.pop());
+    {
+        let mut fds = [PollFd::new(&comp.display, PollFlags::IN)];
+        assert_eq!(
+            poll(
+                &mut fds,
+                Some(&Timespec {
+                    tv_sec: 1,
+                    tv_nsec: 0,
+                }),
+            )
+            .unwrap(),
+            1,
+            "the display must observe the dropped service connection within one second"
+        );
+        assert!(fds[0].revents().contains(PollFlags::IN));
+    }
+    comp.pump();
+    assert!(!dropped_alive.load(Ordering::SeqCst));
     let replacement = channel
         .open_connection(":1.2".into(), false, None, None)
         .unwrap();
     assert_eq!(channel.clients.values().map(Vec::len).sum::<usize>(), 32);
+    assert!(matches!(
+        channel.open_connection(":1.2".into(), false, None, None),
+        Err(fdo::Error::LimitsExceeded(_))
+    ));
     drop(replacement);
 }
 #[test]

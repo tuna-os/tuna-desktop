@@ -1,6 +1,8 @@
 name: Marlin performance samples
 on:
   pull_request:
+    # Draft pull requests skip the samples; marking one ready starts them.
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - .github/workflows/performance-baseline.yml
       - scripts/tuna-vm-perf
@@ -78,10 +80,13 @@ concurrency:
 
 jobs:
   compare:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - name: Validate compact disk export request
         env:
           EXPORT_ONLY: ${{ inputs.export_only }}
@@ -121,19 +126,19 @@ jobs:
             [[ "$WORKFLOW_EVENT" == workflow_dispatch && "$run" =~ ^[0-9]+$ && "$CANDIDATE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo 'candidate requires explicit dispatched run and source SHA' >&2; exit 2; }
           fi
           if [[ -z "$run" ]]; then
-            gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=20" > perf-artifacts/package-candidates-api.json
+            python3 scripts/lib/github_api.py "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=20" > perf-artifacts/package-candidates-api.json
             run=$(python3 scripts/lib/tuna-perf-payload.py latest-run --runs perf-artifacts/package-candidates-api.json --repository "$GITHUB_REPOSITORY" --out perf-artifacts/package-candidate-selection.json)
           fi
           [[ "$run" =~ ^[0-9]+$ ]]
           printf '%s\n' "$run" > perf-artifacts/selected-package-run
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" > perf-artifacts/package-run.json
+          python3 scripts/lib/github_api.py "repos/$GITHUB_REPOSITORY/actions/runs/$run" > perf-artifacts/package-run.json
           if [[ "$PACKAGE_SOURCE" != candidate ]]; then
             jq -e '.head_branch == "main" and .event == "push" and .conclusion == "success"' perf-artifacts/package-run.json
           fi
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?name=tuna-arch&per_page=100" > perf-artifacts/package-artifacts-api.json
+          python3 scripts/lib/github_api.py "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?name=tuna-arch&per_page=100" > perf-artifacts/package-artifacts-api.json
           jq -e '.total_count <= 100 and (.artifacts | length) == .total_count and ([.artifacts[] | select(.name == "tuna-arch" and .expired == false)] | length) == 1' perf-artifacts/package-artifacts-api.json
           artifact=$(jq -r '.artifacts[] | select(.name == "tuna-arch" and .expired == false) | .id' perf-artifacts/package-artifacts-api.json)
-          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact" > perf-artifacts/package-artifact-api.json
+          python3 scripts/lib/github_api.py "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact" > perf-artifacts/package-artifact-api.json
           if [[ "$PACKAGE_SOURCE" == candidate ]]; then
             python3 scripts/lib/tuna-perf-payload.py select-candidate --repository "$GITHUB_REPOSITORY" --expected-sha "$CANDIDATE_COMMIT" --run-id "$run" --run perf-artifacts/package-run.json --artifact perf-artifacts/package-artifact-api.json --out perf-artifacts/package-selection.json
           else
@@ -142,7 +147,7 @@ jobs:
           if [[ -n "$CANDIDATE_COMMIT" ]]; then
             [[ "$(jq -r '.head_sha' perf-artifacts/package-selection.json)" == "$CANDIDATE_COMMIT" ]] || { echo 'selected package does not match requested candidate source' >&2; exit 2; }
           fi
-          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact/zip" > perf-artifacts/package-artifact.zip
+          python3 scripts/lib/github_api.py --max-bytes 4294967296 "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact/zip" > perf-artifacts/package-artifact.zip
       - name: Prepare disk space and optional measurement KVM
         env:
           EXPORT_ONLY: ${{ inputs.export_only }}
@@ -177,6 +182,10 @@ jobs:
           python3 scripts/lib/tuna-perf-payload.py copy --package tuna.pkg.tar.zst --report perf-artifacts/package-payload.json --out perf-artifacts/package-copy.json
           package_sha=$(jq -r '.package.sha256' perf-artifacts/package-payload.json)
           sha256sum tuna.pkg.tar.zst > perf-artifacts/package.sha256
+          # The reference base is the one platform manifest the recipe pins; the
+          # moving Marlin tag outruns the pinned Arch snapshot (run 43009988803).
+          base_image=$(sed -n 's/^ARG BASE_IMAGE=//p' packaging/marlin/perf/Containerfile.baseline)
+          [[ "$base_image" =~ ^ghcr\.io/tuna-os/marlin@sha256:[0-9a-f]{64}$ ]] || { echo 'performance reference base is not one pinned platform digest' >&2; exit 2; }
           # One coherent distribution upgrade supplies BOTH explicit profiles.
           sudo podman build -f packaging/marlin/perf/Containerfile.baseline --target gnome-baseline -t localhost/marlin-gnome51-coherent:base . 2>&1 | tee perf-artifacts/coherent-build.log
           coherent_image=$(sudo podman inspect localhost/marlin-gnome51-coherent:base --format '{{.Id}}')
@@ -221,7 +230,8 @@ jobs:
             python3 scripts/lib/tuna-perf-payload.py runtime --runtime "$profile_artifacts/runtime-versions" --report perf-artifacts/package-payload.json --out "$profile_artifacts/installed-runtime.json"
             sudo podman rm "$container"
             trap - EXIT
-            sudo podman inspect ghcr.io/tuna-os/marlin:gnome --format '{{.Digest}}' | tee base-digest
+            sudo podman inspect "$base_image" --format '{{.Digest}}' | tee base-digest
+            [[ "$(cat base-digest)" == "${base_image#*@}" ]] || { echo 'built reference base differs from the pinned platform digest' >&2; exit 2; }
             sudo podman run --rm "localhost/marlin-tuna-preview:$profile" gnome-shell --version | tee "$profile_artifacts/gnome-version"
             grep -Eq '^GNOME Shell 51([. ]|$)' "$profile_artifacts/gnome-version"
             sudo podman run --rm "localhost/marlin-tuna-preview:$profile" pacman -Q | tee "$profile_artifacts/baseline-packages.txt"
@@ -248,7 +258,7 @@ jobs:
           PYKEY
           scripts/tuna-benchmark-disk-export --profile "$EXPORT_DISK" --ssh-public-key-file /mnt/perf/benchmark-ssh-key.pub
       - name: Upload compact benchmark disk and provenance
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7.0.2
         if: ${{ always() && (inputs.export_disk == 'stock' || inputs.export_disk == 'diagnostic') }}
         with:
           name: marlin-benchmark-disk-${{ inputs.export_disk }}
@@ -277,7 +287,7 @@ jobs:
           if [[ "$ENFORCE" != true ]]; then mode=(--report-only); fi
           scripts/tuna-perf-gate check --artifacts perf-artifacts --out perf-artifacts/perf-gate.json --markdown "$GITHUB_STEP_SUMMARY" "${mode[@]}"
       - name: Upload performance artifacts
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
           name: marlin-performance
