@@ -386,6 +386,45 @@ class Observer(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(result["results"][0]["status"], "missing")
 
+    REFUSAL = {"kernel_attribution": "unavailable", "kernel_attribution_receipt": {
+        "file": "kernel-vblank-acquisition-rejection.json",
+        "reason": "kernel observer reports actual loss, missing probes or invalid acquisition: "
+                  "actual kprobe missed 1 hit(s): tuna_vblank_timer"}}
+
+    def refuse_kernel(self, session):
+        report = json.loads((session / "report.json").read_text())
+        report["gnome_overview_sysprof"] = dict(self.REFUSAL)
+        (session / "report.json").write_text(json.dumps(report))
+
+    def test_diagnostic_kernel_refusal_is_reported_and_never_fails_the_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tree(root / "artifacts")
+            tree(root / "artifacts" / "stock")
+            self.refuse_kernel(root / "artifacts" / "repeat-2" / "gnome")
+            path, out, summary = root / "budgets.json", root / "gate.json", root / "summary.md"
+            path.write_text(json.dumps(budgets(**{"cpu.overview.total.mean": budget(99)})))
+            self.assertEqual(run_gate(["check", "--artifacts", str(root / "artifacts"), "--budgets", str(path),
+                                       "--out", str(out), "--markdown", str(summary)]), 0)
+            result = json.loads(out.read_text())
+            self.assertEqual(result["refused_sessions"], [])
+            self.assertEqual(result["results"][0]["pairs"], 3)
+            self.assertEqual([row["kernel_attribution"] for row in result["diagnostic_kernel_attribution"]],
+                             ["not-observed", "unavailable", "not-observed"])
+            refused = result["diagnostic_kernel_attribution"][1]
+            self.assertEqual(refused["receipt"], "repeat-2/gnome/kernel-vblank-acquisition-rejection.json")
+            self.assertIn("missed 1 hit(s)", refused["reason"])
+            self.assertIn("Diagnostic repeat 2 gnome: kernel vblank attribution unavailable "
+                          "(kernel observer reports actual loss", summary.read_text())
+            self.assertIn("`repeat-2/gnome/kernel-vblank-acquisition-rejection.json`", summary.read_text())
+
+    def test_stock_session_with_a_refused_kernel_observer_still_fails(self):
+        status, result = self.check(self.refuse_kernel)
+        self.assertEqual(status, 1)
+        self.assertEqual(result["results"][0]["status"], "missing")
+        self.assertEqual([(r["repeat"], r["desktop"]) for r in result["refused_sessions"]], [(2, "gnome")])
+        self.assertEqual(result["refused_sessions"][0]["problems"], ["kernel observer refused its acquisition"])
+
     def test_host_cpu_model_is_reported(self):
         with tempfile.TemporaryDirectory() as directory:
             session = Path(directory)

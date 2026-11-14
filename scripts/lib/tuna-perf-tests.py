@@ -380,7 +380,7 @@ class KernelBuildEvidence(unittest.TestCase):
                            capture_writers_after_stop=[], guest_kernel_provenance=kernel)
                 with patch.object(host, "guest_probe", side_effect=chunk):
                     with self.assertRaisesRegex(ValueError, "kernel provenance"):
-                        host.retain_gnome_trace(None, out, row)
+                        host.retain_gnome_trace(None, out, row, "diagnostic")
                 self.assertEqual((out / "gnome-overview.syscap").read_bytes(), raw)
                 self.assertEqual(json.loads((out / "gnome-overview-source.json").read_text()), row)
                 self.assertTrue((out / "gnome-overview-marks.json").is_file())
@@ -407,7 +407,7 @@ class CaptureClosure(unittest.TestCase):
                 if writers is not None:
                     row["capture_writers_after_stop"] = writers
                 with self.subTest(writers=writers), self.assertRaisesRegex(ValueError, "writer did not close"):
-                    host.retain_gnome_trace(None, out, row)
+                    host.retain_gnome_trace(None, out, row, "diagnostic")
                 self.assertEqual((out / "gnome-overview.syscap").read_bytes(), raw)
                 self.assertTrue((out / "gnome-overview-marks.json").exists())
                 self.assertFalse((out / "gnome-overview-frame-ownership.json").exists())
@@ -415,7 +415,7 @@ class CaptureClosure(unittest.TestCase):
             # its writer passes the fence but cannot bypass semantic checks.
             with self.assertRaisesRegex(ValueError, "lacks actual event"):
                 host.retain_gnome_trace(None, out,
-                        dict(metadata, capture_writers_after_stop=[]))
+                        dict(metadata, capture_writers_after_stop=[]), "diagnostic")
 
 
 class DiagnosticSourceEvidence(unittest.TestCase):
@@ -489,7 +489,7 @@ class RejectedPresentationCapture(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory, patch.object(host, "guest_probe", chunk):
             out = Path(directory)
-            host.retain_gnome_trace(None, out, metadata)
+            host.retain_gnome_trace(None, out, metadata, "diagnostic")
             self.assertEqual((out / "gnome-overview.syscap").read_bytes(), raw)
             self.assertEqual(json.loads((out / "gnome-overview-source.json").read_text()), metadata)
             self.assertTrue((out / "gnome-overview-marks.json").exists())

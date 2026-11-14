@@ -140,8 +140,11 @@ additional diagnostic requirement.
 ## Kernel vblank observer probe misses
 
 The diagnostic GNOME session also runs `tuna-kernel-trace`, a tracefs observer
-with ftrace kprobes on the DRM vblank path. It refuses any `kprobe_profile` miss,
-and the refusal fails the session. An ftrace kprobe misses when it is hit while
+with ftrace kprobes on the DRM vblank path. It refuses any `kprobe_profile` miss.
+The refusal makes that diagnostic pair's kernel attribution unavailable
+(`kernel_attribution: unavailable`, receipt
+`kernel-vblank-acquisition-rejection.json`) without failing the pair; see
+[the README](README.md#reading-the-report). An ftrace kprobe misses when it is hit while
 another kprobe handler runs on the same CPU. The p: and r64: probes on one
 symbol share a kprobe, so one miss counts against both. The vblank hrtimer
 fires in hardirq context. When it lands inside a process-context handler that

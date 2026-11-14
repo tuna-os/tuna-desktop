@@ -213,7 +213,34 @@ def session_problems(directory):
     largest = max((len(json.dumps(s, separators=(",", ":"))) for s in samples), default=0)
     if largest > OBSERVER_RECORD_BYTES:
         problems.append(f"observer record of {largest} bytes exceeds {OBSERVER_RECORD_BYTES}")
+    # Only a diagnostic pair may carry a refused kernel observer; a gated
+    # session that does was measured under a failed observer.
+    if (report.get("gnome_overview_sysprof") or {}).get("kernel_attribution") == "unavailable":
+        problems.append("kernel observer refused its acquisition")
     return problems
+
+
+def diagnostic_kernel_attribution(root):
+    """[{"repeat", "kernel_attribution", "reason", "receipt"}] per diagnostic GNOME report.
+
+    A diagnostic pair whose kernel observer refused its acquisition (probe
+    misses, buffer loss) completes with attribution unavailable; its receipt
+    stays beside the retained observer artifacts. Never a budget input.
+    """
+    root = Path(root)
+    rows = []
+    for repeat in (1, 2, 3):
+        session = Path("gnome") if repeat == 1 else Path(f"repeat-{repeat}") / "gnome"
+        path = root / session / "report.json"
+        if not path.is_file():
+            continue
+        trace = json.loads(path.read_text()).get("gnome_overview_sysprof") or {}
+        row = {"repeat": repeat, "kernel_attribution": trace.get("kernel_attribution", "not-observed")}
+        receipt = trace.get("kernel_attribution_receipt")
+        if row["kernel_attribution"] == "unavailable" and isinstance(receipt, dict):
+            row.update(reason=receipt.get("reason"), receipt=str(session / str(receipt.get("file"))))
+        rows.append(row)
+    return rows
 
 
 def host_cpu(directory):
@@ -494,7 +521,7 @@ def attribution(comparison):
     return result
 
 
-def markdown(rows, pairs, budgets, comparison=None, refused=(), hosts=()):
+def markdown(rows, pairs, budgets, comparison=None, refused=(), hosts=(), kernel=()):
     lines = ["## Performance budgets: Tuna Desktop vs GNOME 51", "",
              f"{len(pairs)} {budgets.get('profile', 'stock')} paired sessions. Ratio is the median over pairs of Tuna / GNOME "
              f"(target <= {budgets.get('target_ratio', 1.0):.2f}). Budgets: `docs/perf/budgets.json`. "
@@ -506,6 +533,13 @@ def markdown(rows, pairs, budgets, comparison=None, refused=(), hosts=()):
         lines.append(f"Refused {item['profile']} repeat {item['repeat']} {item['desktop']}: "
                      + "; ".join(item["problems"]))
     if refused:
+        lines.append("")
+    unavailable = [item for item in kernel if item["kernel_attribution"] == "unavailable"]
+    for item in unavailable:
+        lines.append(f"Diagnostic repeat {item['repeat']} gnome: kernel vblank attribution unavailable "
+                     f"({item.get('reason') or 'no reason recorded'}). Receipt: `{item.get('receipt', '-')}`. "
+                     "Not a budget input.")
+    if unavailable:
         lines.append("")
     lines += ["| Metric | Status | GNOME | Tuna | Ratio | 90% CI | Budget | Ceiling |",
               "|---|---|---:|---:|---:|---:|---:|---:|"]

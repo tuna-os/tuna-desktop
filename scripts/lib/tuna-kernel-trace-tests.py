@@ -278,14 +278,16 @@ class Retention(unittest.TestCase):
             return {'kernel_trace':{'index':index,'data':base64.b64encode(value).decode()}}
         with tempfile.TemporaryDirectory() as tmp, patch.object(host,'guest_probe',side_effect=probe):
             out=Path(tmp)
-            with self.assertRaisesRegex(ValueError, 'reports actual loss.*actual dropped events'):host.retain_kernel_trace(None,out,metadata)
+            with self.assertRaisesRegex(host.KernelObserverRefusal, 'reports actual loss.*actual dropped events'):host.retain_kernel_trace(None,out,metadata)
             self.assertEqual((out/'kernel-vblank-trace.txt').read_bytes(),raw)
             self.assertEqual((out/'kernel-vblank-formats.json').read_bytes(),formats)
             self.assertEqual(json.loads((out/'kernel-vblank-source.json').read_text()),metadata)
     def test_incomplete_kernel_chunk_cannot_qualify(self):
         metadata={'raw':{'bytes':2,'sha256':'bad'}}
         with tempfile.TemporaryDirectory() as tmp, patch.object(host,'guest_probe',return_value={'kernel_trace':{'index':0,'data':'eA=='}}):
-            with self.assertRaises(ValueError):host.retain_kernel_trace(None,Path(tmp),metadata)
+            with self.assertRaises(ValueError) as caught:host.retain_kernel_trace(None,Path(tmp),metadata)
+            # A transport or artifact fault is never the observer's own refusal.
+            self.assertNotIsInstance(caught.exception, host.KernelObserverRefusal)
 
 class CallbackIdentity(unittest.TestCase):
     def fixture(self):
@@ -338,7 +340,7 @@ class OriginalRejection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(host,'guest_probe',side_effect=chunk), patch.object(host,'retain_kernel_trace',side_effect=kernel), patch.object(host,'frame_source_evidence',side_effect=identity):
             out = Path(tmp)
             with self.assertRaisesRegex(ValueError,'missing diagnostic marks'):
-                host.retain_gnome_trace(None,out,metadata)
+                host.retain_gnome_trace(None,out,metadata,'diagnostic')
             self.assertEqual(order,['kernel','identity'])
             self.assertEqual((out/'gnome-overview.syscap').read_bytes(),raw)
             owned = json.loads((out/'gnome-overview-frame-ownership.json').read_text())
@@ -348,6 +350,72 @@ class OriginalRejection(unittest.TestCase):
             rejected = json.loads((out/'gnome-overview-source-rejection.json').read_text())
             self.assertEqual(rejected['reason'],'missing diagnostic marks')
             self.assertTrue((out/'kernel-vblank-acquisition-rejection.json').exists())
+
+
+class DiagnosticAttribution(unittest.TestCase):
+    """A diagnostic pair's kernel observer refusal makes attribution unavailable."""
+    REFUSAL = {'qualified_acquisition':False, 'probe_misses':{'tuna_vblank_486e88873cc9183b_timer':1},
+               'errors':['actual kprobe missed 1 hit(s): tuna_vblank_486e88873cc9183b_timer (kprobe_profile)',
+                         'located kprobe re-entry: the drm_vblank_timer_function hardirq on cpu1'],
+               'cleanup_errors':[]}
+
+    def capture(self, kernel):
+        import base64, gzip, hashlib
+        fixture = REPO / 'scripts/lib/fixtures'
+        metadata = json.loads((fixture/'gnome51-presentation-before-dispatch.json').read_text())
+        raw = gzip.decompress((fixture/'gnome51-presentation-before-dispatch.syscap.gz').read_bytes())
+        trace, formats = b'actual retained kernel trace\n', b'{"actual": "format"}'
+        observed = {'raw':{'bytes':len(trace),'sha256':hashlib.sha256(trace).hexdigest()},
+                    'formats':{'bytes':len(formats),'sha256':hashlib.sha256(formats).hexdigest()}}
+        metadata['kernel_trace'] = dict(observed, **kernel)
+        sources = {'gnome-trace-read':('gnome_trace', raw), 'kernel-trace-read':('kernel_trace', trace),
+                   'kernel-formats-read':('kernel_trace', formats)}
+        def probe(agent, action, index):
+            key, value = sources[action]
+            return {key:{'index':index,'data':base64.b64encode(value[index*65536:(index+1)*65536]).decode()}}
+        return metadata, trace, probe
+
+    def test_diagnostic_refusal_completes_with_attribution_unavailable_and_its_receipt(self):
+        metadata, trace, probe = self.capture(self.REFUSAL)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(host,'guest_probe',side_effect=probe):
+            out = Path(tmp)
+            summary = host.retain_gnome_trace(None,out,metadata,'diagnostic')
+            self.assertEqual(summary['kernel_attribution'],'unavailable')
+            self.assertEqual(summary['kernel_attribution_receipt']['file'],'kernel-vblank-acquisition-rejection.json')
+            self.assertIn('missed 1 hit(s)',summary['kernel_attribution_receipt']['reason'])
+            self.assertIn('located kprobe re-entry',summary['kernel_attribution_receipt']['reason'])
+            self.assertIn('latency_upper_ms',summary['frame_ownership'])
+            receipt = json.loads((out/'kernel-vblank-acquisition-rejection.json').read_text())
+            self.assertEqual(receipt['kernel_attribution'],'unavailable')
+            self.assertEqual(receipt['source'],'kernel-vblank-source.json')
+            self.assertEqual(receipt['reason'],summary['kernel_attribution_receipt']['reason'])
+            # The whole refused acquisition stays as evidence.
+            self.assertEqual(json.loads((out/'kernel-vblank-source.json').read_text()),metadata['kernel_trace'])
+            self.assertEqual((out/'kernel-vblank-trace.txt').read_bytes(),trace)
+
+    def test_refusal_outside_the_diagnostic_profile_still_fails(self):
+        metadata, _, probe = self.capture(self.REFUSAL)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(host,'guest_probe',side_effect=probe):
+            out = Path(tmp)
+            with self.assertRaisesRegex(ValueError,'reports actual loss.*missed 1 hit'):
+                host.retain_gnome_trace(None,out,metadata,'stock')
+            self.assertNotIn('kernel_attribution',json.loads((out/'kernel-vblank-acquisition-rejection.json').read_text()))
+
+    def test_diagnostic_artifact_fault_still_fails(self):
+        metadata, _, probe = self.capture(self.REFUSAL)
+        metadata['kernel_trace']['raw']['sha256'] = '0' * 64
+        with tempfile.TemporaryDirectory() as tmp, patch.object(host,'guest_probe',side_effect=probe):
+            with self.assertRaisesRegex(ValueError,'incomplete independent kernel artifacts'):
+                host.retain_gnome_trace(None,Path(tmp),metadata,'diagnostic')
+
+    def test_qualified_observer_reports_attribution_available(self):
+        metadata, _, probe = self.capture({'qualified_acquisition':True,'errors':[],'cleanup_errors':[]})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(host,'guest_probe',side_effect=probe):
+            out = Path(tmp)
+            summary = host.retain_gnome_trace(None,out,metadata,'diagnostic')
+            self.assertEqual(summary['kernel_attribution'],'available')
+            self.assertNotIn('kernel_attribution_receipt',summary)
+            self.assertFalse((out/'kernel-vblank-acquisition-rejection.json').exists())
 
 
 class BufferAllocation(unittest.TestCase):
