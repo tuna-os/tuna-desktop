@@ -74,25 +74,87 @@ mod osk;
 /// spins. The nested (winit) backend always runs at this pace.
 const FRAME_BUDGET: Duration = Duration::from_millis(16);
 
-/// Longest the native loop sleeps with nothing due (#503). Producers
-/// without an event source of their own (the XWayland supervisor's
-/// backoff, the X11 icon reader, a stalled client flush) are still
-/// served at least this often.
+/// Longest the native loop sleeps with nothing due (#503). When no event
+/// source fired in that time either, the tick that follows is an idle
+/// tick: it still serves what only a tick polls (a stalled client flush,
+/// the hub's token reissue, the supervisors), but it neither rebuilds
+/// nor draws the scene, which nothing can have changed. A
+/// producer that changes what is drawn must therefore wake the loop (an
+/// event source or [`crate::wake::Wake`]) or report its deadline to
+/// `producer_wake`.
 const IDLE_WAKE: Duration = Duration::from_millis(500);
+
+/// How long the loop may sleep, and what kind of sleep that is.
+#[derive(Debug, Clone, Copy)]
+struct NextWake {
+    /// The longest sleep before the next tick.
+    after: Duration,
+    /// Nothing is due within `after`, which is the [`IDLE_WAKE`]
+    /// fallback: a tick that no event source precedes is an idle tick.
+    idle: bool,
+    /// Nothing moves and no calloop timer is armed: a wake that finds
+    /// only page flips ready before `after` ends is served by
+    /// [`Runtime::dispatch_flips`] and [`Runtime::flip_tick`] (#503).
+    flips: bool,
+}
+
+/// The DRM device's events (#503), on a loop of their own that the main
+/// loop holds as one descriptor. A full dispatch serves them as before.
+/// A wait that finds only them ready serves them alone, as Mutter's frame
+/// clock idles after a presentation that leaves nothing to draw:
+/// whatever else arrives meanwhile stays pending for the full tick that
+/// follows, as after an idle wait.
+#[cfg(feature = "drm")]
+struct FlipLoop {
+    events: EventLoop<'static, Runtime>,
+    /// The nested loop's descriptor in the main loop.
+    token: calloop::RegistrationToken,
+}
+
+#[cfg(feature = "drm")]
+impl FlipLoop {
+    fn new(
+        source: smithay::backend::drm::DrmDeviceNotifier,
+        main: &LoopHandle<'static, Runtime>,
+    ) -> Result<Self, RuntimeError> {
+        use std::os::fd::AsFd;
+        let events: EventLoop<'static, Runtime> =
+            EventLoop::try_new().map_err(|e| RuntimeError::Loop(e.to_string()))?;
+        events
+            .handle()
+            .insert_source(source, |event, metadata, rt: &mut Runtime| {
+                let flip = match &mut rt.backend {
+                    Backend::Drm(drm) => drm.on_drm_event(event, metadata),
+                    Backend::Winit(_) => None,
+                };
+                match flip {
+                    Some(flip) => rt.page_flipped(flip),
+                    // An error or an unknown CRTC: let a full render look.
+                    None => rt.flip_changed = true,
+                }
+            })
+            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+        let fd = events
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+        let token = main
+            .insert_source(
+                calloop::generic::Generic::new(fd, calloop::Interest::READ, calloop::Mode::Level),
+                |_, _, rt: &mut Runtime| {
+                    rt.dispatch_flips();
+                    Ok(calloop::PostAction::Continue)
+                },
+            )
+            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+        Ok(Self { events, token })
+    }
+}
 
 /// Display-rate ticks continue this long after the last input event or
 /// power-on (#503): an animation whose first steps draw nothing new still
 /// advances. A queued frame alone does not extend it.
 const ACTIVITY_LINGER: Duration = Duration::from_millis(500);
-
-/// Administrative lockdown (#357): how often the tick polls the live
-/// `disable-lock-screen` key. Each poll spawns one background reader at
-/// most and drains completed reads without waiting (see
-/// `ControlHub::refresh_lockdown`), skipped without a session bus; the
-/// shell enforces its own surface immediately, so this backstop's short
-/// lag fails safe (an extra lock in the window still needs auth to
-/// unlock, and unlocks never come from policy).
-const LOCKDOWN_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Wake the native loop for requests on already accepted Wayland clients.
 /// The listening socket only signals new connections. The display owns the
@@ -375,6 +437,27 @@ pub fn current_exe_dir() -> Option<std::path::PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.to_owned()))
+}
+
+/// `GL_RENDERER` of the compositor's own context.
+fn gl_renderer_name(renderer: &mut GlesRenderer) -> Option<String> {
+    use smithay::backend::renderer::gles::ffi;
+    renderer
+        .with_context(|gl| {
+            // SAFETY: the renderer's context is current inside
+            // `with_context`; GL_RENDERER is static, NUL-terminated GL
+            // state, or null on error.
+            unsafe {
+                let name = gl.GetString(ffi::RENDERER);
+                (!name.is_null()).then(|| {
+                    std::ffi::CStr::from_ptr(name.cast())
+                        .to_string_lossy()
+                        .into_owned()
+                })
+            }
+        })
+        .ok()
+        .flatten()
 }
 
 /// Whether a session runs X11 apps (#59): `TUNA_XWAYLAND=1` forces it,
@@ -711,8 +794,9 @@ pub struct Runtime {
     /// Worker threads (idle watches, Orca, wallpaper, Night Light, IME,
     /// X11 icons, PAM, logind) ping the loop through this (#503).
     wake: crate::wake::Wake,
-    /// Last live lockdown refresh (see [`LOCKDOWN_REFRESH_INTERVAL`]).
-    lockdown_refresh_at: Instant,
+    /// The live `disable-lock-screen` key (#357), watched on its own GIO
+    /// thread: a change wakes the loop, nothing polls it.
+    lockdown_settings: crate::lockdown_settings::LockdownSettings,
     /// GNOME's remembered Num Lock (#346): restore once, save changes.
     numlock: crate::numlock::NumlockMemory,
     /// On-demand XWayland server supervisor. Idle until the first X11
@@ -723,6 +807,23 @@ pub struct Runtime {
     /// Cloned from the owned event loop at launch; `'static`
     /// because the loop outlives the runtime in `run`.
     loop_handle: LoopHandle<'static, Runtime>,
+    /// Calloop timers armed through [`Runtime::arm_timer`] and not fired
+    /// yet. They are not descriptors, so the idle wait cannot see one
+    /// fall due: while any is armed the loop keeps dispatching.
+    loop_timers: usize,
+    /// The DRM device's page-flip events, on a loop of their own so that a
+    /// wake that brought nothing else is served without a full tick
+    /// ([`FlipLoop`]).
+    #[cfg(feature = "drm")]
+    flips: Option<FlipLoop>,
+    /// What the last page-flip dispatch changed must be drawn: it applied
+    /// commits a fifo barrier or commit timer held back, delivered an
+    /// event other than a completed flip, or freed an output whose frame
+    /// the last render had to defer.
+    flip_changed: bool,
+    /// The last render left an output without the frame it needed,
+    /// because that output's previous flip was still pending.
+    frame_owed: bool,
     /// A hardware button release that would end a direct strip move or
     /// resize, held until the current dispatch finishes (see the input
     /// source in `launch`).
@@ -1001,6 +1102,8 @@ impl Runtime {
         }
         let event_loop = EventLoop::try_new().map_err(|e| RuntimeError::Loop(e.to_string()))?;
         let choice = session.backend.resolve(has_host_display());
+        #[cfg(feature = "drm")]
+        let mut flips = None;
         let backend = match choice {
             #[cfg(feature = "drm")]
             BackendChoice::Drm => {
@@ -1022,17 +1125,7 @@ impl Runtime {
                         rt.on_session_event(event);
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-                handle
-                    .insert_source(sources.drm, |event, metadata, rt: &mut Runtime| {
-                        let flip = match &mut rt.backend {
-                            Backend::Drm(drm) => drm.on_drm_event(event, metadata),
-                            Backend::Winit(_) => None,
-                        };
-                        if let Some(flip) = flip {
-                            rt.page_flipped(flip);
-                        }
-                    })
-                    .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                flips = Some(FlipLoop::new(sources.drm, &handle)?);
                 if let Some(udev) = sources.udev {
                     handle
                         .insert_source(udev, |event, _, rt: &mut Runtime| {
@@ -1283,6 +1376,26 @@ impl Runtime {
             };
             state.enable_dmabuf(formats);
         }
+        // On software GL the shell draws with cairo. Telling it here saves
+        // it a GL context of its own made only to read GL_RENDERER, which
+        // would keep Mesa, LLVM and llvmpipe's threads in the shell for
+        // good (#503). On a GPU nothing is set and GSK chooses as before.
+        {
+            use tuna_shell_control::gl;
+            let gl_renderer = match &mut backend {
+                Backend::Winit(winit) => gl_renderer_name(winit.renderer()),
+                #[cfg(feature = "drm")]
+                Backend::Drm(drm) => gl_renderer_name(&mut drm.renderer),
+            };
+            let chosen = std::env::var_os(gl::GSK_RENDERER_ENV).is_some();
+            if let Some(gsk) = gl::shell_gsk_renderer(chosen, gl_renderer.as_deref()) {
+                eprintln!(
+                    "tuna-compositor: OpenGL is {}; the shell draws with {gsk}",
+                    gl_renderer.as_deref().unwrap_or_default()
+                );
+                shell.set_env(gl::GSK_RENDERER_ENV, gsk);
+            }
+        }
 
         // org.gnome.Mutter.ScreenCast and DisplayConfig (#61): screen
         // sharing through the stock GNOME portal.
@@ -1489,10 +1602,15 @@ impl Runtime {
                     wake.signal()
                 })
             },
+            lockdown_settings: crate::lockdown_settings::LockdownSettings::start(&wake),
             wake,
-            lockdown_refresh_at: Instant::now(),
             xwayland: XWaylandSupervisor::new(),
             loop_handle,
+            loop_timers: 0,
+            #[cfg(feature = "drm")]
+            flips,
+            flip_changed: false,
+            frame_owed: false,
             #[cfg(feature = "drm")]
             strip_release_held: None,
             #[cfg(feature = "xwayland")]
@@ -1596,6 +1714,7 @@ impl Runtime {
         color_share.set_wake(&runtime.wake);
         runtime.orca.set_wake(&runtime.wake);
         runtime.idle_monitor.set_wake(&runtime.wake);
+        runtime.session_manager.set_wake(&runtime.wake);
         if let Some(ime) = &runtime.ime {
             ime.set_wake(&runtime.wake);
         }
@@ -1609,11 +1728,11 @@ impl Runtime {
                 .iter()
                 .any(|key| std::env::var_os(key).is_some());
         // The shell's idle-blank settings and wallpaper drop live in the
-        // runtime dir: any change there wakes the loop, and the blank
-        // file is read again only when it changed. A state document the
-        // tick itself rewrites there would wake the loop on its own
-        // writes, so then the dir is not watched and the blank file is
-        // read on every tick.
+        // runtime dir: any change there wakes the loop, and either file
+        // is read again only when one of them changed. A state document
+        // the tick itself rewrites there would wake the loop on its own
+        // writes, so then the dir is not watched and both files are read
+        // on every tick.
         if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|dir| state_dir.as_deref() != Some(std::path::Path::new(dir)))
         {
@@ -1624,15 +1743,22 @@ impl Runtime {
                         .handle()
                         .insert_source(watch, |_, fd, rt: &mut Runtime| {
                             let blank = std::ffi::OsStr::new(crate::wake::IDLE_BLANK_FILE);
-                            if crate::wake::changed(&*fd, &[blank]) {
+                            let paper = std::ffi::OsStr::new(crate::wallpaper::WALLPAPER_FILE);
+                            // One answer for both: either changes rarely,
+                            // and reading the other again is one open.
+                            if crate::wake::changed(&*fd, &[blank, paper]) {
                                 rt.blank_stale = true;
+                                rt.wallpaper.drop_changed();
                             }
                             Ok(calloop::PostAction::Continue)
                         })
                         .map_err(|e| e.to_string())
                 });
             match watched {
-                Ok(_) => runtime.blank_watched = true,
+                Ok(_) => {
+                    runtime.blank_watched = true;
+                    runtime.wallpaper.watch_drop();
+                }
                 Err(error) => {
                     eprintln!("tuna-compositor: runtime dir watch unavailable: {error}")
                 }
@@ -3808,6 +3934,7 @@ impl Runtime {
                     scale,
                     blank_alpha: 0.0,
                     tint: color_effect.as_ref(),
+                    opaque: false,
                 },
                 &[],
                 &[],
@@ -4048,6 +4175,7 @@ impl Runtime {
                                 scale: view.scale,
                                 blank_alpha,
                                 tint: color_effect.as_ref(),
+                                opaque: false,
                             },
                             &decor,
                             &previews,
@@ -4086,6 +4214,7 @@ impl Runtime {
                         // Captures stay untinted, like GNOME's (gamma
                         // applies past the framebuffer).
                         tint: color_effect.as_ref(),
+                        opaque: false,
                     },
                     &decor,
                     &previews,
@@ -4922,24 +5051,22 @@ impl Runtime {
     /// signals, runtime files and worker threads wake it earlier through
     /// their event sources; this covers what only time moves, and
     /// coalesced motion falling due.
-    fn next_wake(&self) -> Duration {
+    fn next_wake(&self) -> NextWake {
         let wake = self.producer_wake();
-        self.motion_wake().map_or(wake, |due| wake.min(due))
+        match self.motion_wake() {
+            Some(due) => NextWake {
+                after: wake.after.min(due),
+                idle: false,
+                flips: false,
+            },
+            None => wake,
+        }
     }
 
-    /// The timed producers' earliest wake.
-    fn producer_wake(&self) -> Duration {
-        #[cfg(feature = "drm")]
-        let native = matches!(self.backend, Backend::Drm(_));
-        #[cfg(not(feature = "drm"))]
-        let native = false;
-        // The nested backend has no Wayland readiness source.
-        if !native || self.proof_polling {
-            return FRAME_BUDGET;
-        }
-        let now = Instant::now();
-        let clock = self.animation_clock.now();
-        if now.saturating_duration_since(self.active_at) < ACTIVITY_LINGER
+    /// Whether anything on screen moves or was just touched: the loop
+    /// keeps the display rate and every tick draws.
+    fn in_motion(&self, now: Instant, clock: Duration) -> bool {
+        now.saturating_duration_since(self.active_at) < ACTIVITY_LINGER
             || self.overview_motion.animating()
             || self.manager.workspace_slide().running()
             || self.manager.strip_animating()
@@ -4968,14 +5095,37 @@ impl Runtime {
                 .unlock_worker
                 .as_ref()
                 .is_some_and(|worker| worker.phase.load(std::sync::atomic::Ordering::Acquire) != 1)
-        {
-            return FRAME_BUDGET;
+    }
+
+    /// The timed producers' earliest wake.
+    fn producer_wake(&self) -> NextWake {
+        let moving = NextWake {
+            after: FRAME_BUDGET,
+            idle: false,
+            flips: false,
+        };
+        #[cfg(feature = "drm")]
+        let native = matches!(self.backend, Backend::Drm(_));
+        #[cfg(not(feature = "drm"))]
+        let native = false;
+        // The nested backend has no Wayland readiness source.
+        if !native || self.proof_polling {
+            return moving;
+        }
+        let now = Instant::now();
+        if self.in_motion(now, self.animation_clock.now()) {
+            return moving;
         }
         // Timed producers are served no more often than the display
         // rate: a gate that is due but cannot act yet (the IME bridge
         // while locked, say) costs what the fixed loop did, never a spin.
         let mut wake = IDLE_WAKE;
-        let mut due = |after: Duration| wake = wake.min(after.max(FRAME_BUDGET));
+        // Whether any of them is due by the time the fallback wake fires.
+        let mut timed = false;
+        let mut due = |after: Duration| {
+            timed |= after <= IDLE_WAKE;
+            wake = wake.min(after.max(FRAME_BUDGET));
+        };
         // An inhibited session neither blanks nor locks; its end is
         // handled by the tick that sees it.
         if !self.idle_inhibited {
@@ -5029,11 +5179,13 @@ impl Runtime {
                     due(Duration::from_millis(ms));
                 }
             }
-            if self.state.xwm.is_some() {
-                due(self
-                    .x11_icon_reader
-                    .next_deadline()
-                    .saturating_duration_since(now));
+            // Only a server that did not answer is asked again on a timer.
+            if let Some(retry) = self
+                .x11_icon_reader
+                .next_deadline()
+                .filter(|_| self.state.xwm.is_some())
+            {
+                due(retry.saturating_duration_since(now));
             }
         }
         if let Some(ms) = self
@@ -5057,14 +5209,93 @@ impl Runtime {
         if let Some(ms) = self.shell_retry_ms {
             due(Duration::from_millis(ms));
         }
+        // The input aids' timers: Slow Keys, the Shift-hold shortcut, Mouse
+        // Keys motion, hover and secondary clicks.
+        if let Some(after) = self.input_aids.next_due() {
+            due(after);
+        }
         // A command frame already buffered is applied on the next pass.
-        match self.control.next_poll(self.manager.model()) {
-            Some(after) => wake.min(after),
+        let after = match self.control.next_poll(self.manager.model()) {
+            Some(after) => {
+                timed = true;
+                wake.min(after)
+            }
             None => wake,
+        };
+        // The idle wait watches descriptors only and an idle tick does not
+        // draw: a pending calloop timer, shell files nobody reports (the
+        // tick reads them instead) and a wallpaper that follows the clock
+        // all keep the loop to its full ticks.
+        let quiet = self.loop_timers == 0 && self.blank_watched && !self.wallpaper.follows_clock();
+        NextWake {
+            after,
+            idle: !timed && quiet,
+            // A timed producer falls due only when `after` ends: a page
+            // flip before then changes nothing it serves.
+            flips: quiet,
         }
     }
 
+    /// Run `fire` once, `after` from now, on the loop's own timer. Timers
+    /// are armed only here, where they are counted for `producer_wake`.
+    fn arm_timer(
+        &mut self,
+        after: Duration,
+        fire: impl FnOnce(&mut Runtime) + 'static,
+    ) -> Result<(), String> {
+        let mut fire = Some(fire);
+        let armed = self.loop_handle.insert_source(
+            calloop::timer::Timer::from_duration(after),
+            move |_, _, rt: &mut Runtime| {
+                rt.loop_timers = rt.loop_timers.saturating_sub(1);
+                if let Some(fire) = fire.take() {
+                    fire(rt);
+                }
+                calloop::timer::TimeoutAction::Drop
+            },
+        );
+        match armed {
+            Ok(_) => {
+                self.loop_timers += 1;
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// The tick after a dispatch: everything, the frame included.
     fn tick(&mut self) -> Result<bool, RuntimeError> {
+        self.run_tick(false)
+    }
+
+    /// The tick after a wait that no event source and no deadline ended
+    /// (#503, see [`IDLE_WAKE`]). Nothing was received and nothing was
+    /// due, so the scene is the last frame's: it is neither rebuilt nor
+    /// drawn, and the wallpaper is not looked at. Only what reaches a
+    /// socket between the end of that wait and this tick reading it, or
+    /// what the tick's own polls set moving, is drawn at once.
+    fn idle_tick(&mut self) -> Result<bool, RuntimeError> {
+        self.run_tick(true)
+    }
+
+    /// The tick after page flips served alone ([`Runtime::dispatch_flips`],
+    /// #503): what they presented is sent to the clients, and a full tick
+    /// follows only when they changed something to draw. Nothing else was
+    /// received, and whatever arrives meanwhile is still pending for the
+    /// next wait, which ends at once.
+    fn flip_tick(&mut self) -> Result<bool, RuntimeError> {
+        if std::mem::take(&mut self.flip_changed) {
+            return self.tick();
+        }
+        self.display
+            .flush_clients()
+            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        Ok(!self.exit)
+    }
+
+    fn run_tick(&mut self, idle: bool) -> Result<bool, RuntimeError> {
+        // A full tick draws what the page flips it follows changed.
+        self.flip_changed = false;
         if self.blank_stale || !self.blank_watched {
             self.blank_stale = false;
             if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -5076,7 +5307,8 @@ impl Runtime {
         // Motion folded since the last frame reaches the window manager
         // now, before client requests and this tick's frame.
         self.flush_motion_if_due();
-        self.display
+        let requests = self
+            .display
             .dispatch_clients(&mut self.state)
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         // Smithay has stored this dispatch's selections: copy a new one,
@@ -5164,6 +5396,8 @@ impl Runtime {
         }
         let outcome = self.control.poll(self.manager.model_mut());
         crate::grid_trace::stage(&self.state, "control_poll");
+        // What reached a socket after an idle wait ended (`idle_tick`).
+        let arrived = requests > 0 || outcome.received;
         for workspace in outcome.departed_workspaces.iter().copied() {
             self.manager.keep_departed_workspace_alive(workspace);
         }
@@ -5295,12 +5529,11 @@ impl Runtime {
             self.overview_search = false;
             self.overview_app_grid = false;
         }
-        // Administrative lockdown (#357 follow-up): poll the live key
-        // on a slow tick without blocking (background read plus drain);
-        // the shell maps it onto its idle sender too.
-        if self.lockdown_refresh_at.elapsed() >= LOCKDOWN_REFRESH_INTERVAL {
-            self.control.refresh_lockdown();
-            self.lockdown_refresh_at = Instant::now();
+        // Administrative lockdown (#357): the live key arrives from its
+        // settings watch, which wakes the loop when it changes; the shell
+        // maps the same key onto its idle sender too.
+        if let Some(disabled) = self.lockdown_settings.poll() {
+            self.control.set_lock_screen_disabled(disabled);
         }
         // GNOME's remembered Num Lock (#346): apply the restore once it
         // lands and save every change, as mutter does.
@@ -5534,6 +5767,7 @@ impl Runtime {
                     ime.set_ready_x11_display(None);
                 }
                 self.manager.clear_x11_windows(&mut self.state);
+                self.x11_icon_reader.reset();
                 self.xwayland.disconnected(now);
             }
             let pending = &mut self.pending_x11_client;
@@ -5597,19 +5831,22 @@ impl Runtime {
         crate::grid_trace::stage(&self.state, "publish_display_state");
         self.publish_overview_previews();
         crate::grid_trace::stage(&self.state, "publish_overview_previews");
-        let strip_was_animating = self.manager.strip_animating();
-        self.render()?;
-        // Rendering advances the strip's springs. Publish the terminal frame
-        // before the motion scheduler goes idle; the pre-render snapshot can
-        // otherwise retain the previous frame's residual indefinitely. With
-        // motion disabled, publish the instant frame's actual render count too.
-        let strip_lands_immediately = self.manager.session_mode()
-            == crate::windows::SessionMode::Scroll
-            && !self.input_settings.motion.allows_motion();
-        if (strip_was_animating || strip_lands_immediately) && !self.manager.strip_animating() {
-            self.publish_state();
+        if !idle || arrived || self.in_motion(Instant::now(), self.animation_clock.now()) {
+            let strip_was_animating = self.manager.strip_animating();
+            self.render()?;
+            // Rendering advances the strip's springs. Publish the terminal
+            // frame before the motion scheduler goes idle; the pre-render
+            // snapshot can otherwise retain the previous frame's residual
+            // indefinitely. With motion disabled, publish the instant
+            // frame's actual render count too.
+            let strip_lands_immediately = self.manager.session_mode()
+                == crate::windows::SessionMode::Scroll
+                && !self.input_settings.motion.allows_motion();
+            if (strip_was_animating || strip_lands_immediately) && !self.manager.strip_animating() {
+                self.publish_state();
+            }
+            self.screencast_tick();
         }
-        self.screencast_tick();
         // Send what this tick queued for the shell now, not at the next
         // wake, which may be far off (#503).
         self.control.flush(self.manager.model());
@@ -5619,6 +5856,57 @@ impl Runtime {
         // frame by a whole loop wake (#965). One flush per tick, no new wake.
         flush_rendered_events(&mut self.display, &self.state)?;
         Ok(!self.exit)
+    }
+
+    /// Serve the DRM device's pending events, and nothing else (#503).
+    /// What they change is noted in `flip_changed`: commits a refresh
+    /// cycle released, or an output freed for the frame the last render
+    /// had to defer.
+    #[cfg(feature = "drm")]
+    fn dispatch_flips(&mut self) {
+        let Some(mut flips) = self.flips.take() else {
+            return;
+        };
+        let commits = self.state.commit_count;
+        if let Err(error) = flips.events.dispatch(Some(Duration::ZERO), self) {
+            eprintln!("tuna-compositor: drm: page flip dispatch: {error}");
+            self.flip_changed = true;
+        }
+        self.flips = Some(flips);
+        if self.state.commit_count != commits || self.frame_owed {
+            self.flip_changed = true;
+        }
+    }
+
+    /// Whether, of everything the main loop watches, only the DRM device
+    /// has events ready (#503): the page flips can then be served alone.
+    /// The flip loop's descriptor leaves the main loop's set for the check.
+    #[cfg(feature = "drm")]
+    fn flips_alone(&self, events: &EventLoop<'static, Runtime>) -> bool {
+        let Some(flips) = &self.flips else {
+            return false;
+        };
+        if !crate::wake::ready_within(&flips.events, Duration::ZERO).unwrap_or(false) {
+            return false;
+        }
+        let handle = events.handle();
+        if handle.disable(&flips.token).is_err() {
+            return false;
+        }
+        let others = crate::wake::ready_within(events, Duration::ZERO);
+        if let Err(error) = handle.enable(&flips.token) {
+            eprintln!("tuna-compositor: drm: page flips unwatched: {error}");
+            return false;
+        }
+        matches!(others, Ok(false))
+    }
+
+    #[cfg(not(feature = "drm"))]
+    fn dispatch_flips(&mut self) {}
+
+    #[cfg(not(feature = "drm"))]
+    fn flips_alone(&self, _events: &EventLoop<'static, Runtime>) -> bool {
+        false
     }
 
     /// A page flip completed (hardware): mark what the frame drew
@@ -6040,6 +6328,9 @@ impl Runtime {
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => &mut drm.renderer,
         };
+        // Before anything is drawn or skipped: this tick's commits reach
+        // their textures, and their shm buffers go back to the clients.
+        crate::buffer_upload::upload_committed(renderer, &mut self.state);
         self.manager.step_modal_dim(
             now,
             self.input_settings.motion,
@@ -6323,14 +6614,12 @@ impl Runtime {
                         blank_alpha,
                         accent,
                         decor: decor.clone(),
-                        above: elements.above,
-                        effects: elements
-                            .brightness
-                            .iter()
-                            .copied()
-                            .chain(elements.snapshots.iter().map(|s| s.2))
-                            .map(f32::to_bits)
-                            .chain(self.night_light.effect_bits())
+                        under_tile: elements.under_tile(),
+                        dimmed: elements.dimmed(),
+                        effects: self
+                            .night_light
+                            .effect_bits()
+                            .into_iter()
                             .chain(wellbeing.bits())
                             .chain(zoom_plan.iter().flat_map(|plan| plan.signature_bits()))
                             .collect(),
@@ -6414,6 +6703,7 @@ impl Runtime {
                                             scale: view.scale,
                                             blank_alpha,
                                             tint: night_tint.as_ref(),
+                                            opaque: false,
                                         },
                                         &decor,
                                         &previews,
@@ -6454,6 +6744,7 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: night_tint.as_ref(),
+                                        opaque: false,
                                     },
                                     &decor,
                                     &previews,
@@ -6546,11 +6837,14 @@ impl Runtime {
                     rects.iter().position(|r| r.contains(*at)).unwrap_or(0)
                 };
                 let mut queued = false;
+                let mut owed = false;
                 let mut cursor_presented = false;
                 for (index, out) in outputs.iter_mut().enumerate() {
                     // Display-paced: one frame in flight per output; a
-                    // switched-off CRTC gets none (#340).
+                    // switched-off CRTC gets none (#340). Its flip lets
+                    // the next render look again.
                     if out.pending || !out.enabled {
+                        owed |= out.pending && out.enabled;
                         continue;
                     }
                     let size = out.size;
@@ -6693,16 +6987,14 @@ impl Runtime {
                         blank_alpha,
                         accent,
                         decor: decor.clone(),
-                        above: elements.above,
-                        effects: elements
-                            .brightness
-                            .iter()
-                            .copied()
-                            .chain(elements.snapshots.iter().map(|s| s.2))
-                            .map(f32::to_bits)
-                            // Night Light gains: a temperature step
-                            // repaints, an unchanged filter sleeps.
-                            .chain(self.night_light.effect_bits())
+                        under_tile: elements.under_tile(),
+                        dimmed: elements.dimmed(),
+                        // Night Light gains: a temperature step
+                        // repaints, an unchanged filter sleeps.
+                        effects: self
+                            .night_light
+                            .effect_bits()
+                            .into_iter()
                             .chain(wellbeing.bits())
                             .chain(zoom_plan.iter().flat_map(|plan| plan.signature_bits()))
                             .collect(),
@@ -6795,6 +7087,7 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: output_tint,
+                                        opaque: false,
                                     },
                                     &decor,
                                     &previews,
@@ -6840,6 +7133,9 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: output_tint,
+                                        // GLES places opaque regions right only without a transform.
+                                        opaque: crate::orientation::render_transform(out.transform)
+                                            == Transform::Normal,
                                     },
                                     &decor,
                                     &previews,
@@ -6909,6 +7205,7 @@ impl Runtime {
                     // animations wake the loop, as Mutter's frame clock
                     // idles between a client's frames.
                 }
+                self.frame_owed = owed;
                 queued
             }
         };
@@ -7243,6 +7540,32 @@ impl Scene {
             dim_program: None,
             owners: vec![None; above],
         }
+    }
+
+    /// How many surfaces draw beneath the tile preview. Only this changes
+    /// the drawing order between scene passes; surfaces that come and go
+    /// in front of the preview, as every surface does without a dragged
+    /// window, are the damage tracker's.
+    fn under_tile(&self) -> usize {
+        self.elements.len().saturating_sub(self.above)
+    }
+
+    /// The dimmed surfaces and snapshots, by element id, with their
+    /// brightness ([`crate::native_repaint::FrameSignature::dimmed`]).
+    fn dimmed(&self) -> Vec<(smithay::backend::renderer::element::Id, u32)> {
+        use smithay::backend::renderer::element::Element;
+        self.elements
+            .iter()
+            .zip(&self.brightness)
+            .filter(|(_, brightness)| **brightness != 1.0)
+            .map(|(element, brightness)| (element.id().clone(), brightness.to_bits()))
+            .chain(
+                self.snapshots
+                    .iter()
+                    .filter(|(_, _, brightness)| *brightness != 1.0)
+                    .map(|(_, element, brightness)| (element.id().clone(), brightness.to_bits())),
+            )
+            .collect()
     }
 }
 
@@ -7846,6 +8169,9 @@ struct Target<'a> {
     blank_alpha: f32,
     /// Scene wellbeing effect and output temperature; captures use unity temperature.
     tint: Option<&'a FrameColor>,
+    /// Draw what elements declare opaque without blending: only a frame
+    /// rendered without a transform (`draw_planned`).
+    opaque: bool,
 }
 
 fn draw_scene(
@@ -7867,6 +8193,7 @@ fn draw_scene(
         scale,
         blank_alpha,
         tint,
+        opaque,
     } = target;
     let recolor = |color| tint.map_or(color, |tint| tint.color(color));
     let background = recolor(background);
@@ -7948,7 +8275,7 @@ fn draw_scene(
         frame.clear(background, &clear).map_err(error)?;
     }
     set_tint(frame, 1.0);
-    draw_planned::<GlesRenderer, _>(frame, 1.0, paper, &paper_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, paper, &paper_plan, opaque).map_err(error)?;
     frame.clear_tex_program_override();
     for ((color, _), rects) in decor.iter().zip(decor_plan.iter().rev()) {
         if !rects.is_empty() {
@@ -7958,21 +8285,36 @@ fn draw_scene(
     // Surfaces carry logical sizes: draw them at the output scale. The
     // wallpaper above is already sized in physical pixels.
     set_tint(frame, 1.0);
-    draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan, opaque)
+        .map_err(error)?;
     frame.clear_tex_program_override();
-    draw_slots(frame, scale, scene, &under, &under_plan, tint).map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan).map_err(error)?;
-    draw_slots(frame, scale, scene, &over, &over_plan, tint).map_err(error)?;
+    draw_slots(frame, scale, scene, &under, &under_plan, tint, opaque).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan, opaque).map_err(error)?;
+    draw_slots(frame, scale, scene, &over, &over_plan, tint, opaque).map_err(error)?;
     set_tint(frame, 1.0);
-    draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan, opaque).map_err(error)?;
     frame.clear_tex_program_override();
-    draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan).map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.effects.textures, &effect_textures_plan)
+    draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan, opaque)
         .map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.effects.solids, &effect_solids_plan)
+    draw_planned::<GlesRenderer, _>(
+        frame,
+        1.0,
+        &scene.effects.textures,
+        &effect_textures_plan,
+        opaque,
+    )
+    .map_err(error)?;
+    draw_planned::<GlesRenderer, _>(
+        frame,
+        1.0,
+        &scene.effects.solids,
+        &effect_solids_plan,
+        opaque,
+    )
+    .map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, flashes, &flash_plan, opaque).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan, opaque)
         .map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, flashes, &flash_plan).map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan).map_err(error)?;
     let mut scene_visible = vec![false; scene.elements.len()];
     for (slot, shown) in over
         .iter()
@@ -8124,6 +8466,7 @@ fn draw_slots(
     slots: &[SceneSlot],
     plan: &[Vec<Rectangle<i32, smithay::utils::Physical>>],
     tint: Option<&FrameColor>,
+    opaque: bool,
 ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
     use crate::occlusion::draw_planned;
     for (slot, visible) in slots.iter().zip(plan).rev() {
@@ -8155,6 +8498,7 @@ fn draw_slots(
                 scale,
                 std::slice::from_ref(&scene.elements[index]),
                 visible,
+                opaque,
             ),
             SceneSlot::Bell(k) => draw_planned::<GlesRenderer, _>(
                 frame,
@@ -8173,12 +8517,14 @@ fn draw_slots(
                     )
                 }),
                 visible,
+                opaque,
             ),
             SceneSlot::Snapshot(k) => draw_planned::<GlesRenderer, _>(
                 frame,
                 1.0,
                 std::slice::from_ref(&scene.snapshots[k].1),
                 visible,
+                opaque,
             ),
         };
         frame.clear_tex_program_override();
@@ -8515,15 +8861,49 @@ fn run_loop(
             Ok(calloop::PostAction::Continue)
         })
         .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-    let mut wait = Duration::ZERO;
+    let mut next = NextWake {
+        after: Duration::ZERO,
+        idle: false,
+        flips: false,
+    };
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             runtime.shutdown_colord();
             return Ok(runtime.stats);
         }
-        let dispatched = event_loop
-            .dispatch(Some(wait), &mut runtime)
-            .map_err(|e| RuntimeError::Loop(e.to_string()));
+        // Nothing is due (#503): learn whether any source fires before the
+        // fallback wake without dispatching it. If none does, nothing was
+        // received and the tick is an idle one; the loop is not dispatched
+        // then, so nothing arriving meanwhile is consumed behind its back.
+        // Likewise when only page flips arrived before anything fell due:
+        // they are served alone, and an idle tick follows.
+        let waited = Instant::now();
+        let (quiet, flips, wait) = if next.idle || next.flips {
+            match crate::wake::ready_within(&event_loop, next.after) {
+                Ok(true) => (
+                    false,
+                    next.flips
+                        && (next.idle || waited.elapsed() < next.after)
+                        && runtime.flips_alone(&event_loop),
+                    Duration::ZERO,
+                ),
+                Ok(false) => (next.idle, false, Duration::ZERO),
+                // Interrupted: wait in the dispatch itself, as ever.
+                Err(_) => (false, false, next.after),
+            }
+        } else {
+            (false, false, next.after)
+        };
+        let dispatched = if quiet {
+            Ok(())
+        } else if flips {
+            runtime.dispatch_flips();
+            Ok(())
+        } else {
+            event_loop
+                .dispatch(Some(wait), &mut runtime)
+                .map_err(|e| RuntimeError::Loop(e.to_string()))
+        };
         #[cfg(feature = "drm")]
         if let Some(monitor) = &sleep_monitor {
             let (lock, wake) = monitor.take();
@@ -8535,7 +8915,15 @@ fn run_loop(
             Some(crate::logind_session::Request::Unlock) => runtime.unlock_for_logind(),
             None => {}
         }
-        let ticked = dispatched.and_then(|_| runtime.tick());
+        let ticked = dispatched.and_then(|_| {
+            if quiet {
+                runtime.idle_tick()
+            } else if flips {
+                runtime.flip_tick()
+            } else {
+                runtime.tick()
+            }
+        });
         #[cfg(feature = "drm")]
         if let Some(session) = &mut logind_session {
             session.report_locked(runtime.is_locked());
@@ -8545,10 +8933,15 @@ fn run_loop(
         });
         match ticked {
             Ok(true) => {
-                wait = runtime.next_wake();
+                next = runtime.next_wake();
                 if let Some(delay) = probe_delay {
-                    wait =
-                        wait.min(delay.clamp(Duration::from_millis(1), Duration::from_millis(100)));
+                    next = NextWake {
+                        after: next
+                            .after
+                            .min(delay.clamp(Duration::from_millis(1), Duration::from_millis(100))),
+                        idle: false,
+                        flips: false,
+                    };
                 }
                 continue;
             }

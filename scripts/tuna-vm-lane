@@ -2280,6 +2280,17 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         with open(os.path.join(evidence, f"{label}gpu-trace-wake.json"), "w") as stream:
             json.dump({"log": os.path.basename(gpu_log), "offset": wake_trace_offset}, stream, indent=2)
         qmp.cmd("system_wakeup")
+        # A Linux 7.3 guest's restored virtio-serial port never learns that the
+        # host chardev is open, so qemu-ga replies stall until it reconnects
+        # (PR runs 43385429967 et al.: inventory started, no guest-exec-status
+        # ever arrived). Reopen the transport only: no guest-exec, no state
+        # read, so the inventory below is still the first observation after wake.
+        woke = time.monotonic()
+        connections = agent.reopen_after_wake(timeout=20, attempt=2)
+        with open(os.path.join(evidence, f"{label}wake-transport.json"), "w") as stream:
+            json.dump({"connections": connections, "seconds": round(time.monotonic() - woke, 3),
+                       "scope": "QGA chardev reconnect and guest-sync only; no guest-exec or guest state"},
+                      stream, indent=2)
         # The first response after wake must already be locked. Waiting for a
         # later transition would hide an exposed desktop during resume.
         resumed = inventory(f"{label}first-resume")
@@ -3266,14 +3277,11 @@ class Recorder:
         finally:
             self.lock.release()
 
-    def _exact_pixels(self, card, deadline):
+    def _exact_pixels(self, card):
         path = os.path.join(self.dir, f"f{self.stills[card]:06d}.png")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None
         decoded = subprocess.run(
             ["ffmpeg", "-v", "error", "-i", path, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
-            check=True, capture_output=True, timeout=remaining).stdout
+            check=True, capture_output=True, timeout=self.timeout).stdout
         if (len(decoded) != WIDTH * HEIGHT * 3
                 or baseline.sha256(path) != self.frames[self.stills[card]]["sha256"]):
             return None
@@ -3306,6 +3314,9 @@ class Recorder:
 
         A prior probe is only a readiness hint. A mismatched final frame never
         triggers another capture or extends this view's existing deadline.
+        The exact still must be captured by the deadline; decoding that
+        retained PNG afterwards is analysis of a fixed frame, bounded on its
+        own, so a slow ffmpeg cannot turn a view captured in time into a miss.
         """
         deadline = time.monotonic() + timeout
         ready = False
@@ -3319,14 +3330,14 @@ class Recorder:
                 break
         with self.lock:
             self.still(card)
+            within = time.monotonic() <= deadline
             exact = None
             decode_error = None
             if ready:
                 try:
-                    exact = self._exact_pixels(card, deadline)
+                    exact = self._exact_pixels(card)
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
                     decode_error = type(error).__name__
-            within = time.monotonic() <= deadline
             confirmed = ready and exact is not None and within and bool(predicate(exact))
             evidence = {"predicate": predicate.__name__, "exact_png": exact is not None,
                         "within_deadline": within}
@@ -3831,7 +3842,11 @@ def native_media_source(out, image, owner):
     from maintained_media import git_source, required_source_inputs
     from vm_strip_image import validate_base_origin, validate_product_origin
     def git(*arguments):
-        return subprocess.check_output(["git", "-C", root, *arguments], text=True, timeout=5).strip()
+        # A bound on a local git command, not a gate deadline: on a loaded
+        # runner `git diff HEAD` refreshes a cold index of the whole
+        # checkout and took over 5 s (release run 43440000569), which
+        # failed V-LIFECYCLE without anything being wrong with the tree.
+        return subprocess.check_output(["git", "-C", root, *arguments], text=True, timeout=120).strip()
     head, tree = git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
     if (head != image.get("capture_commit") or head != os.environ.get("GITHUB_SHA")
             or not re.fullmatch("[0-9a-f]{40}", head) or not re.fullmatch("[0-9a-f]{40}", tree)

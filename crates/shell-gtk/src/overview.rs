@@ -634,7 +634,7 @@ impl OverviewUi {
                     let weak = weak.clone();
                     gtk::glib::idle_add_local_once(move || {
                         if let Some(ui) = weak.upgrade() {
-                            Self::rebuild_grid(&ui);
+                            Self::refresh_grid(&ui);
                         }
                     });
                 }));
@@ -1174,28 +1174,35 @@ impl OverviewUi {
             let ui = ui.clone();
             show_apps.connect_toggled(move |t| {
                 let active = t.is_active();
-                {
-                    let me = ui.borrow();
-                    match me.swipe_settle.take() {
-                        Some(settle_ms) => me.settle_grid(active, settle_ms),
-                        None => me.fade_grid(active),
-                    }
-                    me.actions.set_app_grid(active);
-                }
-                // GSettings is also edited by tools outside this process.
-                // Reload the folder/app arrangement whenever the grid is
-                // opened so a settings change made after shell startup is
-                // visible on the next Show Apps action.
+                // The grid's tiles are built when it shows, here, and
+                // dropped when the overview closes: fresh from the app
+                // list and from GSettings, which tools outside this
+                // process edit too. Before the fade, which eases the
+                // grid's content.
                 if active {
                     Self::rebuild_grid(&ui);
                 }
+                let me = ui.borrow();
+                match me.swipe_settle.take() {
+                    Some(settle_ms) => me.settle_grid(active, settle_ms),
+                    None => me.fade_grid(active),
+                }
+                me.actions.set_app_grid(active);
             });
         }
         me.dash_row.append(&show_apps);
         drop(apps);
         drop(me);
         Self::publish_dash_icons(ui);
-        Self::rebuild_grid(ui);
+    }
+
+    /// Rebuild the grid's tiles if it has any: after a change to the
+    /// folders or the saved order while it shows.
+    fn refresh_grid(ui: &Rc<RefCell<Self>>) {
+        let built = ui.borrow().grid.child().is_some();
+        if built {
+            Self::rebuild_grid(ui);
+        }
     }
 
     fn rebuild_grid(ui: &Rc<RefCell<Self>>) {
@@ -1479,6 +1486,10 @@ impl OverviewUi {
             content.set_can_target(old.can_target());
         }
         me.grid.set_child(Some(&content));
+        crate::grid_animation::trace(
+            "grid-build",
+            format_args!("tiles={}", layout.iter().map(Vec::len).sum::<usize>()),
+        );
         // A rebuild under keyboard navigation (the app list changed)
         // keeps the keyboard in the grid, on its first tile.
         if me.keynav.get() == Keynav::Grid {
@@ -1551,12 +1562,19 @@ impl OverviewUi {
     /// for the app grid (`gestureEnd`, :781-786) and eases the grid there
     /// out-cubic over the compositor's settle time.
     pub fn follow_swipe(ui: &Rc<RefCell<Self>>, state: f64, settle_ms: Option<f64>) {
-        let me = ui.borrow();
+        let mut me = ui.borrow();
         if !me.open {
             return;
         }
         let Some(settle_ms) = settle_ms else {
-            me.hold_grid((state - 1.0).clamp(0.0, 1.0));
+            let shown = (state - 1.0).clamp(0.0, 1.0);
+            // The fingers bring the grid in before Show Apps is set.
+            if shown > 0.0 && me.grid.child().is_none() {
+                drop(me);
+                Self::rebuild_grid(ui);
+                me = ui.borrow();
+            }
+            me.hold_grid(shown);
             return;
         };
         let grid = state >= 2.0;
@@ -1632,7 +1650,7 @@ impl OverviewUi {
             )
         };
         if refresh_folders {
-            Self::rebuild_grid(ui);
+            Self::refresh_grid(ui);
         }
         let signature = {
             let me = ui.borrow();
@@ -1676,6 +1694,28 @@ impl OverviewUi {
             me.grid_fade.stop();
             me.apps_shown.set(false);
             me.grid.set_visible(false);
+            // A tile per installed app (button, icon, label, drag and
+            // hover controllers) is rebuilt whenever the grid shows, so
+            // none outlives the overview. A drag keeps its source tree
+            // until it ends.
+            if me.grid.child().is_some()
+                && !(me.grid_dragging.get() || me.grid_external_dragging.get())
+            {
+                me.grid.set_child(gtk::Widget::NONE);
+                crate::grid_animation::trace("grid-drop", format_args!("on close"));
+            }
+            // Likewise the search results, and provider answers still on
+            // their way: they would fill sections nobody sees.
+            if let Some(search) = me.search_cancel.borrow_mut().take() {
+                search.cancel();
+            }
+            for list in [&me.results, &me.provider_box] {
+                while let Some(child) = list.first_child() {
+                    list.remove(&child);
+                }
+                list.set_visible(false);
+            }
+            *me.first_remote_hit.borrow_mut() = None;
         }
     }
 
