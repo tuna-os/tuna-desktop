@@ -2072,11 +2072,15 @@ impl Runtime {
         self.lock.unlock(self.lock_now_ms());
         self.control.set_locked(false);
         self.state.set_shortcut_inhibition_locked(false);
+        // This is the sole authoritative locked -> unlocked transition.
+        // The lock held the keyboard (`hold_lock_focus`): quarantine
+        // lock-origin holds, then hand it back to the session's owner
+        // without raising, as GNOME's unlock returns focus to the
+        // focused window: to a popup grab that outlived the lock first.
+        // A second `restore_keyboard_owner` here would raise that window
+        // and take the keyboard from a grabbing popup.
+        self.manager.unlock_input(&mut self.state);
         self.overlay.hide();
-        // The lock held the keyboard (`hold_lock_focus`); hand it back,
-        // as GNOME's unlock returns focus to the focused window: to a
-        // popup grab that outlived the lock first.
-        self.manager.refocus_after_lock(&mut self.state);
     }
 
     /// logind's `Lock` signal (`loginctl lock-session`): `screenShield.js`
@@ -2285,6 +2289,15 @@ impl Runtime {
             self.cursor
                 .locate
                 .feed_matched(&input, matches_key, self.manager.pointer_pos(), now);
+        }
+        // Trusted AT already received the genuine event above. Session
+        // shortcuts, grabs and clients must not see a lock-origin hold.
+        if !self.is_locked()
+            && self
+                .manager
+                .discard_quarantined_key_input(&mut self.state, &input)
+        {
+            return;
         }
         if self.is_locked() {
             // Locking ends the session's action mode mid-swipe: GNOME's

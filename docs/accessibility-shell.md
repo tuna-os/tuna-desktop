@@ -9,6 +9,95 @@ utterance before sending the next character, then checks the complete ordered
 `s p e e c h` sequence. This tests character echo rather than typing speed:
 Orca cancels pending speech on each keypress, so a fixed input delay can drop
 letters when the speech sink is busy.
+## Screen reader keys while locked (#936)
+
+The owned screen reader remains the user's trusted AT while locked. Its
+KeyboardMonitor receives complete key presses and releases, including the
+password's keysym, Unicode character, physical keycode and keyboard modifier
+state. There is no password redaction and no restriction to keys whose focused
+surface is the lock prompt. Its watches and grabs, including Orca-modifier
+commands and `GrabKeyboard`, remain effective across lock/unlock. This is not
+permission to send input to an ordinary session client: the separate lock
+surface route and post-unlock held-key quarantine enforce that boundary.
+
+This follows the **51.1 source**, not an inference from a Tuna speech result:
+
+- [Mutter's `meta_a11y_manager_notify_clients`](https://github.com/GNOME/mutter/blob/9134e3a5869ce232bf95b77519005865747ba603/src/backends/meta-a11y-manager.c#L617-L681)
+  never checks lock state, password purpose or focus. `WatchKeyboard` watches
+  every key; without it, a grab match is also watched. The only content mask
+  removes Clutter's five mouse-button modifier bits; keyboard modifiers,
+  keysym, Unicode and keycode remain intact. `notify_client` unicasts
+  `(buuuq)` to that grabber's unique bus name. Grabs consume matching presses
+  and their releases; custom modifiers grab chords, with the native
+  accessibility modifier double-press exception. Lock does not clear grabs
+  or synthesize modifier releases.
+- [`events.c`](https://github.com/GNOME/mutter/blob/9134e3a5869ce232bf95b77519005865747ba603/src/core/events.c#L148-L167)
+  calls it before WM shortcuts, Wayland text input and the stage-grab routing.
+  The preconditions are that captured input has not already consumed the
+  event and the focused window does not inhibit shortcuts, not lock-prompt
+  focus. A consumed AT grab stops routing before the screen shield too.
+- [GNOME Shell's screen shield](https://github.com/GNOME/gnome-shell/blob/33da06854e229c256afd5872fedd83c28cbfa176/js/ui/screenShield.js#L199-L205)
+  takes a `LOCK_SCREEN` modal stage grab; [`pushModal`](https://github.com/GNOME/gnome-shell/blob/33da06854e229c256afd5872fedd83c28cbfa176/js/ui/main.js#L695-L736)
+  sets Clutter focus. Neither unregisters the keyboard watcher nor sanitizes
+  its events. Mutter's [access checker](https://github.com/GNOME/mutter/blob/9134e3a5869ce232bf95b77519005865747ba603/src/backends/meta-a11y-manager.c#L409-L411)
+  admits the owner of `org.gnome.Orca.KeyboardMonitor` (apart from its explicit
+  unsafe/debug modes).
+
+Tuna keeps its stricter admission: the same-UID unreaped compositor-owned Orca
+PID must own the monitor name, and signals target its admitted unique bus
+owner only. Owner loss, replacement and child revocation still invalidate
+queued delivery; overflow still fails closed and reliably resets disclosed
+custom modifiers. Lock itself is no longer a transport reset. The AT can
+read these secrets because it is the user's own trusted screen reader,
+exactly as in Mutter; they are not broadcast to other bus listeners, logged,
+or delivered to session surfaces.
+
+### Unlock focus and held-key quarantine (#939)
+
+The authoritative compositor unlock transition calls
+`WindowManager::unlock_input` once to hand keyboard focus back to the actual
+session keyboard owner. The handoff uses the normal focus policy without
+raising a window: overview, exclusive layer surfaces and popup grabs retain
+their priority over the ordinary focused window. It does not wait for a later
+pointer motion or ordinary key to repair seat focus.
+
+Every seat key physically held at that transition is quarantined from ordinary
+session input until its genuine release. Quarantined keys are removed from the
+forwarded pressed-key set before focus is restored, so the new owner's keyboard
+enter cannot disclose lock-held keys. Physical pressed state and XKB state are
+preserved; unlock does not invent releases or reset held modifiers. Repeated
+presses and the eventual release cannot reach session clients or trigger
+ordinary session shortcuts. A subsequent fresh press is eligible for normal
+routing again.
+
+Trusted AT interception remains first, before ordinary-session quarantine
+filtering, including runtime repeat/release filtering. The admitted screen
+reader therefore receives genuine lock keys and genuine held-key releases,
+even when the session must suppress those events. This quarantine is not an
+AT transport reset or a change to the GNOME 51.1 trust policy described above.
+These are routing requirements, not an additional test or CI receipt.
+
+`G-ORCA-SPEECH-LOCK-DBUS` locks after Escape through `ScreenSaver.Lock`;
+`G-ORCA-SPEECH-LOCK-SUPER-L` uses the ordinary complete chord. Each requires
+exactly one spoken bullet per typed character, no plaintext character or word,
+and a real PAM unlock. `G-ORCA-SPEECH-LOCK` requires both. This removes the
+old dependence on Orca's last pre-lock key. Search and password echo are
+acknowledged per character rather than paced by a fixed sleep: Orca cancels
+pending speech on every press, so a busy speech-dispatcher can legitimately
+discard earlier utterances before its logging synthesizer runs (the search
+flake in CI run 41148163143). The ordered echo and exact bullet-count
+assertions are retained; the next key waits for actual speech, never a retry.
+The native VM privacy gate now checks that the same trusted AT hears lock
+keys while the ordinary client hears neither password input nor an
+AT-grabbed key's post-unlock release; `V-NORMAL-INPUT-FAIL-CLOSED` is unchanged.
+
+Local cancellation reproduction (Ubuntu 26.04, Orca 50.3): adding a 400 ms
+delay only to the real speech-dispatcher logging synthesizer reproduces the
+CI symptom with the original 150 ms typing pace: the search gate hears only
+`h`. With the same sink delay and unchanged ordered assertion, per-character
+acknowledgment hears all six letters and reaches Speech Probe. The normal
+full speech proof also passes both lock variants, nine bullets each. These
+are real Orca/speech-dispatcher runs, not a substituted event/speech source.
 
 ## Screen magnifier (#349)
 
