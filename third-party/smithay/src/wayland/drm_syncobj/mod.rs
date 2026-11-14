@@ -10,8 +10,9 @@
 //! `true`. Or it won't be possible to create the blocker. This is similar to other
 //! implementations.
 //!
-//! The release fence is signalled when all references to a
-//! [`Buffer`][crate::backend::renderer::utils::Buffer] are dropped.
+//! GPU renderers must retain each accessed [`Buffer`][crate::backend::renderer::utils::Buffer]
+//! until they attach the frame's completion fence. Buffer release transfers that
+//! fence into the release timeline; dropping a CPU reference is not GPU completion.
 //!
 //! ```no_run
 //! # use smithay::delegate_drm_syncobj;
@@ -56,7 +57,7 @@ use wayland_server::{
 };
 
 use super::{
-    compositor::{self, with_states, BufferAssignment, Cacheable, HookId, SurfaceAttributes},
+    compositor::{self, with_states, BufferAssignment, Cacheable, HookId, SurfaceAttributes, SurfaceData},
     dmabuf::get_dmabuf,
 };
 use crate::backend::drm::DrmDeviceFd;
@@ -94,6 +95,7 @@ pub struct DrmSyncobjCachedState {
     pub acquire_point: Option<DrmSyncPoint>,
     /// Timeline point to be signaled when server is done with buffer
     pub release_point: Option<DrmSyncPoint>,
+    buffer_removed: bool,
 }
 
 impl Cacheable for DrmSyncobjCachedState {
@@ -101,20 +103,39 @@ impl Cacheable for DrmSyncobjCachedState {
         Self {
             acquire_point: self.acquire_point.take(),
             release_point: self.release_point.take(),
+            buffer_removed: std::mem::take(&mut self.buffer_removed),
         }
     }
 
-    fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
-        if self.acquire_point.is_some() && self.release_point.is_some() {
+    fn merge_into(mut self, into: &mut Self, _dh: &DisplayHandle) {
+        if self.buffer_removed || (self.acquire_point.is_some() && self.release_point.is_some()) {
             if let Some(release_point) = &into.release_point {
                 if let Err(err) = release_point.signal() {
                     tracing::error!("Failed to signal syncobj release point: {}", err);
                 }
             }
-            into.acquire_point = self.acquire_point;
-            into.release_point = self.release_point;
+            into.acquire_point = self.acquire_point.take();
+            into.release_point = self.release_point.take();
         }
     }
+}
+
+impl Drop for DrmSyncobjCachedState {
+    fn drop(&mut self) {
+        // These points have never been handed to the renderer. This includes
+        // cached synchronized subsurfaces destroyed before their parent commits.
+        if let Some(release) = self.release_point.take() {
+            if let Err(err) = release.signal() {
+                tracing::error!("Failed to release unused syncobj buffer: {}", err);
+            }
+        }
+    }
+}
+
+/// Permanently reject the pending transaction after a fatal validation or
+/// acquire-watch failure, rather than applying it after posting an error.
+pub fn reject_pending_commit(surface: &WlSurface) {
+    compositor::abort_pending_commit(surface);
 }
 
 /// Delegate type for a `wp_linux_drm_syncobj_manager_v1` global
@@ -205,71 +226,120 @@ where
     }
 }
 
+/// What a surface commit attaches, as the explicit-sync check sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitBuffer {
+    /// No buffer attached in this commit, or a null one.
+    None,
+    /// A linux-dmabuf buffer.
+    Dmabuf,
+    /// Any other buffer (shm, single-pixel, ...).
+    Other,
+}
+
+/// The protocol error a commit on a surface with a
+/// `wp_linux_drm_syncobj_surface_v1` raises, if any.
+///
+/// `acquire` and `release` are the pending points as (timeline, point).
+/// Checked in the order of Mutter 51's
+/// `meta_wayland_surface_explicit_sync_validate`: a non-dmabuf buffer is
+/// `unsupported_buffer`, a buffer needs both points (`no_acquire_point`,
+/// then `no_release_point`), points on one timeline need acquire < release
+/// (`conflicting_points`), and either point without a buffer is `no_buffer`.
+pub fn commit_error<T: PartialEq>(
+    buffer: CommitBuffer,
+    acquire: Option<(&T, u64)>,
+    release: Option<(&T, u64)>,
+) -> Option<(wp_linux_drm_syncobj_surface_v1::Error, &'static str)> {
+    use wp_linux_drm_syncobj_surface_v1::Error;
+    match (buffer, acquire, release) {
+        (CommitBuffer::Other, _, _) => Some((
+            Error::UnsupportedBuffer,
+            "Explicit Sync only supported on dmabuf buffers",
+        )),
+        (CommitBuffer::Dmabuf, None, _) => Some((Error::NoAcquirePoint, "No Acquire point provided")),
+        (CommitBuffer::Dmabuf, _, None) => Some((Error::NoReleasePoint, "No Release point provided")),
+        (CommitBuffer::Dmabuf, Some((acquire, a)), Some((release, r))) if acquire == release && a >= r => {
+            Some((
+                Error::ConflictingPoints,
+                "Invalid Release and Acquire point combination",
+            ))
+        }
+        (CommitBuffer::None, Some(_), _) | (CommitBuffer::None, _, Some(_)) => Some((
+            Error::NoBuffer,
+            "Release or Acquire point set but no buffer attached",
+        )),
+        _ => None,
+    }
+}
+
+/// The protocol error the pending commit in a surface's `states` raises
+/// under explicit sync ([`commit_error`] on its attached buffer and
+/// pending points). Only meaningful while the surface has a
+/// `wp_linux_drm_syncobj_surface_v1`.
+pub fn pending_commit_error(
+    states: &SurfaceData,
+) -> Option<(wp_linux_drm_syncobj_surface_v1::Error, &'static str)> {
+    let buffer = match states
+        .cached_state
+        .get::<SurfaceAttributes>()
+        .pending()
+        .buffer
+        .as_ref()
+    {
+        Some(BufferAssignment::NewBuffer(buffer)) if get_dmabuf(buffer).is_ok() => CommitBuffer::Dmabuf,
+        Some(BufferAssignment::NewBuffer(_)) => CommitBuffer::Other,
+        _ => CommitBuffer::None,
+    };
+    let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+    let pending = &*cached.pending();
+    fn point(point: &Option<DrmSyncPoint>) -> Option<(&DrmTimeline, u64)> {
+        point.as_ref().map(|p| (&p.timeline, p.point))
+    }
+    commit_error(
+        buffer,
+        point(&pending.acquire_point),
+        point(&pending.release_point),
+    )
+}
+
 fn commit_hook<D: DrmSyncobjHandler>(_data: &mut D, _dh: &DisplayHandle, surface: &WlSurface) {
-    compositor::with_states(surface, |states| {
-        let mut cached = states.cached_state.get::<SurfaceAttributes>();
-        let pending = cached.pending();
-        let new_buffer = pending.buffer.as_ref().and_then(|buffer| match buffer {
-            BufferAssignment::NewBuffer(buffer) => Some(buffer),
-            _ => None,
-        });
-        if let Some(data) = states
+    let invalid = compositor::with_states(surface, |states| {
+        let Some(data) = states
             .data_map
             .get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
-        {
-            if let Some(syncobj_surface) = data.borrow().as_ref() {
-                let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
-                let pending = cached.pending();
-                if pending.acquire_point.is_some() && new_buffer.is_none() {
-                    syncobj_surface.post_error(
-                        wp_linux_drm_syncobj_surface_v1::Error::NoBuffer as u32,
-                        "acquire point without buffer".to_string(),
-                    );
-                } else if pending.acquire_point.is_some() && pending.release_point.is_none() {
-                    syncobj_surface.post_error(
-                        wp_linux_drm_syncobj_surface_v1::Error::NoReleasePoint as u32,
-                        "acquire point without release point".to_string(),
-                    );
-                } else if pending.acquire_point.is_none() && pending.release_point.is_some() {
-                    syncobj_surface.post_error(
-                        wp_linux_drm_syncobj_surface_v1::Error::NoAcquirePoint as u32,
-                        "release point without acquire point".to_string(),
-                    );
-                } else if let (Some(acquire), Some(release)) =
-                    (pending.acquire_point.as_ref(), pending.release_point.as_ref())
-                {
-                    if acquire.timeline == release.timeline && release.point <= acquire.point {
-                        syncobj_surface.post_error(
-                            wp_linux_drm_syncobj_surface_v1::Error::ConflictingPoints as u32,
-                            format!(
-                                "release point {} is not greater than acquire point {}",
-                                release.point, acquire.point
-                            ),
-                        );
-                    }
-                    if let Some(buffer) = new_buffer {
-                        if get_dmabuf(buffer).is_err() {
-                            syncobj_surface.post_error(
-                                wp_linux_drm_syncobj_surface_v1::Error::UnsupportedBuffer as u32,
-                                "sync points with non-dmabuf buffer".to_string(),
-                            );
-                        }
-                    }
-                }
-            }
+        else {
+            return false;
+        };
+        let data = data.borrow();
+        let Some(syncobj_surface) = data.as_ref() else {
+            return false;
+        };
+        if let Some((error, message)) = pending_commit_error(states) {
+            syncobj_surface.post_error(error as u32, message);
+            return true;
         }
+        let removed = matches!(
+            states.cached_state.get::<SurfaceAttributes>().pending().buffer,
+            Some(BufferAssignment::Removed)
+        );
+        states.cached_state.get::<DrmSyncobjCachedState>().pending().buffer_removed = removed;
+        false
     });
+    if invalid {
+        reject_pending_commit(surface);
+    }
 }
 
 fn destruction_hook<D: DrmSyncobjHandler>(_data: &mut D, surface: &WlSurface) {
     compositor::with_states(surface, |states| {
         let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
-        if let Some(release_point) = &cached.pending().release_point {
+        if let Some(release_point) = cached.pending().release_point.take() {
             if let Err(err) = release_point.signal() {
                 tracing::error!("Failed to signal syncobj release point: {}", err);
             }
         }
-        if let Some(release_point) = &cached.current().release_point {
+        if let Some(release_point) = cached.current().release_point.take() {
             if let Err(err) = release_point.signal() {
                 tracing::error!("Failed to signal syncobj release point: {}", err);
             }
@@ -320,9 +390,9 @@ where
                     },
                 );
                 with_states(&surface, |states| {
-                    states
-                        .data_map
-                        .insert_if_missing(|| RefCell::new(Some(syncobj_surface)))
+                    states.data_map.insert_if_missing(|| RefCell::new(None::<WpLinuxDrmSyncobjSurfaceV1>));
+                    *states.data_map.get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
+                        .unwrap().borrow_mut() = Some(syncobj_surface);
                 });
             }
             wp_linux_drm_syncobj_manager_v1::Request::ImportTimeline { id, fd } => {
@@ -483,12 +553,12 @@ impl<D: DrmSyncobjHandler> Dispatch<WpLinuxDrmSyncobjTimelineV1, DrmSyncobjTimel
         state: &mut D,
         _client: wayland_server::backend::ClientId,
         _resource: &WpLinuxDrmSyncobjTimelineV1,
-        data: &DrmSyncobjTimelineData,
+        _data: &DrmSyncobjTimelineData,
     ) {
         if let Some(state) = state.drm_syncobj_state() {
             state
                 .known_timelines
-                .retain(|t| t.upgrade().is_some_and(|t| !Arc::ptr_eq(&t, &data.timeline.0)))
+                .retain(|timeline| timeline.upgrade().is_some())
         }
     }
 }

@@ -4,9 +4,9 @@ use drm::control::Device;
 use std::sync::{Mutex, Weak};
 use std::{
     io,
-    os::unix::io::{AsFd, BorrowedFd, OwnedFd},
+    os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
         Arc,
     },
 };
@@ -33,6 +33,9 @@ impl DrmTimelineInner {
             device.syncobj_eventfd(new.syncobj, *point, eventfd.as_fd(), false)?;
             new.event_fds.push((*point, Arc::downgrade(&eventfd)));
         }
+        // The replacement already owns the registrations. Dropping the old
+        // context must destroy its handle without waking those new watches.
+        ctx.event_fds.clear();
         *ctx = new;
         Ok(())
     }
@@ -66,8 +69,14 @@ impl DrmTimelineDeviceSpecific {
         self.device = WeakDrmDeviceFd::new();
         // trigger event fds
         for eventfd in self.event_fds.drain(..).filter_map(|(_, x)| Weak::upgrade(&x)) {
-            let _ = rustix::io::write(&eventfd, &[1]);
+            let _ = rustix::io::write(&eventfd, &1_u64.to_ne_bytes());
         }
+    }
+}
+
+impl Drop for DrmTimelineDeviceSpecific {
+    fn drop(&mut self) {
+        self.invalidate();
     }
 }
 
@@ -89,6 +98,11 @@ impl DrmTimeline {
             timeline_fd: fd,
             dev_ctx,
         })))
+    }
+
+    /// Refer to a point on this timeline without changing its signal state.
+    pub fn point(&self, point: u64) -> DrmSyncPoint {
+        DrmSyncPoint { timeline: self.clone(), point }
     }
 
     /// Query the last signalled timeline point
@@ -163,25 +177,54 @@ impl DrmSyncPoint {
             return Err(err);
         };
         let res = device.syncobj_to_fd(syncobj, true);
-        if res.is_err() {
-            let _ = device.destroy_syncobj(syncobj);
-        }
+        let _ = device.destroy_syncobj(syncobj);
         res
     }
 
+    /// Attach an actual GPU sync-file fence to this timeline point. Import
+    /// requires an existing binary syncobj; FD_TO_HANDLE with handle zero
+    /// does not import a sync-file.
+    pub fn import_sync_file(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+        #[repr(C)]
+        struct Import {
+            handle: u32,
+            flags: u32,
+            fd: i32,
+            pad: u32,
+            point: u64,
+        }
+        const IMPORT: rustix::ioctl::Opcode =
+            rustix::ioctl::opcode::read_write::<Import>(b'd', 0xc2);
+        let ctx = self.timeline.0.dev_ctx.lock().unwrap();
+        let device = ctx.device.upgrade().ok_or(io::ErrorKind::InvalidInput)?;
+        let binary = device.create_syncobj(false)?;
+        let mut data = Import {
+            handle: binary.into(), flags: 1, fd: fd.as_raw_fd(), pad: 0, point: 0,
+        };
+        // SAFETY: DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE uses this fixed-width
+        // structure; flags=IMPORT_SYNC_FILE and handle names the binary object.
+        let result = unsafe {
+            rustix::ioctl::ioctl(device.as_fd(), rustix::ioctl::Updater::<IMPORT, _>::new(&mut data))
+        }.map_err(io::Error::from).and_then(|()| {
+            device.syncobj_timeline_transfer(binary, ctx.syncobj, 0, self.point)
+        });
+        let _ = device.destroy_syncobj(binary);
+        result
+    }
     /// Create an [`calloop::EventSource`] and [`Blocker`] for this sync point.
     ///
     /// This will fail if `drmSyncobjEventfd` isn't supported by the device. See
     /// [`supports_syncobj_eventfd`](super::supports_syncobj_eventfd).
     pub fn generate_blocker(&self) -> io::Result<(DrmSyncPointBlocker, DrmSyncPointSource)> {
         let fd = self.eventfd()?;
-        let signal = Arc::new(AtomicBool::new(false));
+        let signal = Arc::new(AtomicU8::new(0));
         let blocker = DrmSyncPointBlocker {
             signal: signal.clone(),
         };
         let source = DrmSyncPointSource {
             source: Generic::new(fd, Interest::READ, Mode::Level),
             signal,
+            point: self.clone(),
         };
         Ok((blocker, source))
     }
@@ -212,7 +255,22 @@ impl Fence for DrmSyncPoint {
 #[derive(Debug)]
 pub struct DrmSyncPointSource {
     source: Generic<Arc<OwnedFd>>,
-    signal: Arc<AtomicBool>,
+    signal: Arc<AtomicU8>,
+    point: DrmSyncPoint,
+}
+
+impl DrmSyncPointSource {
+    /// A handle with which the compositor can cancel a never-submitted
+    /// buffer's wait (for example when the surface is unmapped).
+    pub fn blocker(&self) -> DrmSyncPointBlocker {
+        DrmSyncPointBlocker { signal: self.signal.clone() }
+    }
+}
+
+impl Drop for DrmSyncPointSource {
+    fn drop(&mut self) {
+        let _ = self.signal.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
+    }
 }
 
 impl EventSource for DrmSyncPointSource {
@@ -230,11 +288,17 @@ impl EventSource for DrmSyncPointSource {
     where
         C: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
     {
-        self.signal.store(true, Ordering::SeqCst);
-        self.source
-            .process_events(readiness, token, |_, _| Ok(PostAction::Remove))?;
-        callback((), &mut ())?;
-        Ok(PostAction::Remove)
+        let signal = &self.signal;
+        let point = &self.point;
+        self.source.process_events(readiness, token, |_, _| {
+            // An invalidated device wakes the eventfd too. It must cancel,
+            // not authorize reading an unacquired buffer.
+            let _ = signal.compare_exchange(
+                0, if point.is_signaled() { 1 } else { 2 }, Ordering::AcqRel, Ordering::Acquire,
+            );
+            callback((), &mut ())?;
+            Ok(PostAction::Remove)
+        })
     }
 
     fn register(&mut self, poll: &mut Poll, token_factory: &mut TokenFactory) -> calloop::Result<()> {
@@ -254,17 +318,47 @@ impl EventSource for DrmSyncPointSource {
 }
 
 /// [`Blocker`] implementation for an accompaning [`DrmSyncPointSource`]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DrmSyncPointBlocker {
-    signal: Arc<AtomicBool>,
+    signal: Arc<AtomicU8>,
+}
+
+impl DrmSyncPointBlocker {
+    /// Cancel a commit without allowing its buffer to be sampled.
+    pub fn cancel(&self) {
+        let _ = self.signal.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
+    }
 }
 
 impl Blocker for DrmSyncPointBlocker {
     fn state(&self) -> BlockerState {
-        if self.signal.load(Ordering::SeqCst) {
-            BlockerState::Released
-        } else {
-            BlockerState::Pending
+        match self.signal.load(Ordering::Acquire) {
+            1 => BlockerState::Released,
+            2 => BlockerState::Cancelled,
+            _ => BlockerState::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_acquire_never_becomes_released() {
+        let blocker = DrmSyncPointBlocker { signal: Arc::new(AtomicU8::new(0)) };
+        assert_eq!(blocker.state(), BlockerState::Pending);
+        blocker.cancel();
+        assert_eq!(blocker.state(), BlockerState::Cancelled);
+        // A late event must not revive a commit discarded by an unmap.
+        let _ = blocker.signal.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+        assert_eq!(blocker.state(), BlockerState::Cancelled);
+    }
+
+    #[test]
+    fn signalled_acquire_remains_released_when_watch_is_retired() {
+        let blocker = DrmSyncPointBlocker { signal: Arc::new(AtomicU8::new(1)) };
+        blocker.cancel();
+        assert_eq!(blocker.state(), BlockerState::Released);
     }
 }

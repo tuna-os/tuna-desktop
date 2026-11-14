@@ -2736,6 +2736,16 @@ def main():
         except Exception as error:
             print(json.dumps({"autotz_error": autotz_guest.error_receipt(error, sys.argv[2:])}))
             raise SystemExit(1) from None
+    elif action == "explicit-sync":
+        if len(sys.argv) != 4 or sys.argv[2] not in {"init", "start", "state", "ack", "finish", "cleanup", "file"}:
+            raise ValueError("explicit-sync requires one fixed operation and one JSON payload")
+        output = call("/usr/libexec/tuna-vm-explicit-sync", sys.argv[2], sys.argv[3], check=False)
+        result = json.loads(output)
+        if type(result) is dict and set(result) == {"explicit_sync_error"}:
+            # The helper's one bounded failure record; the host's failure
+            # transport validates it (vm_guest_agent.FAILURE_RECORDS).
+            print(json.dumps(result))
+            raise SystemExit(1)
     elif action == "greeter-prompt":
         print(json.dumps(greeter_prompt()))
         return

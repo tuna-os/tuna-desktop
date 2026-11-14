@@ -10,6 +10,10 @@ if [ ! -x "$candidate/usr/bin/tuna-compositor" ] || [ ! -x "$candidate/usr/bin/t
 fi
 [ ! -f "$out/assertions.txt" ] || { echo 'use a fresh artifact directory' >&2; exit 2; }
 mkdir -p "$out"
+# Retain the actual observer checkout before crossing the container boundary;
+# a worktree's .git file may point outside the /repo bind mount.
+git -C "$ROOT" rev-parse HEAD >"$out/observer-source-revision.txt"
+git -C "$ROOT" status --porcelain >"$out/observer-source-status.txt"
 podman build --tag localhost/tuna-portal-reference --file "$ROOT/tests/portal-reference/Containerfile" "$ROOT/tests/portal-reference"
 # Preserve zip-compatible evidence on failure as well as success.
 cleanup_artifacts() {

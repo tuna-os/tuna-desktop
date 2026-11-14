@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Protocol-only native emulation profile. The normal VM lane/profile is unchanged.
+# Host llvmpipe drives real virglrenderer; the guest must still pass real DRM
+# timeline/eventfd/native-fence, dmabuf allocation, presentation and QMP pixels.
+# No host DRM modules, render-node substitutions, package overrides or retries.
+set -euo pipefail
+script_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+exec env LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
+    xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 +extension GLX -nolisten tcp' \
+    "$script_root/tuna-vm-lane" "$@" --profile explicit-sync

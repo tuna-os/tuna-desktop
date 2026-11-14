@@ -1819,6 +1819,11 @@ where
         self.frame.as_ref().unwrap().context_id().map()
     }
 
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    fn note_buffer_access(&mut self, buffer: &super::utils::Buffer) -> Result<(), Self::Error> {
+        self.frame.as_mut().unwrap().note_buffer_access(buffer).map_err(Error::Render)
+    }
+
     #[instrument(level = "trace", parent = &self.span, skip(self))]
     #[profiling::function]
     fn clear(&mut self, color: Color32F, at: &[Rectangle<i32, Physical>]) -> Result<(), Error<R, T>> {

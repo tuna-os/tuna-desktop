@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ $# != 1 ]]; then
+    echo 'usage: tuna-background-effect-client-build OUTPUT_DIRECTORY' >&2
+    exit 2
+fi
+script_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# Override for a pinned, corrected wayland-protocols tree when the system
+# package still contains the obsolete Blur=0 staging enum.
+protocol_root=${WAYLAND_PROTOCOLS_DIR:-$(pkg-config --variable=pkgdatadir wayland-protocols)}
+mkdir -p -- "$1"
+output_root=$(cd -- "$1" && pwd)
+for entry in 'stable/xdg-shell/xdg-shell.xml:xdg-shell' 'staging/ext-background-effect/ext-background-effect-v1.xml:ext-background-effect-v1'; do
+    xml=${entry%:*}
+    name=${entry#*:}
+    wayland-scanner client-header "$protocol_root/$xml" "$output_root/$name-client-protocol.h"
+    wayland-scanner private-code "$protocol_root/$xml" "$output_root/$name-protocol.c"
+done
+read -r -a compile_flags <<< "$(pkg-config --cflags wayland-client)"
+read -r -a link_flags <<< "$(pkg-config --libs wayland-client)"
+cc -std=c11 -O2 -Wall -Wextra -Werror "${compile_flags[@]}" -I "$output_root" \
+    "$script_root/lib/tuna-background-effect-client.c" \
+    "$output_root/xdg-shell-protocol.c" "$output_root/ext-background-effect-v1-protocol.c" \
+    "${link_flags[@]}" -o "$output_root/tuna-background-effect-client"

@@ -173,12 +173,26 @@ refuse locked frames. Full detail and the qualification evidence:
 - `ext_session_lock_manager_v1` is advertised to every client outside a
   security context, but a lock is granted only to the supervised shell's
   PID (`session_lock.rs`).
+- `wp_drm_lease_device_v1` (native backend only) is advertised to every
+  client outside a security context: a lease hands over connectors, CRTCs
+  and planes of the session's DRM device, so a sandboxed client never sees
+  it (`drm/lease.rs`, `ClientState::sandboxed`). Unsandboxed clients and
+  Xwayland may lease the non-desktop or explicitly named connectors, as on
+  GNOME. No headless test reaches this filter: the global exists only on
+  the DRM backend.
+- `zwp_xwayland_keyboard_grab_manager_v1` is visible only to the Xwayland
+  client the compositor spawned (Smithay's `XWaylandClientData` filter),
+  which no security-context listener can admit; grants follow Mutter's
+  access rules (`xwayland_grab.rs`). Evidence:
+  `crates/compositor/tests/protocol_gaps.rs`
+  (`the_xwayland_keyboard_grab_global_is_hidden_from_ordinary_clients`).
 - `wp_security_context_manager_v1` lets a sandbox engine (Flatpak) open a
   listener whose clients join tagged with the context (#1046). Every
   privileged global's filter (`ClientState::privileged`: virtual keyboard,
   input method, `mutter_x11_interop`, layer-shell, the foreign toplevel
   list) refuses such a client whatever its other state, and it sees neither
-  the session lock nor the manager itself, so it cannot nest a context.
+  the session lock, the DRM lease device nor the manager itself, so it
+  cannot nest a context.
   Evidence: `crates/compositor/tests/protocols.rs`
   (`security_context_clients_see_no_privileged_global`). A connection the
   listener cannot accept (no descriptor left: EMFILE, ENFILE) rests the

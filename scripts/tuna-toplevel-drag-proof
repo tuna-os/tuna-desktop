@@ -1,0 +1,392 @@
+#!/usr/bin/python3
+"""Real Chromium tab detach/drop/reattach/cancel/owner-exit stage for P-SY-09.
+
+Run in an ALREADY ISOLATED winit/Xvfb session, with TUNA_COMPOSITOR_STATE set
+when that compositor was started. This stage owns only its browser process
+group and profile, not the caller's compositor/display/buses. Requires Python
+Pillow, scrot, xdotool and a Chromium build supporting WaylandXdgToplevelDrag.
+Invoke with python3; no build, protocol substitute, CDP-generated input or retry
+of a failed journey is performed. A missing protocol request is a failure even
+if Chromium's fallback can detach tabs. This qualifies nested input/rendering,
+not native DRM, installed packages, GNOME comparison or rootless Xwayland.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import time
+import urllib.request
+
+
+
+def digest(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def following(before, after, delta, tolerance=2):
+    return all(abs(after[i] - before[i] - delta[i]) <= tolerance for i in (0, 1))
+
+
+def trace_counts(text):
+    return {
+        "create": len(re.findall(r"xdg_toplevel_drag_manager_v1[^\n]*\.get_xdg_toplevel_drag\(", text)),
+        "attach": len(re.findall(r"xdg_toplevel_drag_v1[^\n]*\.attach\(", text)),
+        "drop": len(re.findall(r"wl_data_source[^\n]*\.dnd_drop_performed\(", text)),
+        "cancel": len(re.findall(r"wl_data_source[^\n]*\.cancelled\(", text)),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--browser", type=Path, required=True)
+    parser.add_argument("--compositor-pid", type=int, required=True)
+    parser.add_argument("--state", type=Path, required=True)
+    parser.add_argument("--artifacts", type=Path, required=True)
+    parser.add_argument("--input-display", required=True, help="private Xvfb display hosting winit")
+    parser.add_argument("--wayland-display", required=True)
+    parser.add_argument("--source-revision", required=True, help="actual observer checkout revision")
+    parser.add_argument("--source-status", type=Path, required=True, help="retained observer git status")
+    parser.add_argument("--tab-x", type=int, default=110, help="first tab hotspot relative to window")
+    parser.add_argument("--tab-y", type=int, default=18)
+    args = parser.parse_args()
+    if len(args.source_revision) != 40 or any(c not in "0123456789abcdef" for c in args.source_revision):
+        parser.error("--source-revision must identify the actual 40-hex checkout")
+    source_status = args.source_status.read_text()
+    art = args.artifacts.resolve()
+    art.mkdir(parents=True, exist_ok=False)
+    profile = art / "profile"
+    browser = args.browser.resolve(strict=True)
+    runtime = Path(os.environ["XDG_RUNTIME_DIR"])
+    socket = runtime / args.wayland_display
+    if not socket.is_socket():
+        raise RuntimeError("requested Wayland socket is not present in caller's runtime")
+    compositor_exe = Path(f"/proc/{args.compositor_pid}/exe").resolve(strict=True)
+    environment = dict(os.environ, DISPLAY=args.input_display, WAYLAND_DISPLAY=args.wayland_display,
+                       WAYLAND_DEBUG="client", NO_AT_BRIDGE="1", ACCESSIBILITY_ENABLED="0")
+    manifest = {
+        "source_revision": args.source_revision,
+        "source_dirty": bool(source_status.strip()),
+        "source_status_sha256": digest(args.source_status),
+        "scope": "nested real Chromium, winit/Xvfb input and rendered pixels; not native GPU proof",
+        "browser": {"path": str(browser), "sha256": digest(browser),
+                    "version": subprocess.check_output([str(browser), "--version"], text=True).strip()},
+        "compositor": {"pid": args.compositor_pid, "exe": str(compositor_exe),
+                       "sha256": digest(f"/proc/{args.compositor_pid}/exe"),
+                       "cmdline": Path(f"/proc/{args.compositor_pid}/cmdline").read_bytes().decode().split("\0")},
+        "proof_sha256": digest(__file__), "state_path": str(args.state.resolve()),
+        "display": args.input_display, "wayland_socket": str(socket),
+        "gnome_source": "https://gitlab.gnome.org/GNOME/mutter/-/blob/138a14fbeef09d49ebf5be8a0cb83b042dd5c841/src/wayland/meta-wayland-toplevel-drag.c",
+        "assertions": [],
+    }
+    hosts = subprocess.check_output(
+        ["xdotool", "search", "--onlyvisible", "--pid", str(args.compositor_pid), "--name", "^Smithay"],
+        env=environment, text=True, timeout=5).split()
+    if len(hosts) != 1:
+        raise AssertionError("expected exactly one visible host owned by the original compositor")
+    host = hosts[0]
+    geometry = dict(line.split("=", 1) for line in subprocess.check_output(
+        ["xdotool", "getwindowgeometry", "--shell", host], env=environment, text=True, timeout=5).splitlines())
+    subprocess.run(["xdotool", "windowfocus", "--sync", host], env=environment, check=True, timeout=5)
+    actual_focus = subprocess.check_output(
+        ["xdotool", "getwindowfocus"], env=environment, text=True, timeout=5).strip()
+    if actual_focus != host:
+        raise AssertionError("the original compositor host did not receive real keyboard focus")
+    manifest["input_host"] = {"window": int(host), "geometry": geometry, "actual_focus": int(actual_focus)}
+    fixtures = []
+    for name, color in (("A", "#17365d"), ("B", "#8a211c")):
+        fixture = art / f"tab-{name}.html"
+        fixture.write_text(f"<!doctype html><title>Tuna drag {name}</title><body style='background:{color};color:white;font:48px sans-serif'>Real browser tab {name}</body>")
+        fixtures.append(fixture.as_uri())
+    manifest["fixtures"] = fixtures
+    logs = []
+    processes = []
+    browser_process = None
+    baseline_ids = set()
+
+    def save_manifest():
+        (art / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    def state():
+        return json.loads(args.state.read_text())
+
+    def windows(document):
+        return [window for window in document["windows"] if window["id"] not in baseline_ids]
+
+    def wait(predicate, label):
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if browser_process is not None and browser_process.poll() is not None:
+                raise AssertionError(f"browser exited during {label}")
+            os.kill(args.compositor_pid, 0)
+            document = state()
+            if predicate(document):
+                (art / f"{label}.json").write_text(json.dumps(document, indent=2))
+                return document
+            time.sleep(.05)
+        raise AssertionError(f"timed out: {label}; see {art}")
+
+    def input_(*command):
+        subprocess.run(["xdotool", *map(str, command)], env=environment, check=True)
+
+    def move(x, y):
+        input_("mousemove", "--sync", "--window", host, x, y)
+        time.sleep(.15)
+
+    def capture(label):
+        from PIL import Image
+
+        path = art / f"{label}.png"
+        deadline = time.monotonic() + 20
+        while True:
+            if browser_process is not None and browser_process.poll() is not None:
+                raise AssertionError(f"browser exited during {label}")
+            # scrot refuses to overwrite: without -o, iterations after the
+            # first write label_NNN.png while this loop re-reads the stale
+            # first shot forever, so the poll only passes when the very
+            # first screenshot already shows paint.
+            subprocess.run(["scrot", "-o", str(path)], env=environment, check=True)
+            image = Image.open(path).convert("RGB")
+            colors = image.getcolors(image.width * image.height) or []
+            # Solid fixture pixels establish actual page rendering, not only a
+            # compositor diagnostic write or a CDP target's existence. CDP
+            # targets exist before first paint, so poll for the painted
+            # content (software rendering is slow) instead of single-shotting.
+            # First paint frames differ from the settled color by a few LSB
+            # (observed: (21, 55, 96) settling to (23, 54, 93)), so match
+            # with a small tolerance instead of exact equality.
+            targets = ((23, 54, 93), (138, 33, 28))
+            visible = sum(count for count, color in colors
+                          if any(max(abs(color[i] - target[i]) for i in range(3)) <= 2
+                                 for target in targets))
+            if visible >= 500:
+                return path
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"no visible real fixture content in {label}")
+            time.sleep(0.2)
+
+    def trace():
+        return trace_counts((art / "browser.log").read_text(errors="replace"))
+
+    def tabs(label):
+        port_file = profile / "DevToolsActivePort"
+        deadline = time.monotonic() + 10
+        while not port_file.exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        port = int(port_file.read_text().splitlines()[0])
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=3) as response:
+            targets = json.load(response)
+        pages = sorted(target["url"] for target in targets if target.get("type") == "page")
+        assert pages == sorted(fixtures), f"real browser tab content changed: {pages}"
+        (art / f"{label}-targets.json").write_text(json.dumps(targets, indent=2))
+
+    def launch():
+        nonlocal browser_process
+        log = (art / "browser.log").open("a")
+        logs.append(log)
+        command = [str(browser), "--ozone-platform=wayland", "--enable-features=WaylandXdgToplevelDrag",
+                   "--disable-renderer-accessibility", "--no-first-run", "--no-default-browser-check",
+                   "--disable-session-crashed-bubble", "--remote-debugging-port=0",
+                   f"--user-data-dir={profile}", "--window-size=800,600", "--new-window", *fixtures]
+        browser_process = subprocess.Popen(command, env=environment, stdout=log, stderr=subprocess.STDOUT,
+                                           start_new_session=True)
+        processes.append(browser_process)
+        manifest.setdefault("browser_launches", []).append({"pid": browser_process.pid, "argv": command})
+        ready = wait(lambda d: len(windows(d)) == 1 and not d["client_dnd_active"], "browser-ready-" + str(len(processes)))
+        manifest["browser_launches"][-1]["running_exe_sha256"] = digest(f"/proc/{browser_process.pid}/exe")
+        manifest["browser_launches"][-1]["running_exe"] = str(Path(f"/proc/{browser_process.pid}/exe").resolve(strict=True))
+        tabs("browser-ready-" + str(len(processes)))
+        return windows(ready)[0]
+
+    def settle(window, label):
+        # The shell reframes a mapped window (observed: 800x600 at (240, 116)
+        # becomes 768x558 at (256, 137) ~100ms after map), so a rect read at
+        # launch-ready is stale by gesture time and the press misses into the
+        # background. Aim only once the rect stops moving.
+        deadline = time.monotonic() + 20
+        stable_since = None
+        last_rect = None
+        while time.monotonic() < deadline:
+            if browser_process is not None and browser_process.poll() is not None:
+                raise AssertionError(f"browser exited during {label}")
+            os.kill(args.compositor_pid, 0)
+            document = state()
+            current = next((w for w in windows(document) if w["id"] == window["id"]), None)
+            if current is None:
+                raise AssertionError(f"fixture window vanished during {label}")
+            if current["rect"] != last_rect:
+                last_rect = list(current["rect"])
+                stable_since = time.monotonic()
+            elif time.monotonic() - stable_since >= 0.5:
+                (art / f"{label}.json").write_text(json.dumps(document, indent=2))
+                return current
+            time.sleep(.05)
+        raise AssertionError(f"window never settled during {label}; see {art}")
+
+    def detach(window, label):
+        old = trace()
+        x, y, width, height = window["rect"]
+        # A press can land while Chromium's drag controller is still
+        # unwinding a previous drag (observed after Escape-cancel: the press
+        # activates the tab but no drag starts), so retry the gesture when
+        # no new drag object appears instead of burning the 20s window wait.
+        for attempt in range(3):
+            move(x + args.tab_x, y + args.tab_y)
+            input_("mousedown", 1)
+            # Intermediate physical motion crosses the tabstrip threshold with
+            # the button held; CDP is observation only, never the input source.
+            # The waypoints descend through the window and exit below its bottom
+            # edge: Chromium only tears the tab off once the drag reaches out of
+            # the source window, and the descent must be gradual (teleporting
+            # from mid-window to outside leaves the tab docked as an in-strip
+            # reorder, so the last in-window motion lands near the bottom edge).
+            for step in (1, 2, 3, 4, 5):
+                dy = (height + 60) * step // 5
+                move(x + args.tab_x + 25, y + args.tab_y + dy)
+            start_deadline = time.monotonic() + 3
+            while time.monotonic() < start_deadline:
+                if trace()["create"] > old["create"]:
+                    break
+                time.sleep(.05)
+            else:
+                input_("mouseup", 1)
+                time.sleep(2)
+                continue
+            break
+        else:
+            raise AssertionError(f"browser never started a drag during {label}; see {art}")
+        document = wait(lambda d: len(windows(d)) == 2 and d["client_dnd_active"], label)
+        counts = trace()
+        assert counts["create"] > old["create"] and counts["attach"] > old["attach"], "browser fallback is not xdg_toplevel_drag acceptance"
+        capture(label)
+        detached = next(w for w in windows(document) if w["id"] != window["id"])
+        return detached
+
+    def stop_browser():
+        # Always signal the owned group, even when a launcher has exited while
+        # child browser processes still hold Wayland connections.
+        nonlocal browser_process
+        process = browser_process
+        browser_process = None
+        if process is not None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+
+    success = False
+    try:
+        initial = state()
+        assert not initial["client_dnd_active"], "caller session already owns a DND grab"
+        baseline_ids = {window["id"] for window in initial["windows"]}
+        origin = launch()
+        capture("01-initial-tabs")
+        origin = settle(origin, "01b-window-settled")
+        detached = detach(origin, "02-detached-held")
+        # Position away from screen edges, then compare a second real motion.
+        move(850, 550)
+        first = wait(lambda d: d["client_dnd_active"], "03-follow-first")
+        before = next(w for w in windows(first) if w["id"] == detached["id"])["rect"]
+        move(930, 590)
+        second = wait(lambda d: following(before, next(w for w in windows(d) if w["id"] == detached["id"])["rect"], (80, 40)), "04-follow-second")
+        capture("04-follow-second")
+        dropped = next(w for w in windows(second) if w["id"] == detached["id"])
+        old_drop = trace()["drop"]
+        input_("mouseup", 1)
+        wait(lambda d: not d["client_dnd_active"], "05-dropped")
+        assert trace()["drop"] > old_drop, "browser did not receive dnd_drop_performed"
+        move(1000, 650)
+        stable = wait(lambda d: not d["client_dnd_active"], "06-drop-stable")
+        assert next(w for w in windows(stable) if w["id"] == detached["id"])["rect"][:2] == dropped["rect"][:2]
+        tabs("06-drop-stable")
+        manifest["assertions"].append("real tab detaches, follows pointer while held, and remains at drop")
+
+        # Reattach via the real tab strip. The moving toplevel must not
+        # intercept the DND target hit-test for the original browser window.
+        x, y, _, _ = dropped["rect"]
+        move(x + args.tab_x, y + args.tab_y)
+        input_("mousedown", 1)
+        for dy in (20, 70, 120):
+            move(x + args.tab_x, y + args.tab_y + dy)
+        ox, oy, _, _ = origin["rect"]
+        move(ox + args.tab_x + 160, oy + args.tab_y)
+        # Chromium merges the dragged tab on motion over the strip, not on
+        # enter alone, so jiggle after arrival to deliver that motion.
+        move(ox + args.tab_x + 166, oy + args.tab_y + 3)
+        wait(lambda d: len(windows(d)) == 1, "07-reattached-held")
+        input_("mouseup", 1)
+        reattached = wait(lambda d: len(windows(d)) == 1 and not d["client_dnd_active"], "08-reattached")
+        tabs("08-reattached")
+        capture("08-reattached")
+        manifest["assertions"].append("real detached tab reattaches through underlying tab-strip DND target")
+
+        origin = windows(reattached)[0]
+        detach(origin, "09-cancel-held")
+        old_cancel = trace()["cancel"]
+        input_("key", "Escape")
+        input_("mouseup", 1)
+        cancelled = wait(lambda d: len(windows(d)) == 1 and not d["client_dnd_active"], "10-cancelled")
+        assert trace()["cancel"] > old_cancel
+        tabs("10-cancelled")
+        capture("10-cancelled")
+        manifest["assertions"].append("Escape cancels real browser detach without lost tabs or stale grab")
+
+        detach(windows(cancelled)[0], "11-owner-exit-held")
+        stop_browser()
+        input_("mouseup", 1)
+        wait(lambda d: not windows(d) and not d["client_dnd_active"], "12-owner-exited")
+        launch()
+        capture("13-restarted")
+        manifest["assertions"].append("owner exit releases DND; fresh browser restarts with both fixtures and no stale attachment")
+        success = True
+    except Exception as error:
+        manifest["error"] = repr(error)
+        raise
+    finally:
+        errors = []
+        cleanup = {}
+        for operation in (lambda: input_("mouseup", 1), stop_browser):
+            try:
+                operation()
+            except Exception as error:
+                errors.append(repr(error))
+        try:
+            cleanup = wait(lambda d: not windows(d) and not d["client_dnd_active"], "14-cleanup")
+        except Exception as error:
+            errors.append(repr(error))
+        for log in logs:
+            log.close()
+        try:
+            if profile.exists():
+                shutil.rmtree(profile)
+        except Exception as error:
+            errors.append(repr(error))
+        manifest["cleanup"] = {"browser_processes_exited": all(p.poll() is not None for p in processes),
+                               "profile_removed": not profile.exists(),
+                               "native_dnd_active": cleanup.get("client_dnd_active"),
+                               "caller_session_owned": False, "errors": errors}
+        manifest["result"] = "pass" if success and not errors else "fail"
+        save_manifest()
+        if errors:
+            raise RuntimeError(f"owned browser cleanup failed: {errors}")
+    if success:
+        (art / "assertions.txt").write_text("\n".join("TOPLEVEL-DRAG pass " + assertion for assertion in manifest["assertions"]) + "\n")
+        print(f"nested actual-browser toplevel-drag proof passed: {art}")
+
+
+if __name__ == "__main__":
+    main()

@@ -12,7 +12,9 @@ impl Runtime {
         match &mut self.backend {
             Backend::Winit(_) => true,
             #[cfg(feature = "drm")]
-            Backend::Drm(drm) => drm.update_white_points(&self.color, temperature),
+            Backend::Drm(drm) => drm
+                .borrow_mut()
+                .update_white_points(&self.color, temperature),
         }
     }
 
@@ -57,7 +59,7 @@ impl Runtime {
             .collect();
         #[cfg(feature = "drm")]
         let crtcs = match &self.backend {
-            Backend::Drm(drm) => drm.color_state(),
+            Backend::Drm(drm) => drm.borrow().color_state(),
             Backend::Winit(_) => Vec::new(),
         };
         #[cfg(not(feature = "drm"))]

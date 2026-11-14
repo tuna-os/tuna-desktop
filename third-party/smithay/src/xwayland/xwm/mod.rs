@@ -156,6 +156,7 @@ mod atoms {
             // wayland-stuff
             WL_SURFACE_ID,
             WL_SURFACE_SERIAL,
+            _XWAYLAND_MAY_GRAB_KEYBOARD,
 
             // private
             _SMITHAY_CLOSE_CONNECTION,
@@ -2330,6 +2331,14 @@ where
                             xwm.unpaired_surfaces.insert(serial, xsurface.window_id());
                             guard.wl_surface = None;
                         }
+                    }
+                }
+                x if x == xwm.atoms._XWAYLAND_MAY_GRAB_KEYBOARD => {
+                    // A client allowing its own keyboard grabs (Mutter's
+                    // events.c sets the window's xwayland-may-grab-keyboard).
+                    if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == msg.window) {
+                        surface.state.lock().unwrap().xwayland_may_grab_keyboard =
+                            msg.data.as_data32()[0] != 0;
                     }
                 }
                 x if x == xwm.atoms.WM_CHANGE_STATE => {

@@ -345,6 +345,12 @@ pub trait Frame {
     /// Wait for a [`SyncPoint`](sync::SyncPoint) to be signaled
     fn wait(&mut self, sync: &sync::SyncPoint) -> Result<(), Self::Error>;
 
+    /// Retain an explicitly synchronized Wayland buffer until this frame has
+    /// associated its GPU completion fence with the buffer. Synchronous
+    /// renderers only need to wait for the acquire point here.
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    fn note_buffer_access(&mut self, buffer: &utils::Buffer) -> Result<(), Self::Error>;
+
     /// Finish this [`Frame`] returning any error that may happen during any cleanup.
     ///
     /// Dropping the frame instead may result in any of the following and is implementation dependent:

@@ -62,6 +62,8 @@ pub(crate) struct SharedSurfaceState {
     pub(super) mapped_onto: Option<X11Window>,
     pub(super) geometry: Rectangle<i32, Logical>,
     pub(super) override_redirect: bool,
+    // Set by an _XWAYLAND_MAY_GRAB_KEYBOARD client message.
+    pub(super) xwayland_may_grab_keyboard: bool,
 
     // The associated wl_surface.
     pub(crate) wl_surface: Option<WlSurface>,
@@ -197,6 +199,7 @@ impl X11Surface {
                 net_state: HashSet::new(),
                 motif_hints: vec![0; 5],
                 window_type: Vec::new(),
+                xwayland_may_grab_keyboard: false,
             })),
             user_data: Arc::new(UserDataMap::new()),
         }
@@ -365,6 +368,13 @@ impl X11Surface {
     /// Returns the current window instance of the underlying X11 window
     pub fn instance(&self) -> String {
         self.state.lock().unwrap().instance.clone()
+    }
+
+    /// Whether the client allowed this window's keyboard grabs with an
+    /// `_XWAYLAND_MAY_GRAB_KEYBOARD` client message (data.l\[0\] non-zero),
+    /// as Mutter's `xwayland-may-grab-keyboard` window property.
+    pub fn xwayland_may_grab_keyboard(&self) -> bool {
+        self.state.lock().unwrap().xwayland_may_grab_keyboard
     }
 
     /// Returns the startup id of the underlying X11 window

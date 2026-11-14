@@ -1,0 +1,722 @@
+diff --git a/src/wayland/xdg_foreign/handlers.rs b/src/wayland/xdg_foreign/handlers.rs
+index b25d0fc1..b8860381 100644
+--- a/src/wayland/xdg_foreign/handlers.rs
++++ b/src/wayland/xdg_foreign/handlers.rs
+@@ -1,13 +1,22 @@
+-use std::collections::HashSet;
++use std::collections::HashMap;
+ 
+-use wayland_protocols::xdg::foreign::zv2::server::{
+-    zxdg_exported_v2::{self, ZxdgExportedV2},
+-    zxdg_exporter_v2::{self, ZxdgExporterV2},
+-    zxdg_imported_v2::{self, ZxdgImportedV2},
+-    zxdg_importer_v2::{self, ZxdgImporterV2},
++use wayland_protocols::xdg::foreign::{
++    zv1::server::{
++        zxdg_exported_v1::{self, ZxdgExportedV1},
++        zxdg_exporter_v1::{self, ZxdgExporterV1},
++        zxdg_imported_v1::{self, ZxdgImportedV1},
++        zxdg_importer_v1::{self, ZxdgImporterV1},
++    },
++    zv2::server::{
++        zxdg_exported_v2::{self, ZxdgExportedV2},
++        zxdg_exporter_v2::{self, ZxdgExporterV2},
++        zxdg_imported_v2::{self, ZxdgImportedV2},
++        zxdg_importer_v2::{self, ZxdgImporterV2},
++    },
+ };
+ use wayland_server::{
+-    backend::ClientId, Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
++    backend::ClientId, protocol::wl_surface::WlSurface, Client, DataInit, Dispatch, DisplayHandle,
++    GlobalDispatch, New, Resource,
+ };
+ 
+ use crate::wayland::{
+@@ -19,7 +28,7 @@ use crate::wayland::{
+ };
+ 
+ use super::{
+-    ExportedState, XdgExportedUserData, XdgForeignHandle, XdgForeignHandler, XdgForeignState,
++    ExportedState, Imported, XdgExportedUserData, XdgForeignHandle, XdgForeignHandler, XdgForeignState,
+     XdgImportedUserData,
+ };
+ 
+@@ -43,6 +52,42 @@ where
+     }
+ }
+ 
++impl<D> GlobalDispatch<ZxdgExporterV1, (), D> for XdgForeignState
++where
++    D: Dispatch<ZxdgExporterV1, ()>,
++{
++    fn bind(
++        _state: &mut D,
++        _handle: &DisplayHandle,
++        _client: &Client,
++        resource: New<ZxdgExporterV1>,
++        _global_data: &(),
++        data_init: &mut DataInit<'_, D>,
++    ) {
++        data_init.init(resource, ());
++    }
++}
++
++/// Record a new export under a fresh handle, unique across both
++/// protocol versions: either version's importer finds it.
++fn export<D: XdgForeignHandler>(state: &mut D, surface: WlSurface) -> XdgForeignHandle {
++    let exported = &mut state.xdg_foreign_state().exported;
++    let handle = loop {
++        let handle = XdgForeignHandle::new();
++        if !exported.contains_key(&handle) {
++            break handle;
++        }
++    };
++    exported.insert(
++        handle.clone(),
++        ExportedState {
++            exported_surface: surface,
++            imported_by: HashMap::new(),
++        },
++    );
++    handle
++}
++
+ impl<D> Dispatch<ZxdgExporterV2, (), D> for XdgForeignState
+ where
+     D: Dispatch<ZxdgExportedV2, XdgExportedUserData>,
+@@ -59,7 +104,7 @@ where
+     ) {
+         match request {
+             zxdg_exporter_v2::Request::ExportToplevel { id, surface } => {
+-                let handle = XdgForeignHandle::new();
++                let handle = export(state, surface);
+                 let exported = data_init.init(
+                     id,
+                     XdgExportedUserData {
+@@ -67,15 +112,6 @@ where
+                     },
+                 );
+                 exported.handle(handle.as_str().to_owned());
+-
+-                state.xdg_foreign_state().exported.insert(
+-                    handle,
+-                    ExportedState {
+-                        exported_surface: surface,
+-                        requested_child: None,
+-                        imported_by: HashSet::new(),
+-                    },
+-                );
+             }
+             zxdg_exporter_v2::Request::Destroy => {}
+             _ => {}
+@@ -83,6 +119,37 @@ where
+     }
+ }
+ 
++impl<D> Dispatch<ZxdgExporterV1, (), D> for XdgForeignState
++where
++    D: Dispatch<ZxdgExportedV1, XdgExportedUserData>,
++    D: XdgForeignHandler,
++{
++    fn request(
++        state: &mut D,
++        _client: &Client,
++        _resource: &ZxdgExporterV1,
++        request: zxdg_exporter_v1::Request,
++        _data: &(),
++        _dhandle: &DisplayHandle,
++        data_init: &mut DataInit<'_, D>,
++    ) {
++        match request {
++            zxdg_exporter_v1::Request::Export { id, surface } => {
++                let handle = export(state, surface);
++                let exported = data_init.init(
++                    id,
++                    XdgExportedUserData {
++                        handle: handle.clone(),
++                    },
++                );
++                exported.handle(handle.as_str().to_owned());
++            }
++            zxdg_exporter_v1::Request::Destroy => {}
++            _ => {}
++        }
++    }
++}
++
+ impl<D> Dispatch<ZxdgExportedV2, XdgExportedUserData, D> for XdgForeignState
+ where
+     D: XdgForeignHandler + XdgShellHandler,
+@@ -99,10 +166,45 @@ where
+     }
+ 
+     fn destroyed(state: &mut D, _client: ClientId, _resource: &ZxdgExportedV2, data: &XdgExportedUserData) {
+-        // Revoke the previously exported surface.
+-        // This invalidates any relationship the importer may have set up using the xdg_imported created given the handle sent via xdg_exported.handle.
+-        invalidate_all_relationships(state, &data.handle);
+-        state.xdg_foreign_state().exported.remove(&data.handle);
++        revoke(state, &data.handle);
++    }
++}
++
++impl<D> Dispatch<ZxdgExportedV1, XdgExportedUserData, D> for XdgForeignState
++where
++    D: XdgForeignHandler + XdgShellHandler,
++{
++    fn request(
++        _state: &mut D,
++        _client: &Client,
++        _resource: &ZxdgExportedV1,
++        _request: zxdg_exported_v1::Request,
++        _data: &XdgExportedUserData,
++        _dhandle: &DisplayHandle,
++        _data_init: &mut DataInit<'_, D>,
++    ) {
++    }
++
++    fn destroyed(state: &mut D, _client: ClientId, _resource: &ZxdgExportedV1, data: &XdgExportedUserData) {
++        revoke(state, &data.handle);
++    }
++}
++
++/// Revoke an export: every importer is told its import is destroyed and
++/// every child it parented loses that parent (Mutter's
++/// `meta_wayland_xdg_exported_destroy`).
++fn revoke<D>(state: &mut D, handle: &XdgForeignHandle)
++where
++    D: XdgForeignHandler + XdgShellHandler,
++{
++    let Some(exported) = state.xdg_foreign_state().exported.remove(handle) else {
++        return;
++    };
++    for (imported, child) in exported.imported_by {
++        imported.send_destroyed();
++        if let Some(child) = child {
++            unparent(state, &child, &exported.exported_surface);
++        }
+     }
+ }
+ 
+@@ -126,6 +228,34 @@ where
+     }
+ }
+ 
++impl<D> GlobalDispatch<ZxdgImporterV1, (), D> for XdgForeignState
++where
++    D: Dispatch<ZxdgImporterV1, ()>,
++{
++    fn bind(
++        _state: &mut D,
++        _handle: &DisplayHandle,
++        _client: &Client,
++        resource: New<ZxdgImporterV1>,
++        _global_data: &(),
++        data_init: &mut DataInit<'_, D>,
++    ) {
++        data_init.init(resource, ());
++    }
++}
++
++/// Track a new import of `handle`; an unknown handle is destroyed at
++/// once, as the protocol asks.
++fn import<D: XdgForeignHandler>(state: &mut D, imported: Imported) {
++    let data = imported.data();
++    match state.xdg_foreign_state().exported.get_mut(&data.handle) {
++        Some(exported) => {
++            exported.imported_by.insert(imported, None);
++        }
++        None => imported.send_destroyed(),
++    }
++}
++
+ impl<D: XdgForeignHandler> Dispatch<ZxdgImporterV2, (), D> for XdgForeignState
+ where
+     D: Dispatch<ZxdgImportedV2, XdgImportedUserData>,
+@@ -141,27 +271,13 @@ where
+     ) {
+         match request {
+             zxdg_importer_v2::Request::ImportToplevel { id, handle } => {
+-                let exported = state
+-                    .xdg_foreign_state()
+-                    .exported
+-                    .iter_mut()
+-                    .find(|(key, _)| key.as_str() == handle.as_str());
+-
+                 let imported = data_init.init(
+                     id,
+                     XdgImportedUserData {
+                         handle: XdgForeignHandle(handle),
+                     },
+                 );
+-
+-                match exported {
+-                    Some((_, state)) => {
+-                        state.imported_by.insert(imported);
+-                    }
+-                    None => {
+-                        imported.destroyed();
+-                    }
+-                }
++                import(state, Imported::V2(imported));
+             }
+             zxdg_importer_v2::Request::Destroy => {}
+             _ => {}
+@@ -169,6 +285,35 @@ where
+     }
+ }
+ 
++impl<D: XdgForeignHandler> Dispatch<ZxdgImporterV1, (), D> for XdgForeignState
++where
++    D: Dispatch<ZxdgImportedV1, XdgImportedUserData>,
++{
++    fn request(
++        state: &mut D,
++        _client: &Client,
++        _resource: &ZxdgImporterV1,
++        request: zxdg_importer_v1::Request,
++        _data: &(),
++        _dhandle: &DisplayHandle,
++        data_init: &mut DataInit<'_, D>,
++    ) {
++        match request {
++            zxdg_importer_v1::Request::Import { id, handle } => {
++                let imported = data_init.init(
++                    id,
++                    XdgImportedUserData {
++                        handle: XdgForeignHandle(handle),
++                    },
++                );
++                import(state, Imported::V1(imported));
++            }
++            zxdg_importer_v1::Request::Destroy => {}
++            _ => {}
++        }
++    }
++}
++
+ impl<D> Dispatch<ZxdgImportedV2, XdgImportedUserData, D> for XdgForeignState
+ where
+     D: XdgForeignHandler + XdgShellHandler,
+@@ -178,134 +323,173 @@ where
+         _client: &Client,
+         resource: &ZxdgImportedV2,
+         request: zxdg_imported_v2::Request,
+-        data: &XdgImportedUserData,
++        _data: &XdgImportedUserData,
+         _dhandle: &DisplayHandle,
+         _data_init: &mut DataInit<'_, D>,
+     ) {
+         match request {
+-            zxdg_imported_v2::Request::SetParentOf { surface: child } => {
+-                if let Some((_, exported_state)) = state
+-                    .xdg_foreign_state()
+-                    .exported
+-                    .iter_mut()
+-                    .find(|(key, _)| key.as_str() == data.handle.as_str())
+-                {
+-                    let parent = &exported_state.exported_surface;
+-
+-                    let mut invalid = false;
+-                    let mut changed = false;
+-                    compositor::with_states(&child, |states| {
+-                        if let Some(data) = states.data_map.get::<XdgToplevelSurfaceData>() {
+-                            if is_valid_parent(&child, parent) {
+-                                let mut role = data.lock().unwrap();
+-                                changed = role.parent.as_ref() != Some(parent);
+-                                role.parent = Some(parent.clone());
+-                            } else {
+-                                invalid = true;
+-                            }
+-                        }
+-                    });
+-
+-                    if invalid {
+-                        resource.post_error(
+-                            zxdg_imported_v2::Error::InvalidSurface,
+-                            "invalid parent relationship",
+-                        );
+-                        return;
+-                    }
+-
+-                    exported_state.requested_child = Some((child.clone(), resource.clone()));
+-
+-                    if changed {
+-                        if let Some(toplevel) = state
+-                            .xdg_shell_state()
+-                            .toplevel_surfaces()
+-                            .iter()
+-                            .find(|toplevel| *toplevel.wl_surface() == child)
+-                            .cloned()
+-                        {
+-                            XdgShellHandler::parent_changed(state, toplevel);
+-                        }
+-                    }
+-                }
++            zxdg_imported_v2::Request::SetParentOf { surface } => {
++                set_parent_of(state, Imported::V2(resource.clone()), surface)
+             }
+             zxdg_imported_v2::Request::Destroy => {}
+             _ => {}
+         }
+     }
+ 
+-    fn destroyed(state: &mut D, _client: ClientId, resource: &ZxdgImportedV2, data: &XdgImportedUserData) {
+-        if let Some((_, exported_state)) = state
+-            .xdg_foreign_state()
+-            .exported
+-            .iter_mut()
+-            .find(|(key, _)| key.as_str() == data.handle.as_str())
+-        {
+-            exported_state.imported_by.remove(resource);
+-        }
+-
+-        invalidate_relationship_for(state, &data.handle, Some(resource));
++    fn destroyed(state: &mut D, _client: ClientId, resource: &ZxdgImportedV2, _data: &XdgImportedUserData) {
++        drop_import(state, &Imported::V2(resource.clone()));
+     }
+ }
+ 
+-fn invalidate_all_relationships<D>(state: &mut D, handle: &XdgForeignHandle)
++impl<D> Dispatch<ZxdgImportedV1, XdgImportedUserData, D> for XdgForeignState
+ where
+     D: XdgForeignHandler + XdgShellHandler,
+ {
+-    invalidate_relationship_for(state, handle, None);
+-}
+-
+-fn invalidate_relationship_for<D>(
+-    state: &mut D,
+-    handle: &XdgForeignHandle,
+-    invalidate_for: Option<&ZxdgImportedV2>,
+-) where
+-    D: XdgForeignHandler + XdgShellHandler,
+-{
+-    let Some((_, exported_state)) = state
+-        .xdg_foreign_state()
+-        .exported
+-        .iter_mut()
+-        .find(|(key, _)| key.as_str() == handle.as_str())
+-    else {
+-        return;
+-    };
+-
+-    let Some((requested_child, requested_by)) = exported_state.requested_child.as_ref() else {
+-        return;
+-    };
+-
+-    if let Some(invalidate_for) = invalidate_for {
+-        if invalidate_for != requested_by {
+-            return;
++    fn request(
++        state: &mut D,
++        _client: &Client,
++        resource: &ZxdgImportedV1,
++        request: zxdg_imported_v1::Request,
++        _data: &XdgImportedUserData,
++        _dhandle: &DisplayHandle,
++        _data_init: &mut DataInit<'_, D>,
++    ) {
++        match request {
++            zxdg_imported_v1::Request::SetParentOf { surface } => {
++                set_parent_of(state, Imported::V1(resource.clone()), surface)
++            }
++            zxdg_imported_v1::Request::Destroy => {}
++            _ => {}
+         }
+     }
+ 
++    fn destroyed(state: &mut D, _client: ClientId, resource: &ZxdgImportedV1, _data: &XdgImportedUserData) {
++        drop_import(state, &Imported::V1(resource.clone()));
++    }
++}
++
++/// Make the exported surface `child`'s parent. Each import parents at
++/// most one child at a time (Mutter's `imported->parent_of`): a second
++/// call moves the relationship.
++fn set_parent_of<D>(state: &mut D, imported: Imported, child: WlSurface)
++where
++    D: XdgForeignHandler + XdgShellHandler,
++{
++    let handle = imported.data().handle.clone();
++    let Some(exported) = state.xdg_foreign_state().exported.get(&handle) else {
++        // Revoked: the import is inert until the client destroys it.
++        return;
++    };
++    let Some(previous) = exported.imported_by.get(&imported).cloned() else {
++        return;
++    };
++    let parent = exported.exported_surface.clone();
++
++    let mut invalid = false;
+     let mut changed = false;
+-    compositor::with_states(requested_child, |states| {
++    compositor::with_states(&child, |states| {
++        if let Some(data) = states.data_map.get::<XdgToplevelSurfaceData>() {
++            if is_valid_parent(&child, &parent) {
++                let mut role = data.lock().unwrap();
++                changed = role.parent.as_ref() != Some(&parent);
++                role.parent = Some(parent.clone());
++            } else {
++                invalid = true;
++            }
++        }
++    });
++
++    if invalid {
++        imported.post_invalid_surface("invalid parent relationship");
++        return;
++    }
++
++    if let Some(exported) = state.xdg_foreign_state().exported.get_mut(&handle) {
++        exported.imported_by.insert(imported, Some(child.clone()));
++    }
++    if let Some(previous) = previous.filter(|previous| *previous != child) {
++        unparent(state, &previous, &parent);
++    }
++    if changed {
++        parent_changed(state, &child);
++    }
++}
++
++/// An import was destroyed: the child it parented loses that parent.
++fn drop_import<D>(state: &mut D, imported: &Imported)
++where
++    D: XdgForeignHandler + XdgShellHandler,
++{
++    let handle = &imported.data().handle;
++    let Some(exported) = state.xdg_foreign_state().exported.get_mut(handle) else {
++        return;
++    };
++    let parent = exported.exported_surface.clone();
++    if let Some(Some(child)) = exported.imported_by.remove(imported) {
++        unparent(state, &child, &parent);
++    }
++}
++
++/// Clear `child`'s parent if it is still `parent`.
++fn unparent<D>(state: &mut D, child: &WlSurface, parent: &WlSurface)
++where
++    D: XdgShellHandler,
++{
++    let mut changed = false;
++    compositor::with_states(child, |states| {
+         let Some(data) = states.data_map.get::<XdgToplevelSurfaceData>() else {
+             return;
+         };
+-
+         let data = &mut *data.lock().unwrap();
+-        if data.parent.as_ref() == Some(&exported_state.exported_surface) {
++        if data.parent.as_ref() == Some(parent) {
+             data.parent = None;
+             changed = true;
+         }
+     });
+-
+-    let requested_child = requested_child.clone();
+-    exported_state.requested_child = None;
+-
+     if changed {
+-        if let Some(toplevel) = state
+-            .xdg_shell_state()
+-            .toplevel_surfaces()
+-            .iter()
+-            .find(|toplevel| *toplevel.wl_surface() == requested_child)
+-            .cloned()
+-        {
+-            XdgShellHandler::parent_changed(state, toplevel);
++        parent_changed(state, child);
++    }
++}
++
++fn parent_changed<D: XdgShellHandler>(state: &mut D, child: &WlSurface) {
++    if let Some(toplevel) = state
++        .xdg_shell_state()
++        .toplevel_surfaces()
++        .iter()
++        .find(|toplevel| toplevel.wl_surface() == child)
++        .cloned()
++    {
++        XdgShellHandler::parent_changed(state, toplevel);
++    }
++}
++
++impl Imported {
++    fn data(&self) -> &XdgImportedUserData {
++        match self {
++            Imported::V1(imported) => imported
++                .data::<XdgImportedUserData>()
++                .expect("xdg_imported user data"),
++            Imported::V2(imported) => imported
++                .data::<XdgImportedUserData>()
++                .expect("xdg_imported user data"),
++        }
++    }
++
++    fn send_destroyed(&self) {
++        match self {
++            Imported::V1(imported) => imported.destroyed(),
++            Imported::V2(imported) => imported.destroyed(),
++        }
++    }
++
++    fn post_invalid_surface(&self, message: &str) {
++        match self {
++            // zxdg_imported_v1 has no error enum; Mutter posts
++            // WL_DISPLAY_ERROR_INVALID_OBJECT on the import.
++            Imported::V1(imported) => imported.post_error(0u32, message.to_owned()),
++            Imported::V2(imported) => {
++                imported.post_error(zxdg_imported_v2::Error::InvalidSurface, message.to_owned())
++            }
+         }
+     }
+ }
+diff --git a/src/wayland/xdg_foreign/mod.rs b/src/wayland/xdg_foreign/mod.rs
+index 9c1b19ec..9eb3c647 100644
+--- a/src/wayland/xdg_foreign/mod.rs
++++ b/src/wayland/xdg_foreign/mod.rs
+@@ -29,14 +29,18 @@
+ //! };
+ //! ```
+ 
+-use std::{
+-    collections::{HashMap, HashSet},
+-    ops::Deref,
+-};
++use std::{collections::HashMap, ops::Deref};
+ 
+ use rand::distr::{Alphanumeric, SampleString};
+-use wayland_protocols::xdg::foreign::zv2::server::{
+-    zxdg_exporter_v2::ZxdgExporterV2, zxdg_imported_v2::ZxdgImportedV2, zxdg_importer_v2::ZxdgImporterV2,
++use wayland_protocols::xdg::foreign::{
++    zv1::server::{
++        zxdg_exporter_v1::ZxdgExporterV1, zxdg_imported_v1::ZxdgImportedV1,
++        zxdg_importer_v1::ZxdgImporterV1,
++    },
++    zv2::server::{
++        zxdg_exporter_v2::ZxdgExporterV2, zxdg_imported_v2::ZxdgImportedV2,
++        zxdg_importer_v2::ZxdgImporterV2,
++    },
+ };
+ use wayland_server::{backend::GlobalId, protocol::wl_surface::WlSurface, DisplayHandle, GlobalDispatch};
+ 
+@@ -83,23 +87,36 @@ pub struct XdgImportedUserData {
+     handle: XdgForeignHandle,
+ }
+ 
++/// An import through either protocol version.
++#[derive(Debug, Clone, Hash, PartialEq, Eq)]
++enum Imported {
++    V1(ZxdgImportedV1),
++    V2(ZxdgImportedV2),
++}
++
+ #[derive(Debug)]
+ struct ExportedState {
+     exported_surface: WlSurface,
+-    requested_child: Option<(WlSurface, ZxdgImportedV2)>,
+-    imported_by: HashSet<ZxdgImportedV2>,
++    /// Every live import of this export and the child it parents.
++    imported_by: HashMap<Imported, Option<WlSurface>>,
+ }
+ 
+-/// Tracks the list of exported surfaces
++/// Tracks the list of exported surfaces.
++///
++/// The zxdg_foreign v1 and v2 globals share one handle table, as in
++/// Mutter: a handle exported through either version imports through
++/// either (GTK 3 exports with v1, the portal imports with v2).
+ #[derive(Debug)]
+ pub struct XdgForeignState {
+     exported: HashMap<XdgForeignHandle, ExportedState>,
+     exporter: GlobalId,
+     importer: GlobalId,
++    exporter_v1: GlobalId,
++    importer_v1: GlobalId,
+ }
+ 
+ impl XdgForeignState {
+-    /// Creates a new xdg activation global.
++    /// Creates the xdg foreign v1 and v2 globals.
+     ///
+     /// In order to use this abstraction, your `D` type needs to implement [`XdgForeignHandler`].
+     pub fn new<D>(display: &DisplayHandle) -> Self
+@@ -107,17 +124,33 @@ impl XdgForeignState {
+         D: XdgForeignHandler,
+         D: GlobalDispatch<ZxdgExporterV2, ()>,
+         D: GlobalDispatch<ZxdgImporterV2, ()>,
++        D: GlobalDispatch<ZxdgExporterV1, ()>,
++        D: GlobalDispatch<ZxdgImporterV1, ()>,
+     {
+         let exporter = display.create_global::<D, ZxdgExporterV2, _>(1, ());
+         let importer = display.create_global::<D, ZxdgImporterV2, _>(1, ());
++        let exporter_v1 = display.create_global::<D, ZxdgExporterV1, _>(1, ());
++        let importer_v1 = display.create_global::<D, ZxdgImporterV1, _>(1, ());
+ 
+         Self {
+             exported: HashMap::new(),
+             exporter,
+             importer,
++            exporter_v1,
++            importer_v1,
+         }
+     }
+ 
++    /// Returns the zxdg_exporter_v1 global.
++    pub fn exporter_v1_global(&self) -> GlobalId {
++        self.exporter_v1.clone()
++    }
++
++    /// Returns the zxdg_importer_v1 global.
++    pub fn importer_v1_global(&self) -> GlobalId {
++        self.importer_v1.clone()
++    }
++
+     /// Returns the xdg_exporter global.
+     pub fn exporter_global(&self) -> GlobalId {
+         self.exporter.clone()
+@@ -178,5 +211,45 @@ macro_rules! delegate_xdg_foreign {
+                 __ZxdgImportedV2: $crate::wayland::xdg_foreign::XdgImportedUserData
+             ] => $crate::wayland::xdg_foreign::XdgForeignState
+         );
++
++        type __ZxdgExporterV1 =
++            $crate::reexports::wayland_protocols::xdg::foreign::zv1::server::zxdg_exporter_v1::ZxdgExporterV1;
++        type __ZxdgImporterV1 =
++            $crate::reexports::wayland_protocols::xdg::foreign::zv1::server::zxdg_importer_v1::ZxdgImporterV1;
++        type __ZxdgExportedV1 =
++            $crate::reexports::wayland_protocols::xdg::foreign::zv1::server::zxdg_exported_v1::ZxdgExportedV1;
++        type __ZxdgImportedV1 =
++            $crate::reexports::wayland_protocols::xdg::foreign::zv1::server::zxdg_imported_v1::ZxdgImportedV1;
++
++        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
++            [
++                __ZxdgExporterV1: ()
++            ] => $crate::wayland::xdg_foreign::XdgForeignState
++        );
++        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
++            [
++                __ZxdgImporterV1: ()
++            ] => $crate::wayland::xdg_foreign::XdgForeignState
++        );
++        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
++            [
++                __ZxdgExporterV1: ()
++            ] => $crate::wayland::xdg_foreign::XdgForeignState
++        );
++        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
++            [
++                __ZxdgImporterV1: ()
++            ] => $crate::wayland::xdg_foreign::XdgForeignState
++        );
++        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
++            [
++                __ZxdgExportedV1: $crate::wayland::xdg_foreign::XdgExportedUserData
++            ] => $crate::wayland::xdg_foreign::XdgForeignState
++        );
++        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
++            [
++                __ZxdgImportedV1: $crate::wayland::xdg_foreign::XdgImportedUserData
++            ] => $crate::wayland::xdg_foreign::XdgForeignState
++        );
+     };
+ }
