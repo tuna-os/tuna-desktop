@@ -10,7 +10,12 @@
 //! local replica put three quarters of the first one in LLVM. The
 //! cairo renderer draws the same nodes on the CPU without a compiler,
 //! so the shell takes it whenever OpenGL is a software rasterizer.
-//! `GSK_RENDERER`, when set, still decides.
+//! `GSK_RENDERER`, when set, still decides: a compositor on software GL
+//! sets it to cairo for its shell (`tuna_shell_control::gl`), and the
+//! shell then creates no GL context at all. The probe below is for a
+//! shell started any other way; it leaves Mesa and llvmpipe's rasterizer
+//! threads loaded for the life of the process, which on the nested
+//! llvmpipe session measured 24 MiB of private memory and 25 threads.
 
 use std::ffi::CStr;
 
@@ -21,24 +26,17 @@ use gtk4::prelude::*;
 /// rasterizer. Call before the first window is realized: GSK reads
 /// `GSK_RENDERER` once, for the first renderer it creates.
 pub fn prefer_cairo_on_software_gl(display: &gtk::gdk::Display) {
-    if std::env::var_os("GSK_RENDERER").is_some() {
+    use tuna_shell_control::gl;
+    if std::env::var_os(gl::GSK_RENDERER_ENV).is_some() {
         return;
     }
     let Some(renderer) = gl_renderer(display) else {
         return;
     };
-    if is_software(&renderer) {
+    if gl::is_software_renderer(&renderer) {
         eprintln!("tuna-shell-gtk: OpenGL is {renderer}; drawing with cairo");
-        std::env::set_var("GSK_RENDERER", "cairo");
+        std::env::set_var(gl::GSK_RENDERER_ENV, gl::GSK_RENDERER_CAIRO);
     }
-}
-
-/// Whether a `GL_RENDERER` string names one of Mesa's software
-/// rasterizers.
-pub fn is_software(renderer: &str) -> bool {
-    ["llvmpipe", "softpipe"]
-        .iter()
-        .any(|name| renderer.contains(name))
 }
 
 /// `GL_RENDERER` of a GL context on `display`, as GSK's own check reads
@@ -71,19 +69,5 @@ fn gl_get_renderer() -> Option<String> {
         let get = (*symbol.cast::<Option<GetString>>())?;
         let text = get(GL_RENDERER);
         (!text.is_null()).then(|| CStr::from_ptr(text).to_string_lossy().into_owned())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_software;
-
-    #[test]
-    fn mesa_software_rasterizers_are_software() {
-        assert!(is_software("llvmpipe (LLVM 23.1.0, 256 bits)"));
-        assert!(is_software("softpipe"));
-        assert!(!is_software("virgl (AMD Radeon Graphics)"));
-        assert!(!is_software("Mesa Intel(R) UHD Graphics 620 (KBL GT2)"));
-        assert!(!is_software("NVIDIA GeForce RTX 4070/PCIe/SSE2"));
     }
 }

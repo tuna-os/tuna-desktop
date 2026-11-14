@@ -43,7 +43,11 @@ base, and picks the proof lanes the change can affect:
   lanes whose artifacts it needs. `scripts/ci-select-lanes` (`OWNED` and
   `NO_LANE`) is the authoritative, ordered mapping.
 - a lane's own proof script, reference fixtures or packaging: that lane
-  (plus the lanes whose artifacts it needs).
+  (plus the lanes whose artifacts it needs). A `scripts/tests/` file edit
+  selects the lane whose job runs that file (for example `gtk-shell` for
+  `test_notify_callback_contract.py`); a test only `check` runs selects none.
+  `WorkflowSync.test_lane_run_tests_select_their_lane` fails when a lane job
+  runs a test the selector does not map.
 - a packaged conffile (`share/pam.d/`, installed as `/etc/pam.d/tuna-lock`):
   `journey`, whose disposable Debian lifecycle fails when its bytes drift
   from the released package's, plus the core lanes and every package
@@ -189,11 +193,39 @@ This matches Mutter 51's initial-focus path:
 [attaching the drag handler immediately invalidates focus](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-input.c#L288-L325),
 and [drag focus sends the destination its offer while restricting source-less drags to the origin client](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-data-device.c#L337-L397).
 
+`scripts/tuna-gtk-shell-proof --window-leak-only --artifacts DIR` runs
+G-WINDOW-LEAK (#1088): after five warm-up windows, 100 libadwaita windows
+(`TUNA_WINDOW_LEAK_WINDOWS` sets the count) are opened and closed, odd ones
+with Alt+F4 (the app destroys its window; the close effect plays) and even
+ones by killing the app (its connection closes with every object alive).
+The compositor's `Pss_Anon` must stay within 8 MiB, and its open
+descriptors within two, of the warm state, a bound independent of the
+number of windows; each window used to keep about 1.65 MB.
+`scripts/lib/tuna-resource-sample.py` reads them from `/proc` and leaves
+`window-leak-{before,after}.json` and `window-leak-diff.txt` in the
+artifacts. The compositor side is `cargo test -p tuna-compositor --test
+window_teardown`: a toplevel with and without an `xdg_dialog_v1`, a
+subsurface, a grabbing popup and uploaded shm buffers, closed by destroying
+every object or by disconnecting, must drop every surface's server-side
+data, and the window manager must name the window nowhere.
+
 `scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts DIR` runs the same
 held-button hover and persisted reorder assertions as the full GTK proof,
 without the unrelated earlier gates. It adds no target motion or timing
 relaxation. CI runs this slice with its freshly built compositor and shell;
 the no-post-start-motion wire tests establish the precise protocol ordering.
+
+`scripts/tuna-gtk-shell-proof --search-leak-only --artifacts DIR` runs
+G-SEARCH-LEAK (#1084): after five warm-up searches, 50 overview searches
+with results (`TUNA_SEARCH_LEAK_SEARCHES` sets the count), each typed with
+real keys and closed with Escape, must leave the shell's
+`memfd:gdk-wayland` mappings and the shell's and compositor's open
+descriptors exactly where they were. `scripts/lib/tuna-resource-sample.py`
+reads them from `/proc` and leaves `search-leak-{before,after}.json` in the
+artifacts. The compositor side is `cargo test -p tuna-compositor --test
+buffer_release`: an uploaded `wl_shm` buffer comes back with
+`wl_buffer.release` at once, as Mutter's do, and its pool closes once the
+client destroys it and the surface moves on to another buffer.
 
 Every build uses its own checkout's `target/` (an inherited
 `CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one) and no
@@ -1028,10 +1060,24 @@ show:
   never exits or panics and the shell never exits.
 
 `H-GROWTH` bounds the compositor and shell as the churn lane does: final
-PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32.
-Pull requests and dispatches run 4 rounds, nightly 30. The artifacts keep
-the compositor, shell and client logs, every step's outputs and window
-rectangles (`report.json`), the metrics and the state at a failure.
+PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32. Each
+round's sample in `metrics.jsonl` and `report.json` has, per process, the
+kernel's `Pss_Anon`/`Pss_File`/`Pss_Shmem` split, PSS by mapping kind
+(heap, anonymous, shared memory, GPU, files), fds and mappings
+(`scripts/lib/tuna_process_metrics.py`, shared with `scripts/tuna-stress`);
+the gate's line names the processes and kinds that rose most since round
+0. `smaps-round0-*` and `smaps-final-*` are each process's mappings after
+the first and the last round, `state-round0.json` the compositor state
+after the first, and every step in `report.json` has each process's PSS.
+Pull requests and dispatches run 4 rounds, nightly 30; a dispatch's
+`hotplug_rounds` input (and `churn_rounds` for the churn lane) runs
+another count, and its `hotplug_heaptrack` input runs the storm a second
+time with `--heaptrack`: the compositor and the shell record their
+allocation backtraces (`heaptrack/heaptrack-<name>-<pid>.zst`, read with
+`heaptrack_print`). That run is a diagnostic, since the profiler's memory
+counts in its `H-GROWTH`. The artifacts keep the compositor, shell and
+client logs, every step's outputs and window rectangles (`report.json`),
+the metrics and the state at a failure.
 
 To run it on a host with Linux 6.19+ and sudo, after building
 `tuna-compositor` and `tuna-shell-gtk`:
