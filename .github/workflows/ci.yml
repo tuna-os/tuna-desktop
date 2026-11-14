@@ -164,6 +164,7 @@ jobs:
       - run: python3 scripts/lib/tuna-soak-tests.py
       - run: python3 scripts/lib/tuna-resource-sample-tests.py
       - run: python3 scripts/lib/vm-boot-tests.py
+      - run: python3 scripts/lib/try-tuna-desktop-tests.py
       - run: python3 scripts/lib/ci-runner-guard-tests.py
       - run: python3 scripts/tests/test_ci_closed_pr_cleanup.py
       - run: python3 scripts/tests/test_ci_prepare_artifacts.py

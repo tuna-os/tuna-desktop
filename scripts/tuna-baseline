@@ -42,8 +42,9 @@ def log(msg):
 
 
 class Qmp:
-    def __init__(self, path):
+    def __init__(self, path, *, timeout=None):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(timeout)
         for _ in range(100):
             try:
                 self.sock.connect(path)

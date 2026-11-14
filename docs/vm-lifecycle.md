@@ -101,6 +101,84 @@ actual original-shell AddAgent, source/provider, daemon location/timezone
 and panel-clock gates and restoration requirements. Routing implementation
 alone claims no native runtime qualification.
 
+## Pristine release-disk qualification is separate
+
+The signed release-disk consumer and its native observer live in
+`scripts/lib/try_tuna_desktop.py` and `scripts/lib/try_tuna_qualification.py`.
+They do not turn the fixture journeys above into pristine firstboot proof.
+The observer requires the normal-release signed manifest and its exact
+declared bytes, with the observer checkout matching the signed producer
+source. It boots a writable copy while retaining the shipping disk's hash;
+there are no injected accounts, passwords, SSH keys or fixture services in
+that shipping disk.
+
+Each native Linux/macOS amd64/arm64 host must execute its matching signed
+Corral binary, real local QEMU, browser and noVNC transport. Executable
+headers reject foreign host binaries even where Rosetta/binfmt could run
+them. The guest remains the declared qualified amd64/UEFI disk; ARM hosts
+explicitly use TCG. Receipts retain actual QEMU target/accelerator, firmware
+and binary hashes rather than claiming native guest acceleration.
+
+Actual GNOME Initial Setup creates a passworded operator account in the
+copy. Normal GDM must then enter Tuna, including visible application search,
+with wheel membership and password-required sudo; logout/login and reboot
+must preserve that account and user data. RFB connection alone means
+browser/transport readiness, never successful guest boot or Tuna login.
+Terminal cancellation (SIGINT, SIGTERM or SIGHUP), stop, failed browser launch and failed acquisition
+must retire owned processes/listeners/locks without touching an unrelated
+VM. Normal launch preserves writable user data; qualification explicitly
+deletes only its own disposable copies after retirement.
+The owned stop socket remains serviceable while browser readiness is pending;
+an opener returning zero is not a connection. Native qualification must prove
+early stop after that real no-RFB opener, and each cancellation signal must
+follow an actual current RFB connection in native Chromium. Its retained
+executable/profile identity and actual owned-child wait/exit receipt must agree;
+a pre-browser cancellation or a stale readiness receipt cannot pass.
+
+Native qualification also retains current noVNC milestone PNGs and four
+bounded actual-guest video clips: pristine setup, the first Tuna session,
+passworded re-login, and the post-reboot session. It reuses the VM lane's QMP
+recorder and VP9 encoder, not a slideshow of stills. Each clip contains at most
+the first 30 seconds of its observed UI journey, with capture timing retained;
+it does not claim to show every account-setup or boot step. The PNGs are actual
+noVNC canvas pixels; the clips are actual owned-guest QMP pixels, not browser
+chrome. The qualification hosts require ffmpeg with `libvpx-vp9` in addition to
+their existing browser observation tools; normal launcher users do not.
+
+`media.json` binds those files to the signed manifest and pristine disk hashes,
+desktop/package source, immutable image index and platform digest, exact signed
+Corral release and binary, observer source, and native host. Failed or incomplete
+qualification records `qualified: false`; neither historical diagnosis frames
+nor before-fix firstboot screenshots may be promoted as current documentation
+proof. Documentation intake must retain these identities and all native gates.
+
+The consumer requires Python 3 and the native package manager (on macOS,
+Homebrew and its normal command-line-tool prerequisites). It obtains the
+checksum-pinned Sigstore verifier itself and acquires QEMU plus amd64 UEFI
+through native package trust, including when QEMU exists but firmware is
+missing. Linux without caller access to `/dev/kvm` explicitly uses TCG.
+Interactive Linux hosts use their normal sudo authentication, with its password
+input connected directly to the real terminal; the wrapper never reads or stores
+that password. Without a terminal, sudo must permit noninteractive installation
+or acquisition fails closed. Cancellation waits for an already-started native
+package transaction (and its normal authentication prompt) to finish safely;
+it does not start a VM afterward.
+No Podman or guest disk build belongs in this consumer. An artifact directory
+changes only where the same signed bytes are read; it does not replace
+identities, trust roots or descriptors, and is not a promise of network-free
+dependency bootstrap.
+
+Corral keeps its normal policy for listener authentication.
+The consumer preserves `CORRAL_AUTH_REQUIRED`, `CORRAL_ADMINS`,
+`CORRAL_PEER_TOKEN`. It also preserves Corral's ordinary settings for URLs and tokens.
+It never clears authentication to make a readiness report succeed.
+It excludes overrides for backend discovery and plugin acquisition, not
+Corral authentication. Each lifecycle command names QEMU and the exact owned VM.
+
+The existing public wrapper is not cut over until a real signed disk and
+manifest pass all four native firstboot/browser/lifecycle qualifications.
+Private helper code or fixture receipts alone do not establish that result.
+
 ## Record-free fresh accounts (tunaOS#4092)
 
 `tuna-test` above has a session-less AccountsService record, so it proves
