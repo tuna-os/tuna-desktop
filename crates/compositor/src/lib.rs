@@ -176,6 +176,7 @@ pub mod supervise;
 pub mod tablet;
 pub mod tablet_actions;
 pub(crate) mod tablet_settings;
+pub(crate) mod toplevel_drag;
 pub mod touchpad_swipe;
 mod transient_family;
 pub mod transitions;
@@ -894,11 +895,12 @@ impl SelectionHandler for State {
 impl ClientDndGrabHandler for State {
     fn started(
         &mut self,
-        _source: Option<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
+        source: Option<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
         icon: Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
         _seat: Seat<Self>,
     ) {
         self.dnd_icon = icon;
+        self.protocols.toplevel_drag.drag_started(source);
     }
 
     fn dropped(
@@ -908,6 +910,15 @@ impl ClientDndGrabHandler for State {
         _seat: Seat<Self>,
     ) {
         self.dnd_icon = None;
+        self.protocols.toplevel_drag.drag_ended();
+    }
+
+    fn drop_performed_without_target(
+        &mut self,
+        source: &smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource,
+        _seat: Seat<Self>,
+    ) -> bool {
+        self.protocols.toplevel_drag.performs_drop(source)
     }
 }
 
@@ -1108,12 +1119,16 @@ impl State {
 
     pub(crate) fn cancel_client_dnd(&mut self, time: u32) -> bool {
         let seat = self.seat.clone();
-        smithay::wayland::selection::data_device::cancel_client_dnd(
+        // Mutter's Escape: the toplevel drag's window returns to its start.
+        self.protocols.toplevel_drag.set_cancelling(true);
+        let cancelled = smithay::wayland::selection::data_device::cancel_client_dnd(
             &seat,
             self,
             smithay::utils::SERIAL_COUNTER.next_serial(),
             time,
-        )
+        );
+        self.protocols.toplevel_drag.set_cancelling(false);
+        cancelled
     }
 
     /// Seat for capability attachment and input routing.

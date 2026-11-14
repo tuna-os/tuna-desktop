@@ -14,6 +14,7 @@
 
 mod alive;
 mod tablet_input;
+mod toplevel_drag;
 
 use std::collections::{HashMap, HashSet};
 
@@ -593,6 +594,8 @@ pub struct WindowManager {
     grab_raise: Option<GrabRaise>,
     /// Mutter's alive checks and the close dialog (#1035).
     alive: alive::AliveState,
+    /// The window moved with a client drag (xdg_toplevel_drag_v1).
+    toplevel_drag: Option<toplevel_drag::ToplevelWindowDrag>,
 }
 
 impl WindowManager {
@@ -831,6 +834,7 @@ impl WindowManager {
             auto_raise: None,
             grab_raise: None,
             alive: alive::AliveState::new(state),
+            toplevel_drag: None,
         }
     }
 
@@ -1607,6 +1611,8 @@ impl WindowManager {
                 }
             }
         }
+        // Toplevels attached to a drag since the last tick, now mapped.
+        self.reconcile_toplevel_drag(state);
         self.apply_mapped_session_restores(state);
         for (surface, id) in &self.surface_index {
             self.model.set_icon(*id, state.window_icons.get(surface));
@@ -1967,7 +1973,7 @@ impl WindowManager {
     /// client chose: GNOME's automatic placement (centred, or cascaded
     /// from the last window), dialogs centred over their parent. A
     /// window that left floating before committing keeps its layout.
-    fn place_committed(&mut self, state: &State) {
+    fn place_committed(&mut self, state: &mut State) {
         let ready: Vec<(u64, Size<i32, Logical>)> = self
             .windows
             .iter()
@@ -1996,7 +2002,12 @@ impl WindowManager {
                         .map(|entry| Rectangle::new(entry.loc.into(), entry.size))
                 });
                 let centered = self.center_new_windows;
-                let geometry = self.placement_on(state, Some(size), target, centered);
+                // A window shown during its toplevel drag goes under the
+                // pointer (calc_origin_for_dragged_window).
+                let geometry = match self.place_toplevel_dragged(state, id) {
+                    Some(loc) => Rectangle::new(loc, size),
+                    None => self.placement_on(state, Some(size), target, centered),
+                };
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.geometry = geometry;
                     window.unplaced = false;
@@ -2008,6 +2019,7 @@ impl WindowManager {
                 }
                 let focused = self.model.focused() == Some(id);
                 self.configure(id, focused);
+                self.start_placed_toplevel_drag(state, id);
             } else if let Some(window) = self.windows.get_mut(&id) {
                 window.unplaced = false;
             }
@@ -3655,15 +3667,18 @@ impl WindowManager {
 
     /// Topmost window containing `pos`, if any. Only the active
     /// workspace is hit-testable; hidden workspaces never take focus.
+    /// A window moved with a client drag is not hit (Mutter makes its
+    /// actor non-reactive so the drag finds the target beneath).
     pub fn window_at(&self, pos: Point<f64, Logical>) -> Option<u64> {
         let active = self.model.active_workspace();
         self.presentation_order().into_iter().rev().find(|id| {
-            self.model.window(*id).is_some_and(|entry| {
-                (entry.workspace == active || self.on_all_workspaces(*id))
-                    && self.windows.get(id).is_some_and(|w| {
-                        !w.minimized && contains(self.shifted(*id, w.geometry), pos)
-                    })
-            })
+            !self.toplevel_dragged(*id)
+                && self.model.window(*id).is_some_and(|entry| {
+                    (entry.workspace == active || self.on_all_workspaces(*id))
+                        && self.windows.get(id).is_some_and(|w| {
+                            !w.minimized && contains(self.shifted(*id, w.geometry), pos)
+                        })
+                })
         })
     }
 
@@ -3684,6 +3699,9 @@ impl WindowManager {
         };
         let travelled = (pos.x - self.pointer_pos.x).hypot(pos.y - self.pointer_pos.y);
         self.pointer_pos = pos;
+        // A window attached to the drag follows before the drag finds its
+        // target (the toplevel drag's handler sees motion first).
+        self.toplevel_drag_motion(state, pos);
         // An interactive move/resize owns the pointer until release.
         if self.grab_motion(state, pos) {
             return;
@@ -4256,6 +4274,8 @@ impl WindowManager {
             // frame boundary (GTK4 drops unframed clicks).
             pointer.frame(state);
         }
+        // A release that dropped the drag ends its window drag.
+        self.end_finished_toplevel_drag(state);
     }
 
     /// Scroll the client under the pointer. Wheel notches arrive in v120
