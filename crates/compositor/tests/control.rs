@@ -979,3 +979,44 @@ fn close_dialog_answers_reach_the_hub_outcome_for_known_windows() {
         assert_eq!(matches!(status, CommandStatus::Applied), applied);
     }
 }
+
+/// #503: a hub round reports whether anything arrived on its sockets, so
+/// the runtime's idle tick can tell a round that read something (which may
+/// change what is drawn) from one that only looked.
+#[test]
+fn hub_round_reports_whether_anything_arrived_on_its_sockets() {
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub =
+        ControlHub::bind(path.clone(), std::rc::Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = StateModel::new();
+    assert!(!hub.poll(&mut model).received, "nobody is connected");
+
+    let mut client = hub_client(&path);
+    assert!(hub.poll(&mut model).received, "a peer connected");
+    client_write(&mut client, &hello_current());
+    assert!(hub.poll(&mut model).received, "its handshake was due");
+    assert!(matches!(client_read(&mut client), Message::Hello { .. }));
+    assert!(matches!(client_read(&mut client), Message::Snapshot { .. }));
+    assert!(matches!(client_read(&mut client), Message::Overview { .. }));
+    for _ in 0..3 {
+        assert!(
+            !hub.poll(&mut model).received,
+            "a silent session is not an arrival"
+        );
+    }
+
+    client_write(
+        &mut client,
+        &Message::Command {
+            id: 1,
+            kind: CommandKind::ToggleOverview,
+        },
+    );
+    assert!(hub.poll(&mut model).received, "a command frame was read");
+    assert!(!hub.poll(&mut model).received, "and only once");
+
+    drop(client);
+    assert!(hub.poll(&mut model).received, "the hang-up was read");
+    assert!(!hub.poll(&mut model).received);
+}
