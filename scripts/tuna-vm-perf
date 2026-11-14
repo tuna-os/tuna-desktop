@@ -186,6 +186,15 @@ def distribution(values):
             "mean": statistics.mean(values)}
 
 
+class KernelObserverRefusal(ValueError):
+    """The observer's own refusal of a whole, retained acquisition.
+
+    Its probe misses (the kprobe re-entry race), buffer loss or cleanup errors
+    make kernel vblank attribution unavailable; transport and artifact faults
+    stay plain ValueErrors.
+    """
+
+
 def retain_kernel_trace(agent, out, metadata):
     """Retain the whole observer before rejecting loss or invalid acquisition."""
     (out / "kernel-vblank-source.json").write_text(json.dumps(metadata, indent=2))
@@ -219,7 +228,12 @@ def retain_kernel_trace(agent, out, metadata):
         (out / 'kernel-vblank-artifact-errors.json').write_text(json.dumps(errors, indent=2))
         raise ValueError('incomplete independent kernel artifacts: ' + json.dumps(errors))
     if metadata.get("qualified_acquisition") is not True or metadata.get("errors") or metadata.get("cleanup_errors"):
-        raise ValueError("kernel observer reports actual loss, missing probes or invalid acquisition")
+        # Name the observer's own reasons (probe misses and their located
+        # re-entry, buffer loss, cleanup) so a refusal is distinguishable
+        # from a transport or acquisition fault.
+        reasons = {key: metadata.get(key) for key in ("errors", "cleanup_errors") if metadata.get(key)}
+        raise KernelObserverRefusal("kernel observer reports actual loss, missing probes or invalid acquisition: "
+                                    + json.dumps(reasons, default=str)[:4096])
     if metadata.get("capture_filter") == "actual-native-timer-inventory-v1":
         times = [metadata.get(name) for name in ('discovery_started_monotonic_ns', 'discovery_finished_monotonic_ns', 'filters_ready_monotonic_ns')]
         if not all(type(value) is int for value in times) or not times[0] < times[1] <= times[2] or times[1] - times[0] > 1_000_000_000:
@@ -228,7 +242,7 @@ def retain_kernel_trace(agent, out, metadata):
             raise ValueError('actual kernel filter/discovery evidence is incomplete')
 
 
-def retain_gnome_trace(agent, out, metadata):
+def retain_gnome_trace(agent, out, metadata, profile):
     size = metadata.get("bytes")
     digest = metadata.get("sha256")
     if type(size) is not int or not 256 <= size <= 8 * 1024 * 1024:
@@ -251,13 +265,26 @@ def retain_gnome_trace(agent, out, metadata):
     package = metadata.get("mutter_cogl_library", {}).get("package")
     diagnostic = package in ("mutter 51.0-1.2", "mutter 51.0-1.3", "mutter 51.0-1.5", "mutter 51.0-1.6", "mutter 51.0-1.7")
     observer_error = None
+    # The ftrace kernel observer explains vblank timing; it measures nothing
+    # the budgets gate. In the diagnostic profile its own refusal (whole
+    # artifacts retained) makes attribution unavailable instead of failing the
+    # pair. Any other profile and every transport or artifact fault still fail.
+    kernel_attribution = {"kernel_attribution": "not-observed"}
     # Acquire independent whole kernel bytes before any diagnostic validation.
     if "kernel_trace" in metadata:
         try:
             retain_kernel_trace(agent, out, metadata["kernel_trace"])
+            kernel_attribution = {"kernel_attribution": "available"}
         except Exception as error:
-            observer_error = str(error)
-            (out / "kernel-vblank-acquisition-rejection.json").write_text(json.dumps({"reason": observer_error}, indent=2))
+            unavailable = isinstance(error, KernelObserverRefusal) and profile == "diagnostic"
+            receipt = {"reason": str(error)}
+            if unavailable:
+                receipt.update(kernel_attribution="unavailable", source="kernel-vblank-source.json")
+                kernel_attribution = {"kernel_attribution": "unavailable", "kernel_attribution_receipt": {
+                    "file": "kernel-vblank-acquisition-rejection.json", "reason": str(error)[:4096]}}
+            else:
+                observer_error = str(error)
+            (out / "kernel-vblank-acquisition-rejection.json").write_text(json.dumps(receipt, indent=2))
     evidence = {}
     if diagnostic:
         try:
@@ -297,7 +324,8 @@ def retain_gnome_trace(agent, out, metadata):
     frames["latency_upper_ms"] = distribution([row["latency_upper_ms"] for row in frames["inputs"]])
     return {"bytes": size, "sha256": digest, "frame_count": decoded["frame_count"],
             "mark_count": len(decoded["marks"]), "scope_counts": counts, "frame_ownership": frames,
-            "limitation": (evidence["limitation"] if diagnostic else frames["limitation"])}
+            "limitation": (evidence["limitation"] if diagnostic else frames["limitation"]),
+            **kernel_attribution}
 
 
 # The guest helper's PRESENTED_FRAMES (tuna-perf-phase); >= 3 whole 1 s
@@ -538,7 +566,10 @@ def main():
     observations, phases, guest_phases, notifications = [], {}, {}, []
     agent = None
     gnome_trace_active = False
-    gnome_start_uncertain = False
+    # Only an acknowledged gnome-trace-start owns a kernel observer to stop:
+    # stock and Tuna sessions never start one, and an uncertain start stays
+    # with its supervised start owner.
+    kernel_observer_started = False
     gnome_trace_summary = None
     tuna_overview_original = None
     tuna_overview_summary = None
@@ -637,9 +668,8 @@ def main():
             time.sleep(8)
         guest_phases["typing_end"] = guest_probe(agent, "clock")["boottime_s"]
         if trace_required(args.desktop, args.gnome_profile):
-            gnome_start_uncertain = True
             guest_probe(agent, "gnome-trace-start", out=out, start_owner=handoff)
-            gnome_start_uncertain = False
+            kernel_observer_started = True
             gnome_trace_active = True
             time.sleep(1)  # Preserve pre-input scopes after the actual drained boundary.
         if args.desktop == 'tuna':
@@ -680,7 +710,7 @@ def main():
         if gnome_trace_active:
             metadata = guest_probe(agent, "gnome-trace-stop", out=out)["gnome_trace"]
             gnome_trace_active = False
-            gnome_trace_summary = retain_gnome_trace(agent, out, metadata)
+            gnome_trace_summary = retain_gnome_trace(agent, out, metadata, args.gnome_profile)
         guest_phases["workspaces_start"] = guest_probe(agent, "clock")["boottime_s"]
         for _ in range(10):
             qmp.keys("meta_l", "pgdn")
@@ -793,7 +823,7 @@ def main():
                 except Exception:
                     # Fixed diagnostics only; preserve the original metric error.
                     print("GNOME profile cleanup failed", file=sys.stderr)
-            if agent is not None and args.desktop == "gnome" and not gnome_start_uncertain:
+            if agent is not None and kernel_observer_started:
                 try:
                     observer = guest_probe(agent, "kernel-trace-stop")["kernel_trace"]
                     if not (out / "kernel-vblank-source.json").exists():

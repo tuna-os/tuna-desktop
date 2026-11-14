@@ -74,12 +74,17 @@ class Lifetime(unittest.TestCase):
                 child.kill(); child.wait(); child.stdout.close(); handoff.close()
 
     def test_original_main_finally_preserves_primary_metric_exception(self):
-        self.exercise_original_main_finally(start_uncertain=False)
+        self.exercise_original_main_finally(observer_started=True)
 
     def test_uncertain_start_skips_observer_commands_but_retires_owned_vm(self):
-        self.exercise_original_main_finally(start_uncertain=True)
+        self.exercise_original_main_finally(observer_started=False)
 
-    def exercise_original_main_finally(self, start_uncertain):
+    def test_stock_gnome_never_stops_an_observer_it_never_started(self):
+        # Runs 42612090006 and 43224217367 logged "marker.json missing" from
+        # every stock GNOME session: none of them starts the kernel observer.
+        self.exercise_original_main_finally(observer_started=False, profile='stock')
+
+    def exercise_original_main_finally(self, observer_started, profile='diagnostic'):
         source = ast.parse((ROOT / 'scripts/tuna-vm-perf').read_text())
         main = next(n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == 'main')
         original_try = next(n for n in main.body if isinstance(n, ast.Try))
@@ -92,21 +97,21 @@ class Lifetime(unittest.TestCase):
             observer_calls.append(action)
             raise RuntimeError('controlled observer cleanup failure')
         with tempfile.TemporaryDirectory() as directory:
-            handoff = life.Handoff(directory, 'diagnostic', 'gnome', 1); child = self.child()
+            handoff = life.Handoff(directory, profile, 'gnome', 1); child = self.child()
             class Agent:
                 def close(self): raise OSError('private cleanup body')
             try:
                 handoff.attach(child)
                 scope = {'original': original, 'primary': None, 'vm': child, 'agent': Agent(),
                          'handoff': handoff, 'gnome_trace_active': False,
-                         'gnome_start_uncertain': start_uncertain, 'guest_probe': guest_probe,
+                         'kernel_observer_started': observer_started, 'guest_probe': guest_probe,
                          'out': Path(directory), 'corral': None, 'json': json,
-                         'args': types.SimpleNamespace(desktop='gnome', gnome_profile='diagnostic', corral_vm=None),
+                         'args': types.SimpleNamespace(desktop='gnome', gnome_profile=profile, corral_vm=None),
                          'cleanup_owned_vm': life.cleanup_owned_vm, 'sys': sys}
                 with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(RuntimeError) as raised:
                     exec(compile(actual, 'actual-worker-finally', 'exec'), scope)
                 self.assertIs(raised.exception, original)
-                self.assertEqual(observer_calls, [] if start_uncertain else ['kernel-trace-stop'])
+                self.assertEqual(observer_calls, ['kernel-trace-stop'] if observer_started else [])
                 self.assertIsNotNone(child.returncode)
                 self.assertEqual(life.read_receipt(handoff.path, private=True)['state'], 'reaped')
                 self.assertNotIn('private', err.getvalue())
