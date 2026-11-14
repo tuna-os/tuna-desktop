@@ -1,16 +1,18 @@
 #!/usr/bin/python3
-"""A minimal MPRIS player for the GTK shell proof's G-GSD-MPRIS.
+"""A minimal MPRIS player for the GTK shell proof's G-GSD-MPRIS and
+G-NOTIFY-LOCK-MEDIA.
 
-Usage: tuna-mpris-player-stub.py MARKER [SECONDS]
+Usage: tuna-mpris-player-stub.py MARKER [SECONDS [NAME]]
 
-Owns org.mpris.MediaPlayer2.tunaproof and serves /org/mpris/MediaPlayer2
-with org.mpris.MediaPlayer2 and org.mpris.MediaPlayer2.Player: the
-methods and properties gsd-media-keys' mpris-controller.c reads or calls
+Owns org.mpris.MediaPlayer2.NAME (default tunaproof) and serves
+/org/mpris/MediaPlayer2 with org.mpris.MediaPlayer2 and
+org.mpris.MediaPlayer2.Player: the methods and properties gsd-media-keys'
+mpris-controller.c and gnome-shell's mpris.js read or call
 (PlayPause/Play/Pause/Next/Previous/Stop, Seek, PlaybackStatus,
-LoopStatus, Shuffle). MARKER gets "ready" once the name is owned,
-"properties SENDER" the first time a peer reads its properties (gsd's
-proxy loading), and "call METHOD SENDER" for every method call. Exits
-after SECONDS (default 300).
+LoopStatus, Shuffle, Metadata with a title and an artist). MARKER gets
+"ready" once the name is owned, "properties SENDER" the first time a peer
+reads its properties (gsd's proxy loading), and "call METHOD SENDER" for
+every method call. Exits after SECONDS (default 300).
 """
 import sys
 
@@ -19,7 +21,7 @@ import gi
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
-NAME = "org.mpris.MediaPlayer2.tunaproof"
+NAME = "org.mpris.MediaPlayer2." + (sys.argv[3] if len(sys.argv) > 3 else "tunaproof")
 PATH = "/org/mpris/MediaPlayer2"
 PLAYER = "org.mpris.MediaPlayer2.Player"
 XML = """
@@ -91,6 +93,7 @@ def value(name):
         "Metadata": GLib.Variant("a{sv}", {
             "mpris:trackid": GLib.Variant("o", "/org/tuna/proof/track/1"),
             "xesam:title": GLib.Variant("s", "Tuna Proof Track"),
+            "xesam:artist": GLib.Variant("as", ["Tuna Proof Artist"]),
         }),
         "Position": GLib.Variant("x", 0),
         "MinimumRate": GLib.Variant("d", 1.0), "MaximumRate": GLib.Variant("d", 1.0),

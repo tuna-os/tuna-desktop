@@ -564,7 +564,8 @@ fn source_of(n: &Notification) -> (String, Option<gio::Icon>) {
     }
 }
 
-/// The installed app a `desktop-entry` hint names, if any.
+/// The installed app a desktop id names, if any (a `desktop-entry` hint,
+/// a media player's `DesktopEntry`).
 pub(crate) fn desktop_app(id: &str) -> Option<tuna_shell_host::apps::AppEntry> {
     tuna_shell_host::apps::default_app_dirs()
         .into_iter()
