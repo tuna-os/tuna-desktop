@@ -63,6 +63,29 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
 
 
+    def test_colour_inputs_require_native_and_capture_consumers_without_rotation(self):
+        for path in ("crates/compositor/src/color_management.rs",
+                     "crates/compositor/src/color_render/raw.rs",
+                     "crates/compositor/src/drm/color.rs",
+                     "crates/compositor/src/screencast.rs",
+                     "crates/compositor/src/screenshot.rs",
+                     "crates/compositor/examples/tuna-color-cast-client.rs",
+                     "crates/compositor/tests/color_management.rs",
+                     "scripts/tuna-color-capture-proof"):
+            self.assertEqual(pr(path, size=0), ["drm-smoke", "gtk-shell", "arch-package", "marlin-vm"], path)
+        for path in ("scripts/tuna-color-gnome-reference-ci",
+                     "tests/color-hdr-vkms/tuna_hdr_vkms.c",
+                     "tests/color-dmabuf/r8-import.c"):
+            selected = set(pr(path, size=0))
+            self.assertTrue({'drm-smoke', 'marlin-vm', 'arch-package'} <= selected, path)
+
+    def test_native_colour_payload_always_requires_the_existing_vm_producer(self):
+        for path in ("scripts/tuna-colour-build", "scripts/lib/colour_vm.py"):
+            for run in (0, 4, 19):
+                self.assertEqual(pr(path, run=run, size=0), ["arch-package", "marlin-vm"], path)
+        self.assertEqual(pr("packaging/marlin/vm-lane/tuna-vm-colour", size=0),
+                         ["arch-package", "marlin-image", "marlin-vm"])
+
     def test_transition_policy_and_suite_always_run_journey(self):
         for path in ('scripts/lib/transition-package-policy.py',
                      'scripts/lib/transition-package-policy-tests.py'):
@@ -116,7 +139,10 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("scripts/tests/test_native_product.py"),
                          ["arch-package", "marlin-vm"])
         self.assertEqual(pr("scripts/tests/test_grid_cancel_proof.py"), ["grid-cancel-comparison"])
-        self.assertEqual(pr("scripts/tests/test_colord_startup.py"), ["drm-smoke"])
+        # drm-smoke's qualification closure adds the native colour consumer
+        # (NEEDS: marlin-vm, which downloads arch-package).
+        self.assertEqual(pr("scripts/tests/test_colord_startup.py"),
+                         ["drm-smoke", "arch-package", "marlin-vm"])
         # Control: a test only the always-on check job runs adds no lane.
         self.assertEqual(pr("scripts/tests/test_disk_guard.py"), [])
 
@@ -147,7 +173,10 @@ jobs:
         text = self.BASE.replace("  drm-smoke: {runs-on: *runner, steps: [{run: a}]}",
                                  "  drm-smoke: {runs-on: *runner, steps: [{run: b}]}")
         self.assertEqual(m.workflow_lanes(self.BASE, text), {"drm-smoke"})
-        self.assertEqual(m.select("pull_request", 0, 2, [m.WORKFLOW], {"drm-smoke"})[0], ["drm-smoke"])
+        # Only drm-smoke's job changed; its closure still adds the native
+        # colour consumer (NEEDS).
+        self.assertEqual(m.select("pull_request", 0, 2, [m.WORKFLOW], {"drm-smoke"})[0],
+                         ["drm-smoke", "arch-package", "marlin-vm"])
 
     def test_factory_job_belongs_to_the_marlin_vm_lane(self):
         text = self.BASE.replace("  gdm51-native-package: {runs-on: *runner, steps: [{run: a}]}",

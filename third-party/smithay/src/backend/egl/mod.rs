@@ -57,6 +57,44 @@ use std::ffi::CString;
 #[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
 use std::sync::Arc;
 
+/// The YCbCr-to-RGB matrix an imported dmabuf is sampled with
+/// (`EGL_YUV_COLOR_SPACE_HINT_EXT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum YuvColorSpace {
+    /// ITU-R BT.601
+    Rec601,
+    /// ITU-R BT.709
+    Rec709,
+    /// ITU-R BT.2020
+    Rec2020,
+}
+
+/// The quantization range of an imported YCbCr dmabuf
+/// (`EGL_SAMPLE_RANGE_HINT_EXT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum YuvRange {
+    /// Full range
+    Full,
+    /// Narrow (limited) range
+    Narrow,
+}
+
+/// How a YCbCr dmabuf is converted to RGB when it is imported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct YuvConversion {
+    /// The conversion matrix
+    pub color_space: YuvColorSpace,
+    /// The quantization range
+    pub range: YuvRange,
+}
+
+/// Surface data (in a surface's `data_map`) asking the GLES renderer to
+/// import the surface's YCbCr dmabufs with this conversion. Without it,
+/// or with `None`, the EGL implementation's default applies.
+#[cfg(feature = "wayland_frontend")]
+#[derive(Debug, Default)]
+pub struct YuvConversionHint(pub std::sync::Mutex<Option<YuvConversion>>);
+
 /// Error that can happen on optional EGL features
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EglExtensionNotSupportedError(pub &'static [&'static str]);

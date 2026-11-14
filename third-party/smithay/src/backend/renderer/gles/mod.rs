@@ -301,6 +301,8 @@ pub struct GlesRenderer {
     // caches
     buffers: Vec<GlesBuffer>,
     dmabuf_cache: HashMap<WeakDmabuf, GlesTexture>,
+    /// The YCbCr conversion each cached dmabuf was imported with, when set.
+    dmabuf_conversions: HashMap<WeakDmabuf, crate::backend::egl::YuvConversion>,
     vbos: [ffi::types::GLuint; 2],
     vertices: Vec<f32>,
     non_opaque_damage: Vec<Rectangle<i32, Physical>>,
@@ -635,6 +637,7 @@ impl GlesRenderer {
 
             buffers: Vec::new(),
             dmabuf_cache: std::collections::HashMap::new(),
+            dmabuf_conversions: std::collections::HashMap::new(),
             vertices: Vec::with_capacity(6 * 16),
             non_opaque_damage: Vec::with_capacity(16),
             opaque_damage: Vec::with_capacity(16),
@@ -709,6 +712,7 @@ impl GlesRenderer {
     #[profiling::function]
     fn cleanup(&mut self) {
         self.dmabuf_cache.retain(|entry, _tex| !entry.is_gone());
+        self.dmabuf_conversions.retain(|entry, _| !entry.is_gone());
         // Free outdated buffer resources
         // TODO: Replace with `drain_filter` once it lands
         let mut i = 0;
@@ -1198,6 +1202,112 @@ impl ImportDma for GlesRenderer {
         buffer: &Dmabuf,
         _damage: Option<&[Rectangle<i32, BufferCoord>]>,
     ) -> Result<GlesTexture, GlesError> {
+        self.import_dmabuf_converted(buffer, None)
+    }
+
+    fn dmabuf_formats(&self) -> FormatSet {
+        self.egl.dmabuf_texture_formats().clone()
+    }
+
+    fn has_dmabuf_format(&self, format: Format) -> bool {
+        self.egl.dmabuf_texture_formats().contains(&format)
+    }
+}
+
+impl GlesRenderer {
+    /// Import a single-plane RGB component view without YUV conversion.
+    ///
+    /// The caller must describe the actual component layout, not a YUV format.
+    /// Only formats advertised for non-external sampling are accepted. In
+    /// particular this never falls back to a driver's YUV conversion.
+    pub fn import_dmabuf_raw(&mut self, buffer: &Dmabuf) -> Result<GlesTexture, GlesError> {
+        use crate::backend::allocator::{Buffer, Fourcc};
+        if buffer.num_planes() != 1
+            || !matches!(
+                buffer.format().code,
+                Fourcc::R8
+                    | Fourcc::R16
+                    | Fourcc::Gr88
+                    | Fourcc::Gr1616
+                    | Fourcc::Argb8888
+                    | Fourcc::Abgr8888
+            )
+            || !self.egl.dmabuf_render_formats().contains(&buffer.format())
+        {
+            return Err(GlesError::UnsupportedPixelFormat(buffer.format().code));
+        }
+        if !self.extensions.iter().any(|ext| ext == "GL_OES_EGL_image") {
+            return Err(GlesError::GLExtensionNotSupported(&["GL_OES_EGL_image"]));
+        }
+        unsafe {
+            self.egl.make_current()?;
+            while self.gl.GetError() != ffi::NO_ERROR {}
+        }
+        let image = self
+            .egl
+            .display()
+            .create_image_from_dmabuf(buffer)
+            .map_err(GlesError::BindBufferEGLError)?;
+        let texture = match self.import_egl_image(image, false, None) {
+            Ok(texture) => texture,
+            Err(error) => {
+                let _ = self
+                    .destruction_callback_sender
+                    .send(CleanupResource::EGLImage(image));
+                return Err(error);
+            }
+        };
+        if unsafe { self.gl.GetError() } != ffi::NO_ERROR {
+            let _ = self
+                .destruction_callback_sender
+                .send(CleanupResource::Texture(texture));
+            let _ = self
+                .destruction_callback_sender
+                .send(CleanupResource::EGLImage(image));
+            return Err(GlesError::UnsupportedPixelFormat(buffer.format().code));
+        }
+        Ok(GlesTexture(Arc::new(GlesTextureInternal {
+            texture,
+            sync: RwLock::default(),
+            read_sync: ReadSync::default(),
+            // Component views are sampled by a custom shader, without the
+            // regular memory-import shader's format swizzles.
+            format: Some(ffi::RGBA8),
+            has_alpha: true,
+            is_external: false,
+            y_inverted: buffer.y_inverted(),
+            size: buffer.size(),
+            egl_images: Some(vec![image]),
+            destruction_callback_sender: self.destruction_callback_sender.clone(),
+        })))
+    }
+
+    /// Import a dmabuf as [`ImportDma::import_dmabuf`] does, sampling
+    /// external (YCbCr) formats with `conversion`. A buffer imported
+    /// before with another conversion is imported anew.
+    #[instrument(level = "trace", parent = &self.span, skip(self))]
+    #[profiling::function]
+    pub fn import_dmabuf_with_conversion(
+        &mut self,
+        buffer: &Dmabuf,
+        conversion: Option<crate::backend::egl::YuvConversion>,
+    ) -> Result<GlesTexture, GlesError> {
+        let weak = buffer.weak();
+        if self.dmabuf_conversions.get(&weak).copied() != conversion {
+            self.dmabuf_cache.remove(&weak);
+            match conversion {
+                Some(conversion) => self.dmabuf_conversions.insert(weak, conversion),
+                None => self.dmabuf_conversions.remove(&weak),
+            };
+        }
+        self.import_dmabuf_converted(buffer, conversion)
+    }
+
+    fn import_dmabuf_converted(
+        &mut self,
+        buffer: &Dmabuf,
+        conversion: Option<crate::backend::egl::YuvConversion>,
+    ) -> Result<GlesTexture, GlesError> {
         use crate::backend::allocator::Buffer;
         if !self.extensions.iter().any(|ext| ext == "GL_OES_EGL_image") {
             return Err(GlesError::GLExtensionNotSupported(&["GL_OES_EGL_image"]));
@@ -1208,7 +1318,7 @@ impl ImportDma for GlesRenderer {
             let image = self
                 .egl
                 .display()
-                .create_image_from_dmabuf(buffer)
+                .create_image_from_dmabuf_with_conversion(buffer, conversion.filter(|_| is_external))
                 .map_err(GlesError::BindBufferEGLError)?;
 
             let tex = self.import_egl_image(image, is_external, None)?;
@@ -1232,18 +1342,24 @@ impl ImportDma for GlesRenderer {
             Ok(texture)
         })
     }
-
-    fn dmabuf_formats(&self) -> FormatSet {
-        self.egl.dmabuf_texture_formats().clone()
-    }
-
-    fn has_dmabuf_format(&self, format: Format) -> bool {
-        self.egl.dmabuf_texture_formats().contains(&format)
-    }
 }
 
 #[cfg(feature = "wayland_frontend")]
-impl ImportDmaWl for GlesRenderer {}
+impl ImportDmaWl for GlesRenderer {
+    fn import_dma_buffer(
+        &mut self,
+        buffer: &wayland_server::protocol::wl_buffer::WlBuffer,
+        surface: Option<&crate::wayland::compositor::SurfaceData>,
+        _damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Result<GlesTexture, GlesError> {
+        let dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
+            .expect("import_dma_buffer without checking buffer type?");
+        let conversion = surface
+            .and_then(|states| states.data_map.get::<crate::backend::egl::YuvConversionHint>())
+            .and_then(|hint| *hint.0.lock().unwrap());
+        self.import_dmabuf_with_conversion(dmabuf, conversion)
+    }
+}
 
 impl GlesRenderer {
     #[profiling::function]
@@ -2015,6 +2131,65 @@ impl GlesRenderer {
 }
 
 impl GlesFrame<'_, '_> {
+    /// Sample additional 2D textures during `draw`, retaining their read locks
+    /// and applying the same upload waits and read fences as normal draws.
+    ///
+    /// Units must be distinct, nonzero and within the GL implementation's
+    /// texture-unit limit. The caller owns these bindings; they are cleared on
+    /// return, including when `draw` returns an error.
+    pub fn with_texture_bindings<R, const N: usize>(
+        &mut self,
+        textures: &[(u32, &GlesTexture); N],
+        draw: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let locks = textures.each_ref().map(|(_, t)| t.0.sync.read().unwrap());
+        for ((unit, texture), lock) in textures.iter().zip(&locks) {
+            assert!(*unit > 0 && !texture.0.is_external);
+            unsafe {
+                let gl = &self.renderer.gl;
+                lock.wait_for_upload(gl);
+                gl.ActiveTexture(ffi::TEXTURE0 + unit);
+                gl.BindTexture(ffi::TEXTURE_2D, texture.0.texture);
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+            }
+        }
+        unsafe {
+            self.renderer.gl.ActiveTexture(ffi::TEXTURE0);
+        }
+        let result = draw(self);
+        let fencing = self.renderer.capabilities.contains(&Capability::Fencing);
+        let shared = self.renderer.egl.is_shared();
+        for (unit, texture) in textures {
+            unsafe {
+                let gl = &self.renderer.gl;
+                gl.ActiveTexture(ffi::TEXTURE0 + unit);
+                gl.BindTexture(ffi::TEXTURE_2D, 0);
+                if fencing && shared {
+                    texture
+                        .0
+                        .read_sync
+                        .update(gl, texture.0.destruction_callback_sender.clone());
+                } else if shared {
+                    gl.Finish();
+                }
+            }
+            if fencing && !shared {
+                let reads = &mut self.renderer.frame_reads;
+                if !reads.iter().any(|(read, _)| Arc::ptr_eq(&read.0, &texture.0)) {
+                    reads.push(((*texture).clone(), None));
+                }
+            }
+        }
+        unsafe {
+            self.renderer.gl.ActiveTexture(ffi::TEXTURE0);
+        }
+        drop(locks);
+        result
+    }
+
     /// Run custom code in the GL context owned by this renderer.
     ///
     /// The OpenGL state of the renderer is considered an implementation detail

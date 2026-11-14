@@ -86,12 +86,19 @@ mod a11y_shadow;
 pub mod animation;
 pub mod animation_clock;
 mod auth_owner;
+mod background_blur;
+pub mod background_effect;
 mod bell;
 pub mod buffer_upload;
 pub mod capture_security;
 mod client_listener;
 pub mod clipboard_manager;
+pub mod color_management;
 pub mod color_manager;
+#[cfg(feature = "drm")]
+pub(crate) mod color_output;
+pub(crate) mod color_render;
+pub mod color_state;
 mod constraint_motion;
 pub mod control;
 mod control_readiness;
@@ -764,6 +771,7 @@ impl CompositorHandler for State {
         self.pointer_scene_dirty = true;
         self.initial_outputs.remove(surface);
         self.window_icons.remove(surface);
+        self.protocols.color.surface_destroyed(surface);
     }
 
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -796,6 +804,7 @@ impl CompositorHandler for State {
     /// role is gone it marks the meaningless pending state as anchored on
     /// every edge, which the validator accepts.
     fn new_surface(&mut self, surface: &wl_surface::WlSurface) {
+        self.protocols.color.track(surface);
         smithay::wayland::compositor::add_pre_commit_hook::<State, _>(
             surface,
             |state, _dh, surface| {
@@ -815,6 +824,8 @@ impl CompositorHandler for State {
         self.pointer_scene_dirty = true;
         self.commit_count = self.commit_count.wrapping_add(1);
         on_commit_buffer_handler::<State>(surface);
+        crate::color_management::damage_changed(surface);
+        self.check_color_representation_tree(surface);
         self.committed.push(surface);
         self.window_icons.commit(surface);
         self.popups.commit(surface);
@@ -1346,6 +1357,7 @@ impl State {
             self.retired_output_globals.push(id);
         }
         self.outputs.remove(index);
+        self.protocols.color.output_removed(name);
         if was_primary {
             if let Some(first) = self.outputs.first_mut() {
                 first.primary = true;
@@ -1672,6 +1684,7 @@ impl TestCompositor {
     /// blocking on either side.
     pub fn pump(&mut self) {
         self.display.dispatch_clients(&mut self.state).unwrap();
+        self.state.send_color_information();
         self.state.retain_clipboard();
         let listeners = self.security_listeners.handle();
         for (source, context) in self.state.take_security_contexts() {

@@ -116,6 +116,19 @@ impl Occlusion {
         Rectangle::subtract_rects_many(self.damage.iter().copied(), self.covered.iter().copied())
     }
 
+    /// Let everything still to visit repaint `rects` again, whatever
+    /// covers them: a background blur's sample area, which reads what is
+    /// under its surface (Mutter takes it out of the opaque region).
+    pub(crate) fn uncover(&mut self, rects: &[PhysicalRect]) {
+        if self.covered.is_empty() || rects.is_empty() {
+            return;
+        }
+        self.covered = Rectangle::subtract_rects_many(
+            std::mem::take(&mut self.covered),
+            rects.iter().copied(),
+        );
+    }
+
     pub(crate) fn rendered(&self) -> usize {
         self.rendered
     }
@@ -170,22 +183,33 @@ where
                 r
             })
             .collect();
-        // Only on a target without a transform: on the nested (flipped)
-        // target GLES left the opaque regions in the wrong place. And only
-        // for an element drawn pixel for pixel from its buffer: a scaled
-        // one (an overview preview, a window opening) rounds its opaque
-        // region out over edge pixels it covers only in part.
-        let src = element.src().size;
-        let one_to_one = (src.w - f64::from(geometry.size.w)).abs() < 0.5
-            && (src.h - f64::from(geometry.size.h)).abs() < 0.5;
-        let opaque_regions = if opaque && one_to_one {
-            element.opaque_regions(scale.into())
-        } else {
-            Default::default()
-        };
+        let opaque_regions = drawn_opaque_regions(element, geometry, scale, opaque);
         element.draw(frame, element.src(), geometry, &damage, &opaque_regions)?;
     }
     Ok(())
+}
+
+/// What `element`, drawn at `geometry`, may draw without blending: its
+/// opaque regions with `opaque`, none otherwise. Only on a target without
+/// a transform: on the nested (flipped) target GLES left the opaque
+/// regions in the wrong place. And only for an element drawn pixel for
+/// pixel from its buffer: a scaled one (an overview preview, a window
+/// opening) rounds its opaque region out over edge pixels it covers only
+/// in part.
+pub(crate) fn drawn_opaque_regions<E: Element>(
+    element: &E,
+    geometry: PhysicalRect,
+    scale: f64,
+    opaque: bool,
+) -> smithay::backend::renderer::utils::OpaqueRegions<i32, Physical> {
+    let src = element.src().size;
+    let one_to_one = (src.w - f64::from(geometry.size.w)).abs() < 0.5
+        && (src.h - f64::from(geometry.size.h)).abs() < 0.5;
+    if opaque && one_to_one {
+        element.opaque_regions(scale.into())
+    } else {
+        Default::default()
+    }
 }
 
 /// What one drawn frame did: elements repainted and culled, and for each
@@ -371,6 +395,27 @@ mod tests {
         let visible = occlusion.visit(rect(320, 100, 640, 400), std::iter::empty());
         assert_eq!(area(&visible), 320 * 400);
         assert!(visible.iter().all(|r| r.loc.x >= 640));
+    }
+
+    #[test]
+    fn a_blur_sample_area_repaints_beneath_opaque_surfaces() {
+        // An opaque window with a blur region: what is under its sample
+        // area repaints for the blur to read, the rest stays culled.
+        let mut occlusion = Occlusion::new(full(), &[full()]);
+        let window = rect(100, 100, 400, 300);
+        assert_eq!(
+            occlusion.visit(window, [rect(0, 0, 400, 300)]),
+            vec![window]
+        );
+        let sample = rect(152, 152, 196, 96);
+        occlusion.uncover(&[sample]);
+        let below = occlusion.visit(full(), [rect(0, 0, OUTPUT.0, OUTPUT.1)]);
+        assert_eq!(
+            area(&below),
+            i64::from(OUTPUT.0 * OUTPUT.1) - 400 * 300 + 196 * 96
+        );
+        assert!(below.iter().any(|r| r.contains((200, 200))));
+        assert!(!below.iter().any(|r| r.contains((120, 120))));
     }
 
     #[test]

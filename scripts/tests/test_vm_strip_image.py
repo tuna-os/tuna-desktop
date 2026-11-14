@@ -1,6 +1,7 @@
 """Original package/image/source identity negatives; no image or guest execution."""
 import copy
 import hashlib
+import json
 from pathlib import Path
 import sys
 import subprocess
@@ -66,6 +67,63 @@ class Tests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 admission(package, observed, *args)
 
+    def test_colour_admission_binds_actual_overlay_bytes_and_source_revision(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            expected = {'/usr/bin/tuna-compositor': 'a' * 64}
+            sources = {**{('/usr/libexec/' + name): ('packaging/marlin/vm-lane/' + name)
+                          for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus')},
+                       **fixture_members('colour')}
+            # The overlay is a CI build artifact outside the source tree: the
+            # source commit is recorded inside it, after that commit exists.
+            overlay = {installed: source for installed, source in sources.items()
+                       if source.startswith('native-colour-overlay/')}
+            for installed, source in sources.items():
+                if installed in overlay:
+                    continue
+                path = root / source
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(installed.encode())
+                expected[installed] = hashlib.sha256(path.read_bytes()).hexdigest()
+            inventory = root / 'scripts/lib/maintained-media.tsv'
+            inventory.parent.mkdir(parents=True)
+            inventory.write_bytes(INVENTORY.read_bytes())
+            def git(*arguments):
+                return subprocess.check_output(['git', '-C', str(root), *arguments],
+                                               text=True, stderr=subprocess.PIPE).strip()
+            git('init', '-q')
+            git('config', 'user.name', 'Controlled immutable image admission')
+            git('config', 'user.email', 'controlled@example.invalid')
+            git('add', '.')
+            git('commit', '-qm', 'Actual fixture source snapshot')
+            commit = git('rev-parse', 'HEAD')
+            for installed, source in overlay.items():
+                if installed == '/usr/share/tuna-colour/source.json':
+                    continue
+                path = root / source
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(installed.encode())
+                expected[installed] = hashlib.sha256(path.read_bytes()).hexdigest()
+            receipt = {'revision': commit, 'installed_signed_release_qualified': False,
+                       'elf_sha256': {name: expected['/usr/libexec/tuna-colour/' + name]
+                                      for name in ('unit', 'pixel', 'yuv', 'cast')}}
+            source_receipt = root / sources['/usr/share/tuna-colour/source.json']
+            source_receipt.parent.mkdir(parents=True)
+            source_receipt.write_text(json.dumps(receipt))
+            expected['/usr/share/tuna-colour/source.json'] = hashlib.sha256(source_receipt.read_bytes()).hexdigest()
+            package = {'package': {'sha256': 'b' * 64}, 'required_members':
+                       {'usr/bin/tuna-compositor': {'sha256': 'a' * 64}}}
+            observed = {'schema': 1, 'image_id': 'sha256:' + 'c' * 64, 'member_sha256': expected}
+            args = (root, commit, observed['image_id'], 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'e' * 64)
+            self.assertEqual(admission(package, observed, *args, fixture='colour')['member_sha256'], expected)
+            (root / sources['/usr/libexec/tuna-colour/cast']).write_bytes(b'changed native consumer')
+            with self.assertRaisesRegex(ValueError, 'ELF receipt'):
+                admission(package, observed, *args, fixture='colour')
+            receipt['revision'] = 'f' * 40
+            source_receipt.write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(ValueError, 'exact source'):
+                admission(package, observed, *args, fixture='colour')
+
     def test_native_autotz_requires_every_original_observer(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
@@ -105,6 +163,9 @@ class Tests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     admission(package, altered, *args, fixture='autotz')
 
+    def test_unknown_privileged_fixture_is_rejected(self):
+        with self.assertRaises(ValueError):
+            fixture_members('arbitrary-path')
 
 
 if __name__ == '__main__':

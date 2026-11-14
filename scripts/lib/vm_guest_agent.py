@@ -284,9 +284,11 @@ class GuestAgent:
     """
     MAX_REPLY = 1024 * 1024
 
+    # The consumer's absolute deadline covers acquisition and all nested QGA
+    # operations; reconnecting cannot reset its finite action budget.
     def __init__(self, path, *, deadline=None):
         if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
-            raise ValueError("finite absolute guest-agent deadline required")
+            raise ValueError("finite absolute guest-agent acquisition/command deadline required")
         self._caller_deadline = deadline
         self._path = path
         self.buffer = bytearray()

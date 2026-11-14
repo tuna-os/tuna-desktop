@@ -258,7 +258,7 @@ class PackagePolicy(unittest.TestCase):
         self.env = dict(os.environ, PATH=str(self.tools) + ':' + os.environ['PATH'], FIXTURE=str(self.stage))
         self.tool('dpkg-deb', '''case "$1" in
 -c) find "$FIXTURE" -type f | while read -r path; do echo "-rwxr-xr-x $path"; done ;;
--f) case "$3" in Version) echo 0.1.0 ;; Depends) echo 'libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.0), libpam0g, gsettings-desktop-schemas, gnome-settings-daemon-common' ;; Replaces|Conflicts|Provides) echo roost ;; esac ;;  # tuna-rename: keep
+-f) case "$3" in Version) echo 0.1.0 ;; Depends) echo 'libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.0), libpam0g, gsettings-desktop-schemas, gnome-settings-daemon-common, colord, gnome-color-manager' ;; Replaces|Conflicts|Provides) echo roost ;; esac ;;  # tuna-rename: keep
 -x) cp -pR "$FIXTURE/." "$3/" ;;
 --ctrl-tarfile) tar --owner=0 --group=0 -C "$FIXTURE" -cf - ./conffiles ;;
 --fsys-tarfile) tar --owner=0 --group=0 -C "$FIXTURE" -cf - ./usr ./etc ;;
@@ -367,6 +367,14 @@ esac''')
         path = self.tools / 'dpkg-deb'
         path.write_text(path.read_text().replace(', gnome-settings-daemon-common', ''))
         self.assertNotEqual(self.check(), 0)
+
+    def test_missing_native_colour_runtime_dependency_rejected(self):
+        path = self.tools / 'dpkg-deb'
+        original = path.read_text()
+        for dependency in ('colord', 'gnome-color-manager'):
+            with self.subTest(dependency=dependency):
+                path.write_text(original.replace(', ' + dependency, ''))
+                self.assertNotEqual(self.check(), 0)
 
     def test_launcher_override_denies_before_any_process(self):
         result = subprocess.run(['sh', str(ROOT / 'scripts/lib/tuna-proof-session-launch'), '1', str(ROOT), 'owned'], env=dict(self.env, TUNA_SHELL_BIN='/tmp/wrong'), timeout=5)

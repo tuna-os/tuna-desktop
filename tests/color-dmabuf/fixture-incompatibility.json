@@ -1,0 +1,59 @@
+{
+  "schema": 1,
+  "classification": "vkms imported GEM dumb-map incompatibility",
+  "qualification": "failed",
+  "not_a_generic_r8_or_mesa_incapability": true,
+  "original_ci": {
+    "run_id": 41275157224,
+    "source_commit": "2fde4e4ab1acdeda0b7cfb1c744f013a7bda586c",
+    "job_id": 124755817701,
+    "job_url": "https://github.com/tuna-os/tuna-desktop/actions/runs/41275157224/job/124755817701",
+    "artifact_id": 13071391808,
+    "artifact_digest": "sha256:2a43cf813196ec54948d2e221c6bcec42897aad20459f31e2f6b7b5984c5413c",
+    "assertions_sha256": "4591b8df01e8e32520c31778c06f9326c7b28473b8bf53da22808d8a90bf5523",
+    "fatal_assertion": "D-COLOR-YUV fail actual DMA-heap/GBM/EGL pixel proof failed (color-yuv-import.log)",
+    "independent_c_source_sha256": "63e6648981e3cfc8165e52aa7f334990e0ec78fc74b20cf87e4c3544d99f6377",
+    "independent_c_log_sha256": "7764a369d858b2474ba4b80ea51243b85ee1dc1ee785b8e80ac46ef5768e4ac1",
+    "observed_failure": "SIGSEGV in llvmpipe at imported linear R8 glFinish before auxiliary samplers or YUV conversion",
+    "ioctl_trace_available": false
+  },
+  "independent_native_trace": {
+    "source_commit": "ca7209e8",
+    "source_path": "tests/color-dmabuf/r8-import.c",
+    "source_sha256": "5952e49b9f8e5de27e82cd3122caf21522d20d99a1064a0f242824deefdb2a2e",
+    "kernel": "6.8.0-147-generic",
+    "drm_driver": "vkms",
+    "egl_vendor": "Mesa Project",
+    "gl_renderer": "llvmpipe (LLVM 20.1.2, 256 bits)",
+    "gl_version": "OpenGL ES 3.2 Mesa 25.2.8-0ubuntu0.24.04.4",
+    "same_default_shader_controls": {
+      "ordinary_rgba": {"checked_pixels": 64, "mismatches": 0},
+      "ordinary_uploaded_r8": {"checked_pixels": 64, "mismatches": 0}
+    },
+    "driver_prime_fd_to_handle": {"fd": 4, "dma_fd": 12, "return": 0, "gem_handle": 1},
+    "driver_map_dumb": {"fd": 4, "gem_handle": 1, "return": -22, "errno": "EINVAL", "observed_attempts": 3},
+    "failure": "SIGSEGV at imported R8 glFinish; faulting byte load reads NULL",
+    "observation": "GDB ioctl syscall catchpoints only; no extra application PRIME import, GEM close, map or sampling path",
+    "application_lifetimes": "DMA-heap fd and mapping, EGLImage and GL texture retained through GPU completion; CPU WRITE START/END synchronization",
+    "raw_cores": "disabled",
+    "backtrace_frame_bound": 8,
+    "private_trace_receipt": "artifact://24992",
+    "private_retained_directory": "/tmp/colour-yuv-native-recovery"
+  },
+  "source_evidence": {
+    "mesa_importer": "https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-25.2.8/src/gallium/winsys/sw/kms-dri/kms_dri_sw_winsys.c",
+    "mesa_texture_map": "https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-25.2.8/src/gallium/drivers/llvmpipe/lp_texture.c",
+    "linux_6_8_imported_gem_rejection": "https://github.com/torvalds/linux/blob/v6.8/drivers/gpu/drm/drm_gem.c#L324-L328",
+    "linux_7_0_imported_gem_rejection": "https://github.com/torvalds/linux/blob/v7.0/drivers/gpu/drm/drm_gem.c#L453-L457"
+  },
+  "owner_approved_gate_migration": {
+    "positive_required_route": "additional required native DEV virgl colour profile",
+    "unchanged_unit": "color_render::raw_tests::real_dmabuf_identity_component_import_qualification",
+    "unit_formats": ["Nv12", "Nv21", "Yuv420", "Yvu420", "P010", "P012", "P016", "P210", "Ayuv", "Yuyv", "Uyvy"],
+    "unchanged_live_capture_formats": ["nv12", "p010"],
+    "unchanged_live_capture_coefficients": ["identity-full", "identity-limited", "bt601-full", "bt601-limited", "bt709-full", "bt709-limited", "bt2020-full", "bt2020-limited", "unset"],
+    "ordinary_software_drm_and_calibration": "required and unchanged",
+    "new_route_qualification": "not established by this classified failure receipt; every native sample, readback and capture must actually pass",
+    "normal_two_tuna_gpu_rows": "unchanged"
+  }
+}

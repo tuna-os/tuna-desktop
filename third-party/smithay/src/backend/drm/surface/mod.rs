@@ -157,6 +157,21 @@ pub struct PlaneConfig<'a> {
     pub fence: Option<BorrowedFd<'a>>,
 }
 
+/// Connector encoding properties staged with the primary-plane commit.
+/// Blob IDs remain owned by the caller until this state is replaced in both
+/// pending and committed state (or the surface is destroyed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorColorState {
+    /// Connector carrying the encoded primary framebuffer.
+    pub connector: connector::Handle,
+    /// Discovered `Colorspace` enum value.
+    pub colorspace: Option<u64>,
+    /// Discovered `max bpc` value.
+    pub max_bpc: Option<u64>,
+    /// `HDR_OUTPUT_METADATA` blob ID, zero to disable HDR.
+    pub hdr_metadata: Option<u64>,
+}
+
 /// VRR support state
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VrrSupport {
@@ -301,6 +316,17 @@ impl DrmSurface {
         match &*self.internal {
             DrmSurfaceInternal::Atomic(surf) => surf.use_mode(mode),
             DrmSurfaceInternal::Legacy(surf) => surf.use_mode(mode),
+        }
+    }
+    /// Stage connector encoding for the next atomic commit. Call
+    /// `test_state` with the actual framebuffer before accepting a change.
+    pub fn set_connector_color(&self, colors: Vec<ConnectorColorState>) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.set_connector_color(colors),
+            DrmSurfaceInternal::Legacy(_) => Err(Error::UnknownProperty {
+                handle: self.crtc.into(),
+                name: "HDR_OUTPUT_METADATA",
+            }),
         }
     }
 

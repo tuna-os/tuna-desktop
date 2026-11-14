@@ -339,7 +339,8 @@ pub mod jiff_like {
     }
 }
 
-/// Encode RGBA8 rows (top-down) as a PNG at `path`, creating its dir.
+/// Encode capture-target RGBA8 rows (top-down, BT.709 primaries and
+/// gamma 2.2) as a PNG at `path`, creating its dir.
 pub fn save_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -348,6 +349,16 @@ pub fn save_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> std::io::R
     let mut encoder = png::Encoder::new(file, width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
+    // Capture rendering uses Mutter 51's SDR target, not the monitor's
+    // ICC/HDR state. Its transfer function is gamma 2.2, not piecewise
+    // sRGB: describe the actual encoding with gAMA/cHRM, never sRGB/iCCP.
+    encoder.set_source_gamma(png::ScaledFloat::from_scaled(45455));
+    encoder.set_source_chromaticities(png::SourceChromaticities::new(
+        (0.3127, 0.3290),
+        (0.6400, 0.3300),
+        (0.3000, 0.6000),
+        (0.1500, 0.0600),
+    ));
     let mut writer = encoder
         .write_header()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -408,6 +419,26 @@ mod tests {
         let decoder =
             png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap()));
         let mut reader = decoder.read_info().unwrap();
+        let metadata = reader.info();
+        assert_eq!(
+            metadata.gama_chunk,
+            Some(png::ScaledFloat::from_scaled(45455))
+        );
+        assert_eq!(
+            metadata.chrm_chunk,
+            Some(png::SourceChromaticities::new(
+                (0.3127, 0.3290),
+                (0.6400, 0.3300),
+                (0.3000, 0.6000),
+                (0.1500, 0.0600),
+            ))
+        );
+        assert_eq!(metadata.srgb, None, "gamma 2.2 is not piecewise sRGB");
+        assert!(metadata.icc_profile.is_none(), "no physical output profile");
+        assert!(
+            metadata.coding_independent_code_points.is_none(),
+            "no HDR claim"
+        );
         let mut buf = vec![0; reader.output_buffer_size().unwrap()];
         let info = reader.next_frame(&mut buf).unwrap();
         assert_eq!((info.width, info.height), (2, 1));
