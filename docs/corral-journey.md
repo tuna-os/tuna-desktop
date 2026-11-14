@@ -91,6 +91,10 @@ remains the full daily-driver journey. See the
 [digest-pinned variant matrix](v1-variant-qualification.md) for sequential
 orchestration and the distinction between portal availability and functional
 capture/consent qualification.
+For the upgrade, rollback and crash-recovery proof of the v1 safety-net
+gate, add `--upgrade-to` with a second digest; it replaces the tour with the
+steps in [upgrade-recovery.md](upgrade-recovery.md) and records
+`scope: upgrade-recovery`.
 The native Screenshot requester remains connected until the actual portal
 Response and retains a returned PNG, without app-ID or consent bypass. Its
 request-time console frame requires visual review; a successful PNG response

@@ -312,6 +312,9 @@ compositor's unlock, Arch replacement and Marlin activation/rollback need
 their own native results; archive, user-namespace dpkg and private-PAM
 mechanisms cannot stand in for those tests. Do not remove the bridge based
 only on elapsed releases or the fact that the beta was installed.
+For the Marlin image, run the [upgrade, rollback and crash-recovery
+proof](upgrade-recovery.md) from the previous published digest to the
+candidate's digest.
 
 Uninstalling removes the Tuna Desktop-owned program files and session entries; user configuration and application data
 are preserved.
