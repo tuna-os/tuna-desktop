@@ -148,6 +148,34 @@ class AutomaticTimezoneSemanticControls(unittest.TestCase):
                 value["geoclue"]["interval_observation"][field] = changed
                 self.assertFalse(AUTOTZ.positive_ready(value, self.original))
 
+    def test_guest_computed_deadline_is_admitted_despite_float_rounding(self):
+        # Monitor start instants from failing CI runs 43499426523 and 43472149760,
+        # where `deadline - started` rounds to 44.000000000000014, and passing run
+        # 43529695290, where it rounds to 43.999999999999986.
+        for started in (97.618143743, 104.999872142, 107.361875501):
+            with self.subTest(started=started):
+                deadline = started + GUEST.MONITOR_SECONDS - 1
+                value = observation()
+                value["monitor"]["liveness"].update(
+                    started_monotonic=started, checked_monotonic=started + 3,
+                    deadline_monotonic=deadline)
+                value["geoclue"]["interval_observation"].update(
+                    started_monotonic=started, acknowledged_monotonic=started + 0.05,
+                    observed_through_monotonic=started + 3, deadline_monotonic=deadline)
+                value["timezone_calls"][0]["monotonic"] = started + 1
+                self.assertTrue(AUTOTZ.positive_ready(value, self.original))
+
+    def test_interval_longer_than_monitor_lifetime_is_rejected(self):
+        started = 97.618143743
+        deadline = started + GUEST.MONITOR_SECONDS - 1 + 1e-9
+        self.value["monitor"]["liveness"].update(
+            started_monotonic=started, checked_monotonic=started + 3, deadline_monotonic=deadline)
+        self.value["geoclue"]["interval_observation"].update(
+            started_monotonic=started, acknowledged_monotonic=started + 0.05,
+            observed_through_monotonic=started + 3, deadline_monotonic=deadline)
+        self.value["timezone_calls"][0]["monotonic"] = started + 1
+        self.assertFalse(AUTOTZ.positive_ready(self.value, self.original))
+
     def test_no_method_call_means_no_automatic_positive(self):
         self.value["timezone_calls"] = []
         self.assertFalse(AUTOTZ.positive_ready(self.value, self.original))

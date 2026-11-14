@@ -191,6 +191,20 @@ Its receipt explicitly names the profile as restoration owner, and the
 whole profile cannot qualify without those actual restoration readbacks.
 The default standalone mode owns the same complete cleanup sequence itself.
 
+### Monitor interval bound (#1127)
+
+Main run [43499426523](https://github.com/tuna-os/tuna-desktop/actions/runs/43499426523)
+and #1090 run [43472149760](https://github.com/tuna-os/tuna-desktop/actions/runs/43472149760)
+failed `V-AUTOTZ` although every automatic snapshot already showed the
+daemon's `SetTimezone`, the New York client location and matching
+`/etc/localtime`. The host rejected the live interval: the guest monitor's
+deadline is `started + MONITOR_SECONDS - 1`, but the host bounded
+`deadline - started`, which rounds to 44.000000000000014 for start instants
+such as 97.618143743 and 104.999872142. Readiness then never held, and the
+30-second budget expired mid-snapshot. The host now bounds `deadline` with the
+same expression the guest used, so the bound stays exactly 44 s and any
+longer interval is still rejected.
+
 ## Running
 
 Unit tests (no VM, no privileges, no clock writes):
