@@ -63,15 +63,24 @@ GNOME 51 `org.gnome.desktop.a11y.interface reduced-motion` is read live and comb
 | org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout, sleep-inactive-ac-type, sleep-inactive-battery-timeout, sleep-inactive-battery-type, power-saver-profile-on-low-battery, ambient-enabled | Honored (unqualified) | Consumed by the running gsd-power; automatic suspend, battery policy and ambient light are not proven (gsd-power never suspends a VM) |
 | org.gnome.settings-daemon.plugins.power power-button-action | Honored | gsd-media-keys holds logind's `handle-power-key`, `handle-suspend-key` and `handle-hibernate-key` block inhibitor, so logind's HandlePowerKey never applies. The power key follows the key live, as in GNOME 51: `interactive` calls `org.gnome.SessionManager.Shutdown`, which opens the shell's end-session dialog (nothing while locked); `suspend` and `hibernate` go through logind and fall back to the dialog when logind cannot do them; `nothing` does nothing. gsd 51 powers a virtual machine (hostnamed chassis `vm`) off for every value except `nothing`. Proof V-POWER-BUTTON |
 
-Wallpaper source observations run on bounded workers, with one-second re-observation
-eligibility rather than filesystem reads on the frame thread. File identities include
-the bounded source's SHA-256 as well as device, inode, size and nanosecond mtime/ctime:
-same-length in-place edits must invalidate static caches and slideshow epochs even
-when the filesystem coalesces timestamps. Decode workers validate the bytes against
-the observed digest and recheck source identities before publishing. Native SVG
-FontConfig directory observations also re-enumerate sorted raw member names before
-accepting a receipt; unchanged directory metadata alone does not prove membership
-is unchanged.
+Wallpaper source observations run on bounded workers rather than filesystem reads
+on the frame thread. An observation is repeated when what it read changes, as
+GNOME's `background.js` follows its file with a `Gio.FileMonitor`: inotify watches
+the directory of the picture, of each symbolic link on the way to it and of each
+slideshow picture, for that name being written, replaced, renamed over,
+re-permissioned or removed, and the file itself, for writes through another link
+(#503). A change is observed again at once, within the second the earlier timed
+re-observation allowed, and an unchanged picture is never read again. A source no
+watch vouches for (a network or FUSE filesystem, where inotify misses other hosts'
+and the daemon's changes; a watch that could not be placed) and a slideshow are
+also observed again every 5 s, GIO's poll interval for a file it cannot monitor.
+File identities include the bounded source's SHA-256 as well as device, inode,
+size and nanosecond mtime/ctime: same-length in-place edits must invalidate static
+caches and slideshow epochs even when the filesystem coalesces timestamps. Decode
+workers validate the bytes against the observed digest and recheck source
+identities before publishing. Native SVG FontConfig directory observations also
+re-enumerate sorted raw member names before accepting a receipt; unchanged
+directory metadata alone does not prove membership is unchanged.
 
 ## GNOME Settings Daemon plugins
 

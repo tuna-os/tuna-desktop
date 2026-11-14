@@ -7,9 +7,11 @@
 //! applications and system daemons own the rest. The shell reads all
 //! eleven keys live through `gio` and enforces its surface immediately;
 //! the compositor backstops the lock paths from its own live read of
-//! `disable-lock-screen` (see [`read_lock_screen_key`]) and refuses the
-//! portal's screenshots under `disable-save-to-disk` (see
-//! [`read_save_to_disk_key`]), so no control-protocol change is needed.
+//! `disable-lock-screen` (once at hub startup, see
+//! [`read_lock_screen_key`], then from the change notifications of
+//! `lockdown_settings`) and refuses the portal's screenshots under
+//! `disable-save-to-disk` (see [`read_save_to_disk_key`]), so no
+//! control-protocol change is needed.
 //! Tests inject values through [`LockdownPolicy::from_reader`].
 //!
 //! Key inventory and owners, against the GNOME 51 sources
@@ -44,10 +46,8 @@ use std::time::Duration;
 
 /// GSettings schema holding the lockdown keys.
 pub const SCHEMA: &str = "org.gnome.desktop.lockdown";
-/// Bound for one background `gsettings` read. The compositor tick never
-/// waits on the settings backend (see
-/// [`crate::control::ControlHub::refresh_lockdown`]); a read slower than
-/// this yields `None` and the cached policy holds.
+/// Bound for one `gsettings` read (hub startup, the screenshot service);
+/// a read slower than this yields `None` and the cached policy holds.
 pub const LOCKDOWN_READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// Run-command dialog gate (Alt+F2).
 pub const KEY_DISABLE_COMMAND_LINE: &str = "disable-command-line";
@@ -349,10 +349,10 @@ impl LockdownPolicy {
 /// bus, a slow backend, or garbage output never restricts by accident
 /// (same fail-safe as the shell's missing-schema path).
 ///
-/// The compositor owns no `gio` dependency, so this shells out to the
-/// `gsettings` CLI. The slow-tick refresh runs this on a background
-/// thread (never the frame path); hub startup calls it directly,
-/// bounded by the same timeout.
+/// This shells out to the `gsettings` CLI once, at hub startup, bounded
+/// by the same timeout, so the first `Lock` already meets the policy.
+/// Later changes arrive from `lockdown_settings`, which watches the key
+/// in-process and spawns nothing.
 pub fn read_lock_screen_key() -> Option<bool> {
     read_key(KEY_DISABLE_LOCK_SCREEN)
 }
