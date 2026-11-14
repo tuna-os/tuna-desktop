@@ -55,9 +55,19 @@ jobs:
           CI_ROUND_ROBIN_SIZE: ${{ vars.CI_ROUND_ROBIN_SIZE }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           DRAFT: ${{ github.event.pull_request.draft }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Draft pull requests: check only. Their proof lanes run when the
-          # pull request is marked ready for review.
+          # pull request is marked ready for review. The event's draft flag
+          # is from when the event fired: a push just before "ready for
+          # review" queues a run that still says draft and, by superseding
+          # the ready_for_review run, left #958 with no proof lanes at all.
+          # Ask for the pull request's current state instead.
+          if [ "$DRAFT" = true ]; then
+            DRAFT=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .draft) || DRAFT=true
+          fi
           if [ "$DRAFT" = true ]; then
             echo 'lanes=[]' >> "$GITHUB_OUTPUT"
           elif [ -n "$BASE_SHA" ]; then
@@ -152,10 +162,12 @@ jobs:
       - run: python3 scripts/lib/rename-to-tuna-tests.py
       - run: scripts/rename-to-tuna --check --no-cargo
       - run: python3 scripts/lib/tuna-soak-tests.py
+      - run: python3 scripts/lib/tuna-resource-sample-tests.py
       - run: python3 scripts/lib/vm-boot-tests.py
       - run: python3 scripts/lib/try-tuna-desktop-tests.py
       - run: python3 scripts/lib/ci-runner-guard-tests.py
       - run: python3 scripts/tests/test_ci_closed_pr_cleanup.py
+      - run: python3 scripts/tests/test_ci_prepare_artifacts.py
       - run: python3 scripts/tests/test_vm_guest_agent_deadline.py
       - run: python3 scripts/tests/test_vm_reference_login.py
       - run: python3 scripts/tests/test_gnome_reference_guest.py
@@ -172,6 +184,7 @@ jobs:
         run: python3 scripts/tuna-maintained-media-refresh --verify-if-changed "$MEDIA_BASE_SHA"
       - run: python3 scripts/tests/test_disk_guard.py
       - run: python3 scripts/tests/test_reaper.py
+      - run: python3 scripts/tests/test_process_metrics.py
       - run: python3 scripts/tests/test_local_timeout.py
       - run: /usr/bin/python3 scripts/tests/test_vm_strip_acceptance.py
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
@@ -197,6 +210,7 @@ jobs:
       - run: python3 scripts/lib/a11y-focus-proof-tests.py
       - run: /usr/bin/python3 scripts/tests/test_grid_cancel_proof.py
       - run: /usr/bin/python3 scripts/tests/test_grid_cancel_comparison.py
+      - run: python3 scripts/tests/test_remote_security_failure_report.py
       - run: python3 scripts/lib/pam-helper-source-tests.py
       - run: python3 scripts/lib/minimize-body-pixel-tests.py
       - run: python3 scripts/lib/media-causal-trace-tests.py
@@ -279,6 +293,7 @@ jobs:
       - run: cargo test --locked --manifest-path third-party/smithay/Cargo.toml --no-default-features --features xwayland,wayland_frontend --lib cancellation_tests
       # GL tests on surfaceless Mesa (llvmpipe); libegl1/libgl1-mesa-dri above.
       - run: cargo test --locked --manifest-path third-party/smithay/Cargo.toml --no-default-features --features renderer_gl --lib per_frame_read_fence
+      - run: cargo test --locked --manifest-path third-party/smithay/Cargo.toml --no-default-features --features renderer_gl --lib unscaled_nearest
       - name: Check nested compositor without default features
         run: cargo check --locked -p tuna-compositor --no-default-features
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -1027,6 +1042,14 @@ jobs:
           TUNA_REQUIRE_IBUS: "1"
           TUNA_REQUIRE_WAYLAND_INFO: "1"
           TUNA_REQUIRE_GSD_MEDIA_KEYS: "1"
+      # Closed windows must free their surfaces and textures (#1088): 100
+      # libadwaita windows leave the compositor within a fixed bound.
+      - name: Closed windows leave no memory behind
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: scripts/tuna-gtk-shell-proof --window-leak-only --artifacts gtk-shell-artifacts/window-leak
       # Initial DnD target focus must not wait for another physical motion.
       # Run the unchanged shared hover/reorder assertions independently of
       # unrelated full-suite assertions, using this job's just-built binaries.
@@ -1036,6 +1059,14 @@ jobs:
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts gtk-shell-artifacts/grid-hover
+      # Searches with results must hand their shm buffers back (#1084):
+      # the shell's GDK mappings and both processes' descriptors stay put.
+      - name: Overview searches leave no shm buffers behind
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: scripts/tuna-gtk-shell-proof --search-leak-only --artifacts gtk-shell-artifacts/search-leak
       # Native/X11 geometry and physical input at all required virtual scales.
       - run: |
           for scale in 1 1.25 1.5 2; do
@@ -1072,7 +1103,8 @@ jobs:
           cp /usr/local/lib/*/libgtk4-layer-shell.so* gtk-shell-artifacts/bin/ 2>/dev/null || cp /usr/local/lib/libgtk4-layer-shell.so* gtk-shell-artifacts/bin/
       # G-WS-INSERT publishes the targeted insertion frame/state. Full
       # parity captures need native fonts, wallpapers and installed apps;
-      # use the uploaded binaries with that reference on the capture host.
+      # use the binaries uploaded as gtk-shell-binaries with that reference
+      # on the capture host.
 
       # The feature walkthrough from this run's frames: every frame the
       # manifest names must still be taken, and the bundle is what a
@@ -1104,14 +1136,36 @@ jobs:
           name: walkthrough
           path: walkthrough/
           retention-days: 90
+      # #1063: the evidence (logs, frames, receipts; about 11 MB) is uploaded
+      # first and alone. The unstripped executables beside it were 96 % of
+      # the former 280 MB bundle, and on 2026-11-10 that one upload outlasted
+      # the job deadline at 0.3 MB/s and took the passed proofs' evidence
+      # and the job log with it. They now go to gtk-shell-binaries at the
+      # same relative paths, with their SHA-256 kept in the evidence
+      # (ci-detached-entries.txt). Both uploads stay required. Each has its
+      # own bound, many times its normal duration (seconds; 49 s for all
+      # 280 MB), and together they fit the job deadline, so a storage stall
+      # fails the step that stalled instead of ending as a cancelled job.
       - if: always()
-        run: scripts/ci-prepare-artifacts gtk-shell-artifacts
+        run: |
+          scripts/ci-prepare-artifacts gtk-shell-artifacts
+          scripts/ci-prepare-artifacts --detach gtk-shell-binaries gtk-shell-artifacts bin a11y/bin/gtk-tests
       - uses: actions/upload-artifact@v7.0.2
         id: gtk_artifact
         if: always()
+        timeout-minutes: 5
         with:
           name: gtk-shell
           path: gtk-shell-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        timeout-minutes: 10
+        with:
+          name: gtk-shell-binaries
+          path: gtk-shell-binaries/
+          if-no-files-found: error
           retention-days: 14
 
   orca-speech:
@@ -1247,6 +1301,7 @@ jobs:
           path: ${{ runner.temp }}/remote-package
       - run: sudo apt-get -o Acquire::Retries=3 update -qq && sudo apt-get install -y --no-install-recommends podman zstd shellcheck
       - run: shellcheck scripts/tuna-remote-security tests/remote-desktop-reference/run.sh
+      - run: python3 scripts/tests/test_remote_security_failure_report.py
       - name: Test packaged compositor with actual GNOME 51 RemoteDesktop consent and libei input
         run: |
           mkdir -p "$RUNNER_TEMP/remote-candidate"
