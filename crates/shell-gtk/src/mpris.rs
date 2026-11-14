@@ -1,8 +1,12 @@
 //! GNOME 51's MPRIS client (js/ui/mpris.js): every
 //! `org.mpris.MediaPlayer2.*` name on the session bus becomes a player,
-//! shown once it says `CanPlay`, newest first. The lock screen's
-//! `NotificationsBox` lists them as `MediaMessage`s (js/ui/messageList.js)
-//! when the player's notification policy allows it on the lock screen.
+//! shown once it says `CanPlay`, newest first ([`listed`]). Each player
+//! is a `MediaMessage` (js/ui/messageList.js) in two places: the
+//! calendar's message list (`MessageView._setupMpris`, above the
+//! notifications) and the lock screen's `NotificationsBox`. Either way the
+//! message follows its app's notification policy ([`media_visible`]):
+//! `enable`, and on the lock screen `show-in-lock-screen` as well.
+//! Clicking it in the calendar raises the player ([`raise_target`]).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -11,7 +15,8 @@ use std::rc::{Rc, Weak};
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
-use tuna_shell_host::notification_policy::{GioPolicyStore, PolicyStore};
+use tuna_shell_host::apps::AppEntry;
+use tuna_shell_host::notification_policy::{GioPolicyStore, PolicyStore, SourcePolicy};
 
 use crate::lock_notifications::{MediaAction, MediaEntry};
 
@@ -53,6 +58,59 @@ pub fn track(metadata: Option<&glib::Variant>) -> Track {
     }
 }
 
+/// `MprisSource.players` in the order the message lists stack them:
+/// only players that can play (`CanPlay`; the others never become a
+/// `MediaMessage`), newest first (`_addPlayer` inserts each at index 0).
+/// `players` are `(serial, can_play, player)`, serials growing as players
+/// join the bus.
+pub fn listed<T>(players: impl IntoIterator<Item = (u64, bool, T)>) -> Vec<T> {
+    let mut shown: Vec<(u64, T)> = players
+        .into_iter()
+        .filter(|(_, can_play, _)| *can_play)
+        .map(|(serial, _, player)| (serial, player))
+        .collect();
+    shown.sort_by_key(|(serial, _)| std::cmp::Reverse(*serial));
+    shown.into_iter().map(|(_, player)| player).collect()
+}
+
+/// `MediaMessage._applyPolicy`: a player's message shows while its app's
+/// `enable` holds and, on the lock screen, `show-in-lock-screen` (global
+/// and per app) as well. A player without an installed app has GNOME's
+/// generic policy, always enabled. Do Not Disturb and lockdown play no
+/// part (GNOME's media section reads neither).
+pub fn media_visible(policy: &SourcePolicy, locked: bool) -> bool {
+    policy.enable && (!locked || policy.show_in_lock_screen)
+}
+
+/// What clicking a player's message raises (`MprisPlayer.raise`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Raise<A> {
+    /// Its app (`app.activate()`), preferred because a remote `Raise`
+    /// may run into focus stealing prevention.
+    App(A),
+    /// The player's own `Raise()`, when it says `CanRaise`.
+    Remote,
+    Nothing,
+}
+
+/// `MprisPlayer.raise`: the player's app when its `DesktopEntry` names an
+/// installed one, else its own `Raise()` if it `CanRaise`, else nothing.
+pub fn raise_target<A>(app: Option<A>, can_raise: bool) -> Raise<A> {
+    match app {
+        Some(app) => Raise::App(app),
+        None if can_raise => Raise::Remote,
+        None => Raise::Nothing,
+    }
+}
+
+/// One player that can play: what its `MediaMessage` shows and the
+/// notification policy its visibility follows ([`media_visible`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaPlayer {
+    pub entry: MediaEntry,
+    pub policy: SourcePolicy,
+}
+
 struct Player {
     /// Insertion order: newer players sit above older ones
     /// (`insert_child_at_index(message, 0)`).
@@ -61,10 +119,32 @@ struct Player {
     player: Option<gio::DBusProxy>,
 }
 
+impl Player {
+    /// A non-empty string property of `org.mpris.MediaPlayer2`.
+    fn root_string(&self, key: &str) -> Option<String> {
+        self.root
+            .as_ref()
+            .and_then(|root| root.cached_property(key))
+            .and_then(|v| v.get::<String>())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// A boolean property as GNOME's proxies read it: absent or mistyped is
+/// false.
+fn flag(proxy: &gio::DBusProxy, key: &str) -> bool {
+    proxy
+        .cached_property(key)
+        .and_then(|v| v.get::<bool>())
+        .unwrap_or(false)
+}
+
 pub struct Mpris {
     players: RefCell<HashMap<String, Player>>,
     serial: Cell<u64>,
-    changed: RefCell<Option<Rc<dyn Fn()>>>,
+    /// Told when what the players show may have changed: the calendar's
+    /// message list and the lock screen.
+    changed: RefCell<Vec<Rc<dyn Fn()>>>,
     policy: GioPolicyStore,
     /// The notification settings a shown player's policy reads, watched
     /// so a change applies at once (`notify::enable`,
@@ -78,7 +158,7 @@ impl Mpris {
         let mpris = Rc::new(Self {
             players: RefCell::default(),
             serial: Cell::new(0),
-            changed: RefCell::new(None),
+            changed: RefCell::default(),
             policy: GioPolicyStore::new(),
             watched: RefCell::default(),
         });
@@ -100,12 +180,12 @@ impl Mpris {
 
     /// Call `f` whenever what the players show may have changed.
     pub fn connect_changed(&self, f: impl Fn() + 'static) {
-        *self.changed.borrow_mut() = Some(Rc::new(f));
+        self.changed.borrow_mut().push(Rc::new(f));
     }
 
     fn emit(&self) {
-        let f = self.changed.borrow().clone();
-        if let Some(f) = f {
+        let listeners = self.changed.borrow().clone();
+        for f in listeners {
             f();
         }
     }
@@ -241,54 +321,40 @@ impl Mpris {
         self.emit();
     }
 
-    /// The players the lock screen shows, newest first: those that can
-    /// play, whose policy allows them there (`MediaMessage._applyPolicy`:
-    /// `enable` and the combined `show-in-lock-screen`). Each player's app
-    /// is registered with GNOME Settings (`policy.store()`).
-    pub fn lock_entries(self: &Rc<Self>) -> Vec<MediaEntry> {
+    /// The installed app a player's `DesktopEntry` names
+    /// (`Shell.AppSystem.lookup_app(`${DesktopEntry}.desktop`)`), with the
+    /// id checked as a notification's `desktop-entry` is.
+    fn app(&self, player: &Player) -> Option<(String, AppEntry)> {
+        player
+            .root_string("DesktopEntry")
+            .and_then(|entry| self.policy.app_for(&entry, ""))
+            .and_then(|id| crate::notify::desktop_app(&id).map(|app| (id, app)))
+    }
+
+    /// Every player that can play, newest first ([`listed`]), with what
+    /// its `MediaMessage` shows and its policy. Each player's app is
+    /// registered with GNOME Settings (`policy.store()`) and its keys are
+    /// watched, so a change applies at once.
+    pub fn players(self: &Rc<Self>) -> Vec<MediaPlayer> {
         let players = self.players.borrow();
-        let mut shown: Vec<(u64, MediaEntry)> = Vec::new();
+        let can_play = listed(players.iter().filter_map(|(name, player)| {
+            let proxy = player.player.as_ref()?;
+            Some((player.serial, flag(proxy, "CanPlay"), (name, player, proxy)))
+        }));
+        let mut shown = Vec::with_capacity(can_play.len());
         let mut apps_seen: Vec<String> = Vec::new();
-        for (name, player) in players.iter() {
-            let Some(proxy) = &player.player else {
-                continue;
-            };
-            let flag = |key: &str| {
-                proxy
-                    .cached_property(key)
-                    .and_then(|v| v.get::<bool>())
-                    .unwrap_or(false)
-            };
-            if !flag("CanPlay") {
-                continue;
-            }
-            let root_string = |key: &str| {
-                player
-                    .root
-                    .as_ref()
-                    .and_then(|root| root.cached_property(key))
-                    .and_then(|v| v.get::<String>())
-                    .filter(|s| !s.is_empty())
-            };
-            // `Shell.AppSystem.lookup_app(`${DesktopEntry}.desktop`)`, with
-            // the id checked as a notification's `desktop-entry` is.
-            let app = root_string("DesktopEntry")
-                .and_then(|entry| self.policy.app_for(&entry, ""))
-                .and_then(|entry| crate::notify::desktop_app(&entry).map(|app| (entry, app)));
-            let app_id: Option<String> = app.as_ref().map(|(entry, _)| entry.clone());
+        for (name, player, proxy) in can_play {
+            let app = self.app(player);
+            let app_id: Option<String> = app.as_ref().map(|(id, _)| id.clone());
             if let Some(id) = &app_id {
                 self.policy.register(id);
                 apps_seen.push(id.clone());
-            }
-            let policy = self.policy.policy(app_id.as_deref());
-            if !(policy.enable && policy.show_in_lock_screen) {
-                continue;
             }
             let track = track(proxy.cached_property("Metadata").as_ref());
             let source = app
                 .as_ref()
                 .map(|(_, app)| app.name.clone())
-                .or_else(|| root_string("Identity"))
+                .or_else(|| player.root_string("Identity"))
                 .unwrap_or_default();
             let source_icon = app
                 .as_ref()
@@ -299,9 +365,8 @@ impl Mpris {
                 .cached_property("PlaybackStatus")
                 .and_then(|v| v.get::<String>())
                 .unwrap_or_default();
-            shown.push((
-                player.serial,
-                MediaEntry {
+            shown.push(MediaPlayer {
+                entry: MediaEntry {
                     bus_name: name.clone(),
                     source,
                     source_icon,
@@ -309,15 +374,25 @@ impl Mpris {
                     body: track.artists.join(", "),
                     cover_url: Some(track.cover_url).filter(|u| !u.is_empty()),
                     playing: status == "Playing",
-                    can_go_previous: flag("CanGoPrevious"),
-                    can_go_next: flag("CanGoNext"),
+                    can_go_previous: flag(proxy, "CanGoPrevious"),
+                    can_go_next: flag(proxy, "CanGoNext"),
                 },
-            ));
+                policy: self.policy.policy(app_id.as_deref()),
+            });
         }
         drop(players);
         self.watch_policy(&apps_seen);
-        shown.sort_by_key(|(serial, _)| std::cmp::Reverse(*serial));
-        shown.into_iter().map(|(_, entry)| entry).collect()
+        shown
+    }
+
+    /// The players the lock screen shows, newest first: those whose policy
+    /// allows them there ([`media_visible`] while locked).
+    pub fn lock_entries(self: &Rc<Self>) -> Vec<MediaEntry> {
+        self.players()
+            .into_iter()
+            .filter(|player| media_visible(&player.policy, true))
+            .map(|player| player.entry)
+            .collect()
     }
 
     /// Watch the global keys and each shown player's app keys.
@@ -369,6 +444,44 @@ impl Mpris {
             },
         );
     }
+
+    /// `raise()` on the named player ([`raise_target`]); `activate` is
+    /// `app.activate()`, which raises a running app's window or launches
+    /// it.
+    pub fn raise(&self, bus_name: &str, activate: &dyn Fn(&AppEntry)) {
+        // Decide under the borrow, act after it: activating an app reaches
+        // the compositor, and either may come back here.
+        let (target, root) = {
+            let players = self.players.borrow();
+            let Some(player) = players.get(bus_name) else {
+                return;
+            };
+            let can_raise = player
+                .root
+                .as_ref()
+                .is_some_and(|root| flag(root, "CanRaise"));
+            (
+                raise_target(self.app(player).map(|(_, app)| app), can_raise),
+                player.root.clone(),
+            )
+        };
+        match (target, root) {
+            (Raise::App(app), _) => activate(&app),
+            (Raise::Remote, Some(root)) => root.call(
+                "Raise",
+                None,
+                gio::DBusCallFlags::NONE,
+                -1,
+                None::<&gio::Cancellable>,
+                |reply| {
+                    if let Err(error) = reply {
+                        eprintln!("tuna-shell-gtk: MPRIS Raise: {error}");
+                    }
+                },
+            ),
+            (Raise::Remote | Raise::Nothing, _) => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -415,5 +528,66 @@ mod tests {
         };
         assert_eq!(track(Some(&faulty)), unknown);
         assert_eq!(track(None), unknown);
+    }
+
+    #[test]
+    fn media_section_hides_players_that_cannot_play() {
+        // Serials grow as players join the bus; `CanPlay` false never
+        // becomes a message, and the newest player sits on top.
+        let players = [
+            (1, true, "first"),
+            (2, false, "silent"),
+            (3, true, "third"),
+            (4, false, "loading"),
+        ];
+        assert_eq!(listed(players), vec!["third", "first"]);
+        assert!(listed([(1, false, "silent")]).is_empty());
+        assert!(listed(Vec::<(u64, bool, &str)>::new()).is_empty());
+    }
+
+    #[test]
+    fn media_policy_follows_enable_and_lock_screen_like_gnome() {
+        use tuna_shell_host::notification_policy::{AppPrefs, GlobalPrefs};
+        let global = GlobalPrefs::default();
+        let app = |prefs: AppPrefs| SourcePolicy::app(global, prefs);
+        let on = app(AppPrefs::default());
+        assert!(media_visible(&on, false) && media_visible(&on, true));
+        // A disabled app's player shows nowhere.
+        let off = app(AppPrefs {
+            enable: false,
+            ..AppPrefs::default()
+        });
+        assert!(!media_visible(&off, false) && !media_visible(&off, true));
+        // show-in-lock-screen only matters while locked: the calendar
+        // keeps the player.
+        let unlocked_only = app(AppPrefs {
+            show_in_lock_screen: false,
+            ..AppPrefs::default()
+        });
+        assert!(media_visible(&unlocked_only, false));
+        assert!(!media_visible(&unlocked_only, true));
+        let global_off = SourcePolicy::app(
+            GlobalPrefs {
+                show_in_lock_screen: false,
+                ..global
+            },
+            AppPrefs::default(),
+        );
+        assert!(media_visible(&global_off, false) && !media_visible(&global_off, true));
+        // A player without an installed app: the generic policy, always
+        // enabled; the banners switch (Do Not Disturb) plays no part.
+        let generic = SourcePolicy::generic(GlobalPrefs {
+            show_banners: false,
+            ..global
+        });
+        assert!(media_visible(&generic, false) && media_visible(&generic, true));
+    }
+
+    #[test]
+    fn raising_prefers_the_app_then_the_players_own_raise() {
+        assert_eq!(raise_target(Some("app"), true), Raise::App("app"));
+        assert_eq!(raise_target(Some("app"), false), Raise::App("app"));
+        assert_eq!(raise_target(None::<&str>, true), Raise::Remote);
+        assert_eq!(raise_target(None::<&str>, false), Raise::Nothing);
     }
 }

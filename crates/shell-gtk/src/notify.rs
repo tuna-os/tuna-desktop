@@ -12,6 +12,14 @@
 //! expands on click); Do Not Disturb keeps banners away (critical ones
 //! still show) while history keeps filling.
 //!
+//! Above the groups sit the media players (GNOME 51's `MessageView`
+//! `_setupMpris`: one `MediaMessage` per player that can play, newest
+//! first, see [`crate::mpris`]). They follow their player live, hide while
+//! their app's `enable` is off, raise the player when clicked, and leave
+//! when it leaves the bus. Like GNOME's, they count toward the list's
+//! `empty` (the placeholder) but cannot be closed, so they never make
+//! Clear sensitive (see [`list_state`]).
+//!
 //! Nothing here runs on a period: wire arrivals wake the main loop
 //! through the bus's change callback, the banner's expiry is a one-shot
 //! timeout re-armed after every update, and a banner waiting for an away
@@ -32,7 +40,7 @@ use tuna_shell_host::notifications::{
     Notification, NotificationAction, NotificationCenter, Urgency,
 };
 
-use crate::lock_notifications::LockEntry;
+use crate::lock_notifications::{LockEntry, MediaActions, MediaEntry, MediaMessage};
 
 /// Told when what the lock screen shows may have changed.
 type LockListener = Box<dyn Fn()>;
@@ -290,6 +298,73 @@ fn group_key(n: &Notification) -> String {
     }
 }
 
+/// One message of the calendar's list, in [`message_order`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListItem<P, G> {
+    /// A player's `MediaMessage`.
+    Media(P),
+    /// A notification group.
+    Group(G),
+}
+
+/// `MessageView`'s order: the players' messages on top, as given (newest
+/// first: `_addPlayer` inserts each at index 0), then the notification
+/// groups, which GNOME inserts at `_playerToMessage.size` or further
+/// down, never above a player.
+pub fn message_order<P, G>(
+    players: impl IntoIterator<Item = P>,
+    groups: impl IntoIterator<Item = G>,
+) -> Vec<ListItem<P, G>> {
+    players
+        .into_iter()
+        .map(ListItem::Media)
+        .chain(groups.into_iter().map(ListItem::Group))
+        .collect()
+}
+
+/// What `CalendarMessageList` shows around the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListState {
+    /// `MessageView.empty`: the placeholder shows (and Clear hides).
+    pub empty: bool,
+    /// `MessageView.canClear`: Clear is sensitive.
+    pub can_clear: bool,
+}
+
+/// The list's `empty` and `can-clear` from its `players` (every player
+/// that can play, its policy-hidden messages included: GNOME keeps them
+/// in `messages`, only invisible) and its `notifications`. A
+/// `MediaMessage` cannot close (`canClose()` is false), so players alone
+/// keep the placeholder away and Clear on screen, insensitive.
+pub fn list_state(players: usize, notifications: usize) -> ListState {
+    ListState {
+        empty: players == 0 && notifications == 0,
+        can_clear: notifications > 0,
+    }
+}
+
+/// The calendar's media players now, newest first, each with whether its
+/// policy shows it ([`crate::mpris::media_visible`]).
+pub type CalendarMedia = Rc<dyn Fn() -> Vec<(MediaEntry, bool)>>;
+/// Raises a player, by its bus name, from its message.
+pub type MediaRaise = Rc<dyn Fn(&str)>;
+
+/// What the calendar's media section reads and drives.
+struct MediaHooks {
+    players: CalendarMedia,
+    act: MediaActions,
+    raise: MediaRaise,
+}
+
+/// One player's message in the calendar's list.
+struct MediaRow {
+    /// What it shows now.
+    entry: MediaEntry,
+    /// The list item, zoomed in and out as GNOME's items are.
+    item: crate::transient::MotionBin,
+    message: MediaMessage,
+}
+
 /// Snapshot of what the list shows, to rebuild only on change.
 #[derive(Default, PartialEq)]
 struct Shown {
@@ -389,7 +464,13 @@ pub struct NotifyUi {
     expired: Cell<Option<u64>>,
     /// The calendar popover's left pane.
     pane: gtk::Box,
+    /// The message view: the players' messages on top, then the
+    /// notification groups ([`message_order`]).
     list: gtk::Box,
+    /// Where the media players come from, once the shell connects them.
+    media_hooks: RefCell<Option<MediaHooks>>,
+    /// The players' messages, newest first.
+    media_rows: RefCell<Vec<MediaRow>>,
     empty: gtk::Box,
     clear: gtk::Button,
     /// GNOME binds Clear's visibility to the placeholder without
@@ -713,6 +794,8 @@ impl NotifyUi {
             lock_cache: RefCell::default(),
             policy_watch: RefCell::new(None),
             policy_idle: Cell::new(false),
+            media_hooks: RefCell::new(None),
+            media_rows: RefCell::default(),
         });
         {
             let weak = Rc::downgrade(&ui);
@@ -1291,15 +1374,7 @@ impl NotifyUi {
         } else {
             self.history_stale.set(true);
         }
-        let any = !now.history.is_empty();
-        self.list.set_visible(any);
-        if self.empty.is_visible() == any {
-            // The placeholder changes: from here on Clear follows it.
-            self.clear_bound.set(true);
-        }
-        self.empty.set_visible(!any);
-        self.clear.set_visible(!self.clear_bound.get() || any);
-        self.clear.set_sensitive(any);
+        self.sync_placeholder(now.history.len());
         drop(center);
         *self.shown.borrow_mut() = Some(now);
         // Showing the list above maps it while the store was held.
@@ -1512,8 +1587,15 @@ impl NotifyUi {
     ) {
         self.history_stale.set(false);
         self.group_widgets.borrow_mut().clear();
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
+        // Only the notification groups are rebuilt: the players' messages
+        // stay on top, in place.
+        let media = self.media_items();
+        let mut child = self.list.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if !media.contains(&widget) {
+                self.list.remove(&widget);
+            }
         }
         let by_id: HashMap<u64, &Notification> =
             center.history().iter().map(|n| (n.id, n)).collect();
@@ -1566,11 +1648,19 @@ impl NotifyUi {
         }
     }
 
-    /// Append a list item, zooming it in when it is new and the list is
-    /// on screen (`_addMessage`).
+    /// Append a list item, below every player's message, zooming it in
+    /// when it is new (`_addMessage`).
     fn add_item(&self, item: &crate::transient::MotionBin, new: bool) {
         self.list.append(item);
-        if new && self.list.is_mapped() {
+        if new {
+            self.zoom_in(item);
+        }
+    }
+
+    /// Zoom a new item in while the list is on screen
+    /// (`_addMessageAtIndex`).
+    fn zoom_in(&self, item: &crate::transient::MotionBin) {
+        if self.list.is_mapped() {
             item.animate(
                 &crate::transient::Player::new("message"),
                 crate::transient::MESSAGE_MS,
@@ -1578,6 +1668,194 @@ impl NotifyUi {
                 || {},
             );
         }
+    }
+
+    /// The players' list items, newest first.
+    fn media_items(&self) -> Vec<gtk::Widget> {
+        self.media_rows
+            .borrow()
+            .iter()
+            .map(|row| row.item.clone().upcast())
+            .collect()
+    }
+
+    /// Read the calendar's media players from `players`; `act` drives one
+    /// by its bus name and `raise` raises it (`MediaMessage`).
+    pub fn set_media(
+        self: &Rc<Self>,
+        players: CalendarMedia,
+        act: MediaActions,
+        raise: MediaRaise,
+    ) {
+        *self.media_hooks.borrow_mut() = Some(MediaHooks {
+            players,
+            act,
+            raise,
+        });
+        self.refresh_media();
+    }
+
+    /// Bring the media players up to date, live (`_addPlayer`,
+    /// `_removePlayer`, each `MediaMessage`'s `_update` and
+    /// `_applyPolicy`): a new player's message zooms in on top, one that
+    /// left the bus (or can no longer play) zooms out, and the others
+    /// update in place, so a pressed control keeps its focus.
+    pub fn refresh_media(self: &Rc<Self>) {
+        let Some((players, act, raise)) = self
+            .media_hooks
+            .borrow()
+            .as_ref()
+            .map(|h| (h.players.clone(), h.act.clone(), h.raise.clone()))
+        else {
+            return;
+        };
+        let now = players();
+        let mut rows = std::mem::take(&mut *self.media_rows.borrow_mut());
+        let mut gone = Vec::new();
+        rows.retain(|row| {
+            let stays = now.iter().any(|(e, _)| e.bus_name == row.entry.bus_name);
+            if !stays {
+                gone.push(row.item.clone());
+            }
+            stays
+        });
+        let mut added = Vec::new();
+        let mut next = Vec::with_capacity(now.len());
+        for (entry, visible) in now {
+            let row = match rows.iter().position(|r| r.entry.bus_name == entry.bus_name) {
+                Some(i) => {
+                    let mut row = rows.swap_remove(i);
+                    if row.entry != entry {
+                        row.message.update(&entry);
+                        row.entry = entry;
+                    }
+                    row
+                }
+                None => {
+                    let row = self.media_row(entry, &act, &raise);
+                    added.push(row.item.clone());
+                    row
+                }
+            };
+            // `_applyPolicy`: hidden, yet still one of the list's messages.
+            row.item.set_visible(visible);
+            next.push(row);
+        }
+        *self.media_rows.borrow_mut() = next;
+        for item in &gone {
+            self.remove_media_item(item);
+        }
+        self.arrange(&self.media_items());
+        let notifications = self.shown.borrow().as_ref().map_or(0, |s| s.history.len());
+        // The first player shows the list: its message zooms in on it.
+        self.sync_placeholder(notifications);
+        for item in &added {
+            self.zoom_in(item);
+        }
+    }
+
+    /// One player's message (`MediaMessage`): focusable, and a click,
+    /// Enter or Space on it raises the player, which also closes the
+    /// calendar (`vfunc_clicked`). Its controls take their own clicks; an
+    /// insensitive one, like GNOME's unreactive button, leaves the click
+    /// to the message.
+    fn media_row(&self, entry: MediaEntry, act: &MediaActions, raise: &MediaRaise) -> MediaRow {
+        // GNOME's message role (`Atk.Role.NOTIFICATION`), as `card` gives.
+        let message = MediaMessage::new(&entry, act, gtk::AccessibleRole::Alert);
+        message.widget.set_focusable(true);
+        let activate: Rc<dyn Fn()> = {
+            let (raise, bus_name) = (raise.clone(), entry.bus_name.clone());
+            Rc::new(move || raise(&bus_name))
+        };
+        let click = gtk::GestureClick::new();
+        {
+            let activate = activate.clone();
+            click.connect_released(move |_, _, _, _| activate());
+        }
+        message.widget.add_controller(click);
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |keys, key, _, _| {
+            use gtk::gdk::Key;
+            // Only the message's own focus: its controls handle their keys.
+            let on_message = keys.widget().is_some_and(|message| message.has_focus());
+            match key {
+                Key::Return | Key::KP_Enter | Key::space if on_message => {
+                    activate();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        message.widget.add_controller(keys);
+        let item = crate::transient::MotionBin::new(&message.widget);
+        MediaRow {
+            entry,
+            item,
+            message,
+        }
+    }
+
+    /// `_removePlayer`: the message zooms out, then leaves the list.
+    fn remove_media_item(&self, item: &crate::transient::MotionBin) {
+        let detach = {
+            let (list, item) = (self.list.clone(), item.clone());
+            move || {
+                if item.parent().as_ref() == Some(list.upcast_ref::<gtk::Widget>()) {
+                    list.remove(&item);
+                }
+            }
+        };
+        if !item.is_mapped() {
+            detach();
+            return;
+        }
+        item.set_can_target(false);
+        item.animate(
+            &crate::transient::Player::new("message"),
+            crate::transient::MESSAGE_MS,
+            |_, t| crate::transient::message(t, false),
+            detach,
+        );
+    }
+
+    /// Lay the list out in [`message_order`]: `media` on top, everything
+    /// else (the groups, a departing player's message) below. Widgets
+    /// already listed move in place, keeping their focus.
+    fn arrange(&self, media: &[gtk::Widget]) {
+        let mut groups = Vec::new();
+        let mut child = self.list.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if !media.contains(&widget) {
+                groups.push(widget);
+            }
+        }
+        let mut previous: Option<gtk::Widget> = None;
+        for item in message_order(media.iter().cloned(), groups) {
+            let (ListItem::Media(widget) | ListItem::Group(widget)) = item;
+            if widget.parent().as_ref() != Some(self.list.upcast_ref::<gtk::Widget>()) {
+                self.list.insert_child_after(&widget, previous.as_ref());
+            } else if widget.prev_sibling() != previous {
+                self.list.reorder_child_after(&widget, previous.as_ref());
+            }
+            previous = Some(widget);
+        }
+    }
+
+    /// The placeholder and Clear, from the list's `empty` and `can-clear`
+    /// ([`list_state`]) given its `notifications`. GNOME binds Clear's
+    /// visibility to the placeholder's without SYNC_CREATE.
+    fn sync_placeholder(&self, notifications: usize) {
+        let state = list_state(self.media_rows.borrow().len(), notifications);
+        self.list.set_visible(!state.empty);
+        if self.empty.is_visible() != state.empty {
+            // The placeholder changes: from here on Clear follows it.
+            self.clear_bound.set(true);
+        }
+        self.empty.set_visible(state.empty);
+        self.clear
+            .set_visible(!self.clear_bound.get() || !state.empty);
+        self.clear.set_sensitive(state.can_clear);
     }
 
     /// Drop the banner in: fade, slide down and grow from 90%. `again`
@@ -1784,6 +2062,69 @@ impl NotifyUi {
             group.append(&c);
         }
         group
+    }
+}
+
+#[cfg(test)]
+mod media_list_tests {
+    use super::*;
+
+    #[test]
+    fn media_messages_sit_above_notifications_like_gnome() {
+        // Players come newest first (mpris::listed); every group, urgent
+        // or not, goes below the last player.
+        let players = crate::mpris::listed([(1, true, "older"), (2, true, "newer")]);
+        assert_eq!(
+            message_order(players, ["mail", "chat"]),
+            vec![
+                ListItem::Media("newer"),
+                ListItem::Media("older"),
+                ListItem::Group("mail"),
+                ListItem::Group("chat"),
+            ]
+        );
+        assert_eq!(
+            message_order(Vec::<&str>::new(), ["mail"]),
+            vec![ListItem::Group("mail")]
+        );
+        assert_eq!(
+            message_order(["player"], Vec::<&str>::new()),
+            vec![ListItem::<&str, &str>::Media("player")]
+        );
+    }
+
+    #[test]
+    fn players_keep_the_placeholder_away_but_never_make_clear_sensitive() {
+        assert_eq!(
+            list_state(0, 0),
+            ListState {
+                empty: true,
+                can_clear: false
+            }
+        );
+        // A player alone: no placeholder, Clear on screen but insensitive
+        // (a MediaMessage cannot close).
+        assert_eq!(
+            list_state(1, 0),
+            ListState {
+                empty: false,
+                can_clear: false
+            }
+        );
+        assert_eq!(
+            list_state(0, 2),
+            ListState {
+                empty: false,
+                can_clear: true
+            }
+        );
+        assert_eq!(
+            list_state(2, 1),
+            ListState {
+                empty: false,
+                can_clear: true
+            }
+        );
     }
 }
 

@@ -35,8 +35,8 @@ pub struct LockEntry {
     pub details: Option<Vec<(String, String)>>,
 }
 
-/// What the lock screen shows of one media player (messageList.js
-/// `MediaMessage`).
+/// What one media player's `MediaMessage` (messageList.js) shows, on the
+/// lock screen and in the calendar's message list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaEntry {
     /// The player's bus name, which the controls act on.
@@ -156,7 +156,8 @@ impl NotificationsBox {
             self.media.remove(&child);
         }
         for player in players {
-            self.media.append(&media_message(player, act));
+            let message = MediaMessage::new(player, act, gtk::AccessibleRole::Group);
+            self.media.append(&message.widget);
         }
         self.media.set_visible(!players.is_empty());
         *self.shown_media.borrow_mut() = players.to_vec();
@@ -169,103 +170,156 @@ impl NotificationsBox {
     }
 }
 
-/// One player's `MediaMessage`: the header names its app, the cover (or
-/// `audio-x-generic-symbolic`) beside the track title and artists, and
-/// GNOME's three media controls. Clicking the message itself does
-/// nothing while locked (`vfunc_clicked`).
-fn media_message(player: &MediaEntry, act: &MediaActions) -> gtk::Box {
-    let message = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    message.add_css_class("message");
-    message.add_css_class("media-message");
-    message.set_accessible_role(gtk::AccessibleRole::Group);
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    header.add_css_class("message-header");
-    if let Some(icon) = player
-        .source_icon
-        .as_deref()
-        .and_then(|icon| gio::Icon::for_string(icon).ok())
-    {
-        let image = gtk::Image::from_gicon(&icon);
-        image.set_pixel_size(16);
-        header.append(&image);
-    }
-    let source = gtk::Label::new(Some(&player.source));
-    source.add_css_class("message-source-title");
-    source.set_xalign(0.0);
-    source.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    header.append(&source);
-    message.append(&header);
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    content.add_css_class("message-box");
-    let cover = match &player.cover_url {
-        Some(url) => {
-            let image = gtk::Image::from_gicon(&gio::FileIcon::new(&gio::File::for_uri(url)));
-            image.set_pixel_size(48);
-            image
-        }
-        None => {
-            let image = gtk::Image::from_icon_name("audio-x-generic-symbolic");
-            image.add_css_class("message-themed-icon");
-            image.set_pixel_size(32);
-            image
-        }
-    };
-    cover.add_css_class("message-icon");
-    cover.set_valign(gtk::Align::Start);
-    content.append(&cover);
-    let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    text.add_css_class("message-content");
-    text.set_hexpand(true);
-    for (line, class) in [
-        (&player.title, "message-title"),
-        (&player.body, "message-body"),
-    ] {
-        let label = gtk::Label::new(Some(&one_line(line)));
-        label.add_css_class(class);
-        label.set_xalign(0.0);
-        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        text.append(&label);
-    }
-    content.append(&text);
-    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    controls.set_valign(gtk::Align::Center);
-    let play_icon = if player.playing {
-        "media-playback-pause-symbolic"
+/// The middle control's icon and accessible name (`MediaMessage._update`):
+/// pause while the player plays, else play.
+pub fn play_pause(playing: bool) -> (&'static str, &'static str) {
+    if playing {
+        ("media-playback-pause-symbolic", "Pause")
     } else {
-        "media-playback-start-symbolic"
-    };
-    for (icon, name, action, sensitive) in [
-        (
+        ("media-playback-start-symbolic", "Play")
+    }
+}
+
+/// One player's `MediaMessage`, on the lock screen and in the calendar's
+/// message list alike: the header names its app, the cover (or
+/// `audio-x-generic-symbolic`) beside the track title and artists, and
+/// GNOME's three media controls, previous and next insensitive while the
+/// player cannot go there. [`MediaMessage::update`] follows the player in
+/// place, as `_update` does on `changed`. Clicking the message itself is
+/// its owner's: nothing while locked (`vfunc_clicked`), raising the
+/// player in the calendar.
+pub struct MediaMessage {
+    pub widget: gtk::Box,
+    source_icon: gtk::Image,
+    source: gtk::Label,
+    cover: gtk::Image,
+    title: gtk::Label,
+    body: gtk::Label,
+    previous: gtk::Button,
+    play_pause: gtk::Button,
+    next: gtk::Button,
+}
+
+impl MediaMessage {
+    /// The message for `player`, its controls driving it through `act`,
+    /// with the accessible `role` its list gives messages.
+    pub fn new(player: &MediaEntry, act: &MediaActions, role: gtk::AccessibleRole) -> Self {
+        let widget = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .accessible_role(role)
+            .build();
+        widget.add_css_class("message");
+        widget.add_css_class("media-message");
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        header.add_css_class("message-header");
+        let source_icon = gtk::Image::new();
+        source_icon.add_css_class("message-source-icon");
+        source_icon.set_pixel_size(16);
+        header.append(&source_icon);
+        let source = gtk::Label::new(None);
+        source.add_css_class("message-source-title");
+        source.set_xalign(0.0);
+        source.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        header.append(&source);
+        widget.append(&header);
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        content.add_css_class("message-box");
+        let cover = gtk::Image::new();
+        cover.add_css_class("message-icon");
+        cover.set_valign(gtk::Align::Start);
+        content.append(&cover);
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        text.add_css_class("message-content");
+        text.set_hexpand(true);
+        let line = |class: &str| {
+            let label = gtk::Label::new(None);
+            label.add_css_class(class);
+            label.set_xalign(0.0);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            text.append(&label);
+            label
+        };
+        let title = line("message-title");
+        let body = line("message-body");
+        content.append(&text);
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        controls.set_valign(gtk::Align::Center);
+        let control = |icon: &str, name: &str, action: MediaAction| {
+            let button = gtk::Button::from_icon_name(icon);
+            button.add_css_class("message-media-control");
+            button.add_css_class("flat");
+            button.update_property(&[gtk::accessible::Property::Label(name)]);
+            let (act, bus_name) = (act.clone(), player.bus_name.clone());
+            button.connect_clicked(move |_| act(&bus_name, action));
+            controls.append(&button);
+            button
+        };
+        let previous = control(
             "media-skip-backward-symbolic",
             "Previous",
             MediaAction::Previous,
-            player.can_go_previous,
-        ),
-        (
-            play_icon,
-            if player.playing { "Pause" } else { "Play" },
-            MediaAction::PlayPause,
-            true,
-        ),
-        (
-            "media-skip-forward-symbolic",
-            "Next",
-            MediaAction::Next,
-            player.can_go_next,
-        ),
-    ] {
-        let button = gtk::Button::from_icon_name(icon);
-        button.add_css_class("message-media-control");
-        button.add_css_class("flat");
-        button.set_sensitive(sensitive);
-        button.update_property(&[gtk::accessible::Property::Label(name)]);
-        let (act, bus_name) = (act.clone(), player.bus_name.clone());
-        button.connect_clicked(move |_| act(&bus_name, action));
-        controls.append(&button);
+        );
+        let (icon, name) = play_pause(player.playing);
+        let play_pause = control(icon, name, MediaAction::PlayPause);
+        let next = control("media-skip-forward-symbolic", "Next", MediaAction::Next);
+        content.append(&controls);
+        widget.append(&content);
+        let message = Self {
+            widget,
+            source_icon,
+            source,
+            cover,
+            title,
+            body,
+            previous,
+            play_pause,
+            next,
+        };
+        message.update(player);
+        message
     }
-    content.append(&controls);
-    message.append(&content);
-    message
+
+    /// Show `player` now (`_update`): its app, cover, track, the middle
+    /// control's play or pause, and which way it can skip.
+    pub fn update(&self, player: &MediaEntry) {
+        match player
+            .source_icon
+            .as_deref()
+            .and_then(|icon| gio::Icon::for_string(icon).ok())
+        {
+            Some(icon) => {
+                self.source_icon.set_from_gicon(&icon);
+                self.source_icon.set_visible(true);
+            }
+            None => self.source_icon.set_visible(false),
+        }
+        self.source.set_label(&player.source);
+        match &player.cover_url {
+            Some(url) => {
+                self.cover
+                    .set_from_gicon(&gio::FileIcon::new(&gio::File::for_uri(url)));
+                self.cover.set_pixel_size(48);
+                self.cover.remove_css_class("message-themed-icon");
+            }
+            None => {
+                self.cover.set_icon_name(Some("audio-x-generic-symbolic"));
+                self.cover.set_pixel_size(32);
+                self.cover.add_css_class("message-themed-icon");
+            }
+        }
+        self.title.set_label(&one_line(&player.title));
+        self.body.set_label(&one_line(&player.body));
+        let (icon, name) = play_pause(player.playing);
+        self.play_pause.set_icon_name(icon);
+        self.play_pause
+            .update_property(&[gtk::accessible::Property::Label(name)]);
+        self.previous.set_sensitive(player.can_go_previous);
+        self.next.set_sensitive(player.can_go_next);
+        self.widget.update_property(&[
+            gtk::accessible::Property::Label(player.title.as_str()),
+            gtk::accessible::Property::Description(player.body.as_str()),
+        ]);
+    }
 }
 
 /// One source's box (`_makeNotificationSource` /
@@ -357,5 +411,13 @@ mod tests {
             "<b>A &lt;b&gt;</b> line one line &amp; two"
         );
         assert_eq!(detail_markup("Only", ""), "<b>Only</b> ");
+    }
+
+    #[test]
+    fn play_pause_icon_follows_playback_status() {
+        // `status === 'Playing'` pauses; Paused, Stopped and anything
+        // else plays.
+        assert_eq!(play_pause(true), ("media-playback-pause-symbolic", "Pause"));
+        assert_eq!(play_pause(false), ("media-playback-start-symbolic", "Play"));
     }
 }
