@@ -17,6 +17,9 @@ xkbcommon.workspace = true
 # and the Tuna images ship newer).
 gtk4 = { workspace = true, features = ["v4_14"] }
 libadwaita.workspace = true
+# The date menu's world clocks and weather (world_clocks.rs, weather.rs):
+# GWeather's locations database and forecasts, as gnome-shell uses them.
+libgweather.workspace = true
 gtk4-layer-shell.workspace = true
 gtk4-session-lock.workspace = true
 glib.workspace = true

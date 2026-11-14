@@ -97,9 +97,10 @@ already owns those names.
 ### Build fails on a missing library
 
 `pkg-config` errors naming `libseat`, `libinput`, `libudev`, `gbm`,
-`libdrm`, `xkbcommon`, `gtk4`, `libadwaita-1`, `libpipewire-0.3` or
-`gtk4-layer-shell-0` mean a development package is missing; install the
-list under [Prerequisites](development.md#prerequisites). Ubuntu 24.04 does
+`libdrm`, `xkbcommon`, `gtk4`, `libadwaita-1`, `gweather4`,
+`libpipewire-0.3` or `gtk4-layer-shell-0` mean a development package is
+missing; install the list under
+[Prerequisites](development.md#prerequisites). Ubuntu 24.04 does
 not package gtk4-layer-shell: build it with
 `scripts/ci-install-gtk4-layer-shell`. The `pipewire` crate also needs
 libclang at build time.

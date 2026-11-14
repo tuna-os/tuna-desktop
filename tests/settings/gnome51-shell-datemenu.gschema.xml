@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Test-only GNOME Shell 51 world clocks and weather schemas (the shell's
+     copies of GNOME Clocks' and GNOME Weather's settings) for hosts without
+     gnome-shell.
+     https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/data/org.gnome.shell.gschema.xml.in -->
+<schemalist>
+  <schema id="org.gnome.shell.world-clocks" path="/org/gnome/shell/world-clocks/">
+    <key name="locations" type="av"><default>[]</default></key>
+  </schema>
+  <schema id="org.gnome.shell.weather" path="/org/gnome/shell/weather/">
+    <key name="automatic-location" type="b"><default>false</default></key>
+    <key name="locations" type="av"><default>[]</default></key>
+  </schema>
+</schemalist>

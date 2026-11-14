@@ -111,10 +111,11 @@ requirement traceability.
   toolchain; no MSRV is declared, crates use edition 2021; see the
   [API stability and MSRV policy](docs/api-stability.md)).
 - **System libraries**: libseat, libinput, libudev, GBM, libdrm,
-  libxkbcommon, GTK 4, libadwaita, PipeWire, Wayland and gtk4-layer-shell
-  development files, plus EGL (Mesa llvmpipe is enough) to run a nested
-  session. The [development guide](docs/development.md#prerequisites)
-  has the exact Ubuntu and Arch package lists CI uses.
+  libxkbcommon, GTK 4, libadwaita, libgweather 4, PipeWire, Wayland and
+  gtk4-layer-shell development files, plus EGL (Mesa llvmpipe is enough)
+  to run a nested session. The
+  [development guide](docs/development.md#prerequisites) has the exact
+  Ubuntu and Arch package lists CI uses.
 - **Spektacular CLI** is needed only for spec and plan work, not for
   building or running Tuna Desktop; see the
   [development guide](docs/development.md#spektacular-cli-planning-work-only).

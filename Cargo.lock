@@ -1729,6 +1729,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gweather-sys"
+version = "4.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5bd48d8a64d00703dc2a77efb2284c07192a1345d0162e0bc15488b55d577f0e"
+dependencies = [
+ "gio-sys",
+ "glib-sys",
+ "gobject-sys",
+ "libc",
+ "system-deps 7.0.8",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2304,6 +2317,18 @@ checksum = "a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2"
 dependencies = [
  "arbitrary",
  "cc",
+]
+
+[[package]]
+name = "libgweather"
+version = "4.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18dd39da07edc7e068f1b02da95d5813030343cfd94ae1f132d25695ba8e6c9f"
+dependencies = [
+ "gio",
+ "glib",
+ "gweather-sys",
+ "libc",
 ]
 
 [[package]]
@@ -4268,6 +4293,7 @@ dependencies = [
  "jiff",
  "libadwaita",
  "libc",
+ "libgweather",
  "pipewire",
  "resvg",
  "roxmltree",

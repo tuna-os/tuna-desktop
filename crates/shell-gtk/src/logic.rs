@@ -71,6 +71,30 @@ pub fn clock_text(time: &jiff::civil::DateTime, format: ClockFormat, parts: Cloc
     }
 }
 
+/// A time of day as gnome-shell 51 `js/misc/dateUtils.js` `formatTime`
+/// writes it with `timeOnly` (lines 123-222): `%H:%M`, or `%l:%M %p`,
+/// where GLib pads a single-digit `%l` hour with a FIGURE SPACE
+/// (U+2007). `ampm: false` drops the ` %p`, as the weather forecasts do
+/// (`format.replace(/\s*%p/g, '')`); it changes nothing in 24-hour mode.
+pub fn time_only(hour: i8, minute: i8, format: ClockFormat, ampm: bool) -> String {
+    match format {
+        ClockFormat::TwentyFourHour => format!("{hour:02}:{minute:02}"),
+        ClockFormat::TwelveHour => {
+            let hour12 = match hour % 12 {
+                0 => 12,
+                h => h,
+            };
+            let pad = if hour12 < 10 { "\u{2007}" } else { "" };
+            let suffix = match (ampm, hour < 12) {
+                (false, _) => "",
+                (true, true) => " AM",
+                (true, false) => " PM",
+            };
+            format!("{pad}{hour12}:{minute:02}{suffix}")
+        }
+    }
+}
+
 /// Today button labels: weekday line and full date line (`Thursday` /
 /// `October 1 2026`, dateMenu.js's `%A` and `%B %-d %Y`).
 pub fn calendar_heading(time: &jiff::civil::DateTime) -> (String, String) {
@@ -341,6 +365,21 @@ mod tests {
             ClockFormat::from_setting("bogus"),
             ClockFormat::TwentyFourHour
         );
+    }
+
+    #[test]
+    fn time_only_follows_format_time() {
+        let (h12, h24) = (ClockFormat::TwelveHour, ClockFormat::TwentyFourHour);
+        assert_eq!(time_only(13, 6, h24, true), "13:06");
+        assert_eq!(time_only(0, 5, h24, true), "00:05");
+        // `ampm` only strips `%p`, which the 24-hour format never has.
+        assert_eq!(time_only(9, 0, h24, false), "09:00");
+        assert_eq!(time_only(13, 6, h12, true), "\u{2007}1:06 PM");
+        assert_eq!(time_only(0, 5, h12, true), "12:05 AM");
+        assert_eq!(time_only(12, 0, h12, true), "12:00 PM");
+        assert_eq!(time_only(23, 59, h12, true), "11:59 PM");
+        assert_eq!(time_only(15, 0, h12, false), "\u{2007}3:00");
+        assert_eq!(time_only(10, 30, h12, false), "10:30");
     }
 
     #[test]

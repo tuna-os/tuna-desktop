@@ -129,7 +129,7 @@ Version: 0.1.0~beta.1
 Architecture: amd64
 Maintainer: Tuna fixture <fixture@example.invalid>
 Description: disposable archive policy fixture
-Depends: libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.0), libpam0g, gsettings-desktop-schemas, gnome-settings-daemon-common
+Depends: libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.0), libgweather-4-0t64 (>= 4.4) | libgweather-4-0 (>= 4.4), libpam0g, gsettings-desktop-schemas, gnome-settings-daemon-common
 Replaces: roost
 Conflicts: roost
 Provides: roost
