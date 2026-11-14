@@ -54,6 +54,7 @@ DISPLAY=":$display_num" TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1 TUNA_AUTH_OWNER_ARTIFA
     "$test_executable" --exact actual_runtime_epoch_invalidation_and_public_sync_unlock --nocapture 2>&1 | tee "$out/test-epoch.log"
 grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$out/test-epoch.log"
 grep -q '^auth owner probe runtime receipt: ' "$out/test-epoch.log"
+grep -Fxq 'auth owner runtime environment preserved with concurrent libc getenv' "$out/runtime-epoch/compositor.log"
 DISPLAY=":$display_num" TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1 TUNA_AUTH_OWNER_ARTIFACTS="$out/runtime-pam" \
     timeout --kill-after=3s 45s \
     "$test_executable" --exact actual_main_runtime_private_pam_retirement_and_held_self --nocapture 2>&1 | tee "$out/test-pam.log"

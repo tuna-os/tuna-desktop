@@ -20,7 +20,9 @@ commit, or --changed) can affect:
   see NO_LANE) add no lane;
 - a lane's own proof script, fixtures or packaging runs that lane, and a
   packaged conffile (share/pam.d/) runs journey's lifecycle and every
-  package consumer;
+  package consumer; so does a scripts/tests/ file that the lane's job runs
+  (OWNED below; WorkflowSync.test_lane_run_tests_select_their_lane keeps it
+  complete). Tests only the check job runs add no lane;
 - anything else (crates, share/, other scripts) runs gtk-shell plus a
   round-robin slice of ROTATION: K lanes starting at
   (run_number * K) mod len(ROTATION), K from --size, $CI_ROUND_ROBIN_SIZE
@@ -89,6 +91,20 @@ OWNED = [
     ("scripts/tuna-slow-portal-proof", ["gtk-shell"]),
     ("scripts/tuna-session-restore-proof", ["gtk-shell"]),
     ("scripts/tuna-walkthrough", ["gtk-shell"]),
+    # scripts/tests/* run by a lane job (#1108): a test edit must run the lane
+    # that executes it, or it first runs after merge.
+    ("scripts/tests/test_minimize_brightness_controls.py", ["gtk-shell"]),
+    ("scripts/tests/test_minimize_ci_freeze.py", ["gtk-shell"]),
+    ("scripts/tests/test_minimize_failure_bundle.py", ["gtk-shell"]),
+    ("scripts/tests/test_notify_callback_contract.py", ["gtk-shell"]),
+    ("scripts/tests/test_tuna_lock_auth_fixtures.py", ["gtk-shell"]),
+    ("scripts/tests/test_wellbeing_bundle.py", ["gtk-shell"]),
+    ("scripts/tests/test_wellbeing_bytecode_contract.py", ["gtk-shell"]),
+    ("scripts/tests/test_grid_cancel_*.py", ["grid-cancel-comparison"]),
+    ("scripts/tests/test_ci_install_vkms.py", ["drm-smoke"]),
+    ("scripts/tests/test_colord_startup.py", ["drm-smoke"]),
+    ("scripts/tests/test_native_product.py", ["marlin-vm"]),
+    ("scripts/tests/test_remote_security_failure_report.py", ["remote-security"]),
     ("scripts/tuna-gtk-accessibility-proof", ["gtk-shell"]),
     ("scripts/tuna-a11y-golden", ["gtk-shell"]),
     ("scripts/tuna-wayland-info-compare", ["gtk-shell"]),
@@ -110,6 +126,7 @@ OWNED = [
     ("scripts/tuna-app-content", ["app-content"]),
     ("scripts/tuna-scroll-proof", ["scroll-proof"]),
     ("scripts/tuna-drm-smoke", ["drm-smoke"]),
+    ("scripts/lib/colord-startup.sh", ["drm-smoke"]),
     ("scripts/tuna-orca-speech-proof", ["orca-speech"]),
     ("scripts/lib/tuna-orca-speech.py", ["orca-speech"]),
     ("scripts/tuna-frame-pacer-build", ["drm-smoke"]),
@@ -143,6 +160,8 @@ NO_LANE = [
     ".github/*",
     ".spektacular/*",
     "fuzz/*",
+    # Tests only the check job (or another workflow) runs; OWNED claims the
+    # ones a lane job runs first.
     "scripts/tests/*",
     "scripts/lib/*-tests.py",
     # Products and workflows of their own, never run by a ci.yml lane
@@ -160,6 +179,7 @@ NO_LANE = [
     "scripts/tuna-coverage-report",
     "scripts/tuna-stress",
     "scripts/tuna-hotplug-stress",
+    "scripts/lib/tuna_process_metrics.py",
     "scripts/lib/vm_release*",
     "scripts/lib/vm_firstboot_diagnosis.py",
 ]

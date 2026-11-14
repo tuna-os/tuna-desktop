@@ -82,7 +82,11 @@ where
                 parent_width,
                 parent_height,
             } => {
-                state.parent_size = Some((parent_width, parent_height).into());
+                // Mutter stores any parent size without an error; a negative
+                // one cannot be a `Size` (it panicked), so it is ignored.
+                if parent_width >= 0 && parent_height >= 0 {
+                    state.parent_size = Some((parent_width, parent_height).into());
+                }
             }
             xdg_positioner::Request::SetParentConfigure { serial } => {
                 state.parent_configure = Some(Serial::from(serial));

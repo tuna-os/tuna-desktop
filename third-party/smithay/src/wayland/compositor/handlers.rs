@@ -211,6 +211,11 @@ where
                 });
             }
             wl_surface::Request::Damage { x, y, width, height } => {
+                // As damage_buffer below, and as Mutter's region union
+                // (pixman) does: negative damage adds nothing (#203).
+                if width < 0 || height < 0 {
+                    return;
+                }
                 let client_scale = state.client_compositor_state(client).client_scale();
                 PrivateSurfaceData::with_states(surface, |states| {
                     states
@@ -396,21 +401,29 @@ where
         let mut guard = data.inner.lock().unwrap();
         let client_scale = state.client_compositor_state(client).client_scale();
 
+        // Like Mutter's region (pixman's union/subtract of a rectangle), an
+        // empty, negative or overflowing rectangle changes nothing: it must
+        // not panic the compositor (tuna-os/tuna-desktop#203).
+        let rect = |x: i32, y: i32, width: i32, height: i32| {
+            (width > 0 && height > 0 && x.checked_add(width).is_some() && y.checked_add(height).is_some())
+                .then(|| {
+                    Rectangle::<i32, Client>::new((x, y).into(), (width, height).into())
+                        .to_f64()
+                        .to_logical(client_scale)
+                        .to_i32_round()
+                })
+        };
         match request {
-            wl_region::Request::Add { x, y, width, height } => guard.rects.push((
-                RectangleKind::Add,
-                Rectangle::<i32, Client>::new((x, y).into(), (width, height).into())
-                    .to_f64()
-                    .to_logical(client_scale)
-                    .to_i32_round(),
-            )),
-            wl_region::Request::Subtract { x, y, width, height } => guard.rects.push((
-                RectangleKind::Subtract,
-                Rectangle::<i32, Client>::new((x, y).into(), (width, height).into())
-                    .to_f64()
-                    .to_logical(client_scale)
-                    .to_i32_round(),
-            )),
+            wl_region::Request::Add { x, y, width, height } => {
+                if let Some(rect) = rect(x, y, width, height) {
+                    guard.rects.push((RectangleKind::Add, rect));
+                }
+            }
+            wl_region::Request::Subtract { x, y, width, height } => {
+                if let Some(rect) = rect(x, y, width, height) {
+                    guard.rects.push((RectangleKind::Subtract, rect));
+                }
+            }
             wl_region::Request::Destroy => {
                 // all is handled by our destructor
             }

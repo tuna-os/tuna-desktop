@@ -224,6 +224,30 @@ class NeutralDragGeometry(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'carousel page changed'):
             proof.validate_neutral(nodes, dict(self.state, pointer_position=point), 123, point, self.nodes)
 
+    def test_pixel_beside_an_admitted_point_stays_off_tiles_and_hints(self):
+        # The old-role settle motion (tuna-gtk-shell-proof) passes through
+        # x+1 of the admitted point; it must never enter a tile or a hint.
+        cases = [(self.nodes, None)]
+        for bounds in ([762, 0, 238, 400], [505, 0, 495, 400], [400, 0, 600, 400]):
+            active = self.active(); active[1]['bounds'] = bounds
+            cases.append((active, self.nodes))
+        for nodes, source in cases:
+            x, y = proof.neutral_point(nodes, self.state, 123, source)
+            layer, table, forbidden = proof.grid_geometry(nodes, self.state, 123)
+            x, y = x + 1 - layer[0], y - layer[1]
+            with self.subTest(hint=nodes[1]['bounds']):
+                self.assertTrue(table[0] < x < table[0] + table[2] and table[1] < y < table[1] + table[3])
+                for a, b, w, h in forbidden:
+                    self.assertFalse(a <= x <= a + w and b <= y <= b + h)
+
+    def test_last_admitted_column_keeps_its_neighbour_outside_the_hint(self):
+        # That clearance is the 3 px margin of clear_point.
+        _, table, forbidden = proof.grid_geometry(self.active(), self.state, 123)
+        hint_left = 762
+        admitted = [x for x in range(740, hint_left + 1) if proof.clear_point((x, 200), table, forbidden)]
+        self.assertEqual(admitted, list(range(740, hint_left - 3)))
+        self.assertLess(admitted[-1] + 1, hint_left)
+
 
 
 if __name__ == "__main__":

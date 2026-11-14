@@ -1,0 +1,81 @@
++ systemctl is-system-running
+degraded
++ systemctl --failed --no-legend
+● systemd-networkd-wait-online.service loaded failed failed Wait for Network to be Online
++ journalctl -b -u systemd-networkd-wait-online.service --no-pager -o short-iso
+2026-11-12T16:23:57+00:00 archlinux systemd[1]: Starting Wait for Network to be Online...
+2026-11-12T16:25:58+00:00 tuna-q-variant-diag-pub1112 systemd-networkd-wait-online[600]: Timeout occurred while waiting for network connectivity.
+2026-11-12T16:25:58+00:00 tuna-q-variant-diag-pub1112 systemd[1]: systemd-networkd-wait-online.service: Main process exited, code=exited, status=1/FAILURE
+2026-11-12T16:25:58+00:00 tuna-q-variant-diag-pub1112 systemd[1]: systemd-networkd-wait-online.service: Failed with result 'exit-code'.
+2026-11-12T16:25:58+00:00 tuna-q-variant-diag-pub1112 systemd[1]: Failed to start Wait for Network to be Online.
++ networkctl list --no-pager
+IDX LINK       TYPE     OPERATIONAL SETUP
+  1 lo         loopback carrier     unmanaged
+  2 enp1s0     ether    routable    unmanaged
+  3 tailscale0 none     degraded    unmanaged
+
+3 links listed.
++ systemctl list-unit-files --no-legend systemd-networkd.service systemd-networkd-wait-online.service NetworkManager.service NetworkManager-wait-online.service
+NetworkManager-wait-online.service   enabled disabled
+NetworkManager.service               enabled disabled
+systemd-networkd-wait-online.service enabled enabled
+systemd-networkd.service             enabled enabled
+32:enable systemd-networkd.service
+33:enable systemd-networkd-wait-online.service
+total 4
+lrwxrwxrwx 1 root root 58 2026-11-12T11:06:55 NetworkManager-wait-online.service -> /usr/lib/systemd/system/NetworkManager-wait-online.service
+lrwxrwxrwx 1 root root 60 2026-11-12T16:23:54 systemd-networkd-wait-online.service -> /usr/lib/systemd/system/systemd-networkd-wait-online.service
++ grep -n networkd /usr/lib/systemd/system-preset/90-systemd.preset
++ ls -l --time-style=+%FT%T /etc/systemd/system/network-online.target.wants/
++ systemd-analyze critical-chain graphical.target --no-pager
+The time when unit became active or started is printed after the "@" character.
+The time the unit took to start is printed after the "+" character.
+
+graphical.target @2min 12.003s
+└─flatpak-appstream-refresh.service @2min 5.528s +6.474s
+  └─network-online.target @2min 5.526s
+    └─NetworkManager-wait-online.service @10.965s +317ms
+      └─NetworkManager.service @10.735s +226ms
+        └─basic.target @10.733s
+          └─dbus-broker.service @10.421s +312ms
+            └─dbus.socket @10.404s +119us
+              └─sysinit.target @10.401s
+                └─systemd-update-done.service @10.374s +25ms
+                  └─ldconfig.service @5.898s +4.472s
+                    └─systemd-tmpfiles-setup.service @5.621s +275ms
+                      └─local-fs.target @5.565s
+                        └─run-user-60578-doc.mount @20.340s
+                          └─run-user-60578.mount @12.243s
+                            └─local-fs-pre.target @4.752s
+                              └─systemd-tmpfiles-setup-dev.service @4.698s +52ms
+                                └─systemd-sysusers.service @4.617s +62ms
+                                  └─bootc-sysusers-shadow-sync.service @4.565s +48ms
+                                    └─systemd-tmpfiles-setup-dev-early.service @2.678s +1.883s
+                                      └─kmod-static-nodes.service @2.539s +115ms
+                                        └─systemd-journald.socket
+                                          └─system.slice
+                                            └─-.slice
++ pacman -Qo /usr/lib/systemd/system-preset/90-systemd.preset /usr/lib/systemd/system/flatpak-appstream-refresh.service
+/usr/lib/systemd/system-preset/90-systemd.preset is owned by systemd 262.2-1
+error: No package owns /usr/lib/systemd/system/flatpak-appstream-refresh.service
+[Unit]
+Description=Refresh Flatpak remote metadata
+Documentation=https://docs.projectbluefin.io
+After=network-online.target flatpak-system-helper.service
+Wants=network-online.target
+ConditionPathExists=/usr/bin/flatpak
+ExecCondition=bash -c 'v=$(busctl get-property org.freedesktop.NetworkManager /org/freedesktop/NetworkManager org.freedesktop.NetworkManager Metered 2>/dev/null | cut -d" " -f2); [ "$v" != "1" ] && [ "$v" != "2" ]'
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
++ sed -n 1,12p /usr/lib/systemd/system/flatpak-appstream-refresh.service
++ journalctl -b --no-pager -o short-iso
++ grep -m2 'Unknown key .ExecCondition'
+2026-11-12T16:23:54+00:00 archlinux systemd[1]: /usr/lib/systemd/system/flatpak-appstream-refresh.service:7: Unknown key 'ExecCondition' in section [Unit], ignoring.
+2026-11-12T16:24:09+00:00 tuna-q-variant-diag-pub1112 e2e-runtime-checks[1126]: #   /usr/lib/systemd/system/flatpak-appstream-refresh.service:7: Unknown key 'ExecCondition' in section [Unit], ignoring.
++ pacman -Q tuna-desktop systemd networkmanager
+tuna-desktop 1.0.0beta.2-2
+systemd 262.2-1
+networkmanager 1.58.1-3

@@ -1,4 +1,5 @@
-//! Compare the complete native scene before acquiring a scanout buffer.
+//! Compare complete nested/native scenes before submitting a frame or acquiring
+//! a scanout buffer. The shared damage machinery does not require DRM.
 //! Buffer-age history accounts for every intervening submitted frame; global
 //! drawing changes and reset buffers conservatively require a complete paint.
 //! Within one global drawing, the damage tracker takes each element's own
@@ -184,7 +185,15 @@ pub(crate) struct FrameSignature {
     pub blank_alpha: f32,
     pub accent: [f32; 3],
     pub decor: Vec<(Color32F, Vec<Rectangle<i32, Physical>>)>,
-    pub above: usize,
+    /// How many scene elements draw beneath the tile preview: moving one
+    /// across it changes the drawing order without damaging anything.
+    /// Without a dragged window it is always zero, so a popup, banner or
+    /// window coming or going is left to the tracker (#503).
+    pub under_tile: usize,
+    /// Each dimmed element's brightness (modal dim, size-change
+    /// snapshots) with its id: a brightness change repaints whole, while
+    /// undimmed elements coming and going do not.
+    pub dimmed: Vec<(Id, u32)>,
     // Separate passes preserve both ordering and which scale each pass uses.
     pub groups: Vec<Vec<ElementSignature>>,
 }
@@ -213,7 +222,8 @@ impl FrameSignature {
             && self.accent == old.accent
             && self.decor == old.decor
             && self.effects == old.effects
-            && self.above == old.above
+            && self.dimmed == old.dimmed
+            && self.under_tile == old.under_tile
             && self.groups.len() == old.groups.len()
             && self.groups.iter().zip(&old.groups).all(|(new, old)| {
                 new.iter().all(|new| {
@@ -369,7 +379,8 @@ mod tests {
             blank_alpha: 0.0,
             accent: [0.0; 3],
             decor: vec![],
-            above: 0,
+            under_tile: 0,
+            dimmed: vec![],
             groups: vec![],
         }
     }
@@ -415,11 +426,41 @@ mod tests {
 
     #[test]
     fn parent_brightness_change_invalidates_native_repaint_and_damage_layout() {
-        let before = scene();
+        let parent = Id::new();
+        let mut before = scene();
+        before.dimmed = vec![(parent.clone(), 0.7f32.to_bits())];
         let mut after = before.clone();
-        after.effects = vec![0.7f32.to_bits()];
+        after.dimmed = vec![(parent.clone(), 0.6f32.to_bits())];
         assert!(needs_repaint(Some(&before), &after, false));
         assert!(!after.same_global_drawing(&before));
+        // The dim moving to another element repaints whole too.
+        after.dimmed = vec![(Id::new(), 0.7f32.to_bits())];
+        assert!(!after.same_global_drawing(&before));
+        let mut undimmed = before.clone();
+        undimmed.dimmed.clear();
+        assert!(!undimmed.same_global_drawing(&before));
+    }
+
+    #[test]
+    fn surfaces_coming_and_going_keep_buffer_history() {
+        // A popup, a banner or the workspace indicator appearing over a
+        // dimmed window, or windows leaving with a workspace switch: only
+        // the elements themselves change, so the tracker repaints their
+        // area instead of the whole output (#503).
+        let (window, parent, popup) = (Id::new(), Id::new(), Id::new());
+        let mut before = scene();
+        before.dimmed = vec![(parent.clone(), 0.7f32.to_bits())];
+        before.groups = vec![vec![
+            sig(&solid(&window, rect(0, 0, 40, 30), 0)),
+            sig(&solid(&parent, rect(50, 0, 40, 30), 0)),
+        ]];
+        let mut shown = before.clone();
+        shown.groups[0].push(sig(&solid(&popup, rect(10, 10, 20, 20), 0)));
+        assert!(needs_repaint(Some(&before), &shown, false));
+        assert!(shown.same_global_drawing(&before));
+        let mut gone = before.clone();
+        gone.groups[0].remove(0);
+        assert!(gone.same_global_drawing(&before));
     }
     #[test]
     fn rotation_change_repaints_and_resets_damage() {
@@ -545,8 +586,9 @@ mod tests {
         other_pass.groups[1].push(moved);
         assert!(needs_repaint(Some(&before), &other_pass, false));
         let mut partition = before.clone();
-        partition.above = 1;
+        partition.under_tile = 1;
         assert!(needs_repaint(Some(&before), &partition, false));
+        assert!(!partition.same_global_drawing(&before));
     }
 
     #[test]

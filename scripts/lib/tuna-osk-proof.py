@@ -16,6 +16,12 @@
       Print the CLOCK_MONOTONIC time of the first watched change at or
       after SINCE where the keyboard layer is mapped (PRESENT=1) or
       unmapped (PRESENT=0); exit 1 when none.
+  tuna-osk-proof.py lock-times WATCH SINCE
+      Print the first locked and subsequent locked/hidden watcher times
+      at or after SINCE; exit 1 without output until both are recorded.
+  tuna-osk-proof.py unlock-time WATCH LOCKED
+      Print the first unlocked watcher time after LOCKED; exit 1 without
+      output until it is recorded.
   tuna-osk-proof.py steady WATCH FROM TO
       Exit 0 when the keyboard layer stayed mapped from FROM to TO
       (every change in between keeps it mapped, and it was mapped at
@@ -95,6 +101,33 @@ def first(path, since, present):
     return 1
 
 
+def lock_times(path, since):
+    since = float(since)
+    locked = None
+    for change in changes(path):
+        if change["t"] < since:
+            continue
+        if locked is None:
+            if change["locked"] is not True:
+                continue
+            locked = change["t"]
+        if change["locked"] is not True:
+            return 1
+        if change["osk"] is None:
+            print(f"{locked!r} {change['t']!r}")
+            return 0
+    return 1
+
+
+def unlock_time(path, locked):
+    locked = float(locked)
+    for change in changes(path):
+        if change["t"] > locked and change["locked"] is False:
+            print(repr(change["t"]))
+            return 0
+    return 1
+
+
 def steady(path, start, end):
     start, end = float(start), float(end)
     mapped = False
@@ -120,6 +153,7 @@ def never(path, start, end):
 
 def main(argv):
     commands = {"watch": (watch, 2), "key": (key, 5), "first": (first, 3),
+                "lock-times": (lock_times, 2), "unlock-time": (unlock_time, 2),
                 "steady": (steady, 3), "never": (never, 3)}
     if len(argv) < 2 or argv[1] not in commands or len(argv) - 2 != commands[argv[1]][1]:
         print(__doc__, file=sys.stderr)

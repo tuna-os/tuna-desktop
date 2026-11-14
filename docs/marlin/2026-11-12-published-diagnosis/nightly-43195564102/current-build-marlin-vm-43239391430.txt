@@ -1,0 +1,5 @@
+G-DATETIME-CLOCK-TZ pass: UTC -> Pacific/Auckland: panel 'Fri Nov 13\u200204:41' vs Pacific/Auckland wall time: delta 39s, vs the unrepainted reading: 39639s; 1 dump(s) over 0s (tolerance 120s, deadline 10s)
+G-DATETIME-CLOCK-SET pass: SetTime +7620s: panel 'Thu Nov 12\u200217:48' vs UTC wall time: delta 39s, vs the unrepainted reading: 7581s; 1 dump(s) over 0s (tolerance 120s, deadline 10s)
+V-BRIGHTNESS-CONTRACT pass: original shell brightness wire interface, actual empty kernel backlight inventory, false capability and harmless policy resets; no physical-control proof
+V-LOCKED-HINT pass: logind LockedHint no, then loginctl lock-session locks with yes, the password unlocks with no, Super+L locks with yes and loginctl unlock-session unlocks with no (lifecycle/locked-hint.json)
+V-LIFECYCLE pass: all lifecycle operations completed; individual assertions remain mandatory

@@ -242,6 +242,8 @@ struct ClipClient {
     selection: Option<WlDataOffer>,
     /// Mime types the peer requested from our source.
     sent_mimes: Vec<String>,
+    /// Bytes our clipboard source serves; `PASTE_BYTES` when unset.
+    payload: Option<Vec<u8>>,
     /// Primary offers announced to this client, in arrival order.
     primary_offers: Vec<ZwpPrimarySelectionOfferV1>,
     /// Mime types offered across all primary offers.
@@ -499,7 +501,8 @@ impl Dispatch<WlDataSource, ()> for ClipClient {
             // Small payload: one write, then drop the fd so the
             // reader sees EOF.
             let mut file = std::fs::File::from(fd);
-            file.write_all(PASTE_BYTES).unwrap();
+            file.write_all(state.payload.as_deref().unwrap_or(PASTE_BYTES))
+                .unwrap();
         }
     }
 }
@@ -831,9 +834,15 @@ fn clipboard_copy_paste_round_trips_between_focused_clients() {
         &mut client_a,
         &mut queue_b,
         &mut client_b,
-        |a, _| !a.sent_mimes.is_empty(),
+        |a, _| a.sent_mimes.len() == 2,
     );
-    assert_eq!(client_a.sent_mimes, vec!["text/plain".to_owned()]);
+    // The first send was the clipboard manager's copy, requested when
+    // the selection was set (mutter's MetaClipboardManager); the second
+    // is the paste.
+    assert_eq!(
+        client_a.sent_mimes,
+        vec!["text/plain".to_owned(), "text/plain".to_owned()]
+    );
     // The request fd went over SCM at flush time; dropping our copy
     // leaves the source's write as the last writer, so EOF follows it.
     drop(write_end);
@@ -1657,4 +1666,337 @@ fn native_source_less_drag_cannot_enter_other_client_at_start() {
 #[test]
 fn native_source_less_drag_enters_same_surface_at_start_without_further_motion() {
     stationary_native_drag_case(true, true);
+}
+
+// --- Clipboard retention after the owner goes (#1033) ---
+
+use std::time::Duration;
+
+/// What the first copying client serves (distinct from `PASTE_BYTES`).
+const COPY_A: &[u8] = b"copied by the first client";
+/// What the paste side serves once it copies too.
+const COPY_B: &[u8] = b"copied by the second client";
+
+/// One connected clipboard client.
+type Side = (Connection, EventQueue<ClipClient>, ClipClient);
+
+/// Dispatch whatever reached one client; an empty socket is fine.
+fn drain(queue: &mut EventQueue<ClipClient>, client: &mut ClipClient) {
+    if let Some(guard) = queue.prepare_read() {
+        match guard.read() {
+            Ok(_) => {}
+            Err(wayland_client::backend::WaylandError::Io(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("client read failed: {error:?}"),
+        }
+    }
+    queue.dispatch_pending(client).unwrap();
+}
+
+/// Two mapped clipboard clients: `copy` (A), which may disconnect, and
+/// `paste` (B).
+struct Retention {
+    comp: TestCompositor,
+    manager: WindowManager,
+    a: Option<Side>,
+    b: Side,
+    id_a: u64,
+    id_b: u64,
+    time: u32,
+}
+
+impl Retention {
+    fn new() -> Self {
+        let mut comp = TestCompositor::new();
+        let mut manager: WindowManager = comp.window_manager();
+        let (conn_a, mut queue_a, mut a) = clip_connect(&mut comp);
+        let (conn_b, mut queue_b, mut b) = clip_connect(&mut comp);
+        map_selection_client(&mut comp, &conn_a, &mut queue_a, &mut a, "copy");
+        map_selection_client(&mut comp, &conn_b, &mut queue_b, &mut b, "paste");
+        manager.reconcile(&mut comp.state);
+        sync_mapped(
+            &mut comp,
+            &conn_a,
+            &mut queue_a,
+            &mut a,
+            &conn_b,
+            &mut queue_b,
+            &mut b,
+        );
+        let id = |title: &str| {
+            manager
+                .model()
+                .windows()
+                .find(|w| w.title == title)
+                .unwrap()
+                .id
+        };
+        let (id_a, id_b) = (id("copy"), id("paste"));
+        Self {
+            comp,
+            manager,
+            a: Some((conn_a, queue_a, a)),
+            b: (conn_b, queue_b, b),
+            id_a,
+            id_b,
+            time: 5000,
+        }
+    }
+
+    fn side(&mut self, on_a: bool) -> &mut Side {
+        if on_a {
+            self.a.as_mut().expect("the copying client disconnected")
+        } else {
+            &mut self.b
+        }
+    }
+
+    /// Pump the compositor and every connected client until `done`.
+    fn pump(&mut self, done: impl Fn(Option<&ClipClient>, &ClipClient) -> bool) {
+        for _ in 0..PUMP_ROUNDS {
+            if let Some((_, queue, _)) = self.a.as_mut() {
+                queue.flush().unwrap();
+            }
+            self.b.1.flush().unwrap();
+            self.comp.pump();
+            if let Some((_, queue, client)) = self.a.as_mut() {
+                drain(queue, client);
+            }
+            drain(&mut self.b.1, &mut self.b.2);
+            if done(self.a.as_ref().map(|side| &side.2), &self.b.2) {
+                return;
+            }
+            // The clipboard manager copies and serves on its own threads.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("pump budget exhausted");
+    }
+
+    fn focus(&mut self, on_a: bool) {
+        let id = if on_a { self.id_a } else { self.id_b };
+        assert!(self.manager.focus(&mut self.comp.state, Some(id)));
+    }
+
+    fn key(&mut self, pressed: bool) {
+        self.time += 1;
+        self.manager.on_input(
+            &mut self.comp.state,
+            ManagerInput::Key {
+                keycode: KEY_A,
+                pressed,
+                time: self.time,
+            },
+        );
+    }
+
+    /// Focus one side and press a key there: an honest serial for
+    /// `set_selection`.
+    fn key_serial(&mut self, on_a: bool) -> u32 {
+        self.focus(on_a);
+        let keys = move |a: Option<&ClipClient>, b: &ClipClient| {
+            if on_a {
+                a.map_or(0, |a| a.keys.len())
+            } else {
+                b.keys.len()
+            }
+        };
+        let before = keys(self.a.as_ref().map(|side| &side.2), &self.b.2);
+        self.key(true);
+        self.pump(|a, b| keys(a, b) > before);
+        let serial = self.side(on_a).2.keys.last().unwrap().1;
+        self.key(false);
+        self.pump(|_, _| true);
+        serial
+    }
+
+    /// One side takes the clipboard, offering `mime_types` and serving
+    /// `payload` for each.
+    fn copy(&mut self, on_a: bool, mime_types: &[&str], payload: &[u8]) {
+        let serial = self.key_serial(on_a);
+        let (_, queue, client) = self.side(on_a);
+        let source = client
+            .manager
+            .as_ref()
+            .unwrap()
+            .create_data_source(&queue.handle(), ());
+        for mime_type in mime_types {
+            source.offer((*mime_type).to_owned());
+        }
+        client
+            .device
+            .as_ref()
+            .unwrap()
+            .set_selection(Some(&source), serial);
+        client.source = Some(source);
+        client.payload = Some(payload.to_vec());
+        self.pump(|_, _| true);
+    }
+
+    /// Wait for the clipboard manager's copy of the current selection.
+    fn wait_copy_saved(&mut self) {
+        for _ in 0..PUMP_ROUNDS {
+            self.pump(|_, _| true);
+            if self.comp.clipboard_copy_saved() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the clipboard copy never finished");
+    }
+
+    /// B's current selection offer, read as `mime_type`.
+    fn paste(&mut self, mime_type: &str) -> Vec<u8> {
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        let (read_end, write_end) = UnixStream::pair().unwrap();
+        self.b
+            .2
+            .selection
+            .as_ref()
+            .expect("no selection offer")
+            .receive(mime_type.to_owned(), write_end.as_fd());
+        // One round carries the request to whoever serves it.
+        self.pump(|_, _| true);
+        // Our copy of the write end must go for end of file to follow
+        // the server's.
+        drop(write_end);
+        read_end
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut pasted = Vec::new();
+        std::io::BufReader::new(read_end)
+            .read_to_end(&mut pasted)
+            .unwrap();
+        pasted
+    }
+
+    /// Wait until B's newest offer, the `count`th, is its selection.
+    fn wait_offer(&mut self, count: usize) {
+        self.pump(|_, b| b.offers.len() == count && b.selection.as_ref() == b.offers.last());
+    }
+}
+
+/// The copying client quits: the focused client is offered the saved
+/// copy, and pasting it returns the quit client's exact bytes.
+#[test]
+fn clipboard_survives_owner_disconnect() {
+    let mut t = Retention::new();
+    t.copy(true, &["text/plain;charset=utf-8"], COPY_A);
+    t.wait_copy_saved();
+    assert_eq!(
+        t.side(true).2.sent_mimes,
+        vec!["text/plain;charset=utf-8".to_owned()],
+        "the compositor copies the selection when it is set"
+    );
+    t.focus(false);
+    t.wait_offer(1);
+    t.b.2.offered_mimes.clear();
+
+    t.a = None;
+    t.wait_offer(2);
+    assert_eq!(
+        t.b.2.offered_mimes,
+        vec!["text/plain;charset=utf-8".to_owned()]
+    );
+    assert_eq!(t.paste("text/plain;charset=utf-8"), COPY_A);
+    // The saved copy serves every paste, not just the first.
+    assert_eq!(t.paste("text/plain;charset=utf-8"), COPY_A);
+}
+
+/// The copying client clears the clipboard: the saved copy takes over.
+#[test]
+fn clipboard_survives_owner_null_selection() {
+    let mut t = Retention::new();
+    t.copy(true, &["text/plain;charset=utf-8"], COPY_A);
+    t.wait_copy_saved();
+    let serial = t.key_serial(true);
+    t.side(true)
+        .2
+        .device
+        .as_ref()
+        .unwrap()
+        .set_selection(None, serial);
+    t.pump(|_, _| true);
+
+    t.focus(false);
+    t.wait_offer(1);
+    assert_eq!(
+        t.b.2.offered_mimes,
+        vec!["text/plain;charset=utf-8".to_owned()]
+    );
+    assert_eq!(t.paste("text/plain;charset=utf-8"), COPY_A);
+}
+
+/// Nothing supported is offered: nothing is copied, and the clipboard
+/// empties when its owner quits.
+#[test]
+fn unsupported_clipboard_type_is_not_retained() {
+    let mut t = Retention::new();
+    t.copy(true, &["application/x-foo"], COPY_A);
+    for _ in 0..10 {
+        t.pump(|_, _| true);
+    }
+    assert!(t.side(true).2.sent_mimes.is_empty());
+    assert!(!t.comp.clipboard_copy_saved());
+    t.focus(false);
+    t.wait_offer(1);
+
+    t.a = None;
+    t.pump(|_, b| b.selection.is_none());
+    assert_eq!(t.b.2.offers.len(), 1, "no retained offer may follow");
+}
+
+/// Mutter's preference order picks the copied type; only that type is
+/// offered afterwards.
+#[test]
+fn retained_clipboard_keeps_the_most_preferred_type() {
+    let mut t = Retention::new();
+    t.copy(true, &["image/jpeg", "image/png", "image/bmp"], COPY_A);
+    t.wait_copy_saved();
+    assert_eq!(t.side(true).2.sent_mimes, vec!["image/png".to_owned()]);
+    t.focus(false);
+    t.wait_offer(1);
+    t.b.2.offered_mimes.clear();
+
+    t.a = None;
+    t.wait_offer(2);
+    assert_eq!(t.b.2.offered_mimes, vec!["image/png".to_owned()]);
+    assert_eq!(t.paste("image/png"), COPY_A);
+    assert!(
+        t.paste("image/jpeg").is_empty(),
+        "only the saved type is served"
+    );
+}
+
+/// A client selection after the take-over replaces the retained copy;
+/// when that owner's source goes, its own copy is the one retained.
+#[test]
+fn new_client_selection_replaces_retained_copy() {
+    let mut t = Retention::new();
+    t.copy(true, &["text/plain;charset=utf-8"], COPY_A);
+    t.wait_copy_saved();
+    t.focus(false);
+    t.wait_offer(1);
+    t.a = None;
+    t.wait_offer(2);
+    // The runtime drops the quit client's window after its dispatch.
+    t.manager.reconcile(&mut t.comp.state);
+    t.pump(|_, _| true);
+    let offers = t.b.2.offers.len();
+
+    t.copy(false, &["text/plain"], COPY_B);
+    t.wait_copy_saved();
+    assert_eq!(t.b.2.sent_mimes, vec!["text/plain".to_owned()]);
+    // B holds the focus, so it is offered its own selection.
+    t.wait_offer(offers + 1);
+    t.b.2.offered_mimes.clear();
+
+    t.b.2.source.take().unwrap().destroy();
+    t.wait_offer(offers + 2);
+    assert_eq!(t.b.2.offered_mimes, vec!["text/plain".to_owned()]);
+    assert_eq!(t.paste("text/plain"), COPY_B);
+    assert!(
+        t.paste("text/plain;charset=utf-8").is_empty(),
+        "the first client's copy is gone"
+    );
 }

@@ -13,11 +13,13 @@ No autologin or initial session exists: the lane drives GDM's user list and
 types the fixture password exactly as the published-flavor nightly does
 (`V-GREETER-LIST`, `V-GDM-FALLBACK`, `V-GDM-LOGIN`;
 `docs/marlin-tuna-nightly.md`), from the same `scripts/tuna-vm-lane` code.
-Logout must return to that GDM greeter. These ordinary lifecycle fixtures do
-not change the shipped preview image; the independent paired DEV profiles
-below are separate members of the same existing VM producer. GDM's session
-worker opens a journal stream for `gdm-wayland-session`, forwarded to the
-serial port. The fixture's session environment comes from `environment.d`,
+Logout must return to that GDM greeter. The ordinary two lifecycle/Orca rows
+retain five pristine boots, the default GPU, fresh-account journeys and all
+aggregate gates. These ordinary lifecycle fixtures do not change the shipped
+preview image; the independent paired DEV profiles below are separate members
+of the same existing VM producer. GDM's session worker opens a journal stream
+for `gdm-wayland-session`, forwarded to the serial port. The fixture's
+session environment comes from `environment.d`,
 which gdm-wayland-session imports from the user manager; the per-login Orca
 test secret comes from a user environment generator.
 The ordinary CLI profile is `--profile lifecycle` (the default); its two
@@ -59,6 +61,45 @@ state. GTK4 does not advertise `ENABLED`; requiring that additional bit
 would reject a genuinely focused, interactive button. Both observed bits
 remain in the receipt, but disabled controls remain ineligible. See the
 [GTK4 state mapping](https://github.com/GNOME/gtk/blob/main/gtk/a11y/gtkatspicontext.c).
+
+The published-flavor lane uses these same strict assertions. `--published`
+only records acquisition: no old-package or absent-instrumentation branch
+can pass by crediting a current-build lane. Every boot manifest explicitly
+records `acquisition`, `qualification_mode: "strict"`, `waived_assertions: []`
+and `skipped_assertions: []`; the nightly/repeat receipts preserve and
+classify every actual boot ([receipt contract](marlin-tuna-nightly.md)).
+
+## Required independent native automatic timezone
+
+Whenever `marlin-vm` is selected, its matrix also requires `marlin-vm-autotz`.
+This uses the same original package producer and VM image recipe, with
+`--profile autotz --require-kvm --boots 1`: one pristine snapshot boot,
+stock GDM and the original non-root standard account, unchanged default GPU,
+and no disposable disk or full Core application installer/inventory.
+There is no dispatch, secret or repository-variable waiver.
+The leg never reuses a retained native product: that capsule's receipt binds
+only the lifecycle members, so this image is always built fresh from the
+same run's package and checkout.
+
+The final immutable image receipt binds the exact executing source commit,
+original package hash and original installed ELF hashes, lifecycle helper,
+normal GeoClue policy helper and four fixed native-session observers:
+`native_session.py`, `autotz_guest.py`, `autotz.py`, `geoclue_fixture.py`.
+The latter two are installed from the clock-only source files, not the
+full Core guest. The ordinary preview policy invocation remains unchanged.
+This is same-run source/image admission, **not signed release proof**.
+
+The root `autotz DOMAIN OPERATION JSON` route delegates to the installed
+standalone observer. QGA acquisition and nested commands share finite
+absolute deadlines; reconnecting cannot renew them. Failure diagnostics
+contain only bounded domain/operation/type/sites and optional numeric codes,
+never raw arguments or exception text. Unconfirmed guest-child retirement
+remains fatal. `V-AUTOTZ` requires the consumer's explicit complete qualified
+result; an exception, missing native session or missing result fails the
+row and therefore the existing aggregate CI gate. The consumer retains its
+actual original-shell AddAgent, source/provider, daemon location/timezone
+and panel-clock gates and restoration requirements. Routing implementation
+alone claims no native runtime qualification.
 
 ## Record-free fresh accounts (tunaOS#4092)
 
@@ -830,7 +871,7 @@ feature tour:
 | V-LIFECYCLE-OWNER | Root probe, non-root `gdm-password` login session, three application surfaces/processes |
 | V-NORMAL-INPUT / V-NORMAL-INPUT-FAIL-CLOSED | A real GTK client receives ordinary QMP keys while unlocked, then receives none while locked; artifacts contain only counts and PID, never key values |
 | V-MOUSE-HANDEDNESS | Nine physical QMP clicks pass through native libinput to the same non-root GTK client while the real GNOME mouse setting changes false→true→false; left/right swap, middle stays unchanged, exact before/after counters retained in lifecycle/mouse-handedness.json |
-| V-POINTER-LIVE | GNOME mouse speed/natural-scroll, acceleration profile (`flat`, then `adaptive`), middle-click emulation (on, then off) and scroll-wheel emulation (button 2 → `on-button-down` with BTN_MIDDLE and button lock, then off) reach live libinput device state and restore, asserted on the compositor's per-device libinput readback with per-option availability (each option needs at least one mouse offering it; scroll-wheel emulation is asserted on mice that offer button scrolling and report BTN_MIDDLE in `pointer_buttons`, since libinput rejects a scroll button the device lacks, e.g. the guest's VMMouse); a published guest that predates profile or middle-click/scroll-button reporting skips only those checks, a current build that omits them fails, and a guest mouse schema without GNOME 51's scroll-wheel emulation keys skips only that check; snapshots retained in lifecycle/pointer-live.json (#343) |
+| V-POINTER-LIVE | GNOME mouse speed/natural-scroll, acceleration profile (`flat`, then `adaptive`), middle-click emulation (on, then off) and scroll-wheel emulation (button 2 → `on-button-down` with BTN_MIDDLE and button lock, then off) reach live libinput device state and restore, asserted on the compositor's per-device readback. Each option needs at least one mouse offering it; wheel emulation is asserted on mice offering button scrolling and BTN_MIDDLE in `pointer_buttons` (libinput rejects a button the device lacks). Both source-built and published guests must report profile/button state and provide GNOME 51's wheel-emulation schema; absence fails rather than skipping proof. Snapshots: lifecycle/pointer-live.json (#343) |
 | V-POINTER-HOTPLUG | A QMP-hotplugged USB mouse arrives with the current settings already applied (DRM DeviceAdded path); unplug drops it while survivors keep theirs; bus discovery, arrival and survivor snapshots retained in lifecycle/pointer-hotplug.json (#343) |
 | V-VT | VT away/back, DRM pause/activate events, unchanged process identities and app rectangles, matching body plus a fresh visible count update from the real GTK client |
 | V-SUSPEND | Real logind suspend reaches QEMU `suspended`; the first guest snapshot after `system_wakeup` must already be locked, with all application identities intact; the real varied lock mask must repaint within five seconds, matching the pre-suspend mask; QEMU inactive-output placeholders fail |
@@ -842,11 +883,11 @@ feature tour:
 | V-SHELL-FAIL-CLOSED | Stop the portal and kill the lock UI; original app/compositor identities survive and the supervised replacement stays locked |
 | V-GSD-PLUGINS | Each of the thirteen gnome-settings-daemon plugins the session target wants, MediaKeys included, is the packaged `gsd-*` binary, running as the session user as its unit's main PID and owning its bus name; `org.gnome.SettingsDaemon.Color` belongs to the compositor; A11ySettings has no owner; the session targets are active and the compositor holds `gnome-session-leader-fifo` (lifecycle/gsd-plugins.json, #355, #589) |
 | V-GSD-POWER-IDLE | With `idle-delay` set to 20 s and no input, dbus-monitor records gsd-power's own `SetDimming(true)` before its `PowerSaveMode=3`; the compositor snapshot reports locked and `power_save_mode` 3; Return wakes it to 0 and gsd-power undims; the original delay is restored (lifecycle/gsd-power-idle.json, #355) |
-| V-LOCKED-HINT | logind's `LockedHint` for the login session reads `no`; the session user's `loginctl lock-session` locks the compositor and the hint turns `yes`; the real password unlocks and it reads `no`; Super+L locks with `yes`; `loginctl unlock-session` unlocks with `no`, as GNOME 51's `screenShield.js` does (lifecycle/locked-hint.json, #846). The published flavor predates the integration and defers to the current-build lane |
+| V-LOCKED-HINT | logind's `LockedHint` for the login session reads `no`; the session user's `loginctl lock-session` locks the compositor and the hint turns `yes`; the real password unlocks and it reads `no`; Super+L locks with `yes`; `loginctl unlock-session` unlocks with `no`, as GNOME 51's `screenShield.js` does (lifecycle/locked-hint.json, #846). Required on both acquisitions |
 | V-POWER-BUTTON | gsd-media-keys (its unit's main PID, the session user) holds logind's `block` inhibitor on `handle-power-key:handle-suspend-key:handle-hibernate-key` with Why "GNOME handling keypresses". On a fixture desktop chassis, after each gsd restart a new gsd-media-keys must own its name, hold that inhibitor, have `XF86PowerOff` granted by `GrabAccelerators` and the shell must log that it yielded the bindings. QMP `system_powerdown` (ACPI power button) with `power-button-action` `interactive`: `AcceleratorActivated` reaches gsd, gsd calls `org.gnome.SessionManager.Shutdown`, the compositor calls `EndSessionDialog.Open(1, …)` and the `tuna-shell-end-session` layer shows within 15 s; 5 s after the press QEMU is `running` with the same compositor process and logind session and no logind power request; Escape (always sent, far inside the 60 s countdown) removes the layer, the shell emits `Canceled` and logs its D-Bus Power Off dialog. `nothing`: gsd receives the key, and for at least 8 s no Shutdown, dialog call, layer or logind request follows. On the image's `vm` chassis with a fixture `shutdown` block inhibitor held by root: the key reaches gsd and gsd's own process calls logind `PowerOffWithFlags(0)`; gsd sends it without a reply callback (NO_REPLY_EXPECTED), so logind's refusal has no bus reply, and 5 s later logind has emitted no `PrepareForShutdown`/`PrepareForSleep`, `PreparingForShutdown` is still false with the fixture inhibitor held, no other logind request or non-error reply followed, no dialog opened and QEMU, compositor and session are unchanged. Setting, chassis and `/etc/machine-info` are restored (lifecycle/power-button.json, #353, #589) |
-| V-RESTART-DIALOG | The shell's own power menu by physical keys, on the unlocked desktop after V-POWER-BUTTON (#589): Super+S opens quick settings; physical Tab moves until the shell's AT-SPI tree (`tuna-vm-shell-focus` end-session mode, observation only) reports Power Off Menu focused, Return opens the menu with Suspend, Restart…, Power Off… and Log Out… showing, and Tab/Return chooses Restart…. Within 15 s the shell (the `org.gnome.Shell` owner, not the compositor) has called `org.gnome.SessionManager.Reboot` and the compositor's manager has answered with the shell's `EndSessionDialog.Open(2, 0, 60, …)`, with the `tuna-shell-end-session` layer up; the dialog reads "The system will restart automatically in 60 seconds" with Cancel focused, as GNOME 51's endSessionDialog.js. It steps to 50 seconds with QEMU running, the session and compositor identity unchanged, no logind power request, `PrepareFor*` signal or `PreparingForShutdown`, and the request still unanswered; Return on the focused Cancel then emits the shell's `Canceled`, fails `Reboot` with gnome-session's `G_IO_ERROR_CANCELLED` and takes the layer down, still with logind untouched. Any failure presses Escape so no countdown is left running (lifecycle/end-session-menu.json). The published guest's shell predates the session manager and defers to the current-build lane |
+| V-RESTART-DIALOG | Both current-build and published guests must exercise the shell's own power menu by physical keys on the unlocked desktop after V-POWER-BUTTON (#589): Super+S opens quick settings; physical Tab moves until the shell's AT-SPI tree (`tuna-vm-shell-focus` end-session mode, observation only) reports Power Off Menu focused, Return opens the menu with Suspend, Restart…, Power Off… and Log Out… showing, and Tab/Return chooses Restart…. Within 15 s the shell (the `org.gnome.Shell` owner, not the compositor) has called `org.gnome.SessionManager.Reboot` and the compositor's manager has answered with the shell's `EndSessionDialog.Open(2, 0, 60, …)`, with the `tuna-shell-end-session` layer up; the dialog reads "The system will restart automatically in 60 seconds" with Cancel focused, as GNOME 51's endSessionDialog.js. It steps to 50 seconds with QEMU running, the session and compositor identity unchanged, no logind power request, `PrepareFor*` signal or `PreparingForShutdown`, and the request still unanswered; Return on the focused Cancel then emits the shell's `Canceled`, fails `Reboot` with gnome-session's `G_IO_ERROR_CANCELLED` and takes the layer down, still with logind untouched. Any failure presses Escape so no countdown is left running (lifecycle/end-session-menu.json). An older published shell does not waive the gate |
 | V-POWER-OFF-DIALOG | As V-RESTART-DIALOG for Power Off…: `org.gnome.SessionManager.Shutdown`, `Open(1, 0, 60, …)`, "The system will power off automatically in 60 seconds" stepping to 50, Cancel by Return, `Shutdown` failed as cancelled, logind untouched |
-| V-LOGOUT | The product's Log Out, on the session bus through `org.gnome.SessionManager`, which ends the compositor (the session leader) through its orderly shutdown, as gnome-session's exit ends a GNOME session. The current-build lane logs out from the shell's power menu by physical keys (#589), as V-RESTART-DIALOG runs Restart…: the shell must ask `Logout(0)`, the compositor's manager must answer it once its `Open(0, 0, 60, …)` has put the dialog up, counting down from 60 with Cancel focused, and the session must outlive that countdown, whose expiry confirms the logout (the greeter may only return at least 55 s after the dialog opened). The published lane calls `Logout(1)` (no confirmation); a published guest that predates that manager logs out as its shell did, through logind `Session.Terminate`. Within 30 s of the logout taking effect (90 s from the menu dialog's opening) GDM's non-root gnome-shell greeter in its active gdm-launch-environment session repaints the greeter frame captured before login and no original compositor survives. logind's Terminate signals GDM's session worker together with the compositor; the worker's switch to the login VT could then be cancelled by logind restoring the session VT, leaving GDM without a greeter on the session VT (published nightly runs 40883859027 and 40940329310 attempt 1) |
+| V-LOGOUT | Both lanes use the shell's power menu by physical keys (#589), as V-RESTART-DIALOG runs Restart…: the shell must ask `org.gnome.SessionManager.Logout(0)`, the compositor's manager must answer it once its `Open(0, 0, 60, …)` has put the dialog up, counting down from 60 with Cancel focused, and the session must outlive that countdown, whose expiry confirms the logout (the greeter may only return at least 55 s after the dialog opened). Within 30 s of the logout taking effect (90 s from the menu dialog's opening) GDM's non-root gnome-shell greeter in its active gdm-launch-environment session repaints the greeter frame captured before login and no original compositor survives. A logind `Session.Terminate` substitute or historical published build does not pass |
 
 The original tour's `V-LOCK` still requires exactly unlocked → locked →
 unlocked. Its observations end before lifecycle operations add their own
@@ -972,6 +1013,43 @@ with the corrected installed lifecycle probe must still demonstrate the
 actual first locked wake, exact application geometry/process preservation,
 fresh GPU uploads, stale-auth retirement, fresh authentication and client
 repaint; fixture regressions alone cannot qualify suspend.
+
+#### Wake-time guest-agent transport (guest Linux 7.3)
+
+PR runs for #1083, #1089, #1090 and #1092 (e.g. 43385429967) passed
+`V-SUSPEND-GPU-PM` and reached real S3. The compositor reset scanout and
+repainted after wake. The run then failed `V-LIFECYCLE` with a bare socket
+`timed out`. The guest's qemu-ga logged `guest-exec ... inventory` at 501.22 s
+and no `guest-exec-status` afterwards. Its next request came at 530.45 s, on
+the reconnected diagnostics transport. The host therefore never received the
+guest-exec acknowledgement. The inventory probe itself did not block. The
+green main run 43369611171 polled status 42 ms after the same request.
+
+The difference is the guest kernel, not the PRs. `pacman -Syu` during the
+image build moved the guest from `linux 7.2.15` (main) to `7.3.4` (all four
+PRs). Upstream commit 952261953cf7 ("virtio_console: fix control queue race
+during restore", in
+[7.3.4](https://raw.githubusercontent.com/gregkh/linux/v7.3.4/drivers/char/virtio_console.c)
+but not
+[7.2.15](https://raw.githubusercontent.com/gregkh/linux/v7.2.15/drivers/char/virtio_console.c))
+changed `virtcons_restore()` to fill the control receive queue only after
+sending `PORT_READY`. [QEMU 10.2](https://gitlab.com/qemu-project/qemu/-/raw/v10.2.0/hw/char/virtio-serial-bus.c)
+answers `PORT_READY` with the host-open event before it returns the
+control-out buffer. `send_control_msg()` drops that event when the receive
+queue is empty. Freeze had set the guest port to host-disconnected, so
+after restore every qemu-ga write returns `EAGAIN` until the host chardev
+reconnects.
+
+After `system_wakeup`, the lane now calls `GuestAgent.reopen_after_wake`
+(2 s per connection, 20 s total). It closes and reopens the QGA chardev,
+which makes QEMU send `PORT_OPEN` 0/1 again, until one `guest-sync-delimited`
+round trip completes. The step runs no guest-exec and reads no guest state,
+so the following inventory is still the first state observation after wake.
+The number of connections and the elapsed time go to
+`lifecycle/wake-transport.json`. The inventory keeps its 30 s deadline, and
+no suspend gate changes. A lost acknowledgement or status reply now names its
+QGA step instead of a bare `timed out`. This is controlled-socket evidence only.
+A fresh actual run must still qualify `V-SUSPEND` on the 7.3 guest.
 
 
 ### Date & Time restoration and published capability failures

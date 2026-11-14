@@ -262,6 +262,22 @@ impl Authority {
         self.unlocked()?;
         Ok(sender)
     }
+    /// InputCapture session creation: the installed portal backend only.
+    /// Its InputCapture portal holds the user's consent; GNOME Shell
+    /// never captures input this way and grd has its own interface.
+    pub async fn admit_portal(
+        &self,
+        conn: &Connection,
+        header: &Header<'_>,
+    ) -> fdo::Result<String> {
+        self.unlocked()?;
+        let (sender, caller) = self.authenticate_caller(conn, header).await?;
+        if caller != CaptureCaller::Portal {
+            return Err(denied("input capture requires the installed portal"));
+        }
+        self.unlocked()?;
+        Ok(sender)
+    }
     /// Authenticate desktop-service identity without authorizing capture.
     /// Screenshot's documented false result can deny an authenticated locked
     /// backend while other capture APIs retain their AccessDenied result.

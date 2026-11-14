@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Usage: scripts/lib/tuna-timeout MINUTES LABEL COMMAND [ARGS...]
+#
+# Runs COMMAND in its own process group. If it is still running after
+# MINUTES, the whole group (cargo and every rustc, or a proof and what it
+# started) gets TERM, then KILL 30 s later, and this exits 124 with
+# "LABEL TIMED OUT after MINUTES min". Ctrl-C, TERM and HUP are passed to
+# the group. Otherwise exits with COMMAND's status.
+set -uo pipefail
+[ $# -ge 3 ] || { sed -n '2,8p' "$0" >&2; exit 2; }
+minutes=$1 label=$2
+shift 2
+case "$minutes" in '' | *[!0-9]* | 0) echo "tuna-timeout: bad minutes '$minutes'" >&2; exit 2 ;; esac
+# A background job of a non-interactive shell is no group leader, so
+# setsid makes it one in place: its pid is the group id.
+setsid "$@" &
+pid=$!
+trap 'kill -TERM -- "-$pid" 2>/dev/null' TERM HUP
+trap 'kill -INT -- "-$pid" 2>/dev/null' INT
+expired=$(mktemp "${TMPDIR:-/tmp}/tuna-timeout.XXXXXX")
+(
+    sleep "$((minutes * 60))" &
+    trap 'kill $! 2>/dev/null; exit 0' TERM
+    wait $!
+    echo 1 >"$expired"
+    echo "$label TIMED OUT after $minutes min; stopping process group $pid" >&2
+    kill -TERM -- "-$pid" 2>/dev/null
+    sleep 30 &
+    wait $!
+    kill -KILL -- "-$pid" 2>/dev/null
+) &
+watchdog=$!
+# `wait` returns early when a trapped signal arrives; keep waiting for the
+# command itself.
+status=0
+while :; do
+    wait "$pid"
+    status=$?
+    kill -0 "$pid" 2>/dev/null || break
+done
+kill -TERM "$watchdog" 2>/dev/null
+wait "$watchdog" 2>/dev/null
+if [ -s "$expired" ]; then
+    rm -f "$expired"
+    # Anything of the group still alive after its leader exited.
+    kill -KILL -- "-$pid" 2>/dev/null
+    exit 124
+fi
+rm -f "$expired"
+exit "$status"

@@ -22,20 +22,29 @@ every step it gates on the compositor state (TUNA_COMPOSITOR_STATE):
   H-SCALE    the applied scale and arrangement reach the outputs
   H-STORED   a monitors.xml written mid-session configures the replug
   H-INPUT    Super opens and Escape closes the overview every round
-  H-GROWTH   compositor+shell PSS and fds stay bounded over the storm
+  H-GROWTH   compositor+shell PSS and fds stay bounded over the storm; each
+             round's sample names every process's PSS by kind and fds, each
+             step its PSS, and smaps-round0-*/smaps-final-* the mappings
   H-LIVE     the compositor never exits or panics, the shell never exits
+--heaptrack records the allocation backtraces of the compositor and the
+shell (heaptrack-<name>-<pid>.zst, for heaptrack_print); the profiler's own
+memory then counts in H-GROWTH, so it is a diagnostic run.
 Needs root (sudo) for modprobe, configfs, seatd and uinput.
 """
 import argparse
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts/lib"))
+from tuna_process_metrics import largest_rises, metrics, save_smaps, tree_rollup  # noqa: E402
+
 CONFIGFS = Path("/sys/kernel/config/vkms")
 INSTANCE = "tuna-hotplug"
 SOCKET = "tuna-hotplug"
@@ -124,32 +133,6 @@ def seat_worker():
     mouse.close()
 
 
-def metrics(root_pid):
-    """PSS, RSS and fds of a process and all its descendants."""
-    pairs = subprocess.check_output(["ps", "-eo", "pid=,ppid="], text=True)
-    edges = [tuple(map(int, line.split())) for line in pairs.splitlines()]
-    tree = {root_pid}
-    while True:
-        grown = tree | {pid for pid, parent in edges if parent in tree}
-        if grown == tree:
-            break
-        tree = grown
-    pss, rss, fds = 0, 0, 0
-    for pid in tree:
-        proc = Path(f"/proc/{pid}")
-        try:
-            for line in (proc / "smaps_rollup").read_text().splitlines():
-                parts = line.split()
-                if parts[0] == "Pss:":
-                    pss += int(parts[1])
-                elif parts[0] == "Rss:":
-                    rss += int(parts[1])
-            fds += len(list((proc / "fd").iterdir()))
-        except (FileNotFoundError, ProcessLookupError, PermissionError):
-            pass
-    return {"pss_kib": pss, "rss_kib": rss, "fds": fds, "processes": len(tree)}
-
-
 def sudo_sh(script):
     subprocess.run(["sudo", "sh", "-eu", "-c", script], check=True)
 
@@ -213,6 +196,18 @@ rmdir "$C"/planes/* "$C"/crtcs/* "$C"/encoders/* "$C"/connectors/* "$C"
 """)
 
 
+def heaptrack_dir():
+    """heaptrack's library directory, as its launcher finds it."""
+    launcher = shutil.which("heaptrack")
+    if launcher is None:
+        raise RuntimeError("--heaptrack needs heaptrack installed")
+    usr = Path(launcher).resolve().parent.parent
+    for directory in [usr / "lib/heaptrack", *usr.glob("lib/*/heaptrack")]:
+        if (directory / "libheaptrack_preload.so").exists() and (directory / "libexec/heaptrack_interpret").exists():
+            return directory
+    raise RuntimeError(f"heaptrack's preload library and interpreter are not under {usr}/lib")
+
+
 def run(args):
     out = Path(args.out).resolve()
     if out.exists() and any(out.iterdir()):
@@ -224,6 +219,23 @@ def run(args):
     config = out / "config"
     config.mkdir()
     state_path = out / "state.json"
+    shell_bin = ROOT / "target/debug/tuna-shell-gtk"
+    heaptrack, heaptrack_env, names = None, {}, {}
+    if args.heaptrack:
+        # As the heaptrack launcher runs a program, but writing the raw
+        # trace to a file per process ($$ is the pid) that is interpreted
+        # after the run. The preload library takes itself out of the
+        # environment, so the shell gets it again from a wrapper that
+        # keeps the pid and executable the compositor knows its shell by.
+        heaptrack = heaptrack_dir()
+        heaptrack_env = {"LD_PRELOAD": str(heaptrack / "libheaptrack_preload.so"),
+                         "DUMP_HEAPTRACK_OUTPUT": str(out / "heaptrack.$$.raw")}
+        wrapper = out / "shell-heaptrack"
+        wrapper.write_text("#!/bin/sh\n" + "".join(
+            f"export {key}={shlex.quote(value)}\n" for key, value in heaptrack_env.items())
+            + f'exec {shlex.quote(str(shell_bin))} "$@"\n')
+        wrapper.chmod(0o755)
+        shell_bin = wrapper
     env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
     env.update(XDG_RUNTIME_DIR=str(private), GSK_RENDERER="cairo", GSETTINGS_BACKEND="memory",
                ADW_DISABLE_PORTAL="1", LIBSEAT_BACKEND="seatd",
@@ -285,8 +297,8 @@ def run(args):
         env["DBUS_SESSION_BUS_ADDRESS"], dbus_pid = bus[0], int(bus[1])
 
         compositor = launch([str(ROOT / "target/debug/tuna-compositor"), "--backend", "drm",
-                             "--socket", SOCKET, "--shell-bin", str(ROOT / "target/debug/tuna-shell-gtk")],
-                            "compositor", env | {"TUNA_DRM_DEVICE": card})
+                             "--socket", SOCKET, "--shell-bin", str(shell_bin)],
+                            "compositor", env | {"TUNA_DRM_DEVICE": card} | heaptrack_env)
         log_path = out / "compositor.log"
         wait_for("the GTK shell's panel on the output",
                  lambda: any(layer.get("namespace") == "tuna-panel" for layer in state().get("layers", [])), 60)
@@ -414,10 +426,13 @@ def run(args):
                 wait_for(f"{label}: client {name} keeps drawing frames",
                          lambda: (beats(name) or [{"frames": 0}])[-1]["frames"] > marks[name] + 2, 10)
             snapshot = state()
+            memory = tree_rollup(compositor.pid)
+            names.update(reversed(name.rsplit(":", 1)) for name in memory)
             steps.append({"step": label, "elapsed_s": round(time.monotonic() - start, 3),
                           "outputs": snapshot.get("outputs"),
                           "windows": {n: window(n)["rect"] for n in clients},
-                          "gdk_monitors": {n: (beats(n) or [{}])[-1].get("monitor") for n in clients}})
+                          "gdk_monitors": {n: (beats(n) or [{}])[-1].get("monitor") for n in clients},
+                          "memory": memory})
 
         def plug(index, connected_after, label):
             vkms.plug(index, index in connected_after)
@@ -489,8 +504,16 @@ def run(args):
                 stream.write(json.dumps(value) + "\n")
             if r == 0:
                 baseline = value
+                save_smaps(compositor.pid, out, "round0")
+                shutil.copy(state_path, out / "state-round0.json")
             print(f"tuna-hotplug-stress: round {r + 1}/{args.rounds} passed "
-                  f"(PSS {value['pss_kib']} KiB, {value['fds']} fds)", flush=True)
+                  f"(PSS {value['pss_kib']} KiB, {value['fds']} fds; "
+                  + ", ".join(f"{name.rsplit(':', 1)[0]} {p['pss_kib']} KiB "
+                              f"(anon {p['pss_anon_kib']}, file {p['pss_file_kib']}, "
+                              f"shmem {p['pss_shmem_kib']}), {p['fds']} fds"
+                              for name, p in sorted(value["per_process"].items())) + ")", flush=True)
+
+        save_smaps(compositor.pid, out, "final")
 
         assertions["H-OUTPUTS"] = [True, f"{counts['hotplugs']} hotplugs; wl_outputs and DisplayConfig matched the connected set after each"]
         assertions["H-REHOME"] = [True, f"{len(clients)} windows on their own output when connected, else the primary, after every step"]
@@ -503,8 +526,13 @@ def run(args):
         # Diagnostic limits for a bounded storm, as tuna-stress's.
         pss_limit = baseline["pss_kib"] * 1.25 + 65536
         fd_limit = baseline["fds"] + 32
+        # The owner of the rise: the largest changes since round 0 by
+        # process and mapping kind.
+        owners = ", ".join(f"{comm} {kind} {delta / 1024:+.1f} MiB"
+                           for delta, comm, kind in largest_rises(baseline, final, 4))
         assertions["H-GROWTH"] = [final["pss_kib"] <= pss_limit and final["fds"] <= fd_limit,
-                                  f"PSS {final['pss_kib']}/{int(pss_limit)} KiB; fds {final['fds']}/{fd_limit}"]
+                                  f"PSS {final['pss_kib']}/{int(pss_limit)} KiB; fds {final['fds']}/{fd_limit}; "
+                                  f"since round 0: {owners}"]
         text = (out / "compositor.log").read_text()
         assertions["H-LIVE"] = [compositor.poll() is None and "panicked" not in text
                                 and "ShellExited" not in text,
@@ -540,6 +568,20 @@ def run(args):
                 pass
         for log in logs:
             log.close()
+        if heaptrack is not None:
+            # heaptrack_interpret resolves the backtraces against the
+            # binaries of this run; the raw traces are large.
+            compress, suffix = (["zstd", "-q", "-c"], "zst") if shutil.which("zstd") else (["gzip", "-c"], "gz")
+            for raw in sorted(out.glob("heaptrack.*.raw")):
+                pid = raw.name.split(".")[1]
+                target = out / f"heaptrack-{names.get(pid, 'process')}-{pid}.{suffix}"
+                with raw.open("rb") as source, target.open("wb") as sink:
+                    interpret = subprocess.Popen([str(heaptrack / "libexec/heaptrack_interpret")],
+                                                 stdin=source, stdout=subprocess.PIPE)
+                    subprocess.run(compress, stdin=interpret.stdout, stdout=sink)
+                    interpret.stdout.close()
+                    interpret.wait()
+                raw.unlink()
         try:
             vkms.destroy()
         except subprocess.CalledProcessError as error:
@@ -566,6 +608,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--out", default="hotplug-artifacts")
+    parser.add_argument("--heaptrack", action="store_true",
+                        help="record the compositor's and the shell's allocation backtraces (diagnostic)")
     parser.add_argument("--client", help=argparse.SUPPRESS)
     parser.add_argument("--seat", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()

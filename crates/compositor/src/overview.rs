@@ -406,6 +406,13 @@ pub const SNAP_BACK_MS: f64 = 250.0;
 pub const REVERT_MS: f64 = 750.0;
 /// Workspace scroll inside the overview (`WORKSPACE_SWITCH_TIME`).
 pub const WORKSPACE_SCROLL_MS: f64 = 250.0;
+/// GNOME's `ControlsState` (overviewControls.js:33-37): the overview's
+/// state adjustment runs from the desktop (0) through the window picker
+/// (1) to the app grid (2), and its swipe snaps to each of them
+/// (overviewControls.js:757-775).
+pub const CONTROLS_WINDOW_PICKER: f64 = 1.0;
+pub const CONTROLS_APP_GRID: f64 = 2.0;
+const CONTROLS_STATES: usize = 3;
 
 /// One eased value moving between two endpoints over a fixed time.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -657,13 +664,30 @@ impl MorphCause {
     }
 }
 
-/// A swipe driving the transition: where it began, the finger travel
-/// toward open so far, and its recent `(time, delta)` events.
+/// A swipe driving GNOME's overview controls state (0 desktop, 1 window
+/// picker, 2 app grid): where it began, the bounds GNOME's tracker keeps
+/// it in, the finger travel toward the app grid so far, and its recent
+/// `(time, delta)` events.
 #[derive(Debug, Clone)]
 struct Swipe {
     initial: f64,
+    bounds: (f64, f64),
+    state: f64,
     travel: f64,
     history: crate::workspace_slide::SwipeHistory,
+}
+
+/// The open overview's workspaces scrolled by a swipe
+/// (`WorkspacesView`'s scroll adjustment, workspacesView.js:960-1002):
+/// the drawn position along `workspaces` (fractional while between
+/// two), held by the fingers or easing out a release.
+#[derive(Debug, Clone)]
+struct Scroll {
+    workspaces: Vec<u32>,
+    position: Tween,
+    /// The fingers hold it: the closest workspace when they went down
+    /// and their recent `(time, delta)` events.
+    held: Option<(f64, crate::workspace_slide::SwipeHistory)>,
 }
 
 /// What a settled scene's shape is, to notice when it changes.
@@ -764,8 +788,15 @@ pub struct OverviewCues {
 #[derive(Debug, Clone)]
 pub struct OverviewMotion {
     progress: Tween,
-    /// A swipe holds the transition.
+    /// A swipe holds the controls state.
     swipe: Option<Swipe>,
+    /// GNOME's controls state while a swipe holds it (settled) or its
+    /// release eases it out: the transition draws its part up to the
+    /// window picker, the app grid the rest (overviewControls.js:776-797).
+    drive: Option<Tween>,
+    /// The open overview's workspaces under a swipe.
+    scroll: Option<Scroll>,
+    scroll_release: Option<Release>,
     open_trace: Option<Trace>,
     close_trace: Option<Trace>,
     release: Option<Release>,
@@ -787,6 +818,9 @@ impl Default for OverviewMotion {
         Self {
             progress: Tween::settled(0.0),
             swipe: None,
+            drive: None,
+            scroll: None,
+            scroll_release: None,
             open_trace: None,
             close_trace: None,
             release: None,
@@ -810,6 +844,11 @@ impl OverviewMotion {
     /// pending). The loop keeps the frame cadence until they settle (#503).
     pub(crate) fn animating(&self) -> bool {
         !self.progress.done()
+            || self.drive.as_ref().is_some_and(|tween| !tween.done())
+            || self
+                .scroll
+                .as_ref()
+                .is_some_and(|scroll| !scroll.position.done())
             || !self.search.done()
             || !self.drag_shrink.done()
             || self.hover.iter().any(|(_, tween)| !tween.done())
@@ -826,6 +865,77 @@ impl OverviewMotion {
         self.progress.value()
     }
 
+    /// GNOME's controls state as drawn (0 the desktop, 1 the window
+    /// picker, 2 the app grid): a swipe's while one drives it, else the
+    /// transition, at the app grid when the settled overview shows it.
+    pub fn controls_state(&self, app_grid: bool) -> f64 {
+        match &self.drive {
+            Some(drive) => drive.value(),
+            None if app_grid && self.progress.value() >= CONTROLS_WINDOW_PICKER => {
+                CONTROLS_APP_GRID
+            }
+            None => self.progress.value(),
+        }
+    }
+
+    /// How far toward the app grid a swipe draws the overview (0 the
+    /// window picker, 1 the app grid; GNOME interpolates the workspaces'
+    /// fit mode with the state, overviewControls.js:588-600), or `None`
+    /// while no swipe drives it and the settled state decides.
+    pub fn app_grid_progress(&self) -> Option<f64> {
+        self.drive
+            .as_ref()
+            .map(|drive| (drive.value() - CONTROLS_WINDOW_PICKER).clamp(0.0, 1.0))
+    }
+
+    /// Where a swipe draws the open overview's workspaces: the strip and
+    /// the position along it (fractional between two), or `None` while
+    /// the active workspace decides.
+    pub fn workspace_scroll(&self) -> Option<(&[u32], f64)> {
+        self.scroll
+            .as_ref()
+            .map(|scroll| (scroll.workspaces.as_slice(), scroll.position.value()))
+    }
+
+    /// The overview at rest as a swipe draws it, `layout(workspace,
+    /// app_grid)` laying out the resting overview on `workspace` in the
+    /// app grid or the window picker. A swipe across the controls states
+    /// draws between the window picker and the app grid (GNOME lerps the
+    /// workspaces' fit mode with the state, overviewControls.js:588-600),
+    /// one across workspaces between the two it lies between (the scroll
+    /// adjustment, workspacesView.js:509-540); otherwise `active` and
+    /// `app_grid` decide.
+    pub fn resting(
+        &self,
+        active: u32,
+        app_grid: bool,
+        layout: impl Fn(u32, bool) -> OverviewLayout,
+    ) -> OverviewLayout {
+        let state = |workspace| match self.app_grid_progress() {
+            None => layout(workspace, app_grid),
+            Some(p) if p <= 0.0 => layout(workspace, false),
+            Some(p) if p >= 1.0 => layout(workspace, true),
+            Some(p) => blend(&layout(workspace, false), &layout(workspace, true), p),
+        };
+        let Some((strip, at)) = self
+            .workspace_scroll()
+            .filter(|(strip, _)| !strip.is_empty())
+        else {
+            return state(active);
+        };
+        let last = strip.len() - 1;
+        let (lo, hi) = (
+            (at.floor().max(0.0) as usize).min(last),
+            (at.ceil().max(0.0) as usize).min(last),
+        );
+        let t = at - at.floor();
+        if lo == hi || t <= 0.0 {
+            state(strip[lo])
+        } else {
+            blend(&state(strip[lo]), &state(strip[hi]), t)
+        }
+    }
+
     /// Whether search has fully faded the workspaces out.
     pub fn search_covers(&self) -> bool {
         self.search.value() >= 1.0
@@ -834,6 +944,12 @@ impl OverviewMotion {
     /// Jump everything to its end state (motion turned off).
     pub fn snap(&mut self, open: bool) {
         self.progress = Tween::settled(if open { 1.0 } else { 0.0 });
+        if self.swipe.is_none() {
+            self.drive = None;
+        }
+        if let Some(scroll) = self.scroll.as_mut().filter(|s| s.held.is_none()) {
+            scroll.position = Tween::settled(scroll.position.to);
+        }
         self.search = Tween::settled(self.search.to);
         self.morph = None;
         self.revert = None;
@@ -850,6 +966,18 @@ impl OverviewMotion {
         let animate = motion.allows_motion();
         if self.swipe.is_some() {
             return;
+        }
+        if let Some(drive) = self.drive.as_mut() {
+            // A released swipe eases out toward its target under every
+            // policy (its duration already scaled); anything moving the
+            // overview the other way (a key, a click) takes over from
+            // where it is drawn.
+            if (drive.to >= CONTROLS_WINDOW_PICKER) == open {
+                drive.step(dt_ms);
+                self.progress = Tween::settled(drive.value().min(CONTROLS_WINDOW_PICKER));
+                return;
+            }
+            self.drive = None;
         }
         let target = if open { 1.0 } else { 0.0 };
         let retargeted = self.progress.to != target;
@@ -894,76 +1022,183 @@ impl OverviewMotion {
         }
     }
 
-    /// Whether a swipe holds the transition.
+    /// Whether a swipe holds the controls state.
     pub fn swiping(&self) -> bool {
         self.swipe.is_some()
     }
 
-    /// The swipe has travelled `travel` touchpad units toward open in
-    /// all, at `time`, over `distance` units for the whole transition.
-    /// The first call begins it where the transition is. The transition
-    /// follows the fingers, or with motion off jumps to the nearer end.
-    pub fn swipe_update(&mut self, time: u32, travel: f64, distance: f64, motion: MotionPolicy) {
-        let animate = motion.allows_motion();
-        let at = self.progress.value();
-        let swipe = self.swipe.get_or_insert_with(|| Swipe {
-            initial: at,
+    /// A swipe took the overview's vertical axis at `time` (GNOME's
+    /// `gestureBegin`, overviewControls.js:757-775): it starts from the
+    /// controls state as drawn (the app grid when `app_grid` and the
+    /// overview rests open), kept within the snap points either side of
+    /// the closest one (no long swipes, swipeTracker.js:547-565), so a
+    /// swipe from the desktop stops at the window picker and one from
+    /// the window picker reaches the desktop or the app grid. Its
+    /// velocity history starts from a still sample (swipeTracker.js:509-513).
+    pub fn swipe_begin(&mut self, time: u32, app_grid: bool) {
+        let initial = self.controls_state(app_grid);
+        let mut history = crate::workspace_slide::SwipeHistory::default();
+        history.append(time, 0.0);
+        self.swipe = Some(Swipe {
+            initial,
+            bounds: crate::workspace_slide::swipe_bounds(initial, CONTROLS_STATES),
+            state: initial,
             travel: 0.0,
-            history: Default::default(),
+            history,
         });
-        swipe.history.append(time, travel - swipe.travel);
-        swipe.travel = travel;
-        let raw = (swipe.initial + travel / distance.max(1.0)).clamp(0.0, 1.0);
-        let shown = if animate {
-            raw
-        } else if raw >= 0.5 {
-            1.0
-        } else {
-            0.0
-        };
-        self.progress = Tween::settled(shown);
+        self.drive = Some(Tween::settled(initial));
     }
 
-    /// The swipe ended at `time`: finish toward where GNOME's tracker
-    /// would, carrying the fingers' velocity into an `EASE_OUT_CUBIC`
-    /// of matching duration (back where it began when `cancelled`).
-    /// Returns whether the overview ends open, or `None` without a swipe.
+    /// The swipe has travelled `travel` touchpad units toward the app
+    /// grid in all, at `time`, over `distance` units per state. The
+    /// state moves by each step's share and stays within the swipe's
+    /// bounds (`_updateGesture`, swipeTracker.js:567-576); without
+    /// [`swipe_begin`](Self::swipe_begin) the swipe begins here, short of
+    /// the app grid. It follows the fingers under every motion policy:
+    /// GNOME sets the state adjustment directly (overview.js:359-380,
+    /// overviewControls.js:777-779), which no animation setting touches.
+    pub fn swipe_update(&mut self, time: u32, travel: f64, distance: f64) {
+        if self.swipe.is_none() {
+            self.swipe_begin(time, false);
+        }
+        let Some(swipe) = self.swipe.as_mut() else {
+            return;
+        };
+        let delta = travel - swipe.travel;
+        swipe.history.append(time, delta);
+        swipe.travel = travel;
+        let (low, high) = swipe.bounds;
+        swipe.state = (swipe.state + delta / distance.max(1.0)).clamp(low, high);
+        let state = swipe.state;
+        self.drive = Some(Tween::settled(state));
+        self.progress = Tween::settled(state.min(CONTROLS_WINDOW_PICKER));
+    }
+
+    /// The swipe ended at `time`: finish at the controls state GNOME's
+    /// tracker lands on (`_getEndProgress` over the desktop, window
+    /// picker and app grid within the swipe's bounds, swipeTracker.js:601-658),
+    /// carrying the fingers' velocity into an `EASE_OUT_CUBIC` of
+    /// matching duration (`gestureEnd`, overviewControls.js:781-797);
+    /// back to the state it began nearest when `cancelled`. The duration
+    /// takes the slow-down factor and is zero with animations off
+    /// (animationUtils.js:23-33); reduced motion leaves it as it is.
+    /// Returns the state it settles at and the ease's duration (ms), or
+    /// `None` without a swipe.
     pub fn swipe_end(
         &mut self,
         time: u32,
         cancelled: bool,
         distance: f64,
         motion: MotionPolicy,
-    ) -> Option<bool> {
-        let animate = motion.allows_motion();
+    ) -> Option<(f64, f64)> {
         let Swipe {
             initial,
+            bounds,
+            state,
             mut history,
             ..
         } = self.swipe.take()?;
-        let at = self.progress.value();
         let velocity = history.velocity(time);
-        let (target, duration) = crate::workspace_slide::swipe_release_over(
-            at,
-            initial.round().clamp(0.0, 1.0),
-            2,
+        let (target, duration) = crate::workspace_slide::release_within(
+            state,
+            initial.round().clamp(0.0, CONTROLS_APP_GRID),
+            bounds,
+            CONTROLS_STATES,
             velocity,
             cancelled,
             distance,
         );
         let duration = motion.adjust_ms(duration);
-        self.progress = if animate && duration > 0.0 {
-            Tween::new(at, target, duration, Curve::EaseOutCubic)
+        let drive = if duration > 0.0 {
+            Tween::new(state, target, duration, Curve::EaseOutCubic)
         } else {
             Tween::settled(target)
         };
+        self.progress = Tween::settled(drive.value().min(CONTROLS_WINDOW_PICKER));
+        self.drive = Some(drive);
         self.release = Some(Release {
-            from: at,
+            from: state,
             target,
             velocity,
-            duration_ms: if animate { duration } else { 0.0 },
+            duration_ms: duration,
         });
-        Some(target >= 1.0)
+        Some((target, duration))
+    }
+
+    /// A swipe took the open overview's workspaces at `time`
+    /// (`_switchWorkspaceBegin`, workspacesView.js:960-982): every one
+    /// of `workspaces` is a snap point, and the strip starts where it is
+    /// drawn (a release still easing is caught mid-flight) or at
+    /// `active`.
+    pub fn scroll_begin(&mut self, time: u32, workspaces: Vec<u32>, active: u32) {
+        let at = match &self.scroll {
+            Some(scroll) if scroll.workspaces == workspaces => scroll.position.value(),
+            _ => workspaces.iter().position(|w| *w == active).unwrap_or(0) as f64,
+        };
+        let mut history = crate::workspace_slide::SwipeHistory::default();
+        history.append(time, 0.0);
+        self.scroll = Some(Scroll {
+            workspaces,
+            position: Tween::settled(at),
+            held: Some((at.round(), history)),
+        });
+    }
+
+    /// The fingers moved the strip `delta` touchpad units toward the next
+    /// workspace at `time` (`_switchWorkspaceUpdate`, workspacesView.js:984-987).
+    /// It follows them under every motion policy and across as many
+    /// workspaces as they travel: the overview's tracker allows long
+    /// swipes, bounded only by the first and last workspace
+    /// (workspacesView.js:876, swipeTracker.js:547-549, 567-576).
+    pub fn scroll_update(&mut self, time: u32, delta: f64) {
+        let Some(scroll) = self.scroll.as_mut() else {
+            return;
+        };
+        let Some((_, history)) = scroll.held.as_mut() else {
+            return;
+        };
+        history.append(time, delta);
+        let last = scroll.workspaces.len().saturating_sub(1) as f64;
+        let at = (scroll.position.value() + delta / crate::workspace_slide::TOUCHPAD_BASE_WIDTH)
+            .clamp(0.0, last);
+        scroll.position = Tween::settled(at);
+    }
+
+    /// The fingers lifted at `time`: the strip eases `EASE_OUT_CUBIC` to
+    /// where GNOME's tracker projects their velocity, possibly several
+    /// workspaces on (`_switchWorkspaceEnd`, workspacesView.js:989-1002;
+    /// swipeTracker.js:601-658), or back to the workspace it began
+    /// nearest when `cancelled`. The duration takes the slow-down factor
+    /// and is zero with animations off. Returns the workspace it settles
+    /// on, or `None` without a held scroll.
+    pub fn scroll_end(&mut self, time: u32, cancelled: bool, motion: MotionPolicy) -> Option<u32> {
+        let scroll = self.scroll.as_mut()?;
+        let (initial, mut history) = scroll.held.take()?;
+        let at = scroll.position.value();
+        let velocity = history.velocity(time);
+        let slots = scroll.workspaces.len();
+        let (end, duration) = crate::workspace_slide::release_within(
+            at,
+            initial,
+            (0.0, slots.saturating_sub(1) as f64),
+            slots,
+            velocity,
+            cancelled,
+            crate::workspace_slide::TOUCHPAD_BASE_WIDTH,
+        );
+        let duration = motion.adjust_ms(duration);
+        scroll.position = if duration > 0.0 {
+            Tween::new(at, end, duration, Curve::EaseOutCubic)
+        } else {
+            Tween::settled(end)
+        };
+        self.scroll_release = Some(Release {
+            from: at,
+            target: end,
+            velocity,
+            duration_ms: duration,
+        });
+        scroll.workspaces.get(end as usize).copied()
     }
 
     /// A preview drag began: start GNOME's shrink.
@@ -1005,8 +1240,9 @@ impl OverviewMotion {
     }
 
     /// Advance the settled scene's motion by `dt_ms`. `base` is the
-    /// overview as it would rest (`layout` or `app_grid_layout`), `drag`
-    /// the dragged window and its grab point.
+    /// overview as it would rest (`layout` or `app_grid_layout`, or
+    /// between them and between workspaces where a swipe draws it),
+    /// `drag` the dragged window and its grab point.
     pub fn step_scene(
         &mut self,
         dt_ms: f64,
@@ -1022,10 +1258,16 @@ impl OverviewMotion {
         let motion = cues.motion;
         let animate = motion.allows_motion();
         let shape = SceneShape::of(base, cues.app_grid);
-        let cause = self
-            .pending
-            .take()
-            .or_else(|| self.shape.as_ref().and_then(|old| old.cause(&shape)));
+        // A swipe draws its own way between the window picker and the app
+        // grid, and between workspaces, so the scene it draws changes
+        // shape under the fingers: no morph over it.
+        let swiped = self.drive.is_some() || self.scroll.is_some();
+        let cause = self.pending.take().or_else(|| {
+            self.shape
+                .as_ref()
+                .filter(|_| !swiped)
+                .and_then(|old| old.cause(&shape))
+        });
         if let (Some(cause), Some(from), true) = (cause, self.last_scene.take(), animate) {
             let (duration, curve) = cause.timing();
             let duration = motion.adjust_ms(duration);
@@ -1033,6 +1275,10 @@ impl OverviewMotion {
             self.last_morph = Some(cause);
         }
         self.shape = Some(shape);
+        self.settle_swipes();
+        if let Some(scroll) = self.scroll.as_mut() {
+            scroll.position.step(dt_ms);
+        }
         self.search.retarget(
             if cues.search { 1.0 } else { 0.0 },
             motion.adjust_ms(SIDE_CONTROLS_MS),
@@ -1090,7 +1336,24 @@ impl OverviewMotion {
         self.hovered = None;
         self.hover.clear();
         self.revert = None;
+        self.scroll = None;
+        self.settle_swipes();
         self.drag_released();
+    }
+
+    /// Forget a swipe's controls state and workspace scroll once its
+    /// release has eased out (the settled state takes over).
+    fn settle_swipes(&mut self) {
+        if self.swipe.is_none() && self.drive.as_ref().is_some_and(Tween::done) {
+            self.drive = None;
+        }
+        if self
+            .scroll
+            .as_ref()
+            .is_some_and(|scroll| scroll.held.is_none() && scroll.position.done())
+        {
+            self.scroll = None;
+        }
     }
 
     /// The overview scene before the open/close transition and search
@@ -1177,6 +1440,27 @@ impl OverviewMotion {
                 "duration_ms": self.progress.duration_ms,
             })),
             "release": self.release.map(|r| serde_json::json!({
+                "from": r.from,
+                "target": r.target,
+                "velocity": r.velocity,
+                "duration_ms": r.duration_ms,
+                "curve": Curve::EaseOutCubic.name(),
+            })),
+            "drive": self.drive.map(|t| serde_json::json!({
+                "state": t.value(),
+                "from": t.from,
+                "to": t.to,
+                "duration_ms": t.duration_ms,
+                "held": self.swipe.is_some(),
+            })),
+            "scroll": self.scroll.as_ref().map(|s| serde_json::json!({
+                "workspaces": s.workspaces,
+                "position": s.position.value(),
+                "to": s.position.to,
+                "duration_ms": s.position.duration_ms,
+                "held": s.held.is_some(),
+            })),
+            "scroll_release": self.scroll_release.map(|r| serde_json::json!({
                 "from": r.from,
                 "target": r.target,
                 "velocity": r.velocity,
@@ -1333,6 +1617,20 @@ pub enum OverviewHit {
     Dismiss,
 }
 
+/// The work area the overview lays out in: `output` below `work_top`.
+/// `None` when nothing is left of it (no output at all, or one no taller
+/// than the top bar): GNOME then has no workspaces view, so the layout
+/// entry points lay nothing out rather than scale an empty rectangle.
+fn work_area(output: Rectangle<i32, Logical>, work_top: i32) -> Option<Rectangle<i32, Logical>> {
+    let height = output.size.h.saturating_sub(work_top);
+    (output.size.w > 0 && height > 0).then(|| {
+        Rectangle::new(
+            (output.loc.x, output.loc.y + work_top).into(),
+            (output.size.w, height).into(),
+        )
+    })
+}
+
 /// The card for the workspace `offset` places from the active one: the
 /// work area (`output` below `work_top`) scaled down, neighbors one
 /// picker pitch away and shrunk about their center.
@@ -1398,6 +1696,23 @@ const PREVIEW_SPACING: f64 = 6.0 + (1.0 - 0.7) * 64.0 + 5.0;
 /// GNOME's layout tradeoff weights (`LAYOUT_SCALE_WEIGHT`, `_SPACE_`).
 const LAYOUT_SCALE_WEIGHT: f64 = 1.0;
 const LAYOUT_SPACE_WEIGHT: f64 = 0.1;
+/// The least [`window_scale_for`] gives. gnome-shell yields a
+/// non-positive scale here (a window three monitor heights tall or
+/// more); such a window gets (near) no weight in the row. The value is
+/// gnome-shell's own at 2.98 monitor heights, so the floor continues
+/// its lerp; being positive, it keeps every row's width and height sum
+/// positive, so the fits that divide by them stay finite and no preview
+/// comes out negative.
+const MIN_WINDOW_SCALE: f64 = 0.01;
+
+/// gnome-shell's `_computeWindowScale`: small windows grow a little,
+/// lerp(1.5, 1, height / monitor height). As there, a window taller
+/// than the monitor extrapolates below 1 (0.61 for a 1920px window on a
+/// 1080px monitor), down to [`MIN_WINDOW_SCALE`].
+fn window_scale_for(height: i32, monitor_height: i32) -> f64 {
+    let ratio = f64::from(height) / f64::from(monitor_height);
+    (1.5 + (1.0 - 1.5) * ratio).max(MIN_WINDOW_SCALE)
+}
 
 struct Row {
     windows: Vec<usize>,
@@ -1425,6 +1740,9 @@ pub fn window_slots(
 pub const SELECTOR_SPACING: f64 = 12.0;
 
 /// [`window_slots`] with `spacing` logical pixels between previews.
+/// Nothing is laid out without a monitor, a work area and a picker area
+/// to lay it out in; previews that the spacing leaves no room for come
+/// back empty (zero-sized) rather than negative.
 pub fn window_slots_spaced(
     workarea: Rectangle<i32, Logical>,
     monitor_height: i32,
@@ -1432,14 +1750,14 @@ pub fn window_slots_spaced(
     windows: &[(u64, Rectangle<i32, Logical>)],
     spacing: f64,
 ) -> Vec<(u64, Rectangle<i32, Logical>, f64)> {
-    if windows.is_empty() {
+    let degenerate = |r: &Rectangle<i32, Logical>| r.size.w <= 0 || r.size.h <= 0;
+    if windows.is_empty() || monitor_height <= 0 || degenerate(&workarea) || degenerate(&area) {
         return Vec::new();
     }
-    // Small windows grow a little: lerp(1.5, 1, height / monitor height).
-    let window_scale = |r: &Rectangle<i32, Logical>| {
-        let ratio = f64::from(r.size.h) / f64::from(monitor_height.max(1));
-        1.5 + (1.0 - 1.5) * ratio
-    };
+    let window_scale = |r: &Rectangle<i32, Logical>| window_scale_for(r.size.h, monitor_height);
+    // What `extent` leaves for the previews once their `gaps` are taken
+    // out: nothing when the gaps alone overflow it, never less.
+    let room = |extent: f64, gaps: f64| (extent - gaps).max(0.0);
     let center = |r: &Rectangle<i32, Logical>| {
         (
             f64::from(r.loc.x) + f64::from(r.size.w) / 2.0,
@@ -1509,8 +1827,8 @@ pub fn window_slots_spaced(
         let grid_height: f64 = rows.iter().map(|r| r.full_height).sum();
         let hspacing = (max_row.windows.len() as f64 - 1.0) * spacing;
         let vspacing = (rows.len() as f64 - 1.0) * spacing;
-        let scale = ((w - hspacing) / grid_width)
-            .min((h - vspacing) / grid_height)
+        let scale = (room(w, hspacing) / grid_width)
+            .min(room(h, vspacing) / grid_height)
             .min(MAX_PREVIEW_SCALE);
         let space = (grid_width * scale + hspacing) * (grid_height * scale + vspacing) / (w * h);
         (scale, space)
@@ -1561,14 +1879,14 @@ pub fn window_slots_spaced(
     let row_height = |r: &Row| r.full_height * scale;
     let height_without: f64 = rows.iter().map(row_height).sum();
     let vertical_spacing = (rows.len() as f64 - 1.0) * spacing;
-    let add_v = (1.0f64).min((ah - vertical_spacing) / height_without);
+    let add_v = (1.0f64).min(room(ah, vertical_spacing) / height_without);
     let mut compensation = 0.0;
     let mut y = 0.0;
     let mut placed = Vec::new();
     for r in &rows {
         let hs = (r.windows.len() as f64 - 1.0) * spacing;
         let without = row_width(r) - hs;
-        let add_h = (1.0f64).min((aw - hs) / without);
+        let add_h = (1.0f64).min(room(aw, hs) / without);
         let additional = if add_h < add_v {
             compensation += (add_v - add_h) * row_height(r);
             add_h
@@ -1616,6 +1934,8 @@ pub fn window_slots_spaced(
 
 /// The overview scene: the active card with its windows spread GNOME's
 /// way ([`window_slots`]), neighbors peeking in with theirs in place.
+/// Empty when `output` has no work area below `work_top` (every output
+/// unplugged): GNOME has no workspaces view without a monitor.
 pub fn layout(
     output: Rectangle<i32, Logical>,
     work_top: i32,
@@ -1648,7 +1968,12 @@ pub fn layout_with_policy(
         (index.checked_sub(1), -1),
         (Some(index + 1).filter(|i| *i < workspaces.len()), 1),
     ];
-    let work_h = (output.size.h - work_top).max(1);
+    // No output (every monitor unplugged), or none of it below the top
+    // bar: no workspaces view, nothing to lay out.
+    let Some(workarea) = work_area(output, work_top) else {
+        return out;
+    };
+    let work_h = workarea.size.h;
     let strip = workspaces.len() >= THUMBNAILS_MIN_WORKSPACES;
     let shift = if strip { thumbnails_offset(work_h) } else { 0 };
     if strip {
@@ -1708,10 +2033,6 @@ pub fn layout_with_policy(
             active_card.size.h + 2 * PICKER_PAD_Y,
         )
             .into(),
-    );
-    let workarea = Rectangle::new(
-        (output.loc.x, output.loc.y + work_top).into(),
-        (output.size.w, (output.size.h - work_top).max(1)).into(),
     );
     let mut mine: Vec<(u64, Rectangle<i32, Logical>)> = windows
         .iter()
@@ -1933,7 +2254,10 @@ pub fn app_grid_layout_with_policy(
     } else {
         workspaces.to_vec()
     };
-    let work_h = (output.size.h - work_top).max(1);
+    let Some(workarea) = work_area(output, work_top) else {
+        return out;
+    };
+    let work_h = workarea.size.h;
     let w = (f64::from(output.size.w) * THUMBNAIL_SCALE).round();
     let h = (f64::from(work_h) * THUMBNAIL_SCALE).round();
     let spacing = f64::from(WORKSPACE_SPACING);
@@ -2048,6 +2372,10 @@ mod tests {
     };
     const OFF: MotionPolicy = MotionPolicy {
         level: tuna_shell_control::motion::MotionLevel::Off,
+        slowdown_milli: 1000,
+    };
+    const FADE_ONLY: MotionPolicy = MotionPolicy {
+        level: tuna_shell_control::motion::MotionLevel::FadeOnly,
         slowdown_milli: 1000,
     };
 
@@ -2679,30 +3007,252 @@ mod tests {
     fn a_released_swipe_keeps_its_momentum() {
         let mut motion = OverviewMotion::default();
         for (i, travel) in [15.0, 45.0, 75.0].into_iter().enumerate() {
-            motion.swipe_update(1000 + 10 * i as u32, travel, 300.0, FULL);
+            motion.swipe_update(1000 + 10 * i as u32, travel, 300.0);
         }
         assert!((motion.progress() - 0.25).abs() < 1e-9);
-        assert_eq!(motion.swipe_end(1030, false, 300.0, FULL), Some(true));
+        assert_eq!(
+            motion
+                .swipe_end(1030, false, 300.0, FULL)
+                .map(|(state, _)| state),
+            Some(1.0)
+        );
         let d = motion.diagnostics();
         assert_eq!(d["release"]["curve"], "ease-out-cubic");
-        assert!((d["release"]["velocity"].as_f64().unwrap() - 3.0).abs() < 1e-9);
-        // 0.75 left at 3 px/ms over 300: 225 ms, eased out-cubic.
+        // The history starts still at the first event, so all 75 units
+        // count over its 20 ms (swipeTracker.js:72-86, 509-513).
+        assert!((d["release"]["velocity"].as_f64().unwrap() - 3.75).abs() < 1e-9);
+        // 0.75 left at 3.75 units/ms over 300: 180 ms, eased out-cubic.
         let duration = d["release"]["duration_ms"].as_f64().unwrap();
-        assert!((duration - 225.0).abs() < 1e-6, "{duration}");
+        assert!((duration - 180.0).abs() < 1e-6, "{duration}");
         motion.step_progress(duration / 2.0, true, FULL);
         assert!((motion.progress() - (0.25 + 0.75 * ease_out_cubic(0.5))).abs() < 1e-9);
         motion.step_progress(duration, true, FULL);
         assert_eq!(motion.progress(), 1.0);
         // Cancelled: back where it began.
-        motion.swipe_update(2000, -100.0, 300.0, FULL);
-        assert_eq!(motion.swipe_end(2010, true, 300.0, FULL), Some(true));
-        // Motion off: the held swipe sits at an end and releases there.
+        motion.swipe_update(2000, -100.0, 300.0);
+        assert_eq!(
+            motion
+                .swipe_end(2010, true, 300.0, FULL)
+                .map(|(state, _)| state),
+            Some(1.0)
+        );
+        assert_eq!(motion.swipe_end(2020, false, 300.0, FULL), None);
+    }
+
+    #[test]
+    fn a_held_swipe_follows_the_fingers_under_every_motion_policy() {
+        for policy in [FULL, FADE_ONLY, OFF] {
+            let mut motion = OverviewMotion::default();
+            motion.swipe_update(0, 90.0, 300.0);
+            assert!((motion.progress() - 0.3).abs() < 1e-9, "{policy:?}");
+            motion.swipe_update(400, 180.0, 300.0);
+            assert!((motion.progress() - 0.6).abs() < 1e-9, "{policy:?}");
+            // A slow release past half way opens: eased (reduced motion
+            // leaves GNOME's ease alone), instant with animations off.
+            assert_eq!(
+                motion
+                    .swipe_end(900, false, 300.0, policy)
+                    .map(|(state, _)| state),
+                Some(1.0)
+            );
+            let duration = motion.diagnostics()["release"]["duration_ms"]
+                .as_f64()
+                .unwrap();
+            if policy == OFF {
+                assert_eq!(duration, 0.0);
+                assert_eq!(motion.progress(), 1.0);
+            } else {
+                assert_eq!(duration, 400.0, "{policy:?}");
+                assert!((motion.progress() - 0.6).abs() < 1e-9, "{policy:?}");
+                motion.step_progress(duration, true, policy);
+                assert_eq!(motion.progress(), 1.0, "{policy:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_swipe_runs_from_the_desktop_through_the_window_picker_to_the_app_grid() {
+        // From the desktop the tracker's bounds stop at the window picker
+        // (swipeTracker.js:547-565, no long swipes): 450 units of 300
+        // per state hold it there.
         let mut motion = OverviewMotion::default();
-        motion.swipe_update(0, 180.0, 300.0, OFF);
+        motion.swipe_begin(0, false);
+        motion.swipe_update(10, 450.0, 300.0);
+        assert_eq!(motion.controls_state(false), CONTROLS_WINDOW_PICKER);
         assert_eq!(motion.progress(), 1.0);
-        assert_eq!(motion.swipe_end(10, false, 300.0, OFF), Some(true));
+        assert_eq!(motion.app_grid_progress(), Some(0.0));
+        // From the window picker it spans the desktop and the app grid.
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.swipe_begin(0, false);
+        motion.swipe_update(10, 150.0, 300.0);
+        assert!((motion.controls_state(false) - 1.5).abs() < 1e-9);
         assert_eq!(motion.progress(), 1.0);
-        assert_eq!(motion.swipe_end(20, false, 300.0, OFF), None);
+        assert_eq!(motion.app_grid_progress(), Some(0.5));
+        // Past the app grid it stays there, and coming back moves at once:
+        // each step is clamped, not the total (`_updateGesture`).
+        motion.swipe_update(20, 360.0, 300.0);
+        assert_eq!(motion.controls_state(false), CONTROLS_APP_GRID);
+        motion.swipe_update(30, 300.0, 300.0);
+        assert!((motion.controls_state(false) - 1.8).abs() < 1e-9);
+        // Down through the window picker toward the desktop: 300 units
+        // back is one whole state.
+        motion.swipe_update(40, 0.0, 300.0);
+        assert!((motion.controls_state(false) - 0.8).abs() < 1e-9);
+        assert!((motion.progress() - 0.8).abs() < 1e-9);
+        assert_eq!(motion.app_grid_progress(), Some(0.0));
+        // From the app grid it can only come back to the window picker.
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.swipe_begin(0, true);
+        assert_eq!(motion.controls_state(false), CONTROLS_APP_GRID);
+        motion.swipe_update(10, -150.0, 300.0);
+        assert!((motion.controls_state(true) - 1.5).abs() < 1e-9);
+        motion.swipe_update(20, -600.0, 300.0);
+        assert_eq!(motion.controls_state(true), CONTROLS_WINDOW_PICKER);
+        assert_eq!(motion.progress(), 1.0);
+    }
+
+    #[test]
+    fn a_swipe_up_from_the_window_picker_snaps_to_the_app_grid() {
+        // 60 units up in 20 ms after the still begin sample: 3 units/ms
+        // projects past the app grid's half way, so it lands there,
+        // 0.8 states at 3/300 per ms times 3: 240 ms out-cubic.
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.swipe_begin(1000, false);
+        motion.swipe_update(1010, 30.0, 300.0);
+        motion.swipe_update(1020, 60.0, 300.0);
+        let (state, duration) = motion.swipe_end(1020, false, 300.0, FULL).unwrap();
+        assert_eq!(state, CONTROLS_APP_GRID);
+        assert!((duration - 240.0).abs() < 1e-9, "{duration}");
+        motion.step_progress(120.0, true, FULL);
+        let expect = 1.2 + 0.8 * ease_out_cubic(0.5);
+        assert!((motion.controls_state(false) - expect).abs() < 1e-9);
+        assert_eq!(motion.progress(), 1.0, "the overview stays open");
+        motion.step_progress(120.0, true, FULL);
+        assert_eq!(motion.app_grid_progress(), Some(1.0));
+        // A slow release short of half way goes back to the picker.
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.swipe_begin(0, false);
+        motion.swipe_update(10, 90.0, 300.0);
+        let (state, _) = motion.swipe_end(500, false, 300.0, FULL).unwrap();
+        assert_eq!(state, CONTROLS_WINDOW_PICKER);
+        // A fast swipe down from the app grid lands on the window picker
+        // (its bound), never the desktop; animations off land at once.
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.swipe_begin(0, true);
+        motion.swipe_update(10, -60.0, 300.0);
+        assert_eq!(
+            motion.swipe_end(10, false, 300.0, OFF),
+            Some((CONTROLS_WINDOW_PICKER, 0.0))
+        );
+        assert_eq!(motion.controls_state(false), CONTROLS_WINDOW_PICKER);
+        assert_eq!(motion.progress(), 1.0);
+    }
+
+    #[test]
+    fn a_held_app_grid_swipe_draws_between_the_picker_and_the_grid() {
+        let windows = [win(1, 0, 320, 182, 640, 420)];
+        let picker = layout(output(), 32, &[0], 0, &windows);
+        let grid = app_grid_layout(output(), 32, &[0], 0, &windows);
+        let resting = |motion: &OverviewMotion, app_grid| {
+            motion.resting(0, app_grid, |workspace, grid| {
+                if grid {
+                    app_grid_layout(output(), 32, &[0], workspace, &windows)
+                } else {
+                    layout(output(), 32, &[0], workspace, &windows)
+                }
+            })
+        };
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.step_scene(0.0, &picker, cues(false, false), None, AWAY);
+        assert_eq!(resting(&motion, false), picker);
+        motion.swipe_begin(0, false);
+        motion.swipe_update(10, 75.0, 300.0);
+        let held = resting(&motion, false);
+        assert_eq!(held, blend(&picker, &grid, 0.25));
+        motion.step_scene(16.0, &held, cues(false, false), None, AWAY);
+        // The release sets the app grid at once; the swipe draws the way
+        // there, so no 250 ms picker/grid morph runs on top.
+        motion.swipe_end(20, false, 300.0, FULL).unwrap();
+        motion.step_progress(16.0, true, FULL);
+        let easing = resting(&motion, true);
+        motion.step_scene(16.0, &easing, cues(true, false), None, AWAY);
+        assert!(motion.diagnostics()["morph"].is_null());
+        motion.step_progress(1000.0, true, FULL);
+        motion.step_scene(0.0, &grid, cues(true, false), None, AWAY);
+        motion.step_scene(0.0, &grid, cues(true, false), None, AWAY);
+        assert_eq!(motion.app_grid_progress(), None);
+        assert_eq!(resting(&motion, true), grid);
+        assert!(motion.diagnostics()["morph"].is_null());
+    }
+
+    #[test]
+    fn an_overview_workspace_swipe_follows_and_settles_across_workspaces() {
+        let windows = [win(1, 0, 320, 182, 640, 420), win(2, 1, 320, 182, 640, 420)];
+        let strip = vec![0, 1, 2, 3];
+        let at = |workspace| layout(output(), 32, &strip, workspace, &windows);
+        let resting = |motion: &OverviewMotion| motion.resting(0, false, |w, _| at(w));
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.step_scene(0.0, &at(0), cues(false, false), None, AWAY);
+        motion.scroll_begin(0, strip.clone(), 0);
+        // The strip follows the fingers, 400 units a workspace.
+        motion.scroll_update(10, 200.0);
+        assert_eq!(motion.workspace_scroll(), Some((&strip[..], 0.5)));
+        assert_eq!(resting(&motion), blend(&at(0), &at(1), 0.5));
+        // Long swipes: on past the next workspace, up to the last only.
+        motion.scroll_update(20, 600.0);
+        assert_eq!(motion.workspace_scroll().unwrap().1, 2.0);
+        assert_eq!(resting(&motion), at(2));
+        motion.scroll_update(30, 800.0);
+        assert_eq!(motion.workspace_scroll().unwrap().1, 3.0);
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        motion.step_scene(0.0, &at(0), cues(false, false), None, AWAY);
+        // 180 units over 60 ms: 3 units/ms projects from 0.45 past 1.5,
+        // so the release crosses two workspaces in one ease
+        // (1.55 / (3 / 400) * 3 = 620 ms, under 400 * log2(3)).
+        motion.scroll_begin(1000, strip.clone(), 0);
+        for i in 1..=6 {
+            motion.scroll_update(1000 + 10 * i, 30.0);
+        }
+        assert_eq!(motion.scroll_end(1060, false, FULL), Some(2));
+        let release = &motion.diagnostics()["scroll_release"];
+        assert_eq!(release["target"], 2.0);
+        let duration = release["duration_ms"].as_f64().unwrap();
+        assert!((duration - 620.0).abs() < 1e-6, "{duration}");
+        // It eases out-cubic; the switch it makes draws no 250 ms scroll
+        // morph on top.
+        motion.step_scene(
+            duration / 2.0,
+            &resting(&motion),
+            cues(false, false),
+            None,
+            AWAY,
+        );
+        let mid = 0.45 + 1.55 * ease_out_cubic(0.5);
+        assert!((motion.workspace_scroll().unwrap().1 - mid).abs() < 1e-9);
+        motion.step_scene(0.0, &resting(&motion), cues(false, false), None, AWAY);
+        assert!(motion.diagnostics()["morph"].is_null());
+        // Fingers back down mid-ease catch the strip where it is drawn.
+        motion.scroll_begin(2000, strip.clone(), 2);
+        assert!((motion.workspace_scroll().unwrap().1 - mid).abs() < 1e-9);
+        motion.scroll_update(2010, 0.0);
+        assert_eq!(motion.scroll_end(2400, false, FULL), Some(2));
+        motion.step_scene(1000.0, &at(2), cues(false, false), None, AWAY);
+        motion.step_scene(0.0, &at(2), cues(false, false), None, AWAY);
+        assert_eq!(motion.workspace_scroll(), None);
+        assert!(motion.diagnostics()["morph"].is_null());
+        // Animations off: the release lands at once.
+        motion.scroll_begin(3000, strip.clone(), 2);
+        motion.scroll_update(3010, -400.0);
+        assert_eq!(motion.scroll_end(3500, false, OFF), Some(1));
+        assert_eq!(motion.workspace_scroll().unwrap().1, 1.0);
     }
 
     fn cues(app_grid: bool, search: bool) -> OverviewCues {
@@ -2984,5 +3534,324 @@ mod tests {
                 .iter()
                 .any(|f| f.id == p.id && f.active == p.active))
             .all(|p| p.alpha < 1.0));
+    }
+
+    /// The windows of #1104's session, as re-homed onto its 768x576
+    /// output just before that was unplugged.
+    fn unplugged_windows() -> [OverviewWindow; 3] {
+        [
+            win(1, 0, 144, 137, 480, 320),
+            win(2, 0, 170, 165, 480, 320),
+            win(3, 0, 196, 194, 480, 320),
+        ]
+    }
+
+    /// `State::primary_size` with every output gone, as the runtime
+    /// turns it into the overview's output.
+    fn no_output() -> Rectangle<i32, Logical> {
+        Rectangle::new((0, 0).into(), (0, 0).into())
+    }
+
+    /// Whether everything the scene carries can be drawn: no negative
+    /// extent (smithay's `Size` asserts on one in debug builds) and no
+    /// NaN, infinite or negative scale.
+    fn drawable(layout: &OverviewLayout) -> bool {
+        let sized = |size: Size<i32, Logical>| size.w >= 0 && size.h >= 0;
+        layout
+            .cards
+            .iter()
+            .chain(&layout.thumbnails)
+            .all(|c| sized(c.rect.size) && sized(c.settled) && c.alpha.is_finite())
+            && layout.previews.iter().all(|p| {
+                sized(p.rect.size) && p.scale.is_finite() && p.scale >= 0.0 && p.alpha.is_finite()
+            })
+            && layout.placeholder.iter().all(|(_, rect)| sized(rect.size))
+    }
+
+    #[test]
+    fn no_output_lays_out_nothing() {
+        // #1104: with every output unplugged the primary size is 0x0. The
+        // spread then ran on a 0x1 work area against a monitor height
+        // clamped to 1 and built its previews (-7, -5) large.
+        let windows = unplugged_windows();
+        let nothing = OverviewLayout {
+            allow_workspace_insertion: true,
+            ..Default::default()
+        };
+        assert_eq!(layout(no_output(), 32, &[0], 0, &windows), nothing);
+        assert_eq!(app_grid_layout(no_output(), 32, &[0], 0, &windows), nothing);
+        let fixed = [0, 1, 2, 3];
+        assert_eq!(
+            layout_with_policy(no_output(), 32, &fixed, 0, &windows, false),
+            OverviewLayout::default()
+        );
+        assert_eq!(
+            app_grid_layout_with_policy(no_output(), 32, &fixed, 0, &windows, false),
+            OverviewLayout::default()
+        );
+        // An output no taller than the top bar has no work area either.
+        let bar = Rectangle::new((0, 0).into(), (1280, 32).into());
+        assert_eq!(layout(bar, 32, &[0], 0, &windows), nothing);
+        assert_eq!(app_grid_layout(bar, 32, &[0], 0, &windows), nothing);
+
+        // The spread itself, called as that layout called it, then with
+        // only the monitor, the work area or the picker area missing.
+        let mine: Vec<_> = windows.iter().map(|w| (w.id, w.geometry)).collect();
+        let no_workarea = Rectangle::new((0, 32).into(), (0, 1).into());
+        let picker = Rectangle::new((-20, -12).into(), (40, 26).into());
+        assert!(window_slots(no_workarea, 0, picker, &mine).is_empty());
+        let real = Rectangle::new((0, 32).into(), (1280, 768).into());
+        assert_eq!(window_slots(real, 800, real, &mine).len(), 3);
+        assert!(window_slots(real, 0, real, &mine).is_empty());
+        assert!(window_slots(no_workarea, 800, real, &mine).is_empty());
+        let flat = Rectangle::new((0, 32).into(), (1280, 0).into());
+        assert!(window_slots(real, 800, flat, &mine).is_empty());
+    }
+
+    #[test]
+    fn the_close_transition_survives_losing_every_output() {
+        // What the runtime computes each tick (`overview_base`, then
+        // `overview_layout` for the state snapshot), the outputs going
+        // away half-way through the close as in #1104.
+        let windows = unplugged_windows();
+        let resting = |motion: &OverviewMotion, output: Rectangle<i32, Logical>| {
+            motion.resting(0, false, |workspace, app_grid| {
+                let layout = if app_grid {
+                    app_grid_layout_with_policy
+                } else {
+                    layout_with_policy
+                };
+                layout(output, 32, &[0], workspace, &windows, true)
+            })
+        };
+        let screen = Rectangle::new((0, 0).into(), (768, 576).into());
+        let closing = OverviewCues {
+            open: false,
+            ..cues(false, false)
+        };
+        let mut motion = OverviewMotion::default();
+        opened(&mut motion);
+        let open = resting(&motion, screen);
+        assert_eq!(open.previews.iter().filter(|p| p.active).count(), 3);
+        motion.step_scene(0.0, &open, cues(false, false), None, AWAY);
+        motion.step_progress(0.0, false, FULL);
+        motion.step_progress(125.0, false, FULL);
+        motion.step_scene(125.0, &open, closing, None, AWAY);
+        assert!(motion.progress() > 0.0 && motion.progress() < 1.0);
+
+        // Unplugged: nothing rests any more, and what is still drawn of
+        // the close (the old scene leaving) stays drawable.
+        let gone = resting(&motion, no_output());
+        assert!(gone.cards.is_empty() && gone.thumbnails.is_empty() && gone.previews.is_empty());
+        for _ in 0..4 {
+            motion.step_progress(16.0, false, FULL);
+            motion.step_scene(16.0, &gone, closing, None, AWAY);
+            let drawn = motion.scene(&gone, None, AWAY, no_output(), &windows);
+            assert!(drawable(&drawn), "{drawn:?}");
+            assert_eq!(hit(&drawn, AWAY), OverviewHit::Dismiss);
+            for (_, rects) in thumbnail_decor(&drawn, BLUE) {
+                assert!(rects.iter().all(|r| r.size.w >= 0 && r.size.h >= 0));
+            }
+        }
+        motion.step_progress(TRANSITION_MS, false, FULL);
+        motion.step_scene(TRANSITION_MS, &gone, closing, None, AWAY);
+        assert_eq!(motion.progress(), 0.0);
+    }
+
+    /// `count` windows on workspace 1 of three and one on each neighbor.
+    /// `extreme` mixes in empty, single-pixel and oversized ones.
+    fn sweep_windows(count: i32, extreme: bool) -> Vec<OverviewWindow> {
+        const EXTREMES: [(i32, i32); 5] = [(0, 0), (1, 1), (5000, 4000), (3, 900), (900, 3)];
+        let mut windows: Vec<OverviewWindow> = (0..count)
+            .map(|i| {
+                let (w, h) = if extreme {
+                    EXTREMES[i as usize % EXTREMES.len()]
+                } else {
+                    (200 + 97 * i % 700, 150 + 61 * i % 500)
+                };
+                win(i as u64 + 1, 1, 13 * i % 300, 40 + 17 * i % 200, w, h)
+            })
+            .collect();
+        windows.push(win(100, 0, 10, 40, 300, 200));
+        windows.push(win(101, 2, 20, 50, 640, 480));
+        windows
+    }
+
+    #[test]
+    fn tiny_outputs_never_yield_negative_or_nan_sizes() {
+        // Outputs from nothing to 40x40, with and without a top bar taller
+        // than most of them: far less room than the 30px between two
+        // previews, the picker padding or the thumbnails strip take.
+        for (extreme, work_top) in [(false, 0), (false, 32), (true, 0), (true, 32)] {
+            for (w, h) in (0..=40).flat_map(|w| (0..=40).map(move |h| (w, h))) {
+                let output = Rectangle::new((0, 0).into(), (w, h).into());
+                let case = |count: i32| {
+                    format!("{w}x{h} below {work_top}, {count} windows, extreme {extreme}")
+                };
+                for count in 1..=12 {
+                    let windows = sweep_windows(count, extreme);
+                    let picker = layout(output, work_top, &[0, 1, 2], 1, &windows);
+                    let grid = app_grid_layout(output, work_top, &[0, 1, 2], 1, &windows);
+                    assert!(drawable(&picker), "{}: {picker:?}", case(count));
+                    assert!(drawable(&grid), "{}: {grid:?}", case(count));
+                    let spread = picker.previews.iter().filter(|p| p.active).count();
+                    if w == 0 || h <= work_top {
+                        assert!(picker.cards.is_empty(), "{}", case(count));
+                        assert!(picker.previews.is_empty(), "{}", case(count));
+                        assert!(grid.cards.is_empty(), "{}", case(count));
+                    } else {
+                        // Every window keeps its preview, however small.
+                        assert_eq!(spread, count as usize, "{}", case(count));
+                    }
+                }
+                // What each frame derives from the resting scenes.
+                let windows = sweep_windows(12, extreme);
+                let picker = layout(output, work_top, &[0, 1, 2], 1, &windows);
+                let grid = app_grid_layout(output, work_top, &[0, 1, 2], 1, &windows);
+                let mut hovered = picker.clone();
+                grow_preview(&mut hovered, 1, 1.0);
+                let mut dragged = picker.clone();
+                show_placeholder(&mut dragged, 1);
+                drag_preview(&mut dragged, 1, AWAY, AWAY);
+                for scene in [
+                    transition(&picker, 0.5, output, &windows),
+                    transition(&grid, 0.5, output, &windows),
+                    blend(&picker, &grid, 0.5),
+                    blend(&grid, &picker, 0.5),
+                    hovered,
+                    dragged,
+                ] {
+                    assert!(drawable(&scene), "{}: {scene:?}", case(12));
+                    for (_, rects) in thumbnail_decor(&scene, BLUE) {
+                        assert!(
+                            rects.iter().all(|r| r.size.w >= 0 && r.size.h >= 0),
+                            "{}: {rects:?}",
+                            case(12)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_spread_never_yields_negative_or_nan_slots_in_small_areas() {
+        // Work areas and picker areas from nothing to 40x40, and the
+        // screenshot selector's area on an output its margins swallow.
+        let big = Rectangle::new((0, 32).into(), (1280, 768).into());
+        for extreme in [false, true] {
+            for (w, h) in (0..=40).flat_map(|w| (0..=40).map(move |h| (w, h))) {
+                let area = Rectangle::new((0, 0).into(), (w, h).into());
+                for count in 1..=12 {
+                    let windows: Vec<_> = sweep_windows(count, extreme)
+                        .iter()
+                        .filter(|w| w.workspace == 1)
+                        .map(|w| (w.id, w.geometry))
+                        .collect();
+                    let expected = if w == 0 || h == 0 { 0 } else { windows.len() };
+                    for (workarea, monitor_height, spacing) in [
+                        (area, h, PREVIEW_SPACING),
+                        (area, h, SELECTOR_SPACING),
+                        (big, 800, SELECTOR_SPACING),
+                    ] {
+                        let slots =
+                            window_slots_spaced(workarea, monitor_height, area, &windows, spacing);
+                        let case = || {
+                            format!(
+                                "{count} windows (extreme {extreme}) in {w}x{h} over \
+                                 {workarea:?}, spacing {spacing}: {slots:?}"
+                            )
+                        };
+                        assert_eq!(slots.len(), expected, "{}", case());
+                        for (_, rect, scale) in &slots {
+                            assert!(rect.size.w >= 0 && rect.size.h >= 0, "{}", case());
+                            assert!(scale.is_finite() && *scale >= 0.0, "{}", case());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn previews_the_spacing_leaves_no_room_for_come_back_empty() {
+        // Three previews a row need 24px of selector spacing between
+        // them; a 1x1 area (`screenshot::selector_area` on an output no
+        // larger than its margins) has none to give.
+        let mine: Vec<_> = unplugged_windows()
+            .iter()
+            .map(|w| (w.id, w.geometry))
+            .collect();
+        let workarea = Rectangle::new((0, 32).into(), (1280, 768).into());
+        let area = Rectangle::new((100, 100).into(), (1, 1).into());
+        let slots = window_slots_spaced(workarea, 800, area, &mine, SELECTOR_SPACING);
+        assert_eq!(slots.len(), 3);
+        for (_, rect, scale) in slots {
+            assert_eq!(rect.size, Size::from((0, 0)));
+            assert_eq!(scale, 0.0);
+        }
+    }
+
+    #[test]
+    fn a_window_taller_than_the_monitor_scales_as_in_gnome_51() {
+        // gnome-shell's `_computeWindowScale` does not clamp its lerp: a
+        // 1080x1920 window (a portrait secondary monitor's) weighs
+        // lerp(1.5, 1, 1920 / 1080) = 0.611 against a 1080px primary.
+        let gnome: f64 = 1.5 - 0.5 * 1920.0 / 1080.0;
+        assert!((gnome - 0.6111).abs() < 1e-4);
+        assert!((window_scale_for(1920, 1080) - gnome).abs() < 1e-12);
+        assert_eq!(window_scale_for(540, 1080), 1.25);
+        assert_eq!(window_scale_for(1080, 1080), 1.0);
+        // In the spread: beside a half-height window (1.25) in the same
+        // row, the previews' scales keep that proportion.
+        let primary = Rectangle::new((0, 0).into(), (1920, 1080).into());
+        let windows = [
+            win(1, 0, 1920, 0, 1080, 1920),
+            win(2, 0, 100, 100, 960, 540),
+        ];
+        let l = layout(primary, 32, &[0], 0, &windows);
+        let scale = |id| {
+            let p = l.previews.iter().find(|p| p.active && p.id == id).unwrap();
+            assert!(p.scale < MAX_PREVIEW_SCALE, "{p:?}");
+            p.scale
+        };
+        assert!((scale(1) / scale(2) - gnome / 1.25).abs() < 1e-9, "{l:?}");
+    }
+
+    #[test]
+    fn a_window_past_three_monitor_heights_gets_a_minimal_preview() {
+        // gnome-shell's lerp reaches zero at three monitor heights and is
+        // negative past it (2600px on an 800px monitor: -0.125), which
+        // sized the previews negatively. Such a window weighs
+        // `MIN_WINDOW_SCALE` instead.
+        assert_eq!(window_scale_for(2400, 800), MIN_WINDOW_SCALE);
+        assert_eq!(window_scale_for(2600, 800), MIN_WINDOW_SCALE);
+        assert!(window_scale_for(2380, 800) > MIN_WINDOW_SCALE);
+        let windows = [
+            win(1, 0, 100, 100, 600, 2600),
+            win(2, 0, 100, 100, 600, 400),
+        ];
+        let l = layout(output(), 32, &[0], 0, &windows);
+        let card = l.cards[0].rect;
+        // The picker, a pixel of rounding either way.
+        let picker = Rectangle::new(
+            (card.loc.x - PICKER_PAD_X - 1, card.loc.y - PICKER_PAD_Y - 1).into(),
+            (
+                card.size.w + 2 * PICKER_PAD_X + 2,
+                card.size.h + 2 * PICKER_PAD_Y + 2,
+            )
+                .into(),
+        );
+        let active: Vec<_> = l.previews.iter().filter(|p| p.active).collect();
+        assert_eq!(active.len(), 2);
+        for p in &active {
+            assert!(p.rect.size.w > 0 && p.rect.size.h > 0, "{p:?}");
+            assert!(p.scale > 0.0 && p.scale <= MAX_PREVIEW_SCALE, "{p:?}");
+            assert!(picker.contains_rect(p.rect), "{p:?} inside {picker:?}");
+        }
+        assert!(!active[0].rect.overlaps(active[1].rect), "{active:?}");
+        // Near no weight: the oversized window's preview is a sliver.
+        let tall = active.iter().find(|p| p.id == 1).unwrap();
+        assert!(tall.scale <= MAX_PREVIEW_SCALE * MIN_WINDOW_SCALE + 1e-12);
     }
 }

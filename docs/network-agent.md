@@ -35,6 +35,13 @@ When NetworkManager lists several wired adapters, the Wired menu gives
 each interface an expandable submenu. A single adapter keeps the direct
 connection rows. Changes follow NetworkManager device and property signals.
 
+When NetworkManager reports a captive portal on the activated primary
+connection, the shell posts "Sign in to Network" as GNOME 51 does;
+activating it calls `org.gnome.Shell.PortalHelper.Authenticate` on the
+session bus. That helper ships with gnome-shell (`gnome-shell-portal-helper`,
+D-Bus activated). When the name is not activatable the shell logs once
+and offers nothing.
+
 The GTK proof adds `G-NM-ENTERPRISE`, `G-NM-VPN` and `G-NM-WIRED`: a real
 private GNOME Keyring stores, reuses and deletes an agent-owned EAP password;
 a TLS request asks for its key password; a VPN helper supplies the external

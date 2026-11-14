@@ -39,9 +39,7 @@ impl Interop {
     }
 }
 fn authorized(client: &Client) -> bool {
-    client
-        .get_data::<ClientState>()
-        .is_some_and(|data| data.x11_interop)
+    ClientState::privileged(client, |data| data.x11_interop)
 }
 impl GlobalDispatch<MutterX11Interop, ()> for State {
     fn bind(

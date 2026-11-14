@@ -1,0 +1,613 @@
+#!/usr/bin/python3
+"""Local replica of the perf gate's workload that records desktop-role memory (#503).
+
+Starts tuna-compositor (winit, inside a private Xvfb) with tuna-shell-gtk as its
+supervised shell on a private session/"system"/accessibility bus, replays the
+phases of scripts/tuna-vm-perf with real X input (idle, three typed searches
+that each launch an app, twenty overview toggles, workspace switches, window
+cycling, forty notifications, settle), and after every phase records for both
+processes Pss, Pss_Anon, Pss_File, Pss_Shmem, Private_Dirty and Rss from
+smaps_rollup plus the [heap], anonymous, shared-memory and file totals from
+smaps. A 1 Hz sampler gives the gate's own statistic: the idle and whole-run
+PSS medians.
+
+Usage:
+  scripts/tuna-shell-memory-profile --display :5N --artifacts DIR
+      [--bin-dir DIR] [--shell-bin PATH] [--reps 3] [--extra-apps N]
+      [--shell-env KEY=VALUE]... [--thp always|collapsed] [--trim] [--real-apps] [--quick]
+  scripts/tuna-shell-memory-profile --summarize DIR [--against DIR]
+
+--trim calls malloc_trim(0) in the shell through gdb once the settle sample is
+taken and samples again: the difference is freed heap glibc kept resident
+(needs gdb and, under Yama, sudo). --thp gives the session's processes
+transparent huge pages the way transparent_hugepage/enabled=always does (the
+perf image's setting; most other hosts keep madvise): "always" leaves the
+collapse to khugepaged, "collapsed" asks for it at once, which is where
+khugepaged ends up. --extra-apps adds that many launchable
+desktop entries, for hosts with fewer apps than a desktop image. The three
+searched apps are private stand-ins named as the gate's (Disks, System Monitor,
+Files); they are not the measurement.
+
+This is llvmpipe in a nested session on one host: a way to attribute and
+compare, not the gate's verdict.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import statistics
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+PROCESSES = ("tuna-shell-gtk", "tuna-compositor")
+ROLLUP = ("Rss", "Pss", "Pss_Anon", "Pss_File", "Pss_Shmem", "Private_Dirty", "Private_Clean", "AnonHugePages")
+PHASES = ("idle", "typing", "overview", "workspaces", "window_cycling", "notifications", "settle")
+APPS = (("org.gnome.DiskUtility", "Disks", "disks", "org.gnome.DiskUtility"),
+        ("org.gnome.SystemMonitor", "System Monitor", "system monitor", "org.gnome.SystemMonitor"),
+        ("org.gnome.Nautilus", "Files", "files", "org.gnome.Nautilus"))
+# Marks every private anonymous mapping of the process MADV_HUGEPAGE, again
+# every 200 ms: what transparent_hugepage/enabled=always gives a process, for
+# hosts that keep the default at madvise. With TUNA_THP_SHIM=collapsed it also
+# asks for the collapse at once (MADV_COLLAPSE), the state khugepaged reaches
+# at 4096 pages every 10 s. No allocation and a small stack, so the helper
+# thread adds no arena and no mapping that could be collapsed itself.
+THP_SHIM = r'''
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+
+static char buffer[1 << 20];
+static int collapse;
+
+static void advise(void) {
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    size_t length = 0;
+    ssize_t count;
+    while (length < sizeof buffer - 1 && (count = read(fd, buffer + length, sizeof buffer - 1 - length)) > 0)
+        length += count;
+    close(fd);
+    buffer[length] = 0;
+    for (char *line = buffer; *line;) {
+        char *next = strchr(line, '\n');
+        if (next) *next++ = 0; else next = line + strlen(line);
+        char *cursor;
+        unsigned long start = strtoul(line, &cursor, 16);
+        unsigned long end = strtoul(cursor + 1, &cursor, 16);
+        /* " rw-p offset dev inode [name]": private writable, not file backed. */
+        if (!strncmp(cursor, " rw-p ", 6)) {
+            char *name = strchr(cursor, '/');
+            if (!name && !strstr(cursor, "[v")) {
+                madvise((void *)start, end - start, MADV_HUGEPAGE);
+                if (collapse)
+                    madvise((void *)start, end - start, MADV_COLLAPSE);
+            }
+        }
+        line = next;
+    }
+}
+
+static void *loop(void *unused) {
+    (void)unused;
+    for (;;) { advise(); usleep(200000); }
+    return NULL;
+}
+
+__attribute__((constructor)) static void start(void) {
+    pthread_attr_t attributes;
+    pthread_t thread;
+    const char *mode = getenv("TUNA_THP_SHIM");
+    collapse = mode && !strcmp(mode, "collapsed");
+    pthread_attr_init(&attributes);
+    pthread_attr_setstacksize(&attributes, 256 * 1024);
+    pthread_create(&thread, &attributes, loop, NULL);
+}
+'''
+WINDOW = '''\
+import os, sys
+os.environ.setdefault("ADW_DISABLE_PORTAL", "1")
+os.environ.setdefault("GSK_RENDERER", "cairo")
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, GLib, Gtk
+GLib.set_prgname(sys.argv[1])
+Adw.init()
+loop = GLib.MainLoop()
+window = Adw.Window(title=sys.argv[2])
+window.set_default_size(720, 480)
+box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+box.append(Adw.HeaderBar())
+label = Gtk.Label(label=sys.argv[2], vexpand=True)
+label.add_css_class("title-1")
+box.append(label)
+window.set_content(box)
+window.connect("close-request", lambda *_: loop.quit() or False)
+window.present()
+loop.run()
+'''
+
+
+def rollup(pid):
+    fields = {}
+    for line in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines():
+        key, _, rest = line.partition(":")
+        if key in ROLLUP:
+            fields[key] = int(rest.split()[0])
+    return fields
+
+
+def regions(pid):
+    """Rss, Pss, Private_Dirty and AnonHugePages of smaps by kind of mapping, in KiB.
+
+    "arena" is an anonymous mapping that starts on a 64 MiB boundary (a glibc
+    non-main malloc arena); "stack" includes thread stacks, which smaps does
+    not name: anonymous mappings of 8 MiB preceded by a guard mapping.
+    """
+    kinds = {kind: {"Rss": 0, "Pss": 0, "Private_Dirty": 0, "AnonHugePages": 0}
+             for kind in ("heap", "arena", "anonymous", "shared_memory", "file", "stack", "other")}
+    kind = "other"
+    header = re.compile(r"^([0-9a-f]+)-([0-9a-f]+) (\S+) \S+ \S+ \S+\s*(.*)$")
+    previous = (0, "")
+    mappings, mapping = [], None
+    for line in Path(f"/proc/{pid}/smaps").read_text().splitlines():
+        match = header.match(line)
+        if match:
+            start, end, perms, name = int(match[1], 16), int(match[2], 16), match[3], match[4]
+            if name == "[heap]":
+                kind = "heap"
+            elif not name:
+                if start % (64 << 20) == 0:
+                    kind = "arena"
+                elif previous == (start, "---p") and end - start in (8 << 20, (8 << 20) - 4096):
+                    kind = "stack"
+                else:
+                    kind = "anonymous"
+            elif name.startswith("[stack"):
+                kind = "stack"
+            elif name.startswith(("/memfd:", "/dev/shm/", "/SYSV")):
+                kind = "shared_memory"
+            elif name.startswith("/"):
+                kind = "file"
+            else:
+                kind = "other"
+            previous = (end, perms)
+            mapping = {"kind": kind, "size": (end - start) >> 10}
+            mappings.append(mapping)
+            continue
+        key, _, rest = line.partition(":")
+        if key in kinds[kind]:
+            kinds[kind][key] += int(rest.split()[0])
+            mapping[key] = int(rest.split()[0])
+    # The mappings that hold huge pages, largest first: where the collapse landed.
+    huge = sorted((m for m in mappings if m.get("AnonHugePages")), key=lambda m: -m["AnonHugePages"])
+    return kinds, huge[:40]
+
+
+def sample(pids):
+    result = {}
+    for name, pid in pids.items():
+        kinds, huge = regions(pid)
+        result[name] = {"pid": pid, "rollup": rollup(pid), "regions": kinds, "huge_mappings": huge,
+                        "threads": len(os.listdir(f"/proc/{pid}/task"))}
+    return result
+
+
+class Session:
+    def __init__(self, args, artifacts):
+        self.args, self.art = args, artifacts
+        self.children, self.logs, self.scratch = [], [], []
+        self.state = artifacts / "compositor-state.json"
+        self.state.unlink(missing_ok=True)
+        runtime = Path(tempfile.mkdtemp(prefix="tuna-mem-runtime."))
+        os.chmod(runtime, 0o700)
+        self.scratch.append(runtime)
+        data = artifacts / "data"
+        self.env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), DISPLAY=args.display,
+                        XDG_CONFIG_HOME=str(artifacts / "config"), XDG_DATA_HOME=str(data),
+                        XDG_STATE_HOME=str(artifacts / "state"), XDG_CACHE_HOME=str(artifacts / "cache"),
+                        GSETTINGS_BACKEND="keyfile", TUNA_COMPOSITOR_STATE=str(self.state))
+        for key in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET", "GSK_RENDERER", "AT_SPI_BUS_ADDRESS"):
+            self.env.pop(key, None)
+        for pair in args.shell_env:
+            key, _, value = pair.partition("=")
+            self.env[key] = value
+        applications = data / "applications"
+        applications.mkdir(parents=True, exist_ok=True)
+        window = artifacts / "window.py"
+        window.write_text(WINDOW)
+        for desktop_id, name, _, icon in () if args.real_apps else APPS:
+            (applications / f"{desktop_id}.desktop").write_text(
+                f"[Desktop Entry]\nType=Application\nName={name}\nIcon={icon}\n"
+                f"Exec=/usr/bin/python3 {window} {desktop_id} \"{name}\"\n")
+        icons = ("utilities-terminal", "accessories-text-editor", "applications-system",
+                 "system-file-manager", "preferences-system", "help-browser", "accessories-calculator",
+                 "applications-graphics")
+        for index in range(args.extra_apps):
+            (applications / f"org.tuna.MemoryFixture{index:03}.desktop").write_text(
+                f"[Desktop Entry]\nType=Application\nName=Fixture App {index:03}\n"
+                f"Icon={icons[index % len(icons)]}\nExec=/usr/bin/true\n")
+
+    def spawn(self, argv, name, extra=None, **kw):
+        log = (self.art / f"{name}.log").open("w")
+        self.logs.append(log)
+        child = subprocess.Popen(argv, env=self.env | (extra or {}), stdout=log, stderr=subprocess.STDOUT,
+                                 start_new_session=True, **kw)
+        self.children.append(child)
+        return child
+
+    def run(self, argv, **kw):
+        return subprocess.run(argv, env=self.env, check=True, text=True, capture_output=True, **kw)
+
+    def cstate(self, check, label, seconds=20):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            try:
+                data = json.loads(self.state.read_text())
+                if check(data):
+                    return data
+            except (OSError, ValueError, KeyError, IndexError, TypeError):
+                pass
+            time.sleep(0.05)
+        raise RuntimeError(f"timed out waiting for {label}")
+
+    def start(self):
+        self.spawn(["Xvfb", self.args.display, "-screen", "0", "1280x800x24", "-nolisten", "tcp"], "xvfb")
+        for _ in range(100):
+            if subprocess.run(["xdotool", "getdisplaygeometry"], env=self.env, capture_output=True).returncode == 0:
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError(f"Xvfb did not start on {self.args.display}")
+        # A private "system" bus with the proof's service stand-ins: the shell
+        # must not register its agents with the host's daemons.
+        info = subprocess.run(["/usr/bin/dbus-daemon", "--session", "--fork", "--print-address=1", "--print-pid=1"],
+                              env=self.env, check=True, text=True, capture_output=True).stdout.split()
+        self.env["DBUS_SYSTEM_BUS_ADDRESS"], self.system_bus = info[0], int(info[1])
+        backlight = self.art / "backlight/tuna-bl"
+        backlight.mkdir(parents=True, exist_ok=True)
+        (backlight / "max_brightness").write_text("1000\n")
+        (backlight / "brightness").write_text("500\n")
+        (backlight / "type").write_text("platform\n")
+        self.env["TUNA_BACKLIGHT_ROOT"] = str(self.art / "backlight")
+        self.spawn(["/usr/bin/python3", str(ROOT / "scripts/lib/tuna-service-stubs.py"), str(backlight)], "stubs")
+        if os.access("/usr/libexec/at-spi-bus-launcher", os.X_OK):
+            self.spawn(["/usr/libexec/at-spi-bus-launcher", "--launch-immediately"], "atspi")
+        time.sleep(1)
+        binaries = Path(self.args.bin_dir)
+        shell = self.args.shell_bin or str(binaries / "tuna-shell-gtk")
+        session = {}
+        if self.args.thp:
+            source = self.art / "thp-always.c"
+            source.write_text(THP_SHIM)
+            subprocess.run(["cc", "-O2", "-shared", "-fPIC", "-o", str(self.art / "thp-always.so"), str(source),
+                            "-lpthread"], check=True)
+            # The compositor, the shell and what they launch, as on such a host.
+            session["LD_PRELOAD"] = str(self.art / "thp-always.so")
+            session["TUNA_THP_SHIM"] = self.args.thp
+        self.compositor = self.spawn([str(binaries / "tuna-compositor"), "--backend", "winit", "--socket",
+                                      f"tuna-mem-{os.getpid()}", "--shell-bin", shell], "nested", extra=session)
+        window = ""
+        for _ in range(60):
+            if self.compositor.poll() is not None:
+                raise RuntimeError("compositor exited during startup")
+            window = subprocess.run(["xdotool", "search", "--pid", str(self.compositor.pid), "--name", "Smithay"],
+                                    env=self.env, text=True, capture_output=True).stdout.split()
+            if window:
+                break
+            time.sleep(0.5)
+        if not window:
+            raise RuntimeError("no nested window")
+        self.window = window[0]
+        self.run(["xdotool", "windowfocus", "--sync", self.window])
+        # Away from the hot corner.
+        self.run(["xdotool", "mousemove", "--window", self.window, "640", "400"])
+        self.cstate(lambda s: s["active_workspace"] is not None and not s["locked"]
+                    and any(layer["namespace"] == "tuna-panel" for layer in s["layers"]), "panel", 60)
+        self.pids = {"tuna-compositor": self.compositor.pid, "tuna-shell-gtk": self.shell_pid()}
+
+    def shell_pid(self):
+        """The one tuna-shell-gtk below the compositor (a wrapper may sit between)."""
+        pending, found = [self.compositor.pid], []
+        while pending:
+            parent = pending.pop()
+            for child in subprocess.run(["pgrep", "-P", str(parent)], text=True, capture_output=True).stdout.split():
+                pending.append(int(child))
+                if Path(f"/proc/{child}/comm").read_text().strip() == "tuna-shell-gtk":
+                    found.append(int(child))
+        if len(found) != 1:
+            raise RuntimeError(f"expected one shell, found {found}")
+        return found[0]
+
+    def key(self, *keys):
+        self.run(["xdotool", "key", *keys])
+
+    def stop(self):
+        for child in reversed(self.children):
+            if child.poll() is None:
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        for child in self.children:
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+        try:
+            os.kill(self.system_bus, signal.SIGTERM)
+        except (AttributeError, ProcessLookupError):
+            pass
+        for log in self.logs:
+            log.close()
+        for path in self.scratch:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def workload(session, args, out):
+    quick = args.quick
+    points, series, marks, lost = {}, [], {}, []
+    stop = threading.Event()
+    lock = threading.Lock()
+    current = ["startup"]
+
+    def poll():
+        while not stop.wait(1.0):
+            try:
+                row = {"t": time.monotonic(), "phase": current[0]}
+                for name, pid in session.pids.items():
+                    fields = rollup(pid)
+                    row[name] = fields["Pss"]
+                    row[name + " rss"] = fields["Rss"]
+            except (OSError, KeyError):
+                continue
+            with lock:
+                series.append(row)
+
+    def record(phase):
+        if session.shell_pid() != session.pids["tuna-shell-gtk"]:
+            raise RuntimeError(f"the shell restarted during {phase}")
+        points[phase] = sample(session.pids)
+        shell = points[phase]["tuna-shell-gtk"]
+        print(f"  {phase:15} shell Pss {shell['rollup']['Pss'] / 1024:6.1f} MiB"
+              f" (anon {shell['rollup']['Pss_Anon'] / 1024:5.1f}, heap {shell['regions']['heap']['Rss'] / 1024:5.1f})"
+              f"  compositor Pss {points[phase]['tuna-compositor']['rollup']['Pss'] / 1024:6.1f} MiB", flush=True)
+
+    def begin(phase):
+        current[0] = phase
+        marks[phase] = time.monotonic()
+
+    sampler = threading.Thread(target=poll, daemon=True)
+    sampler.start()
+    try:
+        time.sleep(5 if quick else 30)  # The gate's post-panel settle.
+        begin("idle")
+        time.sleep(5 if quick else 30)
+        record("idle")
+
+        begin("typing")
+        for index, (desktop_id, _, query, _) in enumerate(APPS):
+            session.key("Super_L")
+            session.cstate(lambda s: s["overview_open"], "overview for search")
+            time.sleep(1)
+            # A query that never reaches the entry launches nothing; say so
+            # rather than measure a different workload.
+            for attempt in range(3):
+                session.run(["xdotool", "type", "--delay", "80", query])
+                try:
+                    session.cstate(lambda s: s["overview_search"], "search text", 3)
+                    break
+                except RuntimeError:
+                    focus = session.run(["xdotool", "getwindowfocus"]).stdout.strip()
+                    lost.append({"query": query, "attempt": attempt, "x_focus_is_nested": focus == session.window})
+                    print(f"  typing: {query!r} did not reach the search entry (attempt {attempt + 1},"
+                          f" X focus on the nested window: {focus == session.window})", flush=True)
+            else:
+                raise RuntimeError(f"{query!r} never reached the search entry")
+            time.sleep(1)
+            session.key("Return")
+            if args.real_apps:
+                # The gate does not wait for a window either.
+                session.cstate(lambda s: not s["overview_open"], "launch closes the overview")
+            else:
+                session.cstate(lambda s: any(w["app_id"] == desktop_id for w in s["windows"])
+                               and not s["overview_open"], f"{desktop_id} window")
+            time.sleep(8 if not quick else 2)
+        record("typing")
+
+        begin("overview")
+        for index in range(20):
+            session.key("Super_L")
+            session.cstate(lambda s: s["overview_open"] == (index % 2 == 0), f"overview toggle {index}", 10)
+            time.sleep(1)
+        record("overview")
+
+        begin("workspaces")
+        for _ in range(10):
+            session.key("super+Page_Down")
+            time.sleep(1)
+            session.key("super+Page_Up")
+            time.sleep(1)
+        record("workspaces")
+
+        begin("window_cycling")
+        for _ in range(10):
+            session.key("alt+Tab")
+            time.sleep(1)
+        record("window_cycling")
+
+        begin("notifications")
+        for index in range(40):
+            session.run(["/usr/bin/gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                         "--object-path", "/org/freedesktop/Notifications",
+                         "--method", "org.freedesktop.Notifications.Notify",
+                         "Tuna Desktop performance fixture", "0", "dialog-information",
+                         f"Performance notification {index + 1}", "Fixed benchmark workload",
+                         "[]", "{}", "5000"], timeout=15)
+            time.sleep(1)
+        record("notifications")
+
+        begin("settle")
+        time.sleep(5 if quick else 30)
+        record("settle")
+        marks["end"] = time.monotonic()
+    finally:
+        stop.set()
+        sampler.join()
+
+    if args.trim:
+        pid = session.pids["tuna-shell-gtk"]
+        gdb = ["gdb", "-p", str(pid), "-batch", "-ex", "call (void)malloc_stats()",
+               "-ex", "call (int)malloc_trim(0)"]
+        if Path("/proc/sys/kernel/yama/ptrace_scope").read_text().strip() != "0":
+            gdb = ["sudo", "-n", *gdb]
+        result = subprocess.run(gdb, text=True, capture_output=True, timeout=120)
+        (out / "gdb-trim.log").write_text(result.stdout + result.stderr)
+        if result.returncode != 0 or "$1 = " not in result.stdout:
+            raise RuntimeError("gdb could not call malloc_trim in the shell")
+        time.sleep(1)
+        record("settle_trimmed")
+
+    def median(rows, name):
+        return statistics.median(row[name] for row in rows) if rows else None
+    whole = [row for row in series if row["t"] >= marks["idle"] and row["t"] <= marks["end"]]
+    idle = [row for row in whole if row["phase"] == "idle"]
+    gate = {name: {"idle_p50_kib": median(idle, name), "whole_p50_kib": median(whole, name)}
+            for name in PROCESSES}
+    return {"points": points, "gate": gate, "typing_lost": lost,
+            "series": [{**row, "t": round(row["t"] - marks["idle"], 1)} for row in whole]}
+
+
+def measure(args):
+    artifacts = Path(args.artifacts).resolve()
+    artifacts.mkdir(parents=True, exist_ok=True)
+    for rep in range(1, args.reps + 1):
+        out = artifacts / f"rep-{rep}"
+        if out.exists():
+            shutil.rmtree(out)
+        out.mkdir()
+        print(f"tuna-shell-memory-profile: repetition {rep}", flush=True)
+        session = Session(args, out)
+        try:
+            session.start()
+            result = workload(session, args, out)
+        except BaseException:
+            # What the nested session showed when a step failed.
+            subprocess.run(["scrot", "-o", str(out / "failure.png")], env=session.env, capture_output=True)
+            raise
+        finally:
+            session.stop()
+        result["grid_tiles_extra"] = args.extra_apps
+        result["shell_env"] = args.shell_env
+        result["thp"] = args.thp
+        (out / "memory.json").write_text(json.dumps(result, indent=1))
+        for name in ("data", "config", "state", "cache", "backlight"):
+            shutil.rmtree(out / name, ignore_errors=True)
+    summarize(artifacts, None)
+
+
+def load(directory):
+    return [json.loads(path.read_text()) for path in sorted(Path(directory).glob("rep-*/memory.json"))]
+
+
+def figures(runs):
+    """{(process, row, phase): [KiB per repetition]}."""
+    table = {}
+    for run in runs:
+        for phase, processes in run["points"].items():
+            for name, data in processes.items():
+                for key, value in data["rollup"].items():
+                    table.setdefault((name, key, phase), []).append(value)
+                for kind in ("heap", "arena", "stack", "anonymous", "shared_memory", "file"):
+                    table.setdefault((name, f"{kind} Rss", phase), []).append(data["regions"][kind]["Rss"])
+                    if kind in ("heap", "arena", "stack", "anonymous"):
+                        table.setdefault((name, f"{kind} AnonHugePages", phase), []).append(
+                            data["regions"][kind]["AnonHugePages"])
+        for name, data in run["gate"].items():
+            table.setdefault((name, "Pss 1 Hz p50", "idle"), []).append(data["idle_p50_kib"])
+            table.setdefault((name, "Pss 1 Hz p50", "whole"), []).append(data["whole_p50_kib"])
+    return table
+
+
+def summarize(directory, against):
+    runs = load(directory)
+    if not runs:
+        raise SystemExit(f"no repetitions under {directory}")
+    table = figures(runs)
+    before = figures(load(against)) if against else None
+    phases = [phase for phase in (*PHASES, "settle_trimmed") if any(key[2] == phase for key in table)]
+    rows = (*ROLLUP, "heap Rss", "arena Rss", "stack Rss", "anonymous Rss", "shared_memory Rss", "file Rss",
+            "heap AnonHugePages", "arena AnonHugePages", "stack AnonHugePages", "anonymous AnonHugePages")
+
+    def cell(key):
+        values = table.get(key)
+        if not values:
+            return "-"
+        text = f"{statistics.median(values) / 1024:.1f} ±{(max(values) - min(values)) / 2048:.1f}"
+        if before and before.get(key):
+            text += f" ({(statistics.median(values) - statistics.median(before[key])) / 1024:+.1f})"
+        return text
+
+    print(f"\n{directory}: {len(runs)} repetitions; MiB, median ± half range"
+          + ("; (change of the median against " + str(against) + ")" if against else ""))
+    for name in PROCESSES:
+        print(f"\n| {name} | " + " | ".join(phases) + " |")
+        print("|---|" + "---:|" * len(phases))
+        for row in rows:
+            print(f"| {row} | " + " | ".join(cell((name, row, phase)) for phase in phases) + " |")
+        print(f"| Pss 1 Hz p50 (gate statistic) | idle {cell((name, 'Pss 1 Hz p50', 'idle'))}"
+              f" | whole run {cell((name, 'Pss 1 Hz p50', 'whole'))} |")
+    desktop = {scope: [sum(run["gate"][name][f"{scope}_p50_kib"] for name in PROCESSES) for run in runs]
+               for scope in ("idle", "whole")}
+    print("\ndesktop role (compositor + shell) Pss p50: "
+          + ", ".join(f"{scope} {statistics.median(values) / 1024:.1f} MiB" for scope, values in desktop.items()))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--display", help="private X display for the nested session, e.g. :51")
+    parser.add_argument("--artifacts", help="output directory (rep-N/memory.json)")
+    parser.add_argument("--bin-dir", default=os.environ.get("TUNA_PROOF_BIN_DIR", str(ROOT / "target/debug")))
+    parser.add_argument("--shell-bin", help="shell launcher override (a wrapper may exec the real shell)")
+    parser.add_argument("--reps", type=int, default=3)
+    parser.add_argument("--extra-apps", type=int, default=0)
+    parser.add_argument("--shell-env", action="append", default=[], metavar="KEY=VALUE")
+    parser.add_argument("--trim", action="store_true")
+    parser.add_argument("--thp", choices=("always", "collapsed"),
+                        help="give the session transparent huge pages as enabled=always would (LD_PRELOAD "
+                             "shim): at khugepaged's own pace, or collapsed at once")
+    parser.add_argument("--real-apps", action="store_true",
+                        help="launch the host's own Disks, System Monitor and Files instead of the stand-ins")
+    parser.add_argument("--quick", action="store_true", help="short idle/settle waits; not comparable")
+    parser.add_argument("--summarize", metavar="DIR")
+    parser.add_argument("--against", metavar="DIR")
+    args = parser.parse_args()
+    if args.summarize:
+        summarize(Path(args.summarize), Path(args.against) if args.against else None)
+        return
+    if not args.display or not args.artifacts:
+        parser.error("--display and --artifacts are required")
+    if not os.environ.get("TUNA_MEMORY_PRIVATE_BUS"):
+        os.execvpe("/usr/bin/dbus-run-session",
+                   ["dbus-run-session", "--", sys.executable, *sys.argv],
+                   dict(os.environ, TUNA_MEMORY_PRIVATE_BUS="1"))
+    measure(args)
+
+
+if __name__ == "__main__":
+    main()

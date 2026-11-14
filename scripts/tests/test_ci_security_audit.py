@@ -121,8 +121,8 @@ class WorkflowToolCacheTests(unittest.TestCase):
                     self.assertIn("/.github/actions/ci-tool/", settings["sparse-checkout"])
                     self.assertIn("/scripts/ci-install-gtk4-layer-shell", settings["sparse-checkout"])
                     for consumer in consumers:
-                        self.assertEqual(consumer["uses"],
-                                         f'./{settings["path"]}/.github/actions/ci-tool')
+                        # `$/` always runs the action at the workflow's own commit.
+                        self.assertEqual(consumer["uses"], "$/.github/actions/ci-tool")
                         self.assertLess(job["steps"].index(tooling), job["steps"].index(consumer))
 
     def test_private_checkout_is_excluded_but_untracked_candidate_source_remains_visible(self):

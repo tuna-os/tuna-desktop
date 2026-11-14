@@ -118,11 +118,29 @@ where
                 }
             }
             xdg_toplevel::Request::SetMaxSize { width, height } => {
+                // As Mutter's xdg_toplevel_set_max_size; a negative
+                // size used to panic in `Size::new`.
+                if width < 0 || height < 0 {
+                    toplevel.post_error(
+                        xdg_toplevel::Error::InvalidSize,
+                        format!("invalid negative max size requested {width} x {height}"),
+                    );
+                    return;
+                }
                 with_toplevel_pending_state(data, |toplevel_data| {
                     toplevel_data.max_size = (width, height).into();
                 });
             }
             xdg_toplevel::Request::SetMinSize { width, height } => {
+                // As Mutter's xdg_toplevel_set_min_size; a negative
+                // size used to panic in `Size::new`.
+                if width < 0 || height < 0 {
+                    toplevel.post_error(
+                        xdg_toplevel::Error::InvalidSize,
+                        format!("invalid negative min size requested {width} x {height}"),
+                    );
+                    return;
+                }
                 with_toplevel_pending_state(data, |toplevel_data| {
                     toplevel_data.min_size = (width, height).into();
                 });
@@ -161,6 +179,11 @@ where
     ) {
         data.alive_tracker.destroy_notify();
         data.decoration.lock().unwrap().take();
+        // The xdg_dialog_v1 object's user data is this toplevel: holding it
+        // here past the toplevel's destruction is a reference cycle, which
+        // kept the wl_surface (and its textures) of every toplevel whose
+        // client never sent xdg_dialog_v1.destroy, e.g. one that exited.
+        data.dialog.lock().unwrap().take();
 
         if let Some(index) = state
             .xdg_shell_state()

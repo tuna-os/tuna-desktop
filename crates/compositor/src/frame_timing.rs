@@ -15,7 +15,9 @@
 //!   released, drawn or not, so a client on a hidden workspace keeps
 //!   making progress instead of stalling.
 //! - **commit-timing v1**: a timed update is applied on the refresh
-//!   cycle whose next presentation reaches its timestamp.
+//!   cycle whose next presentation reaches its timestamp. A timestamp
+//!   with tv_nsec of a second or more is an invalid_timestamp error, as
+//!   the protocol and Mutter (meta-wayland-commit-timing.c) have it.
 //!
 //! Smithay 0.7 places the blockers (managed mode); this module releases
 //! them and lets the blocked transactions apply.
@@ -23,12 +25,21 @@
 use std::time::Duration;
 
 use smithay::{
-    delegate_commit_timing, delegate_fifo, delegate_presentation,
+    delegate_fifo, delegate_presentation,
     desktop::utils::{take_presentation_feedback_surface_tree, OutputPresentationFeedback},
     output::Output,
     reexports::{
-        wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
-        wayland_server::{protocol::wl_surface::WlSurface, Client, Resource},
+        wayland_protocols::wp::{
+            commit_timing::v1::server::{
+                wp_commit_timer_v1::{self, WpCommitTimerV1},
+                wp_commit_timing_manager_v1::WpCommitTimingManagerV1,
+            },
+            presentation_time::server::wp_presentation_feedback,
+        },
+        wayland_server::{
+            protocol::wl_surface::WlSurface, Client, DataInit, Dispatch, DisplayHandle, Resource,
+            Weak,
+        },
     },
     utils::{Clock, Monotonic, Time},
     wayland::{
@@ -73,6 +84,26 @@ pub fn refresh_of(output: &Output) -> Duration {
         .filter(|mhz| *mhz > 0)
         .map(|mhz| Duration::from_nanos(1_000_000_000_000 / mhz as u64))
         .unwrap_or(DEFAULT_REFRESH)
+}
+
+/// Mutter's KMS presentation flags (meta-onscreen-native.c page flip
+/// handler, meta-wayland-presentation-time.c): a page flip is vsync'd
+/// and its completion reported by the hardware; the time is the
+/// kernel's vblank timestamp (hardware clock) when it gave one on
+/// CLOCK_MONOTONIC, else the compositor's clock at completion,
+/// without claiming a hardware clock.
+pub fn flip_presentation(
+    kernel_time: Option<Duration>,
+    now: Time<Monotonic>,
+) -> (Time<Monotonic>, wp_presentation_feedback::Kind) {
+    use wp_presentation_feedback::Kind;
+    match kernel_time {
+        Some(time) => (
+            Time::from(time),
+            Kind::Vsync | Kind::HwClock | Kind::HwCompletion,
+        ),
+        None => (now, Kind::Vsync | Kind::HwCompletion),
+    }
 }
 
 /// Take the pending presentation feedback of every surface tree in
@@ -362,4 +393,114 @@ pub fn present_nested_frame_with_cursor(
 
 delegate_presentation!(State);
 delegate_fifo!(State);
-delegate_commit_timing!(State);
+
+// Smithay's commit-timing handling, with the timestamp validated first:
+// smithay accepts any tv_nsec, so a denormal one would order the update
+// a whole second (or more) early instead of being the protocol error.
+smithay::reexports::wayland_server::delegate_global_dispatch!(State: [WpCommitTimingManagerV1: bool] => CommitTimingManagerState);
+smithay::reexports::wayland_server::delegate_dispatch!(State: [WpCommitTimingManagerV1: bool] => CommitTimingManagerState);
+
+impl Dispatch<WpCommitTimerV1, Weak<WlSurface>> for State {
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        timer: &WpCommitTimerV1,
+        request: wp_commit_timer_v1::Request,
+        data: &Weak<WlSurface>,
+        dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        if let wp_commit_timer_v1::Request::SetTimestamp { tv_nsec, .. } = request {
+            // A destroyed surface is reported as such by smithay.
+            if tv_nsec > 999_999_999 && data.upgrade().is_ok() {
+                timer.post_error(
+                    wp_commit_timer_v1::Error::InvalidTimestamp,
+                    "Timestamp is invalid",
+                );
+                return;
+            }
+        }
+        <CommitTimingManagerState as Dispatch<WpCommitTimerV1, Weak<WlSurface>, Self>>::request(
+            state, client, timer, request, data, dh, data_init,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::output::{Mode, PhysicalProperties, Subpixel};
+    use wp_presentation_feedback::Kind;
+
+    fn output(mode: Option<(i32, i32, i32)>) -> Output {
+        let output = Output::new(
+            "test".into(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Tuna Desktop".into(),
+                model: "Test".into(),
+            },
+        );
+        if let Some((w, h, refresh)) = mode {
+            output.change_current_state(
+                Some(Mode {
+                    size: (w, h).into(),
+                    refresh,
+                }),
+                None,
+                None,
+                None,
+            );
+        }
+        output
+    }
+
+    #[test]
+    fn refresh_interval_follows_the_mode_in_millihertz() {
+        assert_eq!(
+            refresh_of(&output(Some((1920, 1080, 60_000)))),
+            Duration::from_nanos(16_666_666)
+        );
+        assert_eq!(
+            refresh_of(&output(Some((1920, 1080, 144_000)))),
+            Duration::from_nanos(6_944_444)
+        );
+        // 59.94 Hz (NTSC) is not rounded to 60.
+        assert_eq!(
+            refresh_of(&output(Some((1920, 1080, 59_940)))),
+            Duration::from_nanos(16_683_350)
+        );
+    }
+
+    #[test]
+    fn a_missing_or_zero_refresh_falls_back_to_60_hz() {
+        // Zero would divide by zero; negative (bogus EDID / virtual
+        // output) would wrap into a huge interval that stalls commit
+        // timers and paces clients at once per many seconds.
+        assert_eq!(refresh_of(&output(None)), DEFAULT_REFRESH);
+        assert_eq!(refresh_of(&output(Some((800, 600, 0)))), DEFAULT_REFRESH);
+        assert_eq!(
+            refresh_of(&output(Some((800, 600, -60_000)))),
+            DEFAULT_REFRESH
+        );
+    }
+
+    #[test]
+    fn a_kernel_vblank_time_is_reported_as_the_hardware_clock() {
+        let now = Time::<Monotonic>::from(Duration::from_secs(500));
+        let vblank = Duration::new(499, 999_000_000);
+        let (time, flags) = flip_presentation(Some(vblank), now);
+        assert_eq!(Duration::from(time), vblank, "the kernel's time, not ours");
+        assert_eq!(flags, Kind::Vsync | Kind::HwClock | Kind::HwCompletion);
+    }
+
+    #[test]
+    fn without_a_monotonic_vblank_time_no_hardware_clock_is_claimed() {
+        let now = Time::<Monotonic>::from(Duration::from_secs(500));
+        let (time, flags) = flip_presentation(None, now);
+        assert_eq!(Duration::from(time), Duration::from_secs(500));
+        assert!(!flags.contains(Kind::HwClock));
+        assert_eq!(flags, Kind::Vsync | Kind::HwCompletion);
+    }
+}

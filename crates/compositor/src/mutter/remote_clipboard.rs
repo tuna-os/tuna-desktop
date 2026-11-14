@@ -7,8 +7,11 @@
 //! `(as)`).
 //!
 //! The Wayland side is smithay's data device: a remote selection is a
-//! compositor-provided selection whose user data is the session id, and a
-//! local client's selection is read through its source. Data never crosses
+//! compositor-provided selection whose user data is
+//! `CompositorSelection::Remote(session id)`, a local client's selection
+//! is read through its source, and the clipboard manager's retained copy
+//! of a gone client's selection (`CompositorSelection::Retained`) is read
+//! from memory (`crate::clipboard_manager`). Data never crosses
 //! the compositor loop: each transfer is a pipe pumped on its own thread,
 //! bounded in size, idle time and count, and cut off when the grant is
 //! revoked (stop, owner loss, lock) or the clipboard is disabled.
@@ -192,12 +195,14 @@ pub(crate) enum PumpEnd {
     Failed,
 }
 
-fn nonblocking(fd: &OwnedFd) -> rustix::io::Result<()> {
+pub(crate) fn nonblocking(fd: &OwnedFd) -> rustix::io::Result<()> {
     let flags = rustix::fs::fcntl_getfl(fd)?;
     rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK)
 }
 
-fn ready(
+/// Wait until `fd` is ready for `flags`, polling `stop` every 100 ms;
+/// `Idle` once `deadline` passes.
+pub(crate) fn ready(
     fd: &OwnedFd,
     flags: rustix::event::PollFlags,
     stop: &dyn Fn() -> bool,
@@ -670,22 +675,45 @@ impl crate::State {
     }
 
     fn apply_remote_clipboard(&mut self, effect: Effect) {
+        use crate::clipboard_manager::CompositorSelection;
         use smithay::wayland::selection::data_device::{
-            clear_data_device_selection, request_data_device_client_selection,
-            set_data_device_selection, SelectionRequestError,
+            clear_data_device_selection, current_data_device_selection_userdata,
+            request_data_device_client_selection, set_data_device_selection, SelectionRequestError,
         };
         match effect {
             Effect::None => {}
             Effect::Own {
                 session_id,
                 mime_types,
-            } => set_data_device_selection(&self.dh, &self.seat, mime_types, session_id),
+            } => {
+                // A remote selection is not copied (see clipboard_manager).
+                self.clipboard_manager.forget();
+                set_data_device_selection(
+                    &self.dh,
+                    &self.seat,
+                    mime_types,
+                    CompositorSelection::Remote(session_id),
+                )
+            }
             Effect::Clear => clear_data_device_selection(&self.dh, &self.seat),
             Effect::Read {
                 mime_type,
                 fd,
                 reply,
             } => {
+                let current = current_data_device_selection_userdata(&self.seat).map(|data| *data);
+                if let Some(CompositorSelection::Retained(generation)) = current {
+                    // The compositor holds a gone client's copy: serve it.
+                    let result = if self.clipboard_manager.serve(generation, &mime_type, fd) {
+                        Ok(())
+                    } else {
+                        Err(fdo::Error::Failed(
+                            "The selection does not offer this mime type".into(),
+                        ))
+                    };
+                    let _ = reply.send(result);
+                    return;
+                }
                 let result = request_data_device_client_selection(&self.seat, mime_type, fd)
                     .map_err(|error| {
                         fdo::Error::Failed(

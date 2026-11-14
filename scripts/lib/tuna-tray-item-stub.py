@@ -4,8 +4,11 @@
 Usage: tuna-tray-item-stub.py MARKER
 
 Registers with org.kde.StatusNotifierWatcher (retrying until the shell
-owns it), titled "Tuna Desktop Tray Probe" with one menu row "Open Probe".
-Firing the row writes "clicked 1" to MARKER.
+owns it) by its unique name and object path, KStatusNotifierItem-style,
+titled "Tuna Desktop Tray Probe" with one menu row "Open Probe". Each
+call appends one line to MARKER: firing the row "clicked 1", Activate
+"activated", SecondaryActivate "secondary", Scroll "scroll DELTA
+ORIENTATION".
 """
 import sys
 
@@ -24,6 +27,8 @@ XML = """
   <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
   <property name="Menu" type="o" access="read"/>
   <method name="Activate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="SecondaryActivate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="Scroll"><arg type="i" direction="in"/><arg type="s" direction="in"/></method>
  </interface>
  <interface name="com.canonical.dbusmenu">
   <method name="GetLayout">
@@ -50,10 +55,19 @@ PROPS = {
 }
 
 
+def mark(text):
+    with open(MARKER, "a") as fh:
+        fh.write(text + "\n")
+
+
 def item_call(conn, sender, path, iface, method, params, invocation):
     if method == "Activate":
-        with open(MARKER, "w") as fh:
-            fh.write("activated\n")
+        mark("activated")
+    elif method == "SecondaryActivate":
+        mark("secondary")
+    elif method == "Scroll":
+        delta, orientation = params.unpack()
+        mark(f"scroll {delta} {orientation}")
     invocation.return_value(None)
 
 
@@ -66,8 +80,7 @@ def menu_call(conn, sender, path, iface, method, params, invocation):
     elif method == "Event":
         item_id, event, _, _ = params.unpack()
         if event == "clicked":
-            with open(MARKER, "w") as fh:
-                fh.write(f"clicked {item_id}\n")
+            mark(f"clicked {item_id}")
         invocation.return_value(None)
 
 

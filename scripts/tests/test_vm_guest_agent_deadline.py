@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
-from vm_guest_agent import GuestAgent
+from vm_guest_agent import GuestAgent, valid_autotz_error
 
 
 class Tests(unittest.TestCase):
@@ -213,20 +213,27 @@ class Tests(unittest.TestCase):
             actor.command('guest-ping')
         self.assertTrue(actor.poisoned)
 
-    def test_run_includes_initial_exec_time_in_all_status_deadlines(self):
+    def test_caller_deadline_caps_longer_nested_command(self):
         actor, _ = self.actor()
-        seen = []
-        def command(name, **kwargs):
-            seen.append(kwargs['deadline'])
-            if name == 'guest-exec':
-                time.sleep(.015)
-                return {'pid': 51}
-            return {'exited': True, 'exitcode': 0, 'out-data': 'e30='}
-        with mock.patch.object(actor, 'command', side_effect=command):
-            self.assertEqual(actor.run('inventory', timeout=.1), {})
-        self.assertEqual(len(set(seen)), 1)
-        self.assertIsNone(actor.pending_guest_pid)
-        self.assertEqual(actor.guest_exec_state, 'none')
+        began = time.monotonic()
+        actor._caller_deadline = began + .05
+        with self.assertRaises(TimeoutError):
+            actor.command('guest-ping', deadline=began + 30)
+        self.assertLess(time.monotonic() - began, .7)
+        self.assertTrue(actor.poisoned)
+
+    def test_autotz_diagnostics_reject_private_or_unbounded_fields(self):
+        value = {'domain': 'autotz', 'operation': 'snapshot',
+                 'exception_type': 'RuntimeError',
+                 'sites': [{'module': 'autotz.py', 'line': 42, 'function': 'dispatch'}]}
+        self.assertTrue(valid_autotz_error(value))
+        self.assertTrue(valid_autotz_error({**value, 'message': 'bounded guest detail'}))
+        self.assertTrue(valid_autotz_error({**value, 'message': 'x' * 2000}))
+        for key, invalid in (('traceback', 'private'), ('operation', '../private'),
+                             ('sites', value['sites'] * 5), ('errno', True),
+                             ('message', 'x' * 2001), ('message', 42)):
+            with self.subTest(key=key):
+                self.assertFalse(valid_autotz_error({**value, key: invalid}))
 
     def test_reference_invalid_operation_never_starts_guest_child(self):
         actor, _ = self.actor()
@@ -302,7 +309,7 @@ class Tests(unittest.TestCase):
     def test_known_exec_pid_survives_transport_timeout(self):
         actor, _ = self.actor()
         with mock.patch.object(actor, 'command', side_effect=[{'pid': 51}, TimeoutError('transport')]):
-            with self.assertRaises(TimeoutError):
+            with self.assertRaisesRegex(TimeoutError, 'inventory timed out awaiting guest-exec-status for pid 51'):
                 actor.run('inventory', timeout=.1)
         self.assertEqual(actor.pending_guest_pid, 51)
 
@@ -312,7 +319,7 @@ class Tests(unittest.TestCase):
             self.assertEqual(actor.guest_exec_state, 'unknown')
             raise TimeoutError('lost acknowledgement')
         with mock.patch.object(actor, 'command', side_effect=command):
-            with self.assertRaises(TimeoutError):
+            with self.assertRaisesRegex(TimeoutError, 'inventory timed out awaiting the guest-exec acknowledgement'):
                 actor.run('inventory', timeout=.1)
         self.assertEqual(actor.guest_exec_state, 'unknown')
         self.assertIsNone(actor.pending_guest_pid)
@@ -383,6 +390,126 @@ class Tests(unittest.TestCase):
                     thread.join(2)
                 self.assertFalse(thread.is_alive())
                 self.assertEqual(errors, [])
+
+    def qemu_chardev(self, serve):
+        """A real listening chardev socket; serve(listener) owns every accept."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = str(Path(directory.name) / 'qga.sock')
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(path)
+        listener.listen(4)
+        listener.settimeout(2)
+        errors = []
+        def run():
+            try:
+                serve(listener)
+            except BaseException as error:
+                errors.append(error)
+        thread = threading.Thread(target=run)
+        thread.start()
+        def finish():
+            listener.close()
+            thread.join(3)
+            self.assertFalse(thread.is_alive(), 'chardev thread not retired')
+            self.assertEqual(errors, [])
+        self.addCleanup(finish)
+        return path
+
+    @staticmethod
+    def request(peer):
+        data = bytearray()
+        while not data.endswith(b'\n'):
+            chunk = peer.recv(4096)
+            if not chunk:
+                return None
+            data.extend(chunk)
+        return json.loads(data.lstrip(b'\xff'))
+
+    def test_wake_reopen_reconnects_until_restored_port_replies(self):
+        # The Linux 7.3 restore leaves the guest port host-disconnected: the
+        # sync on the stale connection is read but its reply never arrives.
+        # Only after the host reopens does the stalled reply flush, ahead of
+        # the fresh one, into the new connection.
+        stale = []
+        closed = threading.Event()
+        def serve(listener):
+            listener.accept()[0].close()  # The pre-suspend connection.
+            peer = listener.accept()[0]
+            with peer:
+                peer.settimeout(2)
+                stale.append(self.request(peer)['arguments']['id'])
+                if self.request(peer) is None:
+                    closed.set()
+            with listener.accept()[0] as peer:
+                peer.settimeout(2)
+                nonce = self.request(peer)['arguments']['id']
+                peer.sendall(b'\xff' + json.dumps({'return': stale[0]}).encode() + b'\n'
+                             + b'\xff' + json.dumps({'return': nonce}).encode() + b'\n')
+                ping = self.request(peer)
+                peer.sendall(json.dumps({'return': {'woke': True}, 'id': ping['id']}).encode() + b'\n')
+                self.request(peer)
+        path = self.qemu_chardev(serve)
+        actor = GuestAgent.__new__(GuestAgent)
+        actor._caller_deadline = None
+        actor._path = path
+        actor.pending_guest_pid = None
+        actor.guest_exec_state = 'none'
+        actor.command_nonce = 'tuna-qga-test'
+        actor.command_sequence = 0
+        actor.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        actor.socket.connect(path)
+        actor.buffer = bytearray()
+        actor.poisoned = False
+        self.addCleanup(actor.close)
+        began = time.monotonic()
+        self.assertEqual(actor.reopen_after_wake(timeout=2, attempt=.2), 2)
+        self.assertLess(time.monotonic() - began, 1.5)
+        self.assertTrue(closed.is_set(), 'stalled connection was not closed before reopening')
+        self.assertFalse(actor.poisoned)
+        self.assertEqual(actor.command('guest-ping'), {'woke': True})
+
+    def test_wake_reopen_exhaustion_names_connections_and_poisons(self):
+        accepted = []
+        def serve(listener):
+            listener.settimeout(.1)
+            stop = time.monotonic() + 1.5
+            while time.monotonic() < stop:
+                try:
+                    accepted.append(listener.accept()[0])
+                except (TimeoutError, OSError):
+                    pass
+            for peer in accepted:
+                peer.close()
+        path = self.qemu_chardev(serve)
+        actor, _ = self.actor()
+        actor._caller_deadline = None
+        actor._path = path
+        actor.guest_exec_state = 'none'
+        began = time.monotonic()
+        with self.assertRaisesRegex(TimeoutError, r'no guest-sync reply on [2-9] reopened connection\(s\) within 0.3s'):
+            actor.reopen_after_wake(timeout=.3, attempt=.1)
+        self.assertLess(time.monotonic() - began, .9)
+        self.assertTrue(actor.poisoned)
+        self.assertEqual(actor.socket.fileno(), -1)
+        with self.assertRaisesRegex(RuntimeError, 'poisoned'):
+            actor.command('guest-ping')
+
+    def test_wake_reopen_refuses_owned_child_or_invalid_bounds_without_closing(self):
+        for state, pid, bounds, error in (
+                ('known', 51, (2, .2), RuntimeError), ('unknown', None, (2, .2), RuntimeError),
+                ('none', None, (0, .2), ValueError), ('none', None, (2, float('nan')), ValueError),
+                ('none', None, (.1, .2), ValueError)):
+            with self.subTest(state=state, bounds=bounds):
+                actor, _ = self.actor()
+                actor._path = '/nonexistent/qga.sock'
+                actor.guest_exec_state = state
+                actor.pending_guest_pid = pid
+                with self.assertRaises(error):
+                    actor.reopen_after_wake(timeout=bounds[0], attempt=bounds[1])
+                self.assertFalse(actor.poisoned)
+                self.assertNotEqual(actor.socket.fileno(), -1)
+                self.assertEqual((actor.guest_exec_state, actor.pending_guest_pid), (state, pid))
 
 
 if __name__ == '__main__':

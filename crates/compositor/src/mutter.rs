@@ -22,6 +22,10 @@ use zbus::object_server::{InterfaceRef, SignalEmitter};
 use zbus::zvariant::{DeserializeDict, OwnedObjectPath, OwnedValue, Type, Value};
 use zbus::{fdo, interface, ObjectServer};
 
+mod capture_eis;
+pub(crate) mod input_capture;
+#[cfg(test)]
+mod input_capture_bus_tests;
 #[cfg(test)]
 mod remote_bus_tests;
 pub mod remote_clipboard;
@@ -169,6 +173,12 @@ pub enum ToLoop {
     /// A RemoteDesktop session's clipboard request (mutter's
     /// MetaClipboardSession); the loop owns the seat's selection.
     RemoteClipboard(remote_clipboard::Request),
+    /// An InputCapture session's `Release` with `cursor_position`: warp
+    /// the pointer there (mutter's `clutter_seat_warp_pointer`).
+    InputCaptureWarp {
+        x: f64,
+        y: f64,
+    },
     StartCast {
         session_id: u64,
         stream_id: u64,
@@ -881,6 +891,7 @@ struct ScreenCast {
     to_loop: calloop::channel::Sender<ToLoop>,
     signals: crate::dbus_signals::SignalQueue,
     next_id: Arc<AtomicU64>,
+    scan: Arc<ScanWake>,
 }
 
 /// A session's streams with their D-Bus interface handles.
@@ -1064,6 +1075,7 @@ impl ScreenCast {
             .lock()
             .map_err(|_| fdo::Error::Failed("session registry unavailable".into()))?
             .push((session, path.clone()));
+        self.scan.notify();
         Ok(path)
     }
 
@@ -1474,6 +1486,55 @@ impl CastSignals {
 /// (fail closed) rather than stalling every other revocation (#657).
 const OWNER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The revocation scan's period while any session, grant or capture
+/// exists.
+const SCAN_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Ends the revocation scan's wait (#503): a session, grant or capture
+/// was created (the scan then runs every [`SCAN_PERIOD`] until none is
+/// left), or the orientation sensor client has something to read. A
+/// notify before the wait is kept, so none is lost to the check before it.
+#[derive(Default)]
+pub(crate) struct ScanWake {
+    pending: Mutex<bool>,
+    ready: std::sync::Condvar,
+}
+
+impl ScanWake {
+    pub(crate) fn notify(&self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = true;
+            self.ready.notify_one();
+        }
+    }
+
+    /// Wait for a notify, or until `deadline` when there is one.
+    fn wait_until(&self, deadline: Option<std::time::Instant>) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        while !*pending {
+            pending = match deadline {
+                None => match self.ready.wait(pending) {
+                    Ok(pending) => pending,
+                    Err(_) => return,
+                },
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return;
+                    }
+                    match self.ready.wait_timeout(pending, left) {
+                        Ok((pending, _)) => pending,
+                        Err(_) => return,
+                    }
+                }
+            };
+        }
+        *pending = false;
+    }
+}
+
 /// Whether each of `owners` is still an admitted capture owner, asked
 /// concurrently on the connection's executor and bounded by `timeout`
 /// overall. An unanswered check counts as gone. The checks themselves
@@ -1514,7 +1575,7 @@ fn owners_alive(
 /// Serve DisplayConfig and ScreenCast on the session bus from a thread.
 /// Returns the channel the event loop reads cast requests from.
 #[allow(clippy::too_many_arguments)] // one share per service the thread serves
-pub fn start(
+pub(crate) fn start(
     outputs: Outputs,
     windows: Windows,
     authority: crate::capture_security::Authority,
@@ -1524,6 +1585,7 @@ pub fn start(
     power_save: std::sync::Arc<crate::power_save::PowerSaveShare>,
     display_state: Arc<crate::display_config::DisplayShare>,
     color: Arc<crate::color_manager::ColorShare>,
+    input_capture: input_capture::CaptureSessions,
 ) -> calloop::channel::Channel<ToLoop> {
     let (to_loop, from_dbus) = calloop::channel::channel();
     let _ = std::thread::Builder::new()
@@ -1535,9 +1597,19 @@ pub fn start(
                 orientation: orientation.clone(),
                 power_save: power_save.clone(),
             };
-            // Accelerometer for sensor-driven orientation (#345): polled
-            // with the admission scan, reported to the loop on change.
-            let mut sensor = crate::orientation::SensorPoller::new();
+            // Wakes the revocation scan below; see `ScanWake`.
+            let scan = Arc::new(ScanWake::default());
+            // Accelerometer for sensor-driven orientation (#345): read by
+            // the scan after a sensor signal or a change of the flags that
+            // inhibit tracking, reported to the loop on change.
+            let mut sensor = {
+                let scan = scan.clone();
+                crate::orientation::SensorPoller::new(move || scan.notify())
+            };
+            for hook in [&orientation.changed, &power_save.changed] {
+                let scan = scan.clone();
+                hook.set(move || scan.notify());
+            }
             let sessions: Sessions = Default::default();
             let remote: remote_desktop::RemoteSessions = Default::default();
             let next_id = Arc::new(AtomicU64::new(1));
@@ -1553,6 +1625,7 @@ pub fn start(
                 to_loop: to_loop.clone(),
                 signals: signals.clone(),
                 next_id: next_id.clone(),
+                scan: scan.clone(),
             };
             let remote_desktop = remote_desktop::RemoteDesktop {
                 authority: authority.clone(),
@@ -1561,6 +1634,16 @@ pub fn start(
                 outputs: outputs.clone(),
                 to_loop: to_loop.clone(),
                 next_id,
+                scan: scan.clone(),
+            };
+            let input_capture_service = input_capture::InputCapture {
+                authority: authority.clone(),
+                sessions: input_capture.clone(),
+                outputs: outputs.clone(),
+                to_loop: to_loop.clone(),
+                signals: signals.clone(),
+                next_id: Arc::new(AtomicU64::new(1)),
+                scan: scan.clone(),
             };
             let service_channel = ServiceChannel {
                 display,
@@ -1574,6 +1657,7 @@ pub fn start(
                 .and_then(|b| b.serve_at("/org/gnome/Mutter/ScreenCast", screencast))
                 .and_then(|b| b.serve_at("/org/gnome/Mutter/DisplayConfig", display_config))
                 .and_then(|b| b.serve_at("/org/gnome/Mutter/RemoteDesktop", remote_desktop))
+                .and_then(|b| b.serve_at("/org/gnome/Mutter/InputCapture", input_capture_service))
                 .and_then(|b| b.serve_at("/org/gnome/Mutter/ServiceChannel", service_channel))
                 .and_then(|b| b.serve_at("/org/gnome/SettingsDaemon/Color", night_light_color))
                 .and_then(|b| {
@@ -1607,6 +1691,7 @@ pub fn start(
                 "org.gnome.Mutter.DisplayConfig",
                 "org.gnome.Mutter.ScreenCast",
                 "org.gnome.Mutter.RemoteDesktop",
+                "org.gnome.Mutter.InputCapture",
                 "org.gnome.Mutter.ServiceChannel",
             ] {
                 match conn.request_name_with_flags(name, flags) {
@@ -1644,11 +1729,22 @@ pub fn start(
                 spawn_color_signals(conn.inner().clone(), night_light.subscribe_changes());
             }
             // Revoke on lock, unique-name disconnect or loss of the trusted
-            // service identity. 100ms admission scan plus one compositor tick
-            // bounds stream teardown; frames additionally fail closed on lock.
-            // A bus that stops answering revokes within OWNER_CHECK_TIMEOUT.
+            // service identity. While any session, grant or capture exists,
+            // a 100ms admission scan plus one compositor tick bounds stream
+            // teardown; frames additionally fail closed on lock. A bus that
+            // stops answering revokes within OWNER_CHECK_TIMEOUT. With none
+            // the scan has nothing to revoke and waits for one to be
+            // created, or for the sensor client (#503).
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let watching = remote.lock().is_ok_and(|s| !s.is_empty())
+                    || sessions.lock().is_ok_and(|s| !s.is_empty())
+                    || input_capture.lock().is_ok_and(|s| !s.is_empty());
+                let deadline = if watching {
+                    Some(std::time::Instant::now() + SCAN_PERIOD)
+                } else {
+                    sensor.next_due()
+                };
+                scan.wait_until(deadline);
                 let remote_snapshot: Vec<_> = remote
                     .lock()
                     .map(|s| s.clone())
@@ -1713,6 +1809,39 @@ pub fn start(
                         sessions.retain(|(s, _)| s.id != session.id);
                     }
                 }
+                // InputCapture sessions: revoked as the grants above (a
+                // session the loop closed on lock goes the same way),
+                // and told when the monitor layout changes (mutter's
+                // on_monitors_changed).
+                let captures: Vec<_> = input_capture
+                    .lock()
+                    .map(|s| s.values().cloned().collect())
+                    .unwrap_or_default();
+                let owners: Vec<String> = captures.iter().map(|s| s.owner.clone()).collect();
+                let alive = owners_alive(&authority, conn.inner(), &owners, OWNER_CHECK_TIMEOUT);
+                let zones = if captures.is_empty() {
+                    input_capture::Zones::default()
+                } else {
+                    outputs
+                        .lock()
+                        .map(|o| input_capture::Zones::from_outputs(&o))
+                        .unwrap_or_default()
+                };
+                for (session, alive) in captures.into_iter().zip(alive) {
+                    if alive && !session.is_closed() {
+                        session.sync_zones(zones.clone());
+                        continue;
+                    }
+                    session.close();
+                    let _ = conn
+                        .object_server()
+                        .remove::<input_capture::CaptureSession, _>(
+                            input_capture::session_path(session.id).as_str(),
+                        );
+                    if let Ok(mut sessions) = input_capture.lock() {
+                        sessions.remove(&session.id);
+                    }
+                }
                 // Mutter inhibits orientation tracking while the display
                 // power-save mode is not on (#355).
                 if let Some(sample) = sensor.poll(orientation.is_inhibited() || !power_save.is_on())
@@ -1730,6 +1859,41 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #503: with nothing to revoke the scan sleeps until a session is
+    /// created or the sensor client calls (it used to wake every 100 ms):
+    /// a wait without a deadline ends only on a notify, a notify that came
+    /// before the wait is kept, and a deadline ends a wait on its own.
+    #[test]
+    fn the_scan_waits_for_a_notify_or_its_deadline() {
+        use std::time::{Duration, Instant};
+        let scan = Arc::new(ScanWake::default());
+        scan.notify();
+        let started = Instant::now();
+        scan.wait_until(None);
+        assert!(started.elapsed() < Duration::from_secs(1), "a kept notify");
+
+        let started = Instant::now();
+        scan.wait_until(Some(started + Duration::from_millis(200)));
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the deadline"
+        );
+
+        let remote = scan.clone();
+        let creator = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            remote.notify();
+        });
+        let started = Instant::now();
+        scan.wait_until(None);
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(250) && waited < Duration::from_secs(5),
+            "woken by the notify alone: {waited:?}"
+        );
+        creator.join().unwrap();
+    }
 
     /// The bus daemon's half of the owner check, answering every PID
     /// query with one process.

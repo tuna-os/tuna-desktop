@@ -68,6 +68,10 @@ const CAPABILITIES: u32 = 1 | 8 | 32;
 const RELEASE: u32 = 1 << 30;
 /// How long a key may wait on IBus before it goes to the app anyway.
 const CALL_TIMEOUT_MS: i32 = 2_000;
+/// After IBus leaves, the first and the longest wait between looks for
+/// a returned daemon.
+const IBUS_RETRY_MIN: Duration = Duration::from_millis(250);
+const IBUS_RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// What IBus tells the bridge.
 enum FromIbus {
@@ -121,51 +125,10 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let bus = ibus_connection()?;
-    let reply = bus.call_sync(
-        Some(IBUS),
-        IBUS_PATH,
-        IBUS,
-        "CreateInputContext",
-        Some(&("Tuna Desktop",).to_variant()),
-        glib::VariantTy::new("(o)").ok(),
-        gio::DBusCallFlags::NONE,
-        CALL_TIMEOUT_MS,
-        None::<&gio::Cancellable>,
-    )?;
-    let path = reply
-        .child_value(0)
-        .str()
-        .ok_or("CreateInputContext returned no path")?
-        .to_owned();
-    let context = IbusContext {
-        bus: bus.clone(),
-        path: path.clone(),
-    };
-    context.send("SetCapabilities", Some((CAPABILITIES,).to_variant()));
-    eprintln!("tuna-ibus-bridge: input context {path}");
-
     // IBus sends the context's signals to this connection only; they
     // queue here and are applied on the Wayland side, in order.
     let incoming: Rc<RefCell<VecDeque<FromIbus>>> = Rc::default();
-    {
-        let incoming = incoming.clone();
-        let subscription = bus.subscribe_to_signal(
-            None,
-            Some(CONTEXT),
-            None,
-            Some(&path),
-            None,
-            gio::DBusSignalFlags::NONE,
-            move |signal| {
-                if let Some(event) = ibus_event(signal.signal_name, signal.parameters) {
-                    incoming.borrow_mut().push_back(event);
-                }
-            },
-        );
-        // Kept for the life of the bridge.
-        std::mem::forget(subscription);
-    }
+    let context = open_context(ibus_connection()?, &incoming)?;
 
     let conn = Connection::connect_to_env()?;
     let mut queue: EventQueue<Bridge> = conn.new_event_queue();
@@ -194,24 +157,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     queue.roundtrip(&mut bridge)?;
     eprintln!("tuna-ibus-bridge: ready");
 
-    // The Wayland socket drives the loop; GLib (IBus's signals) runs
-    // between reads, at least every 50 ms.
+    // The Wayland socket and GLib (IBus's signals, the bus closing) drive
+    // the loop together; it sleeps until one of them has something, or
+    // until a look for a departed IBus is due.
+    let main = glib::MainContext::default();
+    let _owner = main.acquire()?;
     loop {
         queue.flush()?;
         if let Some(guard) = queue.prepare_read() {
-            let wayland_fd = guard.connection_fd();
-            let mut fds = [rustix::event::PollFd::new(
-                &wayland_fd,
-                rustix::event::PollFlags::IN,
-            )];
-            rustix::event::poll(
-                &mut fds,
-                Some(&rustix::event::Timespec {
-                    tv_sec: 0,
-                    tv_nsec: 50_000_000,
-                }),
-            )?;
-            if fds[0].revents().contains(rustix::event::PollFlags::IN) {
+            let limit = bridge
+                .ibus_retry
+                .map(|(at, _)| at.saturating_duration_since(Instant::now()));
+            if wait(&main, guard.connection_fd(), limit)? {
                 let _ = guard.read();
             }
         }
@@ -220,26 +177,120 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // moving a parent must update IBus without another text edit.
         bridge.sync_cursor();
         bridge.apply_incoming();
+        bridge.follow_ibus();
         if bridge.gone {
             return Ok(());
         }
     }
 }
 
+/// One `poll` over the Wayland socket and the descriptors of GLib's
+/// default context (which `main` must be acquired for), with GLib's own
+/// timeout capped at `limit`, then GLib's dispatch: the external-loop
+/// recipe of GLib's documentation (`g_main_context_prepare`, `query`,
+/// `check`, `dispatch`). An IBus signal or the bus closing wakes GLib's
+/// descriptors, so nothing but an event or `limit` ends the wait; the
+/// loop used to wake every 50 ms to look (#503). Returns whether the
+/// socket has something to read (or hung up).
+fn wait(
+    main: &glib::MainContext,
+    wayland: std::os::fd::BorrowedFd<'_>,
+    limit: Option<Duration>,
+) -> rustix::io::Result<bool> {
+    use glib::ffi;
+    use glib::translate::ToGlibPtr;
+    use rustix::event::{PollFd, PollFlags, Timespec};
+    let context: *mut ffi::GMainContext = main.to_glib_none().0;
+    let mut priority = 0;
+    let mut timeout_ms = -1;
+    let mut fds: Vec<ffi::GPollFD> = Vec::new();
+    // SAFETY: the caller owns `main` (acquired); `fds` holds as many
+    // entries as `query` is told, and GLib writes no more than that.
+    unsafe {
+        ffi::g_main_context_prepare(context, &mut priority);
+        loop {
+            let capacity = fds.len();
+            let needed = ffi::g_main_context_query(
+                context,
+                priority,
+                &mut timeout_ms,
+                fds.as_mut_ptr(),
+                capacity as std::ffi::c_int,
+            ) as usize;
+            if needed <= capacity {
+                fds.truncate(needed);
+                break;
+            }
+            fds.resize(
+                needed,
+                ffi::GPollFD {
+                    fd: -1,
+                    events: 0,
+                    revents: 0,
+                },
+            );
+        }
+    }
+    let glib_timeout = u64::try_from(timeout_ms).ok().map(Duration::from_millis);
+    let timeout = match (glib_timeout, limit) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let timeout = timeout.map(|t| Timespec {
+        tv_sec: t.as_secs().try_into().unwrap_or(i64::MAX),
+        tv_nsec: t.subsec_nanos().into(),
+    });
+    let mut polls = Vec::with_capacity(fds.len() + 1);
+    polls.push(PollFd::from_borrowed_fd(wayland, PollFlags::IN));
+    for fd in &fds {
+        // SAFETY: GLib's descriptors stay open until the dispatch below.
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd.fd) };
+        polls.push(PollFd::from_borrowed_fd(
+            borrowed,
+            PollFlags::from_bits_retain(fd.events),
+        ));
+    }
+    match rustix::event::poll(&mut polls, timeout.as_ref()) {
+        Ok(_) => {}
+        Err(rustix::io::Errno::INTR) => polls.iter_mut().for_each(|p| p.clear_revents()),
+        Err(e) => return Err(e),
+    }
+    for (fd, poll) in fds.iter_mut().zip(&polls[1..]) {
+        fd.revents = poll.revents().bits();
+    }
+    // SAFETY: as above; `fds` carries the revents of this poll.
+    unsafe {
+        if ffi::g_main_context_check(
+            context,
+            priority,
+            fds.as_mut_ptr(),
+            fds.len() as std::ffi::c_int,
+        ) != 0
+        {
+            ffi::g_main_context_dispatch(context);
+        }
+    }
+    Ok(polls[0]
+        .revents()
+        .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR))
+}
+
+/// A connection to the IBus bus at `address`.
+fn ibus_bus(address: &str) -> Result<gio::DBusConnection, glib::Error> {
+    gio::DBusConnection::for_address_sync(
+        address,
+        gio::DBusConnectionFlags::AUTHENTICATION_CLIENT
+            | gio::DBusConnectionFlags::MESSAGE_BUS_CONNECTION,
+        None,
+        None::<&gio::Cancellable>,
+    )
+}
+
 /// The IBus bus, starting the daemon when none runs (GNOME Shell's
 /// `ibus-daemon --panel disable`).
 fn ibus_connection() -> Result<gio::DBusConnection, Box<dyn std::error::Error>> {
-    let connect = |address: &str| {
-        gio::DBusConnection::for_address_sync(
-            address,
-            gio::DBusConnectionFlags::AUTHENTICATION_CLIENT
-                | gio::DBusConnectionFlags::MESSAGE_BUS_CONNECTION,
-            None,
-            None::<&gio::Cancellable>,
-        )
-    };
     if let Some(address) = ibus_address() {
-        if let Ok(bus) = connect(&address) {
+        if let Ok(bus) = ibus_bus(&address) {
             return Ok(bus);
         }
     }
@@ -249,7 +300,7 @@ fn ibus_connection() -> Result<gio::DBusConnection, Box<dyn std::error::Error>> 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if let Some(address) = ibus_address() {
-            if let Ok(bus) = connect(&address) {
+            if let Ok(bus) = ibus_bus(&address) {
                 return Ok(bus);
             }
         }
@@ -258,10 +309,58 @@ fn ibus_connection() -> Result<gio::DBusConnection, Box<dyn std::error::Error>> 
     Err("ibus-daemon did not come up".into())
 }
 
+/// A new input context on `bus` with GNOME Shell's capabilities. Its
+/// signals queue on `incoming` for as long as the context lives.
+fn open_context(
+    bus: gio::DBusConnection,
+    incoming: &Rc<RefCell<VecDeque<FromIbus>>>,
+) -> Result<IbusContext, Box<dyn std::error::Error>> {
+    let reply = bus.call_sync(
+        Some(IBUS),
+        IBUS_PATH,
+        IBUS,
+        "CreateInputContext",
+        Some(&("Tuna Desktop",).to_variant()),
+        glib::VariantTy::new("(o)").ok(),
+        gio::DBusCallFlags::NONE,
+        CALL_TIMEOUT_MS,
+        None::<&gio::Cancellable>,
+    )?;
+    let path = reply
+        .child_value(0)
+        .str()
+        .ok_or("CreateInputContext returned no path")?
+        .to_owned();
+    let incoming = incoming.clone();
+    let signals = bus.subscribe_to_signal(
+        None,
+        Some(CONTEXT),
+        None,
+        Some(&path),
+        None,
+        gio::DBusSignalFlags::NONE,
+        move |signal| {
+            if let Some(event) = ibus_event(signal.signal_name, signal.parameters) {
+                incoming.borrow_mut().push_back(event);
+            }
+        },
+    );
+    let context = IbusContext {
+        bus,
+        path,
+        _signals: signals,
+    };
+    context.send("SetCapabilities", Some((CAPABILITIES,).to_variant()));
+    eprintln!("tuna-ibus-bridge: input context {}", context.path);
+    Ok(context)
+}
+
 /// The bridge's IBus input context.
 struct IbusContext {
     bus: gio::DBusConnection,
     path: String,
+    /// The context's signal subscription, dropped with it.
+    _signals: gio::SignalSubscription,
 }
 
 impl IbusContext {
@@ -353,6 +452,17 @@ fn floor_boundary(text: &str, byte: usize) -> usize {
 /// protocol bytes).
 fn char_offset(text: &str, byte: u32) -> u32 {
     text[..floor_boundary(text, byte as usize)].chars().count() as u32
+}
+
+/// `SetSurroundingText`'s arguments: IBus text, then the cursor and
+/// anchor in characters.
+fn surrounding_variant(surrounding: &Surrounding) -> glib::Variant {
+    let text = &surrounding.text;
+    glib::Variant::tuple_from_iter([
+        ibus_text_variant(text),
+        char_offset(text, surrounding.cursor).to_variant(),
+        char_offset(text, surrounding.anchor).to_variant(),
+    ])
 }
 
 /// Byte offset of character `chars` (the text's length past its end).
@@ -448,10 +558,11 @@ struct Bridge {
     active: bool,
     preedit_active: bool,
     /// Surrounding text and content type pending the next `done`, and
-    /// the applied surrounding text.
+    /// the applied ones.
     pending_surrounding: Option<Surrounding>,
     surrounding: Option<Surrounding>,
     pending_content_type: Option<(u32, u32)>,
+    content_type: Option<(u32, u32)>,
     /// The latest cursor rectangle (global, see the module doc), and
     /// the one IBus last heard.
     cursor_rect: Option<(i32, i32, i32, i32)>,
@@ -459,6 +570,8 @@ struct Bridge {
     xkb: Option<(xkb::Keymap, xkb::State)>,
     vk_keymap: bool,
     gone: bool,
+    /// While IBus is gone: when to look for it next, and the wait after.
+    ibus_retry: Option<(Instant, Duration)>,
 }
 
 impl Bridge {
@@ -473,6 +586,55 @@ impl Bridge {
         for event in events {
             self.apply(event);
         }
+    }
+
+    /// IBus's daemon exited or restarted: keys bypass it until one is
+    /// back, then a new context takes over, as GNOME Shell's input
+    /// method creates one on IBus's `connected` (js/misc/inputMethod.js
+    /// `_onConnected`). IBus routes keys only to a focused context and
+    /// the compositor sends no new activation for a field that kept
+    /// focus, so a focused field is focused in the new context at once.
+    fn follow_ibus(&mut self) {
+        if self.context.as_ref().is_some_and(|c| c.bus.is_closed()) {
+            eprintln!("tuna-ibus-bridge: IBus left; keys go to the app until it returns");
+            self.context = None;
+            if std::mem::take(&mut self.preedit_active) {
+                if let Some(im) = &self.im {
+                    im.set_preedit_string(String::new(), 0, 0);
+                    im.commit(self.serial);
+                }
+            }
+            self.ibus_retry = Some((Instant::now(), IBUS_RETRY_MIN));
+        }
+        let Some((at, wait)) = self.ibus_retry else {
+            return;
+        };
+        if Instant::now() < at {
+            return;
+        }
+        // A returned daemon's address names a live socket again.
+        let context = match ibus_address().map(|address| ibus_bus(&address)) {
+            Some(Ok(bus)) => open_context(bus, &self.incoming).ok(),
+            _ => None,
+        };
+        let Some(context) = context else {
+            self.ibus_retry = Some((Instant::now() + wait, (wait * 2).min(IBUS_RETRY_MAX)));
+            return;
+        };
+        eprintln!("tuna-ibus-bridge: IBus returned");
+        self.ibus_retry = None;
+        if self.active {
+            context.send("FocusIn", None);
+            if let Some((purpose, hints)) = self.content_type {
+                context.set_content_type(purpose, hints);
+            }
+            if let Some(surrounding) = &self.surrounding {
+                context.send("SetSurroundingText", Some(surrounding_variant(surrounding)));
+            }
+            self.sent_cursor_rect = None;
+        }
+        self.context = Some(context);
+        self.sync_cursor();
     }
 
     /// IBus's mask for the current modifiers (X's bits).
@@ -605,21 +767,21 @@ impl Bridge {
         if !self.active {
             return;
         }
-        let Some(context) = &self.context else {
-            return;
-        };
+        // The field's state is kept while IBus is away, for its return.
         if let Some((purpose, hints)) = self.pending_content_type.take() {
-            context.set_content_type(purpose, hints);
+            self.content_type = Some((purpose, hints));
+            if let Some(context) = &self.context {
+                context.set_content_type(purpose, hints);
+            }
         }
         if let Some(surrounding) = self.pending_surrounding.take() {
             if self.surrounding.as_ref() != Some(&surrounding) {
-                let text = &surrounding.text;
-                let args = glib::Variant::tuple_from_iter([
-                    ibus_text_variant(text),
-                    char_offset(text, surrounding.cursor).to_variant(),
-                    char_offset(text, surrounding.anchor).to_variant(),
-                ]);
-                context.send("SetSurroundingText", Some(args));
+                if let Some(context) = &self.context {
+                    context.send(
+                        "SetSurroundingText",
+                        Some(surrounding_variant(&surrounding)),
+                    );
+                }
                 self.surrounding = Some(surrounding);
             }
         }
@@ -659,6 +821,7 @@ impl Bridge {
         self.preedit_active = false;
         // A new field: what IBus heard about the last one is stale.
         self.surrounding = None;
+        self.content_type = None;
         self.sent_cursor_rect = None;
         eprintln!(
             "tuna-ibus-bridge: text field {}",
@@ -943,5 +1106,50 @@ mod tests {
         assert_eq!(args.child_value(1).str(), Some("ContentType"));
         let value = args.child_value(2).as_variant().unwrap();
         assert_eq!(value.get::<(u32, u32)>(), Some((8, 2048)));
+    }
+
+    /// #503: the loop sleeps until the Wayland socket or GLib has
+    /// something (the old loop woke every 50 ms): with neither, a wait
+    /// lasts its whole limit; a readable socket ends it at once; work
+    /// queued on GLib's context from another thread, as GDBus's worker
+    /// queues IBus's signals, ends it and is dispatched.
+    #[test]
+    fn the_loop_sleeps_until_the_socket_or_glib_has_something() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let context = glib::MainContext::new();
+        let _owner = context.acquire().unwrap();
+        let (mut wayland, mut compositor) = std::os::unix::net::UnixStream::pair().unwrap();
+
+        let started = Instant::now();
+        assert!(!wait(&context, wayland.as_fd(), Some(Duration::from_millis(300))).unwrap());
+        assert!(
+            started.elapsed() >= Duration::from_millis(290),
+            "an idle wait lasts its limit: {:?}",
+            started.elapsed()
+        );
+
+        compositor.write_all(b"x").unwrap();
+        let started = Instant::now();
+        assert!(wait(&context, wayland.as_fd(), None).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        wayland.read_exact(&mut [0]).unwrap();
+
+        let delivered = Arc::new(AtomicBool::new(false));
+        let (remote, flag) = (context.clone(), delivered.clone());
+        let signal = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            remote.invoke(move || flag.store(true, Ordering::SeqCst));
+        });
+        let started = Instant::now();
+        while !delivered.load(Ordering::SeqCst) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "GLib never woke the wait"
+            );
+            assert!(!wait(&context, wayland.as_fd(), Some(Duration::from_secs(5))).unwrap());
+        }
+        signal.join().unwrap();
     }
 }

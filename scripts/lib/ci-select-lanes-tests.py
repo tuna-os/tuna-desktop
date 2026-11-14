@@ -109,6 +109,17 @@ class Selection(unittest.TestCase):
         # Control: a script that is not listed still rotates lanes.
         self.assertIn("gtk-shell", pr("scripts/tuna-journey-helper", run=3))
 
+    def test_edited_tests_run_the_lane_that_executes_them(self):
+        # #1108: a scripts/tests/ edit used to run no lane, so a gtk-shell
+        # test change first ran on main after merge.
+        self.assertEqual(pr("scripts/tests/test_notify_callback_contract.py"), ["gtk-shell"])
+        self.assertEqual(pr("scripts/tests/test_native_product.py"),
+                         ["arch-package", "marlin-vm"])
+        self.assertEqual(pr("scripts/tests/test_grid_cancel_proof.py"), ["grid-cancel-comparison"])
+        self.assertEqual(pr("scripts/tests/test_colord_startup.py"), ["drm-smoke"])
+        # Control: a test only the always-on check job runs adds no lane.
+        self.assertEqual(pr("scripts/tests/test_disk_guard.py"), [])
+
     def test_pull_requests_never_rotate_the_push_only_image_lane(self):
         self.assertNotIn("marlin-image", m.ROTATION)
         for run in range(len(m.ROTATION)):
@@ -216,6 +227,25 @@ class WorkflowSync(unittest.TestCase):
                                  if m.matches(path, m.NO_LANE) and path in texts
                                  and not m.matches(path, ["scripts/tests/*", "scripts/lib/*-tests.py"]))
         self.assertEqual(reached_no_lane, [])
+
+    def test_lane_run_tests_select_their_lane(self):
+        # #1108: every scripts/tests/ file a lane job names (by path or module
+        # stem) must select that lane when edited. Direct mentions only: the
+        # transitive walk above also crosses shared proof scripts, which would
+        # claim far more lanes than run the file.
+        tracked = subprocess.run(["git", "ls-files", "scripts/tests"], cwd=ROOT, check=True,
+                                 capture_output=True, text=True).stdout.split()
+        self.assertTrue(tracked)
+        for name, job in self.jobs.items():
+            lane = m.WORKFLOW_JOB_LANE.get(name)
+            if lane is None:
+                continue
+            text = json.dumps(job)
+            for path in tracked:
+                stem = Path(path).stem
+                if path.endswith(".py") and any(n in text for n in (path, stem, stem.replace("_", "-"))):
+                    with self.subTest(job=name, test=path):
+                        self.assertIn(lane, pr(path, size=0))
 
     def test_native_reference_artifacts_exist_only_off_pull_requests(self):
         # A pull request builds the primary marlin-vm leg only; the two
