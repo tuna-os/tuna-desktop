@@ -57,6 +57,12 @@ base, and picks the proof lanes the change can affect:
   The slice size is the repository variable `CI_ROUND_ROBIN_SIZE`
   (default 2); each push to a PR covers a different slice and `main` runs
   them all after merge.
+- the native Core consumer inside `marlin-vm` (`core-apps-image`, every
+  `core-apps-leg` and the `native-core-apps` join) is selected as one by the
+  selector's second output, `core_apps`: on a pull request only when
+  `marlin-vm` is selected and the change touches `CORE_APPS_SOURCES` (the
+  host driver, native observer, guest agent, image admission or the Core
+  image layer); on every other event whenever `marlin-vm` runs.
 
 The step summary of `select-lanes` names the chosen lanes and why.
 Independent lanes start after selection, without waiting for workspace
@@ -67,7 +73,9 @@ wait for their producing proof jobs.
 
 `ci-gate` requires both infrastructure jobs to succeed and fails when any
 selected job fails or is cancelled. Only unselected proof lanes may be
-skipped. To run every lane on a branch, dispatch `ci` on it.
+skipped; the `native-core-apps` join in particular must succeed whenever its
+consumer was selected, so a skipped join fails the gate too. To run every
+lane on a branch, dispatch `ci` on it.
 
 ## Native Orca speech proof
 
@@ -502,6 +510,11 @@ cannot satisfy the gate.
 
 `app-content` and `scroll-proof` download Playwright and Chromium into a
 temporary venv on every run, so they need network access.
+`scroll-proof` completes those downloads before launching its compositor:
+the normal five-minute idle lock remains enabled, so dependency latency is
+not part of the live input journey. Each mode change sends exactly one
+physical key chord and waits for the compositor's observed transition;
+silence fails rather than resending a toggle that could undo a slow change.
 
 **Start `tuna-gtk-shell-proof` from a fresh artifacts directory.** The
 script points `XDG_STATE_HOME` at `gtk-shell-artifacts/state`, and the
@@ -656,6 +669,119 @@ The run stopped when `karnataka` SSH/SFTP/legacy-SCP transport became
 unreachable; final beta3 qualification inputs had not been supplied.
 No timeout, lock policy, host capacity setting or qualification floor was
 relaxed.
+
+The recovered current-build producer payload lives in
+`scripts/lib/core_apps.py` and the typed installed observers under
+`packaging/marlin/vm-lane/core-apps/`. It uses the existing native
+QMP/QGA/GDM lifecycle, not a second VM producer. Its explicit CI-only
+`CORE_APPS=1` image installs the 28 original distro applications and retains
+the installed package delta. The UID 1000 account's `wheel` membership comes
+from the ordinary fixture layer (`useradd -G wheel`, shared with the native
+automatic-timezone row); the Core layer requires that baseline, records both
+group sets and that it changed none, and does not install authorization rules
+or replace stock polkit/consent. The two ordinary lifecycle rows use that
+same account.
+
+The private `TUNA_COMPOSITOR_STATE` opt-in additionally exposes per-live-binding
+**server emission**, not application-consumption, counters at the actual
+`WlSurface::key` → `WlKeyboard.key` send path. The default does not count keys,
+allocate observer storage, or take observer snapshots. Evidence joins actual
+kernel-accepted or D-Bus-admitted original PID/UID with a live process pin,
+generational connection/resource identity, native window, and seat focus to
+the original installed process. Mutter ServiceChannel sockets are created
+by the compositor and passed to the admitted application; their raw
+`SO_PEERCRED` identifies the socket-pair creator, not the application.
+Both window and focus observer records therefore use the original pinned
+caller credentials already retained at connection admission. Missing
+credentials, missing UID/pin, and exited peers are unevaluable; there is no
+fallback to the compositor PID or a later numeric-PID lookup. Every app requires a fresh
+prelock positive delta, unchanged counters during locked negative input and
+unlock, and another fresh postunlock positive delta. Missing, recreated,
+retired, late-enabled or overflowing bindings are unevaluable, never zero
+passes. Independent application text/payload, frames, service outcomes,
+100%/150% scaling and restart persistence remain separate requirements.
+IME evidence is physical `nihao`/Space through installed libpinyin with visible
+preedit in the original packaged app, its exact commit and clipboard readback;
+a helper or file chooser cannot qualify the app's editable interface.
+
+This source payload is not a 28-app receipt. The fixture uses genuine packaged
+production Radicale inside the existing guest for authenticated CalDAV and
+CardDAV, original Calendar/Contacts UI and EDS consumption, independent DAV
+payload readback, wrong-password denial, and service/frontend persistence.
+Its owned loopback service is not an HTTP echo, host listener or shipping
+service. Software requires genuine signed previous/current Flathub objects
+for install/update/remove; maps, forecasts and reverse geocoding require
+their real providers. GeoClue's named New York static source is emulated
+input, not GPS.
+
+Normal image construction runs the packaged `tuna-geoclue-agent-policy`
+helper, which verifies the pristine packaged vendor main configuration and
+adds the real `tuna-shell` ID to its complete vendor agent list in an early
+fragment. It preserves later administrator overrides and refuses a modified
+administrator main configuration or a later policy that excludes Tuna.
+GeoClue's [whitelist replacement semantics](https://man.archlinux.org/man/geoclue.5.en.txt)
+require retaining that full list, not replacing it with only Tuna. The helper
+does not change application grants, vendor main bytes, or any live session.
+The qualification fixture only reads effective admission; it never spoofs
+`gnome-shell` or adds `allowed=true` for Maps/Weather. The actual shell logs
+successful `AddAgent` completion; absent errors alone do not prove acceptance.
+Automatic timezone
+requires the original active packaged `gsd-datetime` PID/UID and passive real
+service traffic through timedated, `/etc/localtime` and the panel, including
+both disabled controls and restoration. Absent inputs fail the full run;
+source coverage, counter tests and the old nine-operation archive cannot
+close #397 or #359.
+
+The [native Core job in CI run 41464650830](https://github.com/tuna-os/tuna-desktop/actions/runs/41464650830/job/125362607498)
+failed at `desktop.discover` (`guest.py:142`) before completing the matrix.
+Its retained `native-core-apps` artifact `13156997730`,
+`core-apps/00025-normal-launch-org.gnome.Nautilus.json`, records Nautilus
+window 2 with `client_pid=1935`; `session-owner.json` identifies PID 1935 as
+the original compositor. This exposed the observer's use of socket-pair
+creator credentials on the service connection. The correction preserves
+the strict app bus/PID/UID join and actual server-emission requirements.
+Socket regression controls cover the separate live admitted process,
+expired pins, and absent original credentials/pin/UID, but do not qualify
+Nautilus or any of the 28 applications. A fresh source-bound native Core
+matrix on the installed app/service/reference-GDM path is still required;
+the failed run is not a pass and must not be retried merely for green.
+
+The [native Core job in CI run 42395487640](https://github.com/tuna-os/tuna-desktop/actions/runs/42395487640/job/128507853672)
+completed Fonts, Calculator and Image Viewer and failed in Document Viewer at
+`picker-actual-content-cell`. Its `native-core-apps` artifact shows the host
+driver's fault, not the product's or the chooser filter's. The Files location
+entry is a `GtkEntryCompletion`: typing `<fixture>/` pops the directory's
+children up in a list below the entry, that list selects the row under the
+pointer, and Return with a selected row puts the row into the entry instead
+of activating it. In `core-apps/00728-guest-desktop-tree.json` the picker
+window is at `[195, 141, 890, 550]`, the list at `[275, 59, 426, 176]` inside
+it, and the compositor's `pointer_position` is `[797.6, 253.3]`, where the
+previous chooser's file cell had been clicked. After Return
+(`00733-guest-desktop-tree.json`) the list is gone, the entry is still focused
+and reads `<fixture>/web/`, and the view still shows Papers' empty start
+folder. The first Image Viewer chooser (`00453`, pointer at `[617.5, 419.5]`,
+outside the list) navigated; its later choosers (`00480`, `00679`) took the
+same `web/` row and passed only because Files had reopened in the fixture
+directory. `Desktop.enter_location` now rests the real pointer on the entry,
+counts exact reads only while the compositor reports it there, and requires
+Return to close the entry; the Disks journey uses the same helper.
+`scripts/tests/test_core_apps_desktop.py` replays that geometry. The host
+driver and guest observer unit tests (`scripts/tests/test_core_apps_*.py`,
+`test_vm_native_await.py`, `test_geoclue_agent_policy.py`) run in the CI
+`check` job; they do not qualify any application.
+
+That run also measured the budget: 10 min 46 s of setup, 68 s to a logged-in
+session, then 139 s, 86 s and 173 s for the three completed applications.
+At that pace 28 applications need about 63 minutes, more than the 60-minute
+job allows after setup, so a single boot could not pass even with every
+application working. The consumer now runs as five parallel boots of one
+admitted image, split by domain, and a join job recomputes completeness from
+their receipts before `V-CORE-APPS` is written
+([Required native Core applications](vm-lifecycle.md#required-native-core-applications)).
+The partition, the per-leg share and the join verdict are covered by
+`scripts/tests/test_core_apps_legs.py`, and selection by
+`scripts/lib/ci-select-lanes-tests.py`; the split itself has not yet run in CI.
+
 
 ## Marlin VM lane
 

@@ -75,7 +75,7 @@ use std::{borrow::Cow, fmt, sync::Arc};
 use crate::input::{Inner, Seat, SeatHandler, SeatRc, SeatState};
 
 pub use self::{
-    keyboard::KeyboardUserData,
+    keyboard::{KeyboardDeliveryResource, KeyboardDeliverySnapshot, KeyboardUserData},
     pointer::{PointerUserData, CURSOR_IMAGE_ROLE},
     touch::TouchUserData,
 };

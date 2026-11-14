@@ -35,9 +35,9 @@ schedule, dispatch or a pull request whose head repository is
 
 | Runner | Lanes |
 | --- | --- |
-| `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, native-reference-context, parity-ledger, docs-shots, ci-gate |
+| `tuna-ci-24.04` | select-lanes, check, fprint-phase-proof, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, native-core-apps (the join of the Core legs), native-reference-context, parity-ledger, docs-shots, ci-gate |
 | `tuna-ci-26.04` | journey, orca-speech, portal-security, remote-security, niri-parity |
-| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (pull requests: the primary lifecycle leg only; push, schedule and dispatch add the Orca 51 leg and both paired reference members), marlin-image (push, schedule and dispatch only), gdm51-native-package |
+| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (pull requests: the primary lifecycle leg only; push, schedule and dispatch add the Orca 51 leg and both paired reference members), core-apps-image and core-apps-leg (the native Core image and its five parallel boots, when selected), marlin-image (push, schedule and dispatch only), gdm51-native-package |
 
 Why the always-hosted lanes stay hosted:
 
@@ -47,11 +47,13 @@ Why the always-hosted lanes stay hosted:
   runner's kernel. On karnataka that is the shared host kernel under punjab
   and KubeVirt, a Fedora kernel the Ubuntu module install cannot target, and
   the module would expose a DRM device to the whole node.
-- **marlin-vm** needs more than `/dev/kvm`: it runs
+- **marlin-vm**, and the native Core `core-apps-leg` boots with it, need more
+  than `/dev/kvm`: they run
   `podman run --privileged --pid=host -v /dev:/dev … bootc install to-disk
   --via-loopback`, i.e. loop devices and a privileged container, which is
   root on the node. KVM through KubeVirt's device plugin would work, the
-  disk build would not.
+  disk build would not. `core-apps-image` builds the image those boots load
+  with the same rootful podman, so it stays beside them.
 - **marlin-image** builds the OCI image and, on `main`, pushes it to GHCR
   with a `packages: write` token. Publishing stays on GitHub's ephemeral VMs
   so a compromised long-lived node (or its shared image store) can never

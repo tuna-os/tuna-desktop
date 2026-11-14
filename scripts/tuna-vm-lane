@@ -55,6 +55,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -75,6 +76,7 @@ guest_agent = importlib.util.module_from_spec(_guest_spec)
 _guest_loader.exec_module(guest_agent)
 import soak_report  # noqa: E402  (scripts/lib, on sys.path above)
 import fresh_accounts  # noqa: E402  (scripts/lib, on sys.path above)
+import core_apps_legs  # noqa: E402  (scripts/lib, on sys.path above)
 from tour_media import (TOUR_PUBLIC_CONTROLS, desktop_shown, grey_share,
                         overview_windows_shown, switcher_shown, tour_public_view)
 
@@ -3330,10 +3332,17 @@ class Recorder:
                 break
         with self.lock:
             self.still(card)
+            # The view had to be on screen and its frame retained by the
+            # deadline; decoding the already-retained PNG is a separate,
+            # fixed budget (`_exact_pixels`). A view that appears in the last
+            # second of the window left ffmpeg only milliseconds and was
+            # refused with TimeoutExpired though the frame was good (runs
+            # 42337013327, 42384050579: alt-tab unconfirmed, tour sealing
+            # refused).
             within = time.monotonic() <= deadline
             exact = None
             decode_error = None
-            if ready:
+            if ready and within:
                 try:
                     exact = self._exact_pixels(card)
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
@@ -3787,13 +3796,15 @@ def run_soak(qmp, vm, agent_path, out, record, seconds, warmup, interval, revisi
 
 
 def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, native_relative_mouse=False,
-         observer_records=None, credentials=()):
+         observer_records=None, credentials=(), core_nonce=None):
     ovmf = next((p for p in OVMF if os.path.exists(p)), None)
     if not ovmf:
         sys.exit("tuna-vm-lane: OVMF firmware not found (install ovmf)")
     kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
     if require_kvm and not kvm:
         sys.exit("tuna-vm-lane: KVM required but /dev/kvm is not accessible; refusing emulation")
+    if core_nonce is not None and re.fullmatch("[0-9a-f]{32}", core_nonce) is None:
+        raise ValueError("disposable Core disk requires the exact Core consumer nonce")
     qmp_path = os.path.join(scratch, "qmp.sock")
     agent_path = os.path.join(scratch, "qga.sock")
     serial = os.path.join(out, "serial.log")
@@ -3813,6 +3824,13 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
             "-nic", "user,model=virtio-net-pci"]
     if native_relative_mouse:
         qemu.extend(["-device", "virtio-mouse-pci,id=tuna-relative-mouse"])
+    if core_nonce is not None:
+        fixture_disk = os.path.join(scratch, "core-apps-disposable.raw")
+        with open(fixture_disk, "xb") as stream:
+            stream.truncate(512 * 1024 * 1024)
+        qemu.extend(["-drive", f"file={fixture_disk},format=raw,if=none,id=core-apps-disposable",
+                     "-device", "usb-storage,drive=core-apps-disposable,removable=on,"
+                                "serial=TC397-" + core_nonce[:14]])
     for credential in credentials:
         # systemd imports SMBIOS type 11 io.systemd.credential: strings as
         # system credentials (ConditionCredential=).
@@ -4079,8 +4097,12 @@ def repeat_boots(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--profile", choices=("lifecycle", "autotz", "gnome-reference", "tuna-reference"), default="lifecycle",
-                    help="ordinary lifecycle (default), required independent native automatic-timezone consumer, or explicit paired DEV member")
+    ap.add_argument("--profile", choices=("lifecycle", "autotz", "core-apps", "gnome-reference", "tuna-reference"), default="lifecycle",
+                    help="ordinary lifecycle (default), required independent native automatic-timezone consumer, "
+                         "one leg of the required native Core consumer, or explicit paired DEV member")
+    ap.add_argument("--core-leg", choices=tuple(core_apps_legs.LEGS),
+                    help="the native Core leg this boot runs; the complete matrix is the join of every leg "
+                         "(scripts/lib/core_apps_legs.py)")
     ap.add_argument("--reference-base-evidence",
                     help="actual normal-CI raw index and successful platform cosign verification directory")
     ap.add_argument("--disk", required=True)
@@ -4118,6 +4140,12 @@ def main():
                      "skipped_assertions", "assertions", "tour", "lane"}
     if any(kv.partition("=")[0] in reserved_meta for kv in a.meta):
         ap.error("--meta cannot override qualification policy, assertions, tour or lane")
+    if a.profile == "core-apps":
+        if (not a.require_kvm or not a.strip_image or a.tour or a.boots != 1 or a.soak
+                or a.fresh_accounts or a.published or a.strip_edge or not a.core_leg):
+            ap.error("native Core requires KVM, exact installed image admission, one pristine boot and its leg")
+    elif a.core_leg:
+        ap.error("--core-leg belongs to the native Core profile")
     if a.profile == "autotz":
         if (not a.require_kvm or not a.strip_image or a.tour or a.boots != 1
                 or a.soak or a.fresh_accounts or a.published or a.strip_edge):
@@ -4148,8 +4176,8 @@ def main():
     if a.strip_edge and not a.strip_image:
         ap.error("--strip-edge requires exact installed image admission")
     if a.strip_image:
-        if not a.tour and a.profile != "autotz":
-            ap.error("--strip-image requires --tour lifecycle or explicit native autotz consumer")
+        if not a.tour and a.profile not in ("autotz", "core-apps"):
+            ap.error("--strip-image requires --tour lifecycle, explicit native autotz consumer or the native Core consumer")
         with open(a.strip_image, "rb") as stream:
             raw = stream.read(1048577)
         if len(raw) > 1048576:
@@ -4180,7 +4208,11 @@ def main():
         results[test_id] = (ok, desc)
         log(f"{test_id} {'pass' if ok else 'FAIL'}: {desc}")
 
-    vm, qmp_path, serial_path, kvm, agent_path = boot(os.path.abspath(a.disk), out, scratch, a.timeout, a.require_kvm, guest_agent=True, native_relative_mouse=True)
+    core_nonce = secrets.token_hex(16) if a.profile == "core-apps" else None
+    core_desktop = None
+    vm, qmp_path, serial_path, kvm, agent_path = boot(
+        os.path.abspath(a.disk), out, scratch, a.timeout, a.require_kvm,
+        guest_agent=True, native_relative_mouse=True, core_nonce=core_nonce)
     start = time.time()
     drm = shell = None
     elapsed = 0.0
@@ -4276,6 +4308,22 @@ def main():
             finally:
                 if agent is not None:
                     agent.close()
+            if a.profile == "core-apps":
+                try:
+                    if not manager_ready:
+                        raise RuntimeError("original installed native session owner admission failed")
+                    from core_apps import Desktop
+                    factory = lambda *, deadline: guest_agent.GuestAgent(agent_path, deadline=deadline)
+                    core_desktop = Desktop(qmp, factory, os.path.join(out, "core-apps"), strip_image,
+                                           select_corner_mouse, nonce=core_nonce,
+                                           auth_records=lambda: session_records(read_text(serial_path)),
+                                           auth_refusal=pam_refusal_observed, leg=a.core_leg)
+                    core_desktop.run()
+                    record(core_apps_legs.LEG_ASSERTION, True,
+                           f"native Core leg {a.core_leg}: its installed applications completed; "
+                           "not the complete matrix and not signed-release qualification")
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                    record(core_apps_legs.LEG_ASSERTION, False, f"native Core leg {a.core_leg}: {error}")
             if a.profile == "autotz":
                 try:
                     if not manager_ready:
@@ -4344,6 +4392,9 @@ def main():
         results.setdefault("V-AUTOTZ", (False, "native session never admitted; required consumer did not run"))
     if a.soak:
         results.setdefault("V-SOAK", (False, "the session never became ready, so the soak did not run"))
+    if a.profile == "core-apps":
+        results.setdefault(core_apps_legs.LEG_ASSERTION,
+                           (False, f"native Core leg {a.core_leg}: original native session never admitted its consumer"))
     # GDM starting its greeter on the login VT takes DRM master from the
     # running session; say so instead of leaving a bare pixel failure.
     paused = "tuna-compositor: drm: session paused" in text
@@ -4379,7 +4430,7 @@ def main():
     qemu_version = subprocess.run(["qemu-system-x86_64", "--version"], capture_output=True,
                                   text=True).stdout.splitlines()[0]
     manifest = {
-        "lane": "marlin-vm",
+        "lane": "native-core-apps-" + a.core_leg if a.profile == "core-apps" else "marlin-vm",
         "profile": a.profile,
         **mode,
         "orca_contract": a.orca_contract,
@@ -4402,6 +4453,17 @@ def main():
         manifest[key] = value
     with open(os.path.join(out, "manifest.json"), "w") as fh:
         json.dump(manifest, fh, indent=2)
+    if a.profile == "core-apps":
+        # Written for a failed leg too: the join needs every leg's identity,
+        # exact application list and verdict, and treats a missing one as failure.
+        receipt = core_apps_legs.receipt(
+            a.core_leg, strip_image, getattr(core_desktop, "inventory", None),
+            [row["app"]["app_id"] for row in getattr(core_desktop, "_results", [])],
+            getattr(core_desktop, "timezone", None), {k: v[0] for k, v in results.items()},
+            run={"run_id": os.environ.get("GITHUB_RUN_ID"), "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT")})
+        with open(os.path.join(out, core_apps_legs.RECEIPT_NAME), "w") as fh:
+            json.dump(receipt, fh, indent=2)
+            fh.write("\n")
     for name in os.listdir(scratch):
         os.remove(os.path.join(scratch, name))
     os.rmdir(scratch)

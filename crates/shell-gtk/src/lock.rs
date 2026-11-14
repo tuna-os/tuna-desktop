@@ -1070,6 +1070,18 @@ impl LockUi {
             let lock_keyboard = keyboard.as_ref().map(Rc::downgrade);
             curtain.connect_settled(move |page| {
                 if page != Page::Clock {
+                    // The prompt arrived without a user lift
+                    // (auth-driven show): a sensitive entry takes the
+                    // focus, as on every lift path, so keyboard users
+                    // can type immediately. Already-focused entries
+                    // are unaffected.
+                    if page == Page::Prompt {
+                        if let Some(entry) = entry.upgrade() {
+                            if entry.current().is_sensitive() {
+                                entry.focus();
+                            }
+                        }
+                    }
                     return;
                 }
                 // The prompt is gone: so is its keyboard.

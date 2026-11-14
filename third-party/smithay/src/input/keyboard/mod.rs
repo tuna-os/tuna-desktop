@@ -360,6 +360,11 @@ pub(crate) struct KbdRc<D: SeatHandler> {
     pub(crate) known_kbds: Mutex<Vec<Weak<wayland_server::protocol::wl_keyboard::WlKeyboard>>>,
     #[cfg(feature = "wayland_frontend")]
     pub(crate) last_enter: Mutex<Option<Serial>>,
+    #[cfg(feature = "wayland_frontend")]
+    pub(crate) delivery_observer:
+        std::sync::OnceLock<Mutex<crate::wayland::seat::keyboard::KeyboardDeliveryObserver>>,
+    #[cfg(feature = "wayland_frontend")]
+    pub(crate) keyboard_bindings_started: std::sync::atomic::AtomicBool,
     pub(crate) span: tracing::Span,
     #[cfg(feature = "wayland_frontend")]
     pub(crate) active_keymap: RwLock<KeymapFileId>,
@@ -730,6 +735,10 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
                 known_kbds: Mutex::new(Vec::new()),
                 #[cfg(feature = "wayland_frontend")]
                 last_enter: Mutex::new(None),
+                #[cfg(feature = "wayland_frontend")]
+                delivery_observer: std::sync::OnceLock::new(),
+                #[cfg(feature = "wayland_frontend")]
+                keyboard_bindings_started: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "wayland_frontend")]
                 active_keymap: RwLock::new(active_keymap),
                 span,
