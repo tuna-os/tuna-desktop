@@ -5,7 +5,8 @@
 //! together. xdg-decoration stays absent on purpose (Mutter parity).
 //! `EXPECTED` is what an ordinary client sees; `SHELL_ONLY` holds the
 //! globals the supervised shell's connection sees on top of it (#1048),
-//! and `SANDBOX_HIDDEN` the ones a client inside a
+//! `IME_BRIDGE_ONLY` the ones the compositor's own IBus bridge sees on
+//! top of it, and `SANDBOX_HIDDEN` the ones a client inside a
 //! wp_security_context_v1 does not see (#1046).
 
 use std::collections::BTreeMap;
@@ -131,6 +132,18 @@ const EXPECTED: &[(&str, u32)] = &[
 const SHELL_ONLY: &[(&str, u32)] = &[
     ("ext_foreign_toplevel_list_v1", 1),
     ("zwlr_layer_shell_v1", 4),
+];
+
+/// Globals filtered to the compositor's own IBus bridge connection: its
+/// registry is `EXPECTED` plus these, every other client's lacks them.
+/// They type for other clients and observe their text, so the filter is
+/// `ClientState::privileged` on the bridge flag (docs/security-model.md).
+/// `tuna_osk_input_v1` is the on-screen keyboard's private virtual-text
+/// route (#349, `crates/compositor/src/osk_ime.rs`).
+const IME_BRIDGE_ONLY: &[(&str, u32)] = &[
+    ("tuna_osk_input_v1", 1),
+    ("zwp_input_method_manager_v2", 1),
+    ("zwp_virtual_keyboard_manager_v1", 1),
 ];
 
 /// Globals of `EXPECTED` a client inside a wp_security_context_v1 does
@@ -514,6 +527,43 @@ fn layer_shell_is_visible_and_bindable_only_by_the_supervised_shell() {
 }
 
 #[test]
+fn ime_bridge_globals_are_visible_only_to_the_supervised_bridge() {
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    let mut app = connect(&mut comp);
+    let mut shell = connect_with(&mut comp, TestCompositor::add_shell_client);
+    let mut bridge = connect_with(&mut comp, TestCompositor::add_ime_bridge_client);
+    pump(
+        &mut comp,
+        &mut manager,
+        &mut [&mut app, &mut shell, &mut bridge],
+    );
+
+    // The bridge's registry is the ordinary one plus the filtered globals.
+    let mut expected: Vec<(String, u32)> = EXPECTED
+        .iter()
+        .chain(IME_BRIDGE_ONLY)
+        .map(|(k, v)| ((*k).to_owned(), *v))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        seen_globals(&bridge),
+        expected,
+        "update IME_BRIDGE_ONLY and docs/protocols.md together"
+    );
+    for (interface, _) in IME_BRIDGE_ONLY {
+        assert!(
+            !app.client.globals.contains_key(*interface),
+            "{interface} must stay out of an ordinary client's registry"
+        );
+        assert!(
+            !shell.client.globals.contains_key(*interface),
+            "{interface} must stay out of the supervised shell's registry"
+        );
+    }
+}
+
+#[test]
 fn dmabuf_is_advertised_only_with_renderer_formats() {
     let mut comp = TestCompositor::new();
     let mut manager = comp.window_manager();
@@ -780,7 +830,7 @@ fn security_context_clients_see_no_privileged_global() {
         .map(|(k, v)| ((*k).to_owned(), *v))
         .collect();
     assert_eq!(seen_globals(&sandboxed), expected);
-    for (interface, _) in SHELL_ONLY {
+    for (interface, _) in SHELL_ONLY.iter().chain(IME_BRIDGE_ONLY) {
         assert!(
             !sandboxed.client.globals.contains_key(*interface),
             "{interface} must stay out of a sandboxed client's registry"

@@ -136,6 +136,9 @@ mod occlusion;
 pub mod orca;
 pub mod orientation;
 pub mod osk;
+mod osk_ime;
+#[cfg(test)]
+mod osk_ime_tests;
 mod output_constraints;
 pub mod overlay;
 pub mod overview;

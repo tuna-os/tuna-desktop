@@ -7,10 +7,10 @@
 //! [`TextInputs`] watches every `zwp_text_input_v3` request before
 //! Smithay sees it; the shell hears the result as
 //! `Message::OnScreenKeyboard`. The keyboard then types through
-//! `KeyboardController`'s two paths: a key's string is committed to the
-//! focused text input, and keysyms are pressed on the seat keyboard via
-//! the active layout ([`pick_keycode`], mutter's virtual input device),
-//! which reaches X11 clients, terminals and shortcuts alike.
+//! `KeyboardController`'s paths: native strings use the supervised IBus
+//! context's current source (`crate::osk_ime`), or direct commit without
+//! IBus; declined/unavailable keys, X11 clients and modifiers use the
+//! active layout ([`pick_keycode`], mutter's virtual input device).
 //! [`TouchMode`] is `KeyboardManager`'s touch-mode auto-show.
 
 use smithay::input::keyboard::xkb;

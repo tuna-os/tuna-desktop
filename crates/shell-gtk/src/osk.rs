@@ -161,6 +161,11 @@ fn key_button(label: Option<&str>, icon: Option<&str>, name: &str) -> gtk::Butto
         button.set_child(Some(&image));
     } else if let Some(label) = label {
         button.set_label(label);
+        if name != label {
+            // GtkButton's automatic labelled-by child takes precedence over
+            // an explicit accessible label (notably " " versus "Space").
+            button.reset_relation(gtk::AccessibleRelation::LabelledBy);
+        }
     }
     button.update_property(&[gtk::accessible::Property::Label(name)]);
     button

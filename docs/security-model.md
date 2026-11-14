@@ -83,7 +83,7 @@ labelled **target**.
 | `tuna-compositor` | Everything below. Owns focus, stacking, input routing, the lock flag, capture authorization and privileged protocol exposure ([architecture](architecture.md#process-and-authority-boundaries)) | The trusted computing base of the session | `crates/compositor` |
 | Private PAM helper | Running the `tuna-lock` PAM transaction | Re-executes the compositor's own held image. It never takes an executable path from UI, environment or configuration ([private PAM helper](security/private-pam-helper.md)). | `crates/compositor/src/pam_helper.rs` |
 | Supervised shell (`tuna-shell-gtk` by default, legacy `tuna-shell-host`) | UI intent, lock surfaces, layer surfaces (panel, overview, banners, dialogs), the shell's own capture UI | PID of the compositor's own shell child (`Authority::publish`, `runtime.rs:4881-4890`); for its Wayland connection, the accepted peer's PID at connect time (`runtime.rs:1169-1171`). Between restarts no process is trusted. | `crates/shell-gtk`, `crates/shell-host` |
-| Compositor's IBus bridge | Typing for other clients (virtual keyboard) | A Wayland connection the compositor inserts itself with the `ime_bridge` flag (`ime.rs:360`, `lib.rs:328-331`) | `crates/compositor/src/ime.rs` |
+| Compositor's IBus bridge | Typing for other clients (virtual keyboard, and on-screen-keyboard text over the private `tuna_osk_input_v1`) | A Wayland connection the compositor inserts itself with the `ime_bridge` flag (`ime.rs:360`, `lib.rs:328-331`) | `crates/compositor/src/ime.rs`, `osk_ime.rs` |
 | GNOME portal backend (`xdg-desktop-portal-gnome`) | Consent broker for ScreenCast, Screenshot and RemoteDesktop | Caller's bus-authenticated PID resolves to a root-owned, non-group/world-writable installed executable, and the caller currently owns `org.freedesktop.impl.portal.desktop.gnome` (`capture_security.rs:176-277`) | `crates/compositor/src/capture_security.rs` |
 | GNOME providers (Nautilus file chooser, global-shortcuts provider) | Opening an ordinary display connection, and `mutter_x11_interop` | Same installed-executable check for the requested service type only (`capture_security.rs:9-40`). Confers no capture or input authority ([service channel](portal-service-channel.md)). | `crates/compositor/src/mutter.rs:198-293`, `x11_interop.rs` |
 | Applications | Nothing beyond their own surfaces | Ordinary clients. Discovered Flatpak/Snap identity is metadata only ([service channel](portal-service-channel.md#optional-gnome-sandbox-identities-410)). | `crates/compositor/src/sandbox_identity.rs` |
@@ -152,6 +152,17 @@ refuse locked frames. Full detail and the qualification evidence:
 
 - `zwp_virtual_keyboard_manager_v1` is visible only to the compositor's IBus
   bridge (`protocols.rs:171-181`).
+- `tuna_osk_input_v1`, the on-screen keyboard's private virtual-text route
+  (#349), is visible and bindable only to the compositor's IBus bridge,
+  with the same filter (`osk_ime.rs`, `authorized`). The compositor hands
+  it text for the focused field only while that connection owns the
+  seat's input method, and takes a declined key back only for the current
+  input-method epoch and never while locked. Evidence:
+  `crates/compositor/tests/protocols.rs`
+  (`ime_bridge_globals_are_visible_only_to_the_supervised_bridge`) and
+  `crates/compositor/src/osk_ime_tests.rs`
+  (`virtual_text_is_private_even_when_an_ordinary_client_guesses_the_global`,
+  `virtual_text_is_refused_inside_a_security_context_whatever_the_bridge_flag`).
 - `zwlr_layer_shell_v1` is visible and bindable only to the supervised
   shell's connection (#1048). The compositor marks a native connection as
   the shell's when it accepts it, if the peer is the shell child it spawned
@@ -176,8 +187,9 @@ refuse locked frames. Full detail and the qualification evidence:
 - `wp_security_context_manager_v1` lets a sandbox engine (Flatpak) open a
   listener whose clients join tagged with the context (#1046). Every
   privileged global's filter (`ClientState::privileged`: virtual keyboard,
-  input method, `mutter_x11_interop`, layer-shell, the foreign toplevel
-  list) refuses such a client whatever its other state, and it sees neither
+  input method, `tuna_osk_input_v1`, `mutter_x11_interop`, layer-shell, the
+  foreign toplevel list) refuses such a client whatever its other state,
+  and it sees neither
   the session lock nor the manager itself, so it cannot nest a context.
   Evidence: `crates/compositor/tests/protocols.rs`
   (`security_context_clients_see_no_privileged_global`). A connection the

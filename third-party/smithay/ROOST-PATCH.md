@@ -119,6 +119,35 @@ an input method are still discarded by Smithay (Roost tracks them itself
 before Smithay dispatches them). The isolated diff is retained in
 TEXT-INPUT-FOCUS-API-PATCH.diff; the pinned version stays 0.7.0.
 
+Issue #349's IBus OSK route additionally changes
+src/wayland/input_method/input_method_handle.rs. The additive
+InputMethodHandle::instance_serial API returns the current input-method done
+epoch only to the client owning that instance. The compositor uses it to order
+private virtual text with the supervised bridge's existing focus stream and to
+reject stale fallback replies, without exposing another client's input state.
+Actual Wayland consumer regressions cover denied ordinary-client binding,
+mixed raw/commit ordering, and rejection across focus retirement and lock.
+The isolated diff is retained in INPUT-METHOD-EPOCH-API-PATCH.diff; the pinned
+version stays 0.7.0.
+
+Issue #349's held-delete fallback also changes `src/input/keyboard/mod.rs`
+and `src/wayland/input_method/input_method_handle.rs`. A keyboard retains a
+weak reference to its current input-method keyboard grab, registered when the
+grab receives its initial repeat information. `change_repeat_info` now sends
+live settings to that grab as well as ordinary `wl_keyboard` resources;
+`send_keymap` likewise publishes replacement keymaps and modifiers. Without
+these events the bridge could not honor repeat disabling or retire an old
+held key when the keyboard layout changed. The weak reference creates no
+ownership cycle and is replaced when a new grab is installed. Keyboard-grab
+`unset` clears the registration only when it names the retiring resource, so
+a retired grab is never rearmed and a replacement's registration survives.
+The real Wayland consumer regression
+`input_method_grab_receives_live_repeat_settings_and_usable_keymaps`
+drives the production settings consumer, receives live repeat enable/disable,
+and parses the replacement keymap to interpret the German Z key correctly.
+The isolated delta is `INPUT-METHOD-REPEAT-API-PATCH.diff`; the pinned version
+remains 0.7.0.
+
 Issue #366 changes src/wayland/session_lock/lock.rs: the lock surface's
 pre-commit hook returns early once the client destroyed the
 ext_session_lock_surface_v1 role object. After unlock_and_destroy, GTK
@@ -290,9 +319,8 @@ Permanent grab replacement also sends the retiring live IM grab
 `repeat_info(0, 0)` after releasing its state lock. Returned-key forwarding
 does not send a pause or change the live repeat rate. The consumer checks
 the actual pause event and that a later keyboard repeat-settings change
-does not rearm the retired grab. This baseline has no IM weak repeat
-registration; integrations which add one must clear only the retiring
-resource's registration, never a replacement's.
+does not rearm the retired grab. The IM weak repeat registration above is
+cleared only for the retiring resource, never a replacement's.
 
 A standard `grab_keyboard` request from the admitted current IM also
 rechecks actual seat ownership: it cannot replace a non-IM compositor grab.
