@@ -15,4 +15,20 @@ mkdir -p "$out"
 cleanup_artifacts() { find "$out" \( -type s -o -type p -o -type b -o -type c \) -delete; }
 trap cleanup_artifacts EXIT
 podman build --tag localhost/tuna-remote-reference --file "$ROOT/tests/remote-desktop-reference/Containerfile" "$ROOT/tests/remote-desktop-reference"
-podman run --rm --network=none --security-opt label=disable --volume "$ROOT:/repo:ro" --volume "$candidate:/candidate:ro" --volume "$out:/out" localhost/tuna-remote-reference /repo/tests/remote-desktop-reference/run.sh
+# The proof redirects each component to a log in the artifact directory, so a
+# failed job showed only "exit code 1" after the image build. Print the end of
+# every non-empty log, most recently written last, and keep the proof's status.
+report_failure() {
+    echo "tuna-remote-security: reference proof exited $1; ends of the logs in the remote-security artifact:" >&2
+    find "$out" -maxdepth 1 -type f -name '*.log' -size +0 -printf '%T@ %p\n' | sort -n | cut -d' ' -f2- |
+        while IFS= read -r log; do
+            echo "--- ${log##*/}" >&2
+            tail -n 40 "$log" >&2 || true
+        done
+}
+status=0
+podman run --rm --network=none --security-opt label=disable --volume "$ROOT:/repo:ro" --volume "$candidate:/candidate:ro" --volume "$out:/out" localhost/tuna-remote-reference /repo/tests/remote-desktop-reference/run.sh || status=$?
+if [ "$status" != 0 ]; then
+    report_failure "$status" || true
+    exit "$status"
+fi
