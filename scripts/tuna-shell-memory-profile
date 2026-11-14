@@ -603,9 +603,10 @@ def main():
     if not args.display or not args.artifacts:
         parser.error("--display and --artifacts are required")
     if not os.environ.get("TUNA_MEMORY_PRIVATE_BUS"):
-        os.execvpe("/usr/bin/dbus-run-session",
-                   ["dbus-run-session", "--", sys.executable, *sys.argv],
-                   dict(os.environ, TUNA_MEMORY_PRIVATE_BUS="1"))
+        # One owned session on a private bus: nothing this run starts outlives it (#1082).
+        session = str(Path(__file__).resolve().parent / "lib/tuna-proof-session")
+        os.execve(session, [session, "--bus", "--", sys.executable, *sys.argv],
+                  dict(os.environ, TUNA_MEMORY_PRIVATE_BUS="1"))
     measure(args)
 
 

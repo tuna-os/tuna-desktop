@@ -1421,8 +1421,9 @@ def main():
         parser.error(f"unknown phases: {', '.join(unknown)}")
     args.phases = [p for p in PHASES if p in args.phases]
     if not os.environ.get("TUNA_STRESS_PRIVATE_BUS"):
-        os.execvpe("dbus-run-session", ["dbus-run-session", "--", sys.executable, SELF, *sys.argv[1:]],
-                   os.environ | {"TUNA_STRESS_PRIVATE_BUS": "1"})
+        session = str(Path(SELF).resolve().parent / "lib/tuna-proof-session")
+        os.execve(session, [session, "--bus", "--", sys.executable, SELF, *sys.argv[1:]],
+                  os.environ | {"TUNA_STRESS_PRIVATE_BUS": "1"})
     stress = Stress(args)
     stress.run()
     assertions = stress.assertions

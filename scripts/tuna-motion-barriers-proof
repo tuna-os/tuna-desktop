@@ -26,8 +26,9 @@ def main():
     parser.add_argument("--bin-dir", type=Path, default=ROOT / "target/debug")
     args = parser.parse_args()
     if not os.environ.get("TUNA_MOTION_PRIVATE_BUS"):
-        os.execvpe("dbus-run-session", ["dbus-run-session", "--", sys.executable,
-                     str(Path(__file__).resolve()), *sys.argv[1:]],
+        session = str(ROOT / "scripts/lib/tuna-proof-session")
+        os.execve(session, [session, "--bus", "--", sys.executable,
+                            str(Path(__file__).resolve()), *sys.argv[1:]],
                   os.environ | {"TUNA_MOTION_PRIVATE_BUS": "1"})
     args.artifacts.mkdir(parents=True, exist_ok=True)
     processes, logs = [], []

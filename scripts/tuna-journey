@@ -24,8 +24,8 @@ set -eu
 # and the StatusNotifier watcher, so on a developer machine it would
 # otherwise pick up the host's notifications and tray items. Re-exec
 # once under a private bus when one can be started.
-if [ -z "${TUNA_JOURNEY_PRIVATE_BUS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
-    TUNA_JOURNEY_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+if [ -z "${TUNA_JOURNEY_PRIVATE_BUS:-}" ]; then
+    TUNA_JOURNEY_PRIVATE_BUS=1 exec "$(dirname -- "$0")/lib/tuna-proof-session" --bus -- "$0" "$@"
 fi
 
 unset CDPATH

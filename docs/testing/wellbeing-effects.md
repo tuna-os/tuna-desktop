@@ -81,7 +81,7 @@ accessibility creates artifacts inside the checkout:
 ```sh
 /usr/bin/python3 scripts/tests/test_wellbeing_bundle.py
 /usr/bin/python3 scripts/lib/wellbeing-pixels-tests.py
-dbus-run-session -- /usr/bin/python3 scripts/tuna-wellbeing-proof \
+/usr/bin/python3 scripts/tuna-wellbeing-proof \
   --bin-dir "$RUNNER_TEMP/native-minimize/frozen" \
   --build-receipt "$RUNNER_TEMP/native-minimize/build.json" \
   --artifacts "$RUNNER_TEMP/native-wellbeing" --display :111

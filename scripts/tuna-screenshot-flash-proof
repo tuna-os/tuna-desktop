@@ -5,8 +5,10 @@ The screenshot caller is a supervised proof fixture, not the GTK UI.
 Production admission still authenticates its exact supervised PID. Output
 pixels come from Xvfb; saved PNG comes from production offscreen capture.
 """
-import argparse,hashlib,json,os,select,signal,subprocess,time
+import argparse,hashlib,json,os,select,signal,subprocess,sys,time
 from pathlib import Path
+if not os.environ.get('TUNA_PROOF_SESSION'):  # one owned session: nothing outlives the proof (#1082)
+    session=str(Path(__file__).resolve().parent/'lib'/'tuna-proof-session');os.execv(session,[session,'--',sys.executable,*sys.argv])
 from PIL import Image
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--bundle',type=Path,required=True);p.add_argument('--artifacts',type=Path,required=True)

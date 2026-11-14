@@ -35,7 +35,7 @@ SERVICE
     TUNA_PROOF_PRIVATE_BUS=1
     export XDG_DATA_DIRS TUNA_PROOF_PRIVATE_BUS
     status=0
-    dbus-run-session -- "$0" "$@" || status=$?
+    "$(dirname -- "$0")/lib/tuna-proof-session" --bus -- "$0" "$@" || status=$?
     rm -rf "$services"
     exit "$status"
 fi
