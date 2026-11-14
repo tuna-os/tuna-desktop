@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""CI-only root probes for V-PICKER and V-INTROSPECT (reached through tuna-vm-lifecycle).
+
+Every action prints one JSON object. Clients run as the fixture session's
+own user with the session's real Wayland/X11 displays and session bus; this
+probe only launches them, arms them and reads their state files, Mutter's
+DisplayConfig, the compositor's own state snapshot and xdg-desktop-portal-gnome.
+It never synthesizes input: the lane sends real keyboard and pointer input
+through QEMU.
+"""
+import json
+import os
+import pathlib
+import pwd
+import re
+import signal
+import subprocess
+import sys
+import time
+
+OWNER = pwd.getpwnam("tuna-test")
+RUNTIME = pathlib.Path(f"/run/user/{OWNER.pw_uid}")
+SCENE = RUNTIME / "tuna-vm-state.json"
+PICKER = "/usr/libexec/tuna-vm-picker"
+WATCH = "/usr/libexec/tuna-vm-introspect-watch"
+SANDBOX_CLIENT = "/usr/libexec/tuna-vm-sandbox-client"
+SANDBOX_APP = "org.tuna.VmSandbox"
+FLATPAK_REPO = "/usr/share/tuna-vm/flatpak-repo"
+NONCE = re.compile(r"[0-9a-f]{16}")
+
+
+def nonce(value):
+    if not NONCE.fullmatch(value):
+        raise ValueError("invalid nonce")
+    return value
+
+
+def user_env():
+    """The live session's environment as systemd --user holds it."""
+    text = subprocess.run(["runuser", "-u", OWNER.pw_name, "--", "env", f"XDG_RUNTIME_DIR={RUNTIME}",
+                           f"DBUS_SESSION_BUS_ADDRESS=unix:path={RUNTIME}/bus",
+                           "systemctl", "--user", "show-environment"],
+                          capture_output=True, text=True, timeout=10, check=True).stdout
+    env = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+    result = {key: env[key] for key in ("WAYLAND_DISPLAY", "DISPLAY") if env.get(key)}
+    if "DISPLAY" not in result:
+        # Xwayland starts on demand: the compositor reserves the X socket at
+        # startup but publishes DISPLAY only once the first X11 client made
+        # Xwayland ready. Use the session user's own reserved socket.
+        owned = sorted(p.name[1:] for p in pathlib.Path("/tmp/.X11-unix").glob("X*")
+                       if p.name[1:].isdigit() and p.lstat().st_uid == OWNER.pw_uid)
+        if len(owned) == 1:
+            result["DISPLAY"] = f":{owned[0]}"
+    return result
+
+
+def as_user(*command, extra=(), check=True, timeout=15):
+    env = user_env()
+    base = ["runuser", "-u", OWNER.pw_name, "--", "env", f"XDG_RUNTIME_DIR={RUNTIME}",
+            f"DBUS_SESSION_BUS_ADDRESS=unix:path={RUNTIME}/bus", f"HOME={OWNER.pw_dir}",
+            *(f"{k}={v}" for k, v in env.items()), *extra]
+    return subprocess.run([*base, *command], capture_output=True, text=True,
+                          timeout=timeout, check=check)
+
+
+def spawn_user(*command, extra=()):
+    env = user_env()
+    return subprocess.Popen(["runuser", "-u", OWNER.pw_name, "--", "env", f"XDG_RUNTIME_DIR={RUNTIME}",
+                             f"DBUS_SESSION_BUS_ADDRESS=unix:path={RUNTIME}/bus", f"HOME={OWNER.pw_dir}",
+                             *(f"{k}={v}" for k, v in env.items()), *extra, *command],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True).pid
+
+
+def scene():
+    state = json.loads(SCENE.read_text())
+    return {key: state.get(key) for key in ("focused", "windows", "locked", "stacking", "display_config")}
+
+
+def owned_json(path):
+    info = path.lstat()
+    if info.st_uid != OWNER.pw_uid or not path.is_file() or info.st_mode & 0o077:
+        raise RuntimeError(f"{path.name} is not the session user's private file")
+    return json.loads(path.read_text())
+
+
+def client_pid(pid, executable_name):
+    """The live process, owned by the session user, running this executable."""
+    proc = pathlib.Path(f"/proc/{pid}")
+    if proc.stat().st_uid != OWNER.pw_uid:
+        raise RuntimeError("client is not owned by the session user")
+    cmdline = (proc / "cmdline").read_bytes().split(b"\0")
+    if not any(part.endswith(executable_name.encode()) for part in cmdline):
+        raise RuntimeError("client process changed")
+    return pid
+
+
+def wait_for(predicate, timeout, message):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.1)
+    raise RuntimeError(message)
+
+
+def picker_state_path(role, key):
+    return RUNTIME / f"tuna-vm-picker-{role}-{key}.json"
+
+
+def picker_window(client, current):
+    if not client.get("mapped"):
+        return None
+    if client["role"] == "x11":
+        windows = [w for w in current["windows"] if client.get("xid") and w.get("x11_window_id") == client["xid"]]
+    else:
+        windows = [w for w in current["windows"] if w.get("app_id") == client["app_id"]
+                   and w.get("x11_window_id") is None]
+    return windows[0] if len(windows) == 1 else None
+
+
+def picker(action, role, key):
+    if role not in ("x11", "wayland", "bystander"):
+        raise ValueError("unknown picker role")
+    path = picker_state_path(role, nonce(key))
+    if action == "start":
+        if path.exists():
+            raise RuntimeError("picker fixture already exists")
+        extra = ("GDK_BACKEND=x11",) if role == "x11" else ("GDK_BACKEND=wayland",)
+        spawn_user(PICKER, role, key, extra=extra)
+
+        def ready():
+            if not path.exists():
+                return None
+            client = owned_json(path)
+            current = scene()
+            window = picker_window(client, current)
+            if (window is None or (role != "bystander" and not client.get("handle"))
+                    or current["focused"] != window["id"]):
+                return None
+            return {"client": client, "window": window, "scene": current}
+        return wait_for(ready, 40, f"{role} picker caller did not map, take focus and publish its handle")
+    client = owned_json(path)
+    client_pid(client["pid"], "tuna-vm-picker")
+    if action == "state":
+        current = scene()
+        return {"client": client, "window": picker_window(client, current), "scene": current}
+    if action == "arm":
+        method, token = sys.argv[4], sys.argv[5]
+        if method not in ("OpenFile", "SaveFile") or not re.fullmatch(r"[a-z0-9]{1,32}", token):
+            raise ValueError("unknown picker request")
+        command = {"method": method, "token": token, "name": f"tuna-vm-picker-{token}.txt"}
+        target = pathlib.Path(OWNER.pw_dir, command["name"])
+        if target.exists():
+            raise RuntimeError("picker file already exists")
+        if method == "OpenFile":
+            # The file the user then selects in Nautilus, the session user's own.
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as stream:
+                stream.write(f"tuna-vm-picker open {token}\n")
+            os.chown(target, OWNER.pw_uid, OWNER.pw_gid)
+        command_path = path.with_suffix(".cmd")
+        fd = os.open(command_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(command, stream)
+        os.chown(command_path, OWNER.pw_uid, OWNER.pw_gid)
+        return {"armed": command, "destination": str(target)}
+    if action == "file":
+        token = sys.argv[4]
+        if not re.fullmatch(r"[a-z0-9]{1,32}", token):
+            raise ValueError("invalid token")
+        target = pathlib.Path(OWNER.pw_dir, f"tuna-vm-picker-{token}.txt")
+        info = target.stat() if target.exists() else None
+        return {"path": str(target), "exists": info is not None,
+                "owner_uid": info.st_uid if info else None,
+                "content": target.read_text() if info else None}
+    if action == "stop":
+        os.kill(client["pid"], signal.SIGTERM)
+        wait_for(lambda: not pathlib.Path(f"/proc/{client['pid']}").exists(), 10, "picker client did not exit")
+        path.unlink()
+        return {"stopped": client["pid"]}
+    raise ValueError("unknown picker action")
+
+
+def introspect(action, key):
+    path = RUNTIME / f"tuna-vm-introspect-{nonce(key)}.json"
+    if action == "start":
+        if path.exists():
+            raise RuntimeError("introspect watcher already exists")
+        spawn_user(WATCH, key)
+        return wait_for(lambda: path.exists() and owned_json(path).get("initial") and owned_json(path),
+                        20, "Introspect watcher did not read ScreenSize")
+    value = owned_json(path)
+    client_pid(value["pid"], "tuna-vm-introspect-watch")
+    if action == "state":
+        return value
+    if action == "stop":
+        os.kill(value["pid"], signal.SIGTERM)
+        path.unlink()
+        return {"stopped": value["pid"]}
+    raise ValueError("unknown introspect action")
+
+
+def user_rotate(connector, transform):
+    """Mutter's ApplyMonitorsConfig (temporary) with one monitor's transform changed."""
+    from gi.repository import Gio, GLib
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    dest = ("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig", "org.gnome.Mutter.DisplayConfig")
+    serial, monitors, logical, _ = bus.call_sync(*dest, "GetCurrentState", None, None,
+                                                 Gio.DBusCallFlags.NONE, 5000, None).unpack()
+    current_mode = {}
+    for (name, *_), modes, _props in monitors:
+        for mode in modes:
+            if mode[6].get("is-current"):
+                current_mode[name] = mode[0]
+    config = []
+    for x, y, scale, old_transform, primary, mons, _ in logical:
+        names = [m[0] for m in mons]
+        new = transform if connector in names else old_transform
+        config.append((x, y, scale, new, primary, [(n, current_mode[n], {}) for n in names]))
+    bus.call_sync(*dest, "ApplyMonitorsConfig",
+                  GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})", (serial, 1, config, {})),
+                  None, Gio.DBusCallFlags.NONE, 10000, None)
+    return {"applied": connector, "transform": transform}
+
+
+def flatpak(action):
+    if action == "install":
+        subprocess.run(["flatpak", "remote-add", "--system", "--if-not-exists", "--no-gpg-verify",
+                        "tuna-vm", f"file://{FLATPAK_REPO}"], check=True, capture_output=True, timeout=60)
+        subprocess.run(["flatpak", "install", "--system", "-y", "--noninteractive", "tuna-vm", SANDBOX_APP],
+                       check=True, capture_output=True, timeout=300)
+        # `flatpak info`'s summary view aborts on this minimal app (flatpak
+        # flatpak-main.c flatpak_run assertion); the metadata view is checked.
+        info = subprocess.run(["flatpak", "info", "--system", "--show-metadata", SANDBOX_APP], check=True,
+                              capture_output=True, text=True, timeout=30).stdout
+        return {"installed": SANDBOX_APP, "metadata": info.splitlines()[:12]}
+    if action in ("sandboxed", "forged"):
+        command = (["flatpak", "run", SANDBOX_APP, SANDBOX_APP] if action == "sandboxed"
+                   else [SANDBOX_CLIENT, SANDBOX_APP])
+        pid = spawn_user(*command)
+        return {"launcher": pid, "action": action}
+    if action == "stop":
+        stopped = subprocess.run(["pkill", "-u", str(OWNER.pw_uid), "-f", "tuna-vm-sandbox-client"],
+                                 capture_output=True, timeout=10).returncode
+        return {"pkill": stopped}
+    if action == "processes":
+        rows = []
+        for proc in pathlib.Path("/proc").iterdir():
+            if not proc.name.isdigit():
+                continue
+            try:
+                if proc.stat().st_uid != OWNER.pw_uid:
+                    continue
+                if pathlib.Path(os.readlink(proc / "exe")).name != "tuna-vm-sandbox-client":
+                    continue
+                info = (proc / "root/.flatpak-info")
+                rows.append({"pid": int(proc.name), "flatpak_info": info.exists()})
+            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+                continue
+        return {"clients": rows}
+    raise ValueError("unknown flatpak action")
+
+
+DRM_UEVENTS = pathlib.Path("/run/tuna-vm-drm-uevents.log")
+
+
+def drm(action):
+    """Guest-side evidence for a virtio-gpu scanout plug: every DRM connector's
+    sysfs status/enabled/modes, and the kernel DRM uevents seen since `watch`
+    (HOTPLUG=1 changes), so a missing output is attributable to QEMU/kernel or
+    to the compositor."""
+    if action == "watch":
+        log = DRM_UEVENTS.open("w")
+        # Bounded: the boot step's own timeout reaps it at the latest.
+        subprocess.Popen(["timeout", "600", "udevadm", "monitor", "--kernel", "--property",
+                          "--subsystem-match=drm"], stdout=log, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+        return {"watching": str(DRM_UEVENTS)}
+    if action != "state":
+        raise ValueError("unknown drm action")
+    connectors = {}
+    for path in sorted(pathlib.Path("/sys/class/drm").glob("card*-*")):
+        def attr(name):
+            try:
+                return (path / name).read_text().strip()
+            except OSError:
+                return None
+        modes = attr("modes")
+        connectors[path.name] = {"status": attr("status"), "enabled": attr("enabled"),
+                                 "modes": modes.splitlines()[:4] if modes else []}
+    try:
+        uevents = DRM_UEVENTS.read_text()[-4000:]
+    except OSError:
+        uevents = None
+    return {"connectors": connectors, "uevents": uevents,
+            "hotplug_uevents": uevents.count("HOTPLUG=1") if uevents else 0}
+
+
+def background_state():
+    """xdg-desktop-portal-gnome's Background.GetAppState: built from Introspect
+    GetRunningApplications' sandboxed-app-id (xdg-desktop-portal-gnome 51
+    src/background.c get_app_state)."""
+    out = as_user("gdbus", "call", "--session", "--dest", "org.freedesktop.impl.portal.desktop.gnome",
+                  "--object-path", "/org/freedesktop/portal/desktop",
+                  "--method", "org.freedesktop.impl.portal.Background.GetAppState", timeout=30)
+    text = out.stdout.strip()
+    apps = dict(re.findall(r"'([^']+)': <uint32 (\d+)>", text))
+    return {"raw": text[:2000], "apps": {k: int(v) for k, v in apps.items()}}
+
+
+def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "user-rotate":
+        print(json.dumps(user_rotate(sys.argv[2], int(sys.argv[3]))))
+        return
+    if os.geteuid() != 0 or OWNER.pw_uid == 0:
+        raise RuntimeError("probe must be root and session owner must not be root")
+    action = sys.argv[1]
+    if action == "app-env":
+        result = {"env": user_env(), "scene": scene()}
+    elif action.startswith("app-picker-"):
+        result = picker(action.removeprefix("app-picker-"), sys.argv[2], sys.argv[3])
+    elif action.startswith("app-introspect-"):
+        result = introspect(action.removeprefix("app-introspect-"), sys.argv[2])
+    elif action == "app-rotate":
+        connector, transform = sys.argv[2], int(sys.argv[3])
+        if not re.fullmatch(r"[A-Za-z0-9-]{1,32}", connector) or transform not in range(8):
+            raise ValueError("invalid rotation")
+        result = json.loads(as_user(sys.executable, __file__, "user-rotate", connector, str(transform)).stdout)
+    elif action.startswith("app-flatpak-"):
+        result = flatpak(action.removeprefix("app-flatpak-"))
+    elif action.startswith("app-drm-"):
+        result = drm(action.removeprefix("app-drm-"))
+    elif action == "app-background":
+        result = background_state()
+    elif action == "app-scene":
+        result = scene()
+    else:
+        raise ValueError("unknown app-integration action")
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:  # one bounded line for the lane's record, no traceback
+        print(json.dumps({"app_error": f"{type(error).__name__}: {error}"[:600]}))

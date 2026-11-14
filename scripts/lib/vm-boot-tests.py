@@ -4168,10 +4168,13 @@ class FixtureLoginSession(unittest.TestCase):
         helpers = set(re.findall(r'"(/usr/libexec/[^"]+)"', self.fixture("tuna-vm-lifecycle")))
         # The GDM trace serves only the current build's --fresh-accounts boot;
         # the bounded soak runs only on the published image; the native-session
-        # modules (#1003) serve only the current build's `autotz` profile.
+        # modules (#1003) serve only the current build's `autotz` profile; the
+        # app-integration helper serves only the current build's
+        # --app-integration boot (the lane refuses it with --published).
         unused = {"Containerfile": {"/usr/libexec/tuna-soak/tuna-vm-soak"},
                   "Containerfile.published": {"/usr/libexec/tuna-vm-gdm-trace",
-                                              "/usr/libexec/tuna-native-session"}}
+                                              "/usr/libexec/tuna-native-session",
+                                              "/usr/libexec/tuna-vm-app-integration"}}
         # Orca's token-gated test presenter (orca-speech-trigger) reads the
         # runtime token this user environment generator writes.
         generator = "/usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token"

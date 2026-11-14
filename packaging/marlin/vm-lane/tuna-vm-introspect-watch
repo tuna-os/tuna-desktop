@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""CI-only GNOME Introspect ScreenSize subscriber (V-INTROSPECT).
+
+  tuna-vm-introspect-watch NONCE
+
+Subscribes to org.freedesktop.DBus.Properties.PropertiesChanged on
+org.gnome.Shell.Introspect before reading ScreenSize, so no change between
+the read and the subscription is lost. Records the initial value and every
+ScreenSize notification, each with Mutter's DisplayConfig.GetCurrentState
+taken when it arrived, in a 0600 state file in the runtime directory.
+"""
+import json
+import os
+import pathlib
+import re
+import sys
+import time
+
+from gi.repository import Gio, GLib
+
+NONCE = sys.argv[1]
+if not re.fullmatch(r"[0-9a-f]{16}", NONCE):
+    raise SystemExit("usage: tuna-vm-introspect-watch NONCE")
+STATE = pathlib.Path(os.environ["XDG_RUNTIME_DIR"]) / f"tuna-vm-introspect-{NONCE}.json"
+INTROSPECT = ("org.gnome.Shell.Introspect", "/org/gnome/Shell/Introspect", "org.gnome.Shell.Introspect")
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+state = {"pid": os.getpid(), "initial": None, "changes": [], "errors": []}
+
+
+def publish():
+    temporary = STATE.with_suffix(".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        json.dump(state, stream)
+    temporary.replace(STATE)
+
+
+def layout():
+    """Logical monitors as Mutter reports them: (x, y, scale, transform, [w, h] mode)."""
+    serial, monitors, logical, _ = bus.call_sync(
+        "org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+        "org.gnome.Mutter.DisplayConfig", "GetCurrentState", None, None,
+        Gio.DBusCallFlags.NONE, 5000, None).unpack()
+    modes = {}
+    for (connector, *_), mode_list, _props in monitors:
+        for mode in mode_list:
+            if mode[6].get("is-current"):
+                modes[connector] = [mode[1], mode[2]]
+    return {"serial": serial, "logical": [
+        {"x": x, "y": y, "scale": scale, "transform": transform, "primary": primary,
+         "monitors": [m[0] for m in mons], "mode": modes.get(mons[0][0]) if mons else None}
+        for x, y, scale, transform, primary, mons, _ in logical]}
+
+
+def changed(_conn, _sender, _path, _iface, _signal, params, _data):
+    interface, values, _invalidated = params.unpack()
+    if interface != INTROSPECT[2] or "ScreenSize" not in values:
+        return
+    record = {"size": list(values["ScreenSize"]), "monotonic_ns": time.monotonic_ns()}
+    try:
+        record["layout"] = layout()
+    except GLib.Error as error:
+        record["layout_error"] = error.message
+    state["changes"].append(record)
+    publish()
+
+
+bus.signal_subscribe(INTROSPECT[0], "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                     INTROSPECT[1], None, Gio.DBusSignalFlags.NONE, changed, None)
+size, = bus.call_sync(INTROSPECT[0], INTROSPECT[1], "org.freedesktop.DBus.Properties", "Get",
+                      GLib.Variant("(ss)", (INTROSPECT[2], "ScreenSize")), None,
+                      Gio.DBusCallFlags.NONE, 5000, None).unpack()
+state["initial"] = {"size": list(size), "layout": layout()}
+publish()
+GLib.MainLoop().run()

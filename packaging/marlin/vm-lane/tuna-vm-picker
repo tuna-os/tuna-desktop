@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""CI-only GTK caller for the installed GNOME file chooser (V-PICKER).
+
+  tuna-vm-picker ROLE NONCE
+
+ROLE is `x11` or `wayland` (a caller that opens the GNOME FileChooser
+portal through its own parent handle) or `bystander` (an unrelated app that
+only counts input). The window is one large button. Every real button
+release and key press it receives is counted. A caller opens the portal on a
+release only when the root probe armed it through the command file. The
+probe then never sees a click it caused itself. The state file (mode 0600, in
+the session's runtime directory) holds counts, the parent handle, the GTK
+allocation and every portal response; nothing else leaves the process.
+"""
+import json
+import os
+import pathlib
+import re
+import sys
+import time
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+# The backend typelib must load before GTK creates its first surface, or
+# PyGObject wraps that surface without the backend's methods.
+gi.require_version("GdkWayland" if sys.argv[1:2] != ["x11"] else "GdkX11", "4.0")
+from gi.repository import Gio, GLib, Gtk  # noqa: E402
+if sys.argv[1:2] == ["x11"]:
+    from gi.repository import GdkX11  # noqa: E402
+else:
+    from gi.repository import GdkWayland  # noqa: E402,F401
+
+ROLE, NONCE = sys.argv[1], sys.argv[2]
+if ROLE not in ("x11", "wayland", "bystander") or not re.fullmatch(r"[0-9a-f]{16}", NONCE):
+    raise SystemExit("usage: tuna-vm-picker x11|wayland|bystander NONCE")
+RUNTIME = pathlib.Path(os.environ["XDG_RUNTIME_DIR"])
+STATE = RUNTIME / f"tuna-vm-picker-{ROLE}-{NONCE}.json"
+COMMAND = RUNTIME / f"tuna-vm-picker-{ROLE}-{NONCE}.cmd"
+APP_ID = f"org.tuna.VmPicker.{ROLE.capitalize()}.n{NONCE}"
+# What GNOME apps ask for; #422 requires the allocation to honour it.
+SIZE = (1100, 700) if ROLE != "bystander" else (640, 420)
+
+state = {"role": ROLE, "nonce": NONCE, "pid": os.getpid(), "uid": os.getuid(),
+         "app_id": APP_ID, "mapped": False, "active": False, "allocation": [0, 0],
+         "button_allocation": [0, 0], "xid": None, "handle": None,
+         "clicks": 0, "keys": 0, "requests": [], "responses": [], "errors": []}
+
+
+def publish():
+    temporary = STATE.with_suffix(".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        json.dump(state, stream)
+    temporary.replace(STATE)
+
+
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+sender = bus.get_unique_name()[1:].replace(".", "_")
+
+
+def on_response(_conn, _sender, path, _iface, _signal, params, _data):
+    code, results = params.unpack()
+    pending = [r for r in state["requests"] if r["path"] == path]
+    if not pending:
+        return  # another client's request on the shared bus
+    uris = list(results.get("uris", []))
+    record = {"path": path, "response": code, "uris": uris,
+              "monotonic_ns": time.monotonic_ns()}
+    for uri in uris:
+        # A granted SaveFile destination is written by the app itself,
+        # as any portal caller would; the probe checks it independently.
+        if code == 0 and uri.startswith("file://"):
+            target = pathlib.Path(GLib.filename_from_uri(uri)[0])
+            if pending[0]["method"] == "SaveFile":
+                target.write_text(f"tuna-vm-picker {NONCE} {pending[0]['token']}\n")
+                record["written"] = str(target)
+    state["responses"].append(record)
+    publish()
+
+
+bus.signal_subscribe("org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request",
+                     "Response", None, None, Gio.DBusSignalFlags.NONE, on_response, None)
+
+
+def open_portal(command):
+    method, token = command["method"], command["token"]
+    if method not in ("OpenFile", "SaveFile") or not re.fullmatch(r"[a-z0-9]{1,32}", token):
+        raise ValueError("unknown picker command")
+    path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    options = {"handle_token": GLib.Variant("s", token)}
+    if method == "SaveFile":
+        options["current_name"] = GLib.Variant("s", command["name"])
+        options["current_folder"] = GLib.Variant("ay", os.fsencode(str(pathlib.Path.home())) + b"\0")
+    state["requests"].append({"method": method, "token": token, "path": path,
+                              "handle": state["handle"], "monotonic_ns": time.monotonic_ns()})
+    publish()
+
+    def done(source, result):
+        try:
+            returned, = source.call_finish(result).unpack()
+            if returned != path:
+                state["errors"].append(f"portal returned {returned}, expected {path}")
+        except GLib.Error as error:
+            state["errors"].append(error.message)
+        publish()
+
+    bus.call("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+             "org.freedesktop.portal.FileChooser", method,
+             GLib.Variant("(ssa{sv})", (state["handle"], f"Tuna VM {method} {token}", options)),
+             None, Gio.DBusCallFlags.NONE, 10000, None, done)
+
+
+def released(*_):
+    state["clicks"] += 1
+    publish()
+    if ROLE == "bystander" or not COMMAND.exists():
+        return
+    command = json.loads(COMMAND.read_text())
+    COMMAND.unlink()
+    try:
+        open_portal(command)
+    except (ValueError, KeyError) as error:
+        state["errors"].append(str(error))
+        publish()
+
+
+def key_pressed(*_):
+    state["keys"] += 1
+    publish()
+    return False
+
+
+def activate(app):
+    window = Gtk.ApplicationWindow(application=app, title=f"Tuna VM picker {ROLE}")
+    window.set_default_size(*SIZE)
+    button = Gtk.Button(label=f"Tuna VM picker {ROLE}")
+    button.set_hexpand(True)
+    button.set_vexpand(True)
+    # Capture phase: every real release/press is counted before the
+    # button's own click gesture claims the sequence.
+    click = Gtk.GestureClick()
+    click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    click.connect("released", released)
+    window.add_controller(click)
+    keys = Gtk.EventControllerKey()
+    keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    keys.connect("key-pressed", key_pressed)
+    window.add_controller(keys)
+    window.set_child(button)
+
+    def mapped(*_):
+        surface = window.get_surface()
+        if ROLE == "x11":
+            state["xid"] = GdkX11.X11Surface.get_xid(surface)
+            state["handle"] = "x11:" + format(state["xid"], "x")
+        elif ROLE == "wayland":
+            def exported(_surface, handle, *_data):
+                state["handle"] = "wayland:" + handle
+                publish()
+            if not surface.export_handle(exported, None):
+                state["errors"].append("GTK refused to export the Wayland parent")
+        state["mapped"] = True
+        publish()
+
+    def tick(*_):
+        allocation = [window.get_width(), window.get_height()]
+        button_allocation = [button.get_width(), button.get_height()]
+        active = window.is_active()
+        if (allocation, button_allocation, active) != (state["allocation"], state["button_allocation"], state["active"]):
+            state.update(allocation=allocation, button_allocation=button_allocation, active=active)
+            publish()
+        return GLib.SOURCE_CONTINUE
+
+    window.connect("map", mapped)
+    GLib.timeout_add(50, tick)
+    window.present()
+
+
+if ROLE == "x11":
+    os.environ["GDK_BACKEND"] = "x11"
+publish()
+# The application ID is the Wayland app_id GTK sends (and the X11 WM_CLASS).
+application = Gtk.Application(application_id=APP_ID, flags=Gio.ApplicationFlags.NON_UNIQUE)
+application.connect("activate", activate)
+application.run([])
