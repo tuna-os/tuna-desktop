@@ -39,6 +39,18 @@ The phases and roles are listed in the
 [perf README's regression gate section](perf/README.md#regression-gate-315).
 Growth (soak) budgets are tracked in #315.
 
+`scripts/tuna-shell-memory-profile --display :5N --artifacts DIR` replays the
+gate's workload in a nested session with real X input and records, for the
+shell and the compositor after every phase, `Pss`, `Pss_Anon`, `Pss_File`,
+`Pss_Shmem`, `Private_Dirty` and `AnonHugePages` plus heap, arena and anonymous
+totals from `smaps` (`--summarize DIR --against DIR` compares two runs). Read
+`Pss_Anon` and `Pss_Shmem`: `Pss_File` moves with whatever else on the host
+maps the same libraries. `--thp collapsed` gives the session transparent huge
+pages as `transparent_hugepage/enabled=always` does on the perf image (most
+development hosts keep `madvise`), which is where a sparse heap shows as
+resident memory; `--trim` reports how much of the shell's heap is freed but
+retained.
+
 ## Local CPU profiling
 
 ### Build with symbols and frame pointers
