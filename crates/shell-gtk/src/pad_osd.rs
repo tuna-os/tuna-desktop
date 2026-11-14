@@ -473,7 +473,8 @@ fn element_bounds(
     id: &str,
 ) -> Option<Rect> {
     if let Some(node) = tree.node_by_id(id) {
-        let r = node.abs_stroke_bounding_box();
+        // usvg 0.50: an element that draws nothing has no extents.
+        let r = node.abs_stroke_bounding_box()?;
         return Some(Rect {
             x: f64::from(r.x()),
             y: f64::from(r.y()),

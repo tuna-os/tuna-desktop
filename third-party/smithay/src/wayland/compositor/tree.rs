@@ -415,8 +415,13 @@ impl PrivateSurfaceData {
 
     /// Reorders a surface relative to one of its sibling
     ///
-    /// Fails if `relative_to` is not a sibling or parent of `surface`.
+    /// Fails if `relative_to` is not a distinct sibling or parent of `surface`.
     pub fn reorder(surface: &WlSurface, to: Location, relative_to: &WlSurface) -> Result<(), ()> {
+        // Mutter's is_sibling excludes the surface itself. Removing it
+        // before calculating its own placement would invalidate the index.
+        if surface.id() == relative_to.id() {
+            return Err(());
+        }
         let parent = Self::get_parent(surface).ok_or(())?;
 
         fn index_of(surface: &WlSurface, slice: &[WlSurface]) -> Option<usize> {
@@ -429,7 +434,7 @@ impl PrivateSurfaceData {
         }
 
         let mut parent_guard = Self::lock_user_data(&parent);
-        let my_index = index_of(surface, &parent_guard.children).unwrap();
+        let my_index = index_of(surface, &parent_guard.children).ok_or(())?;
         let mut other_index = match index_of(relative_to, &parent_guard.children) {
             Some(idx) => idx,
             None => return Err(()),

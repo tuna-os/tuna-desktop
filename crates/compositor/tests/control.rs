@@ -877,3 +877,146 @@ fn accelerator_release_and_typed_grabs_require_minor38() {
         }
     }
 }
+
+/// The close dialog over a hung window (#1035): broadcast to live shells,
+/// replayed to a shell that (re)connects while it is shown, gone once
+/// hidden, and never sent to a peer older than 0.50.
+#[test]
+fn hub_replays_shown_close_dialogs_to_newcomers_and_gates_minor50() {
+    let show = Message::ShowCloseDialog {
+        window: 7,
+        app_id: Some("org.gnome.TextEditor".into()),
+        connector: None,
+        x: 0,
+        y: 32,
+        width: 800,
+        height: 600,
+    };
+    let hide = Message::HideCloseDialog { window: 7 };
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub =
+        ControlHub::bind(path.clone(), std::rc::Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = StateModel::new();
+    let mut client = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut client);
+    hub.queue_message(show.clone());
+    hub.poll(&mut model);
+    assert_eq!(client_read(&mut client), show);
+
+    let mut newcomer = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut newcomer);
+    assert_eq!(client_read(&mut newcomer), show);
+
+    hub.queue_message(hide.clone());
+    hub.poll(&mut model);
+    for client in [&mut client, &mut newcomer] {
+        assert_eq!(client_read(client), hide);
+    }
+    let mut late = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut late);
+    late.set_nonblocking(true).unwrap();
+    let mut prefix = [0u8; 4];
+    match late.read_exact(&mut prefix) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("a hidden dialog is not replayed, got {other:?}"),
+    }
+
+    let (conn, mut old) = pair();
+    client_write(
+        &mut old,
+        &Message::Hello {
+            version: ProtocolVersion::new(CURRENT_VERSION.major, 49),
+        },
+    );
+    let mut session = Session::handshake(conn, &StateModel::new()).unwrap();
+    assert!(matches!(client_read(&mut old), Message::Hello { .. }));
+    assert!(matches!(client_read(&mut old), Message::Snapshot { .. }));
+    session.send_window_menu(&show).unwrap();
+    session.send_window_menu(&hide).unwrap();
+    session.send_overview(true).unwrap();
+    assert_eq!(client_read(&mut old), Message::Overview { open: true });
+}
+
+/// Force Quit and Wait reach the window manager for a known window only.
+#[test]
+fn close_dialog_answers_reach_the_hub_outcome_for_known_windows() {
+    use tuna_shell_control::CloseDialogResponse;
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub =
+        ControlHub::bind(path.clone(), std::rc::Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = StateModel::new();
+    let window = model.insert("editor", Some("org.gnome.TextEditor"), 1);
+    let mut client = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut client);
+    for (id, target, response, applied) in [
+        (1, window, CloseDialogResponse::ForceClose, true),
+        (2, window + 1000, CloseDialogResponse::Wait, false),
+        (3, window, CloseDialogResponse::Wait, true),
+    ] {
+        client_write(
+            &mut client,
+            &Message::Command {
+                id,
+                kind: CommandKind::RespondCloseDialog {
+                    window: target,
+                    response,
+                },
+            },
+        );
+        let outcome = hub.poll(&mut model);
+        let expected = if applied {
+            vec![(target, response)]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(outcome.close_dialog_responses, expected);
+        let Message::CommandResult { id: reply, status } = client_read(&mut client) else {
+            panic!("expected command result");
+        };
+        assert_eq!(reply, id);
+        assert_eq!(matches!(status, CommandStatus::Applied), applied);
+    }
+}
+
+/// #503: a hub round reports whether anything arrived on its sockets, so
+/// the runtime's idle tick can tell a round that read something (which may
+/// change what is drawn) from one that only looked.
+#[test]
+fn hub_round_reports_whether_anything_arrived_on_its_sockets() {
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub =
+        ControlHub::bind(path.clone(), std::rc::Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = StateModel::new();
+    assert!(!hub.poll(&mut model).received, "nobody is connected");
+
+    let mut client = hub_client(&path);
+    assert!(hub.poll(&mut model).received, "a peer connected");
+    client_write(&mut client, &hello_current());
+    assert!(hub.poll(&mut model).received, "its handshake was due");
+    assert!(matches!(client_read(&mut client), Message::Hello { .. }));
+    assert!(matches!(client_read(&mut client), Message::Snapshot { .. }));
+    assert!(matches!(client_read(&mut client), Message::Overview { .. }));
+    for _ in 0..3 {
+        assert!(
+            !hub.poll(&mut model).received,
+            "a silent session is not an arrival"
+        );
+    }
+
+    client_write(
+        &mut client,
+        &Message::Command {
+            id: 1,
+            kind: CommandKind::ToggleOverview,
+        },
+    );
+    assert!(hub.poll(&mut model).received, "a command frame was read");
+    assert!(!hub.poll(&mut model).received, "and only once");
+
+    drop(client);
+    assert!(hub.poll(&mut model).received, "the hang-up was read");
+    assert!(!hub.poll(&mut model).received);
+}

@@ -1,7 +1,7 @@
 //! T1 nested runtime loop + launch tests.
 //!
 //! Covers `tuna_compositor::runtime` without window mapping or input
-//! (T2 scope): env hygiene, default session identity, and a live launch
+//! (T2 scope): default session identity and a live launch
 //! smoke test that skips cleanly when no host display/EGL exists.
 //!
 //! Conventions follow the sibling harnesses (`handshake.rs`,
@@ -12,21 +12,15 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tuna_compositor::runtime::{apply_nested_env, restore_env, NestedSession};
+use tuna_compositor::runtime::NestedSession;
 
 const RETRY_ROUNDS: usize = 500;
 const RETRY_SLEEP: Duration = Duration::from_millis(5);
 
-/// Path of the sibling `tuna-compositor` binary: the test executable lives
-/// in `target/<profile>/deps/`, the binary in `target/<profile>/`.
-fn compositor_bin() -> std::path::PathBuf {
-    let mut dir = std::env::current_exe().expect("test executable path");
-    dir.pop();
-    if dir.file_name().is_some_and(|n| n == "deps") {
-        dir.pop();
-    }
-    dir.join("tuna-compositor")
-}
+/// The `tuna-compositor` binary Cargo built for this integration test. Its
+/// location relative to the test executable is not stable across Cargo
+/// releases (1.100 moved test executables into the build directory).
+const COMPOSITOR_BIN: &str = env!("CARGO_BIN_EXE_tuna-compositor");
 
 /// Keep real child launches independent of the invoking user's migration state.
 /// Retain the owner until the child exits so its private roots remain available.
@@ -51,49 +45,6 @@ fn private_launch_env(command: &mut Command) -> tempfile::TempDir {
         command.env(key, path);
     }
     root
-}
-
-/// Env hygiene in ONE test, run sequentially: process env is global, so
-/// splitting set/restore across tests would race with each other.
-/// `apply_nested_env` points `WAYLAND_DISPLAY` at our socket and returns
-/// the previous value; `restore_env` puts it back, or removes the var
-/// when there was none.
-#[test]
-fn nested_env_apply_returns_previous_and_restore_reverts() {
-    // Preserve whatever the ambient test process had; restored at the end
-    // so no other test in this binary observes our mutation.
-    let outer = std::env::var_os("WAYLAND_DISPLAY");
-
-    // Case 1: a previous value exists.
-    std::env::set_var("WAYLAND_DISPLAY", "host-display-0");
-    let prev = apply_nested_env("tuna-nested-test");
-    assert_eq!(
-        prev.as_deref(),
-        Some(std::ffi::OsStr::new("host-display-0"))
-    );
-    assert_eq!(
-        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
-        Some(std::ffi::OsStr::new("tuna-nested-test"))
-    );
-    restore_env(prev);
-    assert_eq!(
-        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
-        Some(std::ffi::OsStr::new("host-display-0"))
-    );
-
-    // Case 2: no previous value.
-    std::env::remove_var("WAYLAND_DISPLAY");
-    let prev = apply_nested_env("tuna-nested-test");
-    assert_eq!(prev, None);
-    assert_eq!(
-        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
-        Some(std::ffi::OsStr::new("tuna-nested-test"))
-    );
-    restore_env(prev);
-    assert_eq!(std::env::var_os("WAYLAND_DISPLAY"), None);
-
-    // Leave the process env as we found it.
-    restore_env(outer);
 }
 
 /// `default_for_pid` names the socket after our pid and picks a positive
@@ -129,13 +80,7 @@ fn launch_smoke_binds_private_socket_or_skips_without_backend() {
         .unwrap()
         .as_nanos();
     let socket_name = format!("tuna-test-{}-{nanos}", std::process::id());
-    let bin = compositor_bin();
-    assert!(
-        bin.is_file(),
-        "missing sibling binary {}; run `cargo build -p tuna-compositor --bins` first",
-        bin.display()
-    );
-    let mut command = Command::new(bin);
+    let mut command = Command::new(COMPOSITOR_BIN);
     let private_root = private_launch_env(&mut command);
     let mut child = command
         .args([
@@ -235,7 +180,7 @@ fn sighup_ends_the_session_through_teardown() {
         .unwrap()
         .as_nanos();
     let socket_name = format!("tuna-hup-{}-{nanos}", std::process::id());
-    let mut command = Command::new(compositor_bin());
+    let mut command = Command::new(COMPOSITOR_BIN);
     let private_root = private_launch_env(&mut command);
     let mut child = command
         .args([

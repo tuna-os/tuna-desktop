@@ -1,0 +1,51 @@
+# CI-only paired DEV fixtures on the actual Published104870/index29097 base.
+# Both members install the same current source package and fixture dependencies;
+# only the fixture account's saved session differs. Stock GNOME/GDM bytes and
+# every original package version must survive unchanged. This is not shipped.
+ARG BASE_IMAGE=ghcr.io/tuna-os/marlin@sha256:104870f1a05fa0a75649ee4ed9952027b29ab12e53af83931ae69e8636e44c3f
+FROM ${BASE_IMAGE}
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+ARG REFERENCE_SESSION
+ARG TUNA_PKG
+ARG TUNA_PKG_SHA256
+COPY ${TUNA_PKG} /tmp/tuna.pkg.tar.zst
+COPY --chmod=0755 packaging/marlin/vm-lane/tuna-vm-published-pacman /usr/libexec/tuna-vm-published-pacman
+COPY --chmod=0755 packaging/marlin/vm-lane/tuna-vm-gnome-reference /usr/libexec/tuna-vm-gnome-reference
+COPY packaging/marlin/vm-lane/journald.conf /usr/lib/systemd/journald.conf.d/90-tuna-vm-lane.conf
+COPY packaging/marlin/vm-lane/kargs.toml /usr/lib/bootc/kargs.d/90-tuna-vm-lane.toml
+RUN case "$REFERENCE_SESSION" in gnome|tuna) ;; *) exit 1 ;; esac \
+    && [[ "$TUNA_PKG_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    && printf '%s  /tmp/tuna.pkg.tar.zst\n' "$TUNA_PKG_SHA256" | sha256sum --check - \
+    && mkdir -p /usr/share/tuna-vm \
+    && pacman -Q > /usr/share/tuna-vm/reference-packages.txt \
+    && pacman -Qlq gdm gnome-shell mutter gnome-session nautilus gnome-control-center gsettings-desktop-schemas \
+       | while IFS= read -r file; do if test -f "$file"; then sha256sum "$file"; fi; done \
+       > /usr/share/tuna-vm/stock-payload.sha256 \
+    && sha256sum /etc/gdm/custom.conf /usr/lib/pam.d/gdm-password \
+       /usr/lib/pam.d/gdm-launch-environment /usr/lib/systemd/system/gdm.service \
+       >> /usr/share/tuna-vm/stock-payload.sha256 \
+    && test "$(readlink -f /etc/systemd/system/display-manager.service)" = /usr/lib/systemd/system/gdm.service \
+    && ! grep -Eiq '^[[:space:]]*(AutomaticLoginEnable|TimedLoginEnable)[[:space:]]*=[[:space:]]*(true|yes|y|1)[[:space:]]*$' /etc/gdm/custom.conf \
+    && /usr/libexec/tuna-vm-published-pacman qemu-guest-agent python python-gobject at-spi2-core libarchive \
+    && bsdtar -xOf /tmp/tuna.pkg.tar.zst .PKGINFO > /tmp/tuna-package-info \
+    && mapfile -t dependencies < <(awk '$1 == "depend" && $2 == "=" {print $3}' /tmp/tuna-package-info) \
+    && /usr/libexec/tuna-vm-published-pacman "${dependencies[@]}" \
+    && pacman -U --noconfirm /tmp/tuna.pkg.tar.zst \
+    && sha256sum --check /usr/share/tuna-vm/stock-payload.sha256 \
+    && pacman -Q > /usr/share/tuna-vm/fixture-packages.txt \
+    && python3 -c 'from pathlib import Path; p=Path("/usr/share/tuna-vm"); before=set((p/"reference-packages.txt").read_text().splitlines()); after=set((p/"fixture-packages.txt").read_text().splitlines()); assert before <= after, "paired fixture changed an original package version"' \
+    && pacman -Q tuna-desktop > /usr/share/tuna-vm/current-package.txt \
+    && sha256sum /usr/bin/tuna-session /usr/bin/tuna-compositor /usr/bin/tuna-shell-host \
+       /usr/bin/tuna-shell-gtk /usr/bin/tuna-ibus-bridge /usr/bin/tuna-wallpaper-svg \
+       > /usr/share/tuna-vm/current-payload.sha256 \
+    && chmod 0644 /usr/share/tuna-vm/*.txt /usr/share/tuna-vm/*.sha256 \
+    && useradd --uid 1000 -M -d /home/tuna-test -s /bin/bash -U tuna-test \
+    && echo 'tuna-test:tuna' | chpasswd \
+    && printf 'd /var/home/tuna-test 0700 tuna-test tuna-test -\nd /var/lib/AccountsService/users 0700 root root -\nf+ /var/lib/AccountsService/users/tuna-test 0600 root root - [User]\\nSystemAccount=false\\nSession=%s\\n' "$REFERENCE_SESSION" \
+       > /usr/lib/tmpfiles.d/tuna-vm-reference.conf \
+    && printf '%s\n' "$REFERENCE_SESSION" > /usr/share/tuna-vm/reference-session.txt \
+    && systemctl mask serial-getty@ttyS0.service \
+    && systemctl add-wants multi-user.target qemu-guest-agent.service \
+    && rm /tmp/tuna.pkg.tar.zst /tmp/tuna-package-info
+LABEL org.opencontainers.image.title="marlin-native-reference-fixtures" \
+      org.opencontainers.image.description="CI-only stock GNOME 51.1 and current Tuna paired native reference fixtures; original GNOME/GDM preserved"

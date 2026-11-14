@@ -228,11 +228,19 @@ const FORBIDDEN_GLOBAL_SUBSTRINGS: &[&str] = &[
     "image_copy_capture",
 ];
 
+/// Reviewed exceptions to the substrings above. ext-foreign-toplevel-list
+/// only lists windows (handle, title, app id, closed) with no capture or
+/// control request, to the supervised shell alone, and covers native and
+/// X11 windows alike: it follows the one window model (#1046).
+const REVIEWED_GLOBALS: &[&str] = &["ext_foreign_toplevel_list_v1"];
+
 #[test]
 fn no_capture_or_toplevel_control_global_advertised() {
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     let mut comp = TestCompositor::new();
-    comp.add_client(server_stream);
+    // The supervised shell's registry is the widest a native client gets:
+    // the ordinary globals plus layer-shell (#1048). None may capture.
+    comp.add_shell_client(server_stream);
 
     let conn = Connection::from_socket(client_stream).unwrap();
     let mut queue = conn.new_event_queue();
@@ -253,7 +261,11 @@ fn no_capture_or_toplevel_control_global_advertised() {
     conn.display().sync(&qh, ());
     roundtrip(&mut comp, &mut queue, &mut client, |c| c.synced);
 
-    for interface in &client.interfaces {
+    for interface in client
+        .interfaces
+        .iter()
+        .filter(|interface| !REVIEWED_GLOBALS.contains(&interface.as_str()))
+    {
         for forbidden in FORBIDDEN_GLOBAL_SUBSTRINGS {
             assert!(
                 !interface.contains(forbidden),

@@ -115,9 +115,6 @@ int main(int argc, char **argv) {
             } else if (type == EIS_EVENT_CLIENT_DISCONNECT) {
                 REQUIRE(acknowledged);
                 eis_event_unref(event);
-                REQUIRE(waitpid(child, &status, 0) == child);
-                child = -1;
-                REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
                 puts("libei lifetime: delayed real EIS delivery precedes acknowledged disconnect");
                 result = 0;
                 goto cleanup;
@@ -128,6 +125,26 @@ int main(int argc, char **argv) {
             REQUIRE(write(acknowledge[1], "\n", 1) == 1);
             acknowledged = true;
             deadline = eis_now(eis) + 2000000;
+            /* The acknowledged sender releases its interfaces and device,
+             * requests the disconnect, closes and exits. libeis 1.6 answers
+             * every release; when such a reply meets the closed socket (EPIPE)
+             * it drops the client source without queueing
+             * EIS_EVENT_CLIENT_DISCONNECT. A dispatch that reads the releases
+             * before the disconnect request is written, and replies after the
+             * close, therefore never sees that request (#1064). Reap the sender
+             * first: its complete teardown is then queued on the socket, and
+             * the next dispatch parses the disconnect request with the
+             * releases. The 2 s bound covers both the exit and the event. */
+            pid_t reaped;
+            while ((reaped = waitpid(child, &status, WNOHANG)) == 0 && eis_now(eis) < deadline)
+                usleep(1000);
+            if (reaped == 0) {
+                fprintf(stderr, "EIS lifetime sender still running 2 s after its acknowledgement\n");
+                goto cleanup;
+            }
+            REQUIRE(reaped == child);
+            child = -1;
+            REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
         }
     }
     fprintf(stderr, "EIS lifetime delivery/disconnect deadline expired: sent=%d acknowledged=%d keys=%u buttons=%u absolute=%u frames=%u\n",

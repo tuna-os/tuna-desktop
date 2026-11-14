@@ -70,9 +70,7 @@ const MANAGER_VERSION: u32 = 1;
 
 /// State of the [`ExtSessionLockManagerV1`] Global.
 #[derive(Debug)]
-pub struct SessionLockManagerState {
-    pub(crate) locked_outputs: Vec<WlOutput>,
-}
+pub struct SessionLockManagerState {}
 
 impl SessionLockManagerState {
     /// Create new [`ExtSessionLockManagerV1`] global.
@@ -90,9 +88,7 @@ impl SessionLockManagerState {
         };
         display.create_global::<D, ExtSessionLockManagerV1, _>(MANAGER_VERSION, data);
 
-        Self {
-            locked_outputs: Vec::new(),
-        }
+        Self {}
     }
 }
 

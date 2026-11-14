@@ -1,0 +1,179 @@
+#!/usr/bin/python3
+"""Add the real Tuna agent to pristine image vendor defaults, never app grants.
+
+GeoClue whitelist keys replace rather than append. Generate an early image
+vendor fragment from the actual packaged main list; all later conf.d policy
+retains its normal precedence. Refuse changed administrator-owned inputs.
+This is an image construction step, never a session/runtime authorization fix.
+"""
+import configparser
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+
+MAIN = Path('/etc/geoclue/geoclue.conf')
+DIRECTORY = MAIN.parent / 'conf.d'
+OUTPUT = DIRECTORY / '00-tuna-desktop-agent.conf'
+RECEIPT = Path('/usr/share/tuna-desktop/geoclue-agent-policy.json')
+
+
+def immutable(path):
+    info = path.lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+            or info.st_mode & 0o022 or info.st_nlink != 1):
+        raise RuntimeError('unsafe original GeoClue policy file: ' + str(path))
+    return path.read_bytes()
+
+
+def read_config(raw):
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    try:
+        parser.read_string(raw.decode())
+    except (configparser.Error, UnicodeError):
+        raise RuntimeError('malformed original GeoClue configuration') from None
+    return parser
+
+
+def command(*argv):
+    return subprocess.check_output(argv, text=True, timeout=10,
+                                   env=dict(os.environ, LC_ALL='C')).strip()
+
+
+def vendor_package(raw):
+    """Use the actual native package database; never bless modified /etc bytes."""
+    original = []
+    database_path = None
+    if shutil.which('pacman') is not None:
+        # Immutable images relocate DBPath into /usr. Query pacman's effective
+        # configuration instead of assuming the mutable Arch filesystem layout.
+        configured = command('pacman-conf', 'DBPath')
+        database_path = Path(configured)
+        if (not configured or '\n' in configured or '\0' in configured
+                or not database_path.is_absolute() or '..' in database_path.parts):
+            raise RuntimeError('configured pacman database path is malformed')
+        metadata = database_path.stat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise RuntimeError('configured pacman database is not immutable root-owned metadata')
+        version = command('pacman', '-Q', 'geoclue').split()
+        if (len(version) != 2 or version[0] != 'geoclue'
+                or re.fullmatch(r'[A-Za-z0-9:.+_-]+', version[1]) is None):
+            raise RuntimeError('installed production GeoClue package identity malformed')
+        if command('pacman', '-Qqo', str(MAIN)) != 'geoclue':
+            raise RuntimeError('GeoClue main policy has another package owner')
+        database = database_path / 'local' / ('geoclue-' + version[1]) / 'files'
+        lines = immutable(database).decode().splitlines()
+        try:
+            start = lines.index('%BACKUP%') + 1
+        except ValueError:
+            raise RuntimeError('original GeoClue package has no backup metadata') from None
+        for line in lines[start:]:
+            if not line:
+                break
+            row = line.split('\t')
+            if len(row) == 2 and row[0] == str(MAIN).lstrip('/'):
+                original.append(row[1])
+        package = ' '.join(version)
+        backend = 'pacman'
+    elif Path('/var/lib/dpkg/status').is_file():
+        owners = command('dpkg-query', '-S', str(MAIN)).splitlines()
+        suffix = ': ' + str(MAIN)
+        if len(owners) != 1 or not owners[0].endswith(suffix):
+            raise RuntimeError('GeoClue main policy native package owner is ambiguous')
+        owner = owners[0][:-len(suffix)]
+        if re.fullmatch(r'[A-Za-z0-9.+:-]+', owner) is None:
+            raise RuntimeError('GeoClue main policy native package owner malformed')
+        for line in command('dpkg-query', '-W', '-f=${Conffiles}', owner).splitlines():
+            row = line.split()
+            if len(row) == 2 and row[0] == str(MAIN):
+                original.append(row[1])
+        package = command('dpkg-query', '-W', '-f=${Package} ${Version}', owner)
+        backend = 'dpkg'
+    elif any(Path(path).is_dir() for path in ('/var/lib/rpm', '/usr/lib/sysimage/rpm')):
+        owner = command('rpm', '-qf', '--qf', '%{NAME}\n', str(MAIN))
+        if re.fullmatch(r'[A-Za-z0-9.+_-]+', owner) is None:
+            raise RuntimeError('GeoClue main policy native package owner malformed')
+        for line in command('rpm', '-q', '--dump', owner).splitlines():
+            row = shlex.split(line)
+            if len(row) >= 10 and row[0] == str(MAIN) and row[7] == '1':
+                original.append(row[3])
+        package = command('rpm', '-q', owner)
+        backend = 'rpm'
+    elif Path('/var/db/pkg').is_dir():
+        packages = []
+        for contents in Path('/var/db/pkg').glob('*/*/CONTENTS'):
+            for line in immutable(contents).decode().splitlines():
+                row = shlex.split(line)
+                if len(row) == 4 and row[:2] == ['obj', str(MAIN)]:
+                    original.append(row[2])
+                    packages.append(str(contents.parent.relative_to('/var/db/pkg')))
+        if len(packages) != 1:
+            raise RuntimeError('GeoClue main policy native package owner is ambiguous')
+        package = packages[0]
+        backend = 'portage'
+    else:
+        raise RuntimeError('supported original native package database unavailable')
+    algorithms = {32: 'md5', 40: 'sha1', 64: 'sha256', 128: 'sha512'}
+    if len(original) != 1 or re.fullmatch('[0-9a-f]+', original[0]) is None:
+        raise RuntimeError('original GeoClue package conffile digest unavailable')
+    algorithm = algorithms.get(len(original[0]))
+    if algorithm is None or hashlib.new(algorithm, raw, usedforsecurity=False).hexdigest() != original[0]:
+        raise RuntimeError('administrator-modified GeoClue main policy; refusing to override its whitelist')
+    return {'backend': backend, 'identity': package, 'original_digest': original[0],
+            'original_digest_algorithm': algorithm,
+            'database_path': str(database_path) if database_path is not None else None}
+
+
+def main():
+    if os.geteuid() != 0 or os.environ.get('TUNA_IMAGE_BUILD') != '1':
+        raise RuntimeError('explicit root image construction only; never a live-session policy change')
+    raw = immutable(MAIN)
+    package = vendor_package(raw)
+    vendor = read_config(raw)
+    agents = [entry.strip() for entry in vendor.get('agent', 'whitelist').split(';') if entry.strip()]
+    if not agents or any(re.fullmatch(r'[A-Za-z0-9_.-]+', agent) is None for agent in agents):
+        raise RuntimeError('invalid original vendor agent whitelist')
+    merged = list(dict.fromkeys(agents + ['tuna-shell']))
+    generated = ('# Image vendor default: preserve the packaged agent list and add the real Tuna agent.\n'
+                 '# Later administrator conf.d settings retain normal GeoClue precedence.\n'
+                 '[agent]\nwhitelist=' + ';'.join(merged) + ';\n').encode()
+    if DIRECTORY.exists() or DIRECTORY.is_symlink():
+        mode = DIRECTORY.lstat()
+        if not stat.S_ISDIR(mode.st_mode) or mode.st_uid != 0 or mode.st_mode & 0o022:
+            raise RuntimeError('unsafe GeoClue configuration directory')
+    else:
+        DIRECTORY.mkdir(mode=0o755)
+    if OUTPUT.exists() or OUTPUT.is_symlink():
+        if immutable(OUTPUT) != generated:
+            raise RuntimeError('existing GeoClue agent fragment differs; refusing administrator overwrite')
+    files = []
+    effective = read_config(raw)
+    for file in sorted(set(DIRECTORY.glob('*.conf')) | {OUTPUT}):
+        content = generated if file == OUTPUT else immutable(file)
+        effective.read_string(content.decode(), source=str(file))
+        files.append({'path': str(file), 'sha256': hashlib.sha256(content).hexdigest()})
+    admitted = [entry.strip() for entry in effective.get('agent', 'whitelist').split(';') if entry.strip()]
+    if 'tuna-shell' not in admitted:
+        raise RuntimeError('later existing GeoClue policy excludes Tuna; preserving it without a bypass')
+    if not OUTPUT.exists():
+        descriptor = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(generated)
+            stream.flush()
+            os.fsync(stream.fileno())
+    RECEIPT.parent.mkdir(parents=True, exist_ok=True)
+    receipt = {'schema': 1, 'agent_id': 'tuna-shell', 'package': package,
+               'vendor_main_sha256': hashlib.sha256(raw).hexdigest(), 'vendor_agents': agents,
+               'effective_agents': admitted, 'files': files,
+               'application_authorization_changed': False, 'administrator_policy_overridden': False,
+               'scope': 'normal-image-vendor-agent-admission-not-app-or-location-authorization'}
+    RECEIPT.write_text(json.dumps(receipt, indent=2) + '\n')
+
+
+if __name__ == '__main__':
+    main()

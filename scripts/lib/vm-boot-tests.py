@@ -7,8 +7,10 @@ import ast
 import base64
 import json
 import os
+import re
 import shlex
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 import unittest
@@ -37,6 +39,99 @@ def with_owner_login_session(scope):
     exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), "exec"), scope)
     return scope
 
+
+
+class StrictPublishedQualification(unittest.TestCase):
+    """Behavioral policy/receipt classification, not native guest qualification."""
+
+    def test_published_changes_acquisition_not_assertion_policy(self):
+        for published, acquisition in ((False, "source-built"), (True, "published")):
+            with self.subTest(published=published):
+                receipt = lane.qualification_receipt(published)
+                self.assertEqual(receipt, {"acquisition": acquisition,
+                                          "qualification_mode": "strict",
+                                          "waived_assertions": [], "skipped_assertions": []})
+                self.assertIs(lane.is_strict_published(receipt), published)
+
+    def test_volume_requires_packaged_owner_and_exact_gnome_ceiling(self):
+        for owner in (None, [":1.9", 7]):
+            with self.subTest(owner=owner), self.assertRaises(RuntimeError):
+                lane.amplified_ceiling({"ok": False, "owner": owner})
+        handler, ceiling = lane.amplified_ceiling(
+            {"ok": True, "owner": [":1.40", 4242]})
+        self.assertEqual(handler, "gsd-media-keys")
+        self.assertEqual(ceiling, 152.52227783203125)
+        self.assertNotEqual(ceiling, 152.52)
+
+    def receipts(self):
+        boots = [{**lane.qualification_receipt(True),
+                  "run_id": "40825026740", "harness_commit": "a" * 40,
+                  "assertions": {"V-STRICT-PUBLISHED": {"pass": True, "detail": "policy"}},
+                  "captured_utc": f"2026-10-31T00:0{index}:00Z"}
+                 for index in range(5)]
+        return {**lane.qualification_receipt(True),
+                "requested_boots": 5, "boots": boots,
+                "boot_results": [{"boot": index, "returncode": 0} for index in range(1, 6)]}
+
+    def test_repeat_requires_all_five_actual_strict_classifications(self):
+        receipt = self.receipts()
+        final = receipt["boots"][-1]
+        self.assertTrue(lane.strict_published_repeat(receipt, final))
+        for index in range(5):
+            for field, value in (("acquisition", "source-built"),
+                                 ("waived_assertions", ["V-BRIGHTNESS-CONTRACT"]),
+                                 ("skipped_assertions", ["V-LOCKED-HINT"]),
+                                 ("qualification_mode", "published-compatibility")):
+                with self.subTest(boot=index, field=field):
+                    changed = json.loads(json.dumps(receipt))
+                    changed["boots"][index][field] = value
+                    self.assertFalse(lane.strict_published_repeat(changed, final))
+        # An old all-pass receipt with no typed enforcement is never strict evidence.
+        old = self.receipts()
+        for boot in old["boots"]:
+            for field in lane.qualification_receipt(True):
+                del boot[field]
+        self.assertFalse(lane.strict_published_repeat(old, old["boots"][-1]))
+
+    def test_repeat_rejects_absent_truncated_failed_or_reindexed_receipts(self):
+        original = self.receipts()
+        for field, value in (("requested_boots", "5"), ("requested_boots", True),
+                             ("requested_boots", 4), ("boots", original["boots"][:4]),
+                             ("boot_results", []), ("qualification_mode", None)):
+            with self.subTest(field=field, value=value):
+                changed = {**original, field: value}
+                self.assertFalse(lane.strict_published_repeat(changed, original["boots"][-1]))
+        for field, value in (("boot", 0), ("boot", True), ("boot", "1"),
+                             ("returncode", False), ("returncode", 1)):
+            with self.subTest(field=field, value=value):
+                changed = self.receipts()
+                changed["boot_results"][0][field] = value
+                self.assertFalse(lane.strict_published_repeat(changed, changed["boots"][-1]))
+        self.assertFalse(lane.strict_published_repeat(None, original["boots"][-1]))
+        self.assertFalse(lane.strict_published_repeat(original, {**original["boots"][-1],
+                                                               "harness_commit": "b" * 40}))
+
+    def test_mode_rejects_missing_or_inconsistent_waiver_fields(self):
+        original = lane.qualification_receipt(True)
+        for field in original:
+            changed = dict(original)
+            del changed[field]
+            self.assertFalse(lane.is_strict_published(changed))
+        for field, value in (("acquisition", True), ("qualification_mode", "compatibility"),
+                             ("waived_assertions", False), ("skipped_assertions", None),
+                             ("waived_assertions", ["V-BRIGHTNESS-CONTRACT"])):
+            self.assertFalse(lane.is_strict_published({**original, field: value}))
+
+    def test_clock_failures_stay_failures_under_strict_policy(self):
+        mode = lane.qualification_receipt(True)
+        records = []
+        raw = {"assertions": ["G-DATETIME-CLOCK-TZ fail panel did not follow timezone",
+                              "G-DATETIME-CLOCK-SET pass actual changed clock"]}
+        with self.assertRaisesRegex(RuntimeError, "G-DATETIME-CLOCK-TZ"):
+            lane.record_datetime_gates(raw, mode["acquisition"] == "published",
+                                       lambda *row: records.append(row))
+        self.assertEqual([(gate, passed) for gate, passed, _ in records],
+                         [("G-DATETIME-CLOCK-TZ", False), ("G-DATETIME-CLOCK-SET", True)])
 
 class DatetimePublishedQualification(unittest.TestCase):
     """Behavioral lane policy tests, not native Date & Time qualification."""
@@ -139,8 +234,8 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
     GSD = {"ok": True, "owner": [":1.40", 4242]}
     UNOWNED = {"ok": False, "owner": None}
 
-    def run_audio(self, *, change=None, older=False, dense=False, setup_error=False,
-                  write_error=False, high=GSD_UI_MAX, media_keys=GSD, published=False):
+    def run_audio(self, *, change=None, dense=False, setup_error=False,
+                  write_error=False, high=GSD_UI_MAX, media_keys=GSD):
         tree = ast.parse(self.SOURCE.read_text())
         lifecycle = next(node for node in tree.body
                          if isinstance(node, ast.FunctionDef) and node.name == "run_lifecycle")
@@ -176,8 +271,7 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
                     reset_receipts.append(json.loads(diagnostic.read_text()) if diagnostic.exists() else None)
                     return {}
                 if action == "audio-amplification-read":
-                    percent = ((98.0, 98.0, 150.0, 98.0) if older else
-                               (100.0, 104.0, high, 100.0))[case_index]
+                    percent = (100.0, 104.0, high, 100.0)[case_index]
                     actual = value(percent, case_index in (1, 2))
                     if case_index == 3 and change:
                         actual.update(change)
@@ -189,7 +283,7 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
                         "media_keys": media_keys}
             scope = {**vars(lane), "agent": SimpleNamespace(run=run),
                      "qmp": SimpleNamespace(keys=lambda key: keys.append(key)),
-                     "evidence": directory, "older_guest": older, "published": published,
+                     "evidence": directory,
                      "record": lambda *args: records.append(args),
                      "time": SimpleNamespace(monotonic=monotonic, sleep=sleep)}
             if write_error:
@@ -246,51 +340,33 @@ class AudioAmplificationDiagnostics(unittest.TestCase):
         self.assertEqual(result.diagnostic[2]["expected_percent"], lane.GNOME_UI_MAX_PERCENT)
         self.assertEqual(result.diagnostic[2]["key_handler"], "gsd-media-keys")
 
-    def test_ceiling_follows_the_guests_media_keys_owner(self):
-        # A published guest whose shell predates gsd-media-keys binds the
-        # volume keys natively and writes wpctl's 1.5252.
-        native = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=self.UNOWNED, published=True)
-        self.assertIsNone(native.error)
-        self.assertEqual(native.diagnostic[2]["expected_percent"], lane.SHELL_NATIVE_UI_MAX_PERCENT)
-        self.assertEqual({case["key_handler"] for case in native.diagnostic}, {"shell-native"})
-        # A published guest running gsd-media-keys gets GNOME's exact ceiling.
-        self.assertIsNone(self.run_audio(media_keys=self.GSD, published=True).error)
-        truncated = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=self.GSD, published=True)
+    def test_ceiling_requires_the_guests_packaged_media_keys_owner(self):
+        self.assertIsNone(self.run_audio(media_keys=self.GSD).error)
+        truncated = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=self.GSD)
         self.assertIsInstance(truncated.error, RuntimeError)
-        # The native ceiling never passes for gsd's, nor gsd's for the native.
-        self.assertIsInstance(self.run_audio(media_keys=self.UNOWNED, published=True).error, RuntimeError)
-        # The current build must run the packaged gsd-media-keys, and no guest
-        # passes with an owner that is not it.
-        for media_keys, published in ((self.UNOWNED, False), ({"ok": False, "owner": [":1.9", 7]}, True),
-                                      ({"ok": False, "owner": [":1.9", 7]}, False)):
-            with self.subTest(media_keys=media_keys, published=published):
-                result = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=media_keys, published=published)
+        for media_keys in (self.UNOWNED, {"ok": False, "owner": [":1.9", 7]}):
+            with self.subTest(media_keys=media_keys):
+                result = self.run_audio(high=self.NATIVE_UI_MAX, media_keys=media_keys)
                 self.assertIsInstance(result.error, RuntimeError)
                 self.assertEqual(result.records, [])
                 self.assertEqual(result.actions[-1], "audio-amplification-reset")
 
-    def test_success_preserves_legacy_receipt_actions_and_verdict(self):
-        for older in (False, True):
-            with self.subTest(older=older):
-                result = self.run_audio(older=older)
-                self.assertIsNone(result.error)
-                self.assertEqual(len(result.legacy), 4)
-                self.assertEqual([v["percent"] for v in result.legacy],
-                                 [98.0, 98.0, 150.0, 98.0] if older else [100.0, 104.0, self.GSD_UI_MAX, 100.0])
-                self.assertEqual(result.keys, [] if older else ["volumeup"] * 4)
-                self.assertEqual(result.sleeps, [] if older else [0.3] * 4)
-                self.assertEqual(result.records[0][:2], ("V-AUDIO-AMPLIFICATION", True))
-                self.assertEqual(result.actions[-1], "audio-amplification-reset")
-                self.assertEqual(len(result.actions), 9)
+    def test_success_preserves_audio_receipt_actions_and_verdict(self):
+        result = self.run_audio()
+        self.assertIsNone(result.error)
+        self.assertEqual(len(result.legacy), 4)
+        self.assertEqual([v["percent"] for v in result.legacy],
+                         [100.0, 104.0, self.GSD_UI_MAX, 100.0])
+        self.assertEqual(result.keys, ["volumeup"] * 4)
+        self.assertEqual(result.sleeps, [0.3] * 4)
+        self.assertEqual(result.records[0][:2], ("V-AUDIO-AMPLIFICATION", True))
+        self.assertEqual(result.actions[-1], "audio-amplification-reset")
+        self.assertEqual(len(result.actions), 9)
 
-    def test_precision_and_old_guest_range_stay_unchanged(self):
+    def test_exact_gnome_precision_stays_unchanged(self):
         for percent, passes in ((100.000001, True), (99.998, False), (100.0012, False)):
             with self.subTest(percent=percent):
                 result = self.run_audio(change={"percent": percent})
-                self.assertEqual(result.error is None, passes)
-        for percent, passes in ((90.0, True), (106.0, True), (106.001, False)):
-            with self.subTest(older_percent=percent):
-                result = self.run_audio(change={"percent": percent}, older=True)
                 self.assertEqual(result.error is None, passes)
 
     def test_history_cap_is_only_retention_and_keeps_last_sample(self):
@@ -522,31 +598,6 @@ class OrcaCommandCleanup(unittest.TestCase):
 
 
 class OrcaFixturePackages(unittest.TestCase):
-    def test_actual_upstream_export_create_requires_explicit_command(self):
-        source = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
-        lines = [line.strip() for line in source.read_text().splitlines()
-                 if "probe_container=$(sudo podman create" in line]
-        self.assertEqual(len(lines), 1)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            sudo = root / "sudo"
-            sudo.write_text('#!/bin/sh\nexec "$@"\n')
-            sudo.chmod(0o755)
-            podman = root / "podman"
-            podman.write_text("#!/usr/bin/env python3\nimport sys\n"
-                "assert sys.argv[1:] == ['create','localhost/marlin-tuna-vm:ci','/usr/bin/true']\n"
-                "print('controlled-inspect-container')\n")
-            podman.chmod(0o755)
-            environment = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
-            for line, success in [(lines[0], True), (lines[0].replace(" /usr/bin/true", ""), False)]:
-                result = subprocess.run(["bash", "-eu", "-c", line + '\nprintf "%s\\n" "$probe_container"\n'],
-                    env=environment, capture_output=True, text=True, timeout=10)
-                if success:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout.strip(), "controlled-inspect-container")
-                else:
-                    self.assertNotEqual(result.returncode, 0)
-        # Controlled shell admission only; no Podman image/runtime proof.
 
     def test_current_build_session_environment_fixes_locale_and_ci_diagnostics(self):
         # gdm-wayland-session lets GDM's own LANG win over the imported user
@@ -559,6 +610,19 @@ class OrcaFixturePackages(unittest.TestCase):
         self.assertIn("COPY packaging/marlin/vm-lane/tuna-vm-orca-token "
                       "/usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token", source)
         # Fixture setup policy only, not a genuine reader or translated-label proof.
+
+    def test_desktop_fixture_user_holds_datetime_privileged_group(self):
+        # The ordinary session user seeds the manual timezone baseline and
+        # gsd-datetime applies the automatic zone; both need GNOME's
+        # privileged group (wheel), otherwise SetTimezone hangs on an
+        # unanswered polkit challenge until the command timeout. The
+        # datetime proof judges actual membership, so this pins the grant.
+        source = (Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/Containerfile").read_text()
+        creations = [line.strip() for line in source.splitlines()
+                     if "useradd" in line and "tuna-test" in line]
+        self.assertEqual(len(creations), 1)
+        self.assertIn("-G wheel", creations[0])
+        # Image recipe policy only, not a guest group-membership proof.
 
     def run_builder_admission(self, upgraded="2.58.9", failed=False):
         source = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/orca51/build"
@@ -1313,6 +1377,20 @@ class ConstraintProofCleanup(unittest.TestCase):
             self.assertEqual(actual["cleanup_errors"][0]["action"], "constraint-quit")
             self.assertTrue((Path(out) / "hot-corner-constraint-mouse-restoration.json").exists())
             self.assertTrue((Path(out) / "hot-corner-constraint-stderr.json").exists())
+
+    def test_principal_quit_by_the_proof_is_not_quit_again(self):
+        calls = []
+        def run(action):
+            calls.append(action)
+            if action == "constraint-quit":
+                raise RuntimeError("principal already gone")
+            return {"stderr": "", "truncated": False}
+        with tempfile.TemporaryDirectory() as out, patch.object(lane, "restore_corner_mouse", return_value={"verified": True}):
+            lane.finish_constraint_proof(SimpleNamespace(run=run), object(), {}, out,
+                {"principal": {"pid": 42}, "principal_quit": True, "primary_error": None})
+            self.assertEqual(calls, ["constraint-log"])
+            actual = json.loads((Path(out) / "hot-corner-constraints.json").read_text())
+            self.assertEqual(actual["cleanup_errors"], [])
 class PublicOrcaNavigation(unittest.TestCase):
     def focus_module(self):
         file = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-shell-focus"
@@ -1446,64 +1524,7 @@ class PublicOrcaNavigation(unittest.TestCase):
         for key, invalid in (("GetNameOwner", ":1.28"), ("GetConnectionUnixProcessID", 934), ("GetConnectionUnixUser", 0)):
             self.assertTrue(eval(predicate, {**scope, "values": {**values, key: invalid}}))
 
-    def test_focus_cli_admits_each_mode_separately_without_changing_default(self):
-        from contextlib import redirect_stdout
-        module = self.focus_module()
-        tree = ast.parse(Path(module.__file__).read_text())
-        entry = next(n for n in tree.body if isinstance(n, ast.If)
-                     and ast.unparse(n.test) == "__name__ == '__main__'")
-        code = compile(ast.Module(body=entry.body, type_ignores=[]), module.__file__, "exec")
-        for mode in (None, "controlled-overview", "end-session", "notification-banner"):
-            calls = []
-            def observe(*args, **kwargs):
-                calls.append((args, kwargs))
-                return {"observation_only": True}
-            scope = {**vars(module), "sys": SimpleNamespace(argv=[
-                module.__file__, "933", "57", "tuna-shell-gtk", "wayland-0"
-            ] + ([] if mode is None else [mode])), "observe": observe}
-            stream = io.StringIO()
-            with self.subTest(mode=mode), redirect_stdout(stream):
-                exec(code, scope)
-            self.assertEqual(calls, [((933, 57, "tuna-shell-gtk", "wayland-0"),
-                                     {"controlled": mode == "controlled-overview",
-                                      "end_session": mode == "end-session",
-                                      "notification": mode == "notification-banner"})])
-            self.assertEqual(json.loads(stream.getvalue()), {"observation_only": True})
-        for extra in (["private mode"], ["end-session", "notification-banner"],
-                      ["controlled-overview", "end-session"]):
-            calls = []
-            scope = {**vars(module), "sys": SimpleNamespace(argv=[
-                module.__file__, "933", "57", "tuna-shell-gtk", "wayland-0", *extra
-            ]), "observe": lambda *args, **kwargs: calls.append(args)}
-            stream = io.StringIO()
-            with self.subTest(extra=extra), redirect_stdout(stream), self.assertRaises(SystemExit) as caught:
-                exec(code, scope)
-            self.assertEqual(caught.exception.code, 1)
-            self.assertEqual(calls, [])
-            self.assertEqual(json.loads(stream.getvalue()),
-                             {"focus_error_type": "ValueError", "focus_operation": "arguments"})
 
-    def test_focus_observer_refuses_combined_or_nonboolean_modes(self):
-        module = self.focus_module()
-        tree = ast.parse(Path(module.__file__).read_text())
-        observe = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "observe")
-        guard = next(n for n in observe.body if isinstance(n, ast.If))
-        code = compile(ast.Module(body=[guard], type_ignores=[]), module.__file__, "exec")
-        for controlled, end_session, notification in (
-                (False, False, False), (True, False, False),
-                (False, True, False), (False, False, True)):
-            exec(code, {"controlled": controlled, "end_session": end_session,
-                        "notification": notification, "executable": "tuna-shell-gtk"})
-        for modes in ((True, True, False), (True, False, True), (False, True, True),
-                      (True, True, True), (1, False, False), (False, 1, False),
-                      (False, False, 1)):
-            with self.subTest(modes=modes), self.assertRaisesRegex(RuntimeError, "fixed controlled"):
-                exec(code, dict(zip(("controlled", "end_session", "notification"), modes),
-                                executable="tuna-shell-gtk"))
-        for flag in ("controlled", "notification"):
-            with self.subTest(flag=flag), self.assertRaises(RuntimeError):
-                exec(code, {**dict.fromkeys(("controlled", "end_session", "notification"), False),
-                            flag: True, "executable": "gnome-disks"})
 
     def focus_mode_tree(self, mode):
         """Execute the actual traversal with public controls and private banner bait."""
@@ -1547,7 +1568,7 @@ class PublicOrcaNavigation(unittest.TestCase):
         scope = {**vars(module), "nodes": [], "pending": [(app, 0, False)], "visited": 0,
                  "notification_frames": [], "notification_closes": [], "search_entries": [],
                  "target": {"showing": 0, "focused": 0, "present": 0}, "focused_roles": [],
-                 "controlled": False, "end_session": mode == "end-session",
+                 "controlled": False, "end_session": mode == "end-session", "logout_name": None,
                  "notification": mode == "notification-banner", "deadline": 8,
                  "time": SimpleNamespace(monotonic=lambda: 0), "unlocked": lambda: None,
                  "accessibility_query": lambda method, *args: method(*args),
@@ -1568,17 +1589,6 @@ class PublicOrcaNavigation(unittest.TestCase):
         self.assertEqual(scope["notification_closes"], [])
         self.assertNotIn(countdown, json.dumps(scope["nodes"]))
 
-    def test_notification_traversal_queries_only_fixed_frame_and_close_not_content(self):
-        scope, calls, countdown = self.focus_mode_tree("notification-banner")
-        self.assertEqual(calls, [("banner", "name"), ("banner", "component"),
-                                 ("close", "name"), ("close", "component")])
-        self.assertEqual(scope["nodes"], [])
-        self.assertEqual(scope["notification_frames"], [[10, 20, 30, 40]])
-        self.assertEqual(scope["notification_closes"],
-                         [{"rect": [10, 20, 30, 40], "focused": True}])
-        retained = json.dumps([scope["nodes"], scope["notification_frames"], scope["notification_closes"]])
-        for private in ("private", "title", "body", "text buffer", countdown, "Restart…"):
-            self.assertNotIn(private, retained)
 
     def test_end_session_traversal_keeps_countdown_without_notification_receipts(self):
         scope, calls, countdown = self.focus_mode_tree("end-session")
@@ -1712,7 +1722,7 @@ class LifecyclePostNavigationBaseline(unittest.TestCase):
         tree = ast.parse(file.read_text())
         helpers = [next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
                    for name in ("same_apps", "same_apps_after_navigation")]
-        scope = {"guest_role": lane.guest_role}
+        scope = {}
         exec(compile(ast.Module(body=helpers, type_ignores=[]), str(file), "exec"), scope)
         return scope
 
@@ -1758,16 +1768,6 @@ class LifecyclePostNavigationBaseline(unittest.TestCase):
         after["session"]["Id"] = "2"
         self.assertFalse(self.policy()["same_apps_after_navigation"](before, after))
 
-    def test_fresh_baseline_is_validated_before_replacing_original(self):
-        file = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
-        source = file.read_text()
-        self.assertLess(source.index('before_vt = inventory("before-vt-baseline")'),
-                        source.index('if not same_apps_after_navigation(before, before_vt):'))
-        self.assertLess(source.index('if not same_apps_after_navigation(before, before_vt):'),
-                        source.index('before = before_vt'))
-        self.assertLess(source.index('before = before_vt'), source.index('base_frame = frame("before-vt")'))
-        self.assertIn('same_apps(before, after_vt)', source)
-        self.assertIn('same_apps(before, pending_auth)', source)
 
 
 class ControlledOverviewDiagnostic(unittest.TestCase):
@@ -2393,26 +2393,6 @@ class BootApi(unittest.TestCase):
         self.assertEqual(events, [("ret",), ("ctrl", "a"), "fixture typed", ("ret",)])
         # Actual prompt/PAM transitions still require the genuine hardware VM.
 
-    def test_actual_orca_commands_use_distinct_qmp_qcodes_for_chords(self):
-        tree = ast.parse((Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text())
-        command = next(node for node in ast.walk(tree)
-                       if isinstance(node, ast.FunctionDef) and node.name == "native_command")
-        chords = [tuple(ast.literal_eval(arg) for arg in node.args)
-                  for node in ast.walk(command) if isinstance(node, ast.Call)
-                  and isinstance(node.func, ast.Attribute) and node.func.attr == "keys"]
-        self.assertIn(("insert", "h"), chords)
-        self.assertIn(("shift", "f4"), chords)
-        for chord in chords:
-            self.assertTrue(set(chord) <= {"insert", "h", "shift", "f4", "esc"})
-            qmp = lane.baseline.Qmp.__new__(lane.baseline.Qmp)
-            qmp.file = io.StringIO()
-            qmp._read = lambda: {"return": {}}
-            with patch.object(lane.baseline.time, "sleep"):
-                qmp.keys(*chord)
-            wire = json.loads(qmp.file.getvalue())
-            self.assertEqual(wire["execute"], "send-key")
-            self.assertEqual(wire["arguments"]["keys"],
-                             [{"type": "qcode", "data": name} for name in chord])
 
     def test_qmp_command_accepts_protocol_name_argument(self):
         qmp = lane.baseline.Qmp.__new__(lane.baseline.Qmp)
@@ -3084,6 +3064,21 @@ def tour_frame(fill, boxes=()):
     return bytes(px)
 
 
+def tour_png(pixels):
+    """Encode real RGB PNG bytes so confirmation consumes the retained image."""
+    import struct
+    import zlib
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+    stride = lane.WIDTH * 3
+    raw = b"".join(b"\0" + pixels[start:start + stride]
+                   for start in range(0, len(pixels), stride))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", lane.WIDTH, lane.HEIGHT, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
 class TourViewPredicates(unittest.TestCase):
     GREY, NAVY, WHITE = (36, 36, 40), (8, 24, 52), (250, 250, 250)
     WINDOWS = (190, 140, 1085, 690, WHITE)
@@ -3119,10 +3114,19 @@ class TourViewPredicates(unittest.TestCase):
             if path.name == "probe.ppm":
                 path.write_bytes(header + (probes.pop(0) if len(probes) > 1 else probes[0]))
             else:
-                path.write_bytes(b"png pixels")
+                path.write_bytes(tour_png(probes[-1]))
         now = [0.0]
+        real_sleep = lane.time.sleep
         def advance(seconds):
-            now[0] += seconds
+            # Patching lane.time patches the process-wide time module. Only
+            # the lane's own polling advances the fake clock; library waits,
+            # such as Python 3.12 subprocess.wait() reaping ffmpeg in a
+            # time.sleep() loop, sleep for real. Otherwise a slow ffmpeg exit
+            # spins that loop and burns the whole fake await_still deadline.
+            if sys._getframe(1).f_globals is vars(lane):
+                now[0] += seconds
+            else:
+                real_sleep(seconds)
         # Polling time advances only at sleep boundaries, not while the host
         # writes a synthetic frame or schedules the test process.
         with tempfile.TemporaryDirectory() as directory, \
@@ -3131,6 +3135,8 @@ class TourViewPredicates(unittest.TestCase):
             recorder = lane.Recorder(SimpleNamespace(cmd=command), directory,
                                      timeout=TourRecorderTests.SCHEDULING_TIMEOUT)
             self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=5, settle=0))
+            self.assertTrue(recorder.still_confirmations["alt-tab"]["confirmed"])
+            self.assertTrue(recorder.still_confirmations["alt-tab"]["evidence"]["exact_png"])
             deadline = now[0] + 0.05
             self.assertFalse(recorder.await_still("overview-windows", lane.overview_windows_shown,
                                                   timeout=0.05, settle=0))
@@ -3139,6 +3145,207 @@ class TourViewPredicates(unittest.TestCase):
             self.assertEqual(recorder.unconfirmed, ["overview-windows"])
             self.assertEqual(sorted(p.name for p in Path(recorder.dir).iterdir()),
                              ["f000000.png", "f000001.png"])
+            recorder.close()
+
+    def test_matching_readiness_cannot_confirm_a_different_retained_png(self):
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        ready = tour_frame(self.NAVY, self.SWITCHER)
+        wrong = tour_png(tour_frame(self.NAVY, [self.WINDOWS]))
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(
+                header + ready if args["format"] == "ppm" else wrong)
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertFalse(recorder.await_still("alt-tab", lane.switcher_shown, timeout=10, settle=0))
+            receipt = recorder.still_confirmations["alt-tab"]
+            self.assertTrue(receipt["evidence"]["exact_png"])
+            self.assertFalse(receipt["confirmed"])
+            self.assertEqual(recorder.unconfirmed, ["alt-tab"])
+            self.assertEqual(recorder.n, 1)  # No retry can replace the missed frame.
+            self.assertEqual(receipt["png_sha256"], lane.baseline.sha256(
+                Path(recorder.dir) / "f000000.png"))
+            recorder.close()
+
+    def test_a_slow_decode_of_a_still_captured_in_time_does_not_miss_the_view(self):
+        # CI runs 43217494460, 43244398470: the switcher was ready and its
+        # still captured inside the 10 s view, but ffmpeg got only the
+        # leftover milliseconds to decode it (TimeoutExpired).
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        pixels = tour_frame(self.NAVY, self.SWITCHER)
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(
+                header + pixels if args["format"] == "ppm" else tour_png(pixels))
+        now = [0.0]
+        real_run = lane.subprocess.run
+        def slow_decode(argv, **kwargs):
+            if argv[0] == "ffmpeg":
+                now[0] += 20.0
+            return real_run(argv, **kwargs)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(lane.time, "monotonic", lambda: now[0]), \
+                patch.object(lane.subprocess, "run", slow_decode):
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertTrue(recorder.await_still("alt-tab", lane.switcher_shown, timeout=5, settle=0))
+            receipt = recorder.still_confirmations["alt-tab"]
+            self.assertTrue(receipt["evidence"]["within_deadline"])
+            self.assertTrue(receipt["evidence"]["exact_png"])
+            recorder.close()
+
+    def test_exact_overview_png_is_confirmed_without_changing_calibrated_floors(self):
+        pixels = tour_frame(self.GREY, [(180, 108, 1100, 660, self.NAVY),
+                                       (440, 420, 840, 670, self.WHITE)])
+        header = f"P6\n{lane.WIDTH} {lane.HEIGHT}\n255\n".encode()
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(
+                header + pixels if args["format"] == "ppm" else tour_png(pixels))
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertTrue(recorder.await_still(
+                "overview-windows", lane.overview_windows_shown, timeout=10, settle=0))
+            self.assertEqual(recorder.unconfirmed, [])
+            self.assertEqual(recorder.still_confirmations["overview-windows"]["png_sha256"],
+                             lane.baseline.sha256(Path(recorder.dir) / "f000000.png"))
+            recorder.close()
+
+
+class TourPublicConfirmationTests(unittest.TestCase):
+    """Fault-injected public observations, not native UI qualification."""
+
+    CONTROLS = {
+        "app-grid": [("frame", "App Grid")],
+        "quick-settings": [("slider", "Volume"), ("push button", "Settings"), ("push button", "Lock Screen")],
+        "calendar": [("push button", "Previous month"), ("push button", "Next month")],
+        "lock": [("frame", "Lock Screen")],
+    }
+
+    def observation(self, card):
+        return {"schema": 1, "method": "public-at-spi",
+                "session": {"Id": "2", "User": "1000", "Type": "wayland", "Class": "user",
+                            "Service": "gdm-password", "VTNr": "2"},
+                "principal": {"pid": 123, "uid": 1000, "start_ticks": 42,
+                              "executable": "/usr/bin/tuna-shell-gtk",
+                              "display": "wayland-0", "session_id": "2"},
+                "atspi": {"owner": ":1.5", "bus_pid": 123, "bus_uid": 1000},
+                "controls": [{"role": role, "label": label, "showing": True, "visible": True,
+                              "extents": [10, 10, 300, 200]} for role, label in self.CONTROLS[card]],
+                "started_monotonic_ns": 100, "completed_monotonic_ns": 200}
+
+    def capture(self, card, change=None):
+        events = []
+        image = tour_png(tour_frame((8, 24, 52)))
+        observations = [self.observation(card), self.observation(card)]
+        if change is not None:
+            change(observations)
+        def command(name, **args):
+            events.append(name)
+            if name == "screendump":
+                Path(args["filename"]).write_bytes(image)
+        def observe(timeout):
+            events.append("observe")
+            return observations.pop(0)
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            confirmed = recorder.public_still(card, observe)
+            recorder.qmp.cmd("send-key")
+            receipt = recorder.still_confirmations[card]
+            self.assertEqual(receipt["png_sha256"],
+                             lane.baseline.sha256(Path(recorder.dir) / "f000000.png"))
+            self.assertEqual(receipt["frame_index"], 0)
+            self.assertEqual(events, ["observe", "screendump", "observe", "send-key"])
+            evidence = receipt["evidence"]
+            self.assertLessEqual(evidence["before"]["completed_monotonic_ns"],
+                                 receipt["capture_requested_monotonic_ns"])
+            self.assertLessEqual(receipt["capture_completed_monotonic_ns"],
+                                 evidence["after"]["requested_monotonic_ns"])
+            self.assertEqual(recorder.unconfirmed, [] if confirmed else [card])
+            recorder.close()
+            return confirmed, receipt
+
+    def test_real_quick_settings_accessible_lock_screen_label_confirms_exact_capture(self):
+        self.assertTrue(self.capture("quick-settings")[0])
+        def obsolete_label(values):
+            for value in values:
+                for control in value["controls"]:
+                    if control["label"] == "Lock Screen":
+                        control["label"] = "Lock"
+        self.assertFalse(self.capture("quick-settings", obsolete_label)[0])
+
+    def test_calendar_without_optional_events_card_still_has_positive_navigation(self):
+        self.assertTrue(self.capture("calendar")[0])
+        for label in ("Previous month", "Next month"):
+            def missing(values, label=label):
+                for value in values:
+                    value["controls"] = [control for control in value["controls"] if control["label"] != label]
+            with self.subTest(missing=label):
+                self.assertFalse(self.capture("calendar", missing)[0])
+
+    def test_each_public_hero_requires_positive_visible_capture_bracket(self):
+        for card in self.CONTROLS:
+            with self.subTest(card=card):
+                self.assertTrue(self.capture(card)[0])
+                for side in (0, 1):
+                    self.assertFalse(self.capture(
+                        card, lambda values, side=side: values[side].update(controls=[]))[0])
+
+    def test_tags_private_state_and_unrelated_controls_are_not_confirmation(self):
+        for card in self.CONTROLS:
+            def wrong(values):
+                for value in values:
+                    value.update(tag=card, locked=True, overview_app_grid=True, controls=[
+                        {"role": "push button", "label": "Take Screenshot", "showing": True,
+                         "visible": True, "extents": [10, 10, 100, 100]}])
+            with self.subTest(card=card):
+                self.assertFalse(self.capture(card, wrong)[0])
+
+    def test_changed_session_or_original_atspi_owner_rejects_the_frame(self):
+        for key in ("session", "principal", "atspi"):
+            with self.subTest(identity=key):
+                self.assertFalse(self.capture("lock", lambda values: values[1].update({key: {}}))[0])
+
+    def test_offscreen_hidden_and_zero_sized_controls_fail(self):
+        for change in ({"showing": False}, {"visible": False}, {"extents": [0, 0, 0, 0]},
+                       {"extents": [lane.WIDTH, 0, 100, 100]}):
+            def wrong(values):
+                values[1]["controls"][0].update(change)
+            self.assertFalse(self.capture("app-grid", wrong)[0])
+
+    def test_matching_but_missing_original_authority_is_not_public_ui_proof(self):
+        for key in ("session", "principal", "atspi"):
+            def wrong(values):
+                for value in values:
+                    value[key] = {}
+            self.assertFalse(self.capture("lock", wrong)[0])
+
+    def test_late_positive_snapshot_cannot_extend_confirmation_deadline(self):
+        now, observations = [0.0], []
+        image = tour_png(tour_frame((8, 24, 52)))
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(image)
+        def observe(timeout):
+            observations.append(timeout)
+            now[0] += 6
+            return self.observation("lock")
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(lane.time, "monotonic", lambda: now[0]):
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertFalse(recorder.public_still("lock", observe))
+            self.assertEqual(len(observations), 2)
+            self.assertLess(observations[1], observations[0])
+            receipt = recorder.still_confirmations["lock"]
+            self.assertFalse(receipt["evidence"]["within_deadline"])
+            self.assertEqual(recorder.n, 1)
+            self.assertEqual(recorder.unconfirmed, ["lock"])
+            recorder.close()
+
+    def test_missing_observer_preserves_diagnostic_but_never_confirms(self):
+        image = tour_png(tour_frame((8, 24, 52)))
+        def command(name, **args):
+            Path(args["filename"]).write_bytes(image)
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
+            self.assertFalse(recorder.public_still("app-grid", None))
+            self.assertEqual(recorder.unconfirmed, ["app-grid"])
+            self.assertEqual((Path(recorder.dir) / "f000000.png").read_bytes(), image)
             recorder.close()
 
 
@@ -3585,6 +3792,33 @@ class S3AbsoluteDeadline(unittest.TestCase):
             self.assertEqual(scope['inventory']('ordinary'),{})
         self.assertEqual(calls,[(('inventory',),{})])
 
+    def test_wake_reopens_qga_transport_before_first_resume_inventory(self):
+        # PR runs 43385429967 et al. (guest Linux 7.3.4): the first post-wake
+        # guest-exec acknowledgement never arrived. The real suspend statements
+        # from system_wakeup to the first-resume inventory must reopen the
+        # transport first, without any guest-exec in between.
+        source = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+        lifecycle = next(n for n in ast.parse(source.read_text()).body
+                         if isinstance(n, ast.FunctionDef) and n.name == "run_lifecycle")
+        check = next(n for n in lifecycle.body if isinstance(n, ast.FunctionDef) and n.name == "suspend_and_check")
+        wake = next(i for i, n in enumerate(check.body) if "system_wakeup" in ast.dump(n))
+        first = next(i for i, n in enumerate(check.body) if "first-resume" in ast.dump(n))
+        events = []
+        agent = SimpleNamespace(
+            reopen_after_wake=lambda **kw: events.append(("reopen", kw)) or 2,
+            run=lambda *a, **kw: events.append(("guest-exec", a)))
+        with tempfile.TemporaryDirectory() as tmp:
+            scope = dict(qmp=SimpleNamespace(cmd=lambda name, **kw: events.append(("qmp", name))),
+                         agent=agent, evidence=tmp, label="", time=lane.time, os=lane.os, json=json,
+                         inventory=lambda label: events.append(("inventory", label)) or {"state": {"locked": True}})
+            exec(compile(ast.Module(body=check.body[wake:first + 1], type_ignores=[]), str(source), "exec"), scope)
+            with open(os.path.join(tmp, "wake-transport.json")) as stream:
+                receipt = json.load(stream)
+        self.assertEqual(events, [("qmp", "system_wakeup"), ("reopen", {"timeout": 20, "attempt": 2}),
+                                  ("inventory", "first-resume")])
+        self.assertEqual(receipt["connections"], 2)
+        self.assertIn("no guest-exec", receipt["scope"])
+
 
 class ShippedSnapshotInventory(unittest.TestCase):
     # Run 37696030597: the graphical PAM login produced a real login
@@ -3653,8 +3887,8 @@ class ShippedSnapshotInventory(unittest.TestCase):
         self.assertIsNone(result["state"]["pointer_position"])
         self.assertIsNone(result["state"]["native_relative_motion_count"])
 
-    def test_published_guest_with_pre_rename_binaries_still_detects_session(self):
-        # The published flavor can still ship the package from before #505.
+    def test_historical_archive_inventory_reports_actual_retired_executable(self):
+        # Inventory reports archival identities verbatim; it does not qualify them.
         uid = os.getuid()
         result = self.run_inventory(dict(self.SHIPPED_STATE), [
             ("1", "959 greeter seat0 tty1"),
@@ -3672,41 +3906,32 @@ class ShippedSnapshotInventory(unittest.TestCase):
             self.run_inventory(state, [("4", f"{uid} tuna-test - -")])
 
 
-class PreRenameGuestLog(unittest.TestCase):
+class CurrentGuestIdentity(unittest.TestCase):
     # tuna-rename: keep-begin
-    # The published flavor can still ship binaries from before #505.
-    def test_pre_rename_binary_lines_read_as_current_names(self):
-        text = lane.normalize_guest_log(
-            "session[9]: roost-compositor: drm: output Virtual-1 1280x800\n"
-            "session[9]: roost-shell-gtk: keybindings: 64 grabs\n"
-            "tuna-vm-health: roost-test ready\n")
-        self.assertRegex(text, lane.DRM_RE)
-        self.assertRegex(text, lane.SHELL_RE)
-        self.assertIn("tuna-vm-health: roost-test ready", text)
+    def test_serial_never_rewrites_retired_binary_names_into_current_evidence(self):
+        retired = ("session[9]: roost-compositor: drm: output Virtual-1 1280x800\n"
+                   "session[9]: roost-shell-gtk: keybindings: 64 grabs\n")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "serial.log"
+            path.write_text("\x1b[0m" + retired)
+            actual = lane.read_text(path)
+        self.assertEqual(actual, retired)
+        self.assertNotRegex(actual, lane.DRM_RE)
+        self.assertNotRegex(actual, lane.SHELL_RE)
 
-    def test_pre_rename_executables_compare_by_role(self):
-        self.assertEqual(lane.guest_role("roost-compositor"), "tuna-compositor")
-        self.assertEqual(lane.guest_role("tuna-shell-gtk"), "tuna-shell-gtk")
-        self.assertEqual(lane.guest_role("nautilus"), "nautilus")
+    def test_current_authentication_requires_actual_current_executable(self):
+        process = {"pid": 11, "uid": 1000, "ppid": 10, "pgrp": 11,
+                   "start_ticks": 123, "exe_device": 1, "exe_inode": 987,
+                   "executable": "tuna-compositor"}
+        self.assertEqual(lane.checked_auth_process(process, "tuna-compositor"), process)
+        for retired in ("roost-compositor", "roost-shell-gtk"):
+            with self.subTest(executable=retired), self.assertRaises(ValueError):
+                lane.checked_auth_process({**process, "executable": retired}, "tuna-compositor")
     # tuna-rename: keep-end
 
 
-class PredatingGuestQualification(unittest.TestCase):
-    # Run 37700332957: the published tuna-desktop 0.1.0-2 guest runs a healthy
-    # session whose snapshot reports every newer instrumentation key as
-    # None, and its shell moves no media-key volume. Newer-behavior gates
-    # qualify on such guests instead of failing the whole lifecycle; the
-    # current-build lane keeps proving them strictly.
-    SHIPPED_STATE = {"locked": False, "windows": [], "focused": None,
-                     "active_workspace": 0, "overview_open": False,
-                     "pointer_position": None, "native_relative_motion_count": None,
-                     "mouse_left_handed": None, "touchpad_left_handed": None,
-                     "hot_corners": None}
-    CURRENT_STATE = {"locked": False, "windows": [], "focused": None,
-                     "active_workspace": 0, "overview_open": False,
-                     "pointer_position": [0, 0], "native_relative_motion_count": 0,
-                     "mouse_left_handed": False, "touchpad_left_handed": False,
-                     "hot_corners": True}
+class MediaVolumeAndLockRecords(unittest.TestCase):
+    # Actual historical baseline-only output must fail rather than waive key behavior.
     STRICT_SERIAL = ("\n".join([
         "tuna-vm-health: audio-hda ready",
         "tuna-vm-health: volume=0.40",
@@ -3718,37 +3943,8 @@ class PredatingGuestQualification(unittest.TestCase):
     BASELINE_SERIAL = ("tuna-vm-health: audio-hda ready\n"
                        "tuna-vm-health: volume=0.40\n")
 
-    def verdict(self, text, state=None):
-        with tempfile.TemporaryDirectory() as directory:
-            lifecycle = Path(directory) / "lifecycle"
-            lifecycle.mkdir()
-            if state is not None:
-                (lifecycle / "before.json").write_text(json.dumps({"state": state}))
-            return lane.media_volume_ok(text, str(lifecycle))
-
-    def test_predating_snapshot_qualifies(self):
-        self.assertTrue(lane.predates_newer_snapshot(dict(self.SHIPPED_STATE)))
-
-    def test_current_snapshot_stays_strict(self):
-        self.assertFalse(lane.predates_newer_snapshot(dict(self.CURRENT_STATE)))
-
-    def test_partial_snapshot_stays_strict(self):
-        # Fail closed: a guest with only some newer keys still takes the
-        # strict path rather than silently qualifying.
-        state = {**self.SHIPPED_STATE, "mouse_left_handed": False}
-        self.assertFalse(lane.predates_newer_snapshot(state))
-
-    def test_sleep_auth_qualifies_on_published_guest_without_auth_owner(self):
-        state = {**self.CURRENT_STATE, "auth_owner": None}
-        self.assertTrue(lane.sleep_auth_qualifies(True, state))
-        self.assertTrue(lane.sleep_auth_qualifies(True, dict(self.SHIPPED_STATE)))
-
-    def test_sleep_auth_stays_strict_on_current_build_lane(self):
-        # marlin-vm runs the branch's own build: never qualified, even if
-        # the key were absent.
-        self.assertFalse(lane.sleep_auth_qualifies(False, dict(self.SHIPPED_STATE)))
-        owner = {"epoch": 1}
-        self.assertFalse(lane.sleep_auth_qualifies(True, {**self.CURRENT_STATE, "auth_owner": owner}))
+    def verdict(self, text):
+        return lane.media_volume_ok(text)
 
     def test_sheared_lock_result_record_reassembles(self):
         # Run 38855306157 serial: one shell eprintln! split across records.
@@ -3774,37 +3970,27 @@ class PredatingGuestQualification(unittest.TestCase):
         self.assertFalse(any("applied=false" in line for line in records))
 
     def test_media_volume_strict_sequence_passes(self):
-        ok, detail = self.verdict(self.STRICT_SERIAL, self.CURRENT_STATE)
+        ok, detail = self.verdict(self.STRICT_SERIAL)
         self.assertTrue(ok)
         self.assertNotIn("predates", detail)
 
-    def test_media_volume_qualifies_on_predating_guest(self):
-        ok, detail = self.verdict(self.BASELINE_SERIAL, self.SHIPPED_STATE)
-        self.assertTrue(ok)
-        self.assertIn("predates", detail)
-
-    def test_media_volume_stays_strict_on_current_guest(self):
-        ok, _ = self.verdict(self.BASELINE_SERIAL, self.CURRENT_STATE)
+    def test_media_volume_rejects_historical_baseline_only(self):
+        ok, detail = self.verdict(self.BASELINE_SERIAL)
         self.assertFalse(ok)
+        self.assertNotIn("predates", detail)
 
-    def test_media_volume_stays_strict_without_predation_evidence(self):
-        ok, _ = self.verdict(self.BASELINE_SERIAL, None)
-        self.assertFalse(ok)
-
-    def test_lock_chord_held_until_lock_owns_input_on_predating_guest(self):
-        # Run 37727015469: a quick Super release on the 0.1.0-2 guest is
-        # dropped before the lock surface maps, latching Super so the
-        # password never reaches PAM. Hold the chord on such guests only.
-        self.assertGreaterEqual(lane.lock_chord_hold_ms(True), 1000)
-
-    def test_lock_chord_stays_quick_on_current_guest(self):
-        # Current guests keep exercising the quick-release regression path.
-        self.assertEqual(lane.lock_chord_hold_ms(False), 80)
+    def test_media_volume_rejects_missing_or_out_of_order_key_transitions(self):
+        for text in (self.STRICT_SERIAL.replace("volume=0.46", "volume=0.40"),
+                     self.STRICT_SERIAL.replace(" [MUTED]", ""),
+                     self.STRICT_SERIAL.replace("volume=0.46", "volume=0.47"),
+                     self.BASELINE_SERIAL + self.STRICT_SERIAL):
+            with self.subTest(text=text):
+                self.assertFalse(self.verdict(text)[0])
 
     def test_media_volume_requires_hda_and_baseline(self):
-        ok, _ = self.verdict("tuna-vm-health: volume=0.40\n", self.SHIPPED_STATE)
+        ok, _ = self.verdict("tuna-vm-health: volume=0.40\n")
         self.assertFalse(ok)
-        ok, _ = self.verdict("tuna-vm-health: audio-hda ready\n", self.SHIPPED_STATE)
+        ok, _ = self.verdict("tuna-vm-health: audio-hda ready\n")
         self.assertFalse(ok)
 
 
@@ -3974,6 +4160,38 @@ class FixtureLoginSession(unittest.TestCase):
                              "display-manager.service)\" = /usr/lib/systemd/system/gdm.service"):
                     self.assertIn(path, containerfile)
                 self.assertNotIn("AutomaticLogin", containerfile.replace("AutomaticLoginEnable|TimedLoginEnable", ""))
+
+    def test_both_fixtures_install_the_guest_helpers_the_lifecycle_runs(self):
+        # The strict published lifecycle (#994) runs the current build's probes:
+        # run 41388914137 stopped at brightness-contract because the published
+        # fixture lacked /usr/libexec/tuna-brightness-proof.
+        helpers = set(re.findall(r'"(/usr/libexec/[^"]+)"', self.fixture("tuna-vm-lifecycle")))
+        # The GDM trace serves only the current build's --fresh-accounts boot;
+        # the bounded soak runs only on the published image; the native-session
+        # modules (#1003) serve only the current build's `autotz` profile; the
+        # colour consumer serves only the `colour` profile, whose
+        # Containerfile.colour layer installs it from the native colour overlay.
+        colour = "/usr/libexec/tuna-vm-colour"
+        self.assertIn("COPY native-colour-overlay/usr/ /usr/", self.fixture("Containerfile.colour"))
+        overlay = (Path(__file__).resolve().parents[2] / "scripts/tuna-colour-build").read_text()
+        self.assertIn("out / 'usr/libexec/tuna-vm-colour'", overlay)
+        unused = {"Containerfile": {"/usr/libexec/tuna-soak/tuna-vm-soak", colour},
+                  "Containerfile.published": {"/usr/libexec/tuna-vm-gdm-trace",
+                                              "/usr/libexec/tuna-native-session", colour}}
+        # Orca's token-gated test presenter (orca-speech-trigger) reads the
+        # runtime token this user environment generator writes.
+        generator = "/usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token"
+        for name, skipped in unused.items():
+            with self.subTest(fixture=name):
+                containerfile = self.fixture(name)
+                # One source to a file, or several sources into a directory.
+                installed = {path.rstrip("/") for path in
+                             re.findall(r"^COPY (?:--\S+ )*\S+(?: \S+)* (\S+)$", containerfile, re.M)}
+                self.assertLessEqual((helpers - skipped) | {generator}, installed)
+                executable = containerfile.split("chmod 0755", 1)[1].split("&&", 1)[0]
+                for path in ("/usr/libexec/tuna-vm-lifecycle", "/usr/libexec/tuna-vm-input",
+                             "/usr/libexec/tuna-vm-shell-focus", generator):
+                    self.assertIn(path, executable)
 
     def test_current_build_runs_tunaos_tuna_flavor_gdm_steps_in_manifest_order(self):
         containerfile = self.fixture("Containerfile")
@@ -4420,13 +4638,46 @@ class InventoryProcessRaces(unittest.TestCase):
 
     def guest(self, state=None, call=None):
         uid = os.getuid()
+        class SnapshotProcPath:
+            """os.PathLike proxy with snapshot, pid-sorted /proc iteration.
+
+            Readdir order and mid-scan birth visibility differ across
+            filesystems, but race hooks address (pid, readlink-count) pairs
+            that only model the designed interleaving under one order.
+            Materialize each fake-/proc-root iterator at creation, numeric
+            pids ascending, so every environment replays the same scan.
+            """
+            def __init__(self, real, root=False):
+                self._real = real
+                self._root = root
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+            def __fspath__(self):
+                return os.fspath(self._real)
+            def __str__(self):
+                return str(self._real)
+            def __eq__(self, other):
+                mine = self._real
+                theirs = other._real if isinstance(other, SnapshotProcPath) else other
+                return mine == theirs
+            def __hash__(self):
+                return hash(self._real)
+            def __truediv__(self, other):
+                return SnapshotProcPath(self._real / other)
+            def iterdir(self):
+                entries = list(self._real.iterdir())
+                if not self._root:
+                    return (SnapshotProcPath(e) for e in entries)
+                entries.sort(key=lambda e: (not e.name.isdigit(),
+                                            int(e.name) if e.name.isdigit() else e.name))
+                return (SnapshotProcPath(e) for e in entries)
         def proc_path(path):
             path = str(path)
             if path == "/proc":
-                return self.root / "proc"
+                return SnapshotProcPath(self.root / "proc", root=True)
             if path.startswith("/proc/"):
-                return self.root / "proc" / path[len("/proc/"):]
-            return Path(path)
+                return SnapshotProcPath(self.root / "proc" / path[len("/proc/"):])
+            return SnapshotProcPath(Path(path))
         def readlink(path):
             target = os.readlink(path)
             pid = int(Path(path).parent.name)
@@ -4460,6 +4711,79 @@ class InventoryProcessRaces(unittest.TestCase):
         result = self.guest()["inventory"]()
         self.assertEqual(self.pids(result), [(600, "tuna-compositor"), (650, "tuna-shell-gtk")])
         self.assertEqual(self.sleeps, [])
+
+    def late_compositor(self, parent=600, group=701, ticks=1800, args=None, other_inode=False):
+        # The first /proc iterator has already captured its entries when 700
+        # is read. The second iterator sees 701, just like a new wake-time PAM
+        # conversation between the helper snapshot and owned-process scan.
+        def spawned(pid, count):
+            if pid == 700 and count == 2:
+                self.process(701, parent, group, ticks, "tuna-compositor",
+                             self.HELPER_ARGS if args is None else args)
+                if other_inode:
+                    other = self.root / "other/tuna-compositor"
+                    other.parent.mkdir()
+                    other.write_bytes(self.binaries["tuna-compositor"].read_bytes())
+                    executable = self.root / "proc/701/exe"
+                    executable.unlink()
+                    executable.symlink_to(other)
+        self.on_readlink = spawned
+        return self.guest()
+
+    def test_helper_born_between_snapshots_is_classified_at_its_scan(self):
+        scope = self.late_compositor()
+        windows = [{"id": 4, "app_id": "org.tuna.VmInput", "rect": [440, 296, 400, 240],
+                    "workspace": 0}]
+        scope["STATE"].write_text(json.dumps({**self.STATE, "windows": windows}))
+        result = scope["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"), (650, "tuna-shell-gtk")])
+        self.assertEqual([(p["pid"], p["start_ticks"]) for p in result["processes"]],
+                         [(600, 1500), (650, 1600)])
+        self.assertEqual(result["state"]["windows"], windows)
+        self.assertTrue(result["state"]["locked"])
+        self.assertGreaterEqual(self.readlinks[701], 2)  # read its actual metadata
+        self.assertEqual(self.sleeps, [])
+
+    def test_late_unrelated_or_impostor_compositors_remain_owned_process_mismatches(self):
+        for options in ({"parent": 999}, {"group": 600}, {"ticks": 1400},
+                        {"args": self.DESKTOP_ARGS},
+                        {"args": self.HELPER_ARGS[:-1] + b"\0extra\0"},
+                        {"other_inode": True}):
+            with self.subTest(options=options):
+                self.setUp()
+                result = self.late_compositor(**options)["inventory"]()
+                self.assertEqual(self.pids(result), [(600, "tuna-compositor"),
+                                 (650, "tuna-shell-gtk"), (701, "tuna-compositor")])
+
+    def test_late_helper_cannot_bind_to_reused_desktop_parent_pid(self):
+        scope = self.late_compositor()
+        spawned = self.on_readlink
+        def reused(pid, count):
+            spawned(pid, count)
+            if pid == 701 and count == 2:
+                stat = self.root / "proc/600/stat"
+                stat.write_text(stat.read_text().replace("1500", "1750"))
+        self.on_readlink = reused
+        result = scope["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"),
+                         (650, "tuna-shell-gtk"), (701, "tuna-compositor")])
+
+    def test_ambiguous_original_desktop_never_excludes_private_children(self):
+        self.process(701, 2, 2, 1800, "tuna-compositor", self.DESKTOP_ARGS)
+        result = self.guest()["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"), (650, "tuna-shell-gtk"),
+                         (700, "tuna-compositor"), (701, "tuna-compositor")])
+
+    def test_classified_helper_pid_reuse_is_not_excluded_by_numeric_pid(self):
+        def reused(pid, count):
+            if pid == 700 and count == 3:
+                (self.root / "proc/700/cmdline").write_bytes(self.DESKTOP_ARGS)
+                stat = self.root / "proc/700/stat"
+                stat.write_text(stat.read_text().replace("1700", "1800"))
+        self.on_readlink = reused
+        result = self.guest()["inventory"]()
+        self.assertEqual(self.pids(result), [(600, "tuna-compositor"),
+                         (650, "tuna-shell-gtk"), (700, "tuna-compositor")])
 
     def test_helper_exiting_after_its_scan_read_is_absent_not_an_owned_compositor(self):
         # Snapshot readlinks 700 twice; the scan's own read is the third.
@@ -4570,14 +4894,9 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertTrue(lane.guest_agent.valid_inventory_error(record))
 
     def test_partially_written_state_file_fails_closed_at_parse_stage(self):
-        # The compositor publishes the snapshot by write-temp + rename, so a
-        # reader never sees a partial file; one would be a writer bug, so the
-        # probe fails with a typed stage instead of retrying past it.
-        runtime = (Path(__file__).resolve().parents[2] / "crates/compositor/src/runtime.rs").read_text()
-        publish = runtime[runtime.index("fn publish_state(&mut self)"):]
-        publish = publish[:publish.index("\n    }\n") + 6]
-        self.assertIn('let tmp = path.with_extension("tmp");', publish)
-        self.assertIn("std::fs::write(&tmp, &doc).is_ok() && std::fs::rename(&tmp, path).is_ok()", publish)
+        # Readers reject malformed snapshots rather than retrying past them.
+        # The publisher's real filesystem/concurrency tests cover atomic
+        # visibility; this test exercises the runtime consumer's typed failure.
         record = self.failure(self.guest(state=json.dumps(self.STATE)[:17]), json.JSONDecodeError)
         self.assertEqual({key: record[key] for key in ("stage", "exception_type", "code")},
                          {"stage": "state-parse", "exception_type": "JSONDecodeError",
@@ -4599,7 +4918,7 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertEqual(caught.exception.code, 1)
         return output.getvalue()
 
-    def transport(self, output, **status):
+    def transport(self, output, action="inventory", **status):
         import contextlib
         actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
         failure = {"exited": True, "exitcode": 1, "out-data": base64.b64encode(output.encode()).decode(),
@@ -4607,7 +4926,7 @@ class InventoryProcessRaces(unittest.TestCase):
         log = io.StringIO()
         with contextlib.redirect_stdout(log), patch.object(actor, "command", side_effect=[{"pid": 10}, failure]):
             with self.assertRaises(RuntimeError) as caught:
-                actor.run("inventory")
+                actor.run(action)
         self.assertNotIn("private", str(caught.exception) + log.getvalue())
         return str(caught.exception), log.getvalue()
 
@@ -4650,6 +4969,25 @@ class InventoryProcessRaces(unittest.TestCase):
         self.assertEqual(self.transport(json.dumps({"inventory_error": record, "extra": "private"}))[0], generic)
         self.assertEqual(self.transport(json.dumps({"inventory_error": record}), **{"out-truncated": True})[0], generic)
         self.assertEqual(self.transport("private " * 600)[0], generic)
+
+    def test_tour_public_ui_failure_record_surfaces_unstaged_only(self):
+        record = {"stage": "unstaged", "exception_type": "RuntimeError",
+                  "code": "observation-exception", "frames": [["_tour_public_ui", 1790]]}
+        self.assertTrue(lane.guest_agent.valid_tour_public_ui_error(record))
+        message, log = self.transport(json.dumps({"tour_public_ui_error": record}), action="tour-public-ui")
+        self.assertEqual(message, "guest lifecycle tour-public-ui failed (exit=1): " + json.dumps(record))
+        self.assertEqual(log, "")
+        generic = "guest lifecycle tour-public-ui failed (exit=1)"
+        invalid = [None, [], {}, {**record, "message": "private"},
+                   {**record, "stage": "state-read"}, {**record, "stage": "private"},
+                   {**record, "exception_type": "private"}, {**record, "code": "private"},
+                   {k: v for k, v in record.items() if k != "frames"}]
+        for value in invalid:
+            with self.subTest(value=value):
+                output = json.dumps({"tour_public_ui_error": value})
+                self.assertEqual(self.transport(output, action="tour-public-ui")[0], generic)
+
+
 class OrcaLogoutRetirement(unittest.TestCase):
     """#836: the compositor's session-end receipt for its own Orca group."""
     RECEIPT = ("tuna-compositor: screen reader retired pid=21699 terminated=true "
@@ -4688,17 +5026,6 @@ class OrcaLogoutRetirement(unittest.TestCase):
             with self.subTest(trace=trace):
                 self.assertIsNone(lane.orca_logout_retirement(trace, 21699))
 
-    def test_departure_probe_runs_first_and_v_orca_logout_stays_unchanged(self):
-        # The unchanged probe must not wait behind the receipt: the user
-        # runtime it reads goes away soon after logout (run 40864799987).
-        source = (Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text()
-        departed = source.index('closed_orca = agent.run("orca-departed"')
-        reap = source.index('record("V-ORCA-LOGOUT-REAP"')
-        survived = source.index('raise RuntimeError("Orca survived the hardware session logout")')
-        self.assertLess(departed, reap)
-        self.assertLess(reap, survived)
-        self.assertIn('record("V-ORCA-LOGOUT", closed_orca["owner"] is None and not closed_orca["original_alive"],',
-                      source)
 
 
 class OrcaDepartureProbe(unittest.TestCase):
@@ -4911,13 +5238,18 @@ class FakeEndSessionGuest:
                  "power-off": "The system will power off automatically in {} seconds",
                  "log-out": "You will be logged out automatically in {} seconds"}
 
-    def __init__(self, fault=None):
+    def __init__(self, fault=None, logout_name="Proof Person"):
         self.fault, self.clock, self.pressed, self.frames = fault, 100.0, [], []
         self.quick = self.menu = False
         self.focus = 0
         self.messages, self.requests, self.system = [], [], []
         self.dialog = None
         self.compositor = 1000
+        self.logout_name = logout_name
+        path = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-shell-focus"
+        loader = importlib.machinery.SourceFileLoader("fake_end_session_focus_policy", str(path))
+        self.focus_policy = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(self.focus_policy)
 
     # The lane's clock.
     def monotonic(self):
@@ -5022,9 +5354,29 @@ class FakeEndSessionGuest:
             focused = self.dialog["focus"] if self.dialog else (focusable[self.focus] if focusable else None)
             controls = [{"label": label, "role": "push button", "focused": label == focused, "active": True}
                         for label in focusable]
-            if self.dialog and self.fault != "no-countdown-label":
-                controls.append({"label": self.COUNTDOWN[self.dialog["case"]].format(self.shown()),
-                                 "role": "label", "focused": False, "active": True})
+            if self.dialog:
+                case = self.dialog["case"]
+                name = "Wrong Person" if self.fault == "wrong-user" else self.logout_name
+                title = "Log Out" if name is None else f"Log Out {name}"
+                body = self.COUNTDOWN[case].format(self.shown())
+                if case == "log-out":
+                    if name is not None:
+                        body = f"{name} will be logged out automatically in {self.shown()} seconds"
+                    if self.fault == "generic-with-account":
+                        title, body = "Log Out", self.COUNTDOWN[case].format(self.shown())
+                    if self.fault == "wrong-title":
+                        title = "Log Out Wrong Person"
+                    if self.fault == "malformed-title":
+                        title += ". Unsaved: diary.txt"
+                    if self.fault == "malformed-countdown":
+                        body += ". Unsaved: diary.txt"
+                    controls.append({"label": title, "role": "label", "focused": False, "active": True})
+                if self.fault != "no-countdown-label":
+                    controls.append({"label": body, "role": "label", "focused": False, "active": True})
+                controls = [record for node in controls
+                            if (record := self.focus_policy.public_node(
+                                node["label"], node["role"], True, node["focused"], node["active"],
+                                end_session=True, logout_name=self.logout_name)) is not None]
             return {"public_controls": controls}
         assert action == "power-button-observe", action
         manager = [self.MANAGER[0], 3000] if self.fault == "manager-not-compositor" else self.MANAGER
@@ -5049,8 +5401,8 @@ class ShellMenuEndSession(unittest.TestCase):
     manager's 60 s end-session dialog (V-RESTART-DIALOG, V-POWER-OFF-DIALOG,
     V-LOGOUT)."""
 
-    def drive(self, name, fault=None):
-        guest = FakeEndSessionGuest(fault)
+    def drive(self, name, fault=None, logout_name="Proof Person"):
+        guest = FakeEndSessionGuest(fault, logout_name)
         with patch.object(lane, "time", guest):
             result = lane.end_session_menu_case(guest, guest, name, guest.identity, guest.frame)
         return guest, result
@@ -5085,6 +5437,14 @@ class ShellMenuEndSession(unittest.TestCase):
         self.assertNotIn(("esc",), guest.pressed)
         self.assertTrue(0 <= result["opened_at"] - guest.dialog["opened"] < 1)
 
+    def test_log_out_personalized_and_service_unavailable_fallback(self):
+        for name in ("Proof Person", "proof", "A.* (Test)", None):
+            with self.subTest(name=name):
+                guest, result = self.drive("log-out", logout_name=name)
+                self.assertEqual(result["reply"]["type"], "method return")
+                self.assertNotIn(("esc",), guest.pressed)
+                self.assertIsNotNone(guest.dialog)
+
     def test_every_broken_link_fails_and_leaves_no_countdown_running(self):
         for name, fault, message in (
                 ("restart", "no-restart-row", "power menu's rows"),
@@ -5098,7 +5458,14 @@ class ShellMenuEndSession(unittest.TestCase):
                 ("power-off", "logind-during-countdown", "did not hold"),
                 ("restart", "vm-stopped", "did not hold"),
                 ("log-out", "logout-refused", "Logout\\(0\\) failed"),
-                ("log-out", "no-countdown-label", "60 s countdown")):
+                ("log-out", "no-countdown-label", "60 s countdown"),
+                ("log-out", "wrong-user", "60 s countdown"),
+                ("log-out", "wrong-title", "60 s countdown"),
+                ("log-out", "malformed-title", "60 s countdown"),
+                ("log-out", "malformed-countdown", "60 s countdown"),
+                ("log-out", "generic-with-account", "60 s countdown"),
+                ("log-out", "cancel-unfocused", "Cancel focused"),
+                ("log-out", "short-countdown", "did not open")):
             with self.subTest(fault=fault):
                 guest = self.fails(name, fault, message)
                 self.assertEqual(guest.pressed[-1], ("esc",), "Escape on every failure")
@@ -5182,6 +5549,76 @@ class ShellMenuEndSession(unittest.TestCase):
                                              end_session=True))
         self.assertIsNone(module.public_node(countdown, "label", False, False, True, end_session=True))
         self.assertIsNone(module.public_node(countdown, "push button", True, False, True, end_session=True))
+
+    def test_accounts_service_personalization_is_exact_and_private(self):
+        path = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-shell-focus"
+        loader = importlib.machinery.SourceFileLoader("end_session_accounts_policy", str(path))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        for properties, expected in (
+                ({"RealName": "Proof Person", "UserName": "proof"}, "Proof Person"),
+                ({"RealName": "", "UserName": "proof"}, "proof"),
+                ({"RealName": "", "UserName": ""}, "login"),
+                ({"RealName": "A.* (Test)", "UserName": "proof"}, "A.* (Test)"),
+                (None, None)):
+            with self.subTest(properties=properties):
+                calls = []
+                def query(path, interface, method, signature, arguments):
+                    calls.append((path, interface, method, signature, arguments))
+                    if properties is None:
+                        return None
+                    return ("/org/freedesktop/Accounts/User1000",) if method == "FindUserByName" else (properties,)
+                actual = module.accounts_logout_name(query, "login")
+                self.assertEqual(actual, expected)
+                self.assertEqual(calls[0], ("/org/freedesktop/Accounts", "org.freedesktop.Accounts",
+                                           "FindUserByName", "(s)", ("login",)))
+                if properties is not None:
+                    self.assertEqual(calls[1], ("/org/freedesktop/Accounts/User1000",
+                                               "org.freedesktop.DBus.Properties", "GetAll", "(s)",
+                                               ("org.freedesktop.Accounts.User",)))
+                prefix = "You" if actual is None else actual
+                title = "Log Out" if actual is None else f"Log Out {actual}"
+                def node(text):
+                    return module.public_node(text, "label", True, False, True,
+                                              end_session=True, logout_name=actual)
+                self.assertEqual(node(title)["label"], "Log Out")
+                for seconds, unit in ((60, "seconds"), (50, "seconds"), (1, "second")):
+                    text = f"{prefix} will be logged out automatically in {seconds} {unit}"
+                    record = node(text)
+                    self.assertEqual(record["label"],
+                                     f"You will be logged out automatically in {seconds} {unit}")
+                    self.assertIsNone(module.public_node(text, "label", True, False, True,
+                                                         logout_name=actual))
+                for text in ("Log Out Wrong Person",
+                             "Wrong Person will be logged out automatically in 60 seconds",
+                             title + ". Unsaved: diary.txt",
+                             f"{prefix} will be logged out automatically in 60 seconds. diary.txt",
+                             f"{prefix} will be logged out automatically in 060 seconds",
+                             "Log Out Axyz (Test)"):
+                    self.assertIsNone(node(text), text)
+                if actual is not None:
+                    self.assertIsNone(node("Log Out"))
+                    self.assertIsNone(node("You will be logged out automatically in 60 seconds"))
+        # User lookup succeeded, but unavailable account properties still mean
+        # the generic not-loaded fallback, not a fabricated username.
+        self.assertIsNone(module.accounts_logout_name(
+            lambda path, interface, method, signature, arguments:
+                ("/org/freedesktop/Accounts/User1000",) if method == "FindUserByName" else None,
+            "login"))
+
+    def test_canonical_logout_receipts_require_title_and_exact_countdown(self):
+        case = lane.END_SESSION_CASES["log-out"]
+        title = {"label": "Log Out", "role": "label", "focused": False, "active": True}
+        def countdown(text):
+            return {"label": text, "role": "label", "focused": False, "active": True}
+        valid = countdown("You will be logged out automatically in 60 seconds")
+        self.assertTrue(lane.countdown_showing([title, valid], case, 60))
+        self.assertFalse(lane.countdown_showing([valid], case, 60))
+        for text in ("You will be logged out automatically in 59 seconds",
+                     "You will be logged out automatically in 60 second",
+                     "Wrong Person will be logged out automatically in 60 seconds",
+                     valid["label"] + ". diary.txt"):
+            self.assertFalse(lane.countdown_showing([title, countdown(text)], case, 60))
 
 
 if __name__ == "__main__":

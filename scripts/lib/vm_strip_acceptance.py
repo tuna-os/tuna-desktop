@@ -441,7 +441,7 @@ def notification_layers(sample):
     return layers, banners
 
 
-def notification_close_control(sample, original, observer_sha256, *, require_focused=False, edge=False):
+def notification_close_control(sample, original, observer_sha256, *, require_focused=False, fixture_control=False, edge=False):
     """Join a concrete Close control to the original shell, not a namespace alone."""
     import re
     windows(sample, original, edge=edge)
@@ -471,6 +471,8 @@ def notification_close_control(sample, original, observer_sha256, *, require_foc
     if (type(banner) is not dict or banner.get('frames') != [[0, 0, width, height]]
             or type(banner.get('close_controls')) is not list or len(banner['close_controls']) != 1):
         raise RuntimeError('one actual owned Notifications frame and Close control required')
+    if fixture_control and banner.get('control_visible') is not True:
+        raise RuntimeError('original controlled notification fixture is not visibly confirmed')
     close = banner['close_controls'][0]
     if type(close) is not dict or type(close.get('focused')) is not bool:
         raise RuntimeError('actual notification Close focus observation missing')
@@ -495,7 +497,7 @@ def notification_close_control(sample, original, observer_sha256, *, require_foc
 
 
 def dismiss_notification_banner(read, observe, send_key, sample, original, observer_sha256, *,
-                                deadline, input_idle, evidence, edge=False):
+                                deadline, input_idle, evidence, fixture_control=False, edge=False):
     """Normal keyboard Close, only after original focused-control observation."""
     layers, banners = notification_layers(sample)
     if not banners:
@@ -534,7 +536,7 @@ def dismiss_notification_banner(read, observe, send_key, sample, original, obser
         raise TimeoutError('notification preparation exceeded capture deadline')
     actual = observe(deadline)
     checked(actual, layers)
-    notification_close_control(actual, original, observer_sha256, edge=edge)
+    notification_close_control(actual, original, observer_sha256, fixture_control=fixture_control, edge=edge)
     evidence.update(activation='normal-keyboard-focused-Close', focus_input_sent=False,
                     activated=False, confirmed_absent=False)
     send_key('meta_l', 'n')
@@ -545,7 +547,7 @@ def dismiss_notification_banner(read, observe, send_key, sample, original, obser
     focused = observe(deadline)
     checked(focused, layers)
     evidence['control'] = notification_close_control(
-        focused, original, observer_sha256, require_focused=True, edge=edge)
+        focused, original, observer_sha256, require_focused=True, fixture_control=fixture_control, edge=edge)
     if time.monotonic() >= deadline:
         raise TimeoutError('notification focus validation exceeded capture deadline')
     send_key('ret')
@@ -581,7 +583,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
     if not re.fullmatch('(sha256:)?[0-9a-f]{64}', image['image_id']) or '@sha256:' not in image['base_image']:
         raise RuntimeError('immutable image/base identity missing')
     root = Path(__file__).resolve().parents[2]
-    for name in ('tuna-vm-input', 'tuna-vm-lifecycle'):
+    for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus'):
         local = root / 'packaging/marlin/vm-lane' / name
         if image['member_sha256'].get('/usr/libexec/' + name) != hashlib.sha256(local.read_bytes()).hexdigest():
             raise RuntimeError('installed fixture/observer differs from exact executing source')
@@ -654,7 +656,8 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
     def chord(*keys, input_transport=transport):
         input_transport.command('send-key', keys=[{'type': 'qcode', 'data': key} for key in keys], **{'hold-time': 80})
 
-    def capture(label, sample, role='alpha'):
+
+    def capture(label, sample, role='alpha', *, notification_control=False):
         found = windows(sample, original, edge=edge)
         png = destination / (label + '.png')
         ppm = destination / (label + '.ppm')
@@ -685,12 +688,39 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
                 remaining = min(12, sample_deadline - time.monotonic(), deadline - time.monotonic())
                 if remaining <= 0:
                     raise TimeoutError('installed notification observation absolute deadline')
-                return agent.run('strip-notification-control', nonce, timeout=remaining)
+                action = 'strip-notification-fixture' if notification_control else 'strip-notification-control'
+                return agent.run(action, nonce, timeout=remaining)
             def notification_key(*keys):
                 chord(*keys, input_transport=capture_transport)
+            if notification_control:
+                control = guest('strip-notification-create', nonce,
+                                budget=min(4, capture_deadline - time.monotonic()))
+                if control.get('owner') != original:
+                    raise RuntimeError('notification control differs from original fixture owner')
+                receipt['notification_control'] = {'id': control['notification_id'],
+                                                   'closed_by_public_button': False}
+                while time.monotonic() < capture_deadline:
+                    sample = read(capture_deadline)
+                    if windows(sample, original, edge=edge) != found:
+                        raise RuntimeError('actual fixture changed while awaiting controlled notification')
+                    _, banners = notification_layers(sample)
+                    if banners:
+                        observed = observe_notification(capture_deadline)
+                        notification_close_control(observed, original, notification_observer_sha256,
+                                                   fixture_control=True, edge=edge)
+                        sample = observed
+                        break
+                    time.sleep(min(.05, max(0, capture_deadline - time.monotonic())))
+                else:
+                    raise TimeoutError('controlled notification did not become visible within capture deadline')
             sample = dismiss_notification_banner(
                 read, observe_notification, notification_key, sample, original, notification_observer_sha256,
-                deadline=capture_deadline, input_idle=not button_down, evidence=dismissal, edge=edge)
+                deadline=capture_deadline, input_idle=not button_down, evidence=dismissal,
+                fixture_control=notification_control, edge=edge)
+            if notification_control:
+                if dismissal.get('activated') is not True or dismissal.get('confirmed_absent') is not True:
+                    raise RuntimeError('controlled notification did not reach its actual public Close endpoint')
+                receipt['notification_control']['closed_by_public_button'] = True
             while time.monotonic() < capture_deadline:
                 attempts += 1
                 diagnostic.update(attempts=attempts, stage='png-acquire',
@@ -1032,7 +1062,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         ready('scroll', grip, extra=heights_moved)
         button(False)
         heights = ready('scroll', extra=heights_moved)
-        capture('10-column-height', heights, 'beta')
+        capture('10-column-height', heights, 'beta', notification_control=True)
         # Super+] on the shared, focused Beta expels it into a new column on
         # the right with the column's width; both are full height again.
         if heights['inventory']['state']['focused'] != stacked['beta']['id']:

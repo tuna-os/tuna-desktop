@@ -1,8 +1,7 @@
 diff --git a/src/backend/renderer/utils/wayland.rs b/src/backend/renderer/utils/wayland.rs
-index bc8b0c70..2f2d84f9 100644
 --- a/src/backend/renderer/utils/wayland.rs
 +++ b/src/backend/renderer/utils/wayland.rs
-@@ -317,6 +317,17 @@ impl RendererSurfaceState {
+@@ -333,6 +333,28 @@ impl RendererSurfaceState {
          self.buffer.as_ref()
      }
  
@@ -10,13 +9,24 @@ index bc8b0c70..2f2d84f9 100644
 +    /// although the client sent nothing new: the buffer reads differently
 +    /// now (e.g. its colour state or YCbCr conversion changed), so the
 +    /// next draw imports it anew. Without a buffer this does nothing.
++    ///
++    /// A `wl_shm` buffer already released by
++    /// [`RendererSurfaceState::release_imported_shm_buffer`] keeps its textures:
++    /// the client may be drawing its next frame into it, so they are the only
++    /// copy of this one. Only the damage is added.
 +    pub fn invalidate_buffer(&mut self) {
 +        if let Some(size) = self.buffer_dimensions {
 +            self.damage.add([Rectangle::from_size(size)]);
-+            self.textures.clear();
++            let released = self
++                .buffer
++                .as_ref()
++                .is_some_and(|buffer| buffer.inner.released.load(Ordering::Relaxed));
++            if !released {
++                self.textures.clear();
++            }
 +        }
 +    }
 +
-     /// Gets a reference to the texture for the specified renderer context
-     pub fn texture<T>(&self, id: ContextId<T>) -> Option<&T>
-     where
+     /// Sends `wl_buffer.release` for the attached buffer now instead of when another
+     /// buffer replaces it, if it is a `wl_shm` buffer the renderer context `id` has
+     /// imported. Returns whether the release was sent.

@@ -1,0 +1,2 @@
+2026-11-02T04:54:50.1542732Z tuna-vm-lane: V-LIFECYCLE FAIL: tour/lifecycle failed: guest lifecycle brightness-contract failed (exit=1)
+2026-11-02T04:54:50.6624767Z tuna-vm-lane: FAILED V-LIFECYCLE (after 26s of 900s)

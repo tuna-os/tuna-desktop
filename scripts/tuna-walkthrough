@@ -9,15 +9,20 @@
 #   scripts/tuna-walkthrough regen [proof arguments...]
 #   scripts/tuna-walkthrough refresh VISUAL_ALL --run-id ID [--merge-sha SHA] [--dest DIR] [--branch B] [--attempt N]
 #   scripts/tuna-walkthrough freshness [--dest DIR] [--expect-head H] [--expect-tree T] [--expect-merge M]
+#   scripts/tuna-walkthrough receipt|intake [artifact roots...] [identity flags]
+#   scripts/tuna-walkthrough freshness --bundle KIND [identity flags]
+# Canonical media: see `scripts/lib/maintained_media.py --help` for the exact
+# current-run producer receipt, independent identity pins and destination rules.
+# Legacy build/regen/visual-refresh are staging-only diagnostics, not promotion.
 #
 # docs/walkthrough.tsv lists each feature: an id, the proof frame that
 # shows it, its section, title, caption and parity-ledger row. `build`
 # copies those frames out of a tuna-gtk-shell-proof artifact directory
-# into DIR/walkthrough/<id>.png and writes DIR/walkthrough.md (DIR
-# defaults to docs/); a frame the proof no longer takes fails the build,
-# so the walkthrough cannot go stale silently. `page` writes the
-# markdown only; `check` fails when docs/walkthrough.md or its images
-# disagree with the manifest. `regen` runs the proof first.
+# into DIR/walkthrough/<id>.png and writes DIR/walkthrough.md (staging
+# defaults to target/walkthrough); every listed source must exist. These
+# legacy diagnostics do not assert current installed-native proof. `page`
+# writes markdown only; `check` checks the page and frame existence,
+# NOT freshness. `regen` runs the proof first; canonical intake is separate.
 #
 # `refresh` rebuilds the images ONLY from exact, fully successful
 # visual-capture artifacts: VISUAL_ALL holds downloaded visual-<stage>
@@ -37,12 +42,31 @@ set -eu
 
 unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+case "${1:-}" in
+    receipt|intake|source-inputs) exec python3 "$ROOT/scripts/lib/maintained_media.py" "$@" ;;
+    refresh)
+        if [ -f "${2:-}/media-receipt.json" ]; then
+            shift
+            exec python3 "$ROOT/scripts/lib/maintained_media.py" intake "$@"
+        fi
+        ;;
+    freshness)
+        for argument in "$@"; do
+            case "$argument" in
+                --bundle|--bundle=*) exec python3 "$ROOT/scripts/lib/maintained_media.py" "$@" ;;
+            esac
+        done
+        ;;
+esac
 MANIFEST="$ROOT/docs/walkthrough.tsv"
 VISUAL_MAP="$ROOT/docs/walkthrough-visual.tsv"
 DEST="$ROOT/docs"
+case "${1:-}" in
+    build|regen|refresh) DEST="$ROOT/target/walkthrough" ;;
+esac
 
 usage() {
-    sed -n '2,35p' "$0"
+    sed -n '2,40p' "$0"
 }
 
 # Manifest rows without comments or blank lines.
@@ -73,9 +97,20 @@ HEAD
     } >"$1"
 }
 
+staging_only() {
+    python3 - "$ROOT" "$DEST" <<'STAGING'
+from pathlib import Path
+import sys
+root, dest = (Path(value).resolve() for value in sys.argv[1:])
+if dest.is_relative_to(root / "docs"):
+    sys.exit("tuna-walkthrough: legacy copies cannot overwrite maintained or historical docs; use receipted intake")
+STAGING
+}
+
 build() {
     [ "$#" -ge 1 ] || { usage >&2; exit 1; }
     ARTIFACTS="$1"
+    staging_only
     mkdir -p "$DEST/walkthrough"
     rows | while IFS="$(printf '\t')" read -r id frame _rest; do
         if [ ! -f "$ARTIFACTS/$frame" ]; then
@@ -137,16 +172,19 @@ refresh() {
     [ -n "$bundle" ] || { echo "tuna-walkthrough: refresh needs VISUAL_ALL" >&2; exit 1; }
     [ -d "$bundle" ] || { echo "tuna-walkthrough: no such bundle $bundle" >&2; exit 1; }
     [ -n "$run_id" ] || { echo "tuna-walkthrough: refresh needs --run-id" >&2; exit 1; }
+    staging_only
     PY_REFRESH=/usr/bin/python3
     [ -x "$PY_REFRESH" ] || PY_REFRESH=python3
     BUNDLE="$bundle" DESTDIR="$DEST" MANIFEST_TSV="$MANIFEST" VISUAL_TSV="$VISUAL_MAP" \
         RUN_ID="$run_id" MERGE_SHA="$merge_sha" BRANCH="$branch" ATTEMPT="$attempt" \
+        PYTHONPATH="$ROOT/scripts/lib${PYTHONPATH:+:$PYTHONPATH}" \
         "$PY_REFRESH" - <<'REFRESH'
 import datetime
 import hashlib
 import json
 import os
 import sys
+from maintained_media import media
 
 bundle = os.environ["BUNDLE"]
 dest = os.environ["DESTDIR"]
@@ -201,10 +239,9 @@ for stage, prov in provenance.items():
     if got_run != run_id:
         fail("stage %s pins run %s, not %s" % (stage, got_run or "none", run_id))
 attempts = {str((p.get("image") or {}).get("github_run_attempt") or "") for p in provenance.values()}
-attempts.discard("")
-if len(attempts) > 1:
-    fail("mixed attempts across stages: %s (attempts are separate sessions)" % sorted(attempts))
-if attempt and attempts and attempt not in attempts:
+if "" in attempts or len(attempts) != 1:
+    fail("mixed attempts or missing attempt across stages")
+if attempt and attempt not in attempts:
     fail("pinned attempt %s does not match bundle attempt %s" % (attempt, sorted(attempts)))
 heads = {(p.get("source") or {}).get("built_head_sha") for p in provenance.values()}
 if len(heads) != 1 or None in heads:
@@ -301,6 +338,8 @@ for ident in want:
     plan.append((ident, stage, src, meta.get("label"), meta.get("duplicate_of")))
 if problems:
     fail("%d frame(s) unusable:\n  %s" % (len(problems), "\n  ".join(problems)))
+for source_path in sorted({entry[2] for entry in plan}):
+    media(source_path)
 
 out_images = os.path.join(dest, "walkthrough")
 os.makedirs(out_images, exist_ok=True)
@@ -332,6 +371,8 @@ manifest = {
     "run_id": run_id,
     "attempt": sorted(attempts)[0] if attempts else None,
     "branch": branch,
+    "environment": "nested-visual-diagnostic",
+    "installed_signed_release_qualified": False,
     "source": {
         # The exact built tree the frames were captured from.
         "built_head_sha": built_head,
@@ -380,6 +421,9 @@ freshness() {
             *) echo "tuna-walkthrough: unknown freshness argument $1" >&2; exit 1 ;;
         esac
     done
+    # Canonical freshness always requires the new run/attempt/image/outcome
+    # contract; legacy self-consistency reports are staging diagnostics only.
+    staging_only
     if [ -z "$expect_head" ]; then
         expect_head="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
     fi
@@ -390,12 +434,10 @@ freshness() {
     [ -x "$PY_FRESH" ] || PY_FRESH=python3
     DESTDIR="$DEST" MANIFEST_TSV="$MANIFEST" EXPECT_HEAD="$expect_head" \
         EXPECT_TREE="$expect_tree" EXPECT_MERGE="$expect_merge" \
-        REPO_ROOT="${TUNA_WALKTHROUGH_REPO_ROOT:-$ROOT}" \
         "$PY_FRESH" - <<'FRESH'
 import hashlib
 import json
 import os
-import subprocess
 import sys
 
 dest = os.environ["DESTDIR"]
@@ -444,38 +486,10 @@ print("tuna-walkthrough: manifest run %s attempt %s built tree %s event %s" % (
 print("tuna-walkthrough: expected tree %s head %s merge %s" % (
     expect_tree[:12], (expect_head[:12] if expect_head else "(any)"),
     (expect_merge[:12] if expect_merge else "(any)")))
-def walkthrough_only_drift(recorded, expected):
-    """True when both trees resolve locally and differ only in the
-    walkthrough's own managed paths (the adopt commit itself). Any git
-    failure fails closed to False."""
-    try:
-        out = subprocess.run(
-            ["git", "-C", os.environ.get("REPO_ROOT", "."),
-             "diff", "--no-commit-id", "--name-only", "-r", recorded, expected],
-            capture_output=True, text=True, timeout=60)
-    except Exception:
-        return False
-    if out.returncode != 0:
-        return False
-    names = [line for line in out.stdout.splitlines() if line.strip()]
-    if not names:
-        return True
-    return all(name == "docs/walkthrough.md" or name.startswith("docs/walkthrough/")
-               for name in names)
-
-
-tree_ok = bool(recorded_tree) and (
-    recorded_tree == expect_tree or walkthrough_only_drift(recorded_tree, expect_tree))
-head_ok = True
-if expect_head:
-    head_ok = bool(recorded_head) and (
-        recorded_head == expect_head or walkthrough_only_drift(recorded_head, expect_head))
-merge_ok = True
-if expect_merge:
-    merge_ok = (recorded_merge == expect_merge)
+tree_ok = bool(recorded_tree) and recorded_tree == expect_tree
+head_ok = not expect_head or (bool(recorded_head) and recorded_head == expect_head)
+merge_ok = not expect_merge or recorded_merge == expect_merge
 source_ok = tree_ok and head_ok and merge_ok
-if tree_ok and recorded_tree != expect_tree:
-    print("tuna-walkthrough: recorded tree differs from expected only in walkthrough paths (adopt drift)")
 if not recorded_tree:
     source_note = "no recorded tree identity"
 elif not tree_ok:

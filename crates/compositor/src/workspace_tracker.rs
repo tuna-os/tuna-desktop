@@ -48,6 +48,28 @@ impl WorkspaceTracker {
             .collect()
     }
 
+    /// Leases that count as occupying their workspace, as GNOME 51's
+    /// `_checkWorkspaces` counts a recent dialog removal or a live
+    /// startup sequence: a leased last workspace gets an empty tail.
+    pub fn occupying_workspaces(&mut self, now: Instant) -> Vec<u32> {
+        self.removed_dialogs.retain(|_, expiry| *expiry > now);
+        self.removed_dialogs
+            .keys()
+            .chain(self.startup.values())
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Explicit keep-alive leases (the departed-workspace grace): the
+    /// workspace survives compaction but is still empty, so it never
+    /// pads a new empty tail after itself.
+    pub fn retained_workspaces(&mut self, now: Instant) -> Vec<u32> {
+        self.keep_alive.retain(|_, expiry| *expiry > now);
+        self.keep_alive.keys().copied().collect()
+    }
+
     pub fn next_deadline(&self) -> Option<Instant> {
         self.removed_dialogs
             .values()

@@ -11,6 +11,22 @@ and on GitHub-hosted runners for forks; the steps and assertions are the
 same on both. See [CI runners](ci-runners.md) for what runs where and the
 switch back to GitHub-hosted runners.
 
+## Slideshow paint identities
+
+`/usr/bin/python3 scripts/tests/test_stock_slideshow_proof.py` exercises the
+stock slideshow proof's deadline and receipt boundaries. Paint receipts
+carry structured file identities: canonical path, device/inode/size,
+mtime/ctime pairs and the cached 32-byte SHA-256 digest. The consumer
+checks live regular-file metadata and content, including metadata before
+and after reading and the path's final identity. It does not parse Rust
+`Debug` output or accept metadata-only identity after the bytes change.
+
+The real `portal-security` slideshow journey remains required: original
+session ownership, the independent GNOME reference, naturally advancing
+static/blend phases, cycle wrap, restart, and every timing and pixel
+threshold are unchanged. Boundary tests are not graphical qualification.
+
+
 ## Which lanes a pull request runs
 
 Every push to `main`, the nightly schedule and `workflow_dispatch` run
@@ -27,7 +43,11 @@ base, and picks the proof lanes the change can affect:
   lanes whose artifacts it needs. `scripts/ci-select-lanes` (`OWNED` and
   `NO_LANE`) is the authoritative, ordered mapping.
 - a lane's own proof script, reference fixtures or packaging: that lane
-  (plus the lanes whose artifacts it needs).
+  (plus the lanes whose artifacts it needs). A `scripts/tests/` file edit
+  selects the lane whose job runs that file (for example `gtk-shell` for
+  `test_notify_callback_contract.py`); a test only `check` runs selects none.
+  `WorkflowSync.test_lane_run_tests_select_their_lane` fails when a lane job
+  runs a test the selector does not map.
 - a packaged conffile (`share/pam.d/`, installed as `/etc/pam.d/tuna-lock`):
   `journey`, whose disposable Debian lifecycle fails when its bytes drift
   from the released package's, plus the core lanes and every package
@@ -54,13 +74,20 @@ skipped. To run every lane on a branch, dispatch `ci` on it.
 The `orca-speech` CI job builds Ubuntu Orca with Tuna's package-owned password
 feedback correction before running the unchanged `scripts/tuna-orca-speech-proof`.
 It uses the canonical `tuna-os/tunaos-packages` factory at immutable commit
-`c0998b94bd7b4fbc67360c239e439de6debf539b`, in a fresh `RUNNER_TEMP` checkout
+`01d74f3c354fe8219ccf21acd4122273b6984588`, in a fresh `RUNNER_TEMP` checkout
 with full history for the recipe's `SOURCE_DATE_EPOCH`. Native APT installs the
 built `orca_50.3-0ubuntu0.1+tuna1_all.deb`; there is no published-package fallback.
 The existing `orca-speech` artifact retains `native-orca-factory.log` and
 `native-orca-package.txt` (factory commit, source epoch, DEB SHA-256, installed
 version and application-script package ownership). This is nested speech-proof
 evidence, not package or image qualification.
+
+This factory revision includes the executable-mode fix from
+[`tunaos-packages#960`](https://github.com/tuna-os/tunaos-packages/pull/960).
+The workflow executes the runner directly through `env`; the factory tracks
+that entry point as `100755` and tests direct execution with Bats.
+The previous pin, `c0998b94bd7b4fbc67360c239e439de6debf539b`, tracked it as
+`100644`, so native builds stopped with exit 126 before any speech proof.
 
 ## Dependency caches
 
@@ -152,6 +179,54 @@ settings local builds need (`just` lists the recipes):
 | `just clean` / `just gc` | deletes this worktree's target / frees disk (below) |
 | `just disk-guard [--watch [s]]` | frees disk now, or keeps checking every `s` seconds (below) |
 
+The real-client native DnD regressions in
+`crates/compositor/tests/data_device.rs` run with
+`cargo test -p tuna-compositor --test data_device native_`. They cover a valid
+press serial followed by held-button motion to another client before
+`start_drag`, plus same-surface and source-less starts. With no subsequent input
+motion, protocol barriers must already deliver target-local Enter/Motion and,
+when a source exists, its MIME offer and actions. Wrong-client events, invalid
+serial acceptance, and cross-client source-less offers are rejected; the initial
+offer must still negotiate a valid drop and Finish. Existing cancellation,
+source/icon lifetime, and touch controls remain in the same test target.
+This matches Mutter 51's initial-focus path:
+[attaching the drag handler immediately invalidates focus](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-input.c#L288-L325),
+and [drag focus sends the destination its offer while restricting source-less drags to the origin client](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-data-device.c#L337-L397).
+
+`scripts/tuna-gtk-shell-proof --window-leak-only --artifacts DIR` runs
+G-WINDOW-LEAK (#1088): after five warm-up windows, 100 libadwaita windows
+(`TUNA_WINDOW_LEAK_WINDOWS` sets the count) are opened and closed, odd ones
+with Alt+F4 (the app destroys its window; the close effect plays) and even
+ones by killing the app (its connection closes with every object alive).
+The compositor's `Pss_Anon` must stay within 8 MiB, and its open
+descriptors within two, of the warm state, a bound independent of the
+number of windows; each window used to keep about 1.65 MB.
+`scripts/lib/tuna-resource-sample.py` reads them from `/proc` and leaves
+`window-leak-{before,after}.json` and `window-leak-diff.txt` in the
+artifacts. The compositor side is `cargo test -p tuna-compositor --test
+window_teardown`: a toplevel with and without an `xdg_dialog_v1`, a
+subsurface, a grabbing popup and uploaded shm buffers, closed by destroying
+every object or by disconnecting, must drop every surface's server-side
+data, and the window manager must name the window nowhere.
+
+`scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts DIR` runs the same
+held-button hover and persisted reorder assertions as the full GTK proof,
+without the unrelated earlier gates. It adds no target motion or timing
+relaxation. CI runs this slice with its freshly built compositor and shell;
+the no-post-start-motion wire tests establish the precise protocol ordering.
+
+`scripts/tuna-gtk-shell-proof --search-leak-only --artifacts DIR` runs
+G-SEARCH-LEAK (#1084): after five warm-up searches, 50 overview searches
+with results (`TUNA_SEARCH_LEAK_SEARCHES` sets the count), each typed with
+real keys and closed with Escape, must leave the shell's
+`memfd:gdk-wayland` mappings and the shell's and compositor's open
+descriptors exactly where they were. `scripts/lib/tuna-resource-sample.py`
+reads them from `/proc` and leaves `search-leak-{before,after}.json` in the
+artifacts. The compositor side is `cargo test -p tuna-compositor --test
+buffer_release`: an uploaded `wl_shm` buffer comes back with
+`wl_buffer.release` at once, as Mutter's do, and its pool closes once the
+client destroys it and the surface moves on to another buffer.
+
 Every build uses its own checkout's `target/` (an inherited
 `CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one) and no
 incremental state, with half the host's CPUs as jobs. Builds from every
@@ -159,6 +234,26 @@ worktree share two machine-wide build slots (one per 8 GiB of RAM, at most
 two: `/tmp/tuna-local-build.slot.N`, `TUNA_BUILD_SLOTS`), so two run at
 once and the rest queue instead of exhausting memory; a cold
 `cargo test --workspace` build at six jobs peaks at 6.4 GiB.
+
+Nothing waits forever. These defaults bound every recipe:
+
+| What | Default | Knob |
+|---|---|---|
+| `just build`, `test`, `clippy` | stopped after 60 min: TERM to cargo's process group (every `rustc` and test binary), KILL 30 s later, slot freed, exit 124 with `TIMED OUT` | `TUNA_BUILD_TIMEOUT` (minutes) |
+| `just proof <name>` | stopped the same way after its CI job's `timeout-minutes` (gtk-shell-proof: 60), at least 45 min; leftovers it started are reaped | `TUNA_PROOF_TIMEOUT` (minutes) |
+| waiting for a build or proof slot | gives up after 120 min with exit 75 | `TUNA_SLOT_WAIT` (minutes) |
+| a slot held past its timeout + 15 min | `scripts/tuna-reaper` reports it and kills the holder, the processes below it with the process groups they lead, and everything carrying its `TUNA_PROOF_RUN` marker | run by `scripts/tuna-disk-guard` on every pass |
+
+Each slot file's mtime records when it was taken, and its contents the
+command's timeout in minutes (`scripts/lib/tuna-semaphore`),
+which is what the reaper measures. `scripts/lib/tuna-timeout MINUTES LABEL
+COMMAND...` is the wrapper the recipes use; Ctrl-C still reaches the
+command's group.
+
+The reaper checks each holder's `/proc/PID/fdinfo` for the actual flock.
+It does not require a `/proc/locks` entry: PID namespaces can hide a live
+inherited lock after the short-lived `flock` utility exits. Merely opening an
+old slot file does not make a process eligible for retirement.
 
 When `sccache` is installed (`cargo install --locked sccache`, or a
 release binary on `PATH`) every recipe compiles through it, so a fresh
@@ -208,9 +303,9 @@ Cleanup is automatic where it is safe:
   proof's timing-sensitive stages fail intermittently. Proofs that touch
   machine-wide state (vkms, seatd, uinput, `sudo` or apt, like
   `drm-smoke`), and scripts that don't start an Xvfb, run one at a time
-  (`/tmp/tuna-local-proof.lock`). A proof's own `cargo build` waits for a
-  build slot. A proof still running after 45 minutes
-  (`TUNA_PROOF_TIMEOUT`) is stopped and its slot freed. Proofs that need
+  (`/tmp/tuna-local-proof.lock.0`). A proof's own `cargo build` waits for a
+  build slot. A proof still running past its timeout (above) is stopped
+  and its slot freed. Proofs that need
   another proof's prebuilt binaries (`--bin-dir`) are refused with the
   name of their caller. When the proof ends, pass or fail, any process it
   started is stopped, including daemons that detached from it
@@ -295,6 +390,11 @@ Clippy runs with `-D warnings`, so any warning fails CI.
 (`hundred_fault_runs_keep_apps_alive_and_resync` in
 `crates/compositor/tests/recovery.rs`) and needs no display or GPU.
 
+After rendering, every backend flushes queued Wayland events before sleeping.
+A frame callback must not wait for an unrelated client request or another loop
+wake to reach its client. This delivery flush does not schedule another render;
+actual presentation and animation cadence still require graphical proof.
+
 The real Wayland-wire pointer tests in `crates/compositor/tests/move_resize.rs`
 cover a window mapping beneath a stationary pointer (#425). The scene repick
 must send `wl_pointer.enter` before any press, the first click must arrive
@@ -317,6 +417,13 @@ native ownership and private PAM retirement cases. Its PID readiness
 markers are published only after complete PID contents are written.
 Artifacts retain supervised test-client panics and early compositor exit
 status; a compiled test or cache hit is not a substitute for these cases.
+The native probe keeps a libc `getenv` reader running across launch and
+teardown and asserts the compositor's `WAYLAND_DISPLAY` never changes.
+The real supervised control client still receives the private display.
+This guards the startup race seen in #919: changing process environment
+after GIO workers start can free the `environ` array while native
+`getenv` traverses it. Child commands, including the bell player, receive
+their display explicitly; no startup or teardown environment rewrite is safe.
 
 The focused private-helper proof is
 `TUNA_REQUIRE_PAM_WRAPPER=1 cargo test -p tuna-compositor --test pam_helper`.
@@ -367,6 +474,13 @@ and writes frames, logs, and usually an `assertions.txt` into the
 artifacts directory. A nonzero exit is a failure; the frames are for human
 review. CI shellchecks each script before running it.
 
+Magnifier focus checks wait for the probe's focused entry to have allocated
+widget bounds before comparing its GTK geometry with the live AT-SPI extent.
+The OSK show/hide and lock checks wait for their asynchronous watcher to
+record the corresponding transition before using its timestamp for timing or
+no-remap assertions. These readiness conditions use the existing gate deadlines;
+missing geometry or watcher transitions remain failures, not skipped assertions.
+
 The native grid-drag cancellation proof holds the pointer button until both
 the compositor reports cancellation and a fresh, complete, owner-bound AT-SPI
 tree restores the normal page arrow without a drag preview. Widget removal
@@ -384,7 +498,7 @@ cannot satisfy the gate.
 | `gtk-shell` | `TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts` | gtk4-layer-shell (`scripts/ci-install-gtk4-layer-shell`), `xwayland pipewire wireplumber at-spi2-core python3-pyatspi fonts-cantarell ffmpeg libpam-wrapper` and the GStreamer PipeWire plugins; see the job for the full list | GTK shell panel, calendar, quick settings, overview, notifications, lock and unlock, AT-SPI trees; writes `assertions.txt` |
 | `gtk-shell` | `scripts/tuna-scale-proof --artifacts gtk-shell-artifacts/scale` | as above | The same session at 150 percent scale; writes `assertions.txt` |
 | `gtk-shell` | `scripts/tuna-slow-portal-proof --artifacts gtk-shell-artifacts/slow-portal` | as above | On a dbus-daemon bus whose portal activation hangs, the shell owns `org.gnome.Shell` within 15 s (40 s on GTK before 4.17, whose GtkApplication always waits on the inhibit portal) and makes no GDK portal call; writes `assertions.txt` |
-| `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg kmod`; run `scripts/ci-install-vkms` after `apt-get update` to ensure vkms for the running kernel | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe` and seatd |
+| `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg kmod python3-evdev python3-gi gir1.2-gtk-4.0 gsettings-desktop-schemas`; run `scripts/ci-install-vkms` after `apt-get update` to ensure vkms for the running kernel | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe`, seatd and uinput |
 
 `app-content` and `scroll-proof` download Playwright and Chromium into a
 temporary venv on every run, so they need network access.
@@ -411,6 +525,55 @@ includes vkms without a separate extra-modules package. No usable candidate
 or a still-missing module fails setup, and package installation errors are
 fatal. Module loading and the real vkms device and presentation assertions
 remain mandatory in the smoke test.
+
+The smoke test also drives real libinput with uinput devices (ADR 0008),
+so it needs `python3-evdev` and the GTK 4 PyGObject client packages the
+CI job installs. `D-TABLET` emulates a Wacom Cintiq 22HD
+(`scripts/lib/tuna-uinput-tablet.py`). `D-TOUCHPAD-SWIPE` (P-IN-02)
+emulates a Synaptics TM3053-004 clickpad as the kernel's rmi4 driver
+creates it (`scripts/lib/tuna-uinput-touchpad.py`, the capabilities of
+libinput's `litest-device-synaptics-rmi4.c`). The kernel timestamps its
+finger motion and libinput classifies it as a touchpad and turns it into
+pointer motion, two-finger scrolling and `LIBINPUT_EVENT_GESTURE_SWIPE_*`.
+The phase then checks GNOME 51's swipe trackers against the compositor
+state: up and down open and close the overview, which follows the held
+fingers; left and right switch workspace; a slow half swipe settles
+back; a short fast flick completes; a long swipe from the desktop stops
+at the window picker, and from the picker the swipe follows into the app
+grid (the shell's grid surface maps and eases on release) and back; in
+the open overview, with four fixed workspaces (mutter's schema is
+compiled in when the host lacks it), a sideways swipe scrolls the
+workspaces under the fingers and a fast flick settles two or more on;
+four fingers are the shell's too; scrolling, and no swipe, reaches a GTK
+4 client; turning natural-scroll off reverses the gestures; and the
+swipe follows under reduced motion and with animations off. The emulator
+also runs on its own and reads
+commands (`down N`, `move DX DY MS`, `hold MS`, `up`, `swipe N DX DY MS
+[PAUSE]`, `scroll`, `tap`, `click`) on stdin, in millimetres and
+milliseconds. Other phases can import `create_touchpad()` from it.
+
+Private colord startup failures in `D-COLORD` retain `colord-startup.txt`:
+the intended user/group, private bus and binary identity, boundary markers
+before namespace creation, tmpfs mount, privilege drop and daemon exec, the
+actual mounted store ownership/mode, and wrapper/supervisor/child PIDs.
+When the wrapper has exited (its world-readable `/proc` entry is gone or a
+zombie; never an unprivileged `kill -0`, which a live root-owned sudo wrapper
+answers with EPERM), the harness waits once and retains its exact shell
+status separately from the supervisor's observed child status. A status
+above 128 includes a possible signal mapping, not an assertion of cause.
+Otherwise readiness still fails at the unchanged 30-second deadline, after
+writing the same receipt.
+`colord.log` contains only the daemon's original stdout/stderr;
+`colord-launch.log` contains launcher errors. Failure receipts also include
+bounded raw kernel journal/ring-buffer output with reader statuses (including
+permission/unavailability errors). These records do not diagnose an OOM or
+authentication failure by themselves; ring-buffer output can predate startup.
+The real private-bus readiness assertion remains mandatory, without restart,
+store permission changes or an authentication bypass.
+
+The startup boundary regression tests use fake sudo/unshare/mount/setpriv
+and daemon commands, not a real privileged mount:
+`python3 -m unittest discover -s scripts/tests -p test_colord_startup.py`.
 
 ## GNOME Core applications: installed-image evidence
 
@@ -501,6 +664,15 @@ installed and checks that the display manager logs into the Tuna Desktop
 hardware session. A CI-only guest service probes the calendar and portal
 on the test user bus; the runner reads the serial log and takes QMP
 screendumps from outside.
+
+The paired native GNOME/Tuna reference consumers separately bind the original
+compositor's open DRM character devices to their actual PCI ancestor and QMP
+topology. The graphics driver's name comes from the read-only kernel
+`DRM_IOCTL_VERSION` query on that same character device, not from its sysfs
+parent's `driver` link: the latter can correctly name the `virtio-pci` bus
+driver rather than the DRM `virtio_gpu` driver. Missing, changed, non-DRM or
+malformed device observations fail admission; the required virtio GPU,
+connected output and preserved PCI checks remain unchanged.
 
 1. It builds `packaging/marlin/Containerfile` (Marlin GNOME 51 plus the
    Tuna Desktop Arch package from `arch-package`) with rootful podman. On top of
@@ -648,6 +820,25 @@ Proof `G-ANIMATION-CLOCK` samples the overview this way at 125 and 250 ms
 in both directions. `G-ANIMATIONS-OFF` and `G-INTROSPECT-MOTION` check the
 live motion policy: animations off snaps everything, Reduced Motion
 (fade-only) snaps overview and strip motion but keeps the idle-shield fade.
+A held touchpad swipe is not an animation. As in GNOME 51 (overview.js:359-380,
+animationUtils.js:23-33), the overview follows the fingers under every
+policy, across the desktop, the window picker and the app grid, and so do
+the overview's workspaces under a sideways swipe. The release eases under
+full motion and Reduced Motion, with the slow-down factor applied, and
+lands at once with animations off (`G-SWIPE-REDUCED-MOTION`,
+`G-SWIPE-APPGRID`, `G-SWIPE-OVERVIEW-SCROLL`, `D-TOUCHPAD-SWIPE`).
+
+The GTK shell reads the same clock file (`crates/shell-gtk/src/anim_clock.rs`)
+for the animations proofs sample from its side. With `TUNA_TRANSIENT_TRACE`
+set, the workspace switcher popup and the Activities dots log each fade,
+swipe phase and changed frame (`tuna-shell-gtk: ws-popup ...`,
+`tuna-shell-gtk: ws-dots ...`, one write per line), and
+`scripts/lib/ws-anim-proof.py` recomputes GNOME 51's values from
+`workspaceSwitcherPopup.js` and `panel.js` to check them. The popup's
+600 ms hold is measured on this clock too, so a frozen clock holds it.
+Gates `G-WS-POPUP-CLOCK`, `G-WS-DOTS-CLOCK`, `G-WS-DOTS-SWIPE` and their
+`-POLICY` variants sample them; the swipe gates check the dots against the
+release time the compositor records for the strip.
 
 The workspace popup's 100 ms fade starts at the display/fade request, not
 the first GTK tick. A delayed first frame therefore samples the fade's
@@ -665,6 +856,28 @@ samples them at 0, 50 and 100 ms of the thumbnails' fade in and 50 ms into
 the fade out (Alt+Escape, which cancels without moving focus), where GNOME's
 ease-out quad gives 0, 191/255 and 1, then 64/255. The grid-cancel comparison
 slice skips the sampling: its old binaries predate the published alphas.
+
+The native grid cancellation proof admits its held drag only after the
+neighboring-page preview is showing **and** the normal page arrows have
+disappeared. GTK creates the preview before its arrow fade finishes, so
+preview presence alone is not a settled first-page tree. This transition
+uses the existing 10-second preview budget; the owner-bound geometry,
+neutral pointer, unchanged page contents and pre-release cancellation
+checks remain mandatory. A gap chosen before the drag is provisional:
+the proof selects again from the live preview allocation, moves the held
+pointer there within the same budget, then validates a fresh tree. This
+also covers old comparison binaries whose preview occupies more than
+the nominal edge width; no guessed hint clipping is accepted.
+
+The edge-tiling-off restore gesture waits for the native move owner,
+`interactive_move_window`, and delivery of its seed motion before sending
+the restore motions. This excludes a stale grab from the preceding drag.
+GTK must request the move while the pointer button is held; physical
+pointer delivery alone does not establish the client round trip. The
+admission snapshot is retained, and the final target is derived from its
+pointer and window geometry. Admission, final pointer delivery, button
+release and work-area restoration share the original 20-second restore
+budget. The owner observation is null while locked.
 
 ## Frame cost
 
@@ -693,6 +906,38 @@ it after a Num Lock change and before the next `gsettings set`. The
 `keyboard.keymap_generation` field goes up each time a keymap is
 applied. Wait for it after changing the input sources or `xkb-options`
 and before typing.
+
+## Settings bindings in unit tests
+
+Shell unit tests that read GSettings use
+`crates/shell-gtk/src/test_settings.rs`. `SettingsFixture::new(xml)`
+compiles a `<schemalist>` with `glib-compile-schemas --strict` into a
+temporary directory, and `settings(id)` opens it on a private memory
+backend, so no dconf, session bus or host schema is involved and
+parallel tests cannot see each other's writes. Create the fixture inside
+`glib::MainContext::with_thread_default` and use `dispatch_until` when a
+test needs `changed` signals. `background_settings.rs` binds GNOME's
+background, interface and screensaver keys this way.
+
+## Shell state across session transitions
+
+`just proof session-sync-proof` runs the real nested runtime with a
+supervised `ControlClient` observer and a mapped xdg window. The existing
+trusted Rust-only probe injects sleep and seat notifications through the
+same internal handlers as logind and libseat; no IPC command or normal
+binary flag can inject them. The observer reconnects across pause and
+activation and checks that windows, workspaces and overview survive.
+Sleep must lock, dismiss overview and redact the window list. A shell
+disconnected throughout wake must reconnect into the current locked
+state, including when seat activation follows wake.
+
+The GTK CI lane runs this bounded proof and keeps `result.json` and
+`runtime.log` in the `session-sync-proof` artifact (built under
+`$RUNNER_TEMP`, so the later source-freeze gate sees a clean checkout). This qualifies
+runtime/control state propagation on **simulated notifications**, not
+physical VT switching, logind suspend delivery or S3. KMS scanout reset,
+libseat device-fd revocation and libinput resume still need a native
+seat/DRM VM or hardware proof; the nested backend has no such devices.
 
 The stock GNOME Settings journey (`tests/portal-reference/settings-run.sh`)
 instead uses a private **dconf** backend. Settings and Tuna's first-run
@@ -796,10 +1041,24 @@ show:
   never exits or panics and the shell never exits.
 
 `H-GROWTH` bounds the compositor and shell as the churn lane does: final
-PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32.
-Pull requests and dispatches run 4 rounds, nightly 30. The artifacts keep
-the compositor, shell and client logs, every step's outputs and window
-rectangles (`report.json`), the metrics and the state at a failure.
+PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32. Each
+round's sample in `metrics.jsonl` and `report.json` has, per process, the
+kernel's `Pss_Anon`/`Pss_File`/`Pss_Shmem` split, PSS by mapping kind
+(heap, anonymous, shared memory, GPU, files), fds and mappings
+(`scripts/lib/tuna_process_metrics.py`, shared with `scripts/tuna-stress`);
+the gate's line names the processes and kinds that rose most since round
+0. `smaps-round0-*` and `smaps-final-*` are each process's mappings after
+the first and the last round, `state-round0.json` the compositor state
+after the first, and every step in `report.json` has each process's PSS.
+Pull requests and dispatches run 4 rounds, nightly 30; a dispatch's
+`hotplug_rounds` input (and `churn_rounds` for the churn lane) runs
+another count, and its `hotplug_heaptrack` input runs the storm a second
+time with `--heaptrack`: the compositor and the shell record their
+allocation backtraces (`heaptrack/heaptrack-<name>-<pid>.zst`, read with
+`heaptrack_print`). That run is a diagnostic, since the profiler's memory
+counts in its `H-GROWTH`. The artifacts keep the compositor, shell and
+client logs, every step's outputs and window rectangles (`report.json`),
+the metrics and the state at a failure.
 
 To run it on a host with Linux 6.19+ and sudo, after building
 `tuna-compositor` and `tuna-shell-gtk`:
@@ -825,26 +1084,69 @@ Read `nested.log` in the artifacts directory first (`compositor.log` for
 retry a deterministic test until it passes: the timing rule in the
 [development guide](development.md#writing-a-test) applies.
 
-## Bounded nested stress
+## Nested stress and torture suite
 
-`nested stress` runs four concurrent Wayland GTK clients. Each round maps
-and destroys 400 windows; three warmup rounds settle renderer caches.
-After every measured round, Escape and Super must still change the
-compositor's overview state, and every destroyed window must disappear.
-The lane then sends 1,000 notifications and closes each over D-Bus.
+`nested stress` (`scripts/tuna-stress`, `.github/workflows/stress.yml`)
+runs the real compositor and GTK shell nested on Xvfb with a private
+session bus, a private system bus of service stubs
+(`scripts/lib/tuna-service-stubs.py`), a pam_wrapper unlock stack and the
+compositor started at systemd's user-session open-file limit (1024 soft).
+Phases, in order (`--phases` runs a subset):
 
-The per-change smoke uses ten measured rounds; nightly uses 300. The
-report retains PSS/RSS, file descriptors and descendant process counts
-for the compositor and supervised shell after each round. Final PSS must
-stay within warmup PSS × 1.25 + 64 MiB, and fd count within warmup + 32.
-These diagnostic bounds catch unbounded growth in this workload; they
-are separate from the GNOME performance targets in #73. A panic, lost
-input response, orphaned window or hung worker fails the lane. Logs,
-metrics, final state, assertions and the exact source revision are kept.
+- `churn`: four clients map and destroy 400 windows per round.
+- `popup`: four clients each map 60 nested (depth three) popups.
+- `protocol`: four live adversaries per mode (`scripts/lib/tuna-wayland-adversary.c`)
+  beside a healthy popup client: malformed opcodes, zero and huge buffers,
+  out-of-order destruction, invalid and never-acknowledged configures,
+  death mid-transaction, 5,000 unthrottled commits each, 300 freshly
+  written 2 MiB SHM buffers each, 1,000 connections held open at once, and
+  a seeded fuzzer: per attacker 100 sessions of up to 256 random requests
+  to every bound global and the objects they create, shaped by each
+  request's signature and kept valid in type and lifetime except one
+  request in 32 (wrong-typed, destroyed or null objects, edge integers);
+  requests that ended earlier sessions are picked less often, and every
+  request must be answered within 5 s (the day's seeds are in the report).
+- `dbus`: 1,000 notifications, 2,000 `ShowOSD` calls, accelerator grab and
+  ungrab floods (then a live grab fires and a departed caller's grab is
+  released), 300 tray items registered from their own connections and
+  pruned after leaving, and a search-provider query flood with every other
+  reply 2.5 s late.
+- `scale`: 40 `ApplyMonitorsConfig` scale changes while clients map.
+- `services`: NetworkManager, BlueZ and power-profiles stubs vanish (half
+  killed) and return ten times; the shell must read each returned daemon
+  again without restarting. `ibus-daemon` is killed five times under a
+  focused field: typing continues without it, and the IBus bridge must
+  focus the returned daemon's new input context.
+- `input`: 1,000 typed keys must arrive exactly once; 2,000 pointer moves;
+  a held key's repeat must stop when focus leaves, not resume on refocus
+  and not leak into the window that gains focus.
+- `swipe`: 60 touchpad swipes interrupted (restarted, Escape mid-gesture,
+  cancelled) must settle.
+- `lock`: Super+L under an active popup grab, mid-swipe; no key, motion or
+  press may reach the client while locked; unlocking with the PAM
+  password restores typing.
+- `shell`: the shell is SIGKILLed through its restart budget, then once
+  more; the recovery overlay's relaunch must bring it back while a client
+  survives and keeps input.
 
-Run it on a development host after building the compositor and GTK shell:
+Every phase ends by proving the input path (Escape and Super change the
+overview). PSS/RSS, fd and mapping counts for the compositor and its
+descendants are sampled before and after each phase, per process and with
+PSS split by mapping kind (heap, anonymous, shared memory, GPU, files), in
+`metrics.jsonl`; a failing growth gate names the phase that grew most and
+the process and kind that grew. Final PSS must stay within
+warmup × 1.25 + 64 MiB, fds within warmup + 32 and mappings within
+warmup × 1.25 + 1024. These diagnostic bounds catch unbounded growth;
+they are separate from the GNOME performance targets in #73. A panic,
+compositor exit, lost input response, orphaned window or hung worker
+fails the lane. Pull requests touching the suite run ten churn rounds;
+the nightly run uses 300.
+
+Run it after building the compositor, GTK shell, shell host (IBus bridge)
+and wallpaper helper:
 
 ```sh
+cargo build -p tuna-compositor -p tuna-shell-gtk -p tuna-shell-host -p tuna-wallpaper-svg
 scripts/tuna-stress --rounds 10 --out /tmp/tuna-stress-fresh
 ```
 
@@ -874,5 +1176,5 @@ cargo install cargo-fuzz --version 0.13.2 --locked
 cargo +nightly-2026-08-28 fuzz run control_body -- -max_total_time=60 -max_len=1048580 -timeout=5 -rss_limit_mb=2048
 ```
 
-This covers the decoder portion of #203. Wayland misuse, client churn,
-service failures and a measured long soak remain separate stress gates.
+This covers the control decoders of #203; Wayland request handlers are
+fuzzed live by the nested stress suite's `protocol` phase.

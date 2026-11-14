@@ -113,6 +113,16 @@ answers only NetworkManager's current unique owner.
 Search providers additionally cancel a query when a newer one starts
 (`providers.rs:1-13`).
 
+**Thunderbolt (`thunderbolt.rs`).** Like GNOME Shell's
+`status/thunderbolt.js`, the shell depends on boltd
+(`org.freedesktop.bolt` on the system bus, normally started by udev with
+`bolt.service`) for Thunderbolt devices. It enrols a newly connected
+device with `EnrollDevice(uid, "default", "none")` only when the session
+is unlocked and polkit already allows `org.freedesktop.bolt.enroll`;
+otherwise it posts GNOME's "Unknown" or "Unauthorized Thunderbolt
+device" notice. Without boltd the proxy has no owner, so nothing is
+enrolled, shown or logged.
+
 **Shared zbus edges (`shell-host`).** `NotificationBus` and `LockdownBus`
 expose `ensure()`, which tries to connect and own the name, and `poll()`.
 The owner calls them from its periodic tick. "No bus" and "name taken"

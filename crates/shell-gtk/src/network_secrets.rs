@@ -484,6 +484,9 @@ mod tests {
     use super::*;
     #[test]
     fn helper_output_is_bounded_and_the_process_is_reaped() {
+        // block_on on the default context acquires it; exclude the other
+        // dispatch-guard holders first.
+        let _dispatch = crate::test_dispatch_guard();
         let context = glib::MainContext::default();
         context
             .with_thread_default(|| {

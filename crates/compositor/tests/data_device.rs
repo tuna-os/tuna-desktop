@@ -207,6 +207,7 @@ struct ClipClient {
     keyboard: Option<WlKeyboard>,
     pointer: Option<wayland_client::protocol::wl_pointer::WlPointer>,
     buttons: Vec<u32>,
+    pointer_enters: usize,
     touch: Option<wayland_client::protocol::wl_touch::WlTouch>,
     touch_downs: Vec<u32>,
     cancelled: usize,
@@ -215,6 +216,12 @@ struct ClipClient {
     finished: usize,
     leaves: usize,
     drag_enter_serial: Option<u32>,
+    drag_enters: Vec<(WlSurface, f64, f64, Option<WlDataOffer>)>,
+    drag_motions: Vec<(f64, f64)>,
+    drag_events: Vec<&'static str>,
+    source_actions: Vec<wayland_client::protocol::wl_data_device_manager::DndAction>,
+    offer_actions: Vec<wayland_client::protocol::wl_data_device_manager::DndAction>,
+    chosen_actions: Vec<wayland_client::protocol::wl_data_device_manager::DndAction>,
     xdg_base: Option<XdgWmBase>,
     manager: Option<WlDataDeviceManager>,
     device: Option<WlDataDevice>,
@@ -235,6 +242,8 @@ struct ClipClient {
     selection: Option<WlDataOffer>,
     /// Mime types the peer requested from our source.
     sent_mimes: Vec<String>,
+    /// Bytes our clipboard source serves; `PASTE_BYTES` when unset.
+    payload: Option<Vec<u8>>,
     /// Primary offers announced to this client, in arrival order.
     primary_offers: Vec<ZwpPrimarySelectionOfferV1>,
     /// Mime types offered across all primary offers.
@@ -409,11 +418,28 @@ impl Dispatch<WlDataDevice, ()> for ClipClient {
     ) {
         use wayland_client::protocol::wl_data_device::Event as DeviceEvent;
         match event {
-            DeviceEvent::DataOffer { id } => state.offers.push(id),
+            DeviceEvent::DataOffer { id } => {
+                state.offers.push(id);
+                state.drag_events.push("offer");
+            }
             DeviceEvent::Selection { id } => state.selection = id,
             DeviceEvent::Drop => state.drops += 1,
             DeviceEvent::Leave => state.leaves += 1,
-            DeviceEvent::Enter { serial, .. } => state.drag_enter_serial = Some(serial),
+            DeviceEvent::Enter {
+                serial,
+                surface,
+                x,
+                y,
+                id,
+            } => {
+                state.drag_enter_serial = Some(serial);
+                state.drag_enters.push((surface, x, y, id));
+                state.drag_events.push("enter");
+            }
+            DeviceEvent::Motion { x, y, .. } => {
+                state.drag_motions.push((x, y));
+                state.drag_events.push("motion");
+            }
             _ => {}
         }
     }
@@ -433,8 +459,17 @@ impl Dispatch<WlDataOffer, ()> for ClipClient {
         _: &QueueHandle<Self>,
     ) {
         use wayland_client::protocol::wl_data_offer::Event as OfferEvent;
-        if let OfferEvent::Offer { mime_type } = event {
-            state.offered_mimes.push(mime_type);
+        match event {
+            OfferEvent::Offer { mime_type } => state.offered_mimes.push(mime_type),
+            OfferEvent::SourceActions { source_actions } => {
+                state
+                    .source_actions
+                    .push(source_actions.into_result().unwrap());
+            }
+            OfferEvent::Action { dnd_action } => {
+                state.offer_actions.push(dnd_action.into_result().unwrap());
+            }
+            _ => {}
         }
     }
 }
@@ -454,6 +489,11 @@ impl Dispatch<WlDataSource, ()> for ClipClient {
             SourceEvent::Cancelled => state.cancelled += 1,
             SourceEvent::DndDropPerformed => state.drop_performed += 1,
             SourceEvent::DndFinished => state.finished += 1,
+            SourceEvent::Action { dnd_action } => {
+                state
+                    .chosen_actions
+                    .push((*dnd_action).into_result().unwrap());
+            }
             _ => {}
         }
         if let SourceEvent::Send { mime_type, fd } = event {
@@ -461,7 +501,8 @@ impl Dispatch<WlDataSource, ()> for ClipClient {
             // Small payload: one write, then drop the fd so the
             // reader sees EOF.
             let mut file = std::fs::File::from(fd);
-            file.write_all(PASTE_BYTES).unwrap();
+            file.write_all(state.payload.as_deref().unwrap_or(PASTE_BYTES))
+                .unwrap();
         }
     }
 }
@@ -793,9 +834,15 @@ fn clipboard_copy_paste_round_trips_between_focused_clients() {
         &mut client_a,
         &mut queue_b,
         &mut client_b,
-        |a, _| !a.sent_mimes.is_empty(),
+        |a, _| a.sent_mimes.len() == 2,
     );
-    assert_eq!(client_a.sent_mimes, vec!["text/plain".to_owned()]);
+    // The first send was the clipboard manager's copy, requested when
+    // the selection was set (mutter's MetaClipboardManager); the second
+    // is the paste.
+    assert_eq!(
+        client_a.sent_mimes,
+        vec!["text/plain".to_owned(), "text/plain".to_owned()]
+    );
     // The request fd went over SCM at flush time; dropping our copy
     // leaves the source's write as the last writer, so EOF follows it.
     drop(write_end);
@@ -968,19 +1015,19 @@ impl Dispatch<wayland_client::protocol::wl_pointer::WlPointer, ()> for ClipClien
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wayland_client::protocol::wl_pointer::Event::Button {
-            serial,
-            state: button_state,
-            ..
-        } = event
-        {
-            if button_state
-                == wayland_client::WEnum::Value(
-                    wayland_client::protocol::wl_pointer::ButtonState::Pressed,
-                )
-            {
-                state.buttons.push(serial);
+        match event {
+            wayland_client::protocol::wl_pointer::Event::Enter { .. } => {
+                state.pointer_enters += 1;
             }
+            wayland_client::protocol::wl_pointer::Event::Button {
+                serial,
+                state:
+                    wayland_client::WEnum::Value(
+                        wayland_client::protocol::wl_pointer::ButtonState::Pressed,
+                    ),
+                ..
+            } => state.buttons.push(serial),
+            _ => {}
         }
     }
 }
@@ -1306,4 +1353,650 @@ fn native_source_less_same_client_drag_can_cancel_without_icon() {
 #[test]
 fn native_touch_source_less_same_client_drag_can_cancel_without_icon() {
     native_drag_case(true, false, false, false, true, true);
+}
+
+/// StartDrag arrives after the press (and possibly after motion under its
+/// implicit grab). Only protocol barriers follow: no input can manufacture the
+/// target's initial Enter/Motion, offer, or successful drop.
+fn stationary_native_drag_case(same_surface: bool, source_less: bool) {
+    use wayland_client::protocol::wl_data_device_manager::DndAction;
+
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    let (conn_a, mut queue_a, mut client_a) = clip_connect(&mut comp);
+    let (conn_b, mut queue_b, mut client_b) = clip_connect(&mut comp);
+    map_selection_client(
+        &mut comp,
+        &conn_a,
+        &mut queue_a,
+        &mut client_a,
+        "drag-origin",
+    );
+    map_selection_client(
+        &mut comp,
+        &conn_b,
+        &mut queue_b,
+        &mut client_b,
+        "drag-target",
+    );
+    manager.reconcile(&mut comp.state);
+    sync_mapped(
+        &mut comp,
+        &conn_a,
+        &mut queue_a,
+        &mut client_a,
+        &conn_b,
+        &mut queue_b,
+        &mut client_b,
+    );
+    manager.reconcile(&mut comp.state);
+    let origin_id = manager
+        .model()
+        .windows()
+        .find(|w| w.title == "drag-origin")
+        .unwrap()
+        .id;
+    let target_id = manager
+        .model()
+        .windows()
+        .find(|w| w.title == "drag-target")
+        .unwrap()
+        .id;
+    // Keep both hit-test regions exposed, independent of default placement.
+    for (id, x) in [(origin_id, 50), (target_id, 400)] {
+        assert!(manager.resize_window(id, 240, 180));
+        let rect = manager.geometry(id).unwrap();
+        assert!(manager.move_window(id, x - rect.loc.x, 80 - rect.loc.y));
+    }
+    let origin_rect = manager.geometry(origin_id).unwrap();
+    let target_rect = if same_surface {
+        origin_rect
+    } else {
+        manager.geometry(target_id).unwrap()
+    };
+    manager.on_input(
+        &mut comp.state,
+        ManagerInput::Motion {
+            pos: (
+                f64::from(origin_rect.loc.x + 20),
+                f64::from(origin_rect.loc.y + 20),
+            )
+                .into(),
+            time: 20,
+        },
+    );
+    manager.on_input(
+        &mut comp.state,
+        ManagerInput::Button {
+            button: 0x110,
+            pressed: true,
+            time: 21,
+        },
+    );
+    sync_mapped(
+        &mut comp,
+        &conn_a,
+        &mut queue_a,
+        &mut client_a,
+        &conn_b,
+        &mut queue_b,
+        &mut client_b,
+    );
+    let serial = *client_a
+        .buttons
+        .last()
+        .expect("origin received the real press");
+    assert_eq!(client_a.pointer_enters, 1);
+    assert_eq!(client_b.pointer_enters, 0);
+
+    // The implicit grab must retain pointer focus on A, while the compositor
+    // hit-tests B. Even the same-surface case uses a position unlike the press.
+    manager.on_input(
+        &mut comp.state,
+        ManagerInput::Motion {
+            pos: (
+                f64::from(target_rect.loc.x + 40),
+                f64::from(target_rect.loc.y + 50),
+            )
+                .into(),
+            time: 22,
+        },
+    );
+    sync_mapped(
+        &mut comp,
+        &conn_a,
+        &mut queue_a,
+        &mut client_a,
+        &conn_b,
+        &mut queue_b,
+        &mut client_b,
+    );
+    assert_eq!(
+        client_a.pointer_enters, 1,
+        "implicit focus stayed on origin"
+    );
+    assert_eq!(
+        client_b.pointer_enters, 0,
+        "implicit grab withheld target pointer focus"
+    );
+
+    let qh = queue_a.handle();
+    let source = (!source_less).then(|| {
+        let source = client_a
+            .manager
+            .as_ref()
+            .unwrap()
+            .create_data_source(&qh, ());
+        source.offer("text/plain".into());
+        source.set_actions(DndAction::Move);
+        source
+    });
+    let device = client_a.device.as_ref().unwrap().clone();
+    let origin = client_a.surface.as_ref().unwrap().clone();
+    device.start_drag(source.as_ref(), &origin, None, serial.wrapping_add(1));
+    sync_mapped(
+        &mut comp,
+        &conn_a,
+        &mut queue_a,
+        &mut client_a,
+        &conn_b,
+        &mut queue_b,
+        &mut client_b,
+    );
+    assert!(!comp.client_dnd_active(), "invalid serial cannot start DnD");
+    assert!(client_a.drag_enters.is_empty() && client_b.drag_enters.is_empty());
+    assert!(client_a.offers.is_empty() && client_b.offers.is_empty());
+
+    device.start_drag(source.as_ref(), &origin, None, serial);
+    client_a.source = source;
+    sync_mapped(
+        &mut comp,
+        &conn_a,
+        &mut queue_a,
+        &mut client_a,
+        &conn_b,
+        &mut queue_b,
+        &mut client_b,
+    );
+    assert!(
+        comp.client_dnd_active(),
+        "valid implicit-grab serial starts DnD"
+    );
+    let offer = {
+        let (target, other) = if same_surface {
+            (&client_a, &client_b)
+        } else {
+            (&client_b, &client_a)
+        };
+        assert!(
+            other.drag_enters.is_empty(),
+            "no stale-origin or wrong-client Enter"
+        );
+        assert!(other.drag_motions.is_empty(), "no wrong-client Motion");
+        assert!(other.offers.is_empty(), "no wrong-client offer");
+        if source_less && !same_surface {
+            assert!(
+                target.drag_enters.is_empty(),
+                "source-less drag is client-local"
+            );
+            assert!(target.drag_motions.is_empty());
+            assert!(
+                target.offers.is_empty(),
+                "source-less drag cannot leak an offer"
+            );
+            None
+        } else {
+            assert_eq!(
+                target.drag_enters.len(),
+                1,
+                "Enter before any subsequent input"
+            );
+            let (surface, x, y, offer) = &target.drag_enters[0];
+            assert_eq!(surface, target.surface.as_ref().unwrap());
+            assert_eq!(
+                (*x, *y),
+                (40.0, 50.0),
+                "current surface-local position, not press"
+            );
+            assert_eq!(target.drag_motions, vec![(40.0, 50.0)]);
+            if source_less {
+                assert!(offer.is_none());
+                assert!(target.offers.is_empty());
+                assert_eq!(target.drag_events, vec!["enter", "motion"]);
+                None
+            } else {
+                assert_eq!(target.offers.len(), 1);
+                assert_eq!(offer.as_ref(), target.offers.first());
+                assert_eq!(target.offered_mimes, vec!["text/plain"]);
+                assert_eq!(target.source_actions, vec![DndAction::Move]);
+                assert_eq!(target.drag_events, vec!["offer", "enter", "motion"]);
+                let offer = offer.as_ref().unwrap().clone();
+                offer.accept(target.drag_enter_serial.unwrap(), Some("text/plain".into()));
+                offer.set_actions(DndAction::Move, DndAction::Move);
+                Some(offer)
+            }
+        }
+    };
+    if offer.is_some() {
+        // Flush the recipient's negotiation before the source's barrier:
+        // cross-client Action is queued only when B's requests are handled.
+        sync_mapped(
+            &mut comp,
+            &conn_b,
+            &mut queue_b,
+            &mut client_b,
+            &conn_a,
+            &mut queue_a,
+            &mut client_a,
+        );
+        let target = if same_surface { &client_a } else { &client_b };
+        assert_eq!(target.offer_actions, vec![DndAction::Move]);
+        assert_eq!(client_a.chosen_actions, vec![DndAction::Move]);
+    } else {
+        assert!(comp.cancel_client_dnd(23));
+        assert!(!comp.cancel_client_dnd(24), "cancellation stays idempotent");
+    }
+    manager.on_input(
+        &mut comp.state,
+        ManagerInput::Button {
+            button: 0x110,
+            pressed: false,
+            time: 25,
+        },
+    );
+    sync_mapped(
+        &mut comp,
+        &conn_a,
+        &mut queue_a,
+        &mut client_a,
+        &conn_b,
+        &mut queue_b,
+        &mut client_b,
+    );
+    assert!(!comp.client_dnd_active());
+    let target = if same_surface { &client_a } else { &client_b };
+    assert_eq!(target.drops, usize::from(offer.is_some()));
+    assert_eq!(client_a.drop_performed, usize::from(offer.is_some()));
+    if source_less && !same_surface {
+        assert_eq!(
+            target.leaves, 0,
+            "foreign client never entered, so receives no Leave"
+        );
+    } else {
+        assert_eq!(
+            target.leaves, 1,
+            "initial target leaves once on termination"
+        );
+    }
+    if let Some(offer) = offer {
+        offer.finish();
+        // Finish is a recipient request; drain B before observing A's reply.
+        sync_mapped(
+            &mut comp,
+            &conn_b,
+            &mut queue_b,
+            &mut client_b,
+            &conn_a,
+            &mut queue_a,
+            &mut client_a,
+        );
+        assert_eq!(
+            client_a.finished, 1,
+            "initial offer remains valid through Finish"
+        );
+        assert_eq!(client_a.cancelled, 0);
+    }
+}
+
+#[test]
+fn native_drag_enters_current_target_at_start_without_further_motion() {
+    stationary_native_drag_case(false, false);
+}
+
+#[test]
+fn native_drag_enters_same_surface_at_start_without_further_motion() {
+    stationary_native_drag_case(true, false);
+}
+
+#[test]
+fn native_source_less_drag_cannot_enter_other_client_at_start() {
+    stationary_native_drag_case(false, true);
+}
+
+#[test]
+fn native_source_less_drag_enters_same_surface_at_start_without_further_motion() {
+    stationary_native_drag_case(true, true);
+}
+
+// --- Clipboard retention after the owner goes (#1033) ---
+
+use std::time::Duration;
+
+/// What the first copying client serves (distinct from `PASTE_BYTES`).
+const COPY_A: &[u8] = b"copied by the first client";
+/// What the paste side serves once it copies too.
+const COPY_B: &[u8] = b"copied by the second client";
+
+/// One connected clipboard client.
+type Side = (Connection, EventQueue<ClipClient>, ClipClient);
+
+/// Dispatch whatever reached one client; an empty socket is fine.
+fn drain(queue: &mut EventQueue<ClipClient>, client: &mut ClipClient) {
+    if let Some(guard) = queue.prepare_read() {
+        match guard.read() {
+            Ok(_) => {}
+            Err(wayland_client::backend::WaylandError::Io(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("client read failed: {error:?}"),
+        }
+    }
+    queue.dispatch_pending(client).unwrap();
+}
+
+/// Two mapped clipboard clients: `copy` (A), which may disconnect, and
+/// `paste` (B).
+struct Retention {
+    comp: TestCompositor,
+    manager: WindowManager,
+    a: Option<Side>,
+    b: Side,
+    id_a: u64,
+    id_b: u64,
+    time: u32,
+}
+
+impl Retention {
+    fn new() -> Self {
+        let mut comp = TestCompositor::new();
+        let mut manager: WindowManager = comp.window_manager();
+        let (conn_a, mut queue_a, mut a) = clip_connect(&mut comp);
+        let (conn_b, mut queue_b, mut b) = clip_connect(&mut comp);
+        map_selection_client(&mut comp, &conn_a, &mut queue_a, &mut a, "copy");
+        map_selection_client(&mut comp, &conn_b, &mut queue_b, &mut b, "paste");
+        manager.reconcile(&mut comp.state);
+        sync_mapped(
+            &mut comp,
+            &conn_a,
+            &mut queue_a,
+            &mut a,
+            &conn_b,
+            &mut queue_b,
+            &mut b,
+        );
+        let id = |title: &str| {
+            manager
+                .model()
+                .windows()
+                .find(|w| w.title == title)
+                .unwrap()
+                .id
+        };
+        let (id_a, id_b) = (id("copy"), id("paste"));
+        Self {
+            comp,
+            manager,
+            a: Some((conn_a, queue_a, a)),
+            b: (conn_b, queue_b, b),
+            id_a,
+            id_b,
+            time: 5000,
+        }
+    }
+
+    fn side(&mut self, on_a: bool) -> &mut Side {
+        if on_a {
+            self.a.as_mut().expect("the copying client disconnected")
+        } else {
+            &mut self.b
+        }
+    }
+
+    /// Pump the compositor and every connected client until `done`.
+    fn pump(&mut self, done: impl Fn(Option<&ClipClient>, &ClipClient) -> bool) {
+        for _ in 0..PUMP_ROUNDS {
+            if let Some((_, queue, _)) = self.a.as_mut() {
+                queue.flush().unwrap();
+            }
+            self.b.1.flush().unwrap();
+            self.comp.pump();
+            if let Some((_, queue, client)) = self.a.as_mut() {
+                drain(queue, client);
+            }
+            drain(&mut self.b.1, &mut self.b.2);
+            if done(self.a.as_ref().map(|side| &side.2), &self.b.2) {
+                return;
+            }
+            // The clipboard manager copies and serves on its own threads.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("pump budget exhausted");
+    }
+
+    fn focus(&mut self, on_a: bool) {
+        let id = if on_a { self.id_a } else { self.id_b };
+        assert!(self.manager.focus(&mut self.comp.state, Some(id)));
+    }
+
+    fn key(&mut self, pressed: bool) {
+        self.time += 1;
+        self.manager.on_input(
+            &mut self.comp.state,
+            ManagerInput::Key {
+                keycode: KEY_A,
+                pressed,
+                time: self.time,
+            },
+        );
+    }
+
+    /// Focus one side and press a key there: an honest serial for
+    /// `set_selection`.
+    fn key_serial(&mut self, on_a: bool) -> u32 {
+        self.focus(on_a);
+        let keys = move |a: Option<&ClipClient>, b: &ClipClient| {
+            if on_a {
+                a.map_or(0, |a| a.keys.len())
+            } else {
+                b.keys.len()
+            }
+        };
+        let before = keys(self.a.as_ref().map(|side| &side.2), &self.b.2);
+        self.key(true);
+        self.pump(|a, b| keys(a, b) > before);
+        let serial = self.side(on_a).2.keys.last().unwrap().1;
+        self.key(false);
+        self.pump(|_, _| true);
+        serial
+    }
+
+    /// One side takes the clipboard, offering `mime_types` and serving
+    /// `payload` for each.
+    fn copy(&mut self, on_a: bool, mime_types: &[&str], payload: &[u8]) {
+        let serial = self.key_serial(on_a);
+        let (_, queue, client) = self.side(on_a);
+        let source = client
+            .manager
+            .as_ref()
+            .unwrap()
+            .create_data_source(&queue.handle(), ());
+        for mime_type in mime_types {
+            source.offer((*mime_type).to_owned());
+        }
+        client
+            .device
+            .as_ref()
+            .unwrap()
+            .set_selection(Some(&source), serial);
+        client.source = Some(source);
+        client.payload = Some(payload.to_vec());
+        self.pump(|_, _| true);
+    }
+
+    /// Wait for the clipboard manager's copy of the current selection.
+    fn wait_copy_saved(&mut self) {
+        for _ in 0..PUMP_ROUNDS {
+            self.pump(|_, _| true);
+            if self.comp.clipboard_copy_saved() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the clipboard copy never finished");
+    }
+
+    /// B's current selection offer, read as `mime_type`.
+    fn paste(&mut self, mime_type: &str) -> Vec<u8> {
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        let (read_end, write_end) = UnixStream::pair().unwrap();
+        self.b
+            .2
+            .selection
+            .as_ref()
+            .expect("no selection offer")
+            .receive(mime_type.to_owned(), write_end.as_fd());
+        // One round carries the request to whoever serves it.
+        self.pump(|_, _| true);
+        // Our copy of the write end must go for end of file to follow
+        // the server's.
+        drop(write_end);
+        read_end
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut pasted = Vec::new();
+        std::io::BufReader::new(read_end)
+            .read_to_end(&mut pasted)
+            .unwrap();
+        pasted
+    }
+
+    /// Wait until B's newest offer, the `count`th, is its selection.
+    fn wait_offer(&mut self, count: usize) {
+        self.pump(|_, b| b.offers.len() == count && b.selection.as_ref() == b.offers.last());
+    }
+}
+
+/// The copying client quits: the focused client is offered the saved
+/// copy, and pasting it returns the quit client's exact bytes.
+#[test]
+fn clipboard_survives_owner_disconnect() {
+    let mut t = Retention::new();
+    t.copy(true, &["text/plain;charset=utf-8"], COPY_A);
+    t.wait_copy_saved();
+    assert_eq!(
+        t.side(true).2.sent_mimes,
+        vec!["text/plain;charset=utf-8".to_owned()],
+        "the compositor copies the selection when it is set"
+    );
+    t.focus(false);
+    t.wait_offer(1);
+    t.b.2.offered_mimes.clear();
+
+    t.a = None;
+    t.wait_offer(2);
+    assert_eq!(
+        t.b.2.offered_mimes,
+        vec!["text/plain;charset=utf-8".to_owned()]
+    );
+    assert_eq!(t.paste("text/plain;charset=utf-8"), COPY_A);
+    // The saved copy serves every paste, not just the first.
+    assert_eq!(t.paste("text/plain;charset=utf-8"), COPY_A);
+}
+
+/// The copying client clears the clipboard: the saved copy takes over.
+#[test]
+fn clipboard_survives_owner_null_selection() {
+    let mut t = Retention::new();
+    t.copy(true, &["text/plain;charset=utf-8"], COPY_A);
+    t.wait_copy_saved();
+    let serial = t.key_serial(true);
+    t.side(true)
+        .2
+        .device
+        .as_ref()
+        .unwrap()
+        .set_selection(None, serial);
+    t.pump(|_, _| true);
+
+    t.focus(false);
+    t.wait_offer(1);
+    assert_eq!(
+        t.b.2.offered_mimes,
+        vec!["text/plain;charset=utf-8".to_owned()]
+    );
+    assert_eq!(t.paste("text/plain;charset=utf-8"), COPY_A);
+}
+
+/// Nothing supported is offered: nothing is copied, and the clipboard
+/// empties when its owner quits.
+#[test]
+fn unsupported_clipboard_type_is_not_retained() {
+    let mut t = Retention::new();
+    t.copy(true, &["application/x-foo"], COPY_A);
+    for _ in 0..10 {
+        t.pump(|_, _| true);
+    }
+    assert!(t.side(true).2.sent_mimes.is_empty());
+    assert!(!t.comp.clipboard_copy_saved());
+    t.focus(false);
+    t.wait_offer(1);
+
+    t.a = None;
+    t.pump(|_, b| b.selection.is_none());
+    assert_eq!(t.b.2.offers.len(), 1, "no retained offer may follow");
+}
+
+/// Mutter's preference order picks the copied type; only that type is
+/// offered afterwards.
+#[test]
+fn retained_clipboard_keeps_the_most_preferred_type() {
+    let mut t = Retention::new();
+    t.copy(true, &["image/jpeg", "image/png", "image/bmp"], COPY_A);
+    t.wait_copy_saved();
+    assert_eq!(t.side(true).2.sent_mimes, vec!["image/png".to_owned()]);
+    t.focus(false);
+    t.wait_offer(1);
+    t.b.2.offered_mimes.clear();
+
+    t.a = None;
+    t.wait_offer(2);
+    assert_eq!(t.b.2.offered_mimes, vec!["image/png".to_owned()]);
+    assert_eq!(t.paste("image/png"), COPY_A);
+    assert!(
+        t.paste("image/jpeg").is_empty(),
+        "only the saved type is served"
+    );
+}
+
+/// A client selection after the take-over replaces the retained copy;
+/// when that owner's source goes, its own copy is the one retained.
+#[test]
+fn new_client_selection_replaces_retained_copy() {
+    let mut t = Retention::new();
+    t.copy(true, &["text/plain;charset=utf-8"], COPY_A);
+    t.wait_copy_saved();
+    t.focus(false);
+    t.wait_offer(1);
+    t.a = None;
+    t.wait_offer(2);
+    // The runtime drops the quit client's window after its dispatch.
+    t.manager.reconcile(&mut t.comp.state);
+    t.pump(|_, _| true);
+    let offers = t.b.2.offers.len();
+
+    t.copy(false, &["text/plain"], COPY_B);
+    t.wait_copy_saved();
+    assert_eq!(t.b.2.sent_mimes, vec!["text/plain".to_owned()]);
+    // B holds the focus, so it is offered its own selection.
+    t.wait_offer(offers + 1);
+    t.b.2.offered_mimes.clear();
+
+    t.b.2.source.take().unwrap().destroy();
+    t.wait_offer(offers + 2);
+    assert_eq!(t.b.2.offered_mimes, vec!["text/plain".to_owned()]);
+    assert_eq!(t.paste("text/plain"), COPY_B);
+    assert!(
+        t.paste("text/plain;charset=utf-8").is_empty(),
+        "the first client's copy is gone"
+    );
 }

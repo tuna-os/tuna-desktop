@@ -7,7 +7,51 @@
 # entry is removed and named in DIR/ci-removed-entries.txt so the bundle
 # still says what was there. Missing directories are skipped: an earlier
 # step may have failed before creating them, and the upload must still run.
+#
+# ci-prepare-artifacts --detach DEST DIR PATH... — move the named entries
+# out of DIR to the same relative path under DEST, for an upload of their
+# own (#1063). Unstripped proof executables are hundreds of megabytes; kept
+# beside the evidence they decide whether the logs, frames and receipts
+# reach storage before the job's deadline. DIR/ci-detached-entries.txt
+# records every moved file in sha256sum format, so the evidence names the
+# exact bytes and `sha256sum -c` checks them from the root of DEST's upload.
+# An absent DIR or PATH is skipped as above; an entry that exists and cannot
+# be moved stays in DIR and fails the step.
 set -u
+if [ "${1:-}" = --detach ]; then
+    [ "$#" -ge 4 ] || { echo 'usage: ci-prepare-artifacts --detach DEST DIR PATH...' >&2; exit 2; }
+    dest="$2"
+    dir="$3"
+    shift 3
+    for rel in "$@"; do
+        case "$rel" in
+            ''|-*|/*|..|../*|*/..|*/../*)
+                echo "ci-prepare-artifacts: $rel is not a path inside the artifact directory" >&2
+                exit 2;;
+        esac
+    done
+    [ -d "$dir" ] || { echo "ci-prepare-artifacts: $dir absent, skipping"; exit 0; }
+    list="$dir/ci-detached-entries.txt"
+    status=0
+    for rel in "$@"; do
+        [ -e "$dir/$rel" ] || { echo "ci-prepare-artifacts: $dir/$rel absent, skipping"; continue; }
+        if [ ! -e "$dest/$rel" ] &&
+            (cd "$dir" && find "$rel" -type f -exec sha256sum {} +) >"$list.tmp" &&
+            LC_ALL=C sort -k 2 -o "$list.tmp" "$list.tmp" &&
+            mkdir -p "$(dirname "$dest/$rel")" && mv "$dir/$rel" "$dest/$rel"; then
+            cat "$list.tmp" >>"$list"
+        else
+            echo "ci-prepare-artifacts: could not detach $dir/$rel to $dest/$rel" >&2
+            status=1
+        fi
+        rm -f "$list.tmp"
+    done
+    if [ -s "$list" ]; then
+        echo "ci-prepare-artifacts: detached $(wc -l <"$list") files from $dir to $dest:"
+        cat "$list"
+    fi
+    exit "$status"
+fi
 for dir in "$@"; do
     [ -d "$dir" ] || { echo "ci-prepare-artifacts: $dir absent, skipping"; continue; }
     list="$dir/ci-removed-entries.txt"

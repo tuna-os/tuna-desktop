@@ -1,0 +1,125 @@
+diff --git a/third-party/smithay/src/wayland/shell/xdg/handlers/positioner.rs b/third-party/smithay/src/wayland/shell/xdg/handlers/positioner.rs
+index 606b00e4..60e2ed38 100644
+--- a/third-party/smithay/src/wayland/shell/xdg/handlers/positioner.rs
++++ b/third-party/smithay/src/wayland/shell/xdg/handlers/positioner.rs
+@@ -82,7 +82,11 @@ where
+                 parent_width,
+                 parent_height,
+             } => {
+-                state.parent_size = Some((parent_width, parent_height).into());
++                // Mutter stores any parent size without an error; a negative
++                // one cannot be a `Size` (it panicked), so it is ignored.
++                if parent_width >= 0 && parent_height >= 0 {
++                    state.parent_size = Some((parent_width, parent_height).into());
++                }
+             }
+             xdg_positioner::Request::SetParentConfigure { serial } => {
+                 state.parent_configure = Some(Serial::from(serial));
+diff --git a/third-party/smithay/src/wayland/shell/xdg/handlers/surface.rs b/third-party/smithay/src/wayland/shell/xdg/handlers/surface.rs
+index 3ae3a79e..60343fd9 100644
+--- a/third-party/smithay/src/wayland/shell/xdg/handlers/surface.rs
++++ b/third-party/smithay/src/wayland/shell/xdg/handlers/surface.rs
+@@ -36,6 +36,31 @@ pub use toplevel::{get_parent, send_toplevel_configure};
+ mod popup;
+ pub use popup::{make_popup_handle, send_popup_configure};
+ 
++/// Whether `surface` is `start` or one of the popup ancestors of `start`.
++/// The existing popup graph is acyclic (each new edge is checked here), so
++/// the walk ends.
++fn popup_chain_contains(start: &wl_surface::WlSurface, surface: &wl_surface::WlSurface) -> bool {
++    let mut current = start.clone();
++    loop {
++        if current == *surface {
++            return true;
++        }
++        if !current.alive() || compositor::get_role(&current) != Some(XDG_POPUP_ROLE) {
++            return false;
++        }
++        let parent = compositor::with_states(&current, |states| {
++            states
++                .data_map
++                .get::<XdgPopupSurfaceData>()
++                .and_then(|attributes| attributes.lock().unwrap().parent.clone())
++        });
++        match parent {
++            Some(parent) => current = parent,
++            None => return false,
++        }
++    }
++}
++
+ /// User data of XdgSurface
+ #[derive(Debug)]
+ pub struct XdgSurfaceUserData {
+@@ -160,15 +185,32 @@ where
+                     .lock()
+                     .unwrap();
+ 
+-                let parent_surface = parent.map(|parent| {
+-                    let parent_data = parent.data::<XdgSurfaceUserData>().unwrap();
+-                    parent_data.wl_surface.clone()
+-                });
+-
+                 // We now can assign a role to the surface
+                 let surface = &data.wl_surface;
+                 let shell = &data.wm_base;
+ 
++                // Mutter (meta-wayland-xdg-shell.c,
++                // xdg_surface_constructor_get_popup) refuses a parent without
++                // an xdg role. A popup must also not be its own ancestor:
++                // find_popup_root_surface and friends walk the parent chain
++                // until it leaves the popups, so a cycle hung the compositor.
++                let parent_surface = match parent {
++                    Some(parent) => {
++                        let parent_data = parent.data::<XdgSurfaceUserData>().unwrap();
++                        if !parent_data.has_active_role.load(Ordering::Acquire)
++                            || popup_chain_contains(&parent_data.wl_surface, surface)
++                        {
++                            shell.post_error(
++                                xdg_wm_base::Error::InvalidPopupParent,
++                                "Invalid popup parent: it has no xdg role or descends from this popup.",
++                            );
++                            return;
++                        }
++                        Some(parent_data.wl_surface.clone())
++                    }
++                    None => None,
++                };
++
+                 let attributes = XdgPopupSurfaceRoleAttributes {
+                     parent: parent_surface,
+                     server_pending: Some(PopupState {
+diff --git a/third-party/smithay/src/wayland/shell/xdg/handlers/surface/toplevel.rs b/third-party/smithay/src/wayland/shell/xdg/handlers/surface/toplevel.rs
+index 17bd3b9b..755c7e2b 100644
+--- a/third-party/smithay/src/wayland/shell/xdg/handlers/surface/toplevel.rs
++++ b/third-party/smithay/src/wayland/shell/xdg/handlers/surface/toplevel.rs
+@@ -118,11 +118,29 @@ where
+                 }
+             }
+             xdg_toplevel::Request::SetMaxSize { width, height } => {
++                // As Mutter's xdg_toplevel_set_max_size; a negative
++                // size used to panic in `Size::new`.
++                if width < 0 || height < 0 {
++                    toplevel.post_error(
++                        xdg_toplevel::Error::InvalidSize,
++                        format!("invalid negative max size requested {width} x {height}"),
++                    );
++                    return;
++                }
+                 with_toplevel_pending_state(data, |toplevel_data| {
+                     toplevel_data.max_size = (width, height).into();
+                 });
+             }
+             xdg_toplevel::Request::SetMinSize { width, height } => {
++                // As Mutter's xdg_toplevel_set_min_size; a negative
++                // size used to panic in `Size::new`.
++                if width < 0 || height < 0 {
++                    toplevel.post_error(
++                        xdg_toplevel::Error::InvalidSize,
++                        format!("invalid negative min size requested {width} x {height}"),
++                    );
++                    return;
++                }
+                 with_toplevel_pending_state(data, |toplevel_data| {
+                     toplevel_data.min_size = (width, height).into();
+                 });

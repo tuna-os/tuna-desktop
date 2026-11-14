@@ -140,7 +140,9 @@ fn destroying_a_layer_role_then_committing_keeps_the_client_connected() {
     let mut comp = TestCompositor::new();
     let _manager = comp.window_manager();
     let (server, stream) = UnixStream::pair().unwrap();
-    comp.add_client(server);
+    // gtk4-layer-shell runs in the supervised shell, the only client
+    // offered layer-shell (#1048).
+    comp.add_shell_client(server);
     let conn = Connection::from_socket(stream).unwrap();
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
@@ -246,7 +248,7 @@ fn destroying_a_layer_role_releases_its_shm_backing() {
     let mut comp = TestCompositor::new();
     let _manager = comp.window_manager();
     let (server, stream) = UnixStream::pair().unwrap();
-    comp.add_client(server);
+    comp.add_shell_client(server);
     let conn = Connection::from_socket(stream).unwrap();
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();

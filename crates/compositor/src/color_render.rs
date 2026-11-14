@@ -539,6 +539,9 @@ impl LutCache {
 /// [`crate::occlusion::draw_planned`]), the colour-managed ones through
 /// the colour program and the rest through the tint program (`tint`),
 /// the dim program (`brightness` below 1 with `dim`) or the default one.
+/// `opaque` lets the rest draw their opaque regions without blending
+/// (see [`crate::occlusion::drawn_opaque_regions`]); colour-managed
+/// surfaces always blend.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_planned<E>(
     frame: &mut GlesFrame<'_, '_>,
@@ -549,6 +552,7 @@ pub(crate) fn draw_planned<E>(
     tint: Option<&FrameColor>,
     brightness: f32,
     dim: Option<&GlesTexProgram>,
+    opaque: bool,
 ) -> Result<(), GlesError>
 where
     E: RenderElement<GlesRenderer>,
@@ -567,8 +571,9 @@ where
     };
     base(frame);
     if colors.is_empty() {
-        let result =
-            crate::occlusion::draw_planned::<GlesRenderer, _>(frame, scale, elements, plan);
+        let result = crate::occlusion::draw_planned::<GlesRenderer, _>(
+            frame, scale, elements, plan, opaque,
+        );
         frame.clear_tex_program_override();
         return result;
     }
@@ -626,7 +631,9 @@ where
                     base(frame);
                     overridden = false;
                 }
-                element.draw(frame, element.src(), geometry, &damage, &[])
+                let opaque_regions =
+                    crate::occlusion::drawn_opaque_regions(element, geometry, scale, opaque);
+                element.draw(frame, element.src(), geometry, &damage, &opaque_regions)
             }
         };
         if let Err(error) = drawn {

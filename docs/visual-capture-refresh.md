@@ -1,97 +1,180 @@
-# Walkthrough refresh procedure
+# Maintained documentation media refresh
 
-Rebuilds `docs/walkthrough/` images ONLY from exact, fully successful
-visual-capture artifacts. Never refresh from a partial run, from mixed
-attempts or built trees, from hash-unvalidated inputs, or from frames
-the validators did not confirm as named-state proof; `refresh` refuses
-all of those. Checked-in images stay STALE-listed until a refresh
-lands: nothing labels them current automatically, and no refresh has
-been performed from any run yet.
+The fixed inventory in `scripts/lib/maintained-media.tsv` owns 46 walkthrough
+PNGs, six README native-VM hero PNGs, and the README overview MP4/GIF.
+It is not a directory-wide adoption rule. Dated diagnostic captures, frozen
+reference baselines, the historical `docs/walkthrough/manifest.json`, and
+already published versioned release assets are never overwritten.
 
-## Prerequisites
+## Automated producers and normal intake
 
-- A `visual-capture` CI run whose conclusion is `success` (build ok,
-  all 14 capture jobs ok, manifest ok, zero partial stages). Note its
-  run id. A green collector job with failed states inside is a partial
-  stage: refresh refuses it by name.
-- The run's recorded identities, read from any consumed stage's
-  `provenance.json` (never assumed): `source.built_head_sha`,
-  `source.built_tree_sha`, `source.event_sha`.
+The ordinary CI run produces:
 
-## Exact commands
+- `gtk-shell`: the real full nested GTK journey, all 46 raw screenshots,
+  original launched-ELF/source identities and successful capture outcomes.
+- `marlin-vm` plus `tuna-tour`: the original five-boot native lifecycle,
+  six confirmed hero stills and the actual tour video. Receipts bind the
+  immutable image, original package, verified base index/platform, original
+  nonroot GDM session, framebuffer timing and every retained media byte.
+- `overview-demo`: a private Xvfb/private-D-Bus session with the actual
+  Alpha/Beta/Gamma libadwaita windows. Physical input opens the overview,
+  selects Beta, reopens it and dismisses it with Escape. The 12-second H.264
+  recording is retained before deriving its 640×400, 8-fps GIF.
+  The first independently decoded, fully written FFmpeg frame must be
+  acknowledged before the original one-second input boundary. An alive process
+  or elapsed startup sleep is not readiness. Retained packet timestamps,
+  byte-prefix hashes and realtime/monotonic clock sandwiches bind every input
+  and UI observation to actual recorded frames; a late recorder fails instead
+  of moving the journey clock.
+
+Each native hero needs positive evidence for its exact retained PNG, not
+merely a tag or an empty failure list. Overview and Alt-Tab reuse the existing
+calibrated framebuffer predicates on those exact pixels. App Grid, quick
+settings, calendar and lock use read-only public AT-SPI showing/visible controls
+before and after the capture, bound to the same originally admitted GDM
+session, shell process and public bus credentials. AT-SPI identities are not
+invented compositor/kernel window identities; lock admission never reads
+credential descendants. Missing controls, changed principals, mismatched PNG
+hashes or capture boundaries fail intake without publishing a replacement.
+Quick settings is identified by its actual accessible **Lock Screen** control,
+not a nonexistent "Lock" label. Calendar admission requires the invariant
+visible **Previous month** and **Next month** controls; the optional events
+card's **Open Calendar** button is correctly absent without configured calendars.
+
+These are different scopes: nested fixtures never qualify an installed
+native image, and DEV native media never qualifies a signed shipping release.
+Title cards in the tour are not screenshots of the product.
+
+The normal check job installs FFmpeg (`ffmpeg` and `ffprobe`) and Python
+Pillow explicitly, so receipt and freshness tests exercise real byte decoding
+rather than skipping unavailable video tools.
+
+`maintained-media.yml` accepts only a successful `ci.yml` main-push run from
+the trusted repository. It rechecks workflow identity, run and attempt,
+source, artifact upload digests, decoded media, UI outcomes and immutable
+image/package/base evidence. ZIP paths, aliases, symlinks and nonregular
+members are rejected before only fixed media/evidence members are extracted.
+No artifact executable is extracted or run.
+The check job has only `contents: read` and `actions: read` for that API
+freshness admission; its dependency audit remains tokenless and fatal on
+failure. The separate trusted promotion workflow's PR-writing permissions
+do not expose a release credential or authorize downloaded code execution.
+
+Canonical changes are checked on every ordinary branch, not only branches
+named by the automation. The comparison includes former destinations from the
+base inventory so removing a row cannot hide replaced pixels. Verification
+independently downloads the named run's exact digest-authenticated GitHub
+artifacts again and compares their actual media, receipts and evidence with the
+proposed canonical files. Rehashing a substituted PNG and every PR-local
+receipt does not make those bytes part of the successful producer run.
+Git comparisons disable rename folding, so moving an inventoried native hero,
+video or manifest outside the inventory still validates the removed source path.
+
+The result enters an ordinary media-refresh PR and the existing full CI,
+never a direct-main commit or a gate/publication bypass. Newer main source
+makes an older promotion stale instead of allowing it to overwrite current
+media. A subsequent successful main CI is still required before claiming
+current merged qualification. Generated-media-only evolution does not create
+an endless refresh-commit loop and never manufactures a latest source SHA:
+the actual captured commit, run, image and package remain recorded.
+Recursion suppression first authenticates the already committed canonical
+bytes against their original run, then independently validates the new current
+capture in retained staging. Reuse requires the **exact final immutable image
+ID, original package SHA and independently current base index/platform**, not
+seven selected ELF hashes or an assumed timestamp-only difference. GTK, Mesa,
+fonts and every other installed runtime byte remain inside that actual image.
+
+Ordinary lifecycle CI retains the exact qualified final OCI image and original
+package/provenance as profile-specific Actions artifacts. Only a completed
+successful trusted Main push with matching real Git required-source inputs and
+the **currently resolved and cryptographically verified** base index/platform
+can supply a reused image. The current mutable `marlin:gnome` request is resolved
+before selection; a moved index/platform, changed source input or unavailable
+eligible image uses the normal fresh build and new genuine capture instead.
+The earlier registry preview is not this final qualified fixture image.
+
+Reuse replaces rebuilding only: all normal CI checks, compilation, security,
+genuine IME, native five-boot and fresh-account gates still run. The same image
+is loaded by its authenticated bytes and requalified in ordinary native CI,
+never executed in the privileged documentation-promotion workflow. No new
+registry/release publication, credential, runner or trust exception is added.
+After canonical adoption changes only generated media, that exact product
+image can be requalified again without a recursive documentation commit.
+Original actual build commit/tree/image/package identities remain recorded;
+the new capture's actual commit/tree and run are distinct, never relabelled.
+Ordinary native consumers include push, pull-request, manual full-CI dispatch
+and scheduled CI; none changes the trusted successful-main producer rule.
+The capsule's original strip receipt remains inside its authenticated
+selection evidence. It is not restored into the current admission output:
+the independent current image inspection must create that new receipt
+exclusively before boot and fresh capture.
+
+`scripts/tuna-hero-media` uses the same exact-run API identity, whole-upload
+digest and bounded ZIP downloader as automatic intake. It downloads the
+`marlin-vm` evidence and reconstructs `tuna-tour` beneath `tour/` before
+validating the six canonical heroes; flattened tour-only downloads are
+not accepted as a complete native receipt root.
+
+## Receipts and explicit freshness
+
+Canonical receipts live separately under
+`docs/walkthrough/media-manifests/{gtk-walkthrough,vm-tour,overview-demo}.json`.
+They retain successful producer outcomes, actual source/run/attempt,
+original evidence hashes and exact output hashes. The VM receipt additionally
+retains the raw OCI index, modern cosign platform output and
+`native-base/platform-verification.json`, plus video hash/inspection. The
+process witness binds the resolved immutable linux/amd64 digest to the actual
+pinned native cosign 3.1.4 executable/version/hash, exact certificate-identity
+and issuer argv, successful integer-zero exit, command bounds, stdout hash/size
+and stderr. Intake revalidates these retained bytes with the shared verifier;
+it does not perform another crypto verification or infer certificate claims
+from optional payload fields (which can be empty).
+Source receipts distinguish actual `built_commit`/`built_tree` from the current
+producer's `capture_commit`/`capture_tree` and checked `merged_commit`. A native
+reused build is accepted only with its authenticated original image/package
+origin and independently equal real Git required-source inputs. Nested GTK and
+overview do not silently accept a different build. Every run validates current
+media into `current-capture/`, retained with intake receipts even when exact
+canonical reuse avoids a new PR; missing/expired old proof earns no reuse credit.
+The original tour video remains in the exact-run artifact, not an invented
+checked-in video destination.
+
+Required-source identity hashes actual clean Git mode/type/blob/path inputs,
+excluding only the 54 registered generated media paths and three generated
+receipt files. Every other tracked source input remains significant. This
+does not permit broad documentation drift or silently relabel old footage.
+
+For an independently verified exact run, use the same explicit identity pins
+as CI:
 
 ```sh
-RUN=<run id>        # e.g. 38246246572
-BRANCH=<branch>     # e.g. w3-visual-capture
-
-# 1. Confirm the run is fully green first (a red or partial run must
-#    never feed a refresh).
-gh run view "$RUN" --json conclusion --jq .conclusion
-#    -> success
-
-# 2. Download the exact artifacts of that run into one bundle dir.
-rm -rf visual-exact
-gh run download "$RUN" -R tuna-os/tuna-desktop --dir visual-exact
-
-# 3. Read the recorded identities out of the bundle (do not hand-make).
-HEAD=$(python3 -c "import json;print(json.load(open('visual-exact/visual-panel/provenance.json'))['source']['built_head_sha'])")
-TREE=$(python3 -c "import json;print(json.load(open('visual-exact/visual-panel/provenance.json'))['source']['built_tree_sha'])")
-EVENT=$(python3 -c "import json;print(json.load(open('visual-exact/visual-panel/provenance.json'))['source']['event_sha'])")
-
-# 4. Refresh into a scratch dest first and inspect the report.
-#    --merge-sha is validated against every consumed provenance and the
-#    refresh fails closed on mismatch; omit it to take the recorded
-#    event SHA (still cross-checked across stages).
-scripts/tuna-walkthrough refresh visual-exact --run-id "$RUN" \
-    --merge-sha "$EVENT" --branch "$BRANCH" --dest /tmp/walkthrough-new
-scripts/tuna-walkthrough freshness --dest /tmp/walkthrough-new \
-    --expect-head "$HEAD" --expect-tree "$TREE" --expect-merge "$EVENT"
-#    -> freshness 46/46 current
-
-# 5. Adopt the result into docs/ (images + page + per-frame manifest).
-cp /tmp/walkthrough-new/walkthrough/*.png docs/walkthrough/
-cp /tmp/walkthrough-new/walkthrough/manifest.json docs/walkthrough/
-cp /tmp/walkthrough-new/walkthrough.md docs/walkthrough.md
-scripts/tuna-walkthrough check        # existing existence gate, unchanged
-scripts/tuna-walkthrough freshness    # expects default to this checkout
+INPUTS=$(python3 scripts/lib/maintained_media.py source-inputs)
+scripts/tuna-docs-shots intake GTK_ROOT VM_ROOT OVERVIEW_ROOT \
+  --bundle gtk-walkthrough --bundle vm-tour --bundle overview-demo \
+  --run-id "$RUN" --attempt "$ATTEMPT" \
+  --expect-merge "$CAPTURE_HEAD" --expect-head "$CAPTURE_HEAD" --expect-tree "$CAPTURE_TREE" \
+  --expect-source-inputs "$INPUTS" --expect-image "$IMAGE_ID" \
+  --expect-package "$PACKAGE_SHA256" --dest STAGING_REPOSITORY_ROOT
+scripts/tuna-docs-shots freshness \
+  --bundle gtk-walkthrough --bundle vm-tour --bundle overview-demo \
+  --run-id "$RUN" --attempt "$ATTEMPT" \
+  --expect-merge "$CAPTURE_HEAD" --expect-head "$CAPTURE_HEAD" --expect-tree "$CAPTURE_TREE" \
+  --expect-source-inputs "$INPUTS" --expect-image "$IMAGE_ID" \
+  --expect-package "$PACKAGE_SHA256" --dest STAGING_REPOSITORY_ROOT \
+  --source-artifact GTK_ROOT --source-artifact VM_ROOT \
+  --source-artifact OVERVIEW_ROOT
 ```
 
-## What refresh pins and validates
+Read the pins from independently admitted workflow/build/image evidence;
+do not invent them or infer trusted current identity from a receipt alone.
+`freshness --source-artifact ROOT` revalidates original retained media,
+including the VM video and raw overview frame acknowledgements. A local check
+without those roots is only canonical-byte/receipt consistency, not independent
+proof of a trusted producer upload or locally present source video. Only the
+trusted exact-run replay above admits canonical automation changes.
 
-Per run, `docs/walkthrough/manifest.json` records: the pinned run id
-and attempt (all consumed stages must share both), the built head and
-tree SHAs (agreed across stages; the tree is what was actually built
-and captured), the event SHA (the triggering event's commit, e.g. the
-PR merge ref; validated, never presented as the tested tree), the
-package versions and image identity, each consumed stage's
-`stage.json` digest, and per frame the PNG hash, capture outcome,
-source stage/artifact and preserved label (with duplicate resolutions).
-
-Before consuming a single byte, refresh hash-validates every input
-against its recorded hash (frame bytes vs `frames.json`, duplicate
-targets vs their records), walks duplicate chains with cycle
-detection, and rejects wallpaper frames, unverified duplicates, and
-baseline-labeled frames for any state but the explicit desktop state
-(`panel`). A passed `--merge-sha` must equal the recorded event SHA
-or the refresh fails.
-
-## Stale exposure
-
-`scripts/tuna-walkthrough freshness` prints a per-frame
-CURRENT/STALE/MISSING report and exits 1 unless every frame is
-current. CURRENT requires the checked-in bytes to match the recorded
-capture hash AND the recorded built tree to equal the expected
-identity (explicit `--expect-*` flags, defaulting to this checkout);
-a manifest that is merely self-consistent but names a different
-source reads STALE. The one exception is adopt drift: trees that
-differ only in the walkthrough's own managed paths still read
-CURRENT, so the adopt commit itself does not invalidate the images;
-any product drift reads STALE. When the expected identity cannot be
-determined, every frame reads STALE (fail closed).
-
-The `visual-capture` workflow's manifest job runs freshness on every
-run as a visible, non-gating report, so staleness shows in CI output
-instead of hiding as silent absence. Until the first refresh lands,
-all 46 checked-in images report STALE (no manifest): that is the
-honest initial state for images last changed before this pipeline
-existed.
+The old visual-stage refresh and seven-frame `docs-shots` collector remain
+diagnostic/staging producers only. They are not alternate canonical-copy
+paths, and there is no maintained `docs/shots` destination. Historical visual
+manifest run `38293537511` remains historical evidence, not a current-source
+or installed-image qualification.

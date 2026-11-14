@@ -20,7 +20,7 @@
 //! like the standard XML without touching gio from zbus threads.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::settings::{
     refresh_privacy, write_disable_camera, write_disable_microphone, write_disable_sound_output,
@@ -41,11 +41,33 @@ pub const LOCKDOWN_IFACE: &str = "org.freedesktop.impl.portal.Lockdown";
 /// live policy is shared with [`LockdownBus`], which re-syncs it
 /// from GSettings and emits `PropertiesChanged`; bus-originated
 /// sets land in `pending` for the next poll to persist, so zbus
-/// worker threads never touch a settings backend.
+/// worker threads never touch a settings backend. `staged` tells the
+/// owner a set is waiting ([`LockdownBus::on_staged`]).
 #[derive(Debug)]
 struct Lockdown {
     live: Arc<Mutex<PrivacyPolicy>>,
     pending: Arc<Mutex<Option<PrivacyPolicy>>>,
+    staged: Staged,
+}
+
+/// The owner's wake for a staged bus-originated set, installed once.
+#[derive(Clone, Default)]
+struct Staged(Arc<OnceLock<Box<dyn Fn() + Send + Sync>>>);
+
+impl Staged {
+    fn notify(&self) {
+        if let Some(wake) = self.0.get() {
+            wake();
+        }
+    }
+}
+
+impl std::fmt::Debug for Staged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Staged")
+            .field(&self.0.get().is_some())
+            .finish()
+    }
 }
 
 /// Standard access-dialog interface (`org.freedesktop.impl.portal.Access`).
@@ -138,24 +160,29 @@ impl Lockdown {
     /// back-to-back read sees the set) and stage the result for
     /// GSettings persistence. A poisoned lock reads as no change.
     fn stage(&self, change: impl FnOnce(&mut PrivacyPolicy)) {
-        let Ok(mut live) = self.live.lock() else {
-            return;
-        };
-        change(&mut live);
-        if let Ok(mut pending) = self.pending.lock() {
+        {
+            let Ok(mut live) = self.live.lock() else {
+                return;
+            };
+            change(&mut live);
+            let Ok(mut pending) = self.pending.lock() else {
+                return;
+            };
             *pending = Some(*live);
         }
+        self.staged.notify();
     }
 }
 
 /// D-Bus edge behind the privacy policy: owns the Tuna backend name
 /// when it is free. The served object and the panel share one
 /// policy, so settings flips show up on the portal bus without a
-/// copy, on the slow tick.
+/// copy, on the next poll.
 pub struct LockdownBus {
     conn: Option<zbus::blocking::Connection>,
     live: Arc<Mutex<PrivacyPolicy>>,
     pending: Arc<Mutex<Option<PrivacyPolicy>>>,
+    staged: Staged,
 }
 
 impl LockdownBus {
@@ -166,7 +193,22 @@ impl LockdownBus {
             conn: None,
             live: Arc::new(Mutex::new(PrivacyPolicy::default())),
             pending: Arc::new(Mutex::new(None)),
+            staged: Staged::default(),
         }
+    }
+
+    /// Run `wake` (from a zbus thread) after each bus-originated set is
+    /// staged, so an owner that waits for events instead of polling
+    /// knows to [`poll`](Self::poll). Installed once; a second call is
+    /// ignored.
+    pub fn on_staged(&self, wake: impl Fn() + Send + Sync + 'static) {
+        let _ = self.staged.0.set(Box::new(wake));
+    }
+
+    /// Whether a bus-originated set still waits to be persisted (the
+    /// backend refused it on the last poll).
+    pub fn has_pending(&self) -> bool {
+        self.pending.lock().is_ok_and(|pending| pending.is_some())
     }
 
     /// Current live policy (what the bus object answers). A poisoned
@@ -182,6 +224,12 @@ impl LockdownBus {
     /// configuration points at, and nothing else changes.
     pub fn ensure(&mut self) -> bool {
         self.connect(None)
+    }
+
+    /// [`LockdownBus::ensure`] over an explicit bus address, for a
+    /// private daemon.
+    pub fn ensure_at(&mut self, address: &str) -> bool {
+        self.connect(Some(address))
     }
 
     /// Serve over an explicit bus address (`None` means the session
@@ -205,6 +253,7 @@ impl LockdownBus {
         let lockdown = Lockdown {
             live: self.live.clone(),
             pending: self.pending.clone(),
+            staged: self.staged.clone(),
         };
         let conn = match builder
             .serve_at(LOCKDOWN_PATH, lockdown)

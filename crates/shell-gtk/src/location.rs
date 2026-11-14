@@ -9,9 +9,9 @@
 //! `InUse` manager property drives the panel icon. With GeoClue absent
 //! the indicator hides; Settings still gates the exported agent's grants.
 //!
-//! The agent id (`tuna-shell`) must join GeoClue's `[agent] whitelist`
-//! on the image, beside `gnome-shell` (`man geoclue`); that packaging
-//! change lives outside this crate.
+//! The real agent id (`tuna-shell`) joins GeoClue's `[agent] whitelist` at
+//! normal image construction through `tuna-geoclue-agent-policy`, preserving
+//! vendor agents and administrator overrides. No app grant is added here.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -620,10 +620,9 @@ impl LocationAgent {
             gio::DBusCallFlags::NONE,
             10_000,
             gio::Cancellable::NONE,
-            |res| {
-                if let Err(e) = res {
-                    eprintln!("tuna-shell-gtk: location agent not registered: {e}");
-                }
+            |res| match res {
+                Ok(_) => eprintln!("tuna-shell-gtk: location agent registered: {AGENT_ID}"),
+                Err(e) => eprintln!("tuna-shell-gtk: location agent not registered: {e}"),
             },
         );
     }

@@ -1,6 +1,7 @@
 //! Owned GIO reader for GNOME's focus policy keys
-//! (`org.gnome.desktop.wm.preferences`, `org.gnome.mutter`), read by the
-//! compositor itself as Mutter's `prefs.c` does in-process.
+//! (`org.gnome.desktop.wm.preferences`, `org.gnome.mutter`) and Mutter's
+//! `check-alive-timeout`, read by the compositor itself as Mutter's
+//! `prefs.c` does in-process.
 //!
 //! The mechanics are `night_light_settings.rs`'s, without its preview:
 //! native `Settings` and their retained `changed` subscription live and
@@ -32,6 +33,7 @@ const KEY_RAISE_ON_CLICK: &str = "raise-on-click";
 const KEY_MOUSE_BUTTON_MODIFIER: &str = "mouse-button-modifier";
 const KEY_RESIZE_WITH_RIGHT_BUTTON: &str = "resize-with-right-button";
 const KEY_POINTER_REST: &str = "focus-change-on-pointer-rest";
+const KEY_CHECK_ALIVE_TIMEOUT: &str = "check-alive-timeout";
 const WM_KEYS: [(&str, &str); 6] = [
     // An enum key's value type is its string nick.
     (KEY_FOCUS_MODE, "s"),
@@ -350,10 +352,13 @@ fn schema_matches(schema: &gio::SettingsSchema, keys: &[(&str, &str)]) -> bool {
     })
 }
 
-/// Watch `settings` on the owned context; only the focus keys re-read.
+/// Watch `settings` on the owned context; only the keys read here re-read.
 fn watch(settings: &gio::Settings, shared: Weak<Shared>) -> glib::SignalHandlerId {
     settings.connect_changed(None, move |_, key| {
-        if key == KEY_POINTER_REST || WM_KEYS.iter().any(|(known, _)| *known == key) {
+        if key == KEY_POINTER_REST
+            || key == KEY_CHECK_ALIVE_TIMEOUT
+            || WM_KEYS.iter().any(|(known, _)| *known == key)
+        {
             if let Some(shared) = shared.upgrade() {
                 shared.request(Instant::now());
             }
@@ -363,8 +368,12 @@ fn watch(settings: &gio::Settings, shared: Weak<Shared>) -> glib::SignalHandlerI
 
 struct GioReader {
     wm: gio::Settings,
-    /// `org.gnome.mutter`, when installed with the pointer-rest key.
+    /// `org.gnome.mutter`, when installed with either key read from it.
     mutter: Option<gio::Settings>,
+    /// Whether `mutter` has `focus-change-on-pointer-rest` (a boolean).
+    pointer_rest: bool,
+    /// Whether `mutter` has `check-alive-timeout` (a `u`).
+    check_alive: bool,
     handlers: Vec<(gio::Settings, glib::SignalHandlerId)>,
 }
 impl GioReader {
@@ -387,8 +396,12 @@ impl GioReader {
             return Err(ReadError("wm preferences key/type mismatch".into()));
         }
         let wm = gio::Settings::new_full(wm, backend, None);
+        let pointer_rest =
+            mutter.is_some_and(|schema| schema_matches(schema, &[(KEY_POINTER_REST, "b")]));
+        let check_alive =
+            mutter.is_some_and(|schema| schema_matches(schema, &[(KEY_CHECK_ALIVE_TIMEOUT, "u")]));
         let mutter = mutter
-            .filter(|schema| schema_matches(schema, &[(KEY_POINTER_REST, "b")]))
+            .filter(|_| pointer_rest || check_alive)
             .map(|schema| gio::Settings::new_full(schema, backend, None));
         let handlers = std::iter::once(&wm)
             .chain(mutter.as_ref())
@@ -397,6 +410,8 @@ impl GioReader {
         Ok(Self {
             wm,
             mutter,
+            pointer_rest,
+            check_alive,
             handlers,
         })
     }
@@ -411,6 +426,12 @@ impl NativeReader for GioReader {
         // only for keys read since. Fixed types bound all data.
         let error = || ReadError("invalid wm preferences value".into());
         let value = |key| self.wm.value(key);
+        let mutter = |installed: bool, key: &str| {
+            self.mutter
+                .as_ref()
+                .filter(|_| installed)
+                .map(|mutter| mutter.value(key))
+        };
         Ok(RawFocusSettings {
             focus_mode: value(KEY_FOCUS_MODE).get::<String>().ok_or_else(error)?,
             auto_raise: value(KEY_AUTO_RAISE).get::<bool>().ok_or_else(error)?,
@@ -422,15 +443,12 @@ impl NativeReader for GioReader {
             resize_with_right_button: value(KEY_RESIZE_WITH_RIGHT_BUTTON)
                 .get::<bool>()
                 .ok_or_else(error)?,
-            focus_change_on_pointer_rest: match &self.mutter {
-                Some(mutter) => Some(
-                    mutter
-                        .value(KEY_POINTER_REST)
-                        .get::<bool>()
-                        .ok_or_else(error)?,
-                ),
-                None => None,
-            },
+            focus_change_on_pointer_rest: mutter(self.pointer_rest, KEY_POINTER_REST)
+                .map(|read| read.get::<bool>().ok_or_else(error))
+                .transpose()?,
+            check_alive_timeout_ms: mutter(self.check_alive, KEY_CHECK_ALIVE_TIMEOUT)
+                .map(|read| read.get::<u32>().ok_or_else(error))
+                .transpose()?,
         })
     }
 }
@@ -554,6 +572,7 @@ mod tests {
         assert_eq!(first.focus_mode, "click");
         assert_eq!(first.mouse_button_modifier, "<Super>");
         assert_eq!(first.focus_change_on_pointer_rest, Some(false));
+        assert_eq!(first.check_alive_timeout_ms, None);
         assert_eq!(reader.status(), CacheStatus::Fresh);
         let source = glib::idle_source_new(
             Some("tuna-wm-preferences-watch-proof"),
@@ -594,9 +613,32 @@ mod tests {
         let reader = gio_reader(&wake, dir.path().to_path_buf(), false);
         let raw = completed(&reader, &mut loop_, Instant::now());
         assert_eq!(raw.focus_change_on_pointer_rest, None);
+        assert_eq!(raw.check_alive_timeout_ms, None);
         let mut policy = FocusPolicy::default();
         policy.apply(&raw);
         assert_eq!(policy, FocusPolicy::default());
+        retire(&reader);
+    }
+
+    #[test]
+    fn check_alive_timeout_reads_from_the_mutter_schema_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        // A mutter schema with only check-alive-timeout (0 disables the
+        // alive check): read, while pointer-rest keeps the shell default.
+        compile(
+            dir.path(),
+            &format!(
+                "<schemalist>{ENUM_XML}{WM_XML}\
+                 <schema id='org.gnome.mutter' path='/tuna/mutter-alive-proof/'>\
+                 <key name='check-alive-timeout' type='u'><default>0</default></key>\
+                 </schema></schemalist>"
+            ),
+        );
+        let (wake, mut loop_) = wake_loop();
+        let reader = gio_reader(&wake, dir.path().to_path_buf(), true);
+        let raw = completed(&reader, &mut loop_, Instant::now());
+        assert_eq!(raw.check_alive_timeout_ms, Some(0));
+        assert_eq!(raw.focus_change_on_pointer_rest, None);
         retire(&reader);
     }
 

@@ -197,10 +197,11 @@ fn pump(
     panic!("pump budget exhausted");
 }
 
-/// Connect one client and bind compositor plus layer shell.
+/// Connect the supervised shell (the only client offered layer-shell,
+/// #1048) and bind compositor plus layer shell.
 fn connect(comp: &mut TestCompositor) -> (Connection, EventQueue<Client>, Client) {
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    comp.add_client(server_stream);
+    comp.add_shell_client(server_stream);
     let conn = Connection::from_socket(client_stream).unwrap();
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();

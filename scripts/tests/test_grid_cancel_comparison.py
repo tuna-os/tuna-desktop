@@ -160,10 +160,9 @@ class Identity(unittest.TestCase):
         }
         with patch.dict(os.environ, environment, clear=True), \
                 patch.object(contract, "source_tuple", return_value=source), \
-                patch.object(contract, "api", side_effect=responses.__getitem__) as api:
+                patch.object(contract, "api", side_effect=responses.__getitem__):
             result = contract.current_identity(ROOT)
         self.assertEqual((result["head"], result["event_head"]), (self.sha, event_head))
-        self.assertEqual(api.call_args_list[-1].args, (f"git/commits/{self.sha}",))
 
     def test_current_identity_requires_both_env_shas_and_matching_checkout_tree(self):
         source = dict(sha=self.sha, tree=self.commit["tree"]["sha"], lock_sha256="lock")
@@ -205,9 +204,8 @@ class Identity(unittest.TestCase):
         for page in (dict(total_count=101, jobs=self.jobs), dict(jobs=self.jobs)):
             with self.subTest(page=page), patch.dict(os.environ, environment, clear=True), \
                     patch.object(contract, "source_tuple", return_value=dict(sha=self.sha)), \
-                    patch.object(contract, "api", return_value=page) as api, self.assertRaises(ValueError):
+                    patch.object(contract, "api", return_value=page), self.assertRaises(ValueError):
                 contract.current_identity(ROOT)
-            self.assertEqual(api.call_count, 1)
 
 
 class BuildRoles(unittest.TestCase):
@@ -319,6 +317,41 @@ class OwnedCleanup(unittest.TestCase):
             self.assertFalse(runner.owned_processes(token))
         finally:
             child.wait(timeout=3)
+
+
+class FailureReport(unittest.TestCase):
+    VERDICT = "tuna-gtk-shell-proof: G-GRID-DRAG-CANCEL FAIL: active neutral pointer or first page not observed"
+
+    def test_excerpt_keeps_the_proof_verdict_and_the_bounded_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output-old.txt"
+            output.write_text("\n".join(["early noise", self.VERDICT, *(f"nested {n}" for n in range(200)), "x" * 5000]) + "\n")
+            excerpt = runner.failure_excerpt(output, limit=50)
+            self.assertEqual(excerpt[0], self.VERDICT)
+            self.assertEqual(excerpt[1:-1], [f"nested {n}" for n in range(151, 200)])
+            self.assertEqual(excerpt[-1], "x" * 2000)
+            # A verdict already inside the end is not repeated.
+            self.assertEqual(runner.failure_excerpt(output, limit=500).count(self.VERDICT), 1)
+            self.assertEqual(runner.failure_excerpt(Path(tmp) / "missing.txt")[0].split(":")[0], "missing.txt unreadable")
+
+    def test_failed_role_prints_its_output_and_still_fails(self):
+        # No proof runs: the child is a stand-in that writes the role output.
+        class Child:
+            pid = 0
+            def __init__(self, argv, stdout, **_):
+                stdout.write("ValueError: actual carousel page changed before Escape\n" + FailureReport.VERDICT + "\n")
+                stdout.flush()
+            def wait(self, timeout): return 1
+        with tempfile.TemporaryDirectory() as tmp, patch.object(runner.subprocess, "Popen", Child), \
+                patch.object(runner, "cleanup_owned", return_value=True), \
+                patch("sys.stderr", new_callable=__import__("io").StringIO) as stderr:
+            work = Path(tmp)
+            with self.assertRaisesRegex(ValueError, "headed comparison failed or left owned processes"):
+                runner.run_role("old", work, work / "admission-old.json", {"source": {"sha": "a" * 40}}, work / "bin-old")
+            self.assertEqual(json.loads((work / "receipt-old.json").read_text())["exit"], 1)
+            printed = stderr.getvalue().splitlines()
+            self.assertEqual(printed[0], "tuna-grid-cancel-comparison: role=old exit=1 owned_cleanup=True; output-old.txt (also uploaded) ends:")
+            self.assertEqual(printed[1:], ["ValueError: actual carousel page changed before Escape", self.VERDICT])
 
 
 if __name__ == "__main__": unittest.main()

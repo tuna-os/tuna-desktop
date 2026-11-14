@@ -100,6 +100,16 @@ def build(source, role, work, ci):
     return path, admission, binaries
 
 
+def failure_excerpt(path, limit=120):
+    # The headed proof's assertion, traceback and nested-session tail exist
+    # only in the redirected role output. Without them a failed job ends on
+    # this wrapper's generic error and the cause needs an artifact download.
+    try: lines = path.read_text(errors="replace").splitlines()
+    except OSError as error: return [f"{path.name} unreadable: {error}"]
+    verdicts = [line for line in lines[:-limit] if line.startswith("tuna-gtk-shell-proof: ") and " FAIL: " in line]
+    return [line[:2000] for line in verdicts + lines[-limit:]]
+
+
 def run_role(role, work, admission_path, admission, binaries):
     home = work / f"home-{role}"
     home.mkdir(mode=0o700)
@@ -127,7 +137,11 @@ def run_role(role, work, admission_path, admission, binaries):
     receipt = {"role": role, "exit": status, "owned_cleanup": clean, "admission": admission,
                "output_sha256": contract.digest(work / f"output-{role}.txt")}
     (work / f"receipt-{role}.json").write_text(json.dumps(receipt, indent=2) + "\n")
-    if status != 0 or not clean: raise ValueError("headed comparison failed or left owned processes")
+    if status != 0 or not clean:
+        print(f"tuna-grid-cancel-comparison: role={role} exit={status} owned_cleanup={clean}; "
+              f"output-{role}.txt (also uploaded) ends:", file=sys.stderr)
+        for line in failure_excerpt(work / f"output-{role}.txt"): print(line, file=sys.stderr)
+        raise ValueError("headed comparison failed or left owned processes")
     if contract.source_tuple(Path(admission["source_root"])) != admission["source"] or contract.source_tuple(ROOT) != admission["harness"]:
         raise ValueError("proof source/lock changed")
     for record in admission["files"].values():

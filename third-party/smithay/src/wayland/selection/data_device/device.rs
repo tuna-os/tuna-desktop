@@ -82,9 +82,11 @@ where
                         // The StartDrag is in response to a pointer implicit grab, all is good
                         handler.started(source.clone(), icon.clone(), seat.clone());
                         let start_data = pointer.grab_start_data().unwrap();
+                        let (focus, motion) = pointer.pending_motion(serial);
                         pointer.set_grab(
                             handler,
-                            dnd_grab::DnDGrab::new_pointer(dh, start_data, source, origin, seat, icon),
+                            dnd_grab::DnDGrab::new_pointer(dh, start_data, source, origin, seat, icon)
+                                .with_initial_pointer_focus(focus, &motion),
                             serial,
                             Focus::Clear,
                         );
