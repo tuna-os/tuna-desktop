@@ -6,6 +6,41 @@ The [v1 checklist](v1.md) and [ADR 0008](adr/0008-v1-beta-track-and-release-scop
 remain unchanged. Marlin remains the GNOME 51 comparison target; the other
 variants still need their own immutable-image runtime evidence.
 
+## Owner decisions, 2026-11-14
+
+The [owner decision of 2026-11-14](https://github.com/tuna-os/tuna-desktop/issues/1050#issuecomment-6882624166),
+as revised the same day on [#1050](https://github.com/tuna-os/tuna-desktop/issues/1050)
+after two of its premises were corrected, sets the v1 required set to
+**15 variants**: all fourteen matrix variants plus stingray. That is
+yellowfin, albacore, skipjack, wahoo, bonito, bonito-rawhide, sailfin, grouper,
+marlin, flounder, flounder-sid, hummingbird, guppy, gurnard and stingray. None
+of them is qualified yet.
+
+- **gurnard: required.** Noble publishes no gtk4-layer-shell source
+  ([Launchpad query](https://api.launchpad.net/1.0/ubuntu/+archive/primary?ws.op=getPublishedSources&distro_series=https%3A%2F%2Fapi.launchpad.net%2F1.0%2Fubuntu%2Fnoble&source_name=gtk4-layer-shell&exact_match=true&status=Published),
+  no entries on 2026-11-14), and there is no `noble` factory target yet
+  ([packages #834](https://github.com/tuna-os/tunaos-packages/issues/834)).
+  The factory will add one: gtk4-layer-shell 1.1 or later packaged for Noble,
+  built with Noble's own versioned `rustc-1.97`/`cargo-1.97`. That compiler
+  closes the earlier gap: the locked gtk4 0.11.5 needs Rust 1.92 or later,
+  and `rustc-1.97` and `cargo-1.97` 1.97.1 reached noble-updates and
+  noble-security on 2026-11-06. TunaOS keeps gurnard unsupported until the
+  target publishes.
+- **stingray: required**, added by the owner on 2026-11-14. It needs an
+  `ubuntu-rolling` factory target, a `tuna` flavor and runtime runs.
+- **hummingbird: required; closure work in progress.** The TuneD
+  `rpm-ostree` provider, `libcanberra` and build-chain publication of the
+  current desktop ([packages #982](https://github.com/tuna-os/tunaos-packages/issues/982),
+  [#959](https://github.com/tuna-os/tunaos-packages/pull/959)) come first,
+  then the image build is re-enabled.
+- **guppy: publication approved under [#577](https://github.com/tuna-os/tuna-desktop/issues/577),
+  pending qualification.** [TunaOS #3883](https://github.com/tuna-os/tunaOS/pull/3883)
+  merges once its runtime run qualifies.
+- **albacore: required; deferral lifted.** [tunaOS #3969](https://github.com/tuna-os/tunaOS/issues/3969)
+  was closed as completed on 2026-11-01, and the owner lifted the deferral on
+  2026-11-14. Its `tuna` cell keeps building and publishing, and it is to be
+  qualified like the others.
+
 ## Current source inventory
 
 The primary inventory is [TunaOS `tunaos.toml` at
@@ -13,7 +48,9 @@ The primary inventory is [TunaOS `tunaos.toml` at
 It declares **14 variants**, eleven admitted amd64 Tuna image cells and three
 source-declared unsupported rows. No arm64 Tuna cell is enabled. All eleven
 Tuna cells have `build_iso=false`, `build_qcow2=false`, and `luks_e2e=false`;
-this matrix does not invent ISO/LUKS acceptance cells.
+this matrix does not invent ISO/LUKS acceptance cells. TunaOS main has since
+added stingray as a fifteenth variant, recorded unsupported until the factory
+has an `ubuntu-rolling` target.
 
 The native package inventory is [tunaos-packages
 `c0998b94bd7b4fbc67360c239e439de6debf539b`](https://github.com/tuna-os/tunaos-packages/tree/c0998b94bd7b4fbc67360c239e439de6debf539b).
@@ -26,7 +63,7 @@ Gentoo payload evidence, and publication attempts are recorded in
 | Variant | Base | Package target / format | Support and integration state |
 |---|---|---|---|
 | yellowfin | AlmaLinux Kitten 10 | `el10` / RPM | admitted; published image, not v1-qualified |
-| albacore | AlmaLinux 10 | `el10` / RPM | admitted; published image, not v1-qualified |
+| albacore | AlmaLinux 10 | `el10` / RPM | admitted; published image, not v1-qualified; **required (2026-11-14)**, owner deferral lifted after [tunaOS #3969](https://github.com/tuna-os/tunaOS/issues/3969) closed |
 | skipjack | CentOS Stream 10 | `el10` / RPM | admitted; published image, not v1-qualified |
 | wahoo | Fedora ELN / EL11 preview | `eln` / RPM | admitted, experimental; missing Tuna tag repaired through existing signed workflow; runtime still required |
 | bonito | Fedora 44 | `fedora` / RPM | admitted; published image, not v1-qualified |
@@ -36,9 +73,10 @@ Gentoo payload evidence, and publication attempts are recorded in
 | marlin | Arch Linux | `arch` / pacman | admitted; real published-image journey has failures, below |
 | flounder | Debian 13 Trixie | `trixie` / DEB | admitted; source retains a portal session-start blocker note; needs actual digest-specific verdict |
 | flounder-sid | Debian Sid | `debian` / DEB | admitted; published as `flounder:tuna-sid`; same portal-note qualification limit |
-| hummingbird | Fedora Hummingbird | native Hummingbird build chain / RPM | **not admitted on main; not an accepted package-unavailable waiver**; native package implementation exists; current served beta1 and power-provider closure block strict admission |
-| guppy | Gentoo | `gentoo` / gpkg, amd64 | **not admitted on main; not an accepted package-unavailable waiver**; signed beta2-r1 publication and served-install verification now pass; image admission/runtime remain open |
-| gurnard | Ubuntu 24.04 Noble | `noble` / no implemented Tuna target | source-backed unsupported: no native target, Rust >=1.92 required, current Noble-updates search exposes only rustc-1.91 in the 1.9 series; no vendored-toolchain substitution |
+| hummingbird | Fedora Hummingbird | native Hummingbird build chain / RPM | **required (2026-11-14); closure work in progress**; not admitted on main; native package implementation exists; current served beta1 and power-provider closure block strict admission |
+| guppy | Gentoo | `gentoo` / gpkg, amd64 | **required (2026-11-14); publication approved under #577, pending qualification**; not admitted on main; signed beta2-r1 publication and served-install verification pass; image admission/runtime remain open |
+| gurnard | Ubuntu 24.04 Noble | `noble` / no implemented Tuna target | **required (2026-11-14)**; unsupported on main until the factory gains a `noble` target with gtk4-layer-shell and `rustc-1.97` |
+| stingray | Ubuntu interim release | `ubuntu-rolling` / no implemented Tuna target | **required (2026-11-14)**; unsupported on main until the factory gains an `ubuntu-rolling` target; flavor and runtime runs remain |
 
 ### Unsupported reasons are evidence, not a scope shortcut
 
@@ -75,12 +113,12 @@ and [published Cargo sources](https://api.launchpad.net/1.0/ubuntu/+archive/prim
 still top out at native `1.91.1`; `rustc-web` and `cargo-web` are not Noble
 escape hatches. The selected locked [gtk4 0.11.5 metadata](https://crates.io/api/v1/crates/gtk4/0.11.5)
 independently requires Rust **at least 1.92**. This is a confirmed lower bound,
-not an assertion about the whole lockfile's exact maximum MSRV.
-**Gurnard remains a blocker for the full fourteen-variant goal**, not a waiver
-or qualified variant. An actual native Noble factory target, compatible
-compiler/Cargo/standard-library closure, package build/install and immutable
-image runtime receipts are still required. No compiler from another target,
-third-party binary injection or target substitution is permitted.
+not an assertion about the whole lockfile's exact maximum MSRV. That audit is
+superseded: `rustc-1.97` reached Noble on 2026-11-06, and **gurnard is required
+for v1** (owner decisions above). A native Noble factory target,
+package build/install and immutable image runtime receipts are still
+required. No compiler from another target, third-party binary injection or
+target substitution is permitted.
 
 ## Current required-cell accounting
 
@@ -112,10 +150,10 @@ as qualified or substituted for an unwaived prerequisite.
   accepted. A reviewed/merged exact-source signed normal-main CI tool may produce
   explicitly diagnostic receipts; final qualification requires the normal signed
   Corral release. No unreviewed PR tool or special trust waiver is used.
-- Hummingbird's independent normal provider review/publication, Guppy's explicit
-  release-approval fence, and Noble's unwaived native compiler/target prerequisite
-  remain distinct blockers. The Albacore owner exception is scoped only to that
-  single cell and does not relax any other failed or unmeasured gate.
+- Hummingbird's provider closure and publication, Guppy's runtime
+  qualification and Gurnard's Noble target remain distinct blockers. Guppy's
+  release-approval fence was settled on 2026-11-14, and the Albacore deferral
+  was lifted that day (see the owner decisions above).
 
 ## Published immutable subjects
 
@@ -142,7 +180,7 @@ has its own [publication receipt](variants/2026-10-31/wahoo-publication.json).
 | marlin | `marlin@sha256:d0e65bce0ac55cb6c58bcf3739e30d6372fe4be978e6ea7c0c1310b3962bdfa5` |
 | flounder | `flounder@sha256:03a4224a791370669f5bf96228097397298fa5e39b566cd3c3d1c1fd11481e2e` |
 | flounder-sid | `flounder@sha256:81570c4609ad406ffa4ce5ac453c64f43708e74285ffc00aba7fc4006883cbc8` |
-| hummingbird, guppy, gurnard | no admitted Tuna image subject in the source inventory; no image pass inferred from native packages |
+| hummingbird, guppy, gurnard, stingray | no admitted Tuna image subject in the source inventory; no image pass inferred from native packages |
 
 ### Existing Marlin runtime verdict is not a v1 pass
 
@@ -223,13 +261,14 @@ Neither `punjab` nor the independent soak VM was touched.
 | yellowfin old `355f66…` (beta1) | pass in both retained runs | availability only; expanded run Screenshot Response 2 and ScreenCast Start timeout because generic Enter did not activate the visible Allow/Share controls | `LockedHint=no` fails; refusal/unlock pass | fail |
 | yellowfin refreshed `64e7a29…` | trusted refresh run [41221855489](https://github.com/tuna-os/tunaOS/actions/runs/41221855489) succeeded; guest reports beta2-2.el10; retained core run 10 pass/3 fail | earlier capture failures were locked-session denials; later untouched-image unlocked Screenshot/ScreenCast deliver real frames, with lock withdrawal observed in 0.147 seconds | `LockedHint=no`; refusal/unlock/logout pass | not qualified; full corrected core matrix receipt and visual review remain separate |
 | marlin | existing exact beta2-2 journey passes these gates | not qualified by that daily-driver receipt | lock hint fails; refused password/unlock pass | fail, not a v1 pass |
-| albacore `b68a195…` | historical receipts retain actual beta1/GDM/session results | historical capture observations retained, not current admission | lock failures remain recorded | **owner-deferred/unqualified**: omit only `albacore:tuna` from active qualification/publication until the externally owned [Mesa crash #3969](https://github.com/tuna-os/tunaOS/issues/3969) is repaired |
+| albacore `b68a195…` | historical receipts retain actual beta1/GDM/session results | historical capture observations retained, not current admission | lock failures remain recorded | not qualified; owner deferral lifted 2026-11-14 after [Mesa crash #3969](https://github.com/tuna-os/tunaOS/issues/3969) closed; required, current-digest run pending |
 | skipjack, wahoo, bonito, sailfin | expanded run: install/GDM/session pass | earlier receipts lack unlocked/timely-consent preconditions; not functional qualification | `LockedHint=no` | fail on retained receipts; corrected preconditions pending |
 | bonito-rawhide | builder Secret label exceeded Kubernetes' 63-byte limit before the VM existed | unproven | unproven | harness failure fixed by VM-name bound; rerun pending |
 | grouper | expanded run interrupted during build; orphan builder VM/Secret/PVC deleted, inventory empty | unproven | unproven | not qualified |
 | flounder, flounder-sid | publication resolved; not yet run | unproven | unproven | not qualified |
-| hummingbird, guppy | admission branches remain open; no admitted immutable-image runtime proof | unproven | unproven | not qualified; stale package-unavailable reasons rejected |
-| gurnard | no native Tuna target | unproven | unproven | source-backed unsupported prerequisite, not a runtime pass |
+| hummingbird, guppy | admission branches remain open; no admitted immutable-image runtime proof | unproven | unproven | required; not qualified; stale package-unavailable reasons rejected |
+| gurnard | no native Tuna target | unproven | unproven | required (2026-11-14); not qualified; waits on a `noble` factory target |
+| stingray | no Tuna target or flavor | unproven | unproven | required (2026-11-14); not qualified |
 
 **[Owner scope override](https://github.com/tuna-os/tuna-desktop/issues/577#issuecomment-6550264429):** Tuna on Albacore may be skipped temporarily while
 its Mesa/GDM crash is fixed elsewhere. This is an explicit deferred/unqualified
@@ -239,8 +278,9 @@ receipt stays unchanged, and no further Albacore attempt or publication is made.
 No other failed variant or gate is omitted by this decision.
 The [machine-readable owner deferral](variants/2026-10-31/owner-deferred.json)
 keeps `qualified:false` distinct from required qualified, required failed and
-required unmeasured cells. Noble's native-compiler prerequisite is separate and
-has no owner exception.
+required unmeasured cells. **The owner lifted this deferral on 2026-11-14**,
+after tunaOS #3969 closed as completed on 2026-11-01; Albacore is required again and
+its retained receipts stay unchanged.
 
 The expanded-run receipts are not retroactively converted into failures of
 the published desktop. The visible GNOME dialogs prove the harness pressed
@@ -292,7 +332,10 @@ Exact admission/publication [gate snapshot](variants/2026-10-31/admission-gates.
   the sentinel flag. The issue body's release gates still apply: no publication
   before the tuna-desktop v1 epic (tuna-desktop#577) approves it.” No candidate
   or signed registry image was published. Without that approval, Guppy GDM/session/
-  portal/lock qualification against a published digest is blocked.
+  portal/lock qualification against a published digest is blocked. The owner
+  approved Guppy publication under #577 on 2026-11-14
+  ([decision](https://github.com/tuna-os/tuna-desktop/issues/1050#issuecomment-6882624166));
+  #3883 merges once its runtime run qualifies.
 - Hummingbird PR #3885 head `0de95641bfdd350e1f148b7f0b1eb600acf58913`.
   [Exact-head run 41213419115](https://github.com/tuna-os/tunaOS/actions/runs/41213419115)
   failed the native TuneD transaction before desktop/boot gates.
@@ -318,10 +361,8 @@ through `tuna-corral-journey`; `--variant NAME` limits runtime work, never hides
 other inventory rows. The only node accepted by this lane is `karnataka`.
 Only newly owned `tuna-q-variant-*` VMs/disks are created/deleted. Existing
 `punjab` and the independent soak VM are never named.
-During the Albacore deferral, use explicit repeated `--variant` selections for
-the other ten published variants; registry discovery still retains all fourteen
-source rows. Do not start another unfiltered `--run` until the owner lifts that
-single-cell deferral.
+The Albacore deferral is lifted, so an unfiltered `--run` again covers every
+published variant; `--variant` still limits runtime work to a subset.
 
 The default runtime scope is the required real-GDM/session/portal/
 lock/unlock/logout core, using the journey's explicit `--qualification-only`
