@@ -1,7 +1,7 @@
 //! T1 nested runtime loop + launch tests.
 //!
 //! Covers `tuna_compositor::runtime` without window mapping or input
-//! (T2 scope): env hygiene, default session identity, and a live launch
+//! (T2 scope): default session identity and a live launch
 //! smoke test that skips cleanly when no host display/EGL exists.
 //!
 //! Conventions follow the sibling harnesses (`handshake.rs`,
@@ -12,63 +12,39 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tuna_compositor::runtime::{apply_nested_env, restore_env, NestedSession};
+use tuna_compositor::runtime::NestedSession;
 
 const RETRY_ROUNDS: usize = 500;
 const RETRY_SLEEP: Duration = Duration::from_millis(5);
 
-/// Path of the sibling `tuna-compositor` binary: the test executable lives
-/// in `target/<profile>/deps/`, the binary in `target/<profile>/`.
-fn compositor_bin() -> std::path::PathBuf {
-    let mut dir = std::env::current_exe().expect("test executable path");
-    dir.pop();
-    if dir.file_name().is_some_and(|n| n == "deps") {
-        dir.pop();
+/// The `tuna-compositor` binary Cargo built for this integration test. Its
+/// location relative to the test executable is not stable across Cargo
+/// releases (1.100 moved test executables into the build directory).
+const COMPOSITOR_BIN: &str = env!("CARGO_BIN_EXE_tuna-compositor");
+
+/// Keep real child launches independent of the invoking user's migration state.
+/// Retain the owner until the child exits so its private roots remain available.
+fn private_launch_env(command: &mut Command) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("private launch root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private launch root permissions");
+    for (key, name) in [
+        ("HOME", "home"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_STATE_HOME", "state"),
+        ("XDG_RUNTIME_DIR", "runtime"),
+    ] {
+        let path = root.path().join(name);
+        std::fs::create_dir(&path).expect("private launch directory");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("private launch directory permissions");
+        command.env(key, path);
     }
-    dir.join("tuna-compositor")
-}
-
-/// Env hygiene in ONE test, run sequentially: process env is global, so
-/// splitting set/restore across tests would race with each other.
-/// `apply_nested_env` points `WAYLAND_DISPLAY` at our socket and returns
-/// the previous value; `restore_env` puts it back, or removes the var
-/// when there was none.
-#[test]
-fn nested_env_apply_returns_previous_and_restore_reverts() {
-    // Preserve whatever the ambient test process had; restored at the end
-    // so no other test in this binary observes our mutation.
-    let outer = std::env::var_os("WAYLAND_DISPLAY");
-
-    // Case 1: a previous value exists.
-    std::env::set_var("WAYLAND_DISPLAY", "host-display-0");
-    let prev = apply_nested_env("tuna-nested-test");
-    assert_eq!(
-        prev.as_deref(),
-        Some(std::ffi::OsStr::new("host-display-0"))
-    );
-    assert_eq!(
-        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
-        Some(std::ffi::OsStr::new("tuna-nested-test"))
-    );
-    restore_env(prev);
-    assert_eq!(
-        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
-        Some(std::ffi::OsStr::new("host-display-0"))
-    );
-
-    // Case 2: no previous value.
-    std::env::remove_var("WAYLAND_DISPLAY");
-    let prev = apply_nested_env("tuna-nested-test");
-    assert_eq!(prev, None);
-    assert_eq!(
-        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
-        Some(std::ffi::OsStr::new("tuna-nested-test"))
-    );
-    restore_env(prev);
-    assert_eq!(std::env::var_os("WAYLAND_DISPLAY"), None);
-
-    // Leave the process env as we found it.
-    restore_env(outer);
+    root
 }
 
 /// `default_for_pid` names the socket after our pid and picks a positive
@@ -104,13 +80,9 @@ fn launch_smoke_binds_private_socket_or_skips_without_backend() {
         .unwrap()
         .as_nanos();
     let socket_name = format!("tuna-test-{}-{nanos}", std::process::id());
-    let bin = compositor_bin();
-    assert!(
-        bin.is_file(),
-        "missing sibling binary {}; run `cargo build -p tuna-compositor --bins` first",
-        bin.display()
-    );
-    let mut child = Command::new(bin)
+    let mut command = Command::new(COMPOSITOR_BIN);
+    let private_root = private_launch_env(&mut command);
+    let mut child = command
         .args([
             "--socket",
             &socket_name,
@@ -125,10 +97,7 @@ fn launch_smoke_binds_private_socket_or_skips_without_backend() {
         .expect("spawn nested compositor");
 
     // `ListeningSocketSource::with_name` binds under `XDG_RUNTIME_DIR`.
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let socket_path = runtime_dir.join(&socket_name);
+    let socket_path = private_root.path().join("runtime").join(&socket_name);
     let mut bound = false;
     let mut exited = None;
     for _ in 0..RETRY_ROUNDS {
@@ -211,7 +180,9 @@ fn sighup_ends_the_session_through_teardown() {
         .unwrap()
         .as_nanos();
     let socket_name = format!("tuna-hup-{}-{nanos}", std::process::id());
-    let mut child = Command::new(compositor_bin())
+    let mut command = Command::new(COMPOSITOR_BIN);
+    let private_root = private_launch_env(&mut command);
+    let mut child = command
         .args([
             "--socket",
             &socket_name,
@@ -224,10 +195,7 @@ fn sighup_ends_the_session_through_teardown() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn nested compositor");
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let socket_path = runtime_dir.join(&socket_name);
+    let socket_path = private_root.path().join("runtime").join(&socket_name);
     let mut bound = false;
     for _ in 0..RETRY_ROUNDS {
         if socket_path.exists() {

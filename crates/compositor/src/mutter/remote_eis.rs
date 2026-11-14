@@ -79,11 +79,7 @@ impl Worker {
                         capabilities,
                         |device| {
                             if let Some(keyboard) = device.interface::<eis::Keyboard>() {
-                                keyboard.keymap(
-                                    eis::keyboard::KeymapType::Xkb,
-                                    self.keymap_len,
-                                    self.keymap.as_fd(),
-                                );
+                                send_keymap(&keyboard, &self.keymap, self.keymap_len);
                             }
                             if device.has_capability(DeviceCapability::PointerAbsolute) {
                                 for output in &self.outputs {
@@ -93,6 +89,13 @@ impl Worker {
                                     let height =
                                         (f64::from(output.height) / output.scale).round().max(1.0)
                                             as u32;
+                                    // ei_device v2: the mapping id pairing this
+                                    // region with the linked monitor stream.
+                                    if device.device().version() >= 2 {
+                                        device.device().region_mapping_id(
+                                            &super::output_mapping_id(&output.connector),
+                                        );
+                                    }
                                     device.device().region(
                                         (output.x - self.origin.0) as u32,
                                         (output.y - self.origin.1) as u32,
@@ -177,7 +180,9 @@ impl Worker {
                     }
                     _ => None,
                 };
-                if let Some(input) = input {
+                // Mutter accepts ConnectToEIS before Start (grd connects
+                // first) and input reaches nothing until the session runs.
+                if let Some(input) = input.filter(|_| self.grant.started.load(Ordering::SeqCst)) {
                     if remote_desktop::queue_input(&self.grant, &self.to_loop, input).is_err() {
                         self.disconnected = true;
                         return calloop::PostAction::Remove;
@@ -193,14 +198,9 @@ impl Worker {
     }
 }
 
-pub(crate) fn start(
-    socket: UnixStream,
-    grant: RemoteGrant,
-    types: u32,
-    keymap: String,
-    outputs: Outputs,
-    to_loop: calloop::channel::Sender<ToLoop>,
-) -> io::Result<()> {
+/// A sealed memfd holding `keymap` and its terminating NUL, the form
+/// libei keymaps take (mutter's `mtk_anonymous_file_new`), and its size.
+pub(super) fn sealed_keymap(name: &str, keymap: &str) -> io::Result<(std::fs::File, u32)> {
     if keymap.is_empty() || keymap.len() > 1_048_576 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -208,7 +208,7 @@ pub(crate) fn start(
         ));
     }
     let fd = rustix::fs::memfd_create(
-        "tuna-remote-keymap",
+        name,
         rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
     )?;
     let mut file = std::fs::File::from(fd);
@@ -221,7 +221,29 @@ pub(crate) fn start(
             | rustix::fs::SealFlags::WRITE
             | rustix::fs::SealFlags::SEAL,
     )?;
-    let keymap_len = keymap.len() as u32 + 1;
+    Ok((file, keymap.len() as u32 + 1))
+}
+
+/// Send a sealed keymap on a fresh read-only description at offset 0
+/// for every send: grd read()s the keymap (grd-session.c
+/// setup_xkb_keymap) instead of mapping it, and the writer left the
+/// file's offset at the end.
+pub(super) fn send_keymap(keyboard: &eis::Keyboard, keymap: &std::fs::File, len: u32) {
+    use std::os::fd::AsRawFd;
+    if let Ok(fresh) = std::fs::File::open(format!("/proc/self/fd/{}", keymap.as_raw_fd())) {
+        keyboard.keymap(eis::keyboard::KeymapType::Xkb, len, fresh.as_fd());
+    }
+}
+
+pub(crate) fn start(
+    socket: UnixStream,
+    grant: RemoteGrant,
+    types: u32,
+    keymap: String,
+    outputs: Outputs,
+    to_loop: calloop::channel::Sender<ToLoop>,
+) -> io::Result<()> {
+    let (file, keymap_len) = sealed_keymap("tuna-remote-keymap", &keymap)?;
     let outputs = outputs
         .lock()
         .map_err(|_| io::Error::other("output registry unavailable"))?

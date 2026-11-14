@@ -45,10 +45,13 @@ is represented by a match, a version floor or a recorded deviation; a
 source-only floor is never described as a measured native version.
 
 **Golden test.** `crates/compositor/tests/protocols.rs` asserts the exact
-list and versions below, as an ordinary client sees them. Adding or
-dropping a protocol updates the test and this page together. The one
-Xwayland-only global is not in that list; its own tests assert that
-ordinary clients never see it.
+list and versions an ordinary client sees (`EXPECTED`), that the
+supervised shell's connection sees exactly that plus `SHELL_ONLY`
+(layer-shell, the foreign toplevel list), and that a client inside a
+`wp_security_context_v1` sees `EXPECTED` less `SANDBOX_HIDDEN` (session
+lock, security context). Adding or dropping a protocol updates the test
+and this page together. The one Xwayland-only global is not in those
+lists; its own tests assert that ordinary clients never see it.
 
 ## Advertised by Tuna Desktop
 
@@ -63,7 +66,7 @@ ordinary clients never see it.
 | zwp_primary_selection_device_manager_v1 | 1 | |
 | xdg_wm_base | 7 | popups with positioner constraints and grabs; edge states from Mutter's edge constraints: maximized is tiled and constrained on every edge, a half tile on its top, bottom and outer edge (Tuna Desktop pairs no tiles, so the inner edge stays free); constrained states only to version 7 binds |
 | zxdg_output_manager_v1 | 3 | |
-| zwlr_layer_shell_v1 | 4 | Tuna Desktop's own shell draws through it |
+| zwlr_layer_shell_v1 | 4 | Tuna Desktop's own shell draws through it. Only the supervised shell's connection may bind it: the native connection whose peer pid is the shell child the compositor spawned and still holds (`tuna-shell-gtk`, or the legacy `tuna-shell-host`), the same identity the session lock and control socket check. Every other client's registry omits it and a blind bind by name is a protocol error (#1048; `ClientState::admit_supervised_shell`, `layer::is_shell_peer`) |
 | zwp_linux_dmabuf_v1 | 5 | only when the renderer reports formats; as Mutter, version 5 when the renderer's EGL device names a render node (else its DRM node), with default feedback naming that device and one tranche of the renderer's formats, and version 3 without one; no scanout tranche, since every surface is composited |
 | xdg_activation_v1 | 1 | focus policy below |
 | wp_viewporter | 1 | |
@@ -72,15 +75,15 @@ ordinary clients never see it.
 | wp_cursor_shape_manager_v1 | 2 | shapes accepted; the compositor cursor is still the default arrow |
 | zwp_idle_inhibit_manager_v1 | 1 | a live inhibitor holds off the idle lock |
 | zwp_text_input_manager_v3 | 1 | text fields reach the input method (#60) |
-| zwp_input_method_manager_v2 | 1 | IMEs such as fcitx5; candidate popups are tracked like any popup |
+| zwp_input_method_manager_v2 | 1 | private to the compositor-supervised IBus connection, using the same server-owned transport authorization as virtual keyboard; ordinary applications cannot discover or force-bind it. This is not a public GNOME IME API. One exact live input-method resource owns the seat; unavailable objects and their inert child IDs cannot type, observe surrounding text, reserve popup roles, take grabs or retire the owner |
 | zwp_pointer_gestures_v1 | 3 | swipes reach apps; three-finger swipes are the shell's (overview, workspaces) |
 | zwp_relative_pointer_manager_v1 | 1 | raw motion from the DRM backend |
 | zwp_tablet_manager_v2 | 2 | tablets, tools (pressure, tilt, distance, buttons, tool cursors) and pads (buttons, rings, strips, mode groups, application labels shown on the pad OSD) from libinput on the DRM backend; the vendored Smithay adds pads, labels and version 2 (`third-party/smithay/TABLET-PAD-API-PATCH.diff`); pad dials need libinput 1.26 (the `input` crate's `libinput_1_26` feature), newer than Ubuntu 24.04's 1.25 (#344) |
 | zwp_pointer_constraints_v1 | 1 | a locked pointer stays put; a confined one stays in its window |
-| ext_session_lock_manager_v1 | 1 | the shell's lock screen; only the supervised shell's lock is granted, and only a password the compositor verified unlocks |
+| ext_session_lock_manager_v1 | 1 | the shell's lock screen; only the supervised shell's lock is granted, and only a password the compositor verified unlocks; while locked, input goes only to the lock surface (or nowhere without one), keyboard focus leaves applications as the session locks and returns to the focused window on unlock; duplicate_output is checked per lock object, so a refused or superseded lock does not make the shell's next lock on the same output a protocol error (`third-party/smithay/SESSION-LOCK-OUTPUTS-PATCH.diff`). Hidden from clients inside a security context |
 | wp_presentation | 2 | CLOCK_MONOTONIC, as Mutter; see frame timing below |
 | wp_fifo_manager_v1 | 1 | a barrier is released on the next refresh cycle |
-| wp_commit_timing_manager_v1 | 1 | a timed update applies on the refresh cycle whose next presentation reaches its time |
+| wp_commit_timing_manager_v1 | 1 | a timed update applies on the refresh cycle whose next presentation reaches its time; a tv_nsec of a second or more is an invalid_timestamp error, as in Mutter |
 | xdg_wm_dialog_v1 | 1 | a modal dialog is attached to its parent: focusing the parent focuses the dialog (GNOME's attach-modal-dialogs) |
 | zxdg_exporter_v2, zxdg_importer_v2 | 1 | xdg-foreign: the portal parents its dialogs to the app's window, which centres and attaches them like the app's own |
 | zxdg_exporter_v1, zxdg_importer_v1 | 1 | GTK 3's xdg-foreign: one handle table with v2, as Mutter, so the portal's v2 import parents its dialogs to a GTK 3 window; revoking an export destroys its imports and clears their parents (`third-party/smithay/XDG-FOREIGN-V1-PATCH.diff`) |
@@ -93,6 +96,11 @@ ordinary clients never see it.
 | wl_fixes | 1 | `destroy_registry` destroys the registry as Mutter does: the client's id is freed and that registry hears no more globals |
 | ext_background_effect_manager_v1 | 1 | capabilities `blur` at bind; one effect object per surface (`background_effect_exists`), `set_blur_region` double-buffered on commit, NULL removes it, `surface_destroyed` once the surface is gone; destroying the object unsets the region on the next commit (meta-wayland-background-effect.c). Drawn as Mutter 51's meta-background-effect.c and clutter-blur.c: the scene beneath the surface, clipped to the surface and its region, blurred (separable gaussian, sigma = radius / 2, radius 24 logical px times the surface's scale, downscaled by powers of two while sigma > 6 and both sides > 256 px), saturation 1.25 and 0.015 grain, at the surface's opacity, under its content; a repaint touching the sample area (region + 2 × radius) repaints all of it, and windows beneath an opaque blurred window still draw there. Not applied to overview previews or Alt+Tab thumbnails (Mutter also blurs behind clones) |
 | wp_drm_lease_device_v1 | 1 | native DRM backend only, as Mutter (`meta-wayland-drm-lease.c`): one global for the session's DRM device, advertised even with nothing to lease; absent nested and headless, so the golden list does not include it. A connected connector is for lease when the kernel marks it `non-desktop` (VR headsets) or `TUNA_DEBUG_LEASE_CONNECTORS` names it (Mutter's `MUTTER_DEBUG_LEASE_CONNECTORS`: colon-separated connector names; the `MUTTER_` name is not read, so a value set for GNOME cannot take a monitor off Tuna Desktop). Such a connector is never a desktop output; when every connected connector is for lease the session starts with no monitor, as Mutter runs. A lease takes per connector a CRTC no desktop output or other lease uses, its primary plane and, when there is one, its cursor plane, else `finished` (`meta-drm-lease.c` `find_resources_to_lease`); leased connectors are withdrawn and offered again when the client destroys the lease or closes the lease fd (the kernel's lease uevent; `update_leases`). Connector hotplug (udev change events) offers and withdraws connectors for lease, ending a lease whose connector went away (`update_connectors`); desktop outputs still do not follow hotplug, and vkms cannot hotplug, so no proof covers this path. A VT switch withdraws every connector and ends every lease, and activation offers them again. Clients get a non-master fd the compositor opens on the card itself, as Mutter does (the session user needs logind's uaccess ACL on the card); a binding that cannot get one stays pending without events until the session is next activated (Mutter's pending resources). Mutter's monitors.xml `for-lease` option and lease devices for a second GPU are not implemented. Vendored Smithay changes: `third-party/smithay/DRM-LEASE-PATCH.diff`. drm-smoke D-LEASE proves advertisement, the empty case and real leases on vkms; leasing to a real headset is hardware-only |
+| wp_security_context_manager_v1 | 1 | a sandbox engine (Flatpak) creates a listener; every client accepted on it joins the display tagged with the context (sandbox engine, app id, instance id: `ClientState::security_context`) until the engine closes the context's close fd. Such a client is refused every privileged global whatever else it is (layer-shell, the foreign toplevel list, input-method, virtual keyboard, `mutter_x11_interop`: `ClientState::privileged`), does not see the session lock, and does not see this manager, so it cannot nest. The published `sandboxed-app-id` stays the one read from the live peer, not the engine's claim (#1046) |
+| ext_idle_notifier_v1 | 2 | idle and resumed from the clock org.gnome.Mutter.IdleMonitor keeps: every timestamped input event restarts it, and the notifications are checked on the same loop tick and deadline. `get_idle_notification` honours the idle inhibitors the idle lock honours (zwp_idle_inhibitor_v1 and org.gnome.SessionManager's idle flag): it never idles while one is held, an idle one resumes when one appears, and its timeout restarts when the last goes. `get_input_idle_notification` counts input alone (`crates/compositor/src/idle_notify.rs`, #1046) |
+| wp_content_type_manager_v1 | 1 | the hint is kept per surface and applied on commit (`protocols::surface_content_type`); recorded for future VRR and frame scheduling, nothing acts on it yet (#1046) |
+| ext_foreign_toplevel_list_v1 | 1 | the supervised shell's alone, like layer-shell: window titles and app ids are published only to the shell and the portal picker (`docs/security-model.md`), so every other registry omits it and a blind bind is a protocol error. A handle per window in the window model, native and X11 alike, with its title and app id (empty when unknown), updated when either changes and `closed` when the window unmaps (#1046) |
+| wp_alpha_modifier_v1 | 1 | the multiplier applies wherever a surface is drawn: Smithay's `WaylandSurfaceRenderElement`, which every surface draw goes through, multiplies it into the element's alpha (#1046) |
 
 ### xdg-activation policy
 
@@ -175,10 +183,24 @@ as niri does, so the stock portal works.
 | org.gnome.Shell.Screenshot | Screenshot, ScreenshotWindow | saves a PNG of the screen or the focused window; the name is left to a real GNOME Shell when one runs (nested preview) |
 | org.gnome.Mutter.ScreenCast | CreateSession, RecordMonitor, RecordWindow, Start, Stop | monitor and window streams over PipeWire (BGRx, shared memory, up to 30 fps), adapted from niri; window streams follow resizes and end when the window closes |
 | org.gnome.Mutter.DisplayConfig | GetCurrentState, ApplyMonitorsConfig | the portal's monitor picker and GNOME Settings' Displays panel (modes, refresh, scale, position, rotation, mirroring, disabling; Mutter 51 verify/temporary/persistent with confirmation) |
-| org.gnome.Shell.Introspect | yes | window list for the portal's window picker; desktop-portal callers only, like GNOME Shell (#61) |
+| org.gnome.Mutter.InputCapture | CreateSession, SupportedCapabilities; Session: GetZones, AddBarrier, ClearBarriers, Enable, Disable, Release, ConnectToEIS, Close; Activated, Deactivated, ZonesChanged, Disabled, Closed | the portal's InputCapture (Input Leap, Deskflow): pointer barriers on outer monitor edges, then pointer and keyboard go to the session's EIS receiver instead of clients until Release; installed portal only, never while locked (#1040, [input capture](input-capture.md)) |
+| org.gnome.Shell.Introspect | yes | window list for the portal's window picker and running apps (with `sandboxed-app-id`) for its Background portal; desktop-portal callers only, like GNOME Shell (#61). As in GNOME 51, the same `/org/gnome/Shell/Introspect` object also answers under `org.gnome.Shell`, where xdg-desktop-portal-gnome's Background portal asks: the GTK shell relays it to the compositor, which admits the original caller with the same rule (#410) |
 | org.freedesktop.PolicyKit1.AuthenticationAgent | BeginAuthentication, CancelAuthentication | the GTK shell registers as this session's polkit agent (system bus, again whenever polkit restarts) and shows GNOME's Authentication Required dialog; passwords go to polkit's helper as libpolkit-agent-1 sends them: through `/run/polkit/agent-helper.socket` (socket-activated `polkit-agent-helper@.service`, polkit ≥ 127) first, else the setuid `polkit-agent-helper-1`. A wrong password restarts the conversation as GNOME does; a helper that fails before asking waits for Authenticate instead of respawning (#884) |
 | org.gnome.Mutter.IdleMonitor | GetIdletime, AddIdleWatch, AddUserActiveWatch, RemoveWatch, WatchFired | the session's idle time and watches, served by the compositor; gnome-settings-daemon dims and blanks on it, and banners wait for an away user |
-| org.gnome.Shell | ShowOSD, FocusSearch, ShowApplications, GrabAccelerator(s), UngrabAccelerator(s), AcceleratorActivated, AcceleratorDeactivated; Mode, OverviewActive, ShellVersion | served by the GTK shell: gnome-settings-daemon's media keys grab their keys here (the compositor keeps them from apps, in the action modes they ask for, the lock screen included) and show the volume and brightness OSD; GNOME's caller allowlist (Settings, media keys, the GNOME portal backend); a caller's grabs go when it leaves the bus. Grab flags `IGNORE_AUTOREPEAT` and `TRIGGER_RELEASE` are honoured (others refuse the grab): a held key's release reaches its caller as AcceleratorDeactivated, never across a lock or to a re-created grab |
+| org.gnome.Shell | ShowOSD, FocusSearch, ShowApplications, GrabAccelerator(s), UngrabAccelerator(s), AcceleratorActivated, AcceleratorDeactivated; Mode, OverviewActive, ShellVersion | served by the GTK shell: gnome-settings-daemon's media keys grab their keys here (the compositor keeps them from apps, in the action modes they ask for, the lock screen included) and show the volume and brightness OSD; GNOME's caller allowlist (Settings, media keys, the GNOME portal backend); a caller's grabs go when it leaves the bus. Grab flags `IGNORE_AUTOREPEAT` and `TRIGGER_RELEASE` are honoured (others refuse the grab): a held key's release reaches its caller as AcceleratorDeactivated, never across a lock or to a re-created grab. As Mutter's synchronous grab, a (un)grab call returns only once the compositor has installed the changed table (its `CommandResult`), so a key pressed after the reply meets it |
+
+Accelerator mutations are serialized: only their own request's
+`CommandResult` commits the proposed grab table and completes the D-Bus
+call. A denied or lost admission returns an error and cannot reappear in
+a subsequent table; a denied ungrab keeps the installed owner. Internal
+rebinding keeps the installed action callbacks until their replacement
+is acknowledged, accepting either generation's already-emitted events
+within the same control drain. Every full table, including one sent for
+an external grab, retains an `Rc` snapshot of its actual internal callback
+generation until its own result; maps are not copied per external call.
+Request identities also retain the local control-connection generation:
+if another send redials between GTK socket pumps, old-link calls fail,
+while admissions already sent on the new link remain pending normally.
 
 ## Gaps against Mutter
 
@@ -200,6 +222,28 @@ GNOME's version.
 - **xdg-decoration is absent,** as in Mutter. GNOME is client-side
   decorations only, and the golden test asserts the absence.
 - **layer-shell is present,** unlike Mutter. Tuna Desktop's shell is a separate
-  process and draws its panel, overview and banners through it.
+  process and draws its panel, overview and banners through it. Only that
+  supervised shell can see or bind it; applications cannot, so they have no
+  more surface-placement reach than on GNOME.
+- **security-context, ext-idle-notify, content-type, ext-foreign-toplevel-list
+  and alpha-modifier are present,** though Mutter 51 advertises none of
+  them (#1046). Smithay 0.7 implements them and they cost GNOME apps
+  nothing: security-context lets Flatpak mark its clients so they are kept
+  from every privileged global, idle-notify serves idle daemons from the
+  idle clock GNOME's IdleMonitor already uses, content-type is only
+  recorded, and alpha-modifier only changes how a client's own surface is
+  blended. The foreign toplevel list is offered to the supervised shell
+  only, so applications learn no more about other windows than on GNOME.
+
+The clipboard outlives the client that copied it, as Mutter's
+`meta-clipboard-manager.c` keeps it. When a client sets the clipboard
+(`wl_data_device` or data control), the compositor copies its most
+preferred supported type in Mutter's order (images up to 200 MiB, plain
+text up to 4 MiB; a larger copy is cut at the limit, as Mutter's is).
+When that owner clears the clipboard, destroys its source or
+disconnects, the compositor offers the finished copy, that one type
+only, as its own selection. The primary selection is not retained, as in
+Mutter. Unlike Mutter, a RemoteDesktop session's selection is not
+copied (`crates/compositor/src/clipboard_manager.rs`, #1033).
 
 `xdg_toplevel_icon_manager_v1` v1 accepts square SHM icons and sanitized theme names, applied on the next surface commit. PNGs live in a private, bounded compositor cache. X11 `_NET_WM_ICON` and legacy square TrueColor `WM_HINTS` pixmaps (24/32-bit color, optional 1-bit transparency mask) are read on a bounded worker for mapped window identities. Palette and unsupported visuals fall back to a generic app icon.

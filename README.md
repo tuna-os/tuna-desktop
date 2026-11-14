@@ -82,7 +82,7 @@ See [capture details](docs/walkthrough/README-media.md) for source revisions and
 
 ## Project status
 
-**Nested developer preview.** A Smithay compositor supervises a GTK4/libadwaita
+**Beta prerelease ([v1.0.0-beta.2](docs/releases/v1.0.0-beta.2.md)), not yet a daily driver.** A Smithay compositor supervises a GTK4/libadwaita
 shell with overview window previews, app grid and search, quick settings,
 notifications, calendar, keyboard navigation and AT-SPI accessibility. Tuna Desktop
 also includes its session supervisor, shell host and versioned

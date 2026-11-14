@@ -1,12 +1,19 @@
 //! GNOME Shell's `org.gnome.Shell.Introspect` (#61): the window list
 //! xdg-desktop-portal-gnome shows in its "Share a window" picker, and
-//! the running-apps list it uses for app-scoped sharing. Adapted from
-//! niri's `src/dbus/gnome_shell_introspect.rs` (GPL-3.0-or-later, like
-//! Tuna Desktop), with GNOME Shell's interface shape (`shell-introspect.c`):
-//! version 3, `WindowsChanged` on every change, and the same caller
-//! policy, since window titles are private. Only the desktop portal
-//! may ask, unless `TUNA_INTROSPECT_UNRESTRICTED=1` (GNOME's "unsafe
-//! mode", for tests and development).
+//! the running-apps list it uses for app-scoped sharing and its Background
+//! portal. Adapted from niri's `src/dbus/gnome_shell_introspect.rs`
+//! (GPL-3.0-or-later, like Tuna Desktop), with GNOME Shell's interface
+//! shape (`shell-introspect.c`): version 3, `WindowsChanged` on every
+//! change, and the same caller policy, since window titles are private.
+//! Only the desktop portal may ask, unless `TUNA_INTROSPECT_UNRESTRICTED=1`
+//! (GNOME's "unsafe mode", for tests and development).
+//!
+//! GNOME Shell serves this object under `org.gnome.Shell` too, and the
+//! portal's Background implementation asks there (#410). That name is the
+//! GTK shell's, which relays the object (`shell-gtk/src/introspect_forward.rs`)
+//! through `org.tuna.Introspect` here, naming the original caller; this
+//! service admits that caller with the same rule, so one policy guards
+//! both names.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,10 +25,10 @@ use zbus::{fdo, interface, Connection};
 
 use crate::mutter::{WindowSnapshot, Windows};
 
-pub const NAME: &str = "org.gnome.Shell.Introspect";
-pub const PATH: &str = "/org/gnome/Shell/Introspect";
+use tuna_shell_control::introspect::{INTERFACE, NAME, PATH};
 pub const UNRESTRICTED_ENV: &str = "TUNA_INTROSPECT_UNRESTRICTED";
 
+#[derive(Clone)]
 struct Service {
     authority: crate::capture_security::Authority,
     windows: Windows,
@@ -29,6 +36,10 @@ struct Service {
     unrestricted: bool,
     animations_enabled: Arc<AtomicBool>,
 }
+
+/// `org.tuna.Introspect`: the same lists for a caller the shell relays
+/// from `org.gnome.Shell`.
+struct Forwarded(Service);
 
 /// GNOME's app id for a window: its desktop file id, or `window:N` for
 /// a window no app claims.
@@ -129,6 +140,22 @@ impl Service {
         self.authority.admit(conn, header).await.map(|_| ())
     }
 
+    async fn check_forwarded(
+        &self,
+        conn: &Connection,
+        header: &Header<'_>,
+        caller: &str,
+    ) -> fdo::Result<()> {
+        self.authority.unlocked()?;
+        if self.unrestricted {
+            return Ok(());
+        }
+        self.authority
+            .admit_forwarded(conn, header, caller)
+            .await
+            .map(|_| ())
+    }
+
     fn snapshot(&self) -> Vec<WindowSnapshot> {
         self.windows.lock().map(|w| w.clone()).unwrap_or_default()
     }
@@ -173,9 +200,35 @@ impl Service {
         self.screen_size.lock().map(|s| *s).unwrap_or((0, 0))
     }
 
-    #[zbus(property)]
+    /// Lowercase in GNOME's interface XML, unlike its other properties.
+    #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
         3
+    }
+}
+
+/// The contract's names (`tuna_shell_control::introspect`); the shell's
+/// relay passes the original caller first.
+#[interface(name = "org.tuna.Introspect")]
+impl Forwarded {
+    async fn get_windows_for(
+        &self,
+        caller: String,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<HashMap<u64, HashMap<String, OwnedValue>>> {
+        self.0.check_forwarded(conn, &header, &caller).await?;
+        Ok(pickable_windows(&self.0.snapshot()))
+    }
+
+    async fn get_running_applications_for(
+        &self,
+        caller: String,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<HashMap<String, HashMap<String, OwnedValue>>> {
+        self.0.check_forwarded(conn, &header, &caller).await?;
+        Ok(running_apps(&self.0.snapshot()))
     }
 }
 
@@ -228,7 +281,7 @@ impl Handle {
         self.emit(
             "org.freedesktop.DBus.Properties",
             "PropertiesChanged",
-            (NAME, changed, Vec::<String>::new()),
+            (INTERFACE, changed, Vec::<String>::new()),
         );
     }
 
@@ -246,7 +299,7 @@ impl Handle {
         self.emit(
             "org.freedesktop.DBus.Properties",
             "PropertiesChanged",
-            (NAME, changed, Vec::<String>::new()),
+            (INTERFACE, changed, Vec::<String>::new()),
         );
     }
 
@@ -261,9 +314,9 @@ impl Handle {
         let apps_changed = running_apps(&current) != running_apps(&snapshot);
         *current = snapshot;
         drop(current);
-        self.emit(NAME, "WindowsChanged", ());
+        self.emit(INTERFACE, "WindowsChanged", ());
         if apps_changed {
-            self.emit(NAME, "RunningApplicationsChanged", ());
+            self.emit(INTERFACE, "RunningApplicationsChanged", ());
         }
     }
 }
@@ -273,6 +326,35 @@ impl Handle {
 pub fn start(screen_size: (i32, i32), authority: crate::capture_security::Authority) -> Handle {
     let handle = Handle::default();
     handle.publish_screen_size(screen_size);
+    let served = handle.clone();
+    let _ = std::thread::Builder::new()
+        .name("tuna-introspect".into())
+        .spawn(move || {
+            match zbus::blocking::connection::Builder::session()
+                .and_then(|builder| serve(builder, &served, authority))
+            {
+                Ok(true) => {
+                    eprintln!("tuna-compositor: serving {NAME}");
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                Ok(false) => eprintln!("tuna-compositor: {NAME} is taken; introspection off"),
+                Err(e) => eprintln!("tuna-compositor: introspect: no session bus: {e}"),
+            }
+        });
+    handle
+}
+
+/// Connect through `builder` and serve `handle`'s lists: GNOME's
+/// interface and the shell's forwarded one on one object, under [`NAME`].
+/// `Ok(false)` when another owner (a real GNOME Shell) has the name; on
+/// success `handle` keeps the connection and signals changes on it.
+pub fn serve(
+    builder: zbus::blocking::connection::Builder<'_>,
+    handle: &Handle,
+    authority: crate::capture_security::Authority,
+) -> zbus::Result<bool> {
     let service = Service {
         authority,
         windows: handle.windows.clone(),
@@ -280,33 +362,16 @@ pub fn start(screen_size: (i32, i32), authority: crate::capture_security::Author
         animations_enabled: handle.animations_enabled.clone(),
         unrestricted: std::env::var(UNRESTRICTED_ENV).is_ok_and(|v| v == "1"),
     };
-    let slot = handle.conn.clone();
-    let _ = std::thread::Builder::new()
-        .name("tuna-introspect".into())
-        .spawn(move || {
-            let conn = match zbus::blocking::connection::Builder::session()
-                .and_then(|b| b.serve_at(PATH, service))
-                .and_then(|b| b.build())
-            {
-                Ok(conn) => conn,
-                Err(e) => {
-                    eprintln!("tuna-compositor: introspect: no session bus: {e}");
-                    return;
-                }
-            };
-            let flags = zbus::fdo::RequestNameFlags::DoNotQueue.into();
-            match conn.request_name_with_flags(NAME, flags) {
-                Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
-                    eprintln!("tuna-compositor: serving {NAME}");
-                    let _ = slot.set(conn);
-                    loop {
-                        std::thread::park();
-                    }
-                }
-                _ => eprintln!("tuna-compositor: {NAME} is taken; introspection off"),
-            }
-        });
-    handle
+    let conn = builder
+        .serve_at(PATH, service.clone())?
+        .serve_at(PATH, Forwarded(service))?
+        .build()?;
+    let flags = zbus::fdo::RequestNameFlags::DoNotQueue.into();
+    if conn.request_name_with_flags(NAME, flags)? != zbus::fdo::RequestNameReply::PrimaryOwner {
+        return Ok(false);
+    }
+    let _ = handle.conn.set(conn);
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -393,7 +458,7 @@ mod tests {
                 HashMap<String, zbus::zvariant::OwnedValue>,
                 Vec<String>,
             ) = message.body().deserialize().unwrap();
-            assert_eq!(iface, NAME);
+            assert_eq!(iface, INTERFACE);
             let size: (i32, i32) = changed["ScreenSize"].clone().try_into().unwrap();
             assert_eq!(size, (width, 1080));
         }

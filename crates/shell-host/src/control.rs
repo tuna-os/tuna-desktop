@@ -86,6 +86,14 @@ pub enum Handled {
         /// How many workspaces there are.
         count: u32,
     },
+    /// A finger-following workspace swipe moved (or released) the strip:
+    /// the Activities dots follow it.
+    WorkspaceProgress {
+        /// Workspace index in `WORKSPACE_PROGRESS_SCALE`ths.
+        position: u32,
+        /// 0 while held; the settle time on release, in microseconds.
+        duration_us: u32,
+    },
     /// A client asked for GNOME's window menu.
     WindowMenu(WindowMenuRequest),
     /// Connector under the compositor pointer changed.
@@ -127,6 +135,20 @@ pub enum Handled {
     },
     /// Mutter's seat touch-mode changed (the unlock dialog's hint).
     SeatTouchMode(bool),
+    /// A touchpad swipe holds (`settle_us: None`) or settles GNOME's
+    /// overview controls state: the app grid follows it.
+    OverviewSwipe {
+        /// `ControlsState` in `OVERVIEW_STATE_SCALE`ths.
+        state: u32,
+        /// The release's settle time, in microseconds.
+        settle_us: Option<u32>,
+    },
+    /// A window stopped answering pings: show (or move) gnome-shell's
+    /// close dialog over its frame (0.50).
+    ShowCloseDialog(CloseDialogRequest),
+    /// Hide this window's close dialog (it answered, went away or left
+    /// the screen, or the session locked).
+    HideCloseDialog(u64),
     /// The keyboard switched Sticky or Slow Keys: save and confirm.
     KeyboardAidToggled {
         aid: tuna_shell_control::KeyboardAid,
@@ -785,6 +807,32 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// Tell the compositor the panel menu closing now goes unanimated
+    /// (`PanelMenu.Button.vfunc_hide`): draw no BoxPointer close for it.
+    pub fn close_menu_unanimated(&mut self) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::CloseMenuUnanimated,
+        })?;
+        Ok(id)
+    }
+
+    /// Answer the close dialog over `window`: gnome-shell's Force Quit
+    /// (`ForceClose`) or Wait (0.50).
+    pub fn respond_close_dialog(
+        &mut self,
+        window: u64,
+        response: tuna_shell_control::CloseDialogResponse,
+    ) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::RespondCloseDialog { window, response },
+        })?;
+        Ok(id)
+    }
+
     /// Carry out one of GNOME's window-menu actions. Returns the request id.
     pub fn window_action(
         &mut self,
@@ -1196,6 +1244,27 @@ impl ControlClient {
             Message::PadOsdInput { pad, event } => Ok(Handled::PadOsdInput { pad, event }),
             Message::ClosePadOsd { pad } => Ok(Handled::ClosePadOsd { pad }),
             Message::SeatTouchMode { touch_mode } => Ok(Handled::SeatTouchMode(touch_mode)),
+            Message::OverviewSwipe { state, settle_us } => {
+                Ok(Handled::OverviewSwipe { state, settle_us })
+            }
+            Message::ShowCloseDialog {
+                window,
+                app_id,
+                connector,
+                x,
+                y,
+                width,
+                height,
+            } => Ok(Handled::ShowCloseDialog(CloseDialogRequest {
+                window,
+                app_id,
+                connector,
+                x,
+                y,
+                width,
+                height,
+            })),
+            Message::HideCloseDialog { window } => Ok(Handled::HideCloseDialog(window)),
             Message::KeyboardAidToggled { aid, enabled } => {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
@@ -1226,6 +1295,13 @@ impl ControlClient {
             Message::WorkspacePopup { index, count } => {
                 Ok(Handled::WorkspacePopup { index, count })
             }
+            Message::WorkspaceProgress {
+                position,
+                duration_us,
+            } => Ok(Handled::WorkspaceProgress {
+                position,
+                duration_us,
+            }),
             Message::AcceleratorDeactivated { action, time, mode } => {
                 // A GRAB_TRIGGER_RELEASE grab's release: UI state only.
                 Ok(Handled::AcceleratorDeactivated { action, time, mode })
@@ -1459,6 +1535,21 @@ pub struct WindowMenuRequest {
     pub workspace_right: bool,
 }
 
+/// Where to show gnome-shell's close dialog: over the frame of a window
+/// that stopped answering pings, in logical pixels local to the output
+/// `connector` (`None`: the primary output).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseDialogRequest {
+    pub window: u64,
+    /// The window's app id, which names the app in the title.
+    pub app_id: Option<String>,
+    pub connector: Option<String>,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
 /// Short label for unexpected-message diagnostics.
 fn message_label(msg: &Message) -> &'static str {
     match msg {
@@ -1478,6 +1569,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::AcceleratorDeactivated { .. } => "AcceleratorDeactivated",
         Message::WindowMenu { .. } => "WindowMenu",
         Message::WorkspacePopup { .. } => "WorkspacePopup",
+        Message::WorkspaceProgress { .. } => "WorkspaceProgress",
         Message::ScreenReader { .. } => "ScreenReader",
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
@@ -1493,6 +1585,9 @@ fn message_label(msg: &Message) -> &'static str {
         Message::PadOsdInput { .. } => "PadOsdInput",
         Message::ClosePadOsd { .. } => "ClosePadOsd",
         Message::SeatTouchMode { .. } => "SeatTouchMode",
+        Message::OverviewSwipe { .. } => "OverviewSwipe",
+        Message::ShowCloseDialog { .. } => "ShowCloseDialog",
+        Message::HideCloseDialog { .. } => "HideCloseDialog",
     }
 }
 
@@ -1713,6 +1808,8 @@ mod tests {
         server_write(&mut peer, &snapshot_rev7());
         client.poll().unwrap();
         assert!(client.input_method_actions_allowed());
+        peer.shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(peer);
         assert!(client.poll().is_err());
         assert!(!client.input_method_actions_allowed());
@@ -1778,6 +1875,9 @@ mod tests {
         client.poll().unwrap();
         assert!(client.input_method_actions_allowed());
         let generation = client.connection_generation();
+        first_peer
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(first_peer);
         assert!(client.poll().is_err());
         assert_eq!(client.connection_generation(), generation + 1);
@@ -2001,6 +2101,26 @@ mod tests {
                 Message::SeatTouchMode { touch_mode: true },
                 Handled::SeatTouchMode(true),
             ),
+            (
+                Message::OverviewSwipe {
+                    state: 15_000,
+                    settle_us: None,
+                },
+                Handled::OverviewSwipe {
+                    state: 15_000,
+                    settle_us: None,
+                },
+            ),
+            (
+                Message::OverviewSwipe {
+                    state: 20_000,
+                    settle_us: Some(180_000),
+                },
+                Handled::OverviewSwipe {
+                    state: 20_000,
+                    settle_us: Some(180_000),
+                },
+            ),
         ];
         for (message, expected) in cases {
             server_write(&mut peer, &message);
@@ -2034,6 +2154,66 @@ mod tests {
                 kind: CommandKind::PadOsdClosed { pad: 3 },
             }
         );
+    }
+
+    #[test]
+    fn unanimated_menu_close_reaches_the_compositor() {
+        let (mut client, mut peer) = handshook();
+        let id = client.close_menu_unanimated().expect("sent");
+        assert_eq!(
+            server_read(&mut peer),
+            Message::Command {
+                id,
+                kind: CommandKind::CloseMenuUnanimated,
+            }
+        );
+    }
+
+    #[test]
+    fn close_dialog_messages_decode_and_answers_reach_the_compositor() {
+        let (mut client, mut peer) = handshook();
+        server_write(
+            &mut peer,
+            &Message::ShowCloseDialog {
+                window: 4,
+                app_id: Some("org.gnome.TextEditor".into()),
+                connector: Some("DP-1".into()),
+                x: 10,
+                y: 42,
+                width: 800,
+                height: 600,
+            },
+        );
+        assert_eq!(
+            client.poll().expect("show"),
+            Handled::ShowCloseDialog(CloseDialogRequest {
+                window: 4,
+                app_id: Some("org.gnome.TextEditor".into()),
+                connector: Some("DP-1".into()),
+                x: 10,
+                y: 42,
+                width: 800,
+                height: 600,
+            })
+        );
+        server_write(&mut peer, &Message::HideCloseDialog { window: 4 });
+        assert_eq!(client.poll().expect("hide"), Handled::HideCloseDialog(4));
+        for response in [
+            tuna_shell_control::CloseDialogResponse::ForceClose,
+            tuna_shell_control::CloseDialogResponse::Wait,
+        ] {
+            let id = client.respond_close_dialog(4, response).expect("sent");
+            assert_eq!(
+                server_read(&mut peer),
+                Message::Command {
+                    id,
+                    kind: CommandKind::RespondCloseDialog {
+                        window: 4,
+                        response
+                    },
+                }
+            );
+        }
     }
 
     #[test]
@@ -2134,14 +2314,22 @@ mod tests {
         assert_eq!(client.native_outputs(), &[owner]);
 
         // Transport loss and socket gone: redial fails, native_outputs must be cleared.
+        // Match real endpoint teardown even when another test's fork retains
+        // a descriptor until exec. Dropping one descriptor alone is not EOF.
+        let inherited_peer = server1.try_clone().expect("retained peer descriptor");
+        server1
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(server1);
         drop(listener);
         std::fs::remove_file(&path).expect("remove socket");
-        assert!(client.poll().is_err());
+        assert!(matches!(client.poll(), Err(ControlError::Io(error))
+            if !matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)));
         assert!(
             client.native_outputs().is_empty(),
             "failed redial must clear connection-scoped native outputs"
         );
+        drop(inherited_peer);
     }
 
     #[test]
@@ -2182,6 +2370,9 @@ mod tests {
         assert_eq!(client.native_outputs(), &[owner]);
 
         // Server 1 drops connection. Server 2 accepts reconnect.
+        server1
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(server1);
         // Redial attempt
         let (mut server2, _) = loop {
@@ -2236,11 +2427,21 @@ mod tests {
             },
         );
         client.poll().unwrap();
-        assert_eq!(client.native_outputs(), &[owner]);
+        assert_eq!(client.native_outputs(), std::slice::from_ref(&owner));
 
-        // Peer drops stream.
+        // A retained duplicate is an open endpoint, not transport loss.
+        let inherited_peer = peer.try_clone().expect("retained peer descriptor");
         drop(peer);
-        assert!(client.poll().is_err());
+        assert!(matches!(client.poll(), Err(ControlError::Io(error))
+            if error.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(client.native_outputs(), &[owner]);
+        assert!(!client.is_closed());
+        inherited_peer
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
+        drop(inherited_peer);
+        assert!(matches!(client.poll(), Err(ControlError::Io(error))
+            if error.kind() == io::ErrorKind::UnexpectedEof));
         assert!(
             client.native_outputs().is_empty(),
             "EOF must immediately clear native_outputs"
@@ -2760,6 +2961,9 @@ mod tests {
         );
         client.poll().unwrap();
         assert!(client.reconcile_wellbeing_effects(true, true).unwrap());
+        first_peer
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(first_peer);
         assert!(client.poll().is_err());
         assert_eq!(client.connection_generation(), 1);
@@ -2807,6 +3011,8 @@ mod tests {
             },
         );
         client.poll().unwrap();
+        peer.shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(peer);
         drop(listener);
         std::fs::remove_file(&path).unwrap();
@@ -3068,6 +3274,9 @@ mod tests {
         let (server1, _) = listener.accept().expect("accept one");
         // Hub and socket both gone: the redial must fail cleanly, not
         // hang or recurse.
+        server1
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(server1);
         drop(listener);
         std::fs::remove_file(&path).expect("remove socket");
@@ -3101,6 +3310,9 @@ mod tests {
         // An incomplete old frame must not contaminate the new stream.
         server1.write_all(&[10, 0, 0, 0, 1]).expect("partial frame");
         let generation = client.connection_generation();
+        server1
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(server1);
         assert!(matches!(client.poll(), Err(ControlError::WouldBlock)));
         assert!(client.needs_snapshot());
@@ -3148,6 +3360,9 @@ mod tests {
         let (path, listener) = listener_at(&dir);
         let mut client = ControlClient::connect(&path).expect("connect");
         let (server, _) = listener.accept().expect("accept");
+        server
+            .shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(server);
         drop(listener);
         std::fs::remove_file(&path).expect("remove socket");
@@ -3164,6 +3379,8 @@ mod tests {
     #[test]
     fn supplied_stream_reports_eof_without_redial() {
         let (mut client, peer) = pair();
+        peer.shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(peer);
         assert!(matches!(client.poll(), Err(ControlError::Io(e))
             if e.kind() == io::ErrorKind::UnexpectedEof));

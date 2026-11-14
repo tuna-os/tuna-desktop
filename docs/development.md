@@ -115,6 +115,18 @@ tuna-desktop/
    cargo test --workspace
    ```
 
+The compositor also supports a nested-only build without its default DRM and
+XWayland features:
+
+```sh
+cargo build --locked -p tuna-compositor --no-default-features
+cargo check --locked -p tuna-compositor --no-default-features
+```
+
+The existing CI `check` job runs the second command to guard this configuration.
+Winit rendering and its shared scene/damage tracking remain available; disabling
+default features does not remove the nested backend's EGL/GLES requirements.
+
 ## Running the Nested Compositor
 
 The nested compositor runs inside your current Wayland or X11 session for safe development and testing. It creates a Tuna Desktop session as a client of your host display.

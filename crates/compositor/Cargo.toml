@@ -50,6 +50,8 @@ tempfile = "3"
 tuna-wallpaper = { path = "../wallpaper" }
 tuna-magnifier = { path = "../magnifier", version = "0.1.0" }
 serde_json.workspace = true
+# Source identity must distinguish same-size edits with coalesced timestamps.
+sha2 = "0.11"
 rustix.workspace = true
 # GNOME51 RemoteDesktop.ConnectToEIS: bounded, revocable input transport.
 reis = { version = "=0.7.1", features = ["calloop"] }
@@ -83,6 +85,9 @@ wayland-protocols-misc = { version = "=0.3.12", features = ["client"] }
 tempfile = "3"
 # Peer-to-peer links let tests watch real D-Bus signals without a bus.
 zbus = { workspace = true, features = ["p2p"] }
+# Smithay's test renderer imports shm buffers as an upload does, without GL
+# (tests/buffer_release.rs, tests/window_teardown.rs).
+smithay = { workspace = true, features = ["renderer_test"] }
 # An X11 client for the real Xwayland keyboard grab test (Smithay's own
 # X11 crate, already in the lock).
 x11rb = "=0.13.2"

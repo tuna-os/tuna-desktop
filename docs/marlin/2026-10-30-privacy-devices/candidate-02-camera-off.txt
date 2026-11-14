@@ -1,0 +1,23 @@
+## 2026-10-30T15:01:14+00:00 candidate-camera-off-by-settings-click
+gsettings disable-camera=true
+gsettings disable-microphone=false
+gsettings disable-sound-output=false
+impl.gnome Lockdown disable-camera: (<true>,)
+impl.gnome Lockdown disable-microphone: (<false>,)
+impl.gnome Lockdown disable-sound-output: (<false>,)
+impl.tuna Lockdown disable-camera: (<true>,)
+impl.tuna Lockdown disable-microphone: (<false>,)
+impl.tuna Lockdown disable-sound-output: (<false>,)
+portal Camera.IsCameraPresent: (<true>,)
+portal Camera.AccessCamera: Error: GDBus.Error:org.freedesktop.portal.Error.NotAllowed: Camera access disabled
+portal Camera.OpenPipeWireRemote: Error: GDBus.Error:org.freedesktop.portal.Error.NotAllowed: Camera access disabled
+pw node 59 tuna-q-sink Audio/Sink mute=False
+pw node 45 tuna-q-mic Audio/Source mute=False
+pw node 60 tuna-q-cam Video/Source mute=None
+wpctl get-volume tuna-q-sink(59): Volume: 1.00
+wpctl get-volume tuna-q-mic(45): Volume: 1.00
+Oct 30 15:00:51 tuna-q-privacy /usr/lib/gdm-wayland-session[5831]: tuna-ibus-bridge: text field left
+Oct 30 15:00:51 tuna-q-privacy /usr/lib/gdm-wayland-session[5831]: tuna-ibus-bridge: text field focused
+Oct 30 15:00:51 tuna-q-privacy /usr/lib/gdm-wayland-session[5831]: tuna-ibus-bridge: text field left
+Oct 30 15:00:51 tuna-q-privacy /usr/lib/gdm-wayland-session[5831]: tuna-ibus-bridge: text field focused
+Oct 30 15:01:01 tuna-q-privacy /usr/lib/gdm-wayland-session[5829]: tuna-shell-gtk: privacy enforcement [DestroyNode { node: 60 }]

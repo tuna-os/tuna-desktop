@@ -4,6 +4,12 @@ The GTK shell consumes `org.gnome.desktop.a11y always-show-universal-access-stat
 
 This implements menu settings and visibility. It does not implement AccessX, or compositor visual alerts. Those remain separately recorded capability gaps; a toggle state alone proves no functional assistive feature. Screen Reader (also Super+Alt+S) starts the distribution Orca in a hardware session, or in a nested one started with `--screen-reader`; what Orca says on the shell is gated by `scripts/tuna-orca-speech-proof` (P-A11Y-06).
 
+The Orca search proof waits for each character's actual speech-dispatcher
+utterance before sending the next character, then checks the complete ordered
+`s p e e c h` sequence. This tests character echo rather than typing speed:
+Orca cancels pending speech on each keypress, so a fixed input delay can drop
+letters when the speech sink is busy.
+
 ## Screen magnifier (#349)
 
 The shell mirrors `screen-magnifier-enabled` and every `org.gnome.desktop.a11y.magnifier` key into the session snapshot `$XDG_RUNTIME_DIR/tuna-magnifier.json` (see the `tuna-magnifier` crate), now and on every change. Super+Alt+8 (toggle, autorepeat ignored) and Super+Alt+=/- (factor plus/minus one, rounded) are media-keys schema keys: in the session gsd-media-keys handles them and flips the same settings; without it (the nested preview) the shell binds them itself. Key defaults and ranges match [gsettings-desktop-schemas 51.0](https://github.com/GNOME/gsettings-desktop-schemas/blob/51.0/schemas/org.gnome.desktop.a11y.magnifier.gschema.xml.in).
@@ -20,7 +26,7 @@ Accepted differences from GNOME 51: touch points are mapped back through the zoo
 
 `scripts/tuna-gtk-accessibility-proof GTK_TEST_EXECUTABLE SOURCE_COMMIT ARTIFACT_DIRECTORY` runs the ignored `accessibility::tests::live_menu_and_focus_settings` test using actual GTK widgets, settings callbacks, and timers. Each run owns a mode 0700 runtime directory, private session and accessibility buses, a free Xvfb display, and memory settings, and records binary/source identity plus GTK version. A persistent guard queries the private bus for its daemon and registry processes, retains pidfds before the test starts, and verifies their exit before the runtime directory is removed. Query failure refuses proof. The dedicated focus schema fixture allows older hosts to exercise the new key without changing installed schemas or the user's settings.
 
-Scope: source GTK widget behavior on the recorded host. Installed Wayland shell pixels, actual keyboard/pointer input, external toolkit clients, native output sessions, and paired GNOME behavior still need qualification. Pure policy tests and this focused source proof alone do not close P-A11Y-05.
+Scope: source GTK widget behavior on the recorded host. Nested shell pixels from real keys and the restart case are covered by the journey gates in the next section. External toolkit clients, native output sessions, the installed image and paired GNOME behavior still need qualification. Pure policy tests and this focused source proof alone do not close P-A11Y-05.
 
 The wrapper emits `G-A11Y-PREFS pass` in `assertions.txt` only after the actual widget receipt, retained pidfds, verified registry/bus/launcher/Xvfb exits, and removed runtime directory all succeed. It clears previous receipts and assertions before starting. CI runs this proof explicitly; listing an ignored Cargo test is insufficient evidence that it ran.
 
@@ -34,6 +40,25 @@ Exact implementation source `88aa154950603ca5d60efc0d678b5a349c557fcc` was compi
 - Shellcheck, shell syntax, Rust formatting, and the 429-key settings inventory check passed.
 
 The manifest records host GTK **4.14.5**, private display/session/accessibility bus identities and mode 0700 runtime. `owned-accessibility.json` confirms retained pidfds and verified exit for the private registry and bus daemon; the runtime directory was removed. The newer native GTK property branch is source-reviewed and compiled but was not exercised on this host. The remaining qualification scope above applies; this is a partial P-A11Y-05 receipt.
+
+## Focus indication and the accessibility menu in the running shell (#351)
+
+The GTK shell journey (`scripts/tuna-gtk-shell-proof`, or only these gates with `--a11y-focus-only`) checks both with real keys sent through the nested window (XTEST into the compositor's keyboard), not by setting widget state. `scripts/lib/tuna-focus-ring-timeline.py` presses the key, then reads the panel strip from the X server every 40 ms and records when each control's focus indication appears and clears. The before, half-second, first-lit and first-expired frames are kept as evidence.
+
+- **G-FOCUS-RING:** Ctrl+Alt+Tab, then Tab, light GNOME 51's focus indication on exactly the focused panel control (Activities, then the clock) and on no other control. As in [`panel_button`'s `&:focus`](https://github.com/GNOME/gnome-shell/blob/51.0/data/theme/gnome-shell-sass/_drawing.scss), that indication is the hover fill: white at 17% over the black bar, with no ring. An open menu's fill still takes priority. Before this gate, the panel showed libadwaita's blue outline, and the gate fails against that look.
+- **G-FOCUS-RING-TIMEOUT:** `keyboard-focus-visible-timeout` decides when the indication clears after a real key, while the control keeps keyboard focus (checked in the accessible tree). The default (-1) clears it at the toolkit's three seconds (measured 3.0 s). A value of 2 clears it at 2 s (measured 2.1 s). A value of 5 outlasts GTK 4.14's own three-second timer and clears at 5 s (measured 5.1 s). A value of 0 never clears it during an 8 s window.
+- **G-A11Y-MENU-CLOSE-STABLE** (#1077): two readers (`scripts/lib/tuna-a11y-tree-reader.py`) walk the shell's whole AT-SPI tree in a loop, child count then each child by index, across 20 rounds of the window menu (Alt+Space, Escape), quick settings and the calendar (panel clicks, Escape) and a notification banner (Notify, CloseNotification) opening and closing. The shell process must be the same afterwards, each reader must have completed at least 20 passes and seen every surface up, and the log must hold no `g_variant_new_object_path` critical. GTK before 4.25 answers the application root's `GetChildAtIndex` for an index past the visible toplevels with the last toplevel it lists, and crashes when that one is hidden (GNOME/gtk#8444, fixed by !10440). The shell keeps the panel, which is always mapped, last in GTK's toplevel list (`accessibility::keep_last_toplevel`), so the panel is the application's last child in the tree. Without that the gate fails in its first round.
+- **G-A11Y-MENU-RESTART:** with every menu feature off and `always-show-universal-access-status` off, the indicator is hidden. Turning always-show on shows it live. Real keys then open the menu (Ctrl+Alt+Tab, Tab to Accessibility, Enter, Tab to Visual Alerts) and Space turns Visual Alerts on. With always-show turned off again, the indicator stays up for the enabled feature. The proof then sends SIGTERM to the shell and the compositor's supervisor restarts it. The restarted shell shows the indicator, and its menu, opened with real keys again, shows Visual Alerts checked. Space turns it off and the indicator hides live.
+- **G-SHELL-STABLE** still fails on any shell exit, except one: it allows exactly one `ShellExited`, and only inside the log byte range of G-A11Y-MENU-RESTART's deliberate restart (from the kill until the restarted shell's indicator is confirmed). An exit anywhere else, or a second exit inside that range, fails it.
+
+Onset and expiration are separate assertions: the indication must first appear within **0.8 s** of `xdotool key` returning, and then satisfy the unchanged timeout window (default 2.8–3.9 s, 2-second setting 1.8–2.9 s, 5-second setting 4.8–5.9 s, zero with no observed expiration during 8 s). A failed check prints the control's measured `lit_from` and `lit_until`; late onset is a `G-FOCUS-RING` failure, not evidence that the timeout cleared the ring. Regression fixtures preserve both bounds and distinguish the captured late-onset cases from genuine early expiration.
+
+Scope and remaining differences from GNOME 51:
+
+- These gates run in the nested GTK session on the CI host's GTK 4.14, so the older-toolkit timer path is exercised. The native `gtk-keyboard-focus-visible-timeout` property path (GTK 4.23.3 and later) is not exercised in a running shell.
+- The installed-package run proves only the focus gates. It keeps its original shell for G-INSTALLED-STABLE, so it skips the restart gate.
+- Paired GNOME 51 captures and hardware sessions are still missing.
+- GNOME Shell's own St chrome does not read `keyboard-focus-visible-timeout`: a focused GNOME panel button stays lit for as long as it has key focus. Tuna's shell is GTK and applies the key, so with the default its panel indication clears after three seconds while focus stays. This is a known difference, not a GNOME behaviour.
 
 ## On-screen keyboard (#349)
 
