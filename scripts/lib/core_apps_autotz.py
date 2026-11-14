@@ -84,9 +84,12 @@ def live_interval(observed):
            for value in (*values, checked)):
         return None
     started, acknowledged, through, deadline = values
+    # The guest monitor admits `started + MONITOR_SECONDS - 1` as its deadline.
+    # Bound it with that same float expression: `deadline - started` rounds and
+    # can exceed the exact lifetime by one ulp, rejecting a genuine interval.
     if (liveness.get("started_monotonic") != started or liveness.get("deadline_monotonic") != deadline
             or not started <= acknowledged <= through <= checked < deadline
-            or not 0 < deadline - started <= MONITOR_SECONDS - 1):
+            or not deadline <= started + MONITOR_SECONDS - 1):
         return None
     return interval
 
