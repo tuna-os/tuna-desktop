@@ -13,7 +13,6 @@
 //! Layer-shell is served from [`State`](crate::State) (see [`crate::layer`])
 //! so the supervised panel attaches over this same display.
 
-use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -34,7 +33,7 @@ use smithay::{
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::Display,
     utils::{Logical, Point, Rectangle, Transform},
-    wayland::{seat::WaylandFocus, socket::ListeningSocketSource},
+    wayland::seat::WaylandFocus,
 };
 
 use crate::control::{ControlHub, PeerGate};
@@ -66,6 +65,7 @@ mod aids;
 mod auth;
 mod color;
 mod display;
+mod input_capture;
 mod motion;
 mod osk;
 
@@ -74,25 +74,87 @@ mod osk;
 /// spins. The nested (winit) backend always runs at this pace.
 const FRAME_BUDGET: Duration = Duration::from_millis(16);
 
-/// Longest the native loop sleeps with nothing due (#503). Producers
-/// without an event source of their own (the XWayland supervisor's
-/// backoff, the X11 icon reader, a stalled client flush) are still
-/// served at least this often.
+/// Longest the native loop sleeps with nothing due (#503). When no event
+/// source fired in that time either, the tick that follows is an idle
+/// tick: it still serves what only a tick polls (a stalled client flush,
+/// the hub's token reissue, the supervisors), but it neither rebuilds
+/// nor draws the scene, which nothing can have changed. A
+/// producer that changes what is drawn must therefore wake the loop (an
+/// event source or [`crate::wake::Wake`]) or report its deadline to
+/// `producer_wake`.
 const IDLE_WAKE: Duration = Duration::from_millis(500);
+
+/// How long the loop may sleep, and what kind of sleep that is.
+#[derive(Debug, Clone, Copy)]
+struct NextWake {
+    /// The longest sleep before the next tick.
+    after: Duration,
+    /// Nothing is due within `after`, which is the [`IDLE_WAKE`]
+    /// fallback: a tick that no event source precedes is an idle tick.
+    idle: bool,
+    /// Nothing moves and no calloop timer is armed: a wake that finds
+    /// only page flips ready before `after` ends is served by
+    /// [`Runtime::dispatch_flips`] and [`Runtime::flip_tick`] (#503).
+    flips: bool,
+}
+
+/// The DRM device's events (#503), on a loop of their own that the main
+/// loop holds as one descriptor. A full dispatch serves them as before.
+/// A wait that finds only them ready serves them alone, as Mutter's frame
+/// clock idles after a presentation that leaves nothing to draw:
+/// whatever else arrives meanwhile stays pending for the full tick that
+/// follows, as after an idle wait.
+#[cfg(feature = "drm")]
+struct FlipLoop {
+    events: EventLoop<'static, Runtime>,
+    /// The nested loop's descriptor in the main loop.
+    token: calloop::RegistrationToken,
+}
+
+#[cfg(feature = "drm")]
+impl FlipLoop {
+    fn new(
+        source: smithay::backend::drm::DrmDeviceNotifier,
+        main: &LoopHandle<'static, Runtime>,
+    ) -> Result<Self, RuntimeError> {
+        use std::os::fd::AsFd;
+        let events: EventLoop<'static, Runtime> =
+            EventLoop::try_new().map_err(|e| RuntimeError::Loop(e.to_string()))?;
+        events
+            .handle()
+            .insert_source(source, |event, metadata, rt: &mut Runtime| {
+                let flip = match &mut rt.backend {
+                    Backend::Drm(drm) => drm.on_drm_event(event, metadata),
+                    Backend::Winit(_) => None,
+                };
+                match flip {
+                    Some(flip) => rt.page_flipped(flip),
+                    // An error or an unknown CRTC: let a full render look.
+                    None => rt.flip_changed = true,
+                }
+            })
+            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+        let fd = events
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+        let token = main
+            .insert_source(
+                calloop::generic::Generic::new(fd, calloop::Interest::READ, calloop::Mode::Level),
+                |_, _, rt: &mut Runtime| {
+                    rt.dispatch_flips();
+                    Ok(calloop::PostAction::Continue)
+                },
+            )
+            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+        Ok(Self { events, token })
+    }
+}
 
 /// Display-rate ticks continue this long after the last input event or
 /// power-on (#503): an animation whose first steps draw nothing new still
 /// advances. A queued frame alone does not extend it.
 const ACTIVITY_LINGER: Duration = Duration::from_millis(500);
-
-/// Administrative lockdown (#357): how often the tick polls the live
-/// `disable-lock-screen` key. Each poll spawns one background reader at
-/// most and drains completed reads without waiting (see
-/// `ControlHub::refresh_lockdown`), skipped without a session bus; the
-/// shell enforces its own surface immediately, so this backstop's short
-/// lag fails safe (an extra lock in the window still needs auth to
-/// unlock, and unlocks never come from policy).
-const LOCKDOWN_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Wake the native loop for requests on already accepted Wayland clients.
 /// The listening socket only signals new connections. The display owns the
@@ -308,6 +370,27 @@ pub fn current_exe_dir() -> Option<std::path::PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.to_owned()))
+}
+
+/// `GL_RENDERER` of the compositor's own context.
+fn gl_renderer_name(renderer: &mut GlesRenderer) -> Option<String> {
+    use smithay::backend::renderer::gles::ffi;
+    renderer
+        .with_context(|gl| {
+            // SAFETY: the renderer's context is current inside
+            // `with_context`; GL_RENDERER is static, NUL-terminated GL
+            // state, or null on error.
+            unsafe {
+                let name = gl.GetString(ffi::RENDERER);
+                (!name.is_null()).then(|| {
+                    std::ffi::CStr::from_ptr(name.cast())
+                        .to_string_lossy()
+                        .into_owned()
+                })
+            }
+        })
+        .ok()
+        .flatten()
 }
 
 /// Whether a session runs X11 apps (#59): `TUNA_XWAYLAND=1` forces it,
@@ -574,25 +657,6 @@ impl std::fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
-/// Apply nested-session environment hygiene (ADR 0003): point
-/// `WAYLAND_DISPLAY` at our private socket for this process and its
-/// children. The parent host environment is never touched — this runs in
-/// our own process — and the previous value is returned so shutdown can
-/// restore it.
-pub fn apply_nested_env(socket_name: &str) -> Option<OsString> {
-    let prev = std::env::var_os("WAYLAND_DISPLAY");
-    std::env::set_var("WAYLAND_DISPLAY", socket_name);
-    prev
-}
-
-/// Undo [`apply_nested_env`].
-pub fn restore_env(prev: Option<OsString>) {
-    match prev {
-        Some(value) => std::env::set_var("WAYLAND_DISPLAY", value),
-        None => std::env::remove_var("WAYLAND_DISPLAY"),
-    }
-}
-
 /// AT-SPI focus and caret for the magnifier (#349): the arrival number
 /// last taken and where it landed, global logical. Extents convert
 /// once, on arrival, as GNOME's handlers do.
@@ -663,8 +727,9 @@ pub struct Runtime {
     /// Worker threads (idle watches, Orca, wallpaper, Night Light, IME,
     /// X11 icons, PAM, logind) ping the loop through this (#503).
     wake: crate::wake::Wake,
-    /// Last live lockdown refresh (see [`LOCKDOWN_REFRESH_INTERVAL`]).
-    lockdown_refresh_at: Instant,
+    /// The live `disable-lock-screen` key (#357), watched on its own GIO
+    /// thread: a change wakes the loop, nothing polls it.
+    lockdown_settings: crate::lockdown_settings::LockdownSettings,
     /// GNOME's remembered Num Lock (#346): restore once, save changes.
     numlock: crate::numlock::NumlockMemory,
     /// On-demand XWayland server supervisor. Idle until the first X11
@@ -675,6 +740,23 @@ pub struct Runtime {
     /// Cloned from the owned event loop at launch; `'static`
     /// because the loop outlives the runtime in `run`.
     loop_handle: LoopHandle<'static, Runtime>,
+    /// Calloop timers armed through [`Runtime::arm_timer`] and not fired
+    /// yet. They are not descriptors, so the idle wait cannot see one
+    /// fall due: while any is armed the loop keeps dispatching.
+    loop_timers: usize,
+    /// The DRM device's page-flip events, on a loop of their own so that a
+    /// wake that brought nothing else is served without a full tick
+    /// ([`FlipLoop`]).
+    #[cfg(feature = "drm")]
+    flips: Option<FlipLoop>,
+    /// What the last page-flip dispatch changed must be drawn: it applied
+    /// commits a fifo barrier or commit timer held back, delivered an
+    /// event other than a completed flip, or freed an output whose frame
+    /// the last render had to defer.
+    flip_changed: bool,
+    /// The last render left an output without the frame it needed,
+    /// because that output's previous flip was still pending.
+    frame_owed: bool,
     /// A hardware button release that would end a direct strip move or
     /// resize, held until the current dispatch finishes (see the input
     /// source in `launch`).
@@ -762,14 +844,18 @@ pub struct Runtime {
     capture_authority: crate::capture_security::Authority,
     cast_grants: std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     remote_held: std::collections::HashMap<u64, RemoteHeld>,
+    /// org.gnome.Mutter.InputCapture's input diversion (#1040).
+    input_capture: crate::mutter::input_capture::Router,
     /// Keys the tablet action mappers' virtual keyboard holds (evdev).
     tablet_virtual_keys: std::collections::BTreeSet<u32>,
     /// The pad OSD labels the shell last received.
     pad_osd_labels_sent: Option<tuna_shell_control::PadOsdLabels>,
     /// Window list org.gnome.Shell.Introspect serves (window sharing).
     introspect: crate::introspect::Handle,
-    /// A three-finger swipe in progress: its travel so far (#60).
-    shell_swipe: Option<Point<f64, Logical>>,
+    /// The touchpad swipe the shell holds (#60, GNOME's
+    /// `TouchpadSwipeGesture`) and the tracker it drives.
+    shell_swipe: crate::touchpad_swipe::TouchpadSwipe,
+    swipe_target: SwipeTarget,
     /// The overview's animations (#499): the open/close transition,
     /// the swipe driving it, and the settled scene's own motion.
     overview_motion: crate::overview::OverviewMotion,
@@ -940,11 +1026,17 @@ impl Runtime {
             Display::new().map_err(|e| RuntimeError::Loop(e.to_string()))?;
         let dh = display.handle();
         let mut state = State::new(&dh);
+        state
+            .protocols
+            .bell
+            .set_wayland_display(&session.socket_name);
         if let Some(path) = crate::xdg_session::default_store_path() {
             state.window_sessions_mut().attach_store(path);
         }
         let event_loop = EventLoop::try_new().map_err(|e| RuntimeError::Loop(e.to_string()))?;
         let choice = session.backend.resolve(has_host_display());
+        #[cfg(feature = "drm")]
+        let mut flips = None;
         let backend = match choice {
             #[cfg(feature = "drm")]
             BackendChoice::Drm => {
@@ -975,39 +1067,10 @@ impl Runtime {
                 let handle = event_loop.handle();
                 handle
                     .insert_source(sources.session, |event, _, rt: &mut Runtime| {
-                        let activated =
-                            matches!(event, smithay::backend::session::Event::ActivateSession);
-                        if matches!(event, smithay::backend::session::Event::PauseSession) {
-                            rt.manager.cancel_strip_pointer(&mut rt.state);
-                        }
-                        if let Backend::Drm(drm) = &mut rt.backend {
-                            drm.on_session_event(event);
-                        }
-                        if let Some(lease) = rt.state.protocols.drm_lease.as_mut() {
-                            if activated {
-                                lease.resume();
-                            } else {
-                                lease.pause();
-                            }
-                        }
-                        // Monitors may have come or gone while another VT
-                        // owned the device.
-                        if activated {
-                            rt.on_drm_hotplug();
-                        }
+                        rt.on_session_event(event);
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-                handle
-                    .insert_source(sources.drm, |event, metadata, rt: &mut Runtime| {
-                        let flip = match &mut rt.backend {
-                            Backend::Drm(drm) => drm.on_drm_event(event, metadata),
-                            Backend::Winit(_) => None,
-                        };
-                        if let Some(flip) = flip {
-                            rt.page_flipped(flip);
-                        }
-                    })
-                    .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+                flips = Some(FlipLoop::new(sources.drm, &handle)?);
                 // Connector hotplug and lessee changes (Mutter's
                 // resources-changed and lease-changed) arrive as udev
                 // changes of the device: the lease device updates its
@@ -1062,13 +1125,17 @@ impl Runtime {
                             smithay::backend::input::InputEvent::TouchDown { .. }
                                 | smithay::backend::input::InputEvent::TouchMotion { .. }
                         );
-                        let inputs = match &mut rt.backend {
+                        let (inputs, from) = match &mut rt.backend {
                             Backend::Drm(drm) => {
                                 drm.set_hot_corner_active(corners_active);
-                                drm.translate(event, &corner_layout)
+                                let from = drm.pointer();
+                                (drm.translate(event, &corner_layout), from)
                             }
-                            Backend::Winit(_) => Vec::new(),
+                            Backend::Winit(_) => (Vec::new(), (0.0, 0.0).into()),
                         };
+                        // InputCapture (#1040) takes what an active
+                        // session captures before anything else sees it.
+                        let inputs = rt.route_input_capture(inputs, from);
                         for input in inputs {
                             let input = if touch { rt.unzoom_touch(input) } else { input };
                             if let ManagerInput::Button {
@@ -1214,22 +1281,26 @@ impl Runtime {
                 )
                 .map_err(|e| RuntimeError::Loop(e.to_string()))?;
         }
-        let socket = ListeningSocketSource::with_name(&session.socket_name)
-            .map_err(|e| RuntimeError::Socket(e.to_string()))?;
-        event_loop
-            .handle()
-            .insert_source(socket, |stream, _, runtime: &mut Runtime| {
-                let client_data = ClientState::native_connection(&stream);
-                if let Ok(client) = runtime
+        // A failed accept (descriptors exhausted by a client flood) rests
+        // the socket instead of ending the session (#203).
+        crate::client_listener::listen(
+            &event_loop.handle(),
+            &session.socket_name,
+            |stream, runtime: &mut Runtime| {
+                let mut client_data = ClientState::native_connection(&stream);
+                // Layer-shell is the supervised shell's alone (#1048).
+                client_data.admit_supervised_shell(&stream, runtime.shell.child_pid());
+                if runtime
                     .display
                     .handle()
                     .insert_client(stream, Arc::new(client_data))
+                    .is_ok()
                 {
-                    let _ = client;
                     runtime.stats.clients += 1;
                 }
-            })
-            .map_err(|e| RuntimeError::Loop(e.to_string()))?;
+            },
+        )
+        .map_err(|e| RuntimeError::Socket(e.to_string()))?;
 
         // The shell offers power actions only on a hardware session: in
         // the nested preview, logind's session is the host's, so Log Out
@@ -1268,6 +1339,26 @@ impl Runtime {
             };
             state.enable_dmabuf(formats, main_device);
         }
+        // On software GL the shell draws with cairo. Telling it here saves
+        // it a GL context of its own made only to read GL_RENDERER, which
+        // would keep Mesa, LLVM and llvmpipe's threads in the shell for
+        // good (#503). On a GPU nothing is set and GSK chooses as before.
+        {
+            use tuna_shell_control::gl;
+            let gl_renderer = match &mut backend {
+                Backend::Winit(winit) => gl_renderer_name(winit.renderer()),
+                #[cfg(feature = "drm")]
+                Backend::Drm(drm) => gl_renderer_name(&mut drm.renderer),
+            };
+            let chosen = std::env::var_os(gl::GSK_RENDERER_ENV).is_some();
+            if let Some(gsk) = gl::shell_gsk_renderer(chosen, gl_renderer.as_deref()) {
+                eprintln!(
+                    "tuna-compositor: OpenGL is {}; the shell draws with {gsk}",
+                    gl_renderer.as_deref().unwrap_or_default()
+                );
+                shell.set_env(gl::GSK_RENDERER_ENV, gsk);
+            }
+        }
 
         // org.gnome.Mutter.ScreenCast and DisplayConfig (#61): screen
         // sharing through the stock GNOME portal.
@@ -1298,6 +1389,7 @@ impl Runtime {
         // org.gnome.Shell.Introspect: the portal's window picker.
         let capture_authority = crate::capture_security::Authority::default();
         let introspect = crate::introspect::start(state.desktop_size(), capture_authority.clone());
+        let input_capture = crate::mutter::input_capture::Router::default();
         event_loop
             .handle()
             .insert_source(
@@ -1311,6 +1403,7 @@ impl Runtime {
                     power_save_share.clone(),
                     display_share.clone(),
                     color_share.clone(),
+                    input_capture.sessions(),
                 ),
                 |event, _, rt: &mut Runtime| {
                     if let calloop::channel::Event::Msg(request) = event {
@@ -1472,10 +1565,15 @@ impl Runtime {
                     wake.signal()
                 })
             },
+            lockdown_settings: crate::lockdown_settings::LockdownSettings::start(&wake),
             wake,
-            lockdown_refresh_at: Instant::now(),
             xwayland: XWaylandSupervisor::new(),
             loop_handle,
+            loop_timers: 0,
+            #[cfg(feature = "drm")]
+            flips,
+            flip_changed: false,
+            frame_owed: false,
             #[cfg(feature = "drm")]
             strip_release_held: None,
             #[cfg(feature = "xwayland")]
@@ -1508,7 +1606,8 @@ impl Runtime {
             blank_watched: false,
             shell_retry_ms: None,
             proof_polling: false,
-            shell_swipe: None,
+            shell_swipe: Default::default(),
+            swipe_target: SwipeTarget::None,
             overview_motion: Default::default(),
             overview_progress_at: Duration::ZERO,
             tile_animation: None,
@@ -1541,6 +1640,7 @@ impl Runtime {
             capture_authority,
             cast_grants: Default::default(),
             remote_held: Default::default(),
+            input_capture,
             tablet_virtual_keys: Default::default(),
             pad_osd_labels_sent: None,
             introspect,
@@ -1577,6 +1677,7 @@ impl Runtime {
         color_share.set_wake(&runtime.wake);
         runtime.orca.set_wake(&runtime.wake);
         runtime.idle_monitor.set_wake(&runtime.wake);
+        runtime.session_manager.set_wake(&runtime.wake);
         if let Some(ime) = &runtime.ime {
             ime.set_wake(&runtime.wake);
         }
@@ -1590,11 +1691,11 @@ impl Runtime {
                 .iter()
                 .any(|key| std::env::var_os(key).is_some());
         // The shell's idle-blank settings and wallpaper drop live in the
-        // runtime dir: any change there wakes the loop, and the blank
-        // file is read again only when it changed. A state document the
-        // tick itself rewrites there would wake the loop on its own
-        // writes, so then the dir is not watched and the blank file is
-        // read on every tick.
+        // runtime dir: any change there wakes the loop, and either file
+        // is read again only when one of them changed. A state document
+        // the tick itself rewrites there would wake the loop on its own
+        // writes, so then the dir is not watched and both files are read
+        // on every tick.
         if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|dir| state_dir.as_deref() != Some(std::path::Path::new(dir)))
         {
@@ -1605,15 +1706,22 @@ impl Runtime {
                         .handle()
                         .insert_source(watch, |_, fd, rt: &mut Runtime| {
                             let blank = std::ffi::OsStr::new(crate::wake::IDLE_BLANK_FILE);
-                            if crate::wake::changed(&*fd, &[blank]) {
+                            let paper = std::ffi::OsStr::new(crate::wallpaper::WALLPAPER_FILE);
+                            // One answer for both: either changes rarely,
+                            // and reading the other again is one open.
+                            if crate::wake::changed(&*fd, &[blank, paper]) {
                                 rt.blank_stale = true;
+                                rt.wallpaper.drop_changed();
                             }
                             Ok(calloop::PostAction::Continue)
                         })
                         .map_err(|e| e.to_string())
                 });
             match watched {
-                Ok(_) => runtime.blank_watched = true,
+                Ok(_) => {
+                    runtime.blank_watched = true;
+                    runtime.wallpaper.watch_drop();
+                }
                 Err(error) => {
                     eprintln!("tuna-compositor: runtime dir watch unavailable: {error}")
                 }
@@ -1750,6 +1858,45 @@ impl Runtime {
         self.control.is_locked()
     }
 
+    /// Apply the compositor-thread half of a coalesced logind update.
+    /// The monitor invalidates auth epochs before waking this thread.
+    fn on_sleep_update(&mut self, lock: bool, wake: bool) {
+        if lock {
+            self.engage_lock();
+        }
+        if wake {
+            // Lock is compositor-owned even if the supervised shell died.
+            self.engage_lock();
+            #[cfg(feature = "drm")]
+            if let Backend::Drm(drm) = &mut self.backend {
+                drm.resume_from_sleep();
+            }
+        }
+    }
+
+    #[cfg(feature = "drm")]
+    fn on_session_event(&mut self, event: smithay::backend::session::Event) {
+        let activated = matches!(event, smithay::backend::session::Event::ActivateSession);
+        if matches!(event, smithay::backend::session::Event::PauseSession) {
+            self.manager.cancel_strip_pointer(&mut self.state);
+        }
+        if let Backend::Drm(drm) = &mut self.backend {
+            drm.on_session_event(event);
+        }
+        if let Some(lease) = self.state.protocols.drm_lease.as_mut() {
+            if activated {
+                lease.resume();
+            } else {
+                lease.pause();
+            }
+        }
+        // Monitors may have come or gone while another VT
+        // owned the device.
+        if activated {
+            self.on_drm_hotplug();
+        }
+    }
+
     /// Engage the lock: flag (idle machine plus hub mirror for
     /// snapshots), overview dismissed, and the exclusive lock surface
     /// up with an empty list — no window titles while locked.
@@ -1778,18 +1925,15 @@ impl Runtime {
         for id in remote_ids {
             self.stop_remote_input(id);
         }
+        // Input capture never survives the lock (#1040).
+        self.input_capture.revoke_all();
         self.capture_authority.publish(true, self.shell.child_pid());
         self.state.set_shortcut_inhibition_locked(true);
         // A three-finger swipe under way is the unlocked session's: end
         // it cancelled, so its overview or workspace slide never resumes
         // (GNOME's trackers interrupt outside their allowed action modes,
         // swipeTracker.js `_updateTouchpadGesture`/`_endTouchpadGesture`).
-        if self.shell_swipe.is_some() {
-            self.shell_swipe_input(&ManagerInput::SwipeEnd {
-                cancelled: true,
-                time: crate::state::system_millis() as u32,
-            });
-        }
+        self.interrupt_shell_swipe(crate::state::system_millis() as u32);
         self.control.set_overview(false);
         // The shield covers GNOME's switcher popup and its window clones;
         // no window image may draw over the lock.
@@ -1966,6 +2110,10 @@ impl Runtime {
         self.control.set_locked(false);
         self.state.set_shortcut_inhibition_locked(false);
         self.overlay.hide();
+        // The lock held the keyboard (`hold_lock_focus`); hand it back,
+        // as GNOME's unlock returns focus to the focused window: to a
+        // popup grab that outlived the lock first.
+        self.manager.refocus_after_lock(&mut self.state);
     }
 
     /// logind's `Lock` signal (`loginctl lock-session`): `screenShield.js`
@@ -2112,6 +2260,7 @@ impl Runtime {
                 self.lock.note_input(input_time(&input));
                 self.idle_since = Instant::now();
                 self.idle_monitor.activity();
+                self.state.protocols.idle_notifier.activity(Instant::now());
                 self.active_at = Instant::now();
                 return;
             }
@@ -2134,6 +2283,7 @@ impl Runtime {
         self.lock.note_input(input_time(&input));
         self.idle_since = Instant::now();
         self.idle_monitor.activity();
+        self.state.protocols.idle_notifier.activity(Instant::now());
         self.active_at = Instant::now();
         if self.is_locked() {
             self.cursor.locate.reset_keys();
@@ -2174,6 +2324,10 @@ impl Runtime {
                 .feed_matched(&input, matches_key, self.manager.pointer_pos(), now);
         }
         if self.is_locked() {
+            // Locking ends the session's action mode mid-swipe: GNOME's
+            // trackers interrupt back to where they began
+            // (swipeTracker.js:487-491, 587-591).
+            self.interrupt_shell_swipe(input_time(&input) as u32);
             // The lock takes the keyboard: a held Escape's release
             // never comes back to the drag cancel below.
             self.dnd_escape_held = false;
@@ -2228,9 +2382,10 @@ impl Runtime {
                 return;
             }
         }
-        // Three-finger swipes are the shell's (GNOME 51): consumed here,
-        // acted on at the end. Other swipes reach the client.
+        // Swipes of three or more fingers are the shell's (GNOME 51):
+        // consumed here. Other swipes reach the client.
         if self.shell_swipe_input(&input) {
+            self.publish_workspace_progress();
             return;
         }
         if !self.overlay.visible {
@@ -2465,6 +2620,51 @@ impl Runtime {
         self.loop_handle.clone()
     }
 
+    /// Put the listener of every security context committed since the
+    /// last call on the loop (wp_security_context_v1, #1046): a client
+    /// it accepts joins the display inside that context, so no
+    /// privileged global admits it. The listener goes once its creator
+    /// closes the context's close fd. A connection that cannot be accepted
+    /// (no descriptor left) rests the listener instead of ending the loop
+    /// (#1071, `security_listener`).
+    fn admit_security_contexts(&mut self) {
+        use crate::security_listener::{Accept, RestingListener, REST};
+        for (source, context) in self.state.take_security_contexts() {
+            let inserted = self.loop_handle.insert_source(
+                RestingListener::new(source),
+                move |accept, _, runtime: &mut Runtime| match accept {
+                    Accept::Client(stream) => {
+                        let data = ClientState::security_context(&stream, context.clone());
+                        if runtime
+                            .display
+                            .handle()
+                            .insert_client(stream, Arc::new(data))
+                            .is_ok()
+                        {
+                            runtime.stats.clients += 1;
+                        }
+                    }
+                    // Said once per run of failures, not at every retry.
+                    Accept::Failed {
+                        error,
+                        repeated: false,
+                    } => eprintln!(
+                        "tuna-compositor: cannot accept a client on a security context \
+                         listener ({error}); it rests {} ms and retries",
+                        REST.as_millis()
+                    ),
+                    Accept::Failed { repeated: true, .. } => {}
+                },
+            );
+            if let Err(error) = inserted {
+                eprintln!(
+                    "tuna-compositor: security context listener not added: {}",
+                    error.error
+                );
+            }
+        }
+    }
+
     /// Mutable protocol state, for the X11 handler impls.
     pub fn state_mut(&mut self) -> &mut State {
         &mut self.state
@@ -2660,6 +2860,8 @@ impl Runtime {
                 "workspace": at, "rect": [r.loc.x, r.loc.y, r.size.w, r.size.h],
             })),
             "overview_progress": progress,
+            // GNOME's controls state: 0 desktop, 1 window picker, 2 app grid.
+            "overview_state": self.overview_motion.controls_state(self.overview_app_grid),
             "workspace_cards": workspace_cards,
 
             // The Alt+Tab switcher's window thumbnails being drawn.
@@ -2813,6 +3015,7 @@ impl Runtime {
         let manual = self.animation_clock.is_manual();
         doc["animation_clock_manual"] = serde_json::json!(manual);
         doc["proof_swipe_sequence"] = serde_json::json!(self.proof_swipe_sequence);
+        doc["touchpad_swipe"] = self.shell_swipe.snapshot();
         doc["animation_clock_ms"] =
             serde_json::json!(manual.then(|| self.animation_clock.now().as_millis() as u64));
         doc["overview_motion"] = self.overview_motion.diagnostics();
@@ -2823,6 +3026,15 @@ impl Runtime {
         doc["magnifier"] = self.magnifier.diagnostics();
         doc["screen_reader_pid"] = serde_json::json!(self.orca.pid());
         doc["screen_reader_state"] = serde_json::json!(self.orca.state());
+        // Shell supervision (#203's crash-loop stress): the supervised
+        // shell's PID, restarts spent from its budget, and whether the
+        // compositor's recovery overlay is up.
+        doc["shell"] = serde_json::json!({
+            "pid": self.shell.child_pid(),
+            "restarts_used": self.shell.restarts_used(),
+            "max_restarts": self.shell.policy().max_attempts,
+            "overlay_visible": self.overlay.visible,
+        });
         doc["a11y_keyboard"] = self
             .a11y_keyboard
             .as_ref()
@@ -2900,23 +3112,32 @@ impl Runtime {
     }
 
     /// The overview at rest on the primary output (#54): the window
-    /// picker or the app grid, before any animation.
+    /// picker or the app grid, before any animation, or between them and
+    /// between workspaces where a swipe draws it.
     fn overview_base(&self) -> crate::overview::OverviewLayout {
         let size = self.state.primary_size();
         let output = Rectangle::new((0, 0).into(), size);
         let model = self.manager.model();
-        let layout = if self.overview_app_grid {
-            crate::overview::app_grid_layout_with_policy
-        } else {
-            crate::overview::layout_with_policy
-        };
-        layout(
-            output,
-            crate::windows::WORK_AREA_TOP,
-            model.workspaces(),
+        let windows = self.manager.overview_windows();
+        let dynamic = model.fixed_workspace_count().is_none();
+        self.overview_motion.resting(
             model.active_workspace(),
-            &self.manager.overview_windows(),
-            model.fixed_workspace_count().is_none(),
+            self.overview_app_grid,
+            |workspace, app_grid| {
+                let layout = if app_grid {
+                    crate::overview::app_grid_layout_with_policy
+                } else {
+                    crate::overview::layout_with_policy
+                };
+                layout(
+                    output,
+                    crate::windows::WORK_AREA_TOP,
+                    model.workspaces(),
+                    workspace,
+                    &windows,
+                    dynamic,
+                )
+            },
         )
     }
 
@@ -3026,7 +3247,7 @@ impl Runtime {
     /// three-finger swipe is held, as GNOME's `_shouldAnimate`.
     fn step_size_changes(&mut self) {
         let policy = crate::size_change::Policy::from_motion(self.input_settings.motion);
-        let allowed = !self.control.overview_open() && self.shell_swipe.is_none();
+        let allowed = !self.control.overview_open() && !self.shell_swipe.active();
         let now = self.animation_clock.now();
         let renderer = match &mut self.backend {
             Backend::Winit(backend) => backend.renderer(),
@@ -3058,6 +3279,26 @@ impl Runtime {
         let slide = self.manager.workspace_slide_mut();
         slide.observe(active, &workspaces, width, policy, suspended, now);
         slide.step(now);
+        self.publish_workspace_progress();
+    }
+
+    /// Tell the shell where a workspace swipe holds the strip, so the
+    /// Activities dots follow it; only swipe phases queue anything.
+    fn publish_workspace_progress(&mut self) {
+        if let Some((position, duration_ms)) = self.manager.workspace_slide_mut().take_progress() {
+            let scale = f64::from(tuna_shell_control::WORKSPACE_PROGRESS_SCALE);
+            self.control
+                .queue_message(tuna_shell_control::Message::WorkspaceProgress {
+                    position: (position.max(0.0) * scale)
+                        .round()
+                        .min(f64::from(tuna_shell_control::MAX_WORKSPACE_PROGRESS))
+                        as u32,
+                    duration_us: (duration_ms.max(0.0) * 1000.0)
+                        .round()
+                        .min(f64::from(tuna_shell_control::MAX_WORKSPACE_PROGRESS_US))
+                        as u32,
+                });
+        }
     }
 
     /// A press while the overview is open that no shell surface took:
@@ -3169,14 +3410,18 @@ impl Runtime {
                 fingers: value["fingers"].as_u64().map_or(3, |f| f as u32),
                 time,
             },
-            Some("update") => ManagerInput::SwipeUpdate {
-                delta: (
+            Some("update") => {
+                let delta: Point<f64, Logical> = (
                     value["dx"].as_f64().unwrap_or(0.0),
                     value["dy"].as_f64().unwrap_or(0.0),
                 )
-                    .into(),
-                time,
-            },
+                    .into();
+                ManagerInput::SwipeUpdate {
+                    delta,
+                    delta_unaccel: delta,
+                    time,
+                }
+            }
             Some("end") => ManagerInput::SwipeEnd {
                 cancelled: value["cancelled"].as_bool().unwrap_or(false),
                 time,
@@ -3197,111 +3442,247 @@ impl Runtime {
         self.on_manager_input(input);
     }
 
-    /// Track a three-finger swipe; returns whether `input` was one of
-    /// its phases (and so consumed).
+    /// Track a touchpad swipe as GNOME's swipe trackers do; returns
+    /// whether `input` was one of the shell's swipe phases (and so
+    /// consumed).
     fn shell_swipe_input(&mut self, input: &ManagerInput) -> bool {
+        use crate::touchpad_swipe::Step;
         match *input {
             ManagerInput::SwipeBegin { fingers, .. } => {
-                if fingers == crate::windows::SHELL_SWIPE_FINGERS {
-                    self.shell_swipe = Some(Point::from((0.0, 0.0)));
-                    return true;
-                }
-                false
+                // A begin replaces whatever an unfinished swipe left.
+                self.swipe_target = SwipeTarget::None;
+                self.shell_swipe.begin(fingers)
             }
-            ManagerInput::SwipeUpdate { delta, time } => match self.shell_swipe.as_mut() {
-                Some(travel) => {
-                    *travel += delta;
-                    let travel = *travel;
-                    // On the desktop a horizontal swipe drags the
-                    // workspace strip with the fingers (GNOME).
-                    let desktop =
-                        !self.control.overview_open() && self.overview_motion.progress() == 0.0;
-                    if self.manager.workspace_slide().following() {
-                        self.manager
-                            .workspace_slide_mut()
-                            .update_swipe(delta.x, time);
-                    } else if desktop
-                        && !self.overview_motion.swiping()
-                        && travel.x.abs() > travel.y.abs()
-                    {
-                        let policy = self.input_settings.motion;
-                        let now = self.animation_clock.now();
-                        let width = self.state.primary_size().w;
-                        let model = self.manager.model();
-                        let active = model.active_workspace();
-                        let workspaces = model.workspaces().to_vec();
-                        let slide = self.manager.workspace_slide_mut();
-                        slide.begin_swipe(active, &workspaces, width, policy, now);
-                        slide.update_swipe(travel.x, time);
+            ManagerInput::SwipeUpdate {
+                delta_unaccel,
+                time,
+                ..
+            } => {
+                let natural = self.input_settings.touchpad_natural_scroll;
+                let rtl = self.input_settings.right_to_left;
+                match self
+                    .shell_swipe
+                    .update(delta_unaccel.x, delta_unaccel.y, natural, rtl)
+                {
+                    None => false,
+                    Some(Step::Pending) => true,
+                    Some(Step::Update {
+                        orientation,
+                        delta,
+                        begin,
+                    }) => {
+                        if begin {
+                            self.begin_swipe_target(orientation, time);
+                        }
+                        self.update_swipe_target(delta, time);
+                        true
                     }
-                    // GNOME's overview follows the fingers: a vertical
-                    // swipe moves the transition (up opens) as it goes.
-                    if travel.y.abs() > travel.x.abs()
-                        && !self.manager.workspace_slide().following()
-                    {
-                        self.overview_motion.swipe_update(
-                            time,
-                            -travel.y,
-                            OVERVIEW_SWIPE_DISTANCE,
-                            self.input_settings.motion,
-                        );
-                    }
-                    true
                 }
-                None => false,
-            },
-            ManagerInput::SwipeEnd { cancelled, time } => {
-                let Some(travel) = self.shell_swipe.take() else {
+            }
+            ManagerInput::SwipeEnd { time, .. } => {
+                if self.shell_swipe.end().is_none() {
                     return false;
-                };
-                if self.manager.workspace_slide().following() {
-                    // Released: the slide finishes on the fingers'
-                    // velocity; the model switches now so focus and
-                    // input never wait for it.
-                    let now = self.animation_clock.now();
-                    let target = self
-                        .manager
-                        .workspace_slide_mut()
-                        .end_swipe(cancelled, time, now);
-                    if let Some(target) = target {
-                        if target != self.manager.model().active_workspace()
-                            && !self.manager.switch_to_workspace(&mut self.state, target)
-                        {
-                            // GNOME's trailing empty workspace: create it.
-                            self.manager.switch_relative(&mut self.state, 1);
-                        }
-                    }
-                    return true;
                 }
-                // Released: finish where GNOME's swipe tracker would,
-                // keeping the fingers' momentum (back where it began
-                // when cancelled).
-                if let Some(open) = self.overview_motion.swipe_end(
-                    time,
-                    cancelled,
-                    OVERVIEW_SWIPE_DISTANCE,
-                    self.input_settings.motion,
-                ) {
-                    self.control.set_overview(open);
-                    return true;
-                }
-                if !cancelled {
-                    use crate::windows::SwipeAction;
-                    match crate::windows::swipe_action(travel.x, travel.y) {
-                        Some(SwipeAction::OpenOverview) => self.control.set_overview(true),
-                        Some(SwipeAction::CloseOverview) => self.control.set_overview(false),
-                        Some(SwipeAction::NextWorkspace) => {
-                            self.manager.switch_relative(&mut self.state, 1);
-                        }
-                        Some(SwipeAction::PreviousWorkspace) => {
-                            self.manager.switch_relative(&mut self.state, -1);
-                        }
-                        None => {}
-                    }
-                }
+                // A libinput cancel lands as a release does
+                // (swipeTracker.js:194-198).
+                self.end_swipe_target(time, false);
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Lose a held swipe without its release (the session locked).
+    fn interrupt_shell_swipe(&mut self, time: u32) {
+        if self.shell_swipe.end().is_some() {
+            self.end_swipe_target(time, true);
+        }
+    }
+
+    /// The swipe committed to `orientation`: start the tracker GNOME
+    /// has on that axis now. Vertical is always the overview's
+    /// (overview.js:226-233, normal and overview modes), across the
+    /// desktop, the window picker and the app grid
+    /// (overviewControls.js:757-775). Horizontal is the desktop's
+    /// workspace strip, or the overview's workspaces while it is open or
+    /// opening (workspaceAnimation.js:363-372); with workspaces only on
+    /// the primary monitor, a horizontal swipe over another monitor moves
+    /// nothing (workspaceAnimation.js:509-512, workspacesView.js:961-962).
+    fn begin_swipe_target(&mut self, orientation: crate::touchpad_swipe::Orientation, time: u32) {
+        use crate::touchpad_swipe::Orientation;
+        self.swipe_target = match orientation {
+            Orientation::Vertical => {
+                let app_grid = self.control.overview_open() && self.overview_app_grid;
+                self.overview_motion.swipe_begin(time, app_grid);
+                SwipeTarget::Overview { travel: 0.0 }
+            }
+            Orientation::Horizontal if self.swipe_over_secondary() => SwipeTarget::None,
+            Orientation::Horizontal if self.control.overview_open() => {
+                // The overview's strip: GNOME's dynamic workspaces end
+                // with an empty one, which a swipe can reach.
+                let model = self.manager.model();
+                let workspaces = if model.fixed_workspace_count().is_none() {
+                    crate::overview::shown_workspaces(
+                        model.workspaces(),
+                        &self.manager.overview_windows(),
+                    )
+                } else {
+                    model.workspaces().to_vec()
+                };
+                let active = model.active_workspace();
+                self.overview_motion.scroll_begin(time, workspaces, active);
+                SwipeTarget::OverviewWorkspaces
+            }
+            Orientation::Horizontal => {
+                self.workspace_swipe_begin(time);
+                SwipeTarget::Workspaces
+            }
+        };
+    }
+
+    /// The tracker moves by `delta` touchpad units (GNOME's sign).
+    fn update_swipe_target(&mut self, delta: f64, time: u32) {
+        match &mut self.swipe_target {
+            SwipeTarget::None => {}
+            SwipeTarget::Overview { travel } => {
+                *travel += delta;
+                let travel = *travel;
+                self.overview_motion.swipe_update(
+                    time,
+                    travel,
+                    crate::touchpad_swipe::TOUCHPAD_BASE_HEIGHT,
+                );
+                let state = self.overview_motion.controls_state(self.overview_app_grid);
+                self.publish_overview_swipe(state, None);
+            }
+            SwipeTarget::Workspaces => self.workspace_swipe_update(-delta, time),
+            SwipeTarget::OverviewWorkspaces => self.overview_motion.scroll_update(time, delta),
+        }
+    }
+
+    /// The fingers lifted (`interrupted`: the swipe was lost): finish
+    /// where GNOME's tracker lands, keeping the fingers' momentum.
+    fn end_swipe_target(&mut self, time: u32, interrupted: bool) {
+        match std::mem::replace(&mut self.swipe_target, SwipeTarget::None) {
+            SwipeTarget::None => {}
+            SwipeTarget::Overview { .. } => {
+                if let Some((state, duration_ms)) = self.overview_motion.swipe_end(
+                    time,
+                    interrupted,
+                    crate::touchpad_swipe::TOUCHPAD_BASE_HEIGHT,
+                    self.input_settings.motion,
+                ) {
+                    // `gestureEnd` checks Show Apps for the app grid
+                    // (overviewControls.js:781-786); the shell follows.
+                    self.overview_app_grid = state >= crate::overview::CONTROLS_APP_GRID;
+                    self.control
+                        .set_overview(state >= crate::overview::CONTROLS_WINDOW_PICKER);
+                    self.publish_overview_swipe(state, Some(duration_ms));
+                }
+            }
+            SwipeTarget::Workspaces => self.workspace_swipe_end(time, interrupted),
+            SwipeTarget::OverviewWorkspaces => {
+                let motion = self.input_settings.motion;
+                let Some(target) = self.overview_motion.scroll_end(time, interrupted, motion)
+                else {
+                    return;
+                };
+                // The model switches now so focus never waits for the
+                // ease; the drawn strip keeps easing. A step past the last
+                // workspace creates GNOME's trailing empty one.
+                let model = self.manager.model();
+                let active = model.active_workspace();
+                let strip = self
+                    .overview_motion
+                    .workspace_scroll()
+                    .map(|(strip, _)| strip.to_vec())
+                    .unwrap_or_default();
+                let index = |workspace| strip.iter().position(|w| *w == workspace);
+                if let (Some(from), Some(to)) = (index(active), index(target)) {
+                    if from != to {
+                        self.manager
+                            .switch_relative(&mut self.state, to as i32 - from as i32);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tell the shell where a swipe holds GNOME's overview controls state
+    /// (`settle_ms: None`) or settles it, so its app grid follows.
+    fn publish_overview_swipe(&mut self, state: f64, settle_ms: Option<f64>) {
+        let scale = f64::from(tuna_shell_control::OVERVIEW_STATE_SCALE);
+        self.control
+            .queue_message(tuna_shell_control::Message::OverviewSwipe {
+                state: (state.clamp(0.0, crate::overview::CONTROLS_APP_GRID) * scale).round()
+                    as u32,
+                settle_us: settle_ms.map(|ms| {
+                    (ms.max(0.0) * 1000.0)
+                        .round()
+                        .min(f64::from(tuna_shell_control::MAX_OVERVIEW_SETTLE_US))
+                        as u32
+                }),
+            });
+    }
+
+    /// Whether the pointer, where a swipe acts, is over a monitor other
+    /// than the primary while workspaces are only on the primary.
+    fn swipe_over_secondary(&self) -> bool {
+        if !self.input_settings.workspace_policy.only_on_primary {
+            return false;
+        }
+        let outputs: Vec<_> = self
+            .state
+            .hot_corner_outputs()
+            .into_iter()
+            .map(|(rect, primary)| crate::workspace_policy::OutputBounds {
+                x: rect.loc.x,
+                y: rect.loc.y,
+                width: rect.size.w,
+                height: rect.size.h,
+                primary,
+            })
+            .collect();
+        let pointer = self.manager.pointer_pos();
+        crate::workspace_policy::on_secondary(
+            (pointer.x.floor() as i32, pointer.y.floor() as i32, 1, 1),
+            &outputs,
+        )
+    }
+
+    /// A horizontal swipe on the desktop holds the workspace strip
+    /// where it is drawn.
+    fn workspace_swipe_begin(&mut self, time: u32) {
+        let policy = self.input_settings.motion;
+        let now = self.animation_clock.now();
+        let width = self.state.primary_size().w;
+        let model = self.manager.model();
+        let active = model.active_workspace();
+        let workspaces = model.workspaces().to_vec();
+        let slide = self.manager.workspace_slide_mut();
+        slide.begin_swipe(active, &workspaces, width, policy, time, now);
+    }
+
+    /// The strip follows the fingers' `dx` (negative towards the next
+    /// workspace, natural scrolling applied).
+    fn workspace_swipe_update(&mut self, dx: f64, time: u32) {
+        self.manager.workspace_slide_mut().update_swipe(dx, time);
+    }
+
+    /// Released: the slide finishes on the fingers' velocity; the model
+    /// switches now so focus and input never wait for it.
+    fn workspace_swipe_end(&mut self, time: u32, cancelled: bool) {
+        let now = self.animation_clock.now();
+        let target = self
+            .manager
+            .workspace_slide_mut()
+            .end_swipe(cancelled, time, now);
+        if let Some(target) = target {
+            // The strip's snap points include GNOME's trailing empty
+            // workspace, so the target always exists (#596).
+            if target != self.manager.model().active_workspace() {
+                self.manager.switch_to_workspace(&mut self.state, target);
+            }
         }
     }
 
@@ -3523,6 +3904,7 @@ impl Runtime {
                     scale,
                     blank_alpha: 0.0,
                     tint: color_effect.as_ref(),
+                    opaque: false,
                 },
                 &[],
                 &[],
@@ -3763,6 +4145,7 @@ impl Runtime {
                                 scale: view.scale,
                                 blank_alpha,
                                 tint: color_effect.as_ref(),
+                                opaque: false,
                             },
                             &decor,
                             &previews,
@@ -3801,6 +4184,7 @@ impl Runtime {
                         // Captures stay untinted, like GNOME's (gamma
                         // applies past the framebuffer).
                         tint: color_effect.as_ref(),
+                        opaque: false,
                     },
                     &decor,
                     &previews,
@@ -4220,6 +4604,7 @@ impl Runtime {
                 self.remote_input(session_id, grant, input);
             }
             crate::mutter::ToLoop::RemoteStop { session_id } => self.stop_remote_input(session_id),
+            crate::mutter::ToLoop::InputCaptureWarp { x, y } => self.input_capture_warp(x, y),
             crate::mutter::ToLoop::RemoteClipboard(request) => {
                 let locked = self.is_locked();
                 self.state.remote_clipboard_request(request, locked);
@@ -4636,24 +5021,22 @@ impl Runtime {
     /// signals, runtime files and worker threads wake it earlier through
     /// their event sources; this covers what only time moves, and
     /// coalesced motion falling due.
-    fn next_wake(&self) -> Duration {
+    fn next_wake(&self) -> NextWake {
         let wake = self.producer_wake();
-        self.motion_wake().map_or(wake, |due| wake.min(due))
+        match self.motion_wake() {
+            Some(due) => NextWake {
+                after: wake.after.min(due),
+                idle: false,
+                flips: false,
+            },
+            None => wake,
+        }
     }
 
-    /// The timed producers' earliest wake.
-    fn producer_wake(&self) -> Duration {
-        #[cfg(feature = "drm")]
-        let native = matches!(self.backend, Backend::Drm(_));
-        #[cfg(not(feature = "drm"))]
-        let native = false;
-        // The nested backend has no Wayland readiness source.
-        if !native || self.proof_polling {
-            return FRAME_BUDGET;
-        }
-        let now = Instant::now();
-        let clock = self.animation_clock.now();
-        if now.saturating_duration_since(self.active_at) < ACTIVITY_LINGER
+    /// Whether anything on screen moves or was just touched: the loop
+    /// keeps the display rate and every tick draws.
+    fn in_motion(&self, now: Instant, clock: Duration) -> bool {
+        now.saturating_duration_since(self.active_at) < ACTIVITY_LINGER
             || self.overview_motion.animating()
             || self.manager.workspace_slide().running()
             || self.manager.strip_animating()
@@ -4673,7 +5056,7 @@ impl Runtime {
                     < 0.2 * self.input_settings.motion.slowdown()
             })
             || self.state.protocols.bell.visual(now).is_some()
-            || self.shell_swipe.is_some()
+            || self.shell_swipe.active()
             || self.overlay.visible
             || !self.casts.is_empty()
             // A running PAM worker publishes its terminal phase before
@@ -4682,14 +5065,37 @@ impl Runtime {
                 .unlock_worker
                 .as_ref()
                 .is_some_and(|worker| worker.phase.load(std::sync::atomic::Ordering::Acquire) != 1)
-        {
-            return FRAME_BUDGET;
+    }
+
+    /// The timed producers' earliest wake.
+    fn producer_wake(&self) -> NextWake {
+        let moving = NextWake {
+            after: FRAME_BUDGET,
+            idle: false,
+            flips: false,
+        };
+        #[cfg(feature = "drm")]
+        let native = matches!(self.backend, Backend::Drm(_));
+        #[cfg(not(feature = "drm"))]
+        let native = false;
+        // The nested backend has no Wayland readiness source.
+        if !native || self.proof_polling {
+            return moving;
+        }
+        let now = Instant::now();
+        if self.in_motion(now, self.animation_clock.now()) {
+            return moving;
         }
         // Timed producers are served no more often than the display
         // rate: a gate that is due but cannot act yet (the IME bridge
         // while locked, say) costs what the fixed loop did, never a spin.
         let mut wake = IDLE_WAKE;
-        let mut due = |after: Duration| wake = wake.min(after.max(FRAME_BUDGET));
+        // Whether any of them is due by the time the fallback wake fires.
+        let mut timed = false;
+        let mut due = |after: Duration| {
+            timed |= after <= IDLE_WAKE;
+            wake = wake.min(after.max(FRAME_BUDGET));
+        };
         // An inhibited session neither blanks nor locks; its end is
         // handled by the tick that sees it.
         if !self.idle_inhibited {
@@ -4709,6 +5115,7 @@ impl Runtime {
         }
         for deadline in [
             self.idle_monitor.next_deadline(),
+            self.state.protocols.idle_notifier.next_deadline(),
             self.orca.next_deadline(),
             self.manager.workspace_lease_deadline(),
             self.wallpaper.maintenance_deadline(),
@@ -4722,6 +5129,8 @@ impl Runtime {
             // Tablet and stylus settings: the bounded re-read.
             self.tablet_settings.next_deadline(now),
             self.manager.focus_deadline(),
+            // Mutter's alive checks: a ping timing out, Wait, re-pings.
+            self.manager.alive_deadline(),
             // Window sessions are written 3 s after a change (Mutter).
             self.state.window_sessions().save_deadline(),
             // The lock conversation's shared idle/total deadline.
@@ -4740,11 +5149,13 @@ impl Runtime {
                     due(Duration::from_millis(ms));
                 }
             }
-            if self.state.xwm.is_some() {
-                due(self
-                    .x11_icon_reader
-                    .next_deadline()
-                    .saturating_duration_since(now));
+            // Only a server that did not answer is asked again on a timer.
+            if let Some(retry) = self
+                .x11_icon_reader
+                .next_deadline()
+                .filter(|_| self.state.xwm.is_some())
+            {
+                due(retry.saturating_duration_since(now));
             }
         }
         if let Some(ms) = self
@@ -4768,14 +5179,93 @@ impl Runtime {
         if let Some(ms) = self.shell_retry_ms {
             due(Duration::from_millis(ms));
         }
+        // The input aids' timers: Slow Keys, the Shift-hold shortcut, Mouse
+        // Keys motion, hover and secondary clicks.
+        if let Some(after) = self.input_aids.next_due() {
+            due(after);
+        }
         // A command frame already buffered is applied on the next pass.
-        match self.control.next_poll(self.manager.model()) {
-            Some(after) => wake.min(after),
+        let after = match self.control.next_poll(self.manager.model()) {
+            Some(after) => {
+                timed = true;
+                wake.min(after)
+            }
             None => wake,
+        };
+        // The idle wait watches descriptors only and an idle tick does not
+        // draw: a pending calloop timer, shell files nobody reports (the
+        // tick reads them instead) and a wallpaper that follows the clock
+        // all keep the loop to its full ticks.
+        let quiet = self.loop_timers == 0 && self.blank_watched && !self.wallpaper.follows_clock();
+        NextWake {
+            after,
+            idle: !timed && quiet,
+            // A timed producer falls due only when `after` ends: a page
+            // flip before then changes nothing it serves.
+            flips: quiet,
         }
     }
 
+    /// Run `fire` once, `after` from now, on the loop's own timer. Timers
+    /// are armed only here, where they are counted for `producer_wake`.
+    fn arm_timer(
+        &mut self,
+        after: Duration,
+        fire: impl FnOnce(&mut Runtime) + 'static,
+    ) -> Result<(), String> {
+        let mut fire = Some(fire);
+        let armed = self.loop_handle.insert_source(
+            calloop::timer::Timer::from_duration(after),
+            move |_, _, rt: &mut Runtime| {
+                rt.loop_timers = rt.loop_timers.saturating_sub(1);
+                if let Some(fire) = fire.take() {
+                    fire(rt);
+                }
+                calloop::timer::TimeoutAction::Drop
+            },
+        );
+        match armed {
+            Ok(_) => {
+                self.loop_timers += 1;
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// The tick after a dispatch: everything, the frame included.
     fn tick(&mut self) -> Result<bool, RuntimeError> {
+        self.run_tick(false)
+    }
+
+    /// The tick after a wait that no event source and no deadline ended
+    /// (#503, see [`IDLE_WAKE`]). Nothing was received and nothing was
+    /// due, so the scene is the last frame's: it is neither rebuilt nor
+    /// drawn, and the wallpaper is not looked at. Only what reaches a
+    /// socket between the end of that wait and this tick reading it, or
+    /// what the tick's own polls set moving, is drawn at once.
+    fn idle_tick(&mut self) -> Result<bool, RuntimeError> {
+        self.run_tick(true)
+    }
+
+    /// The tick after page flips served alone ([`Runtime::dispatch_flips`],
+    /// #503): what they presented is sent to the clients, and a full tick
+    /// follows only when they changed something to draw. Nothing else was
+    /// received, and whatever arrives meanwhile is still pending for the
+    /// next wait, which ends at once.
+    fn flip_tick(&mut self) -> Result<bool, RuntimeError> {
+        if std::mem::take(&mut self.flip_changed) {
+            return self.tick();
+        }
+        self.display
+            .flush_clients()
+            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        Ok(!self.exit)
+    }
+
+    fn run_tick(&mut self, idle: bool) -> Result<bool, RuntimeError> {
+        // A full tick draws what the page flips it follows changed.
+        self.flip_changed = false;
         if self.blank_stale || !self.blank_watched {
             self.blank_stale = false;
             if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -4787,15 +5277,21 @@ impl Runtime {
         // Motion folded since the last frame reaches the window manager
         // now, before client requests and this tick's frame.
         self.flush_motion_if_due();
-        self.display
+        let requests = self
+            .display
             .dispatch_clients(&mut self.state)
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        // Smithay has stored this dispatch's selections: copy a new one,
+        // or take over from an owner that went away (MetaClipboardManager).
+        self.state.retain_clipboard();
+        self.admit_security_contexts();
         self.display
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         self.manager.reconcile(&mut self.state);
         self.state.window_sessions_mut().save_if_due(Instant::now());
         self.focus_policy_tick();
+        self.alive_checks_tick();
         self.tablet_settings_tick();
         self.poll_input_aids();
         #[cfg(feature = "xwayland")]
@@ -4861,6 +5357,8 @@ impl Runtime {
                 .set_seat_touch_mode(drm.touch_mode().touch_mode());
         }
         let outcome = self.control.poll(self.manager.model_mut());
+        // What reached a socket after an idle wait ended (`idle_tick`).
+        let arrived = requests > 0 || outcome.received;
         for workspace in outcome.departed_workspaces.iter().copied() {
             self.manager.keep_departed_workspace_alive(workspace);
         }
@@ -4888,6 +5386,11 @@ impl Runtime {
         if outcome.close_menu_unanimated {
             self.menu_close.close_unanimated(std::time::Instant::now());
         }
+        // gnome-shell's close dialog answers (#1035): Wait or Force Quit.
+        for (window, response) in outcome.close_dialog_responses {
+            self.manager.close_dialog_response(window, response);
+        }
+        self.queue_close_dialogs();
         if let Some(request) = self.state.take_shortcut_consent_update() {
             self.control
                 .queue_message(tuna_shell_control::Message::ShortcutConsent { request });
@@ -4986,12 +5489,11 @@ impl Runtime {
             self.overview_search = false;
             self.overview_app_grid = false;
         }
-        // Administrative lockdown (#357 follow-up): poll the live key
-        // on a slow tick without blocking (background read plus drain);
-        // the shell maps it onto its idle sender too.
-        if self.lockdown_refresh_at.elapsed() >= LOCKDOWN_REFRESH_INTERVAL {
-            self.control.refresh_lockdown();
-            self.lockdown_refresh_at = Instant::now();
+        // Administrative lockdown (#357): the live key arrives from its
+        // settings watch, which wakes the loop when it changes; the shell
+        // maps the same key onto its idle sender too.
+        if let Some(disabled) = self.lockdown_settings.poll() {
+            self.control.set_lock_screen_disabled(disabled);
         }
         // GNOME's remembered Num Lock (#346): apply the restore once it
         // lands and save every change, as mutter does.
@@ -5013,23 +5515,27 @@ impl Runtime {
         // flag. Anyone else's locker is dropped, which tells it the
         // lock failed.
         if let Some((locker, pid)) = self.state.take_lock_request() {
-            let ours = matches!(
-                (pid, self.shell.child_pid()),
-                (Some(pid), Some(child)) if u32::try_from(pid).ok() == Some(child)
+            use crate::session_lock::{lock_request_verdict, LockVerdict};
+            let verdict = lock_request_verdict(
+                pid,
+                self.shell.child_pid(),
+                self.control.lock_screen_allowed(),
             );
-            // Administrative lockdown (#357): a disabled lock screen
-            // refuses even our own shell's locker (no Wayland bypass).
-            let approved = ours && self.control.lock_screen_allowed();
-            if approved {
-                if !self.is_locked() {
-                    self.engage_lock();
+            match verdict {
+                LockVerdict::Approved => {
+                    if !self.is_locked() {
+                        self.engage_lock();
+                    }
                 }
-            } else if ours {
-                eprintln!("tuna-compositor: session lock refused by administrator policy");
-            } else {
-                eprintln!("tuna-compositor: session lock refused for pid {pid:?}");
+                LockVerdict::RefusedByPolicy => {
+                    eprintln!("tuna-compositor: session lock refused by administrator policy");
+                }
+                LockVerdict::RefusedForeign => {
+                    eprintln!("tuna-compositor: session lock refused for pid {pid:?}");
+                }
             }
-            self.state.resolve_lock_request(locker, approved);
+            self.state
+                .resolve_lock_request(locker, verdict == LockVerdict::Approved);
         }
         // A lock client's unlock_and_destroy never unlocks by itself:
         // only a verified password clears the flag.
@@ -5092,6 +5598,12 @@ impl Runtime {
             self.idle_since = Instant::now();
         }
         self.idle_inhibited = inhibited;
+        // ext-idle-notify honours the same inhibitors for its ordinary
+        // notifications; input-only ones ignore them.
+        self.state
+            .protocols
+            .idle_notifier
+            .tick(Instant::now(), inhibited);
         if !self.is_locked() && self.lock.check_timeout(self.lock_now_ms()) {
             // Administrative lockdown (#357): a disabled lock screen
             // never engages on idle; restart the stretch instead so no
@@ -5129,6 +5641,15 @@ impl Runtime {
             if !self.overlay.visible {
                 self.overlay.show(Vec::new());
             }
+            // Keyboard focus belongs to the lock screen from the moment
+            // the session locks, not from the first key: an application
+            // behind the lock must not go on believing it is focused.
+            let lock_surface = self
+                .state
+                .primary_output_name()
+                .and_then(|name| self.state.lock_surface_for(&name));
+            self.manager
+                .hold_lock_focus(&mut self.state, lock_surface.as_ref());
         } else {
             if let Some(ime) = &mut self.ime {
                 ime.poll(crate::state::system_millis(), &mut self.display.handle());
@@ -5202,6 +5723,7 @@ impl Runtime {
                     ime.set_ready_x11_display(None);
                 }
                 self.manager.clear_x11_windows(&mut self.state);
+                self.x11_icon_reader.reset();
                 self.xwayland.disconnected(now);
             }
             let pending = &mut self.pending_x11_client;
@@ -5258,19 +5780,22 @@ impl Runtime {
         self.privacy_screen_tick();
         self.publish_display_state();
         self.publish_overview_previews();
-        let strip_was_animating = self.manager.strip_animating();
-        self.render()?;
-        // Rendering advances the strip's springs. Publish the terminal frame
-        // before the motion scheduler goes idle; the pre-render snapshot can
-        // otherwise retain the previous frame's residual indefinitely. With
-        // motion disabled, publish the instant frame's actual render count too.
-        let strip_lands_immediately = self.manager.session_mode()
-            == crate::windows::SessionMode::Scroll
-            && !self.input_settings.motion.allows_motion();
-        if (strip_was_animating || strip_lands_immediately) && !self.manager.strip_animating() {
-            self.publish_state();
+        if !idle || arrived || self.in_motion(Instant::now(), self.animation_clock.now()) {
+            let strip_was_animating = self.manager.strip_animating();
+            self.render()?;
+            // Rendering advances the strip's springs. Publish the terminal
+            // frame before the motion scheduler goes idle; the pre-render
+            // snapshot can otherwise retain the previous frame's residual
+            // indefinitely. With motion disabled, publish the instant
+            // frame's actual render count too.
+            let strip_lands_immediately = self.manager.session_mode()
+                == crate::windows::SessionMode::Scroll
+                && !self.input_settings.motion.allows_motion();
+            if (strip_was_animating || strip_lands_immediately) && !self.manager.strip_animating() {
+                self.publish_state();
+            }
+            self.screencast_tick();
         }
-        self.screencast_tick();
         // Send what this tick queued for the shell now, not at the next
         // wake, which may be far off (#503).
         self.control.flush(self.manager.model());
@@ -5282,25 +5807,65 @@ impl Runtime {
         Ok(!self.exit)
     }
 
+    /// Serve the DRM device's pending events, and nothing else (#503).
+    /// What they change is noted in `flip_changed`: commits a refresh
+    /// cycle released, or an output freed for the frame the last render
+    /// had to defer.
+    #[cfg(feature = "drm")]
+    fn dispatch_flips(&mut self) {
+        let Some(mut flips) = self.flips.take() else {
+            return;
+        };
+        let commits = self.state.commit_count;
+        if let Err(error) = flips.events.dispatch(Some(Duration::ZERO), self) {
+            eprintln!("tuna-compositor: drm: page flip dispatch: {error}");
+            self.flip_changed = true;
+        }
+        self.flips = Some(flips);
+        if self.state.commit_count != commits || self.frame_owed {
+            self.flip_changed = true;
+        }
+    }
+
+    /// Whether, of everything the main loop watches, only the DRM device
+    /// has events ready (#503): the page flips can then be served alone.
+    /// The flip loop's descriptor leaves the main loop's set for the check.
+    #[cfg(feature = "drm")]
+    fn flips_alone(&self, events: &EventLoop<'static, Runtime>) -> bool {
+        let Some(flips) = &self.flips else {
+            return false;
+        };
+        if !crate::wake::ready_within(&flips.events, Duration::ZERO).unwrap_or(false) {
+            return false;
+        }
+        let handle = events.handle();
+        if handle.disable(&flips.token).is_err() {
+            return false;
+        }
+        let others = crate::wake::ready_within(events, Duration::ZERO);
+        if let Err(error) = handle.enable(&flips.token) {
+            eprintln!("tuna-compositor: drm: page flips unwatched: {error}");
+            return false;
+        }
+        matches!(others, Ok(false))
+    }
+
+    #[cfg(not(feature = "drm"))]
+    fn dispatch_flips(&mut self) {}
+
+    #[cfg(not(feature = "drm"))]
+    fn flips_alone(&self, _events: &EventLoop<'static, Runtime>) -> bool {
+        false
+    }
+
     /// A page flip completed (hardware): mark what the frame drew
     /// presented with the kernel's vblank time and sequence, and on the
     /// primary output advance fifo barriers and commit timers (#89).
     #[cfg(feature = "drm")]
     fn page_flipped(&mut self, flip: crate::drm::PageFlip) {
-        use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
-        use smithay::utils::{Monotonic, Time};
-        // Mutter's KMS flags: vsync'd, kernel-timestamped, completion
-        // reported by the hardware.
-        let (time, flags): (Time<Monotonic>, Kind) = match flip.time {
-            Some(time) => (
-                Time::from(time),
-                Kind::Vsync | Kind::HwClock | Kind::HwCompletion,
-            ),
-            None => (
-                self.state.presentation_now(),
-                Kind::Vsync | Kind::HwCompletion,
-            ),
-        };
+        use smithay::utils::Monotonic;
+        let (time, flags) =
+            crate::frame_timing::flip_presentation(flip.time, self.state.presentation_now());
         if let Some(mut feedback) = flip.feedback {
             feedback.presented::<_, Monotonic>(
                 time,
@@ -5349,6 +5914,7 @@ impl Runtime {
             self.lock.note_input(u64::from(time));
             self.idle_since = Instant::now();
             self.idle_monitor.activity();
+            self.state.protocols.idle_notifier.activity(Instant::now());
             self.active_at = Instant::now();
         }
         let event = match event {
@@ -5596,10 +6162,31 @@ impl Runtime {
             let mut policy = self.manager.focus_policy();
             policy.apply(&raw);
             self.manager.set_focus_policy(policy);
+            if let Some(ms) = raw.check_alive_timeout_ms {
+                self.manager.set_check_alive_timeout(ms);
+            }
         }
         if !self.is_locked() {
             self.manager.repick_pointer_window(&mut self.state);
             self.manager.run_focus_timers(&mut self.state, now);
+        }
+    }
+
+    /// Mutter's alive checks (#1035): pongs, ping timeouts and the close
+    /// dialog's timers; nothing pings or shows while locked, and the
+    /// supervised shell is never pinged.
+    fn alive_checks_tick(&mut self) {
+        let locked = self.is_locked();
+        self.manager.set_shell_pid(self.shell.child_pid());
+        self.manager
+            .run_alive_checks(&mut self.state, Instant::now(), locked);
+        self.queue_close_dialogs();
+    }
+
+    /// Hand the manager's close-dialog messages to the shell.
+    fn queue_close_dialogs(&mut self) {
+        for message in self.manager.take_close_dialogs() {
+            self.control.queue_message(message);
         }
     }
 
@@ -5675,7 +6262,7 @@ impl Runtime {
         let flashes = self.screenshot_flashes.samples(now);
         let allowed = crate::window_lifecycle::effects_allowed(
             self.control.overview_open(),
-            self.shell_swipe.is_some(),
+            self.shell_swipe.active(),
             self.manager.workspace_slide().running(),
             locked,
         );
@@ -5689,6 +6276,9 @@ impl Runtime {
             #[cfg(feature = "drm")]
             Backend::Drm(drm) => &mut drm.renderer,
         };
+        // Before anything is drawn or skipped: this tick's commits reach
+        // their textures, and their shm buffers go back to the clients.
+        crate::buffer_upload::upload_committed(renderer, &mut self.state);
         self.manager.step_modal_dim(
             now,
             self.input_settings.motion,
@@ -5972,14 +6562,12 @@ impl Runtime {
                         blank_alpha,
                         accent,
                         decor: decor.clone(),
-                        above: elements.above,
-                        effects: elements
-                            .brightness
-                            .iter()
-                            .copied()
-                            .chain(elements.snapshots.iter().map(|s| s.2))
-                            .map(f32::to_bits)
-                            .chain(self.night_light.effect_bits())
+                        under_tile: elements.under_tile(),
+                        dimmed: elements.dimmed(),
+                        effects: self
+                            .night_light
+                            .effect_bits()
+                            .into_iter()
                             .chain(wellbeing.bits())
                             .chain(zoom_plan.iter().flat_map(|plan| plan.signature_bits()))
                             .collect(),
@@ -6058,6 +6646,7 @@ impl Runtime {
                                             scale: view.scale,
                                             blank_alpha,
                                             tint: night_tint.as_ref(),
+                                            opaque: false,
                                         },
                                         &decor,
                                         &previews,
@@ -6098,6 +6687,7 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: night_tint.as_ref(),
+                                        opaque: false,
                                     },
                                     &decor,
                                     &previews,
@@ -6171,11 +6761,14 @@ impl Runtime {
                     rects.iter().position(|r| r.contains(*at)).unwrap_or(0)
                 };
                 let mut queued = false;
+                let mut owed = false;
                 let mut cursor_presented = false;
                 for (index, out) in outputs.iter_mut().enumerate() {
                     // Display-paced: one frame in flight per output; a
-                    // switched-off CRTC gets none (#340).
+                    // switched-off CRTC gets none (#340). Its flip lets
+                    // the next render look again.
                     if out.pending || !out.enabled {
+                        owed |= out.pending && out.enabled;
                         continue;
                     }
                     let size = out.size;
@@ -6326,16 +6919,14 @@ impl Runtime {
                         blank_alpha,
                         accent,
                         decor: decor.clone(),
-                        above: elements.above,
-                        effects: elements
-                            .brightness
-                            .iter()
-                            .copied()
-                            .chain(elements.snapshots.iter().map(|s| s.2))
-                            .map(f32::to_bits)
-                            // Night Light gains: a temperature step
-                            // repaints, an unchanged filter sleeps.
-                            .chain(self.night_light.effect_bits())
+                        under_tile: elements.under_tile(),
+                        dimmed: elements.dimmed(),
+                        // Night Light gains: a temperature step
+                        // repaints, an unchanged filter sleeps.
+                        effects: self
+                            .night_light
+                            .effect_bits()
+                            .into_iter()
                             .chain(wellbeing.bits())
                             .chain(zoom_plan.iter().flat_map(|plan| plan.signature_bits()))
                             .collect(),
@@ -6428,6 +7019,7 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: output_tint,
+                                        opaque: false,
                                     },
                                     &decor,
                                     &previews,
@@ -6473,6 +7065,9 @@ impl Runtime {
                                         scale: view.scale,
                                         blank_alpha,
                                         tint: output_tint,
+                                        // GLES places opaque regions right only without a transform.
+                                        opaque: crate::orientation::render_transform(out.transform)
+                                            == Transform::Normal,
                                     },
                                     &decor,
                                     &previews,
@@ -6542,6 +7137,7 @@ impl Runtime {
                     // animations wake the loop, as Mutter's frame clock
                     // idles between a client's frames.
                 }
+                self.frame_owed = owed;
                 queued
             }
         };
@@ -6624,11 +7220,22 @@ impl Runtime {
     }
 }
 
-/// Overview backdrop (GNOME 51's `#overviewGroup`, #222226).
-/// Vertical finger travel for a whole overview transition (logical
-/// touchpad units, as libinput reports swipe deltas).
-const OVERVIEW_SWIPE_DISTANCE: f64 = 300.0;
+/// The tracker a committed touchpad swipe drives.
+#[derive(Debug)]
+enum SwipeTarget {
+    /// Nothing moves (no swipe, or one GNOME's trackers ignore).
+    None,
+    /// The overview's controls state (desktop, window picker, app grid),
+    /// `travel` touchpad units toward the app grid.
+    Overview { travel: f64 },
+    /// The desktop's workspace strip ([`crate::workspace_slide`]).
+    Workspaces,
+    /// The open overview's workspaces (`WorkspacesView`), scrolled by
+    /// [`crate::overview::OverviewMotion`].
+    OverviewWorkspaces,
+}
 
+/// Overview backdrop (GNOME 51's `#overviewGroup`, #222226).
 const OVERVIEW_BACKGROUND: Color32F = Color32F::new(34.0 / 255.0, 34.0 / 255.0, 38.0 / 255.0, 1.0);
 
 /// The overview's solid fills (the workspace thumbnails strip) in
@@ -6938,6 +7545,32 @@ impl Scene {
         crate::native_repaint::coalesce(crate::background_blur::expand_damage(
             damage, &self.blur, output,
         ))
+    }
+
+    /// How many surfaces draw beneath the tile preview. Only this changes
+    /// the drawing order between scene passes; surfaces that come and go
+    /// in front of the preview, as every surface does without a dragged
+    /// window, are the damage tracker's.
+    fn under_tile(&self) -> usize {
+        self.elements.len().saturating_sub(self.above)
+    }
+
+    /// The dimmed surfaces and snapshots, by element id, with their
+    /// brightness ([`crate::native_repaint::FrameSignature::dimmed`]).
+    fn dimmed(&self) -> Vec<(smithay::backend::renderer::element::Id, u32)> {
+        use smithay::backend::renderer::element::Element;
+        self.elements
+            .iter()
+            .zip(&self.brightness)
+            .filter(|(_, brightness)| **brightness != 1.0)
+            .map(|(element, brightness)| (element.id().clone(), brightness.to_bits()))
+            .chain(
+                self.snapshots
+                    .iter()
+                    .filter(|(_, _, brightness)| *brightness != 1.0)
+                    .map(|(_, element, brightness)| (element.id().clone(), brightness.to_bits())),
+            )
+            .collect()
     }
 }
 
@@ -7545,6 +8178,9 @@ struct Target<'a> {
     blank_alpha: f32,
     /// Scene wellbeing effect and output temperature; captures use unity temperature.
     tint: Option<&'a FrameColor>,
+    /// Draw what elements declare opaque without blending: only a frame
+    /// rendered without a transform (`draw_planned`).
+    opaque: bool,
 }
 
 fn draw_scene(
@@ -7566,6 +8202,7 @@ fn draw_scene(
         scale,
         blank_alpha,
         tint,
+        opaque,
     } = target;
     let recolor = |color| tint.map_or(color, |tint| tint.color(color));
     let background = recolor(background);
@@ -7647,7 +8284,7 @@ fn draw_scene(
         frame.clear(background, &clear).map_err(error)?;
     }
     set_tint(frame, 1.0);
-    draw_planned::<GlesRenderer, _>(frame, 1.0, paper, &paper_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, paper, &paper_plan, opaque).map_err(error)?;
     frame.clear_tex_program_override();
     for ((color, _), rects) in decor.iter().zip(decor_plan.iter().rev()) {
         if !rects.is_empty() {
@@ -7657,21 +8294,46 @@ fn draw_scene(
     // Surfaces carry logical sizes: draw them at the output scale. The
     // wallpaper above is already sized in physical pixels.
     set_tint(frame, 1.0);
-    draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan, opaque)
+        .map_err(error)?;
     frame.clear_tex_program_override();
-    draw_slots(frame, output, scale, scene, &under, &under_plan, tint).map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan).map_err(error)?;
-    draw_slots(frame, output, scale, scene, &over, &over_plan, tint).map_err(error)?;
+    draw_slots(
+        frame,
+        output,
+        scale,
+        scene,
+        &under,
+        &under_plan,
+        tint,
+        opaque,
+    )
+    .map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan, opaque).map_err(error)?;
+    draw_slots(frame, output, scale, scene, &over, &over_plan, tint, opaque).map_err(error)?;
     set_tint(frame, 1.0);
-    draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan, opaque).map_err(error)?;
     frame.clear_tex_program_override();
-    draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan).map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.effects.textures, &effect_textures_plan)
+    draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan, opaque)
         .map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, &scene.effects.solids, &effect_solids_plan)
+    draw_planned::<GlesRenderer, _>(
+        frame,
+        1.0,
+        &scene.effects.textures,
+        &effect_textures_plan,
+        opaque,
+    )
+    .map_err(error)?;
+    draw_planned::<GlesRenderer, _>(
+        frame,
+        1.0,
+        &scene.effects.solids,
+        &effect_solids_plan,
+        opaque,
+    )
+    .map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, flashes, &flash_plan, opaque).map_err(error)?;
+    draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan, opaque)
         .map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, flashes, &flash_plan).map_err(error)?;
-    draw_planned::<GlesRenderer, _>(frame, 1.0, shield.as_slice(), &shield_plan).map_err(error)?;
     let mut scene_visible = vec![false; scene.elements.len()];
     for (slot, shown) in over
         .iter()
@@ -7839,6 +8501,7 @@ fn draw_slots(
     slots: &[SceneSlot],
     plan: &[Vec<Rectangle<i32, smithay::utils::Physical>>],
     tint: Option<&FrameColor>,
+    opaque: bool,
 ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
     use crate::occlusion::draw_planned;
     for (slot, visible) in slots.iter().zip(plan).rev() {
@@ -7886,6 +8549,7 @@ fn draw_slots(
                 scale,
                 std::slice::from_ref(&scene.elements[index]),
                 visible,
+                opaque,
             ),
             SceneSlot::Bell(k) => draw_planned::<GlesRenderer, _>(
                 frame,
@@ -7904,12 +8568,14 @@ fn draw_slots(
                     )
                 }),
                 visible,
+                opaque,
             ),
             SceneSlot::Snapshot(k) => draw_planned::<GlesRenderer, _>(
                 frame,
                 1.0,
                 std::slice::from_ref(&scene.snapshots[k].1),
                 visible,
+                opaque,
             ),
         };
         frame.clear_tex_program_override();
@@ -8096,10 +8762,9 @@ fn send_frame_callbacks(
 /// Run a nested session to shutdown: drive the loop and report run
 /// statistics.
 ///
-/// Environment hygiene ([`apply_nested_env`]) is applied only after the
-/// backend exists: the winit backend prefers Wayland when
-/// `WAYLAND_DISPLAY` is set, so setting it first would point winit at our
-/// own not-yet-existing socket.
+/// Supervised child services receive `WAYLAND_DISPLAY` explicitly for the
+/// child command; the compositor process environment remains unmutated
+/// so concurrent background threads (GIO, D-Bus) never race on `environ`.
 pub fn run(session: &NestedSession) -> Result<RunStats, RuntimeError> {
     run_loop(session, |_| None)
 }
@@ -8130,6 +8795,26 @@ impl AuthOwnerProbe<'_> {
     pub fn invalidate_epoch(&mut self) -> bool {
         crate::auth_owner::advance_epoch(&self.runtime.unlock_generation)
     }
+    /// Inject the same compositor-thread sleep update as the logind
+    /// monitor. This trusted Rust-only probe does not simulate S3/KMS.
+    pub fn prepare_for_sleep(&mut self, sleeping: bool) {
+        if sleeping {
+            crate::auth_owner::advance_epoch(&self.runtime.unlock_generation);
+        }
+        self.runtime.on_sleep_update(sleeping, !sleeping);
+    }
+
+    /// Inject libseat's runtime notification, not a kernel VT switch.
+    #[cfg(feature = "drm")]
+    pub fn set_session_active(&mut self, active: bool) {
+        use smithay::backend::session::Event;
+        self.runtime.on_session_event(if active {
+            Event::ActivateSession
+        } else {
+            Event::PauseSession
+        });
+    }
+
     pub fn try_unlock(&mut self, user: &str, password: &str) -> bool {
         self.runtime.try_unlock(user, password)
     }
@@ -8153,7 +8838,6 @@ fn run_loop(
     mut probe: impl FnMut(&mut AuthOwnerProbe<'_>) -> Option<Duration>,
 ) -> Result<RunStats, RuntimeError> {
     let (mut runtime, mut event_loop) = Runtime::launch(session)?;
-    let prev_env = apply_nested_env(&session.socket_name);
     #[cfg(feature = "drm")]
     let _session_services = if matches!(runtime.backend, Backend::Drm(_)) {
         Some(crate::session_services::publish(&session.socket_name))
@@ -8230,29 +8914,53 @@ fn run_loop(
             Ok(calloop::PostAction::Continue)
         })
         .map_err(|e| RuntimeError::Loop(e.to_string()))?;
-    let mut wait = Duration::ZERO;
+    let mut next = NextWake {
+        after: Duration::ZERO,
+        idle: false,
+        flips: false,
+    };
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             runtime.shutdown_colord();
-            restore_env(prev_env);
             return Ok(runtime.stats);
         }
-        let dispatched = event_loop
-            .dispatch(Some(wait), &mut runtime)
-            .map_err(|e| RuntimeError::Loop(e.to_string()));
+        // Nothing is due (#503): learn whether any source fires before the
+        // fallback wake without dispatching it. If none does, nothing was
+        // received and the tick is an idle one; the loop is not dispatched
+        // then, so nothing arriving meanwhile is consumed behind its back.
+        // Likewise when only page flips arrived before anything fell due:
+        // they are served alone, and an idle tick follows.
+        let waited = Instant::now();
+        let (quiet, flips, wait) = if next.idle || next.flips {
+            match crate::wake::ready_within(&event_loop, next.after) {
+                Ok(true) => (
+                    false,
+                    next.flips
+                        && (next.idle || waited.elapsed() < next.after)
+                        && runtime.flips_alone(&event_loop),
+                    Duration::ZERO,
+                ),
+                Ok(false) => (next.idle, false, Duration::ZERO),
+                // Interrupted: wait in the dispatch itself, as ever.
+                Err(_) => (false, false, next.after),
+            }
+        } else {
+            (false, false, next.after)
+        };
+        let dispatched = if quiet {
+            Ok(())
+        } else if flips {
+            runtime.dispatch_flips();
+            Ok(())
+        } else {
+            event_loop
+                .dispatch(Some(wait), &mut runtime)
+                .map_err(|e| RuntimeError::Loop(e.to_string()))
+        };
         #[cfg(feature = "drm")]
         if let Some(monitor) = &sleep_monitor {
             let (lock, wake) = monitor.take();
-            if lock {
-                runtime.engage_lock();
-            }
-            if wake {
-                // Lock is compositor-owned even if the supervised shell died.
-                runtime.engage_lock();
-                if let Backend::Drm(drm) = &mut runtime.backend {
-                    drm.resume_from_sleep();
-                }
-            }
+            runtime.on_sleep_update(lock, wake);
         }
         #[cfg(feature = "drm")]
         match logind_session.as_ref().and_then(|session| session.take()) {
@@ -8260,7 +8968,15 @@ fn run_loop(
             Some(crate::logind_session::Request::Unlock) => runtime.unlock_for_logind(),
             None => {}
         }
-        let ticked = dispatched.and_then(|_| runtime.tick());
+        let ticked = dispatched.and_then(|_| {
+            if quiet {
+                runtime.idle_tick()
+            } else if flips {
+                runtime.flip_tick()
+            } else {
+                runtime.tick()
+            }
+        });
         #[cfg(feature = "drm")]
         if let Some(session) = &mut logind_session {
             session.report_locked(runtime.is_locked());
@@ -8270,16 +8986,20 @@ fn run_loop(
         });
         match ticked {
             Ok(true) => {
-                wait = runtime.next_wake();
+                next = runtime.next_wake();
                 if let Some(delay) = probe_delay {
-                    wait =
-                        wait.min(delay.clamp(Duration::from_millis(1), Duration::from_millis(100)));
+                    next = NextWake {
+                        after: next
+                            .after
+                            .min(delay.clamp(Duration::from_millis(1), Duration::from_millis(100))),
+                        idle: false,
+                        flips: false,
+                    };
                 }
                 continue;
             }
             done => {
                 runtime.shutdown_colord();
-                restore_env(prev_env);
                 return done.map(|_| runtime.stats);
             }
         }

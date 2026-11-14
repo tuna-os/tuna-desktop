@@ -1,7 +1,7 @@
 # Visual capture coverage matrix
 
 Per-feature visual capture of Tuna Desktop v1 from the frozen Wave 3
-integration head. Every one of the 72 parity-ledger rows
+integration head. Every one of the 83 parity-ledger rows
 (`docs/parity-ledger.md`) and all 46 walkthrough entries
 (`docs/walkthrough.tsv`) maps below to the capture stage(s) that collect
 it, or to an explicit reason nested fixtures cannot show it. Checked by
@@ -134,7 +134,7 @@ state records its state observation next to its stills and clips.
 | P-ST-05 | Administrative lockdown | `missing-product` | No adequate capture | no lockdown consumer |
 | P-ST-06 | Remote desktop and RDP flows | `unsupported-in-nested` | No adequate capture | portal input nonvisual in CI; RDP sharing/control/login need Corral |
 | P-ST-07 | Date/time, NTP, time zone on image | `unsupported-in-nested` | No adequate capture | week-start visuals in CI proofs; timedate1/NTP/Geoclue need installed-image Corral |
-| P-ST-08 | Background modes, shading, slideshows | stage:settings-a11y `partial` | No adequate capture | static wallpaper captured; placement modes, shading, XML slideshows unproven |
+| P-ST-08 | Background modes, shading, slideshows | stage:settings-a11y `partial` | No adequate capture | static wallpaper captured; placement/shading/XML pixels are CI portal proofs (run 38878636595) and a 2026-10-30 Corral VM run with main sideloaded; no paired GNOME or multi-output capture |
 | P-ST-09 | Apps panel: permissions, defaults, media | `unsupported-in-nested` | No adequate capture | Apps-panel journeys need installed-image Corral |
 | P-ST-10 | Service-backed Settings panels on image | `unsupported-in-nested` | No adequate capture | network/BT/accounts/printers/sharing/users/region/updates need installed-image Corral item-by-item |
 | P-ST-11 | Legacy/app-owned settings classified | `nonvisual` | No adequate capture | inventory disposition, checked by scripts/tuna-settings-inventory-check |
@@ -149,6 +149,16 @@ state records its state observation next to its stills and clips.
 | P-AN-08 | App grid animations | `unproven` | Transition clip required | folder zoom, launch zoom, page switch, page dots and arrows implemented and trace-gated (G-FOLDER-ZOOM, G-LAUNCH-ZOOM, G-GRID-PAGE-ANIM); no capture state or transition clip yet |
 | P-AN-09 | Menu, OSD, banner, switcher transitions | stage:transitions `clip` + stage:notifications `nested` | Transition clip required | switcher-fade clip + banner stills; popover/submenu/OSD/banner/modal transitions unproven |
 | P-AN-10 | Lock, flash, wallpaper, ripple transitions | stage:system `partial` | Transition clip required | lock stills only; curtain/flash/crossfade/ripple/startup transitions unproven |
+| P-SY-11 | Clipboard kept after the copying app closes | `nonvisual` | No adequate capture | pasted bytes are checked by socketpair clients (`tests/data_device.rs`); a real-app journey needs installed-image Corral |
+| P-WM-10 | Server-side frames on X11 windows | `missing-product` | No adequate capture | X11 windows map bare (walkthrough:x11); no frame exists to capture |
+| P-WM-11 | "Not responding" dialog | `unproven` | No adequate capture | dialog implemented; no capture state with a hung client yet |
+| P-PN-04 | World Clocks and Weather in the calendar | `missing-product` | No adequate capture | calendar popover has neither section |
+| P-NT-04 | Media players in the notification list | `missing-product` | No adequate capture | no media section on main; lock-screen and calendar media are in open PRs |
+| P-PN-05 | Airplane Mode and keyboard backlight toggles | `unproven` | No adequate capture | tiles implemented; need gsd-rfkill and a keyboard backlight (fixture or hardware) to show |
+| P-SY-12 | Switch User | `unsupported-in-nested` | No adequate capture | row exists on hardware sessions only; needs GDM and two accounts on an installed image |
+| P-SY-13 | InputCapture portal backend | `nonvisual` | No adequate capture | D-Bus and EIS behaviour; capture is wired on the DRM input path only |
+| P-SY-14 | Thunderbolt authorisation notices | `unsupported-in-nested` | No adequate capture | needs boltd and a Thunderbolt device or an emulated one (ADR 0008) |
+| P-ST-12 | Captive-portal sign-in | `unproven` | No adequate capture | notification and helper launch need NetworkManager reporting a portal |
 
 ## Walkthrough states
 

@@ -2,8 +2,8 @@
 //!
 //! Starts one isolated nested Wayland session on a private socket and
 //! drives it until the window closes. The host display session is never
-//! touched: `WAYLAND_DISPLAY` is set in this process only, and shutdown
-//! restores the previous value.
+//! touched: child services receive `WAYLAND_DISPLAY` explicitly, and
+//! the compositor process environment remains unmutated.
 
 use std::process::ExitCode;
 
@@ -37,6 +37,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
         return tuna_compositor::pam_helper::entry();
+    }
+    // Before any thread starts: full-screen pixel buffers go back to the
+    // kernel when dropped (see tuna_compositor::malloc).
+    if !tuna_compositor::malloc::pin_mmap_threshold() {
+        eprintln!("tuna-compositor: malloc mmap threshold left to the C library");
+    }
+    // Client connections are descriptors: start from the hard limit, as
+    // Mutter does; spawned processes get the original back.
+    match tuna_compositor::nofile::raise() {
+        Some((old, new)) if old != new => {
+            eprintln!("tuna-compositor: open-file limit raised from {old} to {new}");
+        }
+        Some(_) => {}
+        None => eprintln!("tuna-compositor: open-file limit unchanged (could not raise it)"),
     }
     let mut session = NestedSession::default_for_pid();
     session.xwayland = tuna_compositor::runtime::xwayland_wanted(
@@ -113,8 +127,8 @@ fn main() -> ExitCode {
                 println!("from logind or seatd). --width/--height apply to nested runs.");
                 println!("The shell binary (default: TUNA_SHELL_BIN, else the");
                 println!("tuna-shell-host sibling) is spawned supervised with a");
-                println!("finite restart budget; WAYLAND_DISPLAY is set for this");
-                println!("process only and restored on shutdown.");
+                println!("finite restart budget; WAYLAND_DISPLAY is configured for");
+                println!("supervised children without mutating process environment.");
                 println!("--startup-overview opens the overview at start, as GNOME");
                 println!("does at login (tuna-session passes it).");
                 println!("--screen-reader lets a nested session own the screen");

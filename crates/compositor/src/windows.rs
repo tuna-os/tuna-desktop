@@ -12,6 +12,7 @@
 //! and focused; titles are read from the surface role data; stacking is
 //! insertion order with focus raising to top. All code here is original.
 
+mod alive;
 mod tablet_input;
 
 use std::collections::{HashMap, HashSet};
@@ -590,6 +591,8 @@ pub struct WindowManager {
     /// Pending auto-raise `(window, due)`.
     auto_raise: Option<(u64, std::time::Instant)>,
     grab_raise: Option<GrabRaise>,
+    /// Mutter's alive checks and the close dialog (#1035).
+    alive: alive::AliveState,
 }
 
 impl WindowManager {
@@ -827,6 +830,7 @@ impl WindowManager {
             pointer_rest: None,
             auto_raise: None,
             grab_raise: None,
+            alive: alive::AliveState::new(state),
         }
     }
 
@@ -880,6 +884,63 @@ impl WindowManager {
     /// Every managed window's id, in no particular order.
     pub fn window_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.windows.keys().copied()
+    }
+
+    /// Which of the manager's per-window structures still name window
+    /// `id`. Empty once a closed window is fully forgotten (#1088);
+    /// effect state the runtime steps every frame (map/close effects,
+    /// modal dimming) counts too.
+    pub fn window_references(&self, id: u64) -> Vec<&'static str> {
+        let mut held = Vec::new();
+        let mut check = |name, holds: bool| {
+            if holds {
+                held.push(name);
+            }
+        };
+        check("model", self.model.window(id).is_some());
+        check("windows", self.windows.contains_key(&id));
+        check(
+            "surface_index",
+            self.surface_index.values().any(|v| *v == id),
+        );
+        #[cfg(feature = "xwayland")]
+        check("x11_index", self.x11_index.values().any(|v| *v == id));
+        check("stacking", self.stacking.contains(&id));
+        check("focus_history", self.focus_history.contains(&id));
+        check(
+            "focus_awaits_surface",
+            self.focus_awaits_surface == Some(id),
+        );
+        check("x11_input_focus", self.x11_input_focus == Some(id));
+        check("pre_overview_focus", self.pre_overview_focus == Some(id));
+        check("overview_activated", self.overview_activated == Some(id));
+        check("activated", self.activated == Some(id));
+        check("pointer_window", self.pointer_window == Some(Some(id)));
+        check(
+            "pointer_rest",
+            self.pointer_rest.is_some_and(|r| r.window == Some(id)),
+        );
+        check("auto_raise", self.auto_raise.is_some_and(|(w, _)| w == id));
+        check("grab_raise", self.grab_raise.is_some_and(|g| g.id == id));
+        check(
+            "column_animations",
+            self.column_animations.contains_key(&id),
+        );
+        check("strip_hints", self.strip_hints.contains_key(&id));
+        check(
+            "strip_resize_heights",
+            self.strip_resize_heights.iter().any(|(w, _)| *w == id),
+        );
+        check("icon_geometries", self.icon_geometries.contains_key(&id));
+        check(
+            "menu_requests",
+            self.menu_requests.iter().any(|(w, _, _)| *w == id),
+        );
+        check("size_changes", self.size_changes.holds(id));
+        check("window_lifecycle", self.window_lifecycle.holds(id));
+        check("modal_dim", self.modal_dim.holds(id));
+        check("alive", self.alive_holds(id));
+        held
     }
 
     /// The Wayland surface of window `id`, if it has one.
@@ -1295,16 +1356,16 @@ impl WindowManager {
         output_width: i32,
         motion: tuna_shell_control::motion::MotionPolicy,
     ) {
-        let keep_alive = self
-            .workspace_tracker
-            .protected_workspaces(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        let keep_alive = self.workspace_tracker.occupying_workspaces(now);
+        let retained = self.workspace_tracker.retained_workspaces(now);
         if self.grab.is_some() || overview_dragging {
             return;
         }
         let previous_active = self.model.active_workspace();
         if let Some(indices) = self
             .model
-            .reconcile_dynamic_workspaces_with_remap(&keep_alive)
+            .reconcile_dynamic_workspaces_with_remap(&keep_alive, &retained)
         {
             self.workspace_tracker.remap(&indices);
             let active = self.model.active_workspace();
@@ -1522,29 +1583,7 @@ impl WindowManager {
         state.refresh_ime_cursor_origins();
         // Never pull focus out from under a live grab.
         if state.take_popup_refocus() && !state.popup_grab_active() {
-            // The grab stole keyboard from whoever held it: hand it back
-            // to the same owner — the parked overview first, then an
-            // Exclusive layer surface (the panel holding Ctrl+Alt+Tab
-            // focus keeps its keyboard across its own menus), and only
-            // then the focused window. Handing an Exclusive hold back
-            // to a window (or nothing) strands the panel inactive with
-            // GTK focus intact but no keyboard (G-PANEL-FOCUS).
-            if let Some(held) = self.overview_held.clone() {
-                let serial = SERIAL_COUNTER.next_serial();
-                if let Some(keyboard) = self.keyboard.clone() {
-                    keyboard.set_focus(state, Some(held.clone()), serial);
-                }
-                state.sync_selection_focus(Some(&held));
-            } else if let Some(exclusive) = crate::layer::exclusive_keyboard_layer(state) {
-                let serial = SERIAL_COUNTER.next_serial();
-                if let Some(keyboard) = self.keyboard.clone() {
-                    keyboard.set_focus(state, Some(exclusive.clone()), serial);
-                }
-                state.sync_selection_focus(Some(&exclusive));
-            } else {
-                let focused = self.model.focused();
-                self.apply_focus(state, focused);
-            }
+            self.restore_keyboard_owner(state);
             // The grab held pointer focus wherever the pointer went:
             // re-deliver it where the pointer is now, so the surface it
             // left hears the leave (a panel button drops its hover).
@@ -1632,6 +1671,9 @@ impl WindowManager {
         // hold focus past this tick while the overview is open.
         self.reconcile_overview_focus(state);
         self.reconcile_exclusive_layer(state);
+        // The shell's ext-foreign-toplevel-list follows the model as it
+        // stands after this tick's maps, title changes and unmaps (#1046).
+        state.sync_foreign_toplevels(self.model.revision(), self.model.windows());
         let _ = seen;
     }
 
@@ -2555,6 +2597,10 @@ impl WindowManager {
         // Alt+Tab) until the pointer moves.
         self.sticky_focus = (self.focus_policy.mode.follows_pointer() && id.is_some())
             .then_some(StickyFocus { distance: 0.0 });
+        // meta_window_activate_full ends with meta_window_check_alive.
+        if let Some(id) = id {
+            self.check_alive(id);
+        }
         true
     }
 
@@ -3659,6 +3705,10 @@ impl WindowManager {
             pointer.frame(state);
         }
         if let Some(under) = crossing {
+            // events.c: motion over a window checks it is alive.
+            if let Some(id) = under {
+                self.check_alive(id);
+            }
             self.pointer_crossing(state, under);
         }
     }
@@ -4048,6 +4098,9 @@ impl WindowManager {
             {
                 if let Some(id) = self.window_at(pos) {
                     if self.modal_target(id) != id {
+                        // meta_window_handle_ungrabbed_event: every press
+                        // focuses and checks the window is alive.
+                        self.check_alive(id);
                         self.apply_focus_raise(state, Some(id), self.focus_policy.raise_on_click);
                         self.swallowed_button = Some(button);
                         return;
@@ -4074,6 +4127,10 @@ impl WindowManager {
                     .window_at(pos)
                     .and_then(|id| Some((id, self.shifted(id, self.windows.get(&id)?.geometry))))
                 {
+                    // meta_window_handle_ungrabbed_event focuses the pressed
+                    // window and checks it is alive before its modifier
+                    // actions.
+                    self.check_alive(id);
                     let decision = self.focus_policy.press(
                         self.held_mods(),
                         button,
@@ -4178,10 +4235,14 @@ impl WindowManager {
                     pointer.current_focus().is_some()
                 );
             }
+            let serial = SERIAL_COUNTER.next_serial();
+            if pressed {
+                state.pointer_press_serial = Some(serial);
+            }
             pointer.button(
                 state,
                 &ButtonEvent {
-                    serial: SERIAL_COUNTER.next_serial(),
+                    serial,
                     time,
                     button,
                     state: if pressed {
@@ -4251,6 +4312,70 @@ impl WindowManager {
         pointer.frame(state);
     }
 
+    /// While locked, keyboard focus is the lock surface, or nobody when
+    /// none is up (ext-session-lock-v1: nothing behind the lock has
+    /// focus). Applications get wl_keyboard.leave as the session locks,
+    /// as GNOME's lock screen takes focus, instead of keeping it until
+    /// the first key press; [`Self::refocus_after_lock`] hands it back
+    /// on unlock.
+    pub fn hold_lock_focus(
+        &mut self,
+        state: &mut State,
+        surface: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    ) {
+        if let Some(keyboard) = self.keyboard.clone() {
+            if keyboard.current_focus().as_ref() != surface {
+                keyboard.set_focus(state, surface.cloned(), SERIAL_COUNTER.next_serial());
+            }
+        }
+    }
+
+    /// Hand the keyboard back to whoever owns it when nothing holds it
+    /// (after a popup grab, after unlock): the parked overview first,
+    /// then an Exclusive layer surface (the panel holding Ctrl+Alt+Tab
+    /// focus keeps its keyboard across its own menus), and only then the
+    /// focused window. Handing an Exclusive hold back to a window (or
+    /// nothing) strands the panel inactive with GTK focus intact but no
+    /// keyboard (G-PANEL-FOCUS).
+    pub fn restore_keyboard_owner(&mut self, state: &mut State) {
+        if let Some(held) = self.overview_held.clone() {
+            let serial = SERIAL_COUNTER.next_serial();
+            if let Some(keyboard) = self.keyboard.clone() {
+                keyboard.set_focus(state, Some(held.clone()), serial);
+            }
+            state.sync_selection_focus(Some(&held));
+        } else if let Some(exclusive) = crate::layer::exclusive_keyboard_layer(state) {
+            let serial = SERIAL_COUNTER.next_serial();
+            if let Some(keyboard) = self.keyboard.clone() {
+                keyboard.set_focus(state, Some(exclusive.clone()), serial);
+            }
+            state.sync_selection_focus(Some(&exclusive));
+        } else {
+            let focused = self.model.focused();
+            self.apply_focus(state, focused);
+        }
+    }
+
+    /// The lock lifted: give the keyboard back to what had it, as GNOME
+    /// Shell's `popModal` does (screenShield.js locks with a modal stage
+    /// grab, which revokes Mutter's Wayland popup grab without dismissing
+    /// it): the topmost popup of a grab that outlived the lock, else the
+    /// owner a popup grab hands back to (the parked overview, an
+    /// Exclusive layer, the focused window). Without this the keyboard
+    /// stayed on the destroyed lock surface until the next click.
+    pub fn refocus_after_lock(&mut self, state: &mut State) {
+        if let Some(top) = state.popup_grab.last().map(|p| p.wl_surface().clone()) {
+            if let Some(keyboard) = self.keyboard.clone() {
+                keyboard.set_focus(state, Some(top), SERIAL_COUNTER.next_serial());
+            }
+            return;
+        }
+        // No grab to return to: the owner has the keyboard back at once,
+        // and the next reconcile re-delivers pointer focus as after a grab.
+        self.restore_keyboard_owner(state);
+        state.popup_refocus = true;
+    }
+
     /// Route one input event to the session-lock surface and nothing
     /// else (ext-session-lock-v1): keys go to it with keyboard focus
     /// held there, the pointer acts on it at the output origin, and no
@@ -4304,10 +4429,14 @@ impl WindowManager {
             } => {
                 if let Some(pointer) = self.pointer.clone() {
                     self.lock_pointer_enter(state, &pointer, surface, time);
+                    let serial = SERIAL_COUNTER.next_serial();
+                    if pressed {
+                        state.pointer_press_serial = Some(serial);
+                    }
                     pointer.button(
                         state,
                         &ButtonEvent {
-                            serial: SERIAL_COUNTER.next_serial(),
+                            serial,
                             time,
                             button,
                             state: if pressed {
@@ -4922,8 +5051,9 @@ impl WindowManager {
 
     /// Ask a window's client to close (polite `close` request). The
     /// client unmaps itself; `reconcile` drops it on the next tick and
-    /// focus falls back. False for unknown ids.
-    pub fn close_window(&self, id: u64) -> bool {
+    /// focus falls back. False for unknown ids. Like `meta_window_delete`,
+    /// the request checks the window is alive.
+    pub fn close_window(&mut self, id: u64) -> bool {
         let Some(window) = self.windows.get(&id) else {
             return false;
         };
@@ -4940,11 +5070,12 @@ impl WindowManager {
             }
         }
         eprintln!("tuna-compositor: window {id} close requested");
+        self.check_alive(id);
         true
     }
 
     /// Close the focused window, if any.
-    pub fn close_focused(&self) -> bool {
+    pub fn close_focused(&mut self) -> bool {
         self.model.focused().is_some_and(|id| self.close_window(id))
     }
 
@@ -6715,58 +6846,25 @@ pub enum ManagerInput {
         /// Microseconds, the protocol's precision.
         utime: u64,
     },
-    /// Touchpad swipe gesture phases (#60). Three-finger swipes are
-    /// the shell's (overview, workspaces); others reach the client.
+    /// Touchpad swipe gesture phases (#60). Swipes of three or more
+    /// fingers are the shell's (overview, workspaces; see
+    /// [`crate::touchpad_swipe`]); others reach the client.
     SwipeBegin {
         fingers: u32,
         time: u32,
     },
     SwipeUpdate {
+        /// Accelerated, as clients receive it (pointer-gestures).
         delta: Point<f64, Logical>,
+        /// Unaccelerated, as GNOME's swipe trackers read it
+        /// (swipeTracker.js:142).
+        delta_unaccel: Point<f64, Logical>,
         time: u32,
     },
     SwipeEnd {
         cancelled: bool,
         time: u32,
     },
-}
-
-/// What a finished three-finger touchpad swipe does (GNOME 51).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SwipeAction {
-    /// Swipe up: open the overview.
-    OpenOverview,
-    /// Swipe down: close it.
-    CloseOverview,
-    /// Fingers move left: the next workspace slides in (content follows
-    /// the fingers, as on GNOME).
-    NextWorkspace,
-    /// Fingers move right: the previous workspace.
-    PreviousWorkspace,
-}
-
-/// Fingers GNOME reserves for its own swipes.
-pub const SHELL_SWIPE_FINGERS: u32 = 3;
-/// Distance a swipe must travel to act (logical pixels).
-pub const SWIPE_THRESHOLD: f64 = 100.0;
-
-/// Classify a finished swipe by its dominant axis; short swipes do
-/// nothing.
-pub fn swipe_action(dx: f64, dy: f64) -> Option<SwipeAction> {
-    if dx.abs().max(dy.abs()) < SWIPE_THRESHOLD {
-        return None;
-    }
-    Some(if dy.abs() >= dx.abs() {
-        if dy < 0.0 {
-            SwipeAction::OpenOverview
-        } else {
-            SwipeAction::CloseOverview
-        }
-    } else if dx < 0.0 {
-        SwipeAction::NextWorkspace
-    } else {
-        SwipeAction::PreviousWorkspace
-    })
 }
 
 /// X11 keycodes are kernel evdev numbers plus 8; the winit backend
@@ -7371,7 +7469,7 @@ impl WindowManager {
                     pointer.frame(state);
                 }
             }
-            ManagerInput::SwipeUpdate { delta, time } => {
+            ManagerInput::SwipeUpdate { delta, time, .. } => {
                 if let Some(pointer) = self.pointer.clone() {
                     pointer.gesture_swipe_update(
                         state,
@@ -7712,10 +7810,12 @@ impl WindowManager {
                     "tuna-compositor: workspace now {}",
                     self.model.active_workspace()
                 );
-                // GNOME's switcher popup, outside the overview.
-                if !self.overview_open {
-                    self.workspace_popups.push(self.workspace_popup());
-                }
+            }
+            // GNOME's switcher popup, outside the overview, even when the
+            // key cannot leave the first or last workspace
+            // (windowManager.js:1869-1880).
+            if !self.overview_open {
+                self.workspace_popups.push(self.workspace_popup());
             }
         } else if pressed
             && self.super_held
