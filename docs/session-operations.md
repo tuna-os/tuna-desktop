@@ -297,7 +297,7 @@ For measurements:
 - `frame_cost` in the `TUNA_COMPOSITOR_STATE` snapshot reports what the last
   frame drew and culled ([frame cost](testing.md#frame-cost)).
 - `scripts/tuna-stress` runs the bounded nested stress workload and records
-  memory and file descriptor growth ([bounded nested stress](testing.md#bounded-nested-stress)).
+  memory and file descriptor growth ([nested stress and torture suite](testing.md#nested-stress-and-torture-suite)).
 - [Actual guest endurance evidence](soak.md) describes the long-running VM
   soak.
 

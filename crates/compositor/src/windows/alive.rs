@@ -177,6 +177,12 @@ impl WindowManager {
         self.alive.checks.is_alive(id)
     }
 
+    /// Whether an alive check or a close dialog still names window `id`.
+    pub(super) fn alive_holds(&self, id: u64) -> bool {
+        self.alive.checks.tracked().any(|tracked| tracked == id)
+            || self.alive.placed.contains_key(&id)
+    }
+
     /// `ShowCloseDialog` / `HideCloseDialog` messages for the shell.
     pub fn take_close_dialogs(&mut self) -> Vec<Message> {
         std::mem::take(&mut self.alive.outbox)

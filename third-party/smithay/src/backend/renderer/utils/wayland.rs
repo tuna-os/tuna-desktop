@@ -23,7 +23,10 @@ use crate::{
 use std::{
     any::Any,
     collections::{hash_map::Entry, HashMap},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use super::{CommitCounter, DamageBag, DamageSet, DamageSnapshot, SurfaceView};
@@ -63,6 +66,9 @@ unsafe impl Sync for RendererSurfaceState {}
 #[derive(Debug)]
 struct InnerBuffer {
     buffer: WlBuffer,
+    /// `wl_buffer.release` already went out for the commit that attached this buffer
+    /// (see [`RendererSurfaceState::release_imported_shm_buffer`]).
+    released: AtomicBool,
     #[cfg(feature = "backend_drm")]
     acquire_point: Option<DrmSyncPoint>,
     #[cfg(feature = "backend_drm")]
@@ -74,6 +80,7 @@ struct InnerBuffer {
 impl Drop for InnerBuffer {
     #[inline]
     fn drop(&mut self) {
+
         #[cfg(feature = "backend_drm")]
         if let Some(release_point) = &self.release_point {
             let fences = self.release_fences.get_mut().unwrap();
@@ -88,7 +95,9 @@ impl Drop for InnerBuffer {
                 tracing::error!("Failed to release syncobj buffer safely: {}", err);
             }
         }
-        self.buffer.release();
+        if !*self.released.get_mut() {
+            self.buffer.release();
+        }
     }
 }
 
@@ -104,6 +113,7 @@ impl Buffer {
         Self {
             inner: Arc::new(InnerBuffer {
                 buffer,
+                released: AtomicBool::new(false),
                 #[cfg(feature = "backend_drm")]
                 acquire_point: None,
                 #[cfg(feature = "backend_drm")]
@@ -120,6 +130,7 @@ impl Buffer {
         Self {
             inner: Arc::new(InnerBuffer {
                 buffer,
+                released: AtomicBool::new(false),
                 acquire_point: Some(acquire_point),
                 release_point: Some(release_point),
                 release_fences: Mutex::default(),
@@ -256,22 +267,30 @@ impl RendererSurfaceState {
                 self.buffer_scale = attrs.buffer_scale;
                 self.buffer_transform = attrs.buffer_transform.into();
 
+                // An explicit-sync commit is a new buffer use with its own
+                // acquire and release points, even when the wl_buffer repeats.
                 #[cfg(feature = "backend_drm")]
                 let explicit = syncobj_state.acquire_point.is_some();
                 #[cfg(not(feature = "backend_drm"))]
                 let explicit = false;
-                if explicit || !self.buffer.as_ref().is_some_and(|b| b == buffer) {
-                    self.buffer = Some(Buffer {
-                        inner: Arc::new(InnerBuffer {
-                            buffer,
-                            #[cfg(feature = "backend_drm")]
-                            acquire_point: syncobj_state.acquire_point.take(),
-                            #[cfg(feature = "backend_drm")]
-                            release_point: syncobj_state.release_point.take(),
-                            #[cfg(feature = "backend_drm")]
-                            release_fences: Mutex::default(),
-                        }),
-                    });
+                match self.buffer.as_ref().filter(|b| !explicit && *b == buffer) {
+                    // The same buffer attached again: a release already sent was for
+                    // the previous commit, this one is owed its own.
+                    Some(held) => held.inner.released.store(false, Ordering::Relaxed),
+                    None => {
+                        self.buffer = Some(Buffer {
+                            inner: Arc::new(InnerBuffer {
+                                buffer,
+                                released: AtomicBool::new(false),
+                                #[cfg(feature = "backend_drm")]
+                                acquire_point: syncobj_state.acquire_point.take(),
+                                #[cfg(feature = "backend_drm")]
+                                release_point: syncobj_state.release_point.take(),
+                                #[cfg(feature = "backend_drm")]
+                                release_fences: Mutex::default(),
+                            }),
+                        });
+                    }
                 }
 
                 self.textures.clear();
@@ -412,6 +431,39 @@ impl RendererSurfaceState {
     /// Can be used to check if surface is mapped
     pub fn buffer(&self) -> Option<&Buffer> {
         self.buffer.as_ref()
+    }
+
+    /// Sends `wl_buffer.release` for the attached buffer now instead of when another
+    /// buffer replaces it, if it is a `wl_shm` buffer the renderer context `id` has
+    /// imported. Returns whether the release was sent.
+    ///
+    /// The imported texture is a copy, so the client may draw its next frame into the
+    /// same buffer, as it can under compositors that copy `wl_shm` buffers on commit
+    /// (Mutter, Weston's GL renderer, wlroots). The buffer stays attached: the surface
+    /// stays mapped and keeps drawing from the texture, and one release is sent for
+    /// each commit that attaches a buffer.
+    ///
+    /// Only for compositors that draw the surface with a single renderer context: any
+    /// other context would import pixels the client is already free to overwrite.
+    pub fn release_imported_shm_buffer<T>(&self, id: ContextId<T>) -> bool
+    where
+        T: Texture + 'static,
+    {
+        let Some(buffer) = self.buffer.as_ref() else {
+            return false;
+        };
+        if buffer.inner.released.load(Ordering::Relaxed)
+            || !self.textures.contains_key(&id.erased())
+            || !matches!(
+                crate::backend::renderer::buffer_type(buffer),
+                Some(crate::backend::renderer::BufferType::Shm)
+            )
+        {
+            return false;
+        }
+        buffer.inner.released.store(true, Ordering::Relaxed);
+        buffer.release();
+        true
     }
 
     /// Gets a reference to the texture for the specified renderer context

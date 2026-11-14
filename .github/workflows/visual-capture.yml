@@ -14,6 +14,8 @@ on:
         required: false
         default: ''
   pull_request:
+    # Draft pull requests skip the capture; marking one ready starts it.
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'scripts/tuna-visual-capture*'
       - 'scripts/lib/tuna-visual-*'
@@ -36,6 +38,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -140,7 +143,7 @@ jobs:
 
   manifest:
     needs: capture
-    if: always()
+    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

@@ -113,6 +113,7 @@ fn only_the_installed_portal_may_create_input_capture_sessions() {
                 to_loop,
                 signals: crate::dbus_signals::SignalQueue::new("test-input-capture-signals"),
                 next_id: Arc::new(AtomicU64::new(1)),
+                scan: Default::default(),
             },
         )
         .unwrap()

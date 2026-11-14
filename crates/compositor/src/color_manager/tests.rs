@@ -820,3 +820,67 @@ fn colord_absence_is_reported_not_fatal() {
     assert!(share.devices().is_empty());
     client.shutdown();
 }
+
+/// #503: the colord thread sleeps until something happens. An unchanged
+/// store is not scanned; a profile dropped into it is registered from its
+/// change event; and a symbolic link, whose target lives outside the
+/// watch, brings back the periodic scan that sees the target change.
+#[test]
+fn colord_thread_scans_the_store_on_change_events_not_on_a_timer() {
+    let bus = TestBus::spawn();
+    let (fake, _fake_conn) = serve_fake(&bus);
+    let icc_dir = tempfile::tempdir().unwrap();
+    let share = Arc::new(ColorShare::default());
+    // No EDID and no gamma LUT: the client writes no device profile into
+    // the store itself.
+    let client = ColordClient::start(
+        share.clone(),
+        vec![ColordMonitor {
+            identity: MonitorIdentity::new("HDMI-A-1", None, true, (0, 0), |_| None),
+            gamma_lut_size: 0,
+        }],
+        Bus::Address(bus.address.clone()),
+        Some(icc_dir.path().to_owned()),
+    );
+    wait_for("device ready", || {
+        share.device("HDMI-A-1").is_some_and(|d| d.ready)
+    });
+    let scans = || share.store_scans.load(Ordering::SeqCst);
+    let registered = |file: &Path| {
+        let name = file.display().to_string();
+        let state = fake.0.lock().unwrap();
+        state.profiles.iter().filter(|p| p.2 == name).count()
+    };
+
+    // Three periods of the 500 ms rescan this replaced: nothing is scanned.
+    let before = scans();
+    assert!(before >= 1, "the store is scanned at startup");
+    std::thread::sleep(Duration::from_millis(1600));
+    assert_eq!(scans(), before, "an unchanged store must not be scanned");
+
+    // A profile dropped into the store is registered from its change event.
+    let later = icc_dir.path().join("later.icc");
+    let mut late = icc::DisplayProfile::srgb();
+    late.description = "Later".to_owned();
+    std::fs::write(&later, late.encode().unwrap()).unwrap();
+    wait_for("later profile registered", || registered(&later) == 1);
+    assert!(scans() > before);
+
+    // A link's target changes where the watch cannot see it: the periodic
+    // scan returns and registers the rewritten target, as before.
+    let outside = tempfile::tempdir().unwrap();
+    let target = std::fs::canonicalize(outside.path())
+        .unwrap()
+        .join("linked.icc");
+    let mut linked = icc::DisplayProfile::srgb();
+    linked.description = "Linked".to_owned();
+    std::fs::write(&target, linked.encode().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, icc_dir.path().join("linked.icc")).unwrap();
+    wait_for("linked profile registered", || registered(&target) == 1);
+    linked.description = "Linked again".to_owned();
+    std::fs::write(&target, linked.encode().unwrap()).unwrap();
+    wait_for("rewritten link target registered", || {
+        registered(&target) == 2
+    });
+    client.shutdown();
+}

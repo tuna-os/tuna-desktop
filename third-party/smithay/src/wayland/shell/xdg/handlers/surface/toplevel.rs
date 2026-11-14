@@ -179,6 +179,11 @@ where
     ) {
         data.alive_tracker.destroy_notify();
         data.decoration.lock().unwrap().take();
+        // The xdg_dialog_v1 object's user data is this toplevel: holding it
+        // here past the toplevel's destruction is a reference cycle, which
+        // kept the wl_surface (and its textures) of every toplevel whose
+        // client never sent xdg_dialog_v1.destroy, e.g. one that exited.
+        data.dialog.lock().unwrap().take();
 
         if let Some(index) = state
             .xdg_shell_state()

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 if [ -z "${TUNA_REMOTE_BUS:-}" ]; then TUNA_REMOTE_BUS=1 exec dbus-run-session -- "$0"; fi
+# Every component writes to a log under /out, so a failed step used to end the
+# job without one line. Name the failing command or the expired wait here;
+# scripts/tuna-remote-security then prints the log tails.
+trap 'echo "remote-desktop-reference: line $LINENO: $BASH_COMMAND exited $?" >&2' ERR
+expired() { echo "remote-desktop-reference: deadline expired waiting for $1" >&2; exit 1; }
 export DISPLAY=:99 XDG_RUNTIME_DIR=/out/runtime XDG_CONFIG_HOME=/out/config XDG_DATA_HOME=/out/data XDG_STATE_HOME=/out/state
 export XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=GNOME GSETTINGS_BACKEND=memory LIBGL_ALWAYS_SOFTWARE=1 GTK_A11Y=atspi
 mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME/xdg-desktop-portal" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
@@ -29,7 +34,7 @@ dbus-update-activation-environment DISPLAY WAYLAND_DISPLAY GDK_BACKEND GTK_A11Y 
 export TUNA_COMPOSITOR_STATE=/out/compositor-state.json
 env -u WAYLAND_DISPLAY /candidate/usr/bin/tuna-compositor --backend winit --socket remote-proof --width 1280 --height 800 --shell-bin /candidate/usr/bin/tuna-shell-gtk >/out/compositor.log 2>&1 & pids="$pids $!"
 end=$((SECONDS + 30))
-until [ -S "$XDG_RUNTIME_DIR/remote-proof" ] && [ -s "$TUNA_COMPOSITOR_STATE" ]; do [ "$SECONDS" -lt "$end" ] || exit 1; sleep .1; done
+until [ -S "$XDG_RUNTIME_DIR/remote-proof" ] && [ -s "$TUNA_COMPOSITOR_STATE" ]; do [ "$SECONDS" -lt "$end" ] || expired 'the compositor socket and state file (30 s)'; sleep .1; done
 export WAYLAND_DISPLAY=remote-proof GDK_BACKEND=wayland
 python3 /repo/scripts/lib/tuna-remote-input-window.py /out/input.json >/out/window.log 2>&1 & pids="$pids $!"
 python3 /repo/scripts/lib/tuna-a11y-dump.py tuna-shell-gtk /out/a11y-shell.json 30
@@ -43,12 +48,15 @@ for decision in cancel grant eis disconnect; do
     python3 /repo/scripts/lib/tuna-portal-consent.py "/out/a11y-$decision.json" "$decision" remote
     wait "$client"
 done
-[ -s /out/grant.png ] && [ -s /out/disconnect.png ] && [ ! -f /out/cancel.png ]
+# One command each: `set -e` ignores every failure in an AND list but the last.
+[ -s /out/grant.png ]
+[ -s /out/disconnect.png ]
+[ ! -f /out/cancel.png ]
 # Losing the trusted backend process revokes the compositor grant itself.
 python3 /repo/scripts/lib/tuna-portal-remote-client.py /out/backend-disconnect.png backend-disconnect >/out/backend-disconnect.log 2>&1 & client=$!; pids="$pids $client"
 python3 /repo/scripts/lib/tuna-portal-consent.py /out/a11y-backend-disconnect.json grant remote
 end=$((SECONDS + 30))
-until [ -s /out/backend-disconnect.active ]; do [ "$SECONDS" -lt "$end" ] || exit 1; sleep .1; done
+until [ -s /out/backend-disconnect.active ]; do [ "$SECONDS" -lt "$end" ] || expired 'the backend-disconnect grant to become active (30 s)'; sleep .1; done
 kill "$portal_backend_pid"
 touch /out/backend-disconnect.revoke
 wait "$client"
@@ -59,12 +67,12 @@ sleep 2
 python3 /repo/scripts/lib/tuna-portal-remote-client.py /out/lock-grant.png revoke >/out/lock-grant.log 2>&1 & client=$!; pids="$pids $client"
 python3 /repo/scripts/lib/tuna-portal-consent.py /out/a11y-lock-grant.json grant remote
 end=$((SECONDS + 30))
-until [ -s /out/lock-grant.active ] && jq -e '.capture_streams > 0 and (.locked | not)' "$TUNA_COMPOSITOR_STATE" >/dev/null; do [ "$SECONDS" -lt "$end" ] || exit 1; sleep .1; done
+until [ -s /out/lock-grant.active ] && jq -e '.capture_streams > 0 and (.locked | not)' "$TUNA_COMPOSITOR_STATE" >/dev/null; do [ "$SECONDS" -lt "$end" ] || expired 'an active unlocked capture stream before the lock (30 s)'; sleep .1; done
 gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.SetActive true >/out/lock.log
 end=$((SECONDS + 5))
 touch /out/lock-grant.revoke
 wait "$client"
-until jq -e '.locked and .capture_streams == 0' "$TUNA_COMPOSITOR_STATE" >/dev/null; do [ "$SECONDS" -lt "$end" ] || exit 1; sleep .1; done
+until jq -e '.locked and .capture_streams == 0' "$TUNA_COMPOSITOR_STATE" >/dev/null; do [ "$SECONDS" -lt "$end" ] || expired 'the lock to revoke every capture stream (5 s)'; sleep .1; done
 python3 /repo/scripts/lib/tuna-remote-security-client.py > /out/locked-denial.log
 python3 /repo/scripts/lib/tuna-portal-remote-client.py /out/locked.png locked >/out/locked.log 2>&1 & client=$!; pids="$pids $client"
 sleep 2

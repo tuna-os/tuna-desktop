@@ -1,0 +1,14 @@
+2026-11-12T10:12:06.7766113Z tuna-vm-lane: V-LIFECYCLE-OWNER pass: root probe, non-root gdm-password session and three real app processes/surfaces
+2026-11-12T10:12:06.7768815Z tuna-vm-lane: V-BRIGHTNESS-CONTRACT pass: published guest predates the brightness contract; proven by the current-build marlin-vm lane
+2026-11-12T10:12:30.9158851Z tuna-vm-lane: G-DATETIME-NTP pass: NTP=yes service=active synchronized=yes provider=systemd-timesyncd
+2026-11-12T10:12:30.9159469Z tuna-vm-lane: G-DATETIME-TZ pass: UTC -> Pacific/Auckland observed, reverted to UTC and verified
+2026-11-12T10:12:30.9159960Z tuna-vm-lane: G-DATETIME-TZ-REJECT pass: Invalid/Zone rejected (exit=1), zone stayed UTC
+2026-11-12T10:12:30.9160384Z tuna-vm-lane: G-DATETIME-RTC pass: LocalRTC=no (); no RTC hardware claim
+2026-11-12T10:12:30.9160873Z tuna-vm-lane: G-DATETIME-CLOCK pass: panel 'Nov 12\u200210:12 AM' vs system epoch 1794478327 (UTC): delta 7s, tolerance 120s
+2026-11-12T10:12:30.9162521Z tuna-vm-lane: G-DATETIME-CLOCK-TZ FAIL: published panel capability unqualified/unsupported; an image that predates clock-change monitoring is not a pass: UTC -> Pacific/Auckland: panel 'Nov 12\u200210:12 AM' vs Pacific/Auckland wall time: delta 39583s, vs the unrepainted reading: 17s; 9 dump(s) over 10s (tolerance 120s, deadline 10s)
+2026-11-12T10:12:30.9164603Z tuna-vm-lane: G-DATETIME-MANUAL pass: systemd-timesyncd.service: SetTime while NTP on -> exit 1; NTP off; +7620s observed (delta -0.3615725040435791s); restored (delta 0.3943164348602295s), NTP=yes
+2026-11-12T10:12:30.9166664Z tuna-vm-lane: G-DATETIME-CLOCK-SET FAIL: published panel capability unqualified/unsupported; an image that predates clock-change monitoring is not a pass: SetTime +7620s: panel 'Nov 13\u2002\u20071:19 AM' vs UTC wall time: delta 39628s, vs the unrepainted reading: 32008s; 10 dump(s) over 11s (tolerance 120s, deadline 10s)
+2026-11-12T10:12:30.9169392Z tuna-vm-lane: G-DATETIME-POLKIT pass: tuna-test (not in wheel) non-interactive SetTimezone Pacific/Auckland: expected denied, refused ('Call failed: Access denied as the requested operation requires interactive authentication. However, interactive authentication has not been enabled by the calling program.'), zone stayed UTC
+2026-11-12T10:12:30.9171957Z tuna-vm-lane: G-DATETIME-NTP-ABSENT pass: systemd-timesyncd.service: stopped NTP=no/CanNTP=yes; masked NTP=no/CanNTP=no, SetNTP(true) 'Call failed: NTP not supported'; restored NTP=yes/CanNTP=yes
+2026-11-12T10:12:30.9173171Z tuna-vm-lane: V-LIFECYCLE FAIL: tour/lifecycle failed: Date & Time gates failed: G-DATETIME-CLOCK-TZ, G-DATETIME-CLOCK-SET
+2026-11-12T10:12:31.6138267Z tuna-vm-lane: FAILED G-DATETIME-CLOCK-SET, G-DATETIME-CLOCK-TZ, V-LIFECYCLE (after 30s of 900s)

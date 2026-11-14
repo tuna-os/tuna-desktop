@@ -89,6 +89,7 @@ mod auth_owner;
 mod background_blur;
 pub mod background_effect;
 mod bell;
+pub mod buffer_upload;
 pub mod capture_security;
 mod client_listener;
 pub mod clipboard_manager;
@@ -119,6 +120,7 @@ pub mod introspect;
 pub mod layer;
 pub mod lock;
 pub mod lockdown;
+pub(crate) mod lockdown_settings;
 mod logind_session;
 pub mod magnifier;
 pub mod malloc;
@@ -228,6 +230,9 @@ pub(crate) struct OutputEntry {
 pub struct State {
     /// Surface commits/destruction invalidate the pointer's scene pick.
     pub(crate) pointer_scene_dirty: bool,
+    /// Surface commits applied so far, whatever applied them: a client
+    /// request, or a refresh cycle releasing a held-back one.
+    pub(crate) commit_count: u64,
     pub(crate) window_icons: window_icons::WindowIcons,
     compositor_state: CompositorState,
     shm_state: ShmState,
@@ -285,6 +290,8 @@ pub struct State {
     /// (and through it the SHM pool mapping and fd) for every banner,
     /// overview toggle and other short-lived layer surface (#307).
     pub(crate) dead_layer_surfaces: std::collections::HashSet<ObjectId>,
+    /// Surfaces whose commits await their upload ([`buffer_upload`]).
+    pub(crate) committed: buffer_upload::Committed,
     /// Popup trees per parent surface (#88).
     pub(crate) popups: smithay::desktop::PopupManager,
     /// Popups holding an explicit grab, oldest first: an outside click
@@ -832,6 +839,7 @@ impl CompositorHandler for State {
                 Some(smithay::wayland::compositor::BufferAssignment::Removed)
             )
         });
+        self.commit_count = self.commit_count.wrapping_add(1);
         on_commit_buffer_handler::<State>(surface);
         if unmapped {
             smithay::wayland::xdg_foreign::XdgForeignHandler::foreign_toplevel_destroyed(
@@ -839,6 +847,7 @@ impl CompositorHandler for State {
             );
         }
         self.protocols.toplevel_drag.surface_committed(surface);
+        self.committed.push(surface);
         self.window_icons.commit(surface);
         self.popups.commit(surface);
         if let Some(smithay::desktop::PopupKind::Xdg(popup)) = self.popups.find_popup(surface) {
@@ -1277,11 +1286,13 @@ impl State {
             clipboard_manager: Default::default(),
             panel_surfaces: Vec::new(),
             dead_layer_surfaces: std::collections::HashSet::new(),
+            committed: Default::default(),
             popups: smithay::desktop::PopupManager::default(),
             popup_grab: Vec::new(),
             popup_refocus: false,
             window_origins: std::collections::HashMap::new(),
             pointer_scene_dirty: true,
+            commit_count: 0,
             initial_outputs: std::collections::HashMap::new(),
             outputs: Vec::new(),
             retired_output_globals: Vec::new(),

@@ -319,6 +319,10 @@ pub struct ColorShare {
     generation: AtomicU64,
     wake: crate::wake::Wake,
     next_session: AtomicU64,
+    /// ICC store scans so far, counted to show the colord thread sleeps
+    /// while the store is unchanged.
+    #[cfg(test)]
+    store_scans: AtomicU64,
 }
 
 impl ColorShare {
@@ -782,7 +786,139 @@ pub enum Bus {
 enum Event {
     DeviceChanged(String),
     ColordOwner(bool),
+    /// Something in the ICC store was written, renamed, touched or removed.
+    StoreChanged,
+    /// The store's directory went away: its changes no longer arrive.
+    StoreUnwatched,
     Shutdown,
+}
+
+/// How often the colord thread looks at an ICC store whose changes do not
+/// all arrive as events (see [`StoreWatch`]); also the longest a burst of
+/// store events is gathered before the scan it asks for.
+const STORE_RESCAN: Duration = Duration::from_millis(500);
+/// A store quiet for this long has finished the write that changed it.
+const STORE_SETTLE: Duration = Duration::from_millis(100);
+
+/// The ICC store as an event source (#503), as Mutter's colour store
+/// monitors its directory: an inotify watch whose events one thread
+/// forwards as [`Event::StoreChanged`], one per burst of writes, for as
+/// long as the colord thread keeps this.
+struct StoreWatch {
+    /// Closing it ends the forwarder.
+    _stop: std::os::unix::net::UnixStream,
+}
+
+/// How a wait on the store's watch ended.
+enum StoreWait {
+    Changed,
+    Quiet,
+    /// The directory was removed, renamed or unmounted.
+    Lost,
+    /// The colord thread dropped its [`StoreWatch`].
+    Stopped,
+}
+
+impl StoreWatch {
+    /// Watch `dir`. `None` when the directory cannot report its changes
+    /// (no inotify, or a filesystem other hosts write to): the colord
+    /// thread keeps scanning it every [`STORE_RESCAN`].
+    fn start(dir: &Path, tx: std::sync::mpsc::Sender<Event>) -> Option<Self> {
+        use rustix::fs::inotify;
+        if !crate::wake::inotify_reliable(dir) {
+            return None;
+        }
+        let watch =
+            inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK).ok()?;
+        inotify::add_watch(
+            &watch,
+            dir,
+            inotify::WatchFlags::CLOSE_WRITE
+                | inotify::WatchFlags::MODIFY
+                | inotify::WatchFlags::ATTRIB
+                | inotify::WatchFlags::MOVED_TO
+                | inotify::WatchFlags::MOVED_FROM
+                | inotify::WatchFlags::CREATE
+                | inotify::WatchFlags::DELETE
+                | inotify::WatchFlags::DELETE_SELF
+                | inotify::WatchFlags::MOVE_SELF,
+        )
+        .ok()?;
+        let (stop, stopped) = std::os::unix::net::UnixStream::pair().ok()?;
+        std::thread::Builder::new()
+            .name("tuna-colord-store".into())
+            .spawn(move || loop {
+                match Self::wait(&watch, &stopped, None) {
+                    StoreWait::Changed => {}
+                    StoreWait::Quiet => continue,
+                    StoreWait::Lost => {
+                        let _ = tx.send(Event::StoreUnwatched);
+                        return;
+                    }
+                    StoreWait::Stopped => return,
+                }
+                // A file being written arrives as a burst: one scan once
+                // it is quiet, no later than the rescan this watch
+                // replaces would have looked.
+                let burst = std::time::Instant::now();
+                while burst.elapsed() + STORE_SETTLE < STORE_RESCAN {
+                    match Self::wait(&watch, &stopped, Some(STORE_SETTLE)) {
+                        StoreWait::Changed => {}
+                        StoreWait::Quiet => break,
+                        StoreWait::Lost => {
+                            let _ = tx.send(Event::StoreUnwatched);
+                            return;
+                        }
+                        StoreWait::Stopped => return,
+                    }
+                }
+                if tx.send(Event::StoreChanged).is_err() {
+                    return;
+                }
+            })
+            .ok()?;
+        Some(Self { _stop: stop })
+    }
+
+    /// Block until the watch has events (drained here), `timeout` passes
+    /// (`None`: never) or the other end of `stopped` closes.
+    fn wait(
+        watch: &std::os::fd::OwnedFd,
+        stopped: &std::os::unix::net::UnixStream,
+        timeout: Option<Duration>,
+    ) -> StoreWait {
+        use rustix::event::{PollFd, PollFlags};
+        use rustix::fs::inotify;
+        loop {
+            let mut fds = [
+                PollFd::new(watch, PollFlags::IN),
+                PollFd::new(stopped, PollFlags::IN),
+            ];
+            match crate::wake::poll_fds(&mut fds, timeout) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return StoreWait::Lost,
+                Ok(_) if !fds[1].revents().is_empty() => return StoreWait::Stopped,
+                Ok(0) => return StoreWait::Quiet,
+                Ok(_) => {}
+            }
+            let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
+            let mut events = inotify::Reader::new(watch, &mut buf);
+            let mut lost = false;
+            while let Ok(event) = events.next() {
+                lost |= event.events().intersects(
+                    inotify::ReadFlags::DELETE_SELF
+                        | inotify::ReadFlags::MOVE_SELF
+                        | inotify::ReadFlags::IGNORED
+                        | inotify::ReadFlags::UNMOUNT,
+                );
+            }
+            return if lost {
+                StoreWait::Lost
+            } else {
+                StoreWait::Changed
+            };
+        }
+    }
 }
 
 /// Handle to the colord thread; dropping it leaves the thread running
@@ -833,6 +969,11 @@ struct Colord {
     owned_profiles: HashMap<String, String>,
     /// Store files already registered, with (len, mtime) when seen.
     store_seen: HashMap<PathBuf, (u64, Option<std::time::SystemTime>)>,
+    /// The store's change events, when it can report them.
+    store_watch: Option<StoreWatch>,
+    /// The last scan met a symbolic link: its target lives outside the
+    /// watch, so only a scan sees it change.
+    store_links: bool,
     devices: Vec<Registered>,
 }
 
@@ -880,13 +1021,15 @@ fn run(
         return;
     }
     share.set_status(ColordStatus::Connected);
-    spawn_signal_forwarders(&conn, tx);
+    spawn_signal_forwarders(&conn, tx.clone());
     let mut colord = Colord {
         conn,
         share,
         icc_dir,
         owned_profiles: HashMap::new(),
         store_seen: HashMap::new(),
+        store_watch: None,
+        store_links: false,
         devices: monitors
             .into_iter()
             .map(|monitor| Registered {
@@ -900,11 +1043,21 @@ fn run(
         if let Err(e) = std::fs::create_dir_all(dir) {
             eprintln!("tuna-compositor: colour: Failed to monitor ICC directory: {e}");
         }
+        // Watched before the first scan, so nothing lands between them.
+        colord.store_watch = StoreWatch::start(dir, tx);
     }
     colord.scan_store();
     colord.register_all();
     loop {
-        match rx.recv_timeout(Duration::from_millis(500)) {
+        // The thread sleeps until something happens (#503); a store that
+        // cannot report every change is still scanned on its old period.
+        let event = match colord.store_rescan() {
+            Some(rescan) => rx.recv_timeout(rescan),
+            None => rx
+                .recv()
+                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+        };
+        match event {
             Ok(Event::DeviceChanged(path)) => colord.device_changed(&path),
             Ok(Event::ColordOwner(true)) => {
                 // colord restarted: every temp-scope object is gone.
@@ -924,7 +1077,13 @@ fn run(
                 colord.delete_all();
                 return;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => colord.scan_store(),
+            Ok(Event::StoreUnwatched) => {
+                colord.store_watch = None;
+                colord.scan_store();
+            }
+            Ok(Event::StoreChanged) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                colord.scan_store()
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
@@ -1173,15 +1332,26 @@ impl Colord {
         })
     }
 
+    /// How long the thread may sleep without looking at the store:
+    /// without limit when every change to it arrives as an event.
+    fn store_rescan(&self) -> Option<Duration> {
+        let reported = self.store_watch.is_some() && !self.store_links;
+        (self.icc_dir.is_some() && !reported).then_some(STORE_RESCAN)
+    }
+
     /// Scan the ICC directory for profiles not yet registered.
     fn scan_store(&mut self) {
         let Some(dir) = self.icc_dir.clone() else {
             return;
         };
+        #[cfg(test)]
+        self.share.store_scans.fetch_add(1, Ordering::SeqCst);
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return;
         };
+        self.store_links = false;
         for entry in entries.flatten() {
+            self.store_links |= !entry.file_type().is_ok_and(|kind| !kind.is_symlink());
             let path = entry.path();
             // Symlinks register their target, as Mutter's store does.
             let target = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());

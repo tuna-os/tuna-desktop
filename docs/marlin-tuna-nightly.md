@@ -21,10 +21,12 @@ login.
 Since tunaOS#3438 (2026-10-20) the published flavor logs in through stock
 GDM: it ships no greetd, gtkgreet or `/etc/greetd` files. The fixture
 provisions the public `tuna-test` account and adds QEMU guest agent probes,
-a count-only GTK input client, Disks and System Monitor for the existing
-application tour, plus serial capture. Its AccountsService record only
-lists the account in GDM's user list; it names no session, so the shipped
-image alone decides which session starts. GDM 51.1 starts a Wayland session
+a count-only GTK input client, the lifecycle's brightness, Date & Time and
+Orca focus/speech probes (the same helpers as the current-build fixture),
+Disks and System Monitor for the existing application tour, plus serial
+capture. Its AccountsService record only lists the account in GDM's user
+list; it names no session, so the shipped image alone decides which session
+starts. GDM 51.1 starts a Wayland session
 without a login shell and imports the systemd user environment, so the
 introspection path comes from the account's `environment.d`; session output
 reaches the journal through GDM's own `gdm-wayland-session` stream. An

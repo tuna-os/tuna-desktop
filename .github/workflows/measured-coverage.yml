@@ -1,6 +1,9 @@
 name: Measured test coverage
 on:
   pull_request:
+    # Draft pull requests skip the coverage run (about 25 hosted minutes);
+    # marking one ready starts it, and every push to main still runs it.
+    types: [opened, synchronize, reopened, ready_for_review]
     paths: ['crates/**', 'Cargo.*', 'tests/coverage-floors.json', 'scripts/tuna-coverage-report', 'scripts/tuna-security-artifacts', 'scripts/tuna-test-strategy', 'scripts/lib/tuna-coverage-tests.py', 'scripts/lib/tuna-security-artifact-tests.py', '.github/workflows/measured-coverage.yml', '.github/actions/ci-tool/**', 'scripts/ci-install-gtk4-layer-shell']
   push:
     branches: [main]
@@ -16,6 +19,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 jobs:
   coverage:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

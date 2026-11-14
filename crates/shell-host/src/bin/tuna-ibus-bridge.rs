@@ -157,24 +157,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     queue.roundtrip(&mut bridge)?;
     eprintln!("tuna-ibus-bridge: ready");
 
-    // The Wayland socket drives the loop; GLib (IBus's signals) runs
-    // between reads, at least every 50 ms.
+    // The Wayland socket and GLib (IBus's signals, the bus closing) drive
+    // the loop together; it sleeps until one of them has something, or
+    // until a look for a departed IBus is due.
+    let main = glib::MainContext::default();
+    let _owner = main.acquire()?;
     loop {
         queue.flush()?;
         if let Some(guard) = queue.prepare_read() {
-            let wayland_fd = guard.connection_fd();
-            let mut fds = [rustix::event::PollFd::new(
-                &wayland_fd,
-                rustix::event::PollFlags::IN,
-            )];
-            rustix::event::poll(
-                &mut fds,
-                Some(&rustix::event::Timespec {
-                    tv_sec: 0,
-                    tv_nsec: 50_000_000,
-                }),
-            )?;
-            if fds[0].revents().contains(rustix::event::PollFlags::IN) {
+            let limit = bridge
+                .ibus_retry
+                .map(|(at, _)| at.saturating_duration_since(Instant::now()));
+            if wait(&main, guard.connection_fd(), limit)? {
                 let _ = guard.read();
             }
         }
@@ -188,6 +182,97 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     }
+}
+
+/// One `poll` over the Wayland socket and the descriptors of GLib's
+/// default context (which `main` must be acquired for), with GLib's own
+/// timeout capped at `limit`, then GLib's dispatch: the external-loop
+/// recipe of GLib's documentation (`g_main_context_prepare`, `query`,
+/// `check`, `dispatch`). An IBus signal or the bus closing wakes GLib's
+/// descriptors, so nothing but an event or `limit` ends the wait; the
+/// loop used to wake every 50 ms to look (#503). Returns whether the
+/// socket has something to read (or hung up).
+fn wait(
+    main: &glib::MainContext,
+    wayland: std::os::fd::BorrowedFd<'_>,
+    limit: Option<Duration>,
+) -> rustix::io::Result<bool> {
+    use glib::ffi;
+    use glib::translate::ToGlibPtr;
+    use rustix::event::{PollFd, PollFlags, Timespec};
+    let context: *mut ffi::GMainContext = main.to_glib_none().0;
+    let mut priority = 0;
+    let mut timeout_ms = -1;
+    let mut fds: Vec<ffi::GPollFD> = Vec::new();
+    // SAFETY: the caller owns `main` (acquired); `fds` holds as many
+    // entries as `query` is told, and GLib writes no more than that.
+    unsafe {
+        ffi::g_main_context_prepare(context, &mut priority);
+        loop {
+            let capacity = fds.len();
+            let needed = ffi::g_main_context_query(
+                context,
+                priority,
+                &mut timeout_ms,
+                fds.as_mut_ptr(),
+                capacity as std::ffi::c_int,
+            ) as usize;
+            if needed <= capacity {
+                fds.truncate(needed);
+                break;
+            }
+            fds.resize(
+                needed,
+                ffi::GPollFD {
+                    fd: -1,
+                    events: 0,
+                    revents: 0,
+                },
+            );
+        }
+    }
+    let glib_timeout = u64::try_from(timeout_ms).ok().map(Duration::from_millis);
+    let timeout = match (glib_timeout, limit) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let timeout = timeout.map(|t| Timespec {
+        tv_sec: t.as_secs().try_into().unwrap_or(i64::MAX),
+        tv_nsec: t.subsec_nanos().into(),
+    });
+    let mut polls = Vec::with_capacity(fds.len() + 1);
+    polls.push(PollFd::from_borrowed_fd(wayland, PollFlags::IN));
+    for fd in &fds {
+        // SAFETY: GLib's descriptors stay open until the dispatch below.
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd.fd) };
+        polls.push(PollFd::from_borrowed_fd(
+            borrowed,
+            PollFlags::from_bits_retain(fd.events),
+        ));
+    }
+    match rustix::event::poll(&mut polls, timeout.as_ref()) {
+        Ok(_) => {}
+        Err(rustix::io::Errno::INTR) => polls.iter_mut().for_each(|p| p.clear_revents()),
+        Err(e) => return Err(e),
+    }
+    for (fd, poll) in fds.iter_mut().zip(&polls[1..]) {
+        fd.revents = poll.revents().bits();
+    }
+    // SAFETY: as above; `fds` carries the revents of this poll.
+    unsafe {
+        if ffi::g_main_context_check(
+            context,
+            priority,
+            fds.as_mut_ptr(),
+            fds.len() as std::ffi::c_int,
+        ) != 0
+        {
+            ffi::g_main_context_dispatch(context);
+        }
+    }
+    Ok(polls[0]
+        .revents()
+        .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR))
 }
 
 /// A connection to the IBus bus at `address`.
@@ -1021,5 +1106,50 @@ mod tests {
         assert_eq!(args.child_value(1).str(), Some("ContentType"));
         let value = args.child_value(2).as_variant().unwrap();
         assert_eq!(value.get::<(u32, u32)>(), Some((8, 2048)));
+    }
+
+    /// #503: the loop sleeps until the Wayland socket or GLib has
+    /// something (the old loop woke every 50 ms): with neither, a wait
+    /// lasts its whole limit; a readable socket ends it at once; work
+    /// queued on GLib's context from another thread, as GDBus's worker
+    /// queues IBus's signals, ends it and is dispatched.
+    #[test]
+    fn the_loop_sleeps_until_the_socket_or_glib_has_something() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let context = glib::MainContext::new();
+        let _owner = context.acquire().unwrap();
+        let (mut wayland, mut compositor) = std::os::unix::net::UnixStream::pair().unwrap();
+
+        let started = Instant::now();
+        assert!(!wait(&context, wayland.as_fd(), Some(Duration::from_millis(300))).unwrap());
+        assert!(
+            started.elapsed() >= Duration::from_millis(290),
+            "an idle wait lasts its limit: {:?}",
+            started.elapsed()
+        );
+
+        compositor.write_all(b"x").unwrap();
+        let started = Instant::now();
+        assert!(wait(&context, wayland.as_fd(), None).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        wayland.read_exact(&mut [0]).unwrap();
+
+        let delivered = Arc::new(AtomicBool::new(false));
+        let (remote, flag) = (context.clone(), delivered.clone());
+        let signal = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            remote.invoke(move || flag.store(true, Ordering::SeqCst));
+        });
+        let started = Instant::now();
+        while !delivered.load(Ordering::SeqCst) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "GLib never woke the wait"
+            );
+            assert!(!wait(&context, wayland.as_fd(), Some(Duration::from_secs(5))).unwrap());
+        }
+        signal.join().unwrap();
     }
 }

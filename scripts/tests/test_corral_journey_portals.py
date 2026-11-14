@@ -266,31 +266,34 @@ class CanonicalCallerTests(unittest.TestCase):
 class ConsentVisibilityTests(unittest.TestCase):
     def consent(self, active=False, error=None, stale=False, expired=False):
         action = Mock()
-        button = SimpleNamespace(name='Share', childCount=0,
-                                 getRoleName=lambda: 'push button',
-                                 getState=lambda: SimpleNamespace(contains=lambda state: True),
-                                 queryAction=lambda: action)
+        button = SimpleNamespace(get_name=lambda: 'Share', get_child_count=lambda: 0,
+                                 get_role_name=lambda: 'push button',
+                                 get_state_set=lambda: SimpleNamespace(contains=lambda state: True),
+                                 get_action_iface=lambda: action)
         buttons = [button]
         if stale:
-            buttons.insert(0, SimpleNamespace(name='Allow', childCount=0,
-                getRoleName=lambda: 'push button',
-                getState=lambda: SimpleNamespace(contains=lambda state: True),
-                queryAction=lambda: action.stale))
-        app = SimpleNamespace(name='xdg-desktop-portal-gnome', childCount=len(buttons),
-                              getRoleName=lambda: 'application',
-                              getState=lambda: SimpleNamespace(contains=lambda state: False),
-                              getChildAtIndex=lambda index: buttons[index])
-        desktop = SimpleNamespace(childCount=1, getChildAtIndex=lambda index: app)
-        pyatspi = SimpleNamespace(Registry=SimpleNamespace(getDesktop=lambda index: desktop),
-                                  STATE_SHOWING=1, STATE_SENSITIVE=2)
+            buttons.insert(0, SimpleNamespace(get_name=lambda: 'Allow', get_child_count=lambda: 0,
+                get_role_name=lambda: 'push button',
+                get_state_set=lambda: SimpleNamespace(contains=lambda state: True),
+                get_action_iface=lambda: action.stale))
+        app = SimpleNamespace(get_name=lambda: 'xdg-desktop-portal-gnome', get_child_count=lambda: len(buttons),
+                              get_role_name=lambda: 'application',
+                              get_state_set=lambda: SimpleNamespace(contains=lambda state: False),
+                              get_child_at_index=lambda index: buttons[index])
+        desktop = SimpleNamespace(get_child_count=lambda: 1, get_child_at_index=lambda index: app)
+        atspi = SimpleNamespace(get_desktop=lambda index: desktop,
+                                StateType=SimpleNamespace(SHOWING=1, SENSITIVE=2, CHECKED=3))
         bus = Mock()
         bus.call_sync.return_value.unpack.return_value = (active,)
         bus.call_sync.side_effect = error
         gio = SimpleNamespace(bus_get_sync=lambda *args: bus, BusType=SimpleNamespace(SESSION=0),
                               DBusCallFlags=SimpleNamespace(NONE=0))
+        gi = ModuleType('gi')
+        gi.require_version = Mock()
         repository = ModuleType('gi.repository')
-        repository.Gio, repository.GLib = gio, SimpleNamespace()
-        modules = {'pyatspi': pyatspi, 'gi': ModuleType('gi'), 'gi.repository': repository}
+        repository.Atspi, repository.Gio, repository.GLib = atspi, gio, SimpleNamespace()
+        # pyatspi is absent on published images (Orca 51 dropped python-atspi).
+        modules = {'pyatspi': None, 'gi': gi, 'gi.repository': repository}
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / 'tree.json'
             exit_path = Path(tmp) / 'requester.exit'
@@ -311,32 +314,32 @@ class ConsentVisibilityTests(unittest.TestCase):
         self.assertIsInstance(result, RuntimeError)
         self.assertIn('hidden by a locked session', str(result))
         self.assertTrue(tree[-1]['showing'], 'regression: AT-SPI still marks the hidden button showing')
-        action.doAction.assert_not_called()
+        action.do_action.assert_not_called()
         self.assertEqual(bus.call_sync.call_args.args[3], 'GetActive')
 
     def test_unlocked_visible_share_uses_the_actual_action(self):
         action, _, result, _ = self.consent(active=False)
         self.assertIsInstance(result, SystemExit)
         self.assertEqual(result.code, 0)
-        action.doAction.assert_called_once_with(0)
+        action.do_action.assert_called_once_with(0)
 
     def test_lock_query_failure_never_grants_consent(self):
         action, _, result, _ = self.consent(error=RuntimeError('bus unavailable'))
         self.assertIn('bus unavailable', str(result))
-        action.doAction.assert_not_called()
+        action.do_action.assert_not_called()
 
     def test_screencast_never_activates_a_stale_screenshot_allow(self):
         action, _, result, _ = self.consent(stale=True)
         self.assertIsInstance(result, SystemExit)
         self.assertEqual(result.code, 0)
-        action.doAction.assert_called_once_with(0)
-        action.stale.doAction.assert_not_called()
+        action.do_action.assert_called_once_with(0)
+        action.stale.do_action.assert_not_called()
 
     def test_exited_requester_never_activates_any_accessible_picker(self):
         action, bus, result, _ = self.consent(expired=True)
         self.assertIsInstance(result, RuntimeError)
         self.assertIn('refusing a stale portal picker', str(result))
-        action.doAction.assert_not_called()
+        action.do_action.assert_not_called()
         bus.call_sync.assert_not_called()
 
 

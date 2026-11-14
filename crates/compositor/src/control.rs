@@ -373,8 +373,8 @@ pub struct Session<'a> {
     switcher_thumbnails: Option<Vec<tuna_shell_control::SwitcherThumbnail>>,
     /// The shell's switcher keys, until the runtime drains them.
     switcher_keys: Option<Vec<tuna_shell_control::SwitcherKey>>,
-    /// Administrative lockdown (#357): the hub's policy at accept,
-    /// refreshed onto every session by [`ControlHub::refresh_lockdown`].
+    /// Administrative lockdown (#357): the hub's policy at accept, pushed
+    /// onto every session by [`ControlHub::set_lock_screen_disabled`].
     /// `Lock` commands consult it; a restrictive key denies them with
     /// the administrator's reason instead of engaging the lock.
     lockdown: LockdownPolicy,
@@ -1674,6 +1674,9 @@ pub struct PollOutcome {
     pub switcher_keys: Option<Vec<tuna_shell_control::SwitcherKey>>,
     /// On-screen keyboard input to type, in order (#349).
     pub osk_inputs: Vec<tuna_shell_control::OskInput>,
+    /// Something arrived on the hub's sockets this round: a peer, a frame
+    /// or a hang-up. The runtime's idle tick draws only then (#503).
+    pub received: bool,
 }
 
 /// What GNOME's on-screen keyboard follows, as broadcast to the shell
@@ -1759,13 +1762,6 @@ pub fn is_private_dir(dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Bound on concurrent background lockdown readers (#357 fd3): one slow
-/// backend may overlap one fresh poll, but a hung backend never stacks a
-/// thread per tick. Production ticks 2 s apart with a 500 ms reader bound,
-/// so steady state holds one; the headroom keeps a slow poll from
-/// suppressing its successor.
-const LOCKDOWN_MAX_READERS: usize = 2;
-
 /// Live control-plane driver: accepts shell connections, handshakes them
 /// into [`Session`]s against one [`TokenStore`], emits deltas, and applies
 /// commands — one nonblocking round per [`poll`](Self::poll), so slow or
@@ -1799,25 +1795,14 @@ pub struct ControlHub {
     /// the runtime (idle timeout) or `Lock` commands, shared with every
     /// live session so snapshots carry it; the shell never owns it.
     locked: std::rc::Rc<std::cell::Cell<bool>>,
-    /// Administrative lockdown (#357): read live at bind, refreshed by
-    /// [`ControlHub::refresh_lockdown`], pushed onto every session so
-    /// `Lock` commands deny under a restrictive key. Only the lock key
-    /// is live here; the shell owns the rest of the surface.
+    /// Administrative lockdown (#357): read live at bind, then followed
+    /// through [`ControlHub::set_lock_screen_disabled`], pushed onto
+    /// every session so `Lock` commands deny under a restrictive key.
+    /// Only the lock key is live here; the shell owns the rest of the
+    /// surface.
     lockdown: LockdownPolicy,
     /// Pads (id, device node) the shell's `RequestPadOsd` may name.
     pad_targets: std::rc::Rc<Vec<(u32, String)>>,
-    /// Background policy reads (#357 follow-up): each refresh spawns
-    /// one reader thread reporting here (up to
-    /// [`LOCKDOWN_MAX_READERS`] concurrent); the tick drains
-    /// completed results without waiting, so a hung backend never
-    /// stalls it.
-    lockdown_tx: std::sync::mpsc::Sender<Option<bool>>,
-    lockdown_rx: std::sync::mpsc::Receiver<Option<bool>>,
-    /// Readers currently running (#357 fd3): refreshes while this many
-    /// run skip spawning (single-flight bound), so a hung backend
-    /// cannot stack a thread per tick; the drain still applies every
-    /// landed result with last-valid-wins.
-    lockdown_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Alt-Tab drive events awaiting broadcast. Unlike the overview
     /// intent (level), steps are discrete events: each one is sent to
     /// every live session exactly once, retained until all sends land.
@@ -1915,8 +1900,6 @@ impl ControlHub {
                 None
             }
         });
-        let (lockdown_tx, lockdown_rx) = std::sync::mpsc::channel();
-        let lockdown_inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Ok(Self {
             listener,
             readiness,
@@ -1930,9 +1913,6 @@ impl ControlHub {
             locked: std::rc::Rc::new(std::cell::Cell::new(false)),
             lockdown,
             pad_targets: std::rc::Rc::default(),
-            lockdown_tx,
-            lockdown_rx,
-            lockdown_inflight,
             switcher_queue: Vec::new(),
             switcher_thumbnails_owner: None,
             accelerator_queue: Vec::new(),
@@ -2282,52 +2262,22 @@ impl ControlHub {
         }
     }
 
-    /// Poll the live `disable-lock-screen` key without blocking: drain
-    /// completed background reads (last valid wins; unreadable keeps the
-    /// cached value, never resets) and spawn the next reader unless
-    /// enough already run. The runtime calls this on a slow tick; a hung
-    /// backend never stalls it, and the shell enforces its own surface
-    /// immediately, so this backstop's lag fails safe.
-    pub fn refresh_lockdown(&mut self) {
-        self.refresh_lockdown_with(crate::lockdown::read_lock_screen_key);
+    /// Apply a live read of `disable-lock-screen` (#357): the hub's policy
+    /// and every session's follow it, the other keys keep their values.
+    /// The runtime calls this with each value its settings watch delivers
+    /// (`lockdown_settings`); an unreadable key delivers nothing, so the
+    /// cached policy holds and never resets. The shell enforces its own
+    /// surface immediately, so this backstop fails safe.
+    pub fn set_lock_screen_disabled(&mut self, disabled: bool) {
+        self.set_lockdown_policy(LockdownPolicy {
+            disable_lock_screen: disabled,
+            ..self.lockdown
+        });
     }
 
-    /// [`refresh_lockdown`](Self::refresh_lockdown) with an injectable
-    /// reader. Tests pass a hung double to prove the tick stays bounded;
-    /// production reads the live key on the background thread.
-    pub fn refresh_lockdown_with(
-        &mut self,
-        reader: impl FnOnce() -> Option<bool> + Send + 'static,
-    ) {
-        // Last-valid-wins: overlapping readers land delayed results as one
-        // batch, and a trailing unreadable result must not wipe the live
-        // restriction (or restoration) the batch's valid result carries.
-        if let Some(value) = self.lockdown_rx.try_iter().flatten().last() {
-            self.lockdown
-                .refresh(&|key| (key == crate::lockdown::KEY_DISABLE_LOCK_SCREEN).then_some(value));
-            for session in &mut self.sessions {
-                session.set_lockdown_policy(self.lockdown);
-            }
-        }
-        // Single-flight bound: skip spawning while enough readers run, so
-        // a hung backend cannot stack a thread per tick. The drain above
-        // still runs, so landed results always apply.
-        if self
-            .lockdown_inflight
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            >= LOCKDOWN_MAX_READERS
-        {
-            self.lockdown_inflight
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            return;
-        }
-        let tx = self.lockdown_tx.clone();
-        let inflight = self.lockdown_inflight.clone();
-        std::thread::spawn(move || {
-            let result = reader();
-            let _ = tx.send(result);
-            inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        });
+    /// The hub's lockdown policy, as its sessions hold it.
+    pub fn lockdown_policy(&self) -> LockdownPolicy {
+        self.lockdown
     }
 
     /// The pads a `RequestPadOsd` may name: id and device node.
@@ -2415,7 +2365,9 @@ impl ControlHub {
     pub fn poll(&mut self, model: &mut StateModel) -> PollOutcome {
         let locked_before = self.locked.get();
         let uid = our_uid();
+        let mut received = false;
         while let Ok((stream, _)) = self.listener.accept() {
+            received = true;
             let cred = peer_cred(&stream);
             if !self.gate.admits(cred, uid) || self.pending_count() >= MAX_PENDING_PEERS {
                 // Dropping the stream closes it: the peer sees EOF
@@ -2446,6 +2398,7 @@ impl ControlHub {
                 self.session_peers.swap_remove(i);
             }
         }
+        received |= !self.pending.is_empty();
         self.advance_pending(model);
         self.pending = std::mem::take(&mut self.fresh);
         self.pending_peers = std::mem::take(&mut self.fresh_peers);
@@ -2459,7 +2412,10 @@ impl ControlHub {
                 let deltas_ok = session.emit_deltas(model).is_ok();
                 session.pad_targets = self.pad_targets.clone();
                 let cmd_ok = match session.handle_next(model) {
-                    Ok(_) => true,
+                    Ok(_) => {
+                        received = true;
+                        true
+                    }
                     Err(ControlError::WouldBlock) => true,
                     Err(_) => false,
                 };
@@ -2586,6 +2542,7 @@ impl ControlHub {
             if alive {
                 i += 1;
             } else {
+                received = true;
                 self.sessions.swap_remove(i);
                 self.session_peers.swap_remove(i);
             }
@@ -2605,6 +2562,7 @@ impl ControlHub {
             self.cancel_pending_accelerators();
         }
         self.broadcast();
+        outcome.received = received;
         outcome
     }
 

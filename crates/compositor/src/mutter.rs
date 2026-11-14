@@ -891,6 +891,7 @@ struct ScreenCast {
     to_loop: calloop::channel::Sender<ToLoop>,
     signals: crate::dbus_signals::SignalQueue,
     next_id: Arc<AtomicU64>,
+    scan: Arc<ScanWake>,
 }
 
 /// A session's streams with their D-Bus interface handles.
@@ -1074,6 +1075,7 @@ impl ScreenCast {
             .lock()
             .map_err(|_| fdo::Error::Failed("session registry unavailable".into()))?
             .push((session, path.clone()));
+        self.scan.notify();
         Ok(path)
     }
 
@@ -1484,6 +1486,55 @@ impl CastSignals {
 /// (fail closed) rather than stalling every other revocation (#657).
 const OWNER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The revocation scan's period while any session, grant or capture
+/// exists.
+const SCAN_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Ends the revocation scan's wait (#503): a session, grant or capture
+/// was created (the scan then runs every [`SCAN_PERIOD`] until none is
+/// left), or the orientation sensor client has something to read. A
+/// notify before the wait is kept, so none is lost to the check before it.
+#[derive(Default)]
+pub(crate) struct ScanWake {
+    pending: Mutex<bool>,
+    ready: std::sync::Condvar,
+}
+
+impl ScanWake {
+    pub(crate) fn notify(&self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = true;
+            self.ready.notify_one();
+        }
+    }
+
+    /// Wait for a notify, or until `deadline` when there is one.
+    fn wait_until(&self, deadline: Option<std::time::Instant>) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        while !*pending {
+            pending = match deadline {
+                None => match self.ready.wait(pending) {
+                    Ok(pending) => pending,
+                    Err(_) => return,
+                },
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return;
+                    }
+                    match self.ready.wait_timeout(pending, left) {
+                        Ok((pending, _)) => pending,
+                        Err(_) => return,
+                    }
+                }
+            };
+        }
+        *pending = false;
+    }
+}
+
 /// Whether each of `owners` is still an admitted capture owner, asked
 /// concurrently on the connection's executor and bounded by `timeout`
 /// overall. An unanswered check counts as gone. The checks themselves
@@ -1546,9 +1597,19 @@ pub(crate) fn start(
                 orientation: orientation.clone(),
                 power_save: power_save.clone(),
             };
-            // Accelerometer for sensor-driven orientation (#345): polled
-            // with the admission scan, reported to the loop on change.
-            let mut sensor = crate::orientation::SensorPoller::new();
+            // Wakes the revocation scan below; see `ScanWake`.
+            let scan = Arc::new(ScanWake::default());
+            // Accelerometer for sensor-driven orientation (#345): read by
+            // the scan after a sensor signal or a change of the flags that
+            // inhibit tracking, reported to the loop on change.
+            let mut sensor = {
+                let scan = scan.clone();
+                crate::orientation::SensorPoller::new(move || scan.notify())
+            };
+            for hook in [&orientation.changed, &power_save.changed] {
+                let scan = scan.clone();
+                hook.set(move || scan.notify());
+            }
             let sessions: Sessions = Default::default();
             let remote: remote_desktop::RemoteSessions = Default::default();
             let next_id = Arc::new(AtomicU64::new(1));
@@ -1564,6 +1625,7 @@ pub(crate) fn start(
                 to_loop: to_loop.clone(),
                 signals: signals.clone(),
                 next_id: next_id.clone(),
+                scan: scan.clone(),
             };
             let remote_desktop = remote_desktop::RemoteDesktop {
                 authority: authority.clone(),
@@ -1572,6 +1634,7 @@ pub(crate) fn start(
                 outputs: outputs.clone(),
                 to_loop: to_loop.clone(),
                 next_id,
+                scan: scan.clone(),
             };
             let input_capture_service = input_capture::InputCapture {
                 authority: authority.clone(),
@@ -1580,6 +1643,7 @@ pub(crate) fn start(
                 to_loop: to_loop.clone(),
                 signals: signals.clone(),
                 next_id: Arc::new(AtomicU64::new(1)),
+                scan: scan.clone(),
             };
             let service_channel = ServiceChannel {
                 display,
@@ -1665,11 +1729,22 @@ pub(crate) fn start(
                 spawn_color_signals(conn.inner().clone(), night_light.subscribe_changes());
             }
             // Revoke on lock, unique-name disconnect or loss of the trusted
-            // service identity. 100ms admission scan plus one compositor tick
-            // bounds stream teardown; frames additionally fail closed on lock.
-            // A bus that stops answering revokes within OWNER_CHECK_TIMEOUT.
+            // service identity. While any session, grant or capture exists,
+            // a 100ms admission scan plus one compositor tick bounds stream
+            // teardown; frames additionally fail closed on lock. A bus that
+            // stops answering revokes within OWNER_CHECK_TIMEOUT. With none
+            // the scan has nothing to revoke and waits for one to be
+            // created, or for the sensor client (#503).
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let watching = remote.lock().is_ok_and(|s| !s.is_empty())
+                    || sessions.lock().is_ok_and(|s| !s.is_empty())
+                    || input_capture.lock().is_ok_and(|s| !s.is_empty());
+                let deadline = if watching {
+                    Some(std::time::Instant::now() + SCAN_PERIOD)
+                } else {
+                    sensor.next_due()
+                };
+                scan.wait_until(deadline);
                 let remote_snapshot: Vec<_> = remote
                     .lock()
                     .map(|s| s.clone())
@@ -1784,6 +1859,41 @@ pub(crate) fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #503: with nothing to revoke the scan sleeps until a session is
+    /// created or the sensor client calls (it used to wake every 100 ms):
+    /// a wait without a deadline ends only on a notify, a notify that came
+    /// before the wait is kept, and a deadline ends a wait on its own.
+    #[test]
+    fn the_scan_waits_for_a_notify_or_its_deadline() {
+        use std::time::{Duration, Instant};
+        let scan = Arc::new(ScanWake::default());
+        scan.notify();
+        let started = Instant::now();
+        scan.wait_until(None);
+        assert!(started.elapsed() < Duration::from_secs(1), "a kept notify");
+
+        let started = Instant::now();
+        scan.wait_until(Some(started + Duration::from_millis(200)));
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the deadline"
+        );
+
+        let remote = scan.clone();
+        let creator = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            remote.notify();
+        });
+        let started = Instant::now();
+        scan.wait_until(None);
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(250) && waited < Duration::from_secs(5),
+            "woken by the notify alone: {waited:?}"
+        );
+        creator.join().unwrap();
+    }
 
     /// The bus daemon's half of the owner check, answering every PID
     /// query with one process.

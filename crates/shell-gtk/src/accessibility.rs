@@ -2,7 +2,7 @@
 //! screen reader announcements.
 use crate::gtk;
 use gtk::prelude::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -218,7 +218,21 @@ fn install_focus_policy(settings: gio::Settings) {
     // Older GTK has a fixed three-second timer. Refresh it while the
     // requested duration is alive, using a weak window and no input grabs.
     let windows = gtk::Window::toplevels();
+    // Once per window: `keep_last_toplevel` re-appends the panel, which
+    // the list reports as an added item again.
+    let installed: RefCell<Vec<glib::WeakRef<gtk::Window>>> = RefCell::new(Vec::new());
     let install: Rc<dyn Fn(gtk::Window)> = Rc::new(move |window| {
+        {
+            let mut installed = installed.borrow_mut();
+            installed.retain(|w| w.upgrade().is_some());
+            if installed
+                .iter()
+                .any(|w| w.upgrade().as_ref() == Some(&window))
+            {
+                return;
+            }
+            installed.push(window.downgrade());
+        }
         let last = Rc::new(Cell::new(window.gets_focus_visible().then(Instant::now)));
         let key = gtk::EventControllerKey::new();
         key.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -272,6 +286,59 @@ fn install_focus_policy(settings: gio::Settings) {
     });
 }
 
+/// Keep `window`, which stays mapped for the shell's whole life (the
+/// panel), the last toplevel GTK lists.
+///
+/// GTK before 4.25 answers `GetChildAtIndex` on the AT-SPI application
+/// root for an index past the visible toplevels with the last toplevel
+/// it knows, whatever its state (`gtkatspiroot.c`; GNOME/gtk#8444, fixed
+/// by !10440). A hidden window has no accessible object path (its AT
+/// context is unrealized on unmap), so the reply is built from NULL: a
+/// `g_variant_new_object_path` critical, then a segfault. Any reader
+/// whose child count is one hide out of date asks for such an index: a
+/// screen reader walking the tree while the window menu, a banner, the
+/// switcher or the overview closes. With a mapped window last the stale
+/// index is answered with a live object instead (the panel a second
+/// time), which a reader tolerates. The tree is otherwise unchanged
+/// except that the panel is the application's last child rather than
+/// its first; that holds on every GTK version, fixed or not, so the
+/// order does not depend on the toolkit.
+pub fn keep_last_toplevel(window: &impl IsA<gtk::Window>) {
+    // GTK's toplevel list is a GListStore; without one there is nothing
+    // to reorder.
+    let Ok(store) = gtk::Window::toplevels().downcast::<gio::ListStore>() else {
+        return;
+    };
+    let weak = window.as_ref().downgrade();
+    move_last(&store, window.as_ref().upcast_ref());
+    let moving = Cell::new(false);
+    // In the handler, not an idle: a D-Bus call already queued in this
+    // main-loop turn would be answered before the idle ran.
+    store.connect_items_changed(move |store, _, _, added| {
+        if added == 0 || moving.replace(true) {
+            return;
+        }
+        if let Some(window) = weak.upgrade() {
+            move_last(store, window.upcast_ref());
+        }
+        moving.set(false);
+    });
+}
+
+/// Move `item` to the end of `store` if it is in it and not last already.
+fn move_last(store: &gio::ListStore, item: &glib::Object) {
+    let count = store.n_items();
+    if count == 0 || store.item(count - 1).as_ref() == Some(item) {
+        return;
+    }
+    if let Some(position) = (0..count).find(|&i| store.item(i).as_ref() == Some(item)) {
+        // `item` is the caller's reference, so the store dropping its own
+        // between the two calls does not dispose the window.
+        store.remove(position);
+        store.append(item);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +356,35 @@ mod tests {
         assert_eq!(duration_seconds(-1), Some(3));
         assert_eq!(duration_seconds(1), Some(1));
         assert_eq!(duration_seconds(i32::MAX), Some(i32::MAX as u64));
+    }
+    #[test]
+    fn the_pinned_item_stays_last_as_others_are_added() {
+        let store = gio::ListStore::new::<gio::SimpleAction>();
+        let item = |name: &str| gio::SimpleAction::new(name, None);
+        let (panel, a, b) = (item("panel"), item("a"), item("b"));
+        store.append(&panel);
+        store.append(&a);
+        let names = |store: &gio::ListStore| -> Vec<String> {
+            (0..store.n_items())
+                .filter_map(|i| store.item(i).and_downcast::<gio::SimpleAction>())
+                .map(|action| action.name().to_string())
+                .collect()
+        };
+        move_last(&store, panel.upcast_ref());
+        assert_eq!(names(&store), ["a", "panel"]);
+        // Already last: no remove and re-add for the list's observers.
+        let changes = Rc::new(Cell::new(0));
+        let seen = changes.clone();
+        store.connect_items_changed(move |_, _, _, _| seen.set(seen.get() + 1));
+        move_last(&store, panel.upcast_ref());
+        assert_eq!(changes.get(), 0);
+        store.append(&b);
+        move_last(&store, panel.upcast_ref());
+        assert_eq!(names(&store), ["a", "b", "panel"]);
+        // An item the list no longer holds is left alone.
+        store.remove(2);
+        move_last(&store, panel.upcast_ref());
+        assert_eq!(names(&store), ["a", "b"]);
     }
     #[test]
     #[ignore = "requires private graphical/session/accessibility buses and focus schema fixture"]

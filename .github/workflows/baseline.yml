@@ -8,6 +8,8 @@ on:
   schedule:
     - cron: "0 4 * * 1"
   pull_request:
+    # Draft pull requests skip the capture; marking one ready starts it.
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - scripts/tuna-baseline
       - .github/workflows/baseline.yml
@@ -21,6 +23,7 @@ concurrency:
 
 jobs:
   capture:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:

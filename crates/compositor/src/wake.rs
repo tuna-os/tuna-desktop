@@ -71,6 +71,55 @@ pub(crate) fn changed(fd: impl AsFd, wanted: &[&OsStr]) -> bool {
     hit
 }
 
+/// Whether inotify sees every change to files in `dir`: only on a local
+/// filesystem. Another host writing to a network mount, or a FUSE daemon
+/// changing what it serves, raises no event here (GIO polls such mounts
+/// for the same reason).
+pub(crate) fn inotify_reliable(dir: &Path) -> bool {
+    const LOCAL: [u32; 8] = [
+        0x0000_EF53, // ext2, ext3, ext4
+        0x9123_683E, // btrfs
+        0x5846_5342, // xfs
+        0x0102_1994, // tmpfs
+        0xF2F5_2010, // f2fs
+        0x794C_7630, // overlayfs
+        0x2FC1_2FC1, // zfs
+        0xCA45_1A4E, // bcachefs
+    ];
+    rustix::fs::statfs(dir).is_ok_and(|fs| LOCAL.contains(&(fs.f_type as u32)))
+}
+
+/// `poll(2)` on `fds` for at most `timeout` (`None`: until one is ready);
+/// how many are ready.
+pub(crate) fn poll_fds(
+    fds: &mut [rustix::event::PollFd<'_>],
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<usize> {
+    let timeout = timeout.map(|timeout| rustix::event::Timespec {
+        tv_sec: timeout.as_secs() as _,
+        tv_nsec: timeout.subsec_nanos() as _,
+    });
+    Ok(rustix::event::poll(fds, timeout.as_ref())?)
+}
+
+/// Whether any event source of the loop behind `events` (calloop's own
+/// descriptor) becomes ready within `timeout`. Nothing is dispatched or
+/// consumed: what is ready stays ready for the dispatch that follows, and
+/// a loop that stayed quiet has demonstrably received nothing, which is
+/// what lets its tick skip the work only an event could have caused
+/// (#503). Calloop's timers and idle callbacks are not descriptors and do
+/// not show here.
+pub(crate) fn ready_within(
+    events: impl AsFd,
+    timeout: std::time::Duration,
+) -> std::io::Result<bool> {
+    let mut fds = [rustix::event::PollFd::new(
+        &events,
+        rustix::event::PollFlags::IN,
+    )];
+    Ok(poll_fds(&mut fds, Some(timeout))? > 0)
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct Wake(Arc<Mutex<Option<calloop::ping::Ping>>>);
 impl std::fmt::Debug for Wake {
@@ -162,6 +211,48 @@ mod tests {
         signal_hook::low_level::raise(signal_hook::consts::SIGUSR2).unwrap();
         drain_signals(stream);
         assert!(stream.read(&mut probe).is_err(), "drained");
+    }
+
+    #[test]
+    fn a_quiet_loop_is_told_from_a_ready_one_without_dispatching_either() {
+        use std::time::{Duration, Instant};
+        let (wake, source) = Wake::new().unwrap();
+        let mut loop_ = calloop::EventLoop::<usize>::try_new().unwrap();
+        loop_
+            .handle()
+            .insert_source(source, |_, _, count| *count += 1)
+            .unwrap();
+        let mut count = 0;
+        loop_.dispatch(Some(Duration::ZERO), &mut count).unwrap();
+
+        // Quiet: the wait runs its whole time and reports nothing.
+        let started = Instant::now();
+        assert!(!ready_within(&loop_, Duration::from_millis(100)).unwrap());
+        assert!(started.elapsed() >= Duration::from_millis(100));
+
+        // A wake during the wait ends it, and nothing was dispatched.
+        let waker = wake.clone();
+        let signal = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            waker.signal();
+        });
+        let started = Instant::now();
+        assert!(ready_within(&loop_, Duration::from_secs(10)).unwrap());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the wake ended the wait"
+        );
+        signal.join().unwrap();
+        assert_eq!(count, 0, "the wait dispatched nothing");
+
+        // What is ready stays ready until the dispatch that delivers it.
+        assert!(ready_within(&loop_, Duration::ZERO).unwrap());
+        loop_.dispatch(Some(Duration::ZERO), &mut count).unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            !ready_within(&loop_, Duration::ZERO).unwrap(),
+            "a dispatched loop is quiet again"
+        );
     }
 }
 

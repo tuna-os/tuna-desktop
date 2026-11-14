@@ -88,3 +88,6 @@ zbus = { workspace = true, features = ["p2p"] }
 # An X11 client for the real Xwayland keyboard grab test (Smithay's own
 # X11 crate, already in the lock).
 x11rb = "=0.13.2"
+# Smithay's test renderer imports shm buffers as an upload does, without GL
+# (tests/buffer_release.rs, tests/window_teardown.rs).
+smithay = { workspace = true, features = ["renderer_test"] }
