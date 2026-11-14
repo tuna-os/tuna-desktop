@@ -42,6 +42,57 @@ acknowledgment, and writes PNG plus pixel receipt for each case. It rejects
 cropped, displaced and incorrectly colored fixtures in four focused tests.
 Animated fixture assertions additionally capture a second real frame without pointer input for legacy and SVG themes. All assertions await a fresh native CI journey on this port; fractional-output pixels, multiple physical outputs and hardware measurements remain separate qualification.
 
+`G-CURSOR-SCALE` distinguishes the two loading paths at 125% for size 24:
+Xcursor selects the 48 px image at the ceiled output scale, while SVG
+rasterizes directly at `ceil(24 * 1.25) = 30` px. Both retain 24 logical px
+and draw 30 physical px with their scaled hotspots. The actual framebuffer
+checks require those dimensions and colors independently of the state check.
+
+[CI run 41175449190](https://github.com/tuna-os/tuna-desktop/actions/runs/41175449190),
+GTK job 124476667566, passed `G-CURSOR-FRAME` and captured all 900 legacy
+cursor pixels at 125% at 08:15:33. Its 08:15:54 failure was the next SVG
+state predicate: it wrongly required `[48,48]`, while the compositor
+reported `image_theme: "TunaProofSvg"`, `image: [30,30]`, `logical: [24,24]`
+and `scale: 1.25`. The `G-CURSOR-SCALE FAIL` text is attached to the long
+state-dump line in the job log. The inactive locate effect (count 2) and
+real animation clock belong to this pre-ripple stage, not a failed 125%
+ripple clock. The proof now requires the direct 30 px SVG raster without
+relaxing either actual-pixel assertion. `scripts/lib/cursor-pixels-tests.py`
+exercises the proof's own two predicates, accepting their distinct raster
+sizes and rejecting wrong sizes, logical geometry and theme. This diagnosis
+and regression change do not claim a fresh runtime qualification.
+
+`G-LOCATE-RIPPLE-PIXELS` captures locate-pointer at 415 ms on the frozen
+animation clock and after all rings end. GNOME Shell 51's
+[ripples.js](https://github.com/GNOME/gnome-shell/blob/51.0/js/ui/ripples.js)
+eases the first ring from scale 0.25 to 1.5 over 830 ms with `EASE_OUT_QUAD`.
+At half duration its scale is `0.25 + (1.5 - 0.25) * 0.75 = 1.1875`;
+the 54 px disc-plus-glow therefore has radius 32.0625 logical px
+(40.078125 physical px at 125%). The pixel checker derives its expected
+radius from that curve and the output scale, keeping the 3 px edge tolerance,
+lightened-accent checks and no-residue assertion.
+
+The previous 1.375x / 37.125 px expectation was an arithmetic error in the
+proof, not the renderer: CI run 41147696888, GTK job 124385584993, captured
+left/up ray extents of 33 px and right/down extents of 32 px at 100%.
+Those archived pixels match the upstream curve. This diagnosis is not a
+fresh runtime qualification of the corrected proof.
+
+The subsequent [CI run 41193585314](https://github.com/tuna-os/tuna-desktop/actions/runs/41193585314),
+GTK job 124522031345, passed the 100% ripple and both fractional cursor pixel
+checks, but its 125% ripple baseline froze the just-unmapped cursor probe's
+150 ms destroy snapshot. The baseline still shows its translucent magenta
+rectangle; advancing the same animation clock to 415 ms removes that ghost.
+At `(640,455)`, 55 px below the ripple centre and outside its 40.078125 px
+radius, the archived baseline is `(156,54,161)` while both the ripple and
+settled captures are `(192,28,40)`. The lifecycle history records window 21
+destroy starting at 475523 ms and completing at 475960 ms after that advance.
+The proof now waits for that specific window's destroy-completed record
+under the real clock before freezing the baseline, not merely its removal
+from the live-window list. No pixel exclusions, fresh input, changed bounds
+or extra sleep replace the completion barrier; the analyzer is unchanged.
+This artifact diagnosis does not claim a fresh run of the corrected proof.
+
 
 ## Locked privacy and locate cache bounds
 

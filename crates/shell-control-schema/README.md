@@ -60,9 +60,15 @@ before decoding.
   `touchpad`, `mouse`, `trackball` and `pointing_stick` groups
   (`TouchpadSettings`, `MouseSettings`, `TrackballSettings`,
   `PointingStickSettings`) carry GNOME 51's per-device-class peripherals
-  keys. Every acceleration key uses `PointerAccelProfile`: the compositor
-  supports default, flat, and adaptive; custom curves are unsupported and
-  fall back to the device default.
+  keys. Every acceleration key uses `PointerAccelProfile`: default, flat,
+  adaptive, and custom.
+- Custom acceleration and typing timeout (0.51): `InputSettings::custom_accel`
+  (`CustomAccelConfigs`, one `CustomAccelCurve { step, speeds }` per pointer
+  class, GNOME's `custom-accel-config`) and
+  `InputSettings::disable_while_typing_timeout_ms` are appended after
+  `center_new_windows`. A class whose profile is `Custom` gets its curve
+  after `CustomAccelCurve::or_mutter_fallback`; a curve libinput rejects
+  leaves the device default. Positional: both peers ship together.
 - Tokens and secrets: `ActivationToken`, `TokenMeta`, `Secret`.
 - Switcher and keybindings: `SwitcherAction`, `SwitcherKey`,
   `SwitcherThumbnail`, `WindowAction`, `Accelerator`, and the `MOD_*` and
