@@ -53,6 +53,8 @@ pub(crate) struct RemoteDesktop {
     pub outputs: Outputs,
     pub to_loop: calloop::channel::Sender<ToLoop>,
     pub next_id: Arc<AtomicU64>,
+    /// Wakes the revocation scan for the new grant.
+    pub(crate) scan: Arc<super::ScanWake>,
 }
 #[derive(Clone)]
 pub(crate) struct RemoteSession {
@@ -271,6 +273,7 @@ impl RemoteDesktop {
             .lock()
             .map_err(|_| fdo::Error::Failed("remote registry unavailable".into()))?
             .insert(session_id, grant);
+        self.scan.notify();
         Ok(path)
     }
     #[zbus(property)]

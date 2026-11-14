@@ -94,6 +94,18 @@ dumps are disabled for this dependency fixture. This toolkit regression proof
 is not product acceptance: the old-negative/fixed-positive Escape comparison
 and all selected exact-head lanes must still pass.
 
+The old role is the pinned pre-#674 source, whose page hint widens while its
+preview icons slide in. A pointer parked by a motion that lands in that slide
+is counted as dwelling on the next-page hint, and the page turns a second
+later (main run
+[`43259379979`](https://github.com/tuna-os/tuna-desktop/actions/runs/43259379979):
+`actual carousel page changed before Escape`). In that role only, the harness
+delivers one more real motion inside the admitted neutral gap after the slide,
+so the old pager tests its settled hint; the fixed role and the `gtk-shell`
+gate keep the pointer parked, and every later check is the same for both.
+A role that fails prints the end of its `output-<role>.txt`, including the
+proof's `FAIL` line, in the job log.
+
 ## Keep required checks on the workflow's tested source
 
 The `check` job uses `actions/checkout`'s default PR merge ref, like the

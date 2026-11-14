@@ -1,0 +1,366 @@
+{
+  "schema": 1,
+  "identities": {
+    "tuna-q-variant-diag-pub1112": {
+      "id": "kubevirt/karnataka-k3s/corral-vms/tuna-q-variant-diag-pub1112",
+      "name": "tuna-q-variant-diag-pub1112",
+      "backend": "kubevirt",
+      "status": "\u25cf Running",
+      "ready": true,
+      "running": true,
+      "context": "karnataka-k3s",
+      "capabilities": {
+        "start": true,
+        "stop": true,
+        "delete": true,
+        "ssh": true,
+        "tty": true,
+        "vnc": true,
+        "rdp": true,
+        "metrics": true,
+        "snapshots": true,
+        "migrate": true,
+        "volumes": true,
+        "gpu": true
+      },
+      "endpoints": {
+        "rdp": "10.42.0.56:3389",
+        "ssh": "10.42.0.56:22",
+        "vnc": "10.42.0.56:5900"
+      },
+      "cpu": 4,
+      "mem": "6Gi",
+      "node": "karnataka",
+      "vnc": "off",
+      "ip": "10.42.0.56",
+      "namespace": "corral-vms",
+      "liveMigratable": false,
+      "agentConnected": false,
+      "isTemplate": false,
+      "bootc": false,
+      "tagValues": {
+        "purpose": "tuna-corral-journey"
+      },
+      "expectedUID": "8fdda62a-997b-435b-b7d0-45ad4150616a",
+      "corral_context_alias": "macos-karnataka",
+      "kubernetes_context": "karnataka-k3s",
+      "validated": true,
+      "boundaries": [
+        {
+          "boundary": "after-create",
+          "at": "2026-11-12T16:23:00+00:00",
+          "expectedUID": "8fdda62a-997b-435b-b7d0-45ad4150616a"
+        },
+        {
+          "boundary": "before-start",
+          "at": "2026-11-12T16:23:25+00:00",
+          "expectedUID": "8fdda62a-997b-435b-b7d0-45ad4150616a"
+        },
+        {
+          "boundary": "before-failure-capture",
+          "at": "2026-11-12T16:39:23+00:00",
+          "expectedUID": "8fdda62a-997b-435b-b7d0-45ad4150616a"
+        }
+      ]
+    }
+  },
+  "resources": {
+    "vm/tuna-q-variant-diag-pub1112": {
+      "kind": "vm",
+      "name": "tuna-q-variant-diag-pub1112",
+      "namespace": "corral-vms",
+      "kubernetes_context": "karnataka-k3s",
+      "expectedUID": "8fdda62a-997b-435b-b7d0-45ad4150616a",
+      "creationTimestamp": "2026-11-12T16:22:36Z",
+      "created_this_run": true,
+      "ownership_labels": {
+        "corral": "tuna-q-variant-diag-pub1112",
+        "corral-bootc-image": "",
+        "corral.dev/tag.purpose": "tuna-corral-journey"
+      },
+      "ownerReferences": []
+    }
+  },
+  "commands": [
+    {
+      "argv": [
+        "corral",
+        "context",
+        "get"
+      ],
+      "exit": 0,
+      "stdout": "macos-karnataka\tkubevirt\tkarnataka-k3s\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "kubectl",
+        "--context",
+        "karnataka-k3s",
+        "-n",
+        "corral-vms",
+        "get",
+        "vm",
+        "tuna-q-variant-diag-pub1112",
+        "--ignore-not-found",
+        "-o",
+        "jsonpath={.metadata.name}{\"\\n\"}{.metadata.namespace}{\"\\n\"}{.metadata.uid}{\"\\n\"}{.metadata.creationTimestamp}{\"\\n\"}{.metadata.labels}{\"\\n\"}{.metadata.annotations.corral\\.bootc/image}{\"\\n\"}{.metadata.ownerReferences}"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "kubectl",
+        "--context",
+        "karnataka-k3s",
+        "-n",
+        "corral-vms",
+        "get",
+        "vm",
+        "tuna-q-variant-diag-pub1112-bootc-builder",
+        "--ignore-not-found",
+        "-o",
+        "jsonpath={.metadata.name}{\"\\n\"}{.metadata.namespace}{\"\\n\"}{.metadata.uid}{\"\\n\"}{.metadata.creationTimestamp}{\"\\n\"}{.metadata.labels}{\"\\n\"}{.metadata.annotations.corral\\.bootc/image}{\"\\n\"}{.metadata.ownerReferences}"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "kubectl",
+        "--context",
+        "karnataka-k3s",
+        "-n",
+        "corral-vms",
+        "get",
+        "vmi",
+        "tuna-q-variant-diag-pub1112",
+        "--ignore-not-found",
+        "-o",
+        "jsonpath={.metadata.name}{\"\\n\"}{.metadata.namespace}{\"\\n\"}{.metadata.uid}{\"\\n\"}{.metadata.creationTimestamp}{\"\\n\"}{.metadata.labels}{\"\\n\"}{.metadata.annotations.corral\\.bootc/image}{\"\\n\"}{.metadata.ownerReferences}"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "kubectl",
+        "--context",
+        "karnataka-k3s",
+        "-n",
+        "corral-vms",
+        "get",
+        "vmi",
+        "tuna-q-variant-diag-pub1112-bootc-builder",
+        "--ignore-not-found",
+        "-o",
+        "jsonpath={.metadata.name}{\"\\n\"}{.metadata.namespace}{\"\\n\"}{.metadata.uid}{\"\\n\"}{.metadata.creationTimestamp}{\"\\n\"}{.metadata.labels}{\"\\n\"}{.metadata.annotations.corral\\.bootc/image}{\"\\n\"}{.metadata.ownerReferences}"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "kubectl",
+        "--context",
+        "karnataka-k3s",
+        "-n",
+        "corral-vms",
+        "get",
+        "pvc",
+        "tuna-q-variant-diag-pub1112-bootc-disk",
+        "--ignore-not-found",
+        "-o",
+        "jsonpath={.metadata.name}{\"\\n\"}{.metadata.namespace}{\"\\n\"}{.metadata.uid}{\"\\n\"}{.metadata.creationTimestamp}{\"\\n\"}{.metadata.labels}{\"\\n\"}{.metadata.annotations.corral\\.bootc/image}{\"\\n\"}{.metadata.ownerReferences}"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "kubectl",
+        "--context",
+        "karnataka-k3s",
+        "-n",
+        "corral-vms",
+        "get",
+        "dv",
+        "tuna-q-variant-diag-pub1112-bootc-disk",
+        "--ignore-not-found",
+        "-o",
+        "jsonpath={.metadata.name}{\"\\n\"}{.metadata.namespace}{\"\\n\"}{.metadata.uid}{\"\\n\"}{.metadata.creationTimestamp}{\"\\n\"}{.metadata.labels}{\"\\n\"}{.metadata.annotations.corral\\.bootc/image}{\"\\n\"}{.metadata.ownerReferences}"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "kubectl",
+        "--context",
+        "karnataka-k3s",
+        "-n",
+        "corral-vms",
+        "get",
+        "secret",
+        "tuna-q-variant-diag-pub1112-bootc-builder-cloudinit",
+        "--ignore-not-found",
+        "-o",
+        "jsonpath={.metadata.name}{\"\\n\"}{.metadata.namespace}{\"\\n\"}{.metadata.uid}{\"\\n\"}{.metadata.creationTimestamp}{\"\\n\"}{.metadata.labels}{\"\\n\"}{.metadata.annotations.corral\\.bootc/image}{\"\\n\"}{.metadata.ownerReferences}"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "corral",
+        "--json",
+        "list",
+        "--prefix",
+        "tuna-q-variant-diag-pub1112"
+      ],
+      "exit": 0,
+      "stdout": "[\n  {\n    \"id\": \"kubevirt//corral-vms/tuna-q-variant-diag-pub1112\",\n    \"name\": \"tuna-q-variant-diag-pub1112\",\n    \"backend\": \"kubevirt\",\n    \"status\": \"\u25cb Stopped\",\n    \"ready\": false,\n    \"running\": false,\n    \"capabilities\": {\n      \"start\": true,\n      \"stop\": true,\n      \"delete\": true,\n      \"ssh\": true,\n      \"tty\": true,\n      \"vnc\": true,\n      \"rdp\": true,\n      \"metrics\": true,\n      \"snapshots\": true,\n      \"migrate\": true,\n      \"volumes\": true,\n      \"gpu\": true\n    },\n    \"cpu\": 4,\n    \"mem\": \"6Gi\",\n    \"node\": \"karnataka\",\n    \"vnc\": \"off\",\n    \"namespace\": \"corral-vms\",\n    \"liveMigratable\": false,\n    \"agentConnected\": false,\n    \"isTemplate\": false,\n    \"bootc\": false,\n    \"tagValues\": {\n      \"purpose\": \"tuna-corral-journey\"\n    }\n  },\n  {\n    \"id\": \"kubevirt/karnataka-k3s/corral-vms/tuna-q-variant-diag-pub1112\",\n    \"name\": \"tuna-q-variant-diag-pub1112\",\n    \"backend\": \"kubevirt\",\n    \"status\": \"\u25cb Stopped\",\n    \"ready\": false,\n    \"running\": false,\n    \"context\": \"karnataka-k3s\",\n    \"capabilities\": {\n      \"start\": true,\n      \"stop\": true,\n      \"delete\": true,\n      \"ssh\": true,\n      \"tty\": true,\n      \"vnc\": true,\n      \"rdp\": true,\n      \"metrics\": true,\n      \"snapshots\": true,\n      \"migrate\": true,\n      \"volumes\": true,\n      \"gpu\": true\n    },\n    \"cpu\": 4,\n    \"mem\": \"6Gi\",\n    \"node\": \"karnataka\",\n    \"vnc\": \"off\",\n    \"namespace\": \"corral-vms\",\n    \"liveMigratable\": false,\n    \"agentConnected\": false,\n    \"isTemplate\": false,\n    \"bootc\": false,\n    \"tagValues\": {\n      \"purpose\": \"tuna-corral-journey\"\n    }\n  }\n]\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "kubectl",
+        "--context",
+        "karnataka-k3s",
+        "-n",
+        "corral-vms",
+        "get",
+        "vm",
+        "tuna-q-variant-diag-pub1112",
+        "--ignore-not-found",
+        "-o",
+        "jsonpath={.metadata.name}{\"\\n\"}{.metadata.namespace}{\"\\n\"}{.metadata.uid}{\"\\n\"}{.metadata.creationTimestamp}{\"\\n\"}{.metadata.labels}{\"\\n\"}{.metadata.annotations.corral\\.bootc/image}{\"\\n\"}{.metadata.ownerReferences}"
+      ],
+      "exit": 0,
+      "stdout": "tuna-q-variant-diag-pub1112\ncorral-vms\n8fdda62a-997b-435b-b7d0-45ad4150616a\n2026-11-12T16:22:36Z\n{\"corral\":\"tuna-q-variant-diag-pub1112\",\"corral-bootc-image\":\"\",\"corral.dev/tag.purpose\":\"tuna-corral-journey\"}\nghcr.io/tuna-os/marlin@sha256:77b12bb074712cdf75d9b2af436900e44ddcfd5f910a98a76860e05e57ee30c5\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "corral",
+        "--json",
+        "info",
+        "kubevirt/karnataka-k3s/corral-vms/tuna-q-variant-diag-pub1112"
+      ],
+      "exit": 0,
+      "stdout": "{\n  \"name\": \"tuna-q-variant-diag-pub1112\",\n  \"namespace\": \"corral-vms\",\n  \"context\": \"karnataka-k3s\",\n  \"backend\": \"kubevirt\",\n  \"status\": \"Stopped\",\n  \"ready\": false,\n  \"node\": \"karnataka\",\n  \"cpu\": {\n    \"vcpus\": 4,\n    \"sockets\": 4,\n    \"cores\": 1,\n    \"threads\": 1,\n    \"model\": \"host-passthrough\",\n    \"dedicatedCpuPlacement\": false,\n    \"isolateEmulatorThread\": false\n  },\n  \"memory\": \"6Gi\",\n  \"disks\": [\n    {\n      \"name\": \"rootdisk\",\n      \"type\": \"disk\",\n      \"bus\": \"virtio\",\n      \"source\": \"persistentVolumeClaim\",\n      \"claim\": \"tuna-q-variant-diag-pub1112-bootc-disk\",\n      \"size\": \"40Gi\"\n    }\n  ],\n  \"inputs\": [\n    {\n      \"name\": \"tablet\",\n      \"type\": \"tablet\",\n      \"bus\": \"usb\"\n    }\n  ],\n  \"firmware\": {\n    \"type\": \"uefi\",\n    \"secureBoot\": false,\n    \"machine\": \"q35\"\n  },\n  \"tagValues\": {\n    \"purpose\": \"tuna-corral-journey\"\n  },\n  \"labels\": {\n    \"corral\": \"tuna-q-variant-diag-pub1112\",\n    \"corral-bootc-image\": \"\",\n    \"corral.dev/tag.purpose\": \"tuna-corral-journey\"\n  },\n  \"image\": \"ghcr.io/tuna-os/marlin@sha256:77b12bb074712cdf75d9b2af436900e44ddcfd5f910a98a76860e05e57ee30c5\"\n}\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "corral",
+        "--json",
+        "list",
+        "--prefix",
+        "tuna-q-variant-diag-pub1112"
+      ],
+      "exit": 0,
+      "stdout": "[\n  {\n    \"id\": \"kubevirt//corral-vms/tuna-q-variant-diag-pub1112\",\n    \"name\": \"tuna-q-variant-diag-pub1112\",\n    \"backend\": \"kubevirt\",\n    \"status\": \"\u25cb Stopped\",\n    \"ready\": false,\n    \"running\": false,\n    \"capabilities\": {\n      \"start\": true,\n      \"stop\": true,\n      \"delete\": true,\n      \"ssh\": true,\n      \"tty\": true,\n      \"vnc\": true,\n      \"rdp\": true,\n      \"metrics\": true,\n      \"snapshots\": true,\n      \"migrate\": true,\n      \"volumes\": true,\n      \"gpu\": true\n    },\n    \"cpu\": 4,\n    \"mem\": \"6Gi\",\n    \"node\": \"karnataka\",\n    \"vnc\": \"off\",\n    \"namespace\": \"corral-vms\",\n    \"liveMigratable\": false,\n    \"agentConnected\": false,\n    \"isTemplate\": false,\n    \"bootc\": false,\n    \"tagValues\": {\n      \"purpose\": \"tuna-corral-journey\"\n    }\n  },\n  {\n    \"id\": \"kubevirt/karnataka-k3s/corral-vms/tuna-q-variant-diag-pub1112\",\n    \"name\": \"tuna-q-variant-diag-pub1112\",\n    \"backend\": \"kubevirt\",\n    \"status\": \"\u25cb Stopped\",\n    \"ready\": false,\n    \"running\": false,\n    \"context\": \"karnataka-k3s\",\n    \"capabilities\": {\n      \"start\": true,\n      \"stop\": true,\n      \"delete\": true,\n      \"ssh\": true,\n      \"tty\": true,\n      \"vnc\": true,\n      \"rdp\": true,\n      \"metrics\": true,\n      \"snapshots\": true,\n      \"migrate\": true,\n      \"volumes\": true,\n      \"gpu\": true\n    },\n    \"cpu\": 4,\n    \"mem\": \"6Gi\",\n    \"node\": \"karnataka\",\n    \"vnc\": \"off\",\n    \"namespace\": \"corral-vms\",\n    \"liveMigratable\": false,\n    \"agentConnected\": false,\n    \"isTemplate\": false,\n    \"bootc\": false,\n    \"tagValues\": {\n      \"purpose\": \"tuna-corral-journey\"\n    }\n  }\n]\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "kubectl",
+        "--context",
+        "karnataka-k3s",
+        "-n",
+        "corral-vms",
+        "get",
+        "vm",
+        "tuna-q-variant-diag-pub1112",
+        "--ignore-not-found",
+        "-o",
+        "jsonpath={.metadata.name}{\"\\n\"}{.metadata.namespace}{\"\\n\"}{.metadata.uid}{\"\\n\"}{.metadata.creationTimestamp}{\"\\n\"}{.metadata.labels}{\"\\n\"}{.metadata.annotations.corral\\.bootc/image}{\"\\n\"}{.metadata.ownerReferences}"
+      ],
+      "exit": 0,
+      "stdout": "tuna-q-variant-diag-pub1112\ncorral-vms\n8fdda62a-997b-435b-b7d0-45ad4150616a\n2026-11-12T16:22:36Z\n{\"corral\":\"tuna-q-variant-diag-pub1112\",\"corral-bootc-image\":\"\",\"corral.dev/tag.purpose\":\"tuna-corral-journey\"}\nghcr.io/tuna-os/marlin@sha256:77b12bb074712cdf75d9b2af436900e44ddcfd5f910a98a76860e05e57ee30c5\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "corral",
+        "--json",
+        "info",
+        "kubevirt/karnataka-k3s/corral-vms/tuna-q-variant-diag-pub1112"
+      ],
+      "exit": 0,
+      "stdout": "{\n  \"name\": \"tuna-q-variant-diag-pub1112\",\n  \"namespace\": \"corral-vms\",\n  \"context\": \"karnataka-k3s\",\n  \"backend\": \"kubevirt\",\n  \"status\": \"Stopped\",\n  \"ready\": false,\n  \"node\": \"karnataka\",\n  \"cpu\": {\n    \"vcpus\": 4,\n    \"sockets\": 4,\n    \"cores\": 1,\n    \"threads\": 1,\n    \"model\": \"host-passthrough\",\n    \"dedicatedCpuPlacement\": false,\n    \"isolateEmulatorThread\": false\n  },\n  \"memory\": \"6Gi\",\n  \"disks\": [\n    {\n      \"name\": \"rootdisk\",\n      \"type\": \"disk\",\n      \"bus\": \"virtio\",\n      \"source\": \"persistentVolumeClaim\",\n      \"claim\": \"tuna-q-variant-diag-pub1112-bootc-disk\",\n      \"size\": \"40Gi\"\n    }\n  ],\n  \"inputs\": [\n    {\n      \"name\": \"tablet\",\n      \"type\": \"tablet\",\n      \"bus\": \"usb\"\n    }\n  ],\n  \"firmware\": {\n    \"type\": \"uefi\",\n    \"secureBoot\": false,\n    \"machine\": \"q35\"\n  },\n  \"tagValues\": {\n    \"purpose\": \"tuna-corral-journey\"\n  },\n  \"labels\": {\n    \"corral\": \"tuna-q-variant-diag-pub1112\",\n    \"corral-bootc-image\": \"\",\n    \"corral.dev/tag.purpose\": \"tuna-corral-journey\"\n  },\n  \"image\": \"ghcr.io/tuna-os/marlin@sha256:77b12bb074712cdf75d9b2af436900e44ddcfd5f910a98a76860e05e57ee30c5\"\n}\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "corral",
+        "--json",
+        "list",
+        "--prefix",
+        "tuna-q-variant-diag-pub1112"
+      ],
+      "exit": 0,
+      "stdout": "[\n  {\n    \"id\": \"kubevirt//corral-vms/tuna-q-variant-diag-pub1112\",\n    \"name\": \"tuna-q-variant-diag-pub1112\",\n    \"backend\": \"kubevirt\",\n    \"status\": \"\u25cf Running\",\n    \"ready\": true,\n    \"running\": true,\n    \"capabilities\": {\n      \"start\": true,\n      \"stop\": true,\n      \"delete\": true,\n      \"ssh\": true,\n      \"tty\": true,\n      \"vnc\": true,\n      \"rdp\": true,\n      \"metrics\": true,\n      \"snapshots\": true,\n      \"migrate\": true,\n      \"volumes\": true,\n      \"gpu\": true\n    },\n    \"endpoints\": {\n      \"rdp\": \"10.42.0.56:3389\",\n      \"ssh\": \"10.42.0.56:22\",\n      \"vnc\": \"10.42.0.56:5900\"\n    },\n    \"cpu\": 4,\n    \"mem\": \"6Gi\",\n    \"node\": \"karnataka\",\n    \"vnc\": \"off\",\n    \"ip\": \"10.42.0.56\",\n    \"namespace\": \"corral-vms\",\n    \"liveMigratable\": false,\n    \"agentConnected\": false,\n    \"isTemplate\": false,\n    \"bootc\": false,\n    \"tagValues\": {\n      \"purpose\": \"tuna-corral-journey\"\n    }\n  },\n  {\n    \"id\": \"kubevirt/karnataka-k3s/corral-vms/tuna-q-variant-diag-pub1112\",\n    \"name\": \"tuna-q-variant-diag-pub1112\",\n    \"backend\": \"kubevirt\",\n    \"status\": \"\u25cf Running\",\n    \"ready\": true,\n    \"running\": true,\n    \"context\": \"karnataka-k3s\",\n    \"capabilities\": {\n      \"start\": true,\n      \"stop\": true,\n      \"delete\": true,\n      \"ssh\": true,\n      \"tty\": true,\n      \"vnc\": true,\n      \"rdp\": true,\n      \"metrics\": true,\n      \"snapshots\": true,\n      \"migrate\": true,\n      \"volumes\": true,\n      \"gpu\": true\n    },\n    \"endpoints\": {\n      \"rdp\": \"10.42.0.56:3389\",\n      \"ssh\": \"10.42.0.56:22\",\n      \"vnc\": \"10.42.0.56:5900\"\n    },\n    \"cpu\": 4,\n    \"mem\": \"6Gi\",\n    \"node\": \"karnataka\",\n    \"vnc\": \"off\",\n    \"ip\": \"10.42.0.56\",\n    \"namespace\": \"corral-vms\",\n    \"liveMigratable\": false,\n    \"agentConnected\": false,\n    \"isTemplate\": false,\n    \"bootc\": false,\n    \"tagValues\": {\n      \"purpose\": \"tuna-corral-journey\"\n    }\n  }\n]\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "kubectl",
+        "--context",
+        "karnataka-k3s",
+        "-n",
+        "corral-vms",
+        "get",
+        "vm",
+        "tuna-q-variant-diag-pub1112",
+        "--ignore-not-found",
+        "-o",
+        "jsonpath={.metadata.name}{\"\\n\"}{.metadata.namespace}{\"\\n\"}{.metadata.uid}{\"\\n\"}{.metadata.creationTimestamp}{\"\\n\"}{.metadata.labels}{\"\\n\"}{.metadata.annotations.corral\\.bootc/image}{\"\\n\"}{.metadata.ownerReferences}"
+      ],
+      "exit": 0,
+      "stdout": "tuna-q-variant-diag-pub1112\ncorral-vms\n8fdda62a-997b-435b-b7d0-45ad4150616a\n2026-11-12T16:22:36Z\n{\"corral\":\"tuna-q-variant-diag-pub1112\",\"corral-bootc-image\":\"\",\"corral.dev/tag.purpose\":\"tuna-corral-journey\"}\nghcr.io/tuna-os/marlin@sha256:77b12bb074712cdf75d9b2af436900e44ddcfd5f910a98a76860e05e57ee30c5\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "corral",
+        "--json",
+        "info",
+        "kubevirt/karnataka-k3s/corral-vms/tuna-q-variant-diag-pub1112"
+      ],
+      "exit": 0,
+      "stdout": "{\n  \"name\": \"tuna-q-variant-diag-pub1112\",\n  \"namespace\": \"corral-vms\",\n  \"context\": \"karnataka-k3s\",\n  \"backend\": \"kubevirt\",\n  \"status\": \"Running\",\n  \"ready\": true,\n  \"node\": \"karnataka\",\n  \"cpu\": {\n    \"vcpus\": 4,\n    \"sockets\": 4,\n    \"cores\": 1,\n    \"threads\": 1,\n    \"model\": \"host-passthrough\",\n    \"dedicatedCpuPlacement\": false,\n    \"isolateEmulatorThread\": false\n  },\n  \"memory\": \"6Gi\",\n  \"disks\": [\n    {\n      \"name\": \"rootdisk\",\n      \"type\": \"disk\",\n      \"bus\": \"virtio\",\n      \"source\": \"persistentVolumeClaim\",\n      \"claim\": \"tuna-q-variant-diag-pub1112-bootc-disk\",\n      \"size\": \"40Gi\"\n    }\n  ],\n  \"inputs\": [\n    {\n      \"name\": \"tablet\",\n      \"type\": \"tablet\",\n      \"bus\": \"usb\"\n    }\n  ],\n  \"firmware\": {\n    \"type\": \"uefi\",\n    \"secureBoot\": false,\n    \"machine\": \"q35\"\n  },\n  \"ips\": [\n    \"10.42.0.56\"\n  ],\n  \"tagValues\": {\n    \"purpose\": \"tuna-corral-journey\"\n  },\n  \"labels\": {\n    \"corral\": \"tuna-q-variant-diag-pub1112\",\n    \"corral-bootc-image\": \"\",\n    \"corral.dev/tag.purpose\": \"tuna-corral-journey\"\n  },\n  \"image\": \"ghcr.io/tuna-os/marlin@sha256:77b12bb074712cdf75d9b2af436900e44ddcfd5f910a98a76860e05e57ee30c5\"\n}\n",
+      "stderr": ""
+    }
+  ],
+  "scope": {
+    "name": "tuna-q-variant-diag-pub1112",
+    "namespace": "corral-vms",
+    "node": "karnataka",
+    "image": "ghcr.io/tuna-os/marlin@sha256:77b12bb074712cdf75d9b2af436900e44ddcfd5f910a98a76860e05e57ee30c5",
+    "backend": "kubevirt",
+    "context": "karnataka-k3s",
+    "corral_context_alias": "macos-karnataka",
+    "kubernetes_context": "karnataka-k3s"
+  },
+  "reuse": false,
+  "before": {
+    "vm/tuna-q-variant-diag-pub1112": null,
+    "vm/tuna-q-variant-diag-pub1112-bootc-builder": null,
+    "vmi/tuna-q-variant-diag-pub1112": null,
+    "vmi/tuna-q-variant-diag-pub1112-bootc-builder": null,
+    "pvc/tuna-q-variant-diag-pub1112-bootc-disk": null,
+    "dv/tuna-q-variant-diag-pub1112-bootc-disk": null,
+    "secret/tuna-q-variant-diag-pub1112-bootc-builder-cloudinit": null
+  },
+  "create_started": "2026-11-12T16:13:31+00:00"
+}

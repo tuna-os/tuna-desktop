@@ -43,6 +43,28 @@ impl RuntimeAids {
     fn active(&self) -> bool {
         self.engine.active() || self.pointer.active()
     }
+
+    /// How long until an aid's timer is due (Slow Keys, the Shift-hold
+    /// shortcut, Mouse Keys motion, hover and secondary clicks), for the
+    /// loop's wake (#503); `None` while none is pending. Only the engines
+    /// [`Runtime::poll_input_aids`] runs are asked: a timer nobody would
+    /// serve must not be reported as due.
+    pub(super) fn next_due(&self) -> Option<std::time::Duration> {
+        let engine = self
+            .engine
+            .active()
+            .then(|| self.engine.next_deadline())
+            .flatten();
+        let pointer = self
+            .pointer
+            .active()
+            .then(|| self.pointer.next_deadline())
+            .flatten();
+        let deadline = [engine, pointer].into_iter().flatten().min()?;
+        Some(std::time::Duration::from_millis(
+            deadline.saturating_sub(self.now_ms()),
+        ))
+    }
 }
 
 impl Runtime {

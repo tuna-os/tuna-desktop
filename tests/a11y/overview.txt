@@ -1,9 +1,3 @@
-frame: Top Bar
-toggle button: Activities
-push button: Date and Time
-menu: Date and Time
-push button: System
-menu: System
 frame: Search
 entry: Search
 frame: Dash
@@ -13,3 +7,9 @@ push button: tuna-test-gamma
 toggle button: Show Apps
 frame: Window Previews
 push button: Close
+frame: Top Bar
+toggle button: Activities
+push button: Date and Time
+menu: Date and Time
+push button: System
+menu: System
