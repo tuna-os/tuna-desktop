@@ -35,6 +35,15 @@ console frames for each step.
    Native portal requesters also check frontend availability, actual Screenshot
    delivery, and a ScreenCast PipeWire frame with caller isolation and bounded
    withdrawal on the actual Super+L lock; no candidate desktop binaries are copied.
+   `tuna-test` is a fresh account that never chose a session, so its first
+   login is the [#1050](https://github.com/tuna-os/tuna-desktop/issues/1050)
+   fresh-account check (tunaOS#4055). Before login, the greeter step records
+   GDM's version and `[daemon] FallbackSession`, both AccountsService
+   templates and the account's own record. It requires that the account has
+   no saved session of its own and that each template resolves to `tuna`:
+   a non-empty template `Session`, or `FallbackSession=tuna` on GDM 51 and
+   later. After login it requires that the account's saved session is
+   `tuna` or empty. The receipt keeps both under `fresh_account`.
 5. Every step writes its frame, its guest-side checks, and the `tuna-*`
    journal lines it caused to `manifest.json` with timestamps. A step's
    result is `pass`, `fail` or `not-exercised` (with the reason). Then
