@@ -87,6 +87,7 @@ tuna-desktop/
 │   ├── shell-gtk/            # tuna-shell-gtk: GTK4/libadwaita shell (ADR 0006)
 │   ├── wallpaper/            # tuna-wallpaper: wallpaper decoding
 │   ├── wallpaper-svg/        # tuna-wallpaper-svg: bounded native stream helper
+│   ├── x11-frames/           # tuna-x11-frames: GTK title bars for X11 windows (Mutter's frames protocol)
 │   └── magnifier/            # tuna-magnifier: shared session magnifier settings
 │
 ├── docs/                     # architecture, roadmap, test strategy, ADRs, guides

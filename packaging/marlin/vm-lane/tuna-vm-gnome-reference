@@ -314,8 +314,8 @@ def payload_integrity(deadline):
         required = ('/usr/bin/gdm', '/usr/bin/gnome-shell', *APPS) if key == 'stock' else ('/usr/bin/tuna-compositor', '/usr/bin/tuna-shell-gtk')
         if not set(required) <= entries.keys():
             raise RuntimeError('image payload receipt omits required original native principals')
-        if key == 'current_tuna' and len(entries) != 6:
-            raise RuntimeError('current source payload receipt is not the six installed original Tuna ELFs')
+        if key == 'current_tuna' and len(entries) != 7:
+            raise RuntimeError('current source payload receipt is not the seven installed original Tuna ELFs')
         run(['/usr/bin/sha256sum', '--check', '--strict', '--quiet', str(path)], deadline)
         evidence[key] = {'receipt_path': str(path), 'receipt_sha256': hashlib.sha256(data).hexdigest(),
                          'checked_files': len(entries)}

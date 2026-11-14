@@ -46,7 +46,8 @@ NEW_SESSION = 'usr/share/wayland-sessions/tuna.desktop'
 OLD_BINS = ('roost-compositor', 'roost-greeter', 'roost-ibus-bridge',
             'roost-session', 'roost-shell-gtk', 'roost-shell-host')
 NEW_BINS = ('tuna-compositor', 'tuna-ibus-bridge',
-            'tuna-session', 'tuna-shell-gtk', 'tuna-shell-host', 'tuna-wallpaper-svg')
+            'tuna-session', 'tuna-shell-gtk', 'tuna-shell-host', 'tuna-wallpaper-svg',
+            'tuna-x11-frames')
 # The released betas also shipped the greetd greeter, since removed (GDM only).
 BETA_BINS = NEW_BINS + ('tuna-greeter',)
 PAM_RULES = [['auth', 'include', 'login'], ['account', 'include', 'login']]

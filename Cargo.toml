@@ -10,6 +10,7 @@ members = [
     "crates/wallpaper",
     "crates/magnifier",
     "crates/wallpaper-svg",
+    "crates/x11-frames",
 ]
 
 # Pinned per ADR 0001 (docs/adr/0001-nested-backend-smithay-pin.md).
@@ -32,6 +33,9 @@ signal-hook = "0.4"
 rand = "0.10"
 gtk4 = "0.11"
 libadwaita = "0.9"
+# tuna-x11-frames: GDK's X11 connection. `xlib` gives the Xlib display
+# and the raw `xevent` signal, typed in x11-dl (already in the lockfile).
+gdk4-x11 = { version = "0.11", features = ["xlib"] }
 gtk4-layer-shell = "0.8"
 gtk4-session-lock = { version = "0.4", features = ["v1_1"] }
 glib = "0.22"

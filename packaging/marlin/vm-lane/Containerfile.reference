@@ -37,6 +37,7 @@ RUN case "$REFERENCE_SESSION" in gnome|tuna) ;; *) exit 1 ;; esac \
     && pacman -Q tuna-desktop > /usr/share/tuna-vm/current-package.txt \
     && sha256sum /usr/bin/tuna-session /usr/bin/tuna-compositor /usr/bin/tuna-shell-host \
        /usr/bin/tuna-shell-gtk /usr/bin/tuna-ibus-bridge /usr/bin/tuna-wallpaper-svg \
+       /usr/bin/tuna-x11-frames \
        > /usr/share/tuna-vm/current-payload.sha256 \
     && chmod 0644 /usr/share/tuna-vm/*.txt /usr/share/tuna-vm/*.sha256 \
     && useradd --uid 1000 -M -d /home/tuna-test -s /bin/bash -U tuna-test \

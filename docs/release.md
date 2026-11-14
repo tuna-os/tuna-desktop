@@ -19,7 +19,7 @@ not provide Marlin or physical hardware qualification.
 5. From a clean checkout of the tag, build the package:
    `scripts/tuna-release` — writes `dist/tuna-desktop_X.Y.Z_amd64.deb`.
    Use `--allow-dirty` only for throwaway dev builds, never for a release.
-6. Run `scripts/check-release-package` on the artifact. Require all six
+6. Run `scripts/check-release-package` on the artifact. Require all seven
    binaries, complete version agreement and the generated ELF dependency
    closure plus explicit runtime floors. Install it on the selected target
    with apt, retaining package/hash/distro dependency receipts and the

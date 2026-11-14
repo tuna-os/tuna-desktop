@@ -38,6 +38,7 @@ release.
 | `tuna-compositor` | library + `tuna-compositor`, `tuna-session` binaries | shell-host (tests only) | internal |
 | `tuna-shell-gtk` | binary | none | internal |
 | `tuna-wallpaper-svg` | binary | none | internal |
+| `tuna-x11-frames` | binary | none | internal; speaks Mutter's X11 frames protocol with the compositor's window manager |
 
 The crates could not be published as they stand. For example,
 `tuna-compositor` depends on `tuna-wallpaper` by path with no version
