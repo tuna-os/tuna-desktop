@@ -4190,13 +4190,19 @@ class FixtureLoginSession(unittest.TestCase):
         helpers = set(re.findall(r'"(/usr/libexec/[^"]+)"', self.fixture("tuna-vm-lifecycle")))
         # The GDM trace serves only the current build's --fresh-accounts boot;
         # the bounded soak runs only on the published image; the native-session
-        # modules (#1003) serve only the current build's `autotz` profile.
-        unused = {"Containerfile": {"/usr/libexec/tuna-soak/tuna-vm-soak"},
+        # modules (#1003) serve only the current build's `autotz` profile. The
+        # Core app modules serve only the native-core-apps row, whose separate
+        # layer (Containerfile.core-apps, #1004) installs them over the
+        # ordinary fixture.
+        core = {"/usr/libexec/tuna-core-apps"}
+        unused = {"Containerfile": {"/usr/libexec/tuna-soak/tuna-vm-soak"} | core,
                   "Containerfile.published": {"/usr/libexec/tuna-vm-gdm-trace",
-                                              "/usr/libexec/tuna-native-session"}}
+                                              "/usr/libexec/tuna-native-session"} | core}
         # Orca's token-gated test presenter (orca-speech-trigger) reads the
         # runtime token this user environment generator writes.
         generator = "/usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token"
+        core_layer = set(re.findall(r"^COPY \S+ (\S+)$", self.fixture("Containerfile.core-apps"), re.M))
+        self.assertLessEqual(core, core_layer)
         for name, skipped in unused.items():
             with self.subTest(fixture=name):
                 containerfile = self.fixture(name)
