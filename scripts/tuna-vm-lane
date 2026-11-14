@@ -4156,8 +4156,8 @@ def main():
             ap.error("--soak must exceed a nonnegative warmup, at most 86400, with a positive interval")
         if not re.fullmatch("[0-9a-f]{40}", a.soak_revision or ""):
             ap.error("--soak needs --soak-revision, the exact 40-digit source commit")
-    if a.app_integration and (a.tour or a.boots > 1 or a.strip_image or a.soak):
-        ap.error("--app-integration is its own single boot")
+    if a.app_integration and (a.tour or a.boots > 1 or a.strip_image or a.soak or a.published):
+        ap.error("--app-integration is its own single current-build boot")
     strip_image = None
     if a.strip_edge and not a.strip_image:
         ap.error("--strip-edge requires exact installed image admission")
