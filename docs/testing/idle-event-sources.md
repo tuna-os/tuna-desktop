@@ -106,7 +106,8 @@ casts, or a PAM worker that has not published its terminal phase.
 
 Otherwise the earliest of, never sooner than one frame: the lock timeout and
 idle-blank threshold (16 ms during the blank fade; none while an inhibitor is
-held), IdleMonitor, idle-notify and Orca deadlines, workspace leases, the
+held), IdleMonitor, idle-notify and Orca deadlines, workspace leases, a hidden
+window's 3 s to suspension, the
 wallpaper's safety re-observation (every 5 s, only for a source no watch
 vouches for and for a slideshow), Night Light preview expiry and settings
 re-read, the focus-policy and tablet settings re-reads, focus and alive-check
@@ -121,7 +122,8 @@ frame, 16 ms while a handshake or broadcast is owed).
 
 The end of an idle inhibitor restarts the idle clock, so a session that slept
 through the inhibited stretch never locks the moment it ends. Hidden windows'
-frame callbacks wait for the hidden beat and never force a repaint.
+frame callbacks wait for the hidden beat and never force a repaint; suspended
+windows told so get none (see `suspended` in [protocols](../protocols.md)).
 
 ## Periodic work that remains at idle
 
@@ -151,7 +153,7 @@ the first rows; it is a single noisy host, not the paired GNOME lane:
 | Settings re-reads: Night Light, focus policy, tablet (with a tablet) | 5 s each | A full tick, an idle source on the reader's GIO thread, a second full tick for the completion | Their `changed` subscriptions already deliver changes; the re-read only heals a lost signal or a failed first read |
 | Control hub token reissue | 15 s | `model.reissue` and a delta per window, on the next tick | A deadline in `next_poll` |
 | Idle fallback | 500 ms when nothing else is due | An idle tick: polls, no frame | Nothing to replace; it is the safety net |
-| Hidden-window beat | 995 ms while a hidden window waits on a frame callback | Frame callbacks to hidden surfaces | None (deliberate, as a throttle) |
+| Hidden-window beat | 995 ms while a hidden window not yet told it is suspended waits on a frame callback | Frame callbacks to hidden surfaces | Suspension: after 3 s hidden a window is `suspended` and gets none (#503) |
 | Orca name watch | 1 s while the screen reader runs | One bus query | `NameOwnerChanged` |
 | `blocking` crate pool threads (zbus connects through `blocking::unblock`) | 500 ms per pool thread, for the life of the process (two in the compositor, one in the shell on the vkms replica) | A condvar timeout with no work; `blocking` 1.7 only retires threads above its limit | Connecting the bus socket ourselves and handing zbus the stream (`Builder::unix_stream`) at every connection site |
 | Shell brightness (`brightness_service::start`, `services::brightness`) | 500 ms each | A backlight inventory under `/sys/class/backlight` plus the slider's re-read | Kernel `backlight` uevents (every sysfs write and hotkey change emits one) and output-inventory changes; fixture roots (`TUNA_BACKLIGHT_ROOT`) would keep the poll |
