@@ -8,6 +8,7 @@ import stat
 import json
 import tempfile
 import time
+import subprocess
 from types import SimpleNamespace
 from unittest import mock
 import unittest
@@ -222,6 +223,26 @@ class FailedRequestReceipt(unittest.TestCase):
             self.assertEqual(receipts[0]['user_signals_after'],0)
             self.assertTrue(receipts[0]['after_capability'])
             self.assertIn('ended_ns',receipts[0])
+
+class PowerSequenceAdmission(unittest.TestCase):
+    def test_dim_and_undim_only_wait_for_the_owned_idle_transaction(self):
+        source=(ROOT/'scripts/tuna-gtk-shell-proof').read_text()
+        helper='shell_dimming() {'+source.split('shell_dimming() {',1)[1].split('\n}\n',1)[0]+'\n}\n'
+        for value in ('true','false'):
+            for reply,expected in (('',0),('brightness update already pending',77),
+                                   ('controlled denial',13)):
+                with self.subTest(value=value,reply=reply):
+                    result=subprocess.run(['bash','-c','''
+set -eu
+date() { printf '100\\n'; }
+sleep() { exit 77; }
+fail() { printf '%s\\n' "$*" >&2; exit 13; }
+gdbus() {
+    if [ -n "$TEST_REPLY" ]; then printf '%s\\n' "$TEST_REPLY" >&2; return 1; fi
+}
+'''+helper+'shell_dimming '+value],env=dict(os.environ,TEST_REPLY=reply),
+                        capture_output=True,text=True,timeout=10)
+                    self.assertEqual(result.returncode,expected,result.stderr)
 
 class IdleRestoreAdmission(unittest.TestCase):
     class WireError(Exception):

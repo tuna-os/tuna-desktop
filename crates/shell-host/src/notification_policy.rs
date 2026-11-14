@@ -123,14 +123,13 @@ impl SourcePolicy {
     }
 }
 
-/// What happens to one arriving notification.
+/// What happens to one arriving notification. Its sound is decided when
+/// its banner shows, not here (see
+/// [`NotificationCenter::banner_sound`](crate::notifications::NotificationCenter::banner_sound)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Delivery {
     /// It goes up as a banner.
     pub banner: bool,
-    /// Its sound plays (only alongside a banner, as GNOME plays it when
-    /// the banner shows).
-    pub sound: bool,
     /// The banner opens expanded.
     pub expanded: bool,
 }
@@ -147,9 +146,16 @@ pub fn deliver(policy: &SourcePolicy, urgency: Urgency, dnd: bool) -> Option<Del
     let banner = critical || (!dnd && policy.show_banners);
     Some(Delivery {
         banner,
-        sound: banner && policy.enable_sound,
         expanded: banner && (critical || policy.force_expanded),
     })
+}
+
+/// Whether a banner coming on screen plays its notification's sound
+/// (messageTray.js `Notification.playSound`, run from
+/// `_updateShowingNotification`): only when the sender named one and
+/// the source's `enable-sound-alerts` allows it at that moment.
+pub fn plays_sound(policy: &SourcePolicy, sound: &crate::notifications::Sound) -> bool {
+    policy.enable_sound && !sound.is_empty()
 }
 
 /// GNOME's settings path id for an app id (`_canonicalizeId`):
@@ -208,57 +214,74 @@ pub fn register_child(children: &[String], canonical: &str) -> Option<Vec<String
 pub struct LockSource {
     /// The source's grouping key.
     pub key: String,
-    /// Its newest unseen notification (names and icons the source).
+    /// Its newest notification (names and icons the source).
     pub newest: u64,
-    /// How many of its notifications are unseen.
+    /// How many of its notifications are unseen (`unseenCount`).
     pub count: usize,
-    /// Any of them is critical.
+    /// Any of its notifications is critical (the box's `critical`
+    /// style; seen ones count, as `source.notifications.some(...)`).
     pub critical: bool,
-    /// With `details-in-lock-screen`, each unseen notification's title
-    /// and body, newest first; otherwise `None` and only the source's
-    /// name and count may show.
+    /// When details show (`_shouldShowDetails`), each unseen
+    /// notification's title and body, oldest first as GNOME lists them;
+    /// otherwise `None` and only the source's name and count may show.
     pub details: Option<Vec<(String, String)>>,
 }
 
-/// The lock screen's notification sources: per source, newest first,
-/// its unseen notifications, kept only when its policy shows it while
-/// locked (`show-in-lock-screen`, global and per app). Titles and bodies
-/// are copied only for a source whose policy allows details, so nothing
-/// else can draw them.
+/// The lock screen's notification sources, as unlockDialog.js 51's
+/// `NotificationsBox` shows them. `oldest_first` is the history. A
+/// source shows while it has unseen notifications and its policy keeps
+/// it on the lock screen (`enable`, then `show-in-lock-screen`, global
+/// and per app); critical ones get no exception. Details show with the
+/// app's `details-in-lock-screen`, or when every notification of the
+/// source is system-scoped (`narrowestPrivacyScope`); only then are
+/// titles and bodies copied, so nothing else can draw them. Sources come
+/// newest first by when they started (each new source box goes on top).
 pub fn lock_screen<'a>(
-    newest_first: impl IntoIterator<Item = &'a crate::notifications::Notification>,
+    oldest_first: impl IntoIterator<Item = &'a crate::notifications::Notification>,
     mut policy_for: impl FnMut(&crate::notifications::Notification) -> SourcePolicy,
 ) -> Vec<LockSource> {
-    let mut out: Vec<(LockSource, bool)> = Vec::new();
-    for n in newest_first.into_iter().filter(|n| !n.acknowledged()) {
+    struct Source<'a> {
+        policy: SourcePolicy,
+        members: Vec<&'a crate::notifications::Notification>,
+    }
+    let mut sources: Vec<Source<'a>> = Vec::new();
+    for n in oldest_first {
         let key = n.source_key();
-        let at = match out.iter().position(|(s, _)| s.key == key) {
-            Some(at) => at,
-            None => {
-                let policy = policy_for(n);
-                out.push((
-                    LockSource {
-                        key: key.to_owned(),
-                        newest: n.id,
-                        count: 0,
-                        critical: false,
-                        details: policy.details_in_lock_screen.then(Vec::new),
-                    },
-                    policy.enable && policy.show_in_lock_screen,
-                ));
-                out.len() - 1
-            }
-        };
-        let source = &mut out[at].0;
-        source.count += 1;
-        source.critical |= n.urgency == Urgency::Critical;
-        if let Some(details) = source.details.as_mut() {
-            details.push((n.summary().to_owned(), n.body().to_owned()));
+        match sources
+            .iter_mut()
+            .find(|s| s.members[0].source_key() == key)
+        {
+            Some(source) => source.members.push(n),
+            None => sources.push(Source {
+                policy: policy_for(n),
+                members: vec![n],
+            }),
         }
     }
-    out.into_iter()
-        .filter(|(_, shown)| *shown)
-        .map(|(s, _)| s)
+    sources
+        .into_iter()
+        .rev()
+        .filter(|s| s.policy.enable && s.policy.show_in_lock_screen)
+        .filter_map(|s| {
+            let unseen: Vec<_> = s.members.iter().filter(|n| !n.acknowledged()).collect();
+            if unseen.is_empty() {
+                return None;
+            }
+            let detailed =
+                s.policy.details_in_lock_screen || s.members.iter().all(|n| n.system_scope());
+            Some(LockSource {
+                key: s.members[0].source_key().to_owned(),
+                newest: s.members.last().map_or(0, |n| n.id),
+                count: unseen.len(),
+                critical: s.members.iter().any(|n| n.urgency == Urgency::Critical),
+                details: detailed.then(|| {
+                    unseen
+                        .iter()
+                        .map(|n| (n.summary().to_owned(), n.body().to_owned()))
+                        .collect()
+                }),
+            })
+        })
         .collect()
 }
 
@@ -299,7 +322,8 @@ impl GioPolicyStore {
         Self::default()
     }
 
-    fn global_settings() -> Option<gio::Settings> {
+    /// The global notification settings, or `None` without the schema.
+    pub fn global_settings() -> Option<gio::Settings> {
         let source = gio::SettingsSchemaSource::default()?;
         source.lookup(NOTIFICATIONS_SCHEMA, true)?;
         Some(gio::Settings::new(NOTIFICATIONS_SCHEMA))
@@ -462,10 +486,10 @@ mod tests {
     fn banners_follow_the_app_switch_and_dnd_but_critical_breaks_through() {
         let on = SourcePolicy::app(GlobalPrefs::default(), AppPrefs::default());
         let normal = deliver(&on, Urgency::Normal, false).unwrap();
-        assert!(normal.banner && normal.sound && !normal.expanded);
-        // Do Not Disturb holds the banner, and with it the sound.
+        assert!(normal.banner && !normal.expanded);
+        // Do Not Disturb holds the banner.
         let dnd = deliver(&on, Urgency::Normal, true).unwrap();
-        assert!(!dnd.banner && !dnd.sound);
+        assert!(!dnd.banner);
         // The app's own banner switch does the same.
         let quiet = SourcePolicy::app(
             GlobalPrefs::default(),
@@ -478,12 +502,20 @@ mod tests {
         // Critical shows through both, expanded.
         for dnd in [false, true] {
             let crit = deliver(&quiet, Urgency::Critical, dnd).unwrap();
-            assert!(crit.banner && crit.sound && crit.expanded);
+            assert!(crit.banner && crit.expanded);
         }
     }
 
     #[test]
     fn sound_and_expansion_are_per_app() {
+        let sound = crate::notifications::Sound {
+            name: "message-new-instant".into(),
+            file: String::new(),
+        };
+        let on = SourcePolicy::app(GlobalPrefs::default(), AppPrefs::default());
+        assert!(plays_sound(&on, &sound));
+        // Nothing named: nothing plays, whatever the policy.
+        assert!(!plays_sound(&on, &crate::notifications::Sound::default()));
         let p = SourcePolicy::app(
             GlobalPrefs::default(),
             AppPrefs {
@@ -493,8 +525,17 @@ mod tests {
             },
         );
         let d = deliver(&p, Urgency::Normal, false).unwrap();
-        assert!(d.banner && !d.sound && d.expanded);
-        assert!(!deliver(&p, Urgency::Critical, true).unwrap().sound);
+        assert!(d.banner && d.expanded);
+        // enable-sound-alerts off silences critical banners too.
+        assert!(!plays_sound(&p, &sound));
+        // The generic policy always allows sound (NotificationPolicy).
+        assert!(plays_sound(
+            &SourcePolicy::generic(GlobalPrefs {
+                show_banners: false,
+                show_in_lock_screen: false,
+            }),
+            &sound
+        ));
     }
 
     fn lock_fixture() -> crate::notifications::NotificationCenter {
@@ -529,7 +570,7 @@ mod tests {
     #[test]
     fn lock_screen_counts_unseen_notifications_per_source_without_details() {
         let c = lock_fixture();
-        let view = lock_screen(c.history().iter().rev(), lock_policy(""));
+        let view = lock_screen(c.history().iter(), lock_policy(""));
         assert_eq!(
             view.iter()
                 .map(|s| (s.key.as_str(), s.newest, s.count, s.critical))
@@ -543,14 +584,15 @@ mod tests {
     #[test]
     fn lock_screen_details_are_per_app() {
         let c = lock_fixture();
-        let view = lock_screen(c.history().iter().rev(), lock_policy("mail"));
+        let view = lock_screen(c.history().iter(), lock_policy("mail"));
         let mail = view.iter().find(|s| s.key == "mail").unwrap();
+        // In arrival order, as unlockDialog.js walks source.notifications.
         assert_eq!(
             mail.details.as_deref(),
             Some(
                 &[
-                    ("Lunch?".to_owned(), "At noon".to_owned()),
                     ("Invoice".to_owned(), "Amount due: 12".to_owned()),
+                    ("Lunch?".to_owned(), "At noon".to_owned()),
                 ][..]
             )
         );
@@ -571,7 +613,7 @@ mod tests {
                 },
             )
         };
-        let view = lock_screen(c.history().iter().rev(), hide_chat);
+        let view = lock_screen(c.history().iter(), hide_chat);
         assert_eq!(
             view.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
             ["mail"]
@@ -581,11 +623,77 @@ mod tests {
             show_banners: true,
             show_in_lock_screen: false,
         };
-        assert!(lock_screen(c.history().iter().rev(), |_| SourcePolicy::generic(off)).is_empty());
+        assert!(lock_screen(c.history().iter(), |_| SourcePolicy::generic(off)).is_empty());
         // Everything seen: nothing to show.
         let mut c = c;
         c.acknowledge(&[1, 2, 3, 4, 5]);
-        assert!(lock_screen(c.history().iter().rev(), lock_policy("mail")).is_empty());
+        assert!(lock_screen(c.history().iter(), lock_policy("mail")).is_empty());
+    }
+
+    #[test]
+    fn critical_notifications_get_no_lock_screen_exception() {
+        let c = lock_fixture();
+        // chat holds the critical one: off the lock screen it stays off,
+        // and a disabled app never shows there.
+        let policy = |n: &Notification| {
+            SourcePolicy::app(
+                GlobalPrefs::default(),
+                AppPrefs {
+                    show_in_lock_screen: n.app() != "chat",
+                    enable: n.app() != "mail",
+                    ..AppPrefs::default()
+                },
+            )
+        };
+        assert!(lock_screen(c.history().iter(), policy).is_empty());
+        // A source keeps its critical style once that one is seen.
+        let mut c = c;
+        c.acknowledge(&[3]);
+        let view = lock_screen(c.history().iter(), lock_policy(""));
+        let chat = view.iter().find(|s| s.key == "chat").unwrap();
+        assert_eq!((chat.count, chat.critical), (1, true));
+    }
+
+    #[test]
+    fn lock_sources_stack_newest_started_first() {
+        let mut c = crate::notifications::NotificationCenter::new();
+        for app in ["mail", "chat", "mail"] {
+            c.notify(app, "t", "b", vec![], Urgency::Normal, None);
+        }
+        // mail has the newest notification but started first: each new
+        // source box goes on top (`insert_child_at_index`).
+        let view = lock_screen(c.history().iter(), lock_policy(""));
+        assert_eq!(
+            view.iter()
+                .map(|s| (s.key.as_str(), s.newest))
+                .collect::<Vec<_>>(),
+            [("chat", 2), ("mail", 3)]
+        );
+    }
+
+    #[test]
+    fn system_scoped_sources_show_details_without_the_app_key() {
+        use crate::notifications::{Incoming, NotificationCenter};
+        let incoming = |app: &str, title: &str, system: bool| Incoming {
+            app: app.into(),
+            title: title.into(),
+            body: format!("{title} body"),
+            system_scope: system,
+            ..Incoming::default()
+        };
+        let mut c = NotificationCenter::new();
+        c.deliver(incoming("power", "Battery low", true));
+        c.deliver(incoming("mixed", "System", true));
+        c.deliver(incoming("mixed", "User", false));
+        let view = lock_screen(c.history().iter(), lock_policy(""));
+        let power = view.iter().find(|s| s.key == "power").unwrap();
+        assert_eq!(
+            power.details.as_deref(),
+            Some(&[("Battery low".to_owned(), "Battery low body".to_owned())][..])
+        );
+        // One user-scoped notification makes the whole source private.
+        let mixed = view.iter().find(|s| s.key == "mixed").unwrap();
+        assert_eq!((mixed.count, mixed.details.as_ref()), (2, None));
     }
 
     #[test]

@@ -26,6 +26,7 @@ impl Group {
         open: bool,
     ) -> Rc<Self> {
         let stack = gtk::Stack::new();
+        stack.set_hhomogeneous(false);
         stack.set_vhomogeneous(false);
         stack.add_named(collapsed, Some("collapsed"));
         stack.add_named(expanded, Some("expanded"));
