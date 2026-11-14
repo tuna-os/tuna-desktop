@@ -185,12 +185,30 @@ impl Registry {
 #[derive(Debug, Clone, Default)]
 pub struct Share {
     inhibited: Arc<AtomicU32>,
+    /// Pinged when the published actions change (#503): the loop does not
+    /// poll them, and an idle inhibitor taken or dropped changes what is
+    /// drawn (a blanked screen lights again).
+    wake: crate::wake::Wake,
 }
 
 impl Share {
     /// An idle inhibitor is held (Tuna's idle lock and fade wait).
     pub fn idle_inhibited(&self) -> bool {
         self.inhibited.load(Ordering::Acquire) & FLAG_IDLE != 0
+    }
+
+    pub(crate) fn set_wake(&self, wake: &crate::wake::Wake) {
+        self.wake.connect(wake);
+    }
+
+    /// Publish `actions`; whether they changed. A change wakes the loop
+    /// after it is published.
+    fn publish(&self, actions: u32) -> bool {
+        let changed = self.inhibited.swap(actions, Ordering::AcqRel) != actions;
+        if changed {
+            self.wake.signal();
+        }
+        changed
     }
 }
 
@@ -253,8 +271,7 @@ fn read_policy() -> (bool, bool) {
 
 impl Manager {
     fn publish(&self, registry: &Registry) -> bool {
-        let actions = registry.inhibited_actions();
-        self.share.inhibited.swap(actions, Ordering::AcqRel) != actions
+        self.share.publish(registry.inhibited_actions())
     }
 
     /// `Shutdown`, `Reboot` and `Logout`: gnome-session 51
@@ -899,11 +916,7 @@ fn serve_with(
                             continue;
                         }
                         let gone = registry.vanished(&name);
-                        let actions = registry.inhibited_actions();
-                        (
-                            gone,
-                            share.inhibited.swap(actions, Ordering::AcqRel) != actions,
-                        )
+                        (gone, share.publish(registry.inhibited_actions()))
                     };
                     let Ok(manager) = conn.object_server().interface::<_, Manager>(PATH).await
                     else {
@@ -1067,6 +1080,38 @@ mod tests {
         assert_eq!(registry.inhibited_actions(), FLAG_SUSPEND);
         assert_eq!(registry.paths(), vec![b.path]);
         assert!(registry.vanished(":1.7").is_empty());
+    }
+
+    /// #503: the loop reads the inhibitors without polling them, so a
+    /// change has to wake it; a blanked screen would otherwise stay dark
+    /// under a new inhibitor until something unrelated drew a frame.
+    #[test]
+    fn a_published_inhibitor_change_wakes_the_loop_once_per_change() {
+        let (wake, source) = crate::wake::Wake::new().unwrap();
+        let mut loop_ = calloop::EventLoop::<usize>::try_new().unwrap();
+        loop_
+            .handle()
+            .insert_source(source, |_, _, wakes| *wakes += 1)
+            .unwrap();
+        let share = Share::default();
+        // The service thread holds a clone made before the loop exists.
+        let served = share.clone();
+        share.set_wake(&wake);
+        let mut wakes = 0;
+        let mut woken = |loop_: &mut calloop::EventLoop<usize>| {
+            let before = wakes;
+            loop_.dispatch(Some(Duration::ZERO), &mut wakes).unwrap();
+            wakes - before
+        };
+
+        assert!(served.publish(FLAG_IDLE));
+        assert!(share.idle_inhibited());
+        assert_eq!(woken(&mut loop_), 1, "a new idle inhibitor wakes the loop");
+        assert!(!served.publish(FLAG_IDLE));
+        assert_eq!(woken(&mut loop_), 0, "an unchanged set does not");
+        assert!(served.publish(0));
+        assert!(!share.idle_inhibited());
+        assert_eq!(woken(&mut loop_), 1, "its release does");
     }
 
     #[test]

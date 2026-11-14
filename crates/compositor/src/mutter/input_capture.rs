@@ -821,6 +821,8 @@ pub(crate) struct InputCapture {
     pub to_loop: calloop::channel::Sender<ToLoop>,
     pub signals: SignalQueue,
     pub next_id: Arc<AtomicU64>,
+    /// Wakes the revocation scan for the new session.
+    pub scan: Arc<super::ScanWake>,
 }
 
 #[interface(name = "org.gnome.Mutter.InputCapture")]
@@ -879,6 +881,7 @@ impl InputCapture {
             .lock()
             .map_err(|_| fdo::Error::Failed("input capture registry unavailable".into()))?
             .insert(id, shared);
+        self.scan.notify();
         Ok(path)
     }
 

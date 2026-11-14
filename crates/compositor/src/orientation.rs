@@ -22,6 +22,7 @@
 //! (monitors.xml rotation names). Sensor mapping: `normal`→0,
 //! `bottom-up`→180, `left-up`→90, `right-up`→270.
 
+use futures_lite::StreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -240,6 +241,33 @@ impl OrientationPolicy {
     }
 }
 
+/// A wake for whoever acts on a shared flag, run when the flag changes
+/// (#503): the sensor client claims and releases on these flags without
+/// re-reading them on a timer. Installed once.
+#[derive(Default)]
+pub struct ChangeHook(std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>);
+
+impl ChangeHook {
+    /// Install `wake`; a second call is ignored.
+    pub fn set(&self, wake: impl Fn() + Send + Sync + 'static) {
+        let _ = self.0.set(Box::new(wake));
+    }
+
+    pub fn fire(&self) {
+        if let Some(wake) = self.0.get() {
+            wake();
+        }
+    }
+}
+
+impl std::fmt::Debug for ChangeHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ChangeHook")
+            .field(&self.0.get().is_some())
+            .finish()
+    }
+}
+
 /// Flags shared between the event loop and the Mutter D-Bus thread.
 #[derive(Debug, Default)]
 pub struct OrientationShare {
@@ -247,9 +275,11 @@ pub struct OrientationShare {
     /// DisplayConfig's `PanelOrientationManaged` reads it.
     pub managed: AtomicBool,
     /// The event loop sets this from `orientation-lock`; the sensor
-    /// poller releases its claim while set (mutter inhibits tracking
+    /// client releases its claim while set (mutter inhibits tracking
     /// on lock).
     pub inhibited: AtomicBool,
+    /// Runs when `inhibited` changes.
+    pub changed: ChangeHook,
 }
 
 impl OrientationShare {
@@ -266,39 +296,90 @@ impl OrientationShare {
     }
 
     pub fn set_inhibited(&self, inhibited: bool) {
-        self.inhibited.store(inhibited, Ordering::SeqCst);
+        if self.inhibited.swap(inhibited, Ordering::SeqCst) != inhibited {
+            self.changed.fire();
+        }
     }
 }
 
-/// Blocking iio-sensor-proxy client, polled from the Mutter D-Bus
-/// thread's scan loop. Connects lazily, claims the accelerometer while
-/// tracking (mutter's claim discipline), releases on lock, and retries
-/// an absent service every few seconds so hotplug just works. Every
-/// failure degrades to [`SensorSample::ABSENT`], never to a rotation.
+/// How often a present sensor is read when its signals could not be
+/// subscribed, and a failed claim is retried: the former poll period.
+const SENSOR_POLL: Duration = Duration::from_millis(100);
+
+/// What the signal thread tells the client.
+#[derive(Default)]
+struct Signals {
+    /// A signal arrived since the client last read the sensor.
+    dirty: AtomicBool,
+    /// The subscription still delivers (its connection is open).
+    live: AtomicBool,
+}
+
+/// Connects the client to the system bus (a private bus in tests).
+type Connect = Box<dyn Fn() -> zbus::Result<zbus::Connection> + Send>;
+
+/// Blocking iio-sensor-proxy client for the Mutter D-Bus thread's scan,
+/// driven by the bus as mutter's `MetaOrientationManager` is (#503): one
+/// system-bus connection hears `NameOwnerChanged` for the service and the
+/// sensor's `PropertiesChanged`, and the client reads the sensor only
+/// after such a signal or a change of the inhibiting flags; the caller
+/// polls it when `wake` runs. It claims the accelerometer while tracking
+/// (mutter's claim discipline) and releases on lock. A connection whose
+/// signals cannot be subscribed keeps the former polling: a present
+/// sensor every 100 ms, an absent service through a new connection every
+/// 5 s ([`SensorPoller::next_due`]). Every failure degrades to
+/// [`SensorSample::ABSENT`], never to a rotation.
 pub struct SensorPoller {
+    connect: Connect,
+    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
     connection: Option<zbus::Connection>,
+    signals: Option<std::sync::Arc<Signals>>,
     claimed: bool,
+    /// A claim failed; it is retried every [`SENSOR_POLL`].
+    claim_failed: bool,
     next_retry: Instant,
+    next_read: Instant,
+    inhibited: Option<bool>,
     last: Option<SensorSample>,
 }
 
 impl SensorPoller {
-    pub fn new() -> Self {
+    /// A client on the system bus; `wake` runs (on a signal thread) when
+    /// the next [`poll`](Self::poll) has something to read.
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self::with_bus(
+            wake,
+            Box::new(|| zbus::block_on(zbus::Connection::system())),
+        )
+    }
+
+    fn with_bus(wake: impl Fn() + Send + Sync + 'static, connect: Connect) -> Self {
+        let now = Instant::now();
         Self {
+            connect,
+            wake: std::sync::Arc::new(wake),
             connection: None,
+            signals: None,
             claimed: false,
-            next_retry: Instant::now(),
+            claim_failed: false,
+            next_retry: now,
+            next_read: now,
+            inhibited: None,
             last: None,
         }
     }
 
+    /// Plain reads: a property cache would add a match rule and a
+    /// `GetAll` per proxy.
     fn proxy(connection: &zbus::Connection) -> zbus::Result<zbus::Proxy<'_>> {
-        zbus::block_on(zbus::Proxy::new(
-            connection,
-            SENSOR_BUS_NAME,
-            SENSOR_OBJECT_PATH,
-            SENSOR_INTERFACE,
-        ))
+        zbus::block_on(
+            zbus::proxy::Builder::new(connection)
+                .destination(SENSOR_BUS_NAME)
+                .path(SENSOR_OBJECT_PATH)
+                .interface(SENSOR_INTERFACE)
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build(),
+        )
     }
 
     fn release(&mut self) {
@@ -313,19 +394,62 @@ impl SensorPoller {
         }
     }
 
+    fn live(&self) -> bool {
+        self.signals
+            .as_ref()
+            .is_some_and(|signals| signals.live.load(Ordering::SeqCst))
+    }
+
     fn drop_connection(&mut self, now: Instant) {
         self.claimed = false;
-        self.connection = None;
+        self.signals = None;
+        if let Some(connection) = self.connection.take() {
+            // Ends a signal thread still reading it.
+            let _ = zbus::block_on(connection.close());
+        }
         self.next_retry = now + SENSOR_RETRY;
     }
 
-    /// Poll the sensor once. Returns the sample only when it changed
-    /// since the previous poll, so the caller sends on change.
+    /// When the next [`poll`](Self::poll) reads without a signal: never
+    /// while the subscription delivers (unless a claim failed), else the
+    /// former polling.
+    pub fn next_due(&self) -> Option<Instant> {
+        if self.claim_failed {
+            return Some(self.next_read);
+        }
+        if self.live() {
+            return None;
+        }
+        Some(if self.connection.is_none() {
+            self.next_retry
+        } else {
+            self.next_read
+        })
+    }
+
+    /// Read the sensor if a signal arrived, the flags changed or a
+    /// fallback poll is due ([`next_due`](Self::next_due)). Returns the
+    /// sample only when it changed since the previous read, so the
+    /// caller sends on change.
     pub fn poll(&mut self, inhibited: bool) -> Option<SensorSample> {
         let now = Instant::now();
+        let signalled = self
+            .signals
+            .as_ref()
+            .is_some_and(|signals| signals.dirty.swap(false, Ordering::SeqCst));
+        let due = signalled
+            || self.inhibited != Some(inhibited)
+            || self.next_due().is_some_and(|due| now >= due);
+        if !due {
+            return None;
+        }
+        self.inhibited = Some(inhibited);
         if self.connection.is_none() && now >= self.next_retry {
-            match zbus::block_on(zbus::Connection::system()) {
-                Ok(connection) => self.connection = Some(connection),
+            match (self.connect)() {
+                Ok(connection) => {
+                    self.signals = subscribe(&connection, self.wake.clone());
+                    self.connection = Some(connection);
+                }
                 Err(e) => {
                     eprintln!("tuna-compositor: orientation: no system bus: {e}");
                     self.next_retry = now + SENSOR_RETRY;
@@ -333,6 +457,7 @@ impl SensorPoller {
             }
         }
         let sample = self.read(inhibited, now);
+        self.next_read = now + SENSOR_POLL;
         if Some(sample) != self.last {
             self.last = Some(sample);
             Some(sample)
@@ -350,14 +475,20 @@ impl SensorPoller {
     }
 
     fn read(&mut self, inhibited: bool, now: Instant) -> SensorSample {
+        self.claim_failed = false;
         if self.connection.is_none() {
             return SensorSample::ABSENT;
         }
         let present: Option<bool> =
             self.with_proxy(|proxy| zbus::block_on(proxy.get_property("HasAccelerometer")));
         let Some(present) = present else {
-            // The service is absent or vanished (hotplug): retry later.
-            self.drop_connection(now);
+            // The service is absent or vanished (hotplug). A live
+            // subscription hears it return; otherwise retry later.
+            if self.live() {
+                self.claimed = false;
+            } else {
+                self.drop_connection(now);
+            }
             return SensorSample::ABSENT;
         };
         if inhibited {
@@ -367,7 +498,10 @@ impl SensorPoller {
                 .with_proxy(|proxy| zbus::block_on(proxy.call_method("ClaimAccelerometer", &())))
             {
                 Some(_) => self.claimed = true,
-                None => eprintln!("tuna-compositor: orientation: claim failed"),
+                None => {
+                    eprintln!("tuna-compositor: orientation: claim failed");
+                    self.claim_failed = true;
+                }
             }
         }
         let orientation = if present {
@@ -385,15 +519,99 @@ impl SensorPoller {
     }
 }
 
+/// Subscribe `connection` to the service's owner changes and the sensor's
+/// property changes, and spawn the thread that marks each one and runs
+/// `wake`. `None` when the subscription cannot be placed (the client
+/// then polls as before).
+fn subscribe(
+    connection: &zbus::Connection,
+    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+) -> Option<std::sync::Arc<Signals>> {
+    let rules = (|| -> zbus::Result<_> {
+        Ok([
+            zbus::MatchRule::builder()
+                .msg_type(zbus::message::Type::Signal)
+                .sender("org.freedesktop.DBus")
+                .interface("org.freedesktop.DBus")
+                .member("NameOwnerChanged")
+                .arg(0, SENSOR_BUS_NAME)
+                .build()?,
+            zbus::MatchRule::builder()
+                .msg_type(zbus::message::Type::Signal)
+                .interface("org.freedesktop.DBus.Properties")
+                .member("PropertiesChanged")
+                .path(SENSOR_OBJECT_PATH)
+                .build()?,
+        ])
+    })();
+    let placed = rules.and_then(|rules| {
+        // The stream exists before the rules, so no signal falls between.
+        let messages = zbus::MessageStream::from(connection);
+        zbus::block_on(async {
+            let bus = zbus::fdo::DBusProxy::new(connection).await?;
+            for rule in rules {
+                bus.add_match_rule(rule).await?;
+            }
+            Ok(messages)
+        })
+    });
+    let messages = match placed {
+        Ok(messages) => messages,
+        Err(e) => {
+            eprintln!("tuna-compositor: orientation: no sensor signals, polling: {e}");
+            return None;
+        }
+    };
+    let signals = std::sync::Arc::new(Signals {
+        dirty: AtomicBool::new(false),
+        live: AtomicBool::new(true),
+    });
+    let thread_signals = signals.clone();
+    let spawned = std::thread::Builder::new()
+        .name("tuna-orientation".into())
+        .spawn(move || {
+            let mut messages = messages;
+            zbus::block_on(async {
+                while let Some(message) = messages.next().await {
+                    let Ok(message) = message else {
+                        continue;
+                    };
+                    let header = message.header();
+                    let ours = header.message_type() == zbus::message::Type::Signal
+                        && header.member().is_some_and(|member| {
+                            member.as_str() == "NameOwnerChanged"
+                                || member.as_str() == "PropertiesChanged"
+                        });
+                    if ours {
+                        thread_signals.dirty.store(true, Ordering::SeqCst);
+                        wake();
+                    }
+                }
+            });
+            // The connection closed: the client falls back to polling.
+            thread_signals.live.store(false, Ordering::SeqCst);
+            thread_signals.dirty.store(true, Ordering::SeqCst);
+            wake();
+        });
+    if let Err(e) = spawned {
+        eprintln!("tuna-compositor: orientation: no signal thread, polling: {e}");
+        return None;
+    }
+    Some(signals)
+}
+
 impl Default for SensorPoller {
     fn default() -> Self {
-        Self::new()
+        Self::new(|| {})
     }
 }
 
 impl Drop for SensorPoller {
     fn drop(&mut self) {
         self.release();
+        if let Some(connection) = self.connection.take() {
+            let _ = zbus::block_on(connection.close());
+        }
     }
 }
 
@@ -664,9 +882,172 @@ mod tests {
         // be present, and a rotating device could legitimately change
         // the sample between two polls. Polling, releasing and dropping
         // must simply never panic.
-        let mut poller = SensorPoller::new();
+        let mut poller = SensorPoller::default();
         let _ = poller.poll(false);
         let _ = poller.poll(true);
         poller.release();
+    }
+
+    /// A stand-in iio-sensor-proxy counting what the client asks.
+    struct FakeSensor {
+        orientation: String,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        claims: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        releases: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[zbus::interface(name = "net.hadess.SensorProxy")]
+    impl FakeSensor {
+        #[zbus(property)]
+        fn has_accelerometer(&self) -> bool {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+
+        #[zbus(property)]
+        fn accelerometer_orientation(&self) -> String {
+            self.orientation.clone()
+        }
+
+        fn claim_accelerometer(&self) {
+            self.claims.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn release_accelerometer(&self) {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// #503: the client reads the sensor after `NameOwnerChanged` and
+    /// `PropertiesChanged` and after a flag change, and never on a timer:
+    /// with nothing signalled nothing is due and nothing is read (the
+    /// former scan read it every 100 ms, and re-connected every 5 s while
+    /// the service was absent).
+    #[test]
+    fn the_sensor_client_reads_on_signals_and_flag_changes_only() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Child, Command, Stdio};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        struct Bus(Child);
+        impl Drop for Bus {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut daemon = Bus(Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("private test bus starts"));
+        let mut address = String::new();
+        BufReader::new(daemon.0.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+        let address = address.trim().to_owned();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let woken = |from: usize| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while wakes.load(Ordering::SeqCst) == from {
+                assert!(Instant::now() < deadline, "no wake");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let mut client = {
+            let (wakes, address) = (wakes.clone(), address.clone());
+            SensorPoller::with_bus(
+                move || {
+                    wakes.fetch_add(1, Ordering::SeqCst);
+                },
+                Box::new(move || {
+                    zbus::block_on(zbus::connection::Builder::address(address.as_str()).build())
+                }),
+            )
+        };
+
+        // No service: one read, then the subscription needs no timer.
+        assert_eq!(client.poll(false), Some(SensorSample::ABSENT));
+        assert_eq!(client.next_due(), None, "a live subscription polls nothing");
+        assert_eq!(client.poll(false), None);
+
+        // The service appears: its owner change wakes the client, which
+        // claims and reads.
+        let (reads, claims, releases) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let before = wakes.load(Ordering::SeqCst);
+        let service = zbus::block_on(
+            zbus::connection::Builder::address(address.as_str())
+                .serve_at(
+                    SENSOR_OBJECT_PATH,
+                    FakeSensor {
+                        orientation: "normal".into(),
+                        reads: reads.clone(),
+                        claims: claims.clone(),
+                        releases: releases.clone(),
+                    },
+                )
+                .name(SENSOR_BUS_NAME)
+                .build(),
+        )
+        .unwrap();
+        woken(before);
+        assert_eq!(
+            client.poll(false),
+            Some(SensorSample {
+                present: true,
+                orientation: Some(SensorOrientation::Normal),
+            })
+        );
+        assert_eq!(claims.load(Ordering::SeqCst), 1, "tracking claims");
+
+        // Quiet: nothing is due and nothing is read.
+        let read = reads.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(client.next_due(), None);
+        assert_eq!(client.poll(false), None);
+        assert_eq!(reads.load(Ordering::SeqCst), read, "no signal, no read");
+
+        // The device turns: `PropertiesChanged` wakes the client.
+        let before = wakes.load(Ordering::SeqCst);
+        let sensor = zbus::block_on(
+            service
+                .object_server()
+                .interface::<_, FakeSensor>(SENSOR_OBJECT_PATH),
+        )
+        .unwrap();
+        zbus::block_on(async {
+            sensor.get_mut().await.orientation = "left-up".into();
+            sensor
+                .get()
+                .await
+                .accelerometer_orientation_changed(sensor.signal_emitter())
+                .await
+        })
+        .unwrap();
+        woken(before);
+        assert_eq!(
+            client.poll(false),
+            Some(SensorSample {
+                present: true,
+                orientation: Some(SensorOrientation::LeftUp),
+            })
+        );
+
+        // Orientation lock: the flag change alone releases the claim.
+        assert_eq!(client.poll(true), None, "the sample holds");
+        assert_eq!(releases.load(Ordering::SeqCst), 1, "locking releases");
+
+        // The service leaves: its owner change reads as absent.
+        let before = wakes.load(Ordering::SeqCst);
+        drop(sensor);
+        drop(service);
+        woken(before);
+        assert_eq!(client.poll(true), Some(SensorSample::ABSENT));
+        assert_eq!(client.next_due(), None);
     }
 }
