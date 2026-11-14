@@ -18,7 +18,6 @@ use wayland_client::{
         wl_registry::{self, WlRegistry},
         wl_seat::WlSeat,
         wl_subcompositor::WlSubcompositor,
-        wl_subsurface::WlSubsurface,
         wl_surface::WlSurface,
     },
     Connection, Dispatch, EventQueue, QueueHandle,
@@ -273,8 +272,6 @@ wayland_client::delegate_noop!(Client: ignore WpFifoManagerV1);
 wayland_client::delegate_noop!(Client: ignore WpFifoV1);
 wayland_client::delegate_noop!(Client: ignore WpCommitTimingManagerV1);
 wayland_client::delegate_noop!(Client: ignore WpCommitTimerV1);
-wayland_client::delegate_noop!(Client: ignore WlSubcompositor);
-wayland_client::delegate_noop!(Client: ignore WlSubsurface);
 wayland_client::delegate_noop!(Client: ignore ZwpKeyboardShortcutsInhibitManagerV1);
 wayland_client::delegate_noop!(Client: ignore XdgSystemBellV1);
 wayland_client::delegate_noop!(Client: ignore XdgWmDialogV1);

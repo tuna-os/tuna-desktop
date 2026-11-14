@@ -1850,8 +1850,13 @@ impl Runtime {
             // Lock is compositor-owned even if the supervised shell died.
             self.engage_lock();
             #[cfg(feature = "drm")]
-            if let Backend::Drm(drm) = &mut self.backend {
-                drm.resume_from_sleep();
+            {
+                if let Backend::Drm(drm) = &mut self.backend {
+                    drm.resume_from_sleep();
+                }
+                // Monitors (and their HDR signalling) may have changed
+                // while suspended.
+                self.on_drm_hotplug();
             }
         }
     }
@@ -8515,27 +8520,11 @@ fn draw_scene(
     .map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan, opaque).map_err(error)?;
     draw_slots(
-        frame,
-        output,
-        scale,
-        scene,
-        &over,
-        &over_plan,
-        tint,
-        colors,
-        opaque,
+        frame, output, scale, scene, &over, &over_plan, tint, colors, opaque,
     )
     .map_err(error)?;
     crate::color_render::draw_planned(
-        frame,
-        scale,
-        &scene.top,
-        &top_plan,
-        colors,
-        tint,
-        1.0,
-        None,
-        opaque,
+        frame, scale, &scene.top, &top_plan, colors, tint, 1.0, None, opaque,
     )
     .map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan, opaque)

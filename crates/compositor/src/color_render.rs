@@ -571,9 +571,8 @@ where
     };
     base(frame);
     if colors.is_empty() {
-        let result = crate::occlusion::draw_planned::<GlesRenderer, _>(
-            frame, scale, elements, plan, opaque,
-        );
+        let result =
+            crate::occlusion::draw_planned::<GlesRenderer, _>(frame, scale, elements, plan, opaque);
         frame.clear_tex_program_override();
         return result;
     }
