@@ -762,6 +762,9 @@ pub struct Runtime {
     /// source in `launch`).
     #[cfg(feature = "drm")]
     strip_release_held: Option<ManagerInput>,
+    /// Explicit-sync acquire points holding commits (#364).
+    #[cfg(feature = "drm")]
+    acquire_waits: crate::explicit_sync::AcquireWaits,
     /// XWayland server client awaiting its `Ready` event, after
     /// which the X11 window manager starts against it (xwayland
     /// feature only).
@@ -1319,6 +1322,8 @@ impl Runtime {
 
         // linux-dmabuf lists exactly what this renderer imports (#89),
         // with feedback naming the renderer's device as Mutter's does.
+        // Explicit sync follows when that renderer's device has timeline
+        // syncobjs, on whichever backend, as Mutter decides it (#364).
         let mut backend = backend;
         let mut state = state;
         {
@@ -1338,6 +1343,11 @@ impl Runtime {
                 ),
             };
             state.enable_dmabuf(formats, main_device);
+            #[cfg(feature = "drm")]
+            state.enable_explicit_sync(match &mut backend {
+                Backend::Winit(winit) => crate::explicit_sync::probe(winit.renderer()),
+                Backend::Drm(drm) => crate::explicit_sync::probe(&drm.renderer),
+            });
         }
         // On software GL the shell draws with cairo. Telling it here saves
         // it a GL context of its own made only to read GL_RENDERER, which
@@ -1576,6 +1586,8 @@ impl Runtime {
             frame_owed: false,
             #[cfg(feature = "drm")]
             strip_release_held: None,
+            #[cfg(feature = "drm")]
+            acquire_waits: Default::default(),
             #[cfg(feature = "xwayland")]
             pending_x11_client: None,
             #[cfg(feature = "xwayland")]
@@ -5288,6 +5300,19 @@ impl Runtime {
         self.display
             .flush_clients()
             .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        // Commits held for an explicit-sync acquire point wait on the loop.
+        #[cfg(feature = "drm")]
+        {
+            let queued = self.state.take_acquire_waits();
+            self.acquire_waits.watch(
+                &self.loop_handle,
+                queued,
+                |runtime: &mut Runtime, id, surface| {
+                    runtime.acquire_waits.signalled(id);
+                    crate::explicit_sync::acquired(&mut runtime.state, surface);
+                },
+            );
+        }
         self.manager.reconcile(&mut self.state);
         self.state.window_sessions_mut().save_if_due(Instant::now());
         self.focus_policy_tick();
