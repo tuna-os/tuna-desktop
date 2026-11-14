@@ -70,7 +70,7 @@ def response(number):
 try:
     bus=runtime/'bus';spawn(['dbus-daemon','--session','--nofork','--address=unix:path='+str(bus)],'bus');wait(bus.exists,'bus')
     env['DBUS_SESSION_BUS_ADDRESS']='unix:path='+str(bus);env['DBUS_SYSTEM_BUS_ADDRESS']=env['DBUS_SESSION_BUS_ADDRESS']
-    r,w=os.pipe();spawn(['Xvfb','-displayfd',str(w),'-screen','0','1280x800x24','-nolisten','tcp','-noreset'],'xvfb',pass_fds=(w,));os.close(w)
+    r,w=os.pipe();spawn([str(Path(__file__).resolve().parent/'lib'/'tuna-xvfb'),'-displayfd',str(w),'-screen','0','1280x800x24','-nolisten','tcp','-noreset'],'xvfb',pass_fds=(w,));os.close(w)
     display_number=b'';display_deadline=time.monotonic()+8
     while not display_number.endswith(b'\n'):
         assert select.select([r],[],[],max(0,display_deadline-time.monotonic()))[0], 'private display readiness timeout'

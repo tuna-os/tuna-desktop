@@ -1,0 +1,12 @@
+[Unit]
+Description=Prepare Tuna CI static NVMe scratch pool
+RequiresMountsFor=/var/lib/tuna-ci-scratch
+Before=k3s.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/tuna-ci/prepare-scratch-pool
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target

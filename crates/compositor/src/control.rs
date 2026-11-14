@@ -373,8 +373,8 @@ pub struct Session<'a> {
     switcher_thumbnails: Option<Vec<tuna_shell_control::SwitcherThumbnail>>,
     /// The shell's switcher keys, until the runtime drains them.
     switcher_keys: Option<Vec<tuna_shell_control::SwitcherKey>>,
-    /// Administrative lockdown (#357): the hub's policy at accept,
-    /// refreshed onto every session by [`ControlHub::refresh_lockdown`].
+    /// Administrative lockdown (#357): the hub's policy at accept, pushed
+    /// onto every session by [`ControlHub::set_lock_screen_disabled`].
     /// `Lock` commands consult it; a restrictive key denies them with
     /// the administrator's reason instead of engaging the lock.
     lockdown: LockdownPolicy,
@@ -384,6 +384,10 @@ pub struct Session<'a> {
     pad_osd_requests: Vec<(u32, bool)>,
     /// `PadOsdClosed`s, drained by the hub.
     pad_osd_closed: Vec<u32>,
+    /// A `CloseMenuUnanimated` arrived, drained by the hub.
+    close_menu_unanimated: bool,
+    /// Close-dialog answers `(window, response)`, drained by the hub.
+    close_dialog_responses: Vec<(u64, tuna_shell_control::CloseDialogResponse)>,
 }
 
 impl std::fmt::Debug for Session<'_> {
@@ -484,6 +488,8 @@ impl<'a> Session<'a> {
             pad_targets: std::rc::Rc::default(),
             pad_osd_requests: Vec::new(),
             pad_osd_closed: Vec::new(),
+            close_menu_unanimated: false,
+            close_dialog_responses: Vec::new(),
         };
         let msg = match session.conn.read_frame() {
             Ok(msg) => msg,
@@ -608,9 +614,24 @@ impl<'a> Session<'a> {
 
     /// Ask the shell to draw GNOME's window menu.
     /// Peers older than 0.42 cannot decode `ConfirmDisplayChange`, nor
-    /// older than 0.45 the tablet OSD messages, and receive nothing.
+    /// older than 0.45 the tablet OSD messages, nor older than 0.48
+    /// `WorkspaceProgress`, nor older than 0.49 `OverviewSwipe`, nor older
+    /// than 0.50 the close-dialog messages, and receive nothing.
     pub fn send_window_menu(&mut self, menu: &Message) -> Result<(), ControlError> {
         if matches!(menu, Message::ConfirmDisplayChange { .. }) && self.peer_minor < 42 {
+            return Ok(());
+        }
+        if matches!(menu, Message::WorkspaceProgress { .. }) && self.peer_minor < 48 {
+            return Ok(());
+        }
+        if matches!(menu, Message::OverviewSwipe { .. }) && self.peer_minor < 49 {
+            return Ok(());
+        }
+        if matches!(
+            menu,
+            Message::ShowCloseDialog { .. } | Message::HideCloseDialog { .. }
+        ) && self.peer_minor < 50
+        {
             return Ok(());
         }
         let tablet = matches!(
@@ -1132,6 +1153,49 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
+                kind: CommandKind::CloseMenuUnanimated,
+            } => {
+                self.close_menu_unanimated = true;
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::RespondCloseDialog { window, response },
+            } => {
+                if self.peer_minor < 50 {
+                    self.conn.write_frame(&Message::Error {
+                        kind: ErrorKind::UnknownCommand,
+                        message: "close dialog responses require negotiated minor 50".into(),
+                    })?;
+                    return Ok(Handled::ErrorSent {
+                        kind: ErrorKind::UnknownCommand,
+                    });
+                }
+                // The window manager carries it out (drained by the hub).
+                // No dialog shows over the lock screen, so none answers.
+                let status = if self.locked.get() {
+                    CommandStatus::Denied {
+                        reason: "session locked".into(),
+                    }
+                } else if model.windows().any(|w| w.id == window) {
+                    self.close_dialog_responses.push((window, response));
+                    CommandStatus::Applied
+                } else {
+                    CommandStatus::Denied {
+                        reason: "unknown window".into(),
+                    }
+                };
+                let applied = status == CommandStatus::Applied;
+                self.conn
+                    .write_frame(&Message::CommandResult { id, status })?;
+                Ok(Handled::CommandResult { id, applied })
+            }
+            Message::Command {
+                id,
                 kind: CommandKind::WindowAction { window, action },
             } => {
                 // The window manager carries it out (drained by the hub);
@@ -1261,6 +1325,7 @@ impl<'a> Session<'a> {
             | Message::AcceleratorDeactivated { .. }
             | Message::WindowMenu { .. }
             | Message::WorkspacePopup { .. }
+            | Message::WorkspaceProgress { .. }
             | Message::PointerOutput { .. }
             | Message::ScreenReader { .. }
             | Message::KeyboardAidToggled { .. }
@@ -1276,6 +1341,9 @@ impl<'a> Session<'a> {
             | Message::PadOsdInput { .. }
             | Message::ClosePadOsd { .. }
             | Message::SeatTouchMode { .. }
+            | Message::OverviewSwipe { .. }
+            | Message::ShowCloseDialog { .. }
+            | Message::HideCloseDialog { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
                     kind: ErrorKind::UnknownCommand,
@@ -1320,6 +1388,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::AcceleratorDeactivated { .. } => "AcceleratorDeactivated",
         Message::WindowMenu { .. } => "WindowMenu",
         Message::WorkspacePopup { .. } => "WorkspacePopup",
+        Message::WorkspaceProgress { .. } => "WorkspaceProgress",
         Message::PointerOutput { .. } => "PointerOutput",
         Message::ShortcutConsent { .. } => "ShortcutConsent",
         Message::ConfirmDisplayChange { .. } => "ConfirmDisplayChange",
@@ -1335,6 +1404,9 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::PadOsdInput { .. } => "PadOsdInput",
         Message::ClosePadOsd { .. } => "ClosePadOsd",
         Message::SeatTouchMode { .. } => "SeatTouchMode",
+        Message::OverviewSwipe { .. } => "OverviewSwipe",
+        Message::ShowCloseDialog { .. } => "ShowCloseDialog",
+        Message::HideCloseDialog { .. } => "HideCloseDialog",
     }
 }
 
@@ -1511,6 +1583,8 @@ fn apply_command(
         | CommandKind::CancelVerification
         | CommandKind::RequestPadOsd { .. }
         | CommandKind::PadOsdClosed { .. }
+        | CommandKind::CloseMenuUnanimated
+        | CommandKind::RespondCloseDialog { .. }
         | CommandKind::SwitchInputSource { .. }
         | CommandKind::SetWindowIconGeometries { .. }
         | CommandKind::SetWellbeingEffects { .. }
@@ -1588,6 +1662,10 @@ pub struct PollOutcome {
     pub pad_osd_requests: Vec<(u32, bool)>,
     /// Pad OSDs the shell closed, in order.
     pub pad_osd_closed: Vec<u32>,
+    /// The shell closed a panel menu unanimated (its button was hidden).
+    pub close_menu_unanimated: bool,
+    /// Close-dialog answers `(window, response)`, in order (#1035).
+    pub close_dialog_responses: Vec<(u64, tuna_shell_control::CloseDialogResponse)>,
     /// Input-source switches to make (`true` backward), in order.
     pub input_source_switches: Vec<bool>,
     /// New switcher thumbnail frames, if the shell sent any.
@@ -1596,6 +1674,9 @@ pub struct PollOutcome {
     pub switcher_keys: Option<Vec<tuna_shell_control::SwitcherKey>>,
     /// On-screen keyboard input to type, in order (#349).
     pub osk_inputs: Vec<tuna_shell_control::OskInput>,
+    /// Something arrived on the hub's sockets this round: a peer, a frame
+    /// or a hang-up. The runtime's idle tick draws only then (#503).
+    pub received: bool,
 }
 
 /// What GNOME's on-screen keyboard follows, as broadcast to the shell
@@ -1681,13 +1762,6 @@ pub fn is_private_dir(dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Bound on concurrent background lockdown readers (#357 fd3): one slow
-/// backend may overlap one fresh poll, but a hung backend never stacks a
-/// thread per tick. Production ticks 2 s apart with a 500 ms reader bound,
-/// so steady state holds one; the headroom keeps a slow poll from
-/// suppressing its successor.
-const LOCKDOWN_MAX_READERS: usize = 2;
-
 /// Live control-plane driver: accepts shell connections, handshakes them
 /// into [`Session`]s against one [`TokenStore`], emits deltas, and applies
 /// commands — one nonblocking round per [`poll`](Self::poll), so slow or
@@ -1721,33 +1795,29 @@ pub struct ControlHub {
     /// the runtime (idle timeout) or `Lock` commands, shared with every
     /// live session so snapshots carry it; the shell never owns it.
     locked: std::rc::Rc<std::cell::Cell<bool>>,
-    /// Administrative lockdown (#357): read live at bind, refreshed by
-    /// [`ControlHub::refresh_lockdown`], pushed onto every session so
-    /// `Lock` commands deny under a restrictive key. Only the lock key
-    /// is live here; the shell owns the rest of the surface.
+    /// Administrative lockdown (#357): read live at bind, then followed
+    /// through [`ControlHub::set_lock_screen_disabled`], pushed onto
+    /// every session so `Lock` commands deny under a restrictive key.
+    /// Only the lock key is live here; the shell owns the rest of the
+    /// surface.
     lockdown: LockdownPolicy,
     /// Pads (id, device node) the shell's `RequestPadOsd` may name.
     pad_targets: std::rc::Rc<Vec<(u32, String)>>,
-    /// Background policy reads (#357 follow-up): each refresh spawns
-    /// one reader thread reporting here (up to
-    /// [`LOCKDOWN_MAX_READERS`] concurrent); the tick drains
-    /// completed results without waiting, so a hung backend never
-    /// stalls it.
-    lockdown_tx: std::sync::mpsc::Sender<Option<bool>>,
-    lockdown_rx: std::sync::mpsc::Receiver<Option<bool>>,
-    /// Readers currently running (#357 fd3): refreshes while this many
-    /// run skip spawning (single-flight bound), so a hung backend
-    /// cannot stack a thread per tick; the drain still applies every
-    /// landed result with last-valid-wins.
-    lockdown_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Alt-Tab drive events awaiting broadcast. Unlike the overview
     /// intent (level), steps are discrete events: each one is sent to
     /// every live session exactly once, retained until all sends land.
     switcher_queue: Vec<SwitcherAction>,
+    /// The connection whose switcher thumbnails are drawn. The shell
+    /// clears them when its popup's fade ends; a shell that goes away
+    /// first takes them with it, as GNOME's clones die with its popup.
+    switcher_thumbnails_owner: Option<u64>,
     /// Accelerator presses waiting for the next poll.
     accelerator_queue: Vec<(u32, u32, u32, bool)>,
     /// Window-menu requests waiting for the next poll.
     menu_queue: Vec<Message>,
+    /// The close dialogs shown now (their latest `ShowCloseDialog`), so a
+    /// shell (re)connecting mid-hang gets them with its snapshot.
+    close_dialogs: std::collections::BTreeMap<u64, Message>,
     /// What the on-screen keyboard follows, as last set by the runtime,
     /// and the value every live session holds (#349).
     osk: OskBroadcast,
@@ -1830,8 +1900,6 @@ impl ControlHub {
                 None
             }
         });
-        let (lockdown_tx, lockdown_rx) = std::sync::mpsc::channel();
-        let lockdown_inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Ok(Self {
             listener,
             readiness,
@@ -1845,12 +1913,11 @@ impl ControlHub {
             locked: std::rc::Rc::new(std::cell::Cell::new(false)),
             lockdown,
             pad_targets: std::rc::Rc::default(),
-            lockdown_tx,
-            lockdown_rx,
-            lockdown_inflight,
             switcher_queue: Vec::new(),
+            switcher_thumbnails_owner: None,
             accelerator_queue: Vec::new(),
             menu_queue: Vec::new(),
+            close_dialogs: std::collections::BTreeMap::new(),
             osk: OskBroadcast::default(),
             // No focus and no auto-show is what a shell assumes before
             // any message: only a change is owed.
@@ -2195,52 +2262,22 @@ impl ControlHub {
         }
     }
 
-    /// Poll the live `disable-lock-screen` key without blocking: drain
-    /// completed background reads (last valid wins; unreadable keeps the
-    /// cached value, never resets) and spawn the next reader unless
-    /// enough already run. The runtime calls this on a slow tick; a hung
-    /// backend never stalls it, and the shell enforces its own surface
-    /// immediately, so this backstop's lag fails safe.
-    pub fn refresh_lockdown(&mut self) {
-        self.refresh_lockdown_with(crate::lockdown::read_lock_screen_key);
+    /// Apply a live read of `disable-lock-screen` (#357): the hub's policy
+    /// and every session's follow it, the other keys keep their values.
+    /// The runtime calls this with each value its settings watch delivers
+    /// (`lockdown_settings`); an unreadable key delivers nothing, so the
+    /// cached policy holds and never resets. The shell enforces its own
+    /// surface immediately, so this backstop fails safe.
+    pub fn set_lock_screen_disabled(&mut self, disabled: bool) {
+        self.set_lockdown_policy(LockdownPolicy {
+            disable_lock_screen: disabled,
+            ..self.lockdown
+        });
     }
 
-    /// [`refresh_lockdown`](Self::refresh_lockdown) with an injectable
-    /// reader. Tests pass a hung double to prove the tick stays bounded;
-    /// production reads the live key on the background thread.
-    pub fn refresh_lockdown_with(
-        &mut self,
-        reader: impl FnOnce() -> Option<bool> + Send + 'static,
-    ) {
-        // Last-valid-wins: overlapping readers land delayed results as one
-        // batch, and a trailing unreadable result must not wipe the live
-        // restriction (or restoration) the batch's valid result carries.
-        if let Some(value) = self.lockdown_rx.try_iter().flatten().last() {
-            self.lockdown
-                .refresh(&|key| (key == crate::lockdown::KEY_DISABLE_LOCK_SCREEN).then_some(value));
-            for session in &mut self.sessions {
-                session.set_lockdown_policy(self.lockdown);
-            }
-        }
-        // Single-flight bound: skip spawning while enough readers run, so
-        // a hung backend cannot stack a thread per tick. The drain above
-        // still runs, so landed results always apply.
-        if self
-            .lockdown_inflight
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            >= LOCKDOWN_MAX_READERS
-        {
-            self.lockdown_inflight
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            return;
-        }
-        let tx = self.lockdown_tx.clone();
-        let inflight = self.lockdown_inflight.clone();
-        std::thread::spawn(move || {
-            let result = reader();
-            let _ = tx.send(result);
-            inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        });
+    /// The hub's lockdown policy, as its sessions hold it.
+    pub fn lockdown_policy(&self) -> LockdownPolicy {
+        self.lockdown
     }
 
     /// The pads a `RequestPadOsd` may name: id and device node.
@@ -2274,6 +2311,15 @@ impl ControlHub {
     }
 
     pub fn queue_message(&mut self, message: Message) {
+        match &message {
+            Message::ShowCloseDialog { window, .. } => {
+                self.close_dialogs.insert(*window, message.clone());
+            }
+            Message::HideCloseDialog { window } => {
+                self.close_dialogs.remove(window);
+            }
+            _ => {}
+        }
         self.menu_queue.push(message);
     }
 
@@ -2319,7 +2365,9 @@ impl ControlHub {
     pub fn poll(&mut self, model: &mut StateModel) -> PollOutcome {
         let locked_before = self.locked.get();
         let uid = our_uid();
+        let mut received = false;
         while let Ok((stream, _)) = self.listener.accept() {
+            received = true;
             let cred = peer_cred(&stream);
             if !self.gate.admits(cred, uid) || self.pending_count() >= MAX_PENDING_PEERS {
                 // Dropping the stream closes it: the peer sees EOF
@@ -2350,6 +2398,7 @@ impl ControlHub {
                 self.session_peers.swap_remove(i);
             }
         }
+        received |= !self.pending.is_empty();
         self.advance_pending(model);
         self.pending = std::mem::take(&mut self.fresh);
         self.pending_peers = std::mem::take(&mut self.fresh_peers);
@@ -2363,7 +2412,10 @@ impl ControlHub {
                 let deltas_ok = session.emit_deltas(model).is_ok();
                 session.pad_targets = self.pad_targets.clone();
                 let cmd_ok = match session.handle_next(model) {
-                    Ok(_) => true,
+                    Ok(_) => {
+                        received = true;
+                        true
+                    }
                     Err(ControlError::WouldBlock) => true,
                     Err(_) => false,
                 };
@@ -2398,10 +2450,17 @@ impl ControlHub {
                     outcome
                         .pad_osd_closed
                         .extend(std::mem::take(&mut session.pad_osd_closed));
+                    outcome.close_menu_unanimated |=
+                        std::mem::take(&mut session.close_menu_unanimated);
+                    outcome
+                        .close_dialog_responses
+                        .extend(std::mem::take(&mut session.close_dialog_responses));
                     outcome
                         .input_source_switches
                         .extend(std::mem::take(&mut session.input_source_switches));
                     if let Some(thumbnails) = session.switcher_thumbnails.take() {
+                        self.switcher_thumbnails_owner =
+                            (!thumbnails.is_empty()).then_some(session.connection_id);
                         outcome.switcher_thumbnails = Some(thumbnails);
                     }
                     if let Some(keys) = session.switcher_keys.take() {
@@ -2483,8 +2542,18 @@ impl ControlHub {
             if alive {
                 i += 1;
             } else {
+                received = true;
                 self.sessions.swap_remove(i);
                 self.session_peers.swap_remove(i);
+            }
+        }
+        // The thumbnails' shell disconnected, crashed or was replaced
+        // (a narrowed gate evicts the old one) while they were drawn:
+        // nobody is left to fade them out.
+        if let Some(owner) = self.switcher_thumbnails_owner {
+            if !self.sessions.iter().any(|s| s.connection_id == owner) {
+                self.switcher_thumbnails_owner = None;
+                outcome.switcher_thumbnails = Some(Vec::new());
             }
         }
         // A Lock command changes the logical lock before Runtime::engage_lock
@@ -2493,6 +2562,7 @@ impl ControlHub {
             self.cancel_pending_accelerators();
         }
         self.broadcast();
+        outcome.received = received;
         outcome
     }
 
@@ -2708,6 +2778,9 @@ impl ControlHub {
                     let _ = session.send_window_menu(&Message::PointerOutput {
                         name: self.pointer_output.clone(),
                     });
+                }
+                for shown in self.close_dialogs.values() {
+                    let _ = session.send_window_menu(shown);
                 }
                 session.connection_id = connection_id;
                 session.auth_owner = self.auth_owner;
@@ -2968,7 +3041,7 @@ mod auth_origin_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
-    fn setup() -> (tempfile::TempDir, ControlHub, StateModel) {
+    pub(super) fn setup() -> (tempfile::TempDir, ControlHub, StateModel) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(is_private_dir(dir.path()));
@@ -2980,7 +3053,7 @@ mod auth_origin_tests {
         .unwrap();
         (dir, hub, StateModel::new())
     }
-    fn connect(hub: &mut ControlHub, model: &mut StateModel) -> ControlConn {
+    pub(super) fn connect(hub: &mut ControlHub, model: &mut StateModel) -> ControlConn {
         let mut client = ControlConn::new(UnixStream::connect(hub.socket_path()).unwrap()).unwrap();
         client
             .write_frame(&Message::Hello {
@@ -2993,7 +3066,7 @@ mod auth_origin_tests {
         drain(&mut client);
         client
     }
-    fn drain(client: &mut ControlConn) -> Vec<(u64, CommandStatus)> {
+    pub(super) fn drain(client: &mut ControlConn) -> Vec<(u64, CommandStatus)> {
         let mut out = Vec::new();
         loop {
             match client.read_frame() {
@@ -3302,5 +3375,81 @@ mod auth_origin_tests {
         assert_eq!(hub.sessions.len(), 1);
         assert!(hub.next_connection.is_none());
         assert!(hub.refused_count() > 0);
+    }
+}
+
+#[cfg(test)]
+mod switcher_thumbnail_tests {
+    use super::auth_origin_tests::{connect, drain, setup};
+    use super::*;
+
+    fn send_thumbnails(client: &mut ControlConn, id: u64, windows: &[u64]) {
+        let thumbnails = windows
+            .iter()
+            .map(|&window| tuna_shell_control::SwitcherThumbnail {
+                window,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                opacity: 128,
+            })
+            .collect();
+        client
+            .write_frame(&Message::Command {
+                id,
+                kind: CommandKind::SetSwitcherThumbnails { thumbnails },
+            })
+            .unwrap();
+    }
+
+    /// Every thumbnail list the runtime is handed over a few rounds,
+    /// enough for a closed peer's EOF to be seen.
+    fn applied(
+        hub: &mut ControlHub,
+        model: &mut StateModel,
+    ) -> Vec<Vec<tuna_shell_control::SwitcherThumbnail>> {
+        (0..3)
+            .filter_map(|_| hub.poll(model).switcher_thumbnails)
+            .collect()
+    }
+
+    #[test]
+    fn a_departed_shell_takes_its_switcher_thumbnails_with_it() {
+        let (_dir, mut hub, mut model) = setup();
+        let mut shell = connect(&mut hub, &mut model);
+        let other = connect(&mut hub, &mut model);
+        send_thumbnails(&mut shell, 1, &[7, 8]);
+        let drawn = applied(&mut hub, &mut model);
+        assert_eq!(drawn.len(), 1);
+        assert_eq!(drawn[0].len(), 2);
+        assert_eq!(drain(&mut shell), [(1, CommandStatus::Applied)]);
+        // Another peer leaving changes nothing.
+        drop(other);
+        assert!(applied(&mut hub, &mut model).is_empty());
+        assert_eq!(hub.sessions.len(), 1);
+        // The shell dies mid-fade: the hub clears the drawn images once.
+        drop(shell);
+        assert_eq!(applied(&mut hub, &mut model), [Vec::new()]);
+        assert!(hub.sessions.is_empty());
+        assert!(applied(&mut hub, &mut model).is_empty());
+
+        // A shell that cleared its own thumbnails owes nothing on exit.
+        let mut shell = connect(&mut hub, &mut model);
+        send_thumbnails(&mut shell, 2, &[7]);
+        assert_eq!(applied(&mut hub, &mut model).len(), 1);
+        send_thumbnails(&mut shell, 3, &[]);
+        assert_eq!(applied(&mut hub, &mut model), [Vec::new()]);
+        drop(shell);
+        assert!(applied(&mut hub, &mut model).is_empty());
+
+        // A replaced shell: the gate narrows to the new process and
+        // evicts the old session while its thumbnails are drawn.
+        let mut shell = connect(&mut hub, &mut model);
+        send_thumbnails(&mut shell, 4, &[7]);
+        assert_eq!(applied(&mut hub, &mut model).len(), 1);
+        hub.set_peer_gate(PeerGate::Closed);
+        assert_eq!(applied(&mut hub, &mut model), [Vec::new()]);
+        assert!(hub.sessions.is_empty());
     }
 }

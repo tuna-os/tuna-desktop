@@ -12,10 +12,17 @@ push, schedule and workflow_dispatch run every lane. A pull_request runs
 what its changed files (`git diff --name-only HEAD^1 HEAD` on the merge
 commit, or --changed) can affect:
 
-- shared CI inputs (this script, ci.yml, the Cargo workspace manifests,
-  vendored third-party crates, the nested-session launcher) run every lane;
-- docs and other non-runtime files add no lane;
-- a lane's own proof script, fixtures or packaging runs that lane;
+- shared CI inputs (this script, the Cargo workspace manifests, vendored
+  third-party crates, the nested-session launcher, and a ci.yml edit
+  outside the lane jobs or to a job that is not a lane) run every lane; with
+  --base a ci.yml edit to lane jobs runs only those lanes;
+- docs and other non-runtime files (including tooling of other workflows,
+  see NO_LANE) add no lane;
+- a lane's own proof script, fixtures or packaging runs that lane, and a
+  packaged conffile (share/pam.d/) runs journey's lifecycle and every
+  package consumer; so does a scripts/tests/ file that the lane's job runs
+  (OWNED below; WorkflowSync.test_lane_run_tests_select_their_lane keeps it
+  complete). Tests only the check job runs add no lane;
 - anything else (crates, share/, other scripts) runs gtk-shell plus a
   round-robin slice of ROTATION: K lanes starting at
   (run_number * K) mod len(ROTATION), K from --size, $CI_ROUND_ROBIN_SIZE
@@ -45,10 +52,12 @@ LANES = [
 CORE = ["fprint-phase-proof", "grid-cancel-comparison", "gtk-shell"]
 
 # Interchangeable end-to-end coverage of the same build, rotated per run.
+# marlin-image is not here: ci.yml runs it on push, schedule and dispatch
+# only (it rebuilds what marlin-vm builds), so a pull request rotating it
+# would pay for arch-package and run nothing.
 ROTATION = [
     "journey", "app-content", "scroll-proof", "drm-smoke", "orca-speech",
-    "portal-security", "remote-security", "niri-parity", "marlin-image",
-    "marlin-vm",
+    "portal-security", "remote-security", "niri-parity", "marlin-vm",
 ]
 
 # Lanes that download other lanes' artifacts.
@@ -65,6 +74,7 @@ NEEDS = {
 # fnmatch patterns: `*` also matches `/`. First matching rule wins.
 FULL = [
     ".github/workflows/ci.yml",
+    ".github/actions/ci-tool/*",
     "scripts/ci-*",
     "Cargo.toml",
     "Cargo.lock",
@@ -81,6 +91,20 @@ OWNED = [
     ("scripts/tuna-slow-portal-proof", ["gtk-shell"]),
     ("scripts/tuna-session-restore-proof", ["gtk-shell"]),
     ("scripts/tuna-walkthrough", ["gtk-shell"]),
+    # scripts/tests/* run by a lane job (#1108): a test edit must run the lane
+    # that executes it, or it first runs after merge.
+    ("scripts/tests/test_minimize_brightness_controls.py", ["gtk-shell"]),
+    ("scripts/tests/test_minimize_ci_freeze.py", ["gtk-shell"]),
+    ("scripts/tests/test_minimize_failure_bundle.py", ["gtk-shell"]),
+    ("scripts/tests/test_notify_callback_contract.py", ["gtk-shell"]),
+    ("scripts/tests/test_tuna_lock_auth_fixtures.py", ["gtk-shell"]),
+    ("scripts/tests/test_wellbeing_bundle.py", ["gtk-shell"]),
+    ("scripts/tests/test_wellbeing_bytecode_contract.py", ["gtk-shell"]),
+    ("scripts/tests/test_grid_cancel_*.py", ["grid-cancel-comparison"]),
+    ("scripts/tests/test_ci_install_vkms.py", ["drm-smoke"]),
+    ("scripts/tests/test_colord_startup.py", ["drm-smoke"]),
+    ("scripts/tests/test_native_product.py", ["marlin-vm"]),
+    ("scripts/tests/test_remote_security_failure_report.py", ["remote-security"]),
     ("scripts/tuna-gtk-accessibility-proof", ["gtk-shell"]),
     ("scripts/tuna-a11y-golden", ["gtk-shell"]),
     ("scripts/tuna-wayland-info-compare", ["gtk-shell"]),
@@ -95,9 +119,14 @@ OWNED = [
     ("scripts/lib/transition-package-policy*", ["journey"]),
     ("scripts/lib/legacy-upgrade-*", ["journey"]),
     ("share/compat/*", ["journey", *PACKAGE_CONSUMERS]),
+    # The lock screen's PAM service is a dpkg conffile and an Arch backup
+    # file: journey's Debian lifecycle prompts on any byte change (#899), the
+    # images ship it, and the lock screen authenticates through it.
+    ("share/pam.d/*", ["journey", *CORE, *PACKAGE_CONSUMERS]),
     ("scripts/tuna-app-content", ["app-content"]),
     ("scripts/tuna-scroll-proof", ["scroll-proof"]),
     ("scripts/tuna-drm-smoke", ["drm-smoke"]),
+    ("scripts/lib/colord-startup.sh", ["drm-smoke"]),
     ("scripts/tuna-orca-speech-proof", ["orca-speech"]),
     ("scripts/lib/tuna-orca-speech.py", ["orca-speech"]),
     ("scripts/tuna-frame-pacer-build", ["drm-smoke"]),
@@ -114,6 +143,9 @@ OWNED = [
     ("docs/nested-session.md", ["arch-package"]),
     ("packaging/marlin/*", ["marlin-image", "marlin-vm"]),
     ("scripts/tuna-vm-lane", ["marlin-vm"]),
+    ("scripts/lib/vm_guest_agent.py", ["marlin-vm"]),
+    ("scripts/lib/vm_gnome_reference.py", ["marlin-vm"]),
+    ("scripts/lib/vm_strip_*", ["marlin-vm"]),
     ("scripts/tuna-ledger", ["parity-ledger"]),
     ("docs/parity-ledger.md", ["parity-ledger"]),
     ("scripts/tuna-docs-shots", ["docs-shots"]),
@@ -128,9 +160,40 @@ NO_LANE = [
     ".github/*",
     ".spektacular/*",
     "fuzz/*",
+    # Tests only the check job (or another workflow) runs; OWNED claims the
+    # ones a lane job runs first.
     "scripts/tests/*",
     "scripts/lib/*-tests.py",
+    # Products and workflows of their own, never run by a ci.yml lane
+    # (WorkflowSync.test_no_lane_scripts_are_not_run_by_a_lane keeps this
+    # true): corral installed-image tooling, variant qualification, hero
+    # media, the stress, coverage and VM-release workflows, and the
+    # contributor-facing try script and justfile. Each is covered by the
+    # always-on check job and by its own workflow's path filter.
+    "justfile",
+    "scripts/try-tuna-desktop*",
+    "scripts/tuna-corral-*",
+    "scripts/lib/corral_*.py",
+    "scripts/tuna-variant-qualification",
+    "scripts/tuna-hero-media",
+    "scripts/tuna-coverage-report",
+    "scripts/tuna-stress",
+    "scripts/tuna-hotplug-stress",
+    "scripts/lib/tuna_process_metrics.py",
+    "scripts/lib/vm_release*",
+    "scripts/lib/vm_firstboot_diagnosis.py",
 ]
+
+
+WORKFLOW = ".github/workflows/ci.yml"
+# ci.yml job name -> the lane that owns it. Every other lane is its own job.
+WORKFLOW_JOB_LANE = {
+    **{lane: lane for lane in LANES},
+    "gdm51-native-package": "marlin-vm",
+    "native-reference-context": "marlin-vm",
+}
+# Jobs that run on every pull request regardless of selection.
+WORKFLOW_ALWAYS_ON_JOBS = {"check", "ci-gate"}
 
 
 def matches(path, patterns):
@@ -143,12 +206,60 @@ def rotation(run_number, size):
     return [ROTATION[(start + i) % len(ROTATION)] for i in range(size)]
 
 
-def select(event, run_number, size, changed):
-    """Return (lanes in LANES order, human-readable reason)."""
+def workflow_lanes(base_text, head_text):
+    """Lanes whose job definition differs between two ci.yml texts.
+
+    YAML anchors are resolved before comparing, so editing an anchored
+    `runs-on` or checkout block changes every job that aliases it. Returns
+    None (caller falls back to every lane) when the files cannot be compared,
+    when anything outside `jobs:` (triggers, concurrency, permissions) or the
+    select-lanes job changed, or when a job is not a known lane.
+    """
+    try:
+        import yaml
+        base, head = yaml.safe_load(base_text), yaml.safe_load(head_text)
+        base_jobs, head_jobs = base.pop("jobs"), head.pop("jobs")
+    except Exception:  # missing PyYAML, unreadable or non-mapping YAML
+        return None
+    if base != head:
+        return None
+    lanes = set()
+    for name in set(base_jobs) | set(head_jobs):
+        if base_jobs.get(name) == head_jobs.get(name):
+            continue
+        if name in WORKFLOW_ALWAYS_ON_JOBS:
+            continue
+        if name == "select-lanes" or name not in WORKFLOW_JOB_LANE:
+            return None
+        lanes.add(WORKFLOW_JOB_LANE[name])
+    return lanes
+
+
+def workflow_texts(base):
+    """ci.yml at the merge base of `base` and HEAD, and at HEAD."""
+    def git(*argv):
+        return subprocess.run(["git", *argv], capture_output=True, text=True)
+    merge_base = git("merge-base", base, "HEAD")
+    old, new = git("show", f"{merge_base.stdout.strip()}:{WORKFLOW}"), git("show", f"HEAD:{WORKFLOW}")
+    if merge_base.returncode or old.returncode or new.returncode:
+        return "", ""
+    return old.stdout, new.stdout
+
+
+def select(event, run_number, size, changed, wf_lanes=None):
+    """Return (lanes in LANES order, human-readable reason).
+
+    wf_lanes: lanes touched by this change's ci.yml edit (workflow_lanes);
+    None treats any ci.yml edit as a shared CI input.
+    """
     if event != "pull_request":
         return list(LANES), f"{event}: every lane"
     chosen, reasons, code = set(), [], []
     for path in changed:
+        if path == WORKFLOW and wf_lanes is not None:
+            chosen.update(wf_lanes)
+            reasons.append(f"{path} edits only the {', '.join(sorted(wf_lanes)) or 'check/gate'} job(s)")
+            continue
         if matches(path, FULL):
             return list(LANES), f"{path} is shared CI input: every lane"
         owned = next((lanes for pattern, lanes in OWNED
@@ -194,9 +305,14 @@ def main():
                         default=int(os.environ.get("CI_ROUND_ROBIN_SIZE") or "2"))
     parser.add_argument("--changed", help="file of changed paths, - for stdin "
                         "(default: git diff HEAD^1 HEAD on pull_request)")
+    parser.add_argument("--base", help="pull request base revision; with it, an edit to "
+                        "ci.yml selects only the lanes whose job definition changed")
     args = parser.parse_args()
     changed = changed_files(args.changed) if args.event == "pull_request" else []
-    lanes, reason = select(args.event, args.run_number, args.size, changed)
+    wf_lanes = None
+    if args.event == "pull_request" and args.base and WORKFLOW in changed:
+        wf_lanes = workflow_lanes(*workflow_texts(args.base))
+    lanes, reason = select(args.event, args.run_number, args.size, changed, wf_lanes)
     print("lanes=" + json.dumps(lanes, separators=(",", ":")))
     message = f"ci lanes: {', '.join(lanes) or 'none'}\nreason: {reason}\n"
     sys.stderr.write(message)

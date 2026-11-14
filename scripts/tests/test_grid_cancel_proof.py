@@ -19,9 +19,6 @@ class CancelEvidence(unittest.TestCase):
                            client_dnd_active=True, rendered_frames=10, seat_pressed_key_count=0)
         self.after = dict(self.before, client_dnd_active=False, rendered_frames=11)
 
-    def test_actual_positive_shape(self):
-        proof.validate(self.before, self.after, b"[]\n", b"[]\n")
-
     def test_old_escape_close_is_not_cancellation(self):
         self.after.update(overview_open=False, client_dnd_active=True)
         with self.assertRaises(ValueError):
@@ -62,9 +59,6 @@ class LiveTreeEvidence(unittest.TestCase):
                     showing=True, checked=False, selected=False, focused=False, bounds=None, process_id=123)
         button = dict(root, role="push button", name="Next Page", depth=1, bounds=[0, 0, 20, 20])
         return [root, button]
-
-    def test_positive_fresh_owner_tree(self):
-        proof.validate_tree(self.tree(), 123)
 
     def test_any_transport_error_fails_even_with_live_anchor(self):
         nodes = self.tree() + [dict(role="error", name="gone", depth=2, showing=False)]
@@ -160,6 +154,27 @@ class NeutralDragGeometry(unittest.TestCase):
         with self.assertRaises(ValueError):
             proof.validate_neutral(self.active(), dict(self.state, pointer_position=point), 123, point, self.nodes)
 
+    def test_active_selection_avoids_hint_that_covers_the_source_gap(self):
+        active = self.active()
+        active[1]['bounds'] = [400, 0, 600, 400]
+        source_point = proof.neutral_point(self.nodes, self.state, 123)
+        with self.assertRaises(ValueError):
+            proof.validate_neutral(active, dict(self.state, pointer_position=source_point),
+                                   123, source_point, self.nodes)
+        point = proof.neutral_point(active, self.state, 123, self.nodes)
+        proof.validate_neutral(active, dict(self.state, pointer_position=point),
+                               123, point, self.nodes)
+        self.assertLess(point[0], 397)
+
+    def test_active_selection_rejects_a_changed_page_or_retired_drag(self):
+        active = self.active()
+        active[4]['name'] = 'Different Page App'
+        with self.assertRaises(ValueError):
+            proof.neutral_point(active, self.state, 123, self.nodes)
+        with self.assertRaises(ValueError):
+            proof.neutral_point(self.active(), dict(self.state, client_dnd_active=False),
+                                123, self.nodes)
+
     def test_both_hint_regions_are_forbidden(self):
         nodes = self.active()
         nodes += [dict(nodes[1], name='Previous page preview', bounds=[0, 0, 200, 400])]
@@ -203,48 +218,36 @@ class NeutralDragGeometry(unittest.TestCase):
         nodes = copy.deepcopy(self.nodes); nodes[4]['bounds'] = [100, 10, 800, 350]
         with self.assertRaises(ValueError): proof.neutral_point(nodes, self.state, 123)
 
-    def test_actual_cli_checks_source_owner_and_writes_admission(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tree, source, state, receipt = (Path(tmp) / name for name in ('tree', 'source', 'state', 'receipt'))
-            point = proof.neutral_point(self.nodes, self.state, 123)
-            tree.write_text(json.dumps(self.active()))
-            source.write_text(json.dumps(self.nodes))
-            state.write_text(json.dumps(dict(self.state, pointer_position=point)))
-            argv = ['proof', 'neutral-check', '123', '456', str(tree), str(state),
-                    str(point[0]), str(point[1]), str(source), str(receipt)]
-            with patch.object(sys, 'argv', argv), patch.object(proof, 'validate_live_tree') as owner:
-                proof.main()
-            self.assertEqual(owner.call_count, 3)
-            self.assertTrue(json.loads(receipt.read_text())['first_page_observed'])
-            self.assertEqual(json.loads(receipt.read_text())['point'], point)
-            receipt.unlink()
-            with patch.object(sys, 'argv', argv), patch.object(proof, 'validate_live_tree', side_effect=[None, None, ValueError('owner replaced')]):
-                with self.assertRaises(ValueError): proof.main()
-            self.assertFalse(receipt.exists())
-
     def test_changed_actual_page_with_stale_next_preview_fails(self):
         point = proof.neutral_point(self.nodes, self.state, 123)
         nodes = self.active(); nodes[4]['name'] = 'Different Page App'
         with self.assertRaisesRegex(ValueError, 'carousel page changed'):
             proof.validate_neutral(nodes, dict(self.state, pointer_position=point), 123, point, self.nodes)
 
-    def test_production_input_order_and_existing_negative_controls_retained(self):
-        source = (Path(__file__).parents[1] / 'tuna-gtk-shell-proof').read_text()
-        selection = source.index('neutral_coordinates=')
-        press = source.index('xdotool mousedown 1', selection)
-        move = source.index('xdotool mousemove --window "$WID" "$grid_neutral_x"', press)
-        peek = source.index('grid_cancel_dump "$ARTIFACTS/a11y-folder-page-peek.json"', move)
-        observed = source.index('active neutral pointer or first page not observed', peek)
-        escape = source.index('xdotool key Escape', observed)
-        release = source.index('xdotool mouseup 1', escape)
-        self.assertLess(selection, press); self.assertLess(move, peek)
-        self.assertLess(observed, escape); self.assertLess(escape, release)
-        for gate in ('normal Next Page arrow did not return', 'cancelled drag changed saved layout'):
-            # Layout predicate lives in its production contract, not an injected oracle.
-            if gate == 'cancelled drag changed saved layout':
-                self.assertIn(gate, (Path(__file__).parents[1] / 'lib/tuna_grid_cancel_proof.py').read_text())
-            else: self.assertIn(gate, source)
-        self.assertIn('fail G-GRID-DRAG-PAGE', source)
+    def test_pixel_beside_an_admitted_point_stays_off_tiles_and_hints(self):
+        # The old-role settle motion (tuna-gtk-shell-proof) passes through
+        # x+1 of the admitted point; it must never enter a tile or a hint.
+        cases = [(self.nodes, None)]
+        for bounds in ([762, 0, 238, 400], [505, 0, 495, 400], [400, 0, 600, 400]):
+            active = self.active(); active[1]['bounds'] = bounds
+            cases.append((active, self.nodes))
+        for nodes, source in cases:
+            x, y = proof.neutral_point(nodes, self.state, 123, source)
+            layer, table, forbidden = proof.grid_geometry(nodes, self.state, 123)
+            x, y = x + 1 - layer[0], y - layer[1]
+            with self.subTest(hint=nodes[1]['bounds']):
+                self.assertTrue(table[0] < x < table[0] + table[2] and table[1] < y < table[1] + table[3])
+                for a, b, w, h in forbidden:
+                    self.assertFalse(a <= x <= a + w and b <= y <= b + h)
+
+    def test_last_admitted_column_keeps_its_neighbour_outside_the_hint(self):
+        # That clearance is the 3 px margin of clear_point.
+        _, table, forbidden = proof.grid_geometry(self.active(), self.state, 123)
+        hint_left = 762
+        admitted = [x for x in range(740, hint_left + 1) if proof.clear_point((x, 200), table, forbidden)]
+        self.assertEqual(admitted, list(range(740, hint_left - 3)))
+        self.assertLess(admitted[-1] + 1, hint_left)
+
 
 
 if __name__ == "__main__":

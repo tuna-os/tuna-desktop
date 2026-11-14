@@ -5,8 +5,8 @@
 > as a GDM session or from a TTY, and as a nested window otherwise. A hardware
 > session needs a seat from logind or seatd. Hardware support is new: it is
 > proven on the kernel's virtual KMS device in CI (`scripts/tuna-drm-smoke`)
-> and not yet qualified on real GPUs; the cursor is drawn in software and
-> client cursor images are not composited yet.
+> and not yet qualified on real GPUs. The compositor draws the cursor,
+> including client cursor images, into each frame; no KMS cursor plane is used.
 
 ## Test-drive in a VM (one command)
 
@@ -24,6 +24,8 @@ curl -fsSL https://raw.githubusercontent.com/tuna-os/tuna-desktop/main/scripts/t
 ```
 
 This downloads Corral (checksum-verified), pulls and cosign-verifies the published TunaOS image, and launches Tuna Desktop in local QEMU with a local-only browser console over noVNC. Stop anytime with Ctrl-C. See `scripts/try-tuna-desktop` for options (`TRY_TUNA_MEM`, `TRY_TUNA_PORT`, etc.).
+
+If it stops with `no signatures published for ...`, the pipeline published that build unsigned: the script checks signatures before the multi-GB download and refuses an image that cannot pass verification. Retry when a signed build publishes, or set `TRY_TUNA_IMAGE` to a signed build.
 
 ## From the Debian-format package
 

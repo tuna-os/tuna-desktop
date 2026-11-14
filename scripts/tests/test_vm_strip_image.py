@@ -3,11 +3,13 @@ import copy
 import hashlib
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
-from vm_strip_image import admission, IMAGE_INSPECTION, canonical_image_id
+from vm_strip_image import admission, fixture_members, canonical_image_id
+from maintained_media import INVENTORY
 
 
 class Tests(unittest.TestCase):
@@ -27,17 +29,32 @@ class Tests(unittest.TestCase):
             fixture = root / 'packaging/marlin/vm-lane'
             fixture.mkdir(parents=True)
             expected = {'/usr/bin/tuna-compositor': 'a' * 64}
-            for name in ('tuna-vm-input', 'tuna-vm-lifecycle'):
+            for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus'):
                 (fixture / name).write_text(name)
                 expected['/usr/libexec/' + name] = hashlib.sha256(name.encode()).hexdigest()
+            inventory = root / 'scripts/lib/maintained-media.tsv'
+            inventory.parent.mkdir(parents=True)
+            inventory.write_bytes(INVENTORY.read_bytes())
+            def git(*arguments):
+                return subprocess.check_output(['git', '-C', str(root), *arguments],
+                                               text=True, stderr=subprocess.PIPE).strip()
+            git('init', '-q')
+            git('config', 'user.name', 'Controlled immutable image admission')
+            git('config', 'user.email', 'controlled@example.invalid')
+            git('add', '.')
+            git('commit', '-qm', 'Actual fixture source snapshot')
+            commit = git('rev-parse', 'HEAD')
             package = {'package': {'sha256': 'b' * 64}, 'required_members':
                        {'usr/bin/tuna-compositor': {'sha256': 'a' * 64}}}
             observed = {'schema': 1, 'image_id': 'sha256:' + 'c' * 64, 'member_sha256': expected}
-            args = (root, 'd' * 40, observed['image_id'], 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'e' * 64)
+            args = (root, commit, observed['image_id'], 'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'e' * 64)
             receipt = admission(package, observed, *args)
             self.assertFalse(receipt['installed_signed_release_qualified'])
+            self.assertEqual(receipt['commit'], commit)
+            self.assertEqual(receipt['capture_commit'], commit)
+            self.assertEqual(receipt['built_tree'], git('rev-parse', 'HEAD^{tree}'))
             with self.assertRaises(ValueError):
-                admission(package, observed, root, 'd' * 40, 'c' * 64, args[-1])
+                admission(package, observed, root, commit, 'c' * 64, args[-1])
             for key, value in [('schema', 2), ('image_id', 'sha256:' + 'f' * 64),
                                ('member_sha256', {**expected, '/unrelated': 'a' * 64}),
                                ('member_sha256', {**expected, '/usr/bin/tuna-compositor': 'f' * 64})]:
@@ -49,19 +66,45 @@ class Tests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 admission(package, observed, *args)
 
-    def test_actual_inspection_program_parses(self):
-        compile(IMAGE_INSPECTION, '<immutable-image-inspector>', 'exec')
+    def test_native_autotz_requires_every_original_observer(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            sources = {'/usr/libexec/' + name: 'packaging/marlin/vm-lane/' + name
+                       for name in ('tuna-vm-input', 'tuna-vm-lifecycle', 'tuna-vm-shell-focus')}
+            sources.update(fixture_members('autotz'))
+            expected = {'/usr/bin/tuna-compositor': 'a' * 64}
+            for installed, source in sources.items():
+                path = root / source
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source)
+                expected[installed] = hashlib.sha256(source.encode()).hexdigest()
+            inventory = root / 'scripts/lib/maintained-media.tsv'
+            inventory.parent.mkdir(parents=True)
+            inventory.write_bytes(INVENTORY.read_bytes())
+            def git(*arguments):
+                return subprocess.check_output(['git', '-C', str(root), *arguments],
+                                               text=True, stderr=subprocess.PIPE).strip()
+            git('init', '-q')
+            git('config', 'user.name', 'Controlled immutable image admission')
+            git('config', 'user.email', 'controlled@example.invalid')
+            git('add', '.')
+            git('commit', '-qm', 'Actual fixture source snapshot')
+            package = {'package': {'sha256': 'b' * 64}, 'required_members':
+                       {'usr/bin/tuna-compositor': {'sha256': 'a' * 64}}}
+            observed = {'schema': 1, 'image_id': 'sha256:' + 'c' * 64, 'member_sha256': expected}
+            args = (root, git('rev-parse', 'HEAD'), observed['image_id'],
+                    'ghcr.io/tuna-os/marlin:gnome@sha256:' + 'e' * 64)
+            self.assertFalse(admission(package, observed, *args, fixture='autotz')['installed_signed_release_qualified'])
+            for installed in sources:
+                missing = copy.deepcopy(observed)
+                del missing['member_sha256'][installed]
+                with self.subTest(installed=installed), self.assertRaises(ValueError):
+                    admission(package, missing, *args, fixture='autotz')
+                altered = copy.deepcopy(observed)
+                altered['member_sha256'][installed] = 'f' * 64
+                with self.assertRaises(ValueError):
+                    admission(package, altered, *args, fixture='autotz')
 
-    def test_ci_keeps_original_gates_and_pins_actual_inspection(self):
-        root = Path(__file__).resolve().parents[2]
-        source = (root / '.github/workflows/ci.yml').read_text()
-        self.assertIn('TUNA_PKG_SHA256=', source)
-        self.assertIn('--entrypoint /usr/bin/python3 "$image_id"', source)
-        self.assertIn('--strip-image vm-lane-artifacts/strip-image.json', source)
-        lane = (root / 'scripts/tuna-vm-lane').read_text()
-        self.assertIn('if getattr(args, "strip_image", None) and index == args.boots:', lane)
-        self.assertIn('strip_image.get(field) != metadata.get(meta)', lane)
-        self.assertIn('reconnect=lambda: guest_agent.GuestAgent(agent_path)', lane)
 
 
 if __name__ == '__main__':

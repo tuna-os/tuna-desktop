@@ -10,14 +10,15 @@ bridge stays on, so focus and caret events are real. Appends JSON lines
 to LOG:
 
   {"bounds": {"button": [x, y, w, h], "area": [...], "entry": [...]}}
-      once mapped, in window (frame) coordinates, the frame the
-      compositor's window rect gives (titlebar included);
+      once mapped and allocated, in window (frame) coordinates, the
+      frame the compositor's window rect gives (titlebar included);
   {"click": [x, y]}  for every primary press on the area, area-local;
   {"text": "..."}    for every entry change.
 
 REQUESTS, polled every 50 ms, holds {"generation": N, "request":
 "focus-button" | "focus-entry"}; each new generation moves keyboard
-focus there and acknowledges by writing N to REQUESTS.ack.
+focus there, logs allocated bounds tagged with that generation, then
+acknowledges by writing N to REQUESTS.ack.
 """
 import json
 import os
@@ -51,15 +52,20 @@ CSS = """
 
 
 def bounds(widget, window):
+    # compute_bounds() can succeed before allocation: CSS alone gave the
+    # unallocated entry an 18x2 rectangle while the area was still 0x0.
+    if not widget.get_mapped() or widget.get_width() <= 0 or widget.get_height() <= 0:
+        return None
     ok, rect = widget.compute_bounds(window)
     if not ok:
         return None
-    return [
+    found = [
         round(rect.origin.x),
         round(rect.origin.y),
         round(rect.size.width),
         round(rect.size.height),
     ]
+    return found if found[2] > 0 and found[3] > 0 else None
 
 
 def build(loop):
@@ -99,12 +105,17 @@ def build(loop):
     win.set_child(box)
     win.set_focus(button)
 
-    def report():
+    def report(generation=None, target=None):
+        if target is not None:
+            focused = win.get_focus()
+            # Gtk.Entry delegates focus to its internal Gtk.Text.
+            if focused is None or not (focused == target or focused.is_ancestor(target)):
+                return True
         parts = {"button": button, "area": area, "entry": entry}
         found = {name: bounds(widget, win) for name, widget in parts.items()}
         if any(value is None for value in found.values()):
             return True
-        log({"bounds": found})
+        log({"bounds": found, "generation": generation})
         return False
 
     win.connect("map", lambda *_: GLib.timeout_add(300, report))
@@ -119,6 +130,10 @@ def build(loop):
                 if generation != handled[0]:
                     target = {"focus-button": button, "focus-entry": entry}[data["request"]]
                     target.grab_focus()
+                    # Retry within the proof's existing acknowledgement
+                    # deadline until focus and allocation are real.
+                    if report(generation, target):
+                        return True
                     handled[0] = generation
                     Path(REQUESTS + ".ack").write_text(str(generation))
             except (OSError, ValueError, KeyError):

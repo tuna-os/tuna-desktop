@@ -3623,6 +3623,7 @@ impl ShellHost {
                 ],
                 icon: None,
                 categories: Vec::new(),
+                new_window: Default::default(),
             };
             let _ = self.launcher.launch(&synthetic);
         }
@@ -4733,6 +4734,7 @@ mod tests {
                 argv: vec![std::ffi::OsString::from("/bin/true")],
                 icon: None,
                 categories: Vec::new(),
+                new_window: Default::default(),
             };
             let mut host = ShellHost::new(
                 PanelConfig::default(),
@@ -5866,6 +5868,7 @@ mod tests {
                     argv: vec![std::ffi::OsString::from("/bin/true")],
                     icon: None,
                     categories: Vec::new(),
+                    new_window: Default::default(),
                 }]),
                 Favorites::load(dir.path().join(crate::favorites::FAVORITES_FILE)),
             );
@@ -6181,7 +6184,9 @@ mod tests {
             use crate::watcher::{IndicatorIcon, IndicatorItem};
             let mut comp = TestCompositor::new();
             let (server_stream, client_stream) = UnixStream::pair().unwrap();
-            comp.add_client(server_stream);
+            // The supervised shell's connection: the only one offered
+            // layer-shell (#1048).
+            comp.add_shell_client(server_stream);
             let conn = Connection::from_socket(client_stream).unwrap();
             let mut queue = conn.new_event_queue();
             let (mut host, _dir) = test_host();
@@ -6237,7 +6242,7 @@ mod tests {
             let mut comp = TestCompositor::new();
             comp.state.set_output_size(1280, 800);
             let (server_stream, client_stream) = UnixStream::pair().unwrap();
-            comp.add_client(server_stream);
+            comp.add_shell_client(server_stream);
             let conn = Connection::from_socket(client_stream).unwrap();
             let mut queue = conn.new_event_queue();
             let (mut host, _dir) = test_host();
@@ -6290,7 +6295,7 @@ mod tests {
             let mut comp = TestCompositor::new();
             comp.state.set_output_size(1280, 800);
             let (server_stream, client_stream) = UnixStream::pair().unwrap();
-            comp.add_client(server_stream);
+            comp.add_shell_client(server_stream);
             let conn = Connection::from_socket(client_stream).unwrap();
             let mut queue = conn.new_event_queue();
             let (mut host, _dir) = test_host();
@@ -6338,7 +6343,7 @@ mod tests {
             let mut comp = TestCompositor::new();
             comp.state.set_output_size(1280, 800);
             let (server_stream, client_stream) = UnixStream::pair().unwrap();
-            comp.add_client(server_stream);
+            comp.add_shell_client(server_stream);
             let conn = Connection::from_socket(client_stream).unwrap();
             let mut queue = conn.new_event_queue();
             let (mut host, _dir) = test_host();
@@ -6391,7 +6396,7 @@ mod tests {
             let mut comp = TestCompositor::new();
             comp.state.set_output_size(1280, 800);
             let (server_stream, client_stream) = UnixStream::pair().unwrap();
-            comp.add_client(server_stream);
+            comp.add_shell_client(server_stream);
             let conn = Connection::from_socket(client_stream).unwrap();
             let mut queue = conn.new_event_queue();
             let (mut host, _dir) = test_host();
@@ -6459,7 +6464,7 @@ mod tests {
             let mut comp = TestCompositor::new();
             comp.state.set_output_size(1280, 800);
             let (server_stream, client_stream) = UnixStream::pair().unwrap();
-            comp.add_client(server_stream);
+            comp.add_shell_client(server_stream);
             let conn = Connection::from_socket(client_stream).unwrap();
             let mut queue = conn.new_event_queue();
             let (mut host, _dir) = keyed_host();
@@ -6732,7 +6737,7 @@ mod tests {
         fn panel_attaches_acknowledges_and_stops_on_close() {
             let mut comp = TestCompositor::new();
             let (server_stream, client_stream) = UnixStream::pair().unwrap();
-            comp.add_client(server_stream);
+            comp.add_shell_client(server_stream);
             let conn = Connection::from_socket(client_stream).unwrap();
 
             // Learn global names on a throwaway queue first, then bind
@@ -6819,7 +6824,7 @@ mod tests {
             let mut comp = TestCompositor::new();
             comp.state.set_output_size(1280, 800);
             let (server_stream, client_stream) = UnixStream::pair().unwrap();
-            comp.add_client(server_stream);
+            comp.add_shell_client(server_stream);
             let conn = Connection::from_socket(client_stream).unwrap();
             let mut queue = conn.new_event_queue();
             let (mut host, _dir) = test_host();
@@ -8446,6 +8451,7 @@ mod tests {
                     argv: vec![std::ffi::OsString::from("/bin/true")],
                     icon: icon.map(str::to_owned),
                     categories: Vec::new(),
+                    new_window: Default::default(),
                 }]),
                 Favorites::load(dir.path().join(crate::favorites::FAVORITES_FILE)),
             );
@@ -8539,12 +8545,7 @@ mod tests {
                 service: service.to_owned(),
                 title: "Tray".to_owned(),
                 status: status.to_owned(),
-                icon_name: String::new(),
-                icon_pixmap: Vec::new(),
-                attention_name: String::new(),
-                attention_pixmap: Vec::new(),
-                tooltip_title: String::new(),
-                tooltip_body: String::new(),
+                ..Default::default()
             }
         }
 

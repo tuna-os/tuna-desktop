@@ -1,0 +1,11 @@
+[
+  {
+    "name": "tuna-q-isg-mar1",
+    "deleted": true,
+    "removed": [
+      "virtualmachine.kubevirt.io/tuna-q-isg-mar1",
+      "virtualmachineinstance.kubevirt.io/tuna-q-isg-mar1",
+      "persistentvolumeclaim/tuna-q-isg-mar1-bootc-disk"
+    ]
+  }
+]
