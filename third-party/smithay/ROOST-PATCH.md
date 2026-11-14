@@ -222,6 +222,18 @@ the parent's list likewise returns an error instead of unwrapping.
 The real-client regression in crates/compositor/tests/popups.rs covers
 both requests and confirms another client is still served afterward.
 
+Issue #353 changes Cargo.toml (the xwayland feature enables x11rb's xkb
+protocol) and src/xwayland/xwm/mod.rs, additively. X11Wm::select_bell_events
+does what Mutter 51's init_x11_bell does (src/x11/meta-x11-display.c): select
+XkbBellNotify on the core keyboard and turn off its AudibleBell control, so
+X11 bells reach the new XwmHandler::bell callback (default: ignore) with the
+window the client named and the X server time, and Xwayland never rings them
+itself. X11Wm::release_xsettings_selection gives up the _XSETTINGS_S0
+selection start_wm takes: Mutter never owns XSETTINGS, and
+gnome-settings-daemon's xsettings plugin exits while another manager holds
+it. The isolated diff is retained in XKB-BELL-XSETTINGS-API-PATCH.diff; the
+pinned version stays 0.7.0.
+
 Issue #1084 changes src/backend/renderer/utils/wayland.rs: the additive
 RendererSurfaceState::release_imported_shm_buffer sends wl_buffer.release
 for the attached wl_shm buffer once the given renderer context has

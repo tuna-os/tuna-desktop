@@ -234,6 +234,9 @@ pub enum X11ManagerEvent {
     Maximize(u32, bool),
     /// An X11 fullscreen/unfullscreen request (X11 window id, on?).
     Fullscreen(u32, bool),
+    /// An X11 client rang the bell (`XkbBellNotify`): the X window it
+    /// named, if any, and the X server time.
+    Bell { window: Option<u32>, time: u32 },
 }
 
 /// Spawn the compatibility server and hook its event source into the
@@ -318,7 +321,17 @@ pub fn on_xwayland_event(
                 return;
             };
             match X11Wm::start_wm(runtime.loop_handle(), x11_socket, client) {
-                Ok(xwm) => {
+                Ok(mut xwm) => {
+                    // Mutter 51 `init_x11_bell`: X11 bells reach the same
+                    // policy as xdg-system-bell.
+                    if let Err(error) = xwm.select_bell_events() {
+                        eprintln!("tuna-compositor: xwayland: no XKB bell events: {error}");
+                    }
+                    // Mutter never owns XSETTINGS: gsd-xsettings, started
+                    // below with the X11 services, does.
+                    if let Err(error) = xwm.release_xsettings_selection() {
+                        eprintln!("tuna-compositor: xwayland: XSETTINGS not released: {error}");
+                    }
                     runtime.state_mut().xwm = Some(xwm);
                     runtime.set_x11_display(display_number);
                     crate::session_services::x11_display_ready(display_number);
@@ -535,6 +548,10 @@ mod handlers {
                         $state(self),
                         X11ManagerEvent::Fullscreen(window.window_id(), false),
                     );
+                }
+
+                fn bell(&mut self, _xwm: XwmId, window: Option<X11Window>, time: u32) {
+                    push($state(self), X11ManagerEvent::Bell { window, time });
                 }
             }
         };

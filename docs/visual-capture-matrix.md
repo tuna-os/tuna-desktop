@@ -127,7 +127,7 @@ state records its state observation next to its stills and clips.
 | P-A11Y-05 | Reduced motion, focus visibility, a11y menu | stage:settings-a11y `partial` | No adequate capture | a11y indicator/menu still; motion-preference transition variants unproven |
 | P-A11Y-06 | Orca activation and spoken navigation | `nonvisual` | No adequate capture | speech has no pixels; the nested speech proof (G-ORCA-SPEECH-*) logs what Orca says, activation on hardware is V-ORCA-ACTIVATION |
 | P-A11Y-07 | Simulated secondary and hover click, click-type chooser | stage:settings-a11y `partial` | No adequate capture | `dwell-chooser` collects the real hover-click chooser; pie-timer intermediate frames and native pointer input remain outside these stills |
-| P-SN-01 | Sound prefs, over-amplification, bell | stage:quick-settings `partial` | No adequate capture | volume OSD captured; overdrive/feedback/audible-visual bell unproven |
+| P-SN-01 | Sound prefs, over-amplification, bell | stage:quick-settings `partial` | No adequate capture | volume OSD captured; the visual bell is pixel-checked in the GTK proof (G-VISUAL-BELL, G-X11-BELL) but not captured here; overdrive and audible feedback have no still |
 | P-ST-02 | Wellbeing, screen time, breaks | `missing-product` | No adequate capture | no consumer and no history file |
 | P-ST-03 | Power panel and policies | stage:quick-settings `partial` | No adequate capture | logind backlight/OSD captured; Brightness interface and PowerSaveMode need installed-image Corral |
 | P-ST-04 | Privacy device controls | `missing-product` | No adequate capture | camera/mic/output/privacy-screen/USB keys have no consumer |
