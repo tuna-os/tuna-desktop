@@ -15,7 +15,10 @@
 #   G-SCREENSHOT-CTRL-C) only.
 #   --x11-frames-only runs panel readiness, the P-WM-10 X11 frame gates
 #   (G-X11-FRAME, G-X11-FRAME-ACTIONS, G-X11-FRAME-CSD,
-#   G-X11-FRAME-RECOVERY) and G-SHELL-STABLE only.
+#   G-X11-FRAME-RECOVERY), the P-SY-04 gates for override-redirect X11
+#   windows (G-X11-MENU, G-X11-TOOLTIP), G-RESIZE-BORDER (P-WM-04: the
+#   invisible border a native window is resized from, as an X11 frame is)
+#   and G-SHELL-STABLE only.
 #   --search-leak-only runs panel readiness, G-SEARCH-LEAK (50 searches with
 #   results leave shm mappings and descriptors where they were, #1084) and
 #   G-SHELL-STABLE only.
@@ -524,7 +527,7 @@ while [ $# -gt 0 ]; do
         --window-leak-only) WINDOW_LEAK_ONLY=1; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
-        --help|-h) sed -n '2,31p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,34p' "$0"; exit 0 ;;
         *) echo "tuna-gtk-shell-proof: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -985,6 +988,8 @@ pass G-GRID-ON-DEMAND "no grid tiles on the window picker or after close; a held
 . "$ROOT/scripts/lib/tuna-a11y-focus-proof.sh"
 . "$ROOT/scripts/lib/tuna-keyboard-routes-proof.sh"
 . "$ROOT/scripts/lib/tuna-x11-frames-proof.sh"
+. "$ROOT/scripts/lib/tuna-x11-unmanaged-proof.sh"
+. "$ROOT/scripts/lib/tuna-resize-border-proof.sh"
 . "$ROOT/scripts/lib/tuna-search-leak-proof.sh"
 . "$ROOT/scripts/lib/tuna-window-leak-proof.sh"
 
@@ -1835,6 +1840,9 @@ if [ "$X11_FRAMES_ONLY" = 1 ]; then
     # Let the startup cover settle before frames are read.
     sleep 3
     x11_frames_proof
+    x11_unmanaged_proof
+    # The same invisible-border hit-test for a native window.
+    resize_border_proof
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
     exit 0
@@ -2260,6 +2268,13 @@ xdotool mouseup 1
 cstate ".windows[] | select(.app_id == \"tuna-test-beta\") | .rect[2] == $bw" "untiled" ||
     fail G-TILE-PREVIEW "the window tiled after leaving the edge"
 pass G-TILE-PREVIEW "dragging to the left edge shows GNOME's tile preview; leaving the edge drops it"
+
+# The invisible border around a client-decorated window takes the pointer
+# (P-WM-04, #1079). The comparison slice runs old binaries that predate
+# it.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    resize_border_proof
+fi
 
 # The comparison slice runs old binaries that predate these preferences.
 if [ "$GRID_CANCEL_ONLY" != 1 ]; then
@@ -5219,6 +5234,8 @@ EOF
     # own probes and restore button-layout, so the tray gate after them
     # starts from the same session.
     x11_frames_proof
+    # Menus and tooltips: override-redirect X11 windows (P-SY-04, #1076).
+    x11_unmanaged_proof
     tray_x11_gate
 else
     echo "tuna-gtk-shell-proof: G-X11-APP skipped (no Xwayland or xeyes)"

@@ -1,0 +1,119 @@
+diff --git a/third-party/smithay/src/xwayland/xwm/mod.rs b/third-party/smithay/src/xwayland/xwm/mod.rs
+index ff2e421c4..3a6bbdb57 100644
+--- a/third-party/smithay/src/xwayland/xwm/mod.rs
++++ b/third-party/smithay/src/xwayland/xwm/mod.rs
+@@ -127,9 +127,9 @@ use x11rb::{
+         xproto::{
+             Atom, AtomEnum, ChangeWindowAttributesAux, ConfigWindow, ConfigureNotifyEvent,
+             ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, CursorWrapper, EventMask,
+-            FontWrapper, GcontextWrapper, GetPropertyReply, ImageFormat, PixmapWrapper, PropMode, Property,
+-            QueryExtensionReply, Screen, SelectionNotifyEvent, SelectionRequestEvent, StackMode, WindowClass,
+-            CONFIGURE_NOTIFY_EVENT, SELECTION_NOTIFY_EVENT,
++            FontWrapper, GcontextWrapper, GetPropertyReply, GrabMode, GrabStatus, ImageFormat, PixmapWrapper,
++            PropMode, Property, QueryExtensionReply, Screen, SelectionNotifyEvent, SelectionRequestEvent,
++            StackMode, WindowClass, CONFIGURE_NOTIFY_EVENT, SELECTION_NOTIFY_EVENT,
+         },
+         Event,
+     },
+@@ -1423,6 +1423,42 @@ impl X11Wm {
+         Ok(offered)
+     }
+ 
++    /// Whether an X11 client holds an active pointer grab: an open menu,
++    /// a dropdown, a drag.
++    ///
++    /// A grabbing X11 client is sent every pointer event, wherever the
++    /// pointer is; that is how a menu learns of the click outside it that
++    /// dismisses it. Xwayland only hears of pointer events on its own
++    /// surfaces, so a compositor that wants to keep that promise for a
++    /// press elsewhere has to know a grab is active, and no event says so.
++    /// This asks the X server with a `GrabPointer` on the window manager's
++    /// own window, which is never mapped: the X server answers
++    /// `AlreadyGrabbed` when another client holds the pointer and
++    /// `NotViewable` otherwise (dix `GrabDevice` tests them in that
++    /// order), so the request never takes a grab itself.
++    pub fn pointer_grabbed(&self) -> Result<bool, ReplyError> {
++        let status = self
++            .conn
++            .grab_pointer(
++                false,
++                self.wm_window,
++                EventMask::NO_EVENT,
++                GrabMode::ASYNC,
++                GrabMode::ASYNC,
++                x11rb::NONE,
++                x11rb::NONE,
++                x11rb::CURRENT_TIME,
++            )?
++            .reply()?
++            .status;
++        if status == GrabStatus::SUCCESS {
++            // Unreachable while the window stays unmapped; never keep it.
++            self.conn.ungrab_pointer(x11rb::CURRENT_TIME)?;
++            self.conn.flush()?;
++        }
++        Ok(status == GrabStatus::ALREADY_GRABBED)
++    }
++
+     /// Gets the current primary output as advertised by xrandr
+     pub fn get_randr_primary_output(&self) -> Result<Option<String>, ReplyError> {
+         let current_primary = self
+diff --git a/third-party/smithay/src/xwayland/xwm/surface.rs b/third-party/smithay/src/xwayland/xwm/surface.rs
+index 6434bbd24..5cdfacdd9 100644
+--- a/third-party/smithay/src/xwayland/xwm/surface.rs
++++ b/third-party/smithay/src/xwayland/xwm/surface.rs
+@@ -356,6 +356,16 @@ pub fn addresses_window(target: X11Window, client: X11Window, frame: Option<X11W
+     target == client || frame == Some(target)
+ }
+ 
++/// The two `CARD32` of a managed window's ICCCM `WM_STATE` property
++/// (section 4.1.3.1): `IconicState` or `NormalState`, and no icon window
++/// (Mutter's `set_wm_state_on_xwindow`: "Mutter doesn't use icon windows,
++/// so data\[1\] should be None").
++pub fn wm_state_property(iconic: bool) -> [u32; 2] {
++    const NORMAL_STATE: u32 = 1;
++    const ICONIC_STATE: u32 = 3;
++    [if iconic { ICONIC_STATE } else { NORMAL_STATE }, x11rb::NONE]
++}
++
+ fn connection_error(error: ReplyOrIdError) -> ConnectionError {
+     match error {
+         ReplyOrIdError::ConnectionError(error) => error,
+@@ -1345,6 +1355,37 @@ impl X11Surface {
+         Ok(())
+     }
+ 
++    /// Marks a mapped window minimized or restored without unmapping it,
++    /// for a compositor that keeps drawing a minimized window's surface
++    /// (in an overview, a switcher, the minimize animation).
++    ///
++    /// Mutter's `meta_window_x11_set_wm_state` and
++    /// `meta_window_x11_set_net_wm_state`: `WM_STATE` on the client is
++    /// `IconicState` while the window is hidden and `NormalState` again
++    /// when it shows, and `_NET_WM_STATE` gains or loses
++    /// `_NET_WM_STATE_HIDDEN`, on the client and on its frame. That is how
++    /// an X11 client knows to pause what nobody sees, and how a pager
++    /// shows the window's state. A window that is not mapped keeps the
++    /// `WM_STATE` [`set_mapped`](Self::set_mapped) gave it.
++    pub fn set_minimized(&self, minimized: bool) -> Result<(), ConnectionError> {
++        let managed = {
++            let state = self.state.lock().unwrap();
++            state.mapped && state.mapped_onto.is_some() && !state.override_redirect
++        };
++        if managed {
++            let conn = self.conn.upgrade().ok_or(ConnectionError::UnknownError)?;
++            conn.change_property32(
++                PropMode::REPLACE,
++                self.window,
++                self.atoms.WM_STATE,
++                self.atoms.WM_STATE,
++                &wm_state_property(minimized),
++            )?;
++            conn.flush()?;
++        }
++        self.set_suspended(minimized)
++    }
++
+     /// Sets the window as activated or not.
+     ///
+     /// Allows the client to reflect this state in their UI.

@@ -127,9 +127,9 @@ use x11rb::{
         xproto::{
             Atom, AtomEnum, ChangeWindowAttributesAux, ConfigWindow, ConfigureNotifyEvent,
             ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, CursorWrapper, EventMask,
-            FontWrapper, GcontextWrapper, GetPropertyReply, ImageFormat, PixmapWrapper, PropMode, Property,
-            QueryExtensionReply, Screen, SelectionNotifyEvent, SelectionRequestEvent, StackMode, WindowClass,
-            CONFIGURE_NOTIFY_EVENT, SELECTION_NOTIFY_EVENT,
+            FontWrapper, GcontextWrapper, GetPropertyReply, GrabMode, GrabStatus, ImageFormat, PixmapWrapper,
+            PropMode, Property, QueryExtensionReply, Screen, SelectionNotifyEvent, SelectionRequestEvent,
+            StackMode, WindowClass, CONFIGURE_NOTIFY_EVENT, SELECTION_NOTIFY_EVENT,
         },
         Event,
     },
@@ -1421,6 +1421,42 @@ impl X11Wm {
             self.conn.flush()?;
         }
         Ok(offered)
+    }
+
+    /// Whether an X11 client holds an active pointer grab: an open menu,
+    /// a dropdown, a drag.
+    ///
+    /// A grabbing X11 client is sent every pointer event, wherever the
+    /// pointer is; that is how a menu learns of the click outside it that
+    /// dismisses it. Xwayland only hears of pointer events on its own
+    /// surfaces, so a compositor that wants to keep that promise for a
+    /// press elsewhere has to know a grab is active, and no event says so.
+    /// This asks the X server with a `GrabPointer` on the window manager's
+    /// own window, which is never mapped: the X server answers
+    /// `AlreadyGrabbed` when another client holds the pointer and
+    /// `NotViewable` otherwise (dix `GrabDevice` tests them in that
+    /// order), so the request never takes a grab itself.
+    pub fn pointer_grabbed(&self) -> Result<bool, ReplyError> {
+        let status = self
+            .conn
+            .grab_pointer(
+                false,
+                self.wm_window,
+                EventMask::NO_EVENT,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                x11rb::NONE,
+                x11rb::NONE,
+                x11rb::CURRENT_TIME,
+            )?
+            .reply()?
+            .status;
+        if status == GrabStatus::SUCCESS {
+            // Unreachable while the window stays unmapped; never keep it.
+            self.conn.ungrab_pointer(x11rb::CURRENT_TIME)?;
+            self.conn.flush()?;
+        }
+        Ok(status == GrabStatus::ALREADY_GRABBED)
     }
 
     /// Gets the current primary output as advertised by xrandr
