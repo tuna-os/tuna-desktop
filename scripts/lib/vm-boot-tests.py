@@ -3207,7 +3207,10 @@ class TourViewPredicates(unittest.TestCase):
             if argv[0] == "ffmpeg":
                 budgets.append(kwargs["timeout"])
             return real_run(argv, **kwargs)
+        # The clock is frozen inside the window: a wall-clock 0.3 s window
+        # also elapses whenever a loaded host is slow to take the still.
         with tempfile.TemporaryDirectory() as directory, \
+                patch.object(lane.time, "monotonic", lambda: 0.0), \
                 patch.object(lane.subprocess, "run", spy):
             recorder = lane.Recorder(SimpleNamespace(cmd=command), directory)
             # A window this short left the decode milliseconds before; the
