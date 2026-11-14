@@ -169,6 +169,80 @@ crates/compositor/tests/data_device.rs cover a disconnecting owner and a
 destroyed source. The isolated diff is retained in
 CLIPBOARD-SOURCE-ALIVE-PATCH.diff; the pinned version stays 0.7.0.
 
+Issue #203 changes src/wayland/compositor/handlers.rs: wl_region add and
+subtract with an empty, negative or overflowing rectangle, and
+wl_surface.damage with a negative size (damage_buffer already returned
+early), panicked in
+`Size::new` and took the whole session down (found by the nested stress
+suite's protocol fuzzer). Mutter hands the rectangle to pixman
+(meta-wayland-region.c, mtk_region_union_rectangle), which leaves the
+region unchanged for such a rectangle; the handler now ignores it the same
+way. The stress suite's `bad-region` adversary covers it. The isolated diff
+is retained in REGION-RECT-PATCH.diff; the pinned
+version stays 0.7.0.
+
+Issue #203 also changes src/wayland/shm/handlers.rs: wl_shm_pool.resize
+with a size of zero or less posted the invalid-size error and then went on
+to `NonZeroUsize::try_from(size).unwrap()`, which panicked and took the
+whole session down (found by the deeper, error-aware protocol fuzzer).
+The handler now returns after the error, as libwayland-server's
+shm_pool_resize does. The isolated diff is retained in
+SHM-RESIZE-PATCH.diff; the pinned version stays 0.7.0.
+
+Issue #203 also changes src/wayland/shell/xdg/handlers/surface.rs,
+surface/toplevel.rs and positioner.rs, all found by the deeper protocol
+fuzzer:
+
+- xdg_surface.get_popup accepted any parent, including the popup's own
+  xdg_surface or a second xdg_surface on a surface that already was a
+  popup. The popup then descended from itself and
+  `find_popup_root_surface` (and every other walk up the popup chain)
+  looped forever, hanging the whole session. As Mutter's
+  xdg_surface_constructor_get_popup (meta-wayland-xdg-shell.c), a parent
+  without an xdg role is refused with `invalid_popup_parent`; so is one
+  that descends from the new popup.
+- xdg_toplevel.set_min_size and set_max_size with a negative size panicked
+  in `Size::new`. They now post `invalid_size`, as Mutter's
+  xdg_toplevel_set_min_size and xdg_toplevel_set_max_size do.
+- xdg_positioner.set_parent_size with a negative size panicked the same
+  way. Mutter stores any parent size without an error; a negative one
+  cannot be a `Size`, so it is ignored.
+
+crates/compositor/tests/popups.rs covers the popup parent checks. The
+isolated diff is retained in XDG-SHELL-FUZZ-PATCH.diff; the pinned version
+stays 0.7.0.
+
+Issue #203 also changes src/wayland/compositor/tree.rs: placing a
+subsurface above itself removed it from its parent's child list, then
+inserted past the end and panicked. Both above-self and below-self now
+return an error before changing the list, which the request handler turns
+into `wl_subsurface.bad_surface`. This matches Mutter's `is_sibling`
+and `subsurface_place` in meta-wayland-subsurface.c. A missing child in
+the parent's list likewise returns an error instead of unwrapping.
+The real-client regression in crates/compositor/tests/popups.rs covers
+both requests and confirms another client is still served afterward.
+
+Issue #1084 changes src/backend/renderer/utils/wayland.rs: the additive
+RendererSurfaceState::release_imported_shm_buffer sends wl_buffer.release
+for the attached wl_shm buffer once the given renderer context has
+imported it, instead of when another buffer replaces it. Mutter copies
+SHM buffers when it applies a commit and never holds them
+(meta-wayland-surface.c, buffer_held), and GTK's cairo renderer before
+4.22 depends on that: when its surface changes size it forgets the buffers
+still attached and never frees them on a late release (GTK 8a39f8e6), so
+every resize of a cairo-drawn surface leaked one shm pool in the client and
+its descriptor in the compositor. The buffer stays attached (the surface
+stays mapped and draws from its texture); a per-buffer flag keeps the
+release from being sent twice and is cleared when the same buffer is
+attached again, so each commit gets one release. Existing APIs and the
+drop-time release of buffers nobody imported are unchanged. Roost calls it
+for every committed surface tree right after importing it with its only
+renderer (crates/compositor/src/buffer_upload.rs); real socketpair tests in
+crates/compositor/tests/buffer_release.rs cover a resized layer surface,
+re-attached and replaced buffers, a destroyed surface, and a toplevel with
+a subsurface. The isolated diff is retained in SHM-EARLY-RELEASE-PATCH.diff;
+the pinned version stays 0.7.0.
+
 Issue #364 additionally changes `src/wayland/input_method/{mod.rs,
 input_method_handle.rs,input_method_keyboard_grab.rs}`. Registry visibility
 and forced binds both enforce the compositor's input-method admission
@@ -226,3 +300,41 @@ Such a late request receives a tracked inert child without metadata; its
 release and parent teardown cannot unset the compositor owner. The returned-
 key consumer exercises this race with actual standard requests and verifies
 continued physical-key delivery to the compositor grab.
+
+Issue #1088 changes src/wayland/shell/xdg/handlers/surface/toplevel.rs:
+the xdg_toplevel's destructor now also drops the xdg_dialog_v1 handle its
+user data keeps, as it already drops the decoration's. The dialog object's
+own user data is the ToplevelSurface (the xdg_toplevel and its
+wl_surface), so the two held each other and only xdg_dialog_v1.destroy
+broke the cycle. GTK 4 creates an xdg_dialog_v1 for every toplevel, and an
+app that exits (or is killed) just disconnects: every such window's
+wl_surface, its role data and the textures its frames were uploaded to
+stayed allocated for the rest of the session, about 1.65 MB per closed
+libadwaita window. Upstream master has the same cycle. The dialog
+object itself stays usable until its client destroys it (its requests
+only touch the surface's role data, which outlives the role). Real
+socketpair tests in crates/compositor/tests/window_teardown.rs close
+windows with and without an xdg_dialog_v1 by destroying every object and
+by disconnecting, and check that each surface's server-side data is
+dropped. The isolated diff is retained in XDG-DIALOG-CYCLE-PATCH.diff; the
+pinned version stays 0.7.0.
+
+Issue #503 additionally changes GlesFrame::render_texture_from_to in
+src/backend/renderer/gles/mod.rs: a texture drawn texel for pixel (the
+source size, turned by the buffer transform, equals the destination size,
+and the source starts at a whole texel) is sampled with GL_NEAREST for that
+draw, whatever filters the renderer is set to. Every sample of such a draw
+lands on a texel centre, so nearest and linear name the same texel, and
+nearest does not fetch and weigh the three texels around it: on llvmpipe
+the four gathers of a bilinear fetch are most of the fragment work, and
+nearly everything a desktop draws outside an animation is unscaled. Mutter
+does the same for unscaled shaped textures and backgrounds
+(meta-shaped-texture.c, meta-background-content.c). The renderer's
+configured filters are restored after the draw; scaled, stretched or
+sub-texel-shifted draws keep them. GL tests in unscaled_nearest_tests
+(surfaceless Mesa EGL) read the filter each draw leaves on the texture and
+the pixels it produces: an unscaled, a cropped and a quarter-turned draw
+are nearest and show only source texels, while shrunk, grown, one-axis
+stretched and half-texel-shifted draws stay linear and filtered. The
+isolated diff is retained in UNSCALED-NEAREST-PATCH.diff; the pinned
+version stays 0.7.0.

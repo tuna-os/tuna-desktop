@@ -828,6 +828,63 @@ impl WindowManager {
         self.windows.keys().copied()
     }
 
+    /// Which of the manager's per-window structures still name window
+    /// `id`. Empty once a closed window is fully forgotten (#1088);
+    /// effect state the runtime steps every frame (map/close effects,
+    /// modal dimming) counts too.
+    pub fn window_references(&self, id: u64) -> Vec<&'static str> {
+        let mut held = Vec::new();
+        let mut check = |name, holds: bool| {
+            if holds {
+                held.push(name);
+            }
+        };
+        check("model", self.model.window(id).is_some());
+        check("windows", self.windows.contains_key(&id));
+        check(
+            "surface_index",
+            self.surface_index.values().any(|v| *v == id),
+        );
+        #[cfg(feature = "xwayland")]
+        check("x11_index", self.x11_index.values().any(|v| *v == id));
+        check("stacking", self.stacking.contains(&id));
+        check("focus_history", self.focus_history.contains(&id));
+        check(
+            "focus_awaits_surface",
+            self.focus_awaits_surface == Some(id),
+        );
+        check("x11_input_focus", self.x11_input_focus == Some(id));
+        check("pre_overview_focus", self.pre_overview_focus == Some(id));
+        check("overview_activated", self.overview_activated == Some(id));
+        check("activated", self.activated == Some(id));
+        check("pointer_window", self.pointer_window == Some(Some(id)));
+        check(
+            "pointer_rest",
+            self.pointer_rest.is_some_and(|r| r.window == Some(id)),
+        );
+        check("auto_raise", self.auto_raise.is_some_and(|(w, _)| w == id));
+        check("grab_raise", self.grab_raise.is_some_and(|g| g.id == id));
+        check(
+            "column_animations",
+            self.column_animations.contains_key(&id),
+        );
+        check("strip_hints", self.strip_hints.contains_key(&id));
+        check(
+            "strip_resize_heights",
+            self.strip_resize_heights.iter().any(|(w, _)| *w == id),
+        );
+        check("icon_geometries", self.icon_geometries.contains_key(&id));
+        check(
+            "menu_requests",
+            self.menu_requests.iter().any(|(w, _, _)| *w == id),
+        );
+        check("size_changes", self.size_changes.holds(id));
+        check("window_lifecycle", self.window_lifecycle.holds(id));
+        check("modal_dim", self.modal_dim.holds(id));
+        check("alive", self.alive_holds(id));
+        held
+    }
+
     /// The Wayland surface of window `id`, if it has one.
     pub fn surface_of(&self, id: u64) -> Option<WlSurface> {
         self.windows
@@ -4136,10 +4193,14 @@ impl WindowManager {
                     pointer.current_focus().is_some()
                 );
             }
+            let serial = SERIAL_COUNTER.next_serial();
+            if pressed {
+                state.pointer_press_serial = Some(serial);
+            }
             pointer.button(
                 state,
                 &ButtonEvent {
-                    serial: SERIAL_COUNTER.next_serial(),
+                    serial,
                     time,
                     button,
                     state: if pressed {
@@ -4213,8 +4274,8 @@ impl WindowManager {
     /// none is up (ext-session-lock-v1: nothing behind the lock has
     /// focus). Applications get wl_keyboard.leave as the session locks,
     /// as GNOME's lock screen takes focus, instead of keeping it until
-    /// the first key press; [`Self::restore_keyboard_owner`] hands it
-    /// back on unlock.
+    /// the first key press; [`Self::refocus_after_lock`] hands it back
+    /// on unlock.
     pub fn hold_lock_focus(
         &mut self,
         state: &mut State,
@@ -4251,6 +4312,26 @@ impl WindowManager {
             let focused = self.model.focused();
             self.apply_focus(state, focused);
         }
+    }
+
+    /// The lock lifted: give the keyboard back to what had it, as GNOME
+    /// Shell's `popModal` does (screenShield.js locks with a modal stage
+    /// grab, which revokes Mutter's Wayland popup grab without dismissing
+    /// it): the topmost popup of a grab that outlived the lock, else the
+    /// owner a popup grab hands back to (the parked overview, an
+    /// Exclusive layer, the focused window). Without this the keyboard
+    /// stayed on the destroyed lock surface until the next click.
+    pub fn refocus_after_lock(&mut self, state: &mut State) {
+        if let Some(top) = state.popup_grab.last().map(|p| p.wl_surface().clone()) {
+            if let Some(keyboard) = self.keyboard.clone() {
+                keyboard.set_focus(state, Some(top), SERIAL_COUNTER.next_serial());
+            }
+            return;
+        }
+        // No grab to return to: the owner has the keyboard back at once,
+        // and the next reconcile re-delivers pointer focus as after a grab.
+        self.restore_keyboard_owner(state);
+        state.popup_refocus = true;
     }
 
     /// Route one input event to the session-lock surface and nothing
@@ -4306,10 +4387,14 @@ impl WindowManager {
             } => {
                 if let Some(pointer) = self.pointer.clone() {
                     self.lock_pointer_enter(state, &pointer, surface, time);
+                    let serial = SERIAL_COUNTER.next_serial();
+                    if pressed {
+                        state.pointer_press_serial = Some(serial);
+                    }
                     pointer.button(
                         state,
                         &ButtonEvent {
-                            serial: SERIAL_COUNTER.next_serial(),
+                            serial,
                             time,
                             button,
                             state: if pressed {

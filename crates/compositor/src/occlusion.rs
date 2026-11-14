@@ -142,12 +142,16 @@ impl Occlusion {
 }
 
 /// Draw one planned pass bottom to top. Each element gets only its
-/// visible damage.
+/// visible damage. With `opaque`, what an element drawn pixel for pixel
+/// declares opaque is drawn without blending, as Mutter draws opaque
+/// regions: on llvmpipe a blended pixel also reads the one beneath it
+/// (#503).
 pub(crate) fn draw_planned<R, E>(
     frame: &mut R::Frame<'_, '_>,
     scale: f64,
     elements: &[E],
     plan: &[Vec<PhysicalRect>],
+    opaque: bool,
 ) -> Result<(), R::Error>
 where
     R: Renderer,
@@ -166,9 +170,20 @@ where
                 r
             })
             .collect();
-        // No opaque regions: GLES would draw them with blending off, and
-        // on the nested (flipped) target that blanked the wrong pixels.
-        element.draw(frame, element.src(), geometry, &damage, &[])?;
+        // Only on a target without a transform: on the nested (flipped)
+        // target GLES left the opaque regions in the wrong place. And only
+        // for an element drawn pixel for pixel from its buffer: a scaled
+        // one (an overview preview, a window opening) rounds its opaque
+        // region out over edge pixels it covers only in part.
+        let src = element.src().size;
+        let one_to_one = (src.w - f64::from(geometry.size.w)).abs() < 0.5
+            && (src.h - f64::from(geometry.size.h)).abs() < 0.5;
+        let opaque_regions = if opaque && one_to_one {
+            element.opaque_regions(scale.into())
+        } else {
+            Default::default()
+        };
+        element.draw(frame, element.src(), geometry, &damage, &opaque_regions)?;
     }
     Ok(())
 }

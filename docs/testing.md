@@ -43,7 +43,11 @@ base, and picks the proof lanes the change can affect:
   lanes whose artifacts it needs. `scripts/ci-select-lanes` (`OWNED` and
   `NO_LANE`) is the authoritative, ordered mapping.
 - a lane's own proof script, reference fixtures or packaging: that lane
-  (plus the lanes whose artifacts it needs).
+  (plus the lanes whose artifacts it needs). A `scripts/tests/` file edit
+  selects the lane whose job runs that file (for example `gtk-shell` for
+  `test_notify_callback_contract.py`); a test only `check` runs selects none.
+  `WorkflowSync.test_lane_run_tests_select_their_lane` fails when a lane job
+  runs a test the selector does not map.
 - a packaged conffile (`share/pam.d/`, installed as `/etc/pam.d/tuna-lock`):
   `journey`, whose disposable Debian lifecycle fails when its bytes drift
   from the released package's, plus the core lanes and every package
@@ -189,11 +193,39 @@ This matches Mutter 51's initial-focus path:
 [attaching the drag handler immediately invalidates focus](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-input.c#L288-L325),
 and [drag focus sends the destination its offer while restricting source-less drags to the origin client](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-data-device.c#L337-L397).
 
+`scripts/tuna-gtk-shell-proof --window-leak-only --artifacts DIR` runs
+G-WINDOW-LEAK (#1088): after five warm-up windows, 100 libadwaita windows
+(`TUNA_WINDOW_LEAK_WINDOWS` sets the count) are opened and closed, odd ones
+with Alt+F4 (the app destroys its window; the close effect plays) and even
+ones by killing the app (its connection closes with every object alive).
+The compositor's `Pss_Anon` must stay within 8 MiB, and its open
+descriptors within two, of the warm state, a bound independent of the
+number of windows; each window used to keep about 1.65 MB.
+`scripts/lib/tuna-resource-sample.py` reads them from `/proc` and leaves
+`window-leak-{before,after}.json` and `window-leak-diff.txt` in the
+artifacts. The compositor side is `cargo test -p tuna-compositor --test
+window_teardown`: a toplevel with and without an `xdg_dialog_v1`, a
+subsurface, a grabbing popup and uploaded shm buffers, closed by destroying
+every object or by disconnecting, must drop every surface's server-side
+data, and the window manager must name the window nowhere.
+
 `scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts DIR` runs the same
 held-button hover and persisted reorder assertions as the full GTK proof,
 without the unrelated earlier gates. It adds no target motion or timing
 relaxation. CI runs this slice with its freshly built compositor and shell;
 the no-post-start-motion wire tests establish the precise protocol ordering.
+
+`scripts/tuna-gtk-shell-proof --search-leak-only --artifacts DIR` runs
+G-SEARCH-LEAK (#1084): after five warm-up searches, 50 overview searches
+with results (`TUNA_SEARCH_LEAK_SEARCHES` sets the count), each typed with
+real keys and closed with Escape, must leave the shell's
+`memfd:gdk-wayland` mappings and the shell's and compositor's open
+descriptors exactly where they were. `scripts/lib/tuna-resource-sample.py`
+reads them from `/proc` and leaves `search-leak-{before,after}.json` in the
+artifacts. The compositor side is `cargo test -p tuna-compositor --test
+buffer_release`: an uploaded `wl_shm` buffer comes back with
+`wl_buffer.release` at once, as Mutter's do, and its pool closes once the
+client destroys it and the surface moves on to another buffer.
 
 Every build uses its own checkout's `target/` (an inherited
 `CARGO_TARGET_DIR` is ignored; set `TUNA_TARGET_DIR` to choose one) and no
@@ -442,6 +474,13 @@ and writes frames, logs, and usually an `assertions.txt` into the
 artifacts directory. A nonzero exit is a failure; the frames are for human
 review. CI shellchecks each script before running it.
 
+Magnifier focus checks wait for the probe's focused entry to have allocated
+widget bounds before comparing its GTK geometry with the live AT-SPI extent.
+The OSK show/hide and lock checks wait for their asynchronous watcher to
+record the corresponding transition before using its timestamp for timing or
+no-remap assertions. These readiness conditions use the existing gate deadlines;
+missing geometry or watcher transitions remain failures, not skipped assertions.
+
 The native grid-drag cancellation proof holds the pointer button until both
 the compositor reports cancellation and a fresh, complete, owner-bound AT-SPI
 tree restores the normal page arrow without a drag preview. Widget removal
@@ -512,6 +551,29 @@ also runs on its own and reads
 commands (`down N`, `move DX DY MS`, `hold MS`, `up`, `swipe N DX DY MS
 [PAUSE]`, `scroll`, `tap`, `click`) on stdin, in millimetres and
 milliseconds. Other phases can import `create_touchpad()` from it.
+
+Private colord startup failures in `D-COLORD` retain `colord-startup.txt`:
+the intended user/group, private bus and binary identity, boundary markers
+before namespace creation, tmpfs mount, privilege drop and daemon exec, the
+actual mounted store ownership/mode, and wrapper/supervisor/child PIDs.
+When the wrapper has exited (its world-readable `/proc` entry is gone or a
+zombie; never an unprivileged `kill -0`, which a live root-owned sudo wrapper
+answers with EPERM), the harness waits once and retains its exact shell
+status separately from the supervisor's observed child status. A status
+above 128 includes a possible signal mapping, not an assertion of cause.
+Otherwise readiness still fails at the unchanged 30-second deadline, after
+writing the same receipt.
+`colord.log` contains only the daemon's original stdout/stderr;
+`colord-launch.log` contains launcher errors. Failure receipts also include
+bounded raw kernel journal/ring-buffer output with reader statuses (including
+permission/unavailability errors). These records do not diagnose an OOM or
+authentication failure by themselves; ring-buffer output can predate startup.
+The real private-bus readiness assertion remains mandatory, without restart,
+store permission changes or an authentication bypass.
+
+The startup boundary regression tests use fake sudo/unshare/mount/setpriv
+and daemon commands, not a real privileged mount:
+`python3 -m unittest discover -s scripts/tests -p test_colord_startup.py`.
 
 ## GNOME Core applications: installed-image evidence
 
@@ -979,10 +1041,24 @@ show:
   never exits or panics and the shell never exits.
 
 `H-GROWTH` bounds the compositor and shell as the churn lane does: final
-PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32.
-Pull requests and dispatches run 4 rounds, nightly 30. The artifacts keep
-the compositor, shell and client logs, every step's outputs and window
-rectangles (`report.json`), the metrics and the state at a failure.
+PSS within round-0 PSS × 1.25 + 64 MiB and fds within round-0 + 32. Each
+round's sample in `metrics.jsonl` and `report.json` has, per process, the
+kernel's `Pss_Anon`/`Pss_File`/`Pss_Shmem` split, PSS by mapping kind
+(heap, anonymous, shared memory, GPU, files), fds and mappings
+(`scripts/lib/tuna_process_metrics.py`, shared with `scripts/tuna-stress`);
+the gate's line names the processes and kinds that rose most since round
+0. `smaps-round0-*` and `smaps-final-*` are each process's mappings after
+the first and the last round, `state-round0.json` the compositor state
+after the first, and every step in `report.json` has each process's PSS.
+Pull requests and dispatches run 4 rounds, nightly 30; a dispatch's
+`hotplug_rounds` input (and `churn_rounds` for the churn lane) runs
+another count, and its `hotplug_heaptrack` input runs the storm a second
+time with `--heaptrack`: the compositor and the shell record their
+allocation backtraces (`heaptrack/heaptrack-<name>-<pid>.zst`, read with
+`heaptrack_print`). That run is a diagnostic, since the profiler's memory
+counts in its `H-GROWTH`. The artifacts keep the compositor, shell and
+client logs, every step's outputs and window rectangles (`report.json`),
+the metrics and the state at a failure.
 
 To run it on a host with Linux 6.19+ and sudo, after building
 `tuna-compositor` and `tuna-shell-gtk`:
@@ -1008,26 +1084,69 @@ Read `nested.log` in the artifacts directory first (`compositor.log` for
 retry a deterministic test until it passes: the timing rule in the
 [development guide](development.md#writing-a-test) applies.
 
-## Bounded nested stress
+## Nested stress and torture suite
 
-`nested stress` runs four concurrent Wayland GTK clients. Each round maps
-and destroys 400 windows; three warmup rounds settle renderer caches.
-After every measured round, Escape and Super must still change the
-compositor's overview state, and every destroyed window must disappear.
-The lane then sends 1,000 notifications and closes each over D-Bus.
+`nested stress` (`scripts/tuna-stress`, `.github/workflows/stress.yml`)
+runs the real compositor and GTK shell nested on Xvfb with a private
+session bus, a private system bus of service stubs
+(`scripts/lib/tuna-service-stubs.py`), a pam_wrapper unlock stack and the
+compositor started at systemd's user-session open-file limit (1024 soft).
+Phases, in order (`--phases` runs a subset):
 
-The per-change smoke uses ten measured rounds; nightly uses 300. The
-report retains PSS/RSS, file descriptors and descendant process counts
-for the compositor and supervised shell after each round. Final PSS must
-stay within warmup PSS × 1.25 + 64 MiB, and fd count within warmup + 32.
-These diagnostic bounds catch unbounded growth in this workload; they
-are separate from the GNOME performance targets in #73. A panic, lost
-input response, orphaned window or hung worker fails the lane. Logs,
-metrics, final state, assertions and the exact source revision are kept.
+- `churn`: four clients map and destroy 400 windows per round.
+- `popup`: four clients each map 60 nested (depth three) popups.
+- `protocol`: four live adversaries per mode (`scripts/lib/tuna-wayland-adversary.c`)
+  beside a healthy popup client: malformed opcodes, zero and huge buffers,
+  out-of-order destruction, invalid and never-acknowledged configures,
+  death mid-transaction, 5,000 unthrottled commits each, 300 freshly
+  written 2 MiB SHM buffers each, 1,000 connections held open at once, and
+  a seeded fuzzer: per attacker 100 sessions of up to 256 random requests
+  to every bound global and the objects they create, shaped by each
+  request's signature and kept valid in type and lifetime except one
+  request in 32 (wrong-typed, destroyed or null objects, edge integers);
+  requests that ended earlier sessions are picked less often, and every
+  request must be answered within 5 s (the day's seeds are in the report).
+- `dbus`: 1,000 notifications, 2,000 `ShowOSD` calls, accelerator grab and
+  ungrab floods (then a live grab fires and a departed caller's grab is
+  released), 300 tray items registered from their own connections and
+  pruned after leaving, and a search-provider query flood with every other
+  reply 2.5 s late.
+- `scale`: 40 `ApplyMonitorsConfig` scale changes while clients map.
+- `services`: NetworkManager, BlueZ and power-profiles stubs vanish (half
+  killed) and return ten times; the shell must read each returned daemon
+  again without restarting. `ibus-daemon` is killed five times under a
+  focused field: typing continues without it, and the IBus bridge must
+  focus the returned daemon's new input context.
+- `input`: 1,000 typed keys must arrive exactly once; 2,000 pointer moves;
+  a held key's repeat must stop when focus leaves, not resume on refocus
+  and not leak into the window that gains focus.
+- `swipe`: 60 touchpad swipes interrupted (restarted, Escape mid-gesture,
+  cancelled) must settle.
+- `lock`: Super+L under an active popup grab, mid-swipe; no key, motion or
+  press may reach the client while locked; unlocking with the PAM
+  password restores typing.
+- `shell`: the shell is SIGKILLed through its restart budget, then once
+  more; the recovery overlay's relaunch must bring it back while a client
+  survives and keeps input.
 
-Run it on a development host after building the compositor and GTK shell:
+Every phase ends by proving the input path (Escape and Super change the
+overview). PSS/RSS, fd and mapping counts for the compositor and its
+descendants are sampled before and after each phase, per process and with
+PSS split by mapping kind (heap, anonymous, shared memory, GPU, files), in
+`metrics.jsonl`; a failing growth gate names the phase that grew most and
+the process and kind that grew. Final PSS must stay within
+warmup × 1.25 + 64 MiB, fds within warmup + 32 and mappings within
+warmup × 1.25 + 1024. These diagnostic bounds catch unbounded growth;
+they are separate from the GNOME performance targets in #73. A panic,
+compositor exit, lost input response, orphaned window or hung worker
+fails the lane. Pull requests touching the suite run ten churn rounds;
+the nightly run uses 300.
+
+Run it after building the compositor, GTK shell, shell host (IBus bridge)
+and wallpaper helper:
 
 ```sh
+cargo build -p tuna-compositor -p tuna-shell-gtk -p tuna-shell-host -p tuna-wallpaper-svg
 scripts/tuna-stress --rounds 10 --out /tmp/tuna-stress-fresh
 ```
 
@@ -1057,5 +1176,5 @@ cargo install cargo-fuzz --version 0.13.2 --locked
 cargo +nightly-2026-08-28 fuzz run control_body -- -max_total_time=60 -max_len=1048580 -timeout=5 -rss_limit_mb=2048
 ```
 
-This covers the decoder portion of #203. Wayland misuse, client churn,
-service failures and a measured long soak remain separate stress gates.
+This covers the control decoders of #203; Wayland request handlers are
+fuzzed live by the nested stress suite's `protocol` phase.
