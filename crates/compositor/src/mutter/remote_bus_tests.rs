@@ -138,6 +138,7 @@ fn only_the_installed_remote_desktop_daemon_may_create_sessions() {
         outputs: Default::default(),
         to_loop: to_loop.clone(),
         next_id: next_id.clone(),
+        scan: Default::default(),
     };
     let screencast = ScreenCast {
         remote: remote.clone(),
@@ -148,6 +149,7 @@ fn only_the_installed_remote_desktop_daemon_may_create_sessions() {
         to_loop,
         signals: crate::dbus_signals::SignalQueue::new("test-mutter-signals"),
         next_id,
+        scan: Default::default(),
     };
     let _server = zbus::blocking::connection::Builder::address(bus.1.as_str())
         .unwrap()
@@ -878,6 +880,7 @@ fn a_remote_grant_links_one_screencast_session_of_its_own_owner() {
         to_loop,
         signals: crate::dbus_signals::SignalQueue::new("test-mutter-signals"),
         next_id: Arc::new(AtomicU64::new(1)),
+        scan: Default::default(),
     };
     let grant = remote_desktop::RemoteGrant::new(1, ":1.5".into());
     remote

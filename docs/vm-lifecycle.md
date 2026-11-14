@@ -1014,6 +1014,43 @@ actual first locked wake, exact application geometry/process preservation,
 fresh GPU uploads, stale-auth retirement, fresh authentication and client
 repaint; fixture regressions alone cannot qualify suspend.
 
+#### Wake-time guest-agent transport (guest Linux 7.3)
+
+PR runs for #1083, #1089, #1090 and #1092 (e.g. 43385429967) passed
+`V-SUSPEND-GPU-PM` and reached real S3. The compositor reset scanout and
+repainted after wake. The run then failed `V-LIFECYCLE` with a bare socket
+`timed out`. The guest's qemu-ga logged `guest-exec ... inventory` at 501.22 s
+and no `guest-exec-status` afterwards. Its next request came at 530.45 s, on
+the reconnected diagnostics transport. The host therefore never received the
+guest-exec acknowledgement. The inventory probe itself did not block. The
+green main run 43369611171 polled status 42 ms after the same request.
+
+The difference is the guest kernel, not the PRs. `pacman -Syu` during the
+image build moved the guest from `linux 7.2.15` (main) to `7.3.4` (all four
+PRs). Upstream commit 952261953cf7 ("virtio_console: fix control queue race
+during restore", in
+[7.3.4](https://raw.githubusercontent.com/gregkh/linux/v7.3.4/drivers/char/virtio_console.c)
+but not
+[7.2.15](https://raw.githubusercontent.com/gregkh/linux/v7.2.15/drivers/char/virtio_console.c))
+changed `virtcons_restore()` to fill the control receive queue only after
+sending `PORT_READY`. [QEMU 10.2](https://gitlab.com/qemu-project/qemu/-/raw/v10.2.0/hw/char/virtio-serial-bus.c)
+answers `PORT_READY` with the host-open event before it returns the
+control-out buffer. `send_control_msg()` drops that event when the receive
+queue is empty. Freeze had set the guest port to host-disconnected, so
+after restore every qemu-ga write returns `EAGAIN` until the host chardev
+reconnects.
+
+After `system_wakeup`, the lane now calls `GuestAgent.reopen_after_wake`
+(2 s per connection, 20 s total). It closes and reopens the QGA chardev,
+which makes QEMU send `PORT_OPEN` 0/1 again, until one `guest-sync-delimited`
+round trip completes. The step runs no guest-exec and reads no guest state,
+so the following inventory is still the first state observation after wake.
+The number of connections and the elapsed time go to
+`lifecycle/wake-transport.json`. The inventory keeps its 30 s deadline, and
+no suspend gate changes. A lost acknowledgement or status reply now names its
+QGA step instead of a bare `timed out`. This is controlled-socket evidence only.
+A fresh actual run must still qualify `V-SUSPEND` on the 7.3 guest.
+
 
 ### Date & Time restoration and published capability failures
 

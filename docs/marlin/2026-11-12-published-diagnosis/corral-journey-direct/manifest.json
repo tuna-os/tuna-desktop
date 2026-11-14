@@ -1,0 +1,880 @@
+{
+  "schema": 2,
+  "started": "2026-11-12T16:41:42+00:00",
+  "runner": "scripts/tuna-corral-journey Journey (direct)",
+  "runner_sha256": "2b5b49faa6dcd2ba7c11965fd76f19d1e88bf6576883180d5cb5c33393c0005d",
+  "scope": "daily-driver",
+  "image": {
+    "ref": "ghcr.io/tuna-os/marlin@sha256:77b12bb074712cdf75d9b2af436900e44ddcfd5f910a98a76860e05e57ee30c5",
+    "booted": "ghcr.io/tuna-os/marlin@sha256:77b12bb074712cdf75d9b2af436900e44ddcfd5f910a98a76860e05e57ee30c5",
+    "booted_manifest_digest": "sha256:87d2baf30fc72b96ec5d625b369090a7cd728c11b803042841220c922a68a977"
+  },
+  "vm": {
+    "target": "kubevirt/karnataka-k3s/corral-vms/tuna-q-variant-diag-pub1112",
+    "boot_id": "286f9b68-d6dc-407a-8732-e160ef73e57a"
+  },
+  "note": "Run tuna-corral-journey's own Journey steps on the already provisioned VM.\n\nThe script's provision() could not finish: `corral wait` reported the VM's\n`running` condition as \"not found\" for 900 s while `corral list`, `corral info`,\n`corral ssh` and kubectl all saw it Running (corral v0.7.0+36.g76b6dd5). The\nreadiness conditions were checked by hand instead (see ../by-hand/readiness.txt).",
+  "steps": [
+    {
+      "id": "greeter-user-list",
+      "title": "GDM shows the user list",
+      "started": "2026-11-12T16:42:11+00:00",
+      "checks": [
+        {
+          "name": "console size",
+          "ok": true,
+          "observed": [
+            1280,
+            800
+          ]
+        },
+        {
+          "name": "GDM greeter session on seat0",
+          "ok": true,
+          "observed": "1"
+        },
+        {
+          "name": "no user session yet",
+          "ok": true,
+          "observed": null
+        }
+      ],
+      "result": "pass",
+      "frame": "01-greeter-user-list.png",
+      "frame_sha256": "2c9695a4e10a626b860a285b450f99a7c6b4024d051339ec890aacafacb7cb92",
+      "crosscheck": {
+        "identical": true,
+        "corral_png_sha256": "05a06963540c9a1a3ea6a2d6e1c9960dbf71f9c665ebac2f483d79024c038d6f"
+      },
+      "journal": [],
+      "finished": "2026-11-12T16:43:13+00:00"
+    },
+    {
+      "id": "greeter-password",
+      "title": "Select the user; GDM asks for the password",
+      "started": "2026-11-12T16:43:13+00:00",
+      "checks": [
+        {
+          "name": "password prompt requested",
+          "ok": true,
+          "observed": "Enter on the focused user row changed the greeter"
+        }
+      ],
+      "result": "pass",
+      "frame": "02-greeter-password.png",
+      "frame_sha256": "a5c7372aa356b3e65a1d2e0bf21d5dc5af486a40839276b8bf58dac781ebd5f8",
+      "journal": [],
+      "finished": "2026-11-12T16:43:27+00:00"
+    },
+    {
+      "id": "session-is-tuna",
+      "title": "Password login starts Tuna Desktop (lands in the overview)",
+      "started": "2026-11-12T16:43:27+00:00",
+      "checks": [
+        {
+          "name": "logind session via gdm-password",
+          "ok": true,
+          "observed": {
+            "Service": "gdm-password",
+            "Desktop": "",
+            "Type": "wayland",
+            "Class": "user",
+            "State": "active",
+            "LockedHint": "no"
+          }
+        },
+        {
+          "name": "Tuna compositor and shell run",
+          "ok": true,
+          "observed": [
+            "tuna-compositor",
+            "tuna-ibus-bridg",
+            "tuna-shell-gtk"
+          ]
+        },
+        {
+          "name": "no gnome-shell for the user",
+          "ok": true,
+          "observed": false
+        },
+        {
+          "name": "session desktop is tuna",
+          "ok": true,
+          "observed": [
+            "XDG_CURRENT_DESKTOP=Tuna:GNOME",
+            "XDG_SESSION_DESKTOP=tuna",
+            "XDG_SESSION_TYPE=wayland"
+          ]
+        }
+      ],
+      "result": "pass",
+      "frame": "03-session-is-tuna.png",
+      "frame_sha256": "b7a84a8ef17759b44ab464eebc4404f2e4cb54ec7c2b9276d963c5dc4a5a4beb",
+      "crosscheck": {
+        "identical": true,
+        "corral_png_sha256": "77c890f184683d98aec0c9e907b2d2d59f243e53ce56c1ca946ac192adadc39c"
+      },
+      "journal": [
+        "tuna-compositor: serving org.gnome.Mutter.ServiceChannel",
+        "tuna-compositor: serving org.gnome.SettingsDaemon.Color",
+        "tuna-compositor: session services: display environment imported (systemd=true bus=true)",
+        "tuna-compositor: session services: holding the session leader FIFO",
+        "tuna-compositor: ime: IBus bridge started",
+        "tuna-ibus-bridge: input context /org/freedesktop/IBus/InputContext_2",
+        "tuna-ibus-bridge: ready",
+        "tuna-compositor: session services: graphical target active",
+        "tuna-shell-gtk: OpenGL is llvmpipe (LLVM 23.1.4, 256 bits); drawing with cairo",
+        "tuna-compositor: session services: portals refreshed",
+        "tuna-shell-gtk: wellbeing: screen-time state Active",
+        "tuna-shell-gtk: keybindings: 73",
+        "tuna-compositor: switcher keys:",
+        "tuna-compositor: overview focus parked",
+        "tuna-shell-gtk: search providers: org.gnome.Settings.desktop, org.gnome.Nautilus.desktop",
+        "tuna-shell-gtk: media keys: gsd-media-keys owns the media-keys bindings",
+        "tuna-compositor: switcher keys: 12 chords, cycle-group Some(SwitcherKey { keysym: 65475, mods: 8, kind: CycleGroup }), cycle-windows Some(SwitcherKey { keysym: 65307, mods: 8, kind: CycleWindows })",
+        "tuna-shell-gtk: keybindings: 73 grabs, maximize on [\"<Super>Up\"]",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-shell-gtk: polkit agent registered",
+        "tuna-shell-gtk: IBus panel: owns org.freedesktop.IBus.Panel on the IBus bus",
+        "tuna-shell-gtk: network agent registered",
+        "tuna-compositor: wallpaper decoded for 1280x800 in 123 ms",
+        "tuna-compositor: session services: GDM session and display registered",
+        "tuna-compositor: libinput: scroll-wheel emulation button rejected for QEMU QEMU USB Tablet: Unsupported"
+      ],
+      "finished": "2026-11-12T16:44:51+00:00"
+    },
+    {
+      "id": "portal-availability",
+      "title": "Published portal interfaces respond (not capture consent)",
+      "started": "2026-11-12T16:44:51+00:00",
+      "checks": [
+        {
+          "name": "settings portal responds",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "stdout": "(<<uint32 0>>,)",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "screenshot portal responds",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "stdout": "(<uint32 2>,)",
+            "stderr": ""
+          }
+        },
+        {
+          "name": "screencast portal responds",
+          "ok": true,
+          "observed": {
+            "exit": 0,
+            "stdout": "(<uint32 7>,)",
+            "stderr": ""
+          }
+        }
+      ],
+      "result": "pass",
+      "frame": "04-portal-availability.png",
+      "frame_sha256": "566885bdda378ac20575fbe141eab209cec6761e5ea6d834ae8cfc98e1c3f605",
+      "journal": [],
+      "finished": "2026-11-12T16:46:10+00:00"
+    },
+    {
+      "id": "portal-screenshot",
+      "title": "Request Screenshot through the actual published frontend",
+      "started": "2026-11-12T16:46:10+00:00",
+      "checks": [
+        {
+          "name": "native requester awaiting matching consent",
+          "ok": true,
+          "observed": {
+            "session_state": [
+              {
+                "phase": "before-request",
+                "at": "2026-11-12T16:46:36.978+00:00",
+                "exit": 0,
+                "stdout": "(false,)",
+                "stderr": ""
+              }
+            ],
+            "ready": true,
+            "finished": false,
+            "root": "/run/user/1000/tuna-variant-screenshot-454681364213217",
+            "requester_exit": null,
+            "log": "",
+            "response": null,
+            "pid": 4079,
+            "argv": [
+              "/usr/bin/python3",
+              "/run/user/1000/tuna-variant-screenshot-454681364213217/tuna-portal-screenshot-client.py",
+              "/run/user/1000/tuna-variant-screenshot-454681364213217/frame.png",
+              "allow"
+            ],
+            "source_sha256": {
+              "tuna-portal-consent.py": "b6f3ddbb5376fc6b2dc7bec612bec6b647fee6ad96a3adaee1c5ab4f98493849",
+              "tuna-portal-screenshot-client.py": "69de07c8d3dc1d2914fd96dfd82995dca6bdab0092001cde149982d08ba61dcb"
+            }
+          }
+        },
+        {
+          "name": "actual portal consent control activated",
+          "ok": false,
+          "observed": {
+            "argv": [
+              "/usr/bin/python3",
+              "/run/user/1000/tuna-variant-screenshot-454681364213217/tuna-portal-consent.py",
+              "/run/user/1000/tuna-variant-screenshot-454681364213217/consent.json",
+              "grant",
+              "--external-capture",
+              "--kind",
+              "screenshot",
+              "--request-exit",
+              "/run/user/1000/tuna-variant-screenshot-454681364213217/requester.exit"
+            ],
+            "kind": "screenshot",
+            "exit": 1,
+            "stdout": "",
+            "stderr": "Traceback (most recent call last):\n  File \"/run/user/1000/tuna-variant-screenshot-454681364213217/tuna-portal-consent.py\", line 8, in <module>\n    import pyatspi\nModuleNotFoundError: No module named 'pyatspi'\n",
+            "accessible_tree": null,
+            "method": "AT-SPI action on the matching visible GNOME portal consent control",
+            "helper_sha256": "b6f3ddbb5376fc6b2dc7bec612bec6b647fee6ad96a3adaee1c5ab4f98493849"
+          }
+        },
+        {
+          "name": "native consent and image proof exits successfully",
+          "ok": false,
+          "observed": {
+            "exit": null,
+            "log": "",
+            "error": "actual matching portal consent was not activated"
+          }
+        },
+        {
+          "name": "step ran",
+          "ok": false,
+          "observed": "RuntimeError: portal after-response requires an unlocked session: []"
+        }
+      ],
+      "result": "fail",
+      "frame": "05-portal-screenshot.png",
+      "frame_sha256": "11c7e3d45ec0d6440028e3cf5076a6c960cbc75949b4d8b08cceaaad0589940d",
+      "journal": [
+        "tuna-ibus-bridge: text field left"
+      ],
+      "finished": "2026-11-12T16:46:52+00:00"
+    },
+    {
+      "id": "desktop",
+      "title": "Escape leaves the overview for the desktop",
+      "started": "2026-11-12T16:46:52+00:00",
+      "checks": [
+        {
+          "name": "overview closed",
+          "ok": true,
+          "observed": "Escape from the login overview (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "06-desktop.png",
+      "frame_sha256": "5221ba0a4af4b996872a47037eaced4081ba3af84b74a802da325f746f7b4cad",
+      "journal": [
+        "tuna-compositor: overview focus restored"
+      ],
+      "finished": "2026-11-12T16:47:11+00:00"
+    },
+    {
+      "id": "overview",
+      "title": "Super opens the overview",
+      "started": "2026-11-12T16:47:23+00:00",
+      "checks": [
+        {
+          "name": "compositor parked focus for the overview",
+          "ok": true,
+          "observed": [
+            "tuna-compositor: overview focus parked"
+          ]
+        }
+      ],
+      "result": "pass",
+      "frame": "07-overview.png",
+      "frame_sha256": "605e2287c546970e8c52f20f73ead94c0648b93a0a610763f7c3cc667871c755",
+      "journal": [
+        "tuna-compositor: overview focus parked",
+        "tuna-ibus-bridge: text field focused"
+      ],
+      "finished": "2026-11-12T16:47:54+00:00"
+    },
+    {
+      "id": "app-grid",
+      "title": "Super+A shows the app grid",
+      "started": "2026-11-12T16:47:54+00:00",
+      "checks": [
+        {
+          "name": "app grid shown",
+          "ok": true,
+          "observed": "Super+A (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "08-app-grid.png",
+      "frame_sha256": "1a97898d077b001e8e012e4d2a7136abf7689c1c31693a250cd1cba9f89aa143",
+      "journal": [],
+      "finished": "2026-11-12T16:48:21+00:00"
+    },
+    {
+      "id": "search-files",
+      "title": "Type to search finds Files",
+      "started": "2026-11-12T16:48:21+00:00",
+      "checks": [
+        {
+          "name": "search typed",
+          "ok": true,
+          "observed": "typed 'files' into the overview (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "09-search-files.png",
+      "frame_sha256": "eefc5909e2ee49057618eddf4c14151acfdfd8991eef02ec5d0c1b0c549772c4",
+      "journal": [
+        "tuna-ibus-bridge: text field left",
+        "tuna-compositor: overview focus restored",
+        "tuna-compositor: overview focus parked",
+        "tuna-ibus-bridge: text field focused"
+      ],
+      "finished": "2026-11-12T16:48:51+00:00"
+    },
+    {
+      "id": "launch-files",
+      "title": "Enter launches Files",
+      "started": "2026-11-12T16:48:51+00:00",
+      "checks": [
+        {
+          "name": "Files (nautilus) running",
+          "ok": true,
+          "observed": "4706\n4815"
+        }
+      ],
+      "result": "pass",
+      "frame": "10-launch-files.png",
+      "frame_sha256": "45d4bfc337a1f4dc2ec4d23e9c5c34474a374dc01e82463bdb42c0d1772abaea",
+      "journal": [
+        "tuna-compositor: overview focus restored",
+        "tuna-ibus-bridge: text field left",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-ibus-bridge: text field left"
+      ],
+      "finished": "2026-11-12T16:49:15+00:00"
+    },
+    {
+      "id": "launch-settings",
+      "title": "Search and launch GNOME Settings",
+      "started": "2026-11-12T16:49:15+00:00",
+      "checks": [
+        {
+          "name": "GNOME Settings running",
+          "ok": true,
+          "observed": "4978"
+        }
+      ],
+      "result": "pass",
+      "frame": "11-launch-settings.png",
+      "frame_sha256": "45d4bfc337a1f4dc2ec4d23e9c5c34474a374dc01e82463bdb42c0d1772abaea",
+      "journal": [
+        "tuna-compositor: overview focus parked",
+        "tuna-ibus-bridge: text field focused",
+        "tuna-compositor: overview focus restored",
+        "tuna-ibus-bridge: text field left"
+      ],
+      "finished": "2026-11-12T16:49:43+00:00"
+    },
+    {
+      "id": "alt-tab-switcher",
+      "title": "Alt+Tab shows the window switcher",
+      "started": "2026-11-12T16:49:43+00:00",
+      "checks": [
+        {
+          "name": "switcher shown while Alt is held",
+          "ok": true,
+          "observed": "Alt held after Tab (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "12-alt-tab-switcher.png",
+      "frame_sha256": "24f9eea22893e2d19d1e4ee41bd9e571ee251086372f3786ad98df3b21283749",
+      "journal": [
+        "tuna-compositor: modifier alt keycode=56 pressed=true",
+        "tuna-compositor: modifier alt keycode=56 pressed=true",
+        "tuna-compositor: switcher Step { forward: true }"
+      ],
+      "finished": "2026-11-12T16:49:59+00:00"
+    },
+    {
+      "id": "alt-tab-commit",
+      "title": "Releasing Alt raises the other window",
+      "started": "2026-11-12T16:49:59+00:00",
+      "checks": [
+        {
+          "name": "Alt release commits",
+          "ok": true,
+          "observed": "Files should now be in front (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "13-alt-tab-commit.png",
+      "frame_sha256": "503ea8959b90704112b040b98d737edd274e4d921a2076ac10d6a75516669d1a",
+      "journal": [
+        "tuna-compositor: modifier alt keycode=56 pressed=false",
+        "tuna-compositor: modifier alt keycode=56 pressed=false",
+        "tuna-compositor: switcher Commit",
+        "tuna-shell-gtk: switcher fade popup-out start animated=true",
+        "tuna-shell-gtk: switcher fade popup-out settled"
+      ],
+      "finished": "2026-11-12T16:50:13+00:00"
+    },
+    {
+      "id": "alt-tab-back",
+      "title": "Alt+Tab tap returns to Settings",
+      "started": "2026-11-12T16:50:13+00:00",
+      "checks": [
+        {
+          "name": "Settings in front again",
+          "ok": true,
+          "observed": "Alt+Tab tap (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "14-alt-tab-back.png",
+      "frame_sha256": "503ea8959b90704112b040b98d737edd274e4d921a2076ac10d6a75516669d1a",
+      "journal": [
+        "tuna-compositor: modifier alt keycode=56 pressed=true",
+        "tuna-compositor: modifier alt keycode=56 pressed=true",
+        "tuna-compositor: switcher Step { forward: true }",
+        "tuna-compositor: modifier alt keycode=56 pressed=false",
+        "tuna-compositor: modifier alt keycode=56 pressed=false",
+        "tuna-compositor: switcher Commit",
+        "tuna-shell-gtk: switcher fade popup-out start animated=true",
+        "tuna-shell-gtk: switcher fade popup-out settled"
+      ],
+      "finished": "2026-11-12T16:50:31+00:00"
+    },
+    {
+      "id": "settings-appearance",
+      "title": "Open Settings > Appearance",
+      "started": "2026-11-12T16:50:31+00:00",
+      "checks": [
+        {
+          "name": "initial color-scheme recorded",
+          "ok": true,
+          "observed": "'default'"
+        }
+      ],
+      "result": "pass",
+      "frame": "15-settings-appearance.png",
+      "frame_sha256": "b01b63634113fee0dcf0bb8b969bf50087aaa39ff893e583240b7cc3c9b860d9",
+      "journal": [],
+      "finished": "2026-11-12T16:51:03+00:00"
+    },
+    {
+      "id": "settings-dark-style",
+      "title": "Choosing Dark applies dark style",
+      "started": "2026-11-12T16:51:03+00:00",
+      "checks": [
+        {
+          "name": "color-scheme is prefer-dark",
+          "ok": false,
+          "observed": "'default'"
+        }
+      ],
+      "result": "fail",
+      "frame": "16-settings-dark-style.png",
+      "frame_sha256": "82edb9a383efef6b0d5994a644bc50e425e7ed3c8aba176bf622d55dae062660",
+      "journal": [],
+      "finished": "2026-11-12T16:51:34+00:00"
+    },
+    {
+      "id": "settings-wallpaper",
+      "title": "Choosing a background changes the wallpaper",
+      "started": "2026-11-12T16:51:34+00:00",
+      "checks": [
+        {
+          "name": "picture-uri changed",
+          "ok": false,
+          "observed": {
+            "before": "'file:///usr/share/backgrounds/tunaos/tunaos-default.jpg'",
+            "after": "'file:///usr/share/backgrounds/tunaos/tunaos-default.jpg'"
+          }
+        }
+      ],
+      "result": "fail",
+      "frame": "17-settings-wallpaper.png",
+      "frame_sha256": "aa2ee98cb6dfdff64838087512f637d04a055b500891ccbc9dec3f006016cf48",
+      "journal": [],
+      "finished": "2026-11-12T16:52:12+00:00"
+    },
+    {
+      "id": "quick-settings",
+      "title": "Super+S opens quick settings",
+      "started": "2026-11-12T16:52:12+00:00",
+      "checks": [
+        {
+          "name": "Dark Style setting is on (tile should show on)",
+          "ok": false,
+          "observed": "'default'"
+        }
+      ],
+      "result": "fail",
+      "frame": "18-quick-settings.png",
+      "frame_sha256": "d1cf333b364eae409a89b9db4c49d4ae85d078ab577d183e19d4528061b72276",
+      "journal": [],
+      "finished": "2026-11-12T16:52:46+00:00"
+    },
+    {
+      "id": "quick-settings-night-light",
+      "title": "Night Light tile toggles Night Light",
+      "started": "2026-11-12T16:52:46+00:00",
+      "checks": [
+        {
+          "name": "night-light-enabled is true",
+          "ok": true,
+          "observed": "true"
+        },
+        {
+          "name": "org.gnome.SettingsDaemon.Color is served",
+          "ok": true,
+          "observed": "tuna-compositor"
+        }
+      ],
+      "result": "pass",
+      "frame": "19-quick-settings-night-light.png",
+      "frame_sha256": "a72c16e03c5da9cb29c140b34269947311030fb0a4e064ead500e3392e14225b",
+      "journal": [],
+      "finished": "2026-11-12T16:53:28+00:00"
+    },
+    {
+      "id": "quick-settings-sliders",
+      "title": "Volume and brightness sliders",
+      "started": "2026-11-12T16:53:28+00:00",
+      "checks": [
+        {
+          "name": "audio sink present",
+          "ok": true,
+          "observed": "\u251c\u2500 Sinks:\n \u2502  *   35. Dummy Output                        [vol: 1.00]\n \u2502  \n \u251c\u2500 Sources:\n \u251c\u2500 Sinks:\n \u2502  \n \u251c\u2500 Sources:"
+        },
+        {
+          "name": "backlight present",
+          "ok": false,
+          "observed": "0 backlight devices"
+        }
+      ],
+      "result": "fail",
+      "frame": "20-quick-settings-sliders.png",
+      "frame_sha256": "d6a2817781cde2cfbc19e17ac0a47e8d324bf564b27e3066d8332bb9bc85f6b5",
+      "journal": [],
+      "finished": "2026-11-12T16:54:28+00:00"
+    },
+    {
+      "id": "notify-send",
+      "title": "notify-send (libnotify) posts a notification",
+      "started": "2026-11-12T16:54:28+00:00",
+      "checks": [
+        {
+          "name": "notify-send succeeds",
+          "ok": false,
+          "observed": "Failed to show notification: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: Unknown method 'GetServerInformation'\nYou are using a client virtctl version that is different from the KubeVirt version running in the cluster\nClient Version: v1.8.2\nServer Version: v1.9.1\n\nexit status 1\nexit status 1"
+        }
+      ],
+      "result": "fail",
+      "frame": "21-notify-send.png",
+      "frame_sha256": "72ff70619472e65e46b714ca0c2d841ca2880b0931f5b9a0cbc0e9e54f41bf05",
+      "journal": [
+        "tuna-compositor: cycle chord near-miss: sym=Some(65307) mods=0"
+      ],
+      "finished": "2026-11-12T16:55:33+00:00"
+    },
+    {
+      "id": "notification-banner",
+      "title": "Notify over D-Bus shows a banner",
+      "started": "2026-11-12T16:55:33+00:00",
+      "checks": [
+        {
+          "name": "Notify returned an id",
+          "ok": true,
+          "observed": "(uint32 1,)"
+        }
+      ],
+      "result": "pass",
+      "frame": "22-notification-banner.png",
+      "frame_sha256": "8e73ef16277547744f6d7e4cf1ba011dfbf3199a141772c7011c06a01f0cd9c8",
+      "journal": [],
+      "finished": "2026-11-12T16:56:24+00:00"
+    },
+    {
+      "id": "date-menu",
+      "title": "Super+V lists the notification",
+      "started": "2026-11-12T16:56:24+00:00",
+      "checks": [
+        {
+          "name": "date menu opened while the banner is up",
+          "ok": true,
+          "observed": "GNOME 51 blocks the banner here (see frame)"
+        }
+      ],
+      "result": "pass",
+      "frame": "23-date-menu.png",
+      "frame_sha256": "a73632139b70016fa57b104d0dd11418d68cc4ad17b9c2014e4593fafcb102af",
+      "journal": [],
+      "finished": "2026-11-12T16:56:40+00:00"
+    },
+    {
+      "id": "portal-screencast",
+      "title": "Start frontend stream before lock (frame validated during lock)",
+      "started": "2026-11-12T16:56:40+00:00",
+      "checks": [
+        {
+          "name": "native requester awaiting matching consent",
+          "ok": false,
+          "observed": {
+            "session_state": [
+              {
+                "phase": "before-request",
+                "at": "2026-11-12T16:56:55.016+00:00",
+                "exit": 0,
+                "stdout": "(false,)",
+                "stderr": ""
+              }
+            ],
+            "ready": false,
+            "finished": true,
+            "root": "/run/user/1000/tuna-variant-screencast-455304071236848",
+            "requester_exit": "1",
+            "log": "Traceback (most recent call last):\n  File \"/run/user/1000/tuna-variant-screencast-455304071236848/tuna-portal-capture-client.py\", line 36, in <module>\n    code, result = request(\"CreateSession\", \"(a{sv})\", (opts,))\n                   ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/run/user/1000/tuna-variant-screencast-455304071236848/tuna-portal-capture-client.py\", line 24, in request\n    handle, = call(\"org.freedesktop.portal.ScreenCast\", method, GLib.Variant(signature, args))\n              ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/run/user/1000/tuna-variant-screencast-455304071236848/tuna-portal-capture-client.py\", line 22, in call\n    return bus.call_sync(\"org.freedesktop.portal.Desktop\", path, iface, method, args, None, Gio.DBusCallFlags.NONE, 30000, None).unpack()\n           ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ngi.repository.GLib.GError: g-io-error-quark: Timeout was reached (24)\n",
+            "response": null,
+            "pid": 7289,
+            "argv": [
+              "/usr/bin/python3",
+              "/run/user/1000/tuna-variant-screencast-455304071236848/tuna-portal-capture-client.py",
+              "/run/user/1000/tuna-variant-screencast-455304071236848/frame.png",
+              "revoke"
+            ],
+            "source_sha256": {
+              "tuna-portal-consent.py": "6966ebe73f0cf4d2393a2f4b49bbb132c55368a187f7d8926f13d72befd42345",
+              "tuna-portal-capture-client.py": "6a3e82bdbf988153feae702fb927f867ff435a56558aef392b382c5d94c15c3c",
+              "tuna-pipewire-dump.py": "a63c93d72b90be6b649909b034d3a241e79eea9daae3b1b64f9f05ba3db05b4f"
+            }
+          }
+        }
+      ],
+      "result": "fail",
+      "frame": "24-portal-screencast.png",
+      "frame_sha256": "c19a6a142518a7b492675baf4656cf111c91e4b6d6f4498206a969222d581219",
+      "journal": [],
+      "finished": "2026-11-12T16:57:30+00:00"
+    }
+  ],
+  "console_endpoint": {
+    "vm": "tuna-q-variant-diag-pub1112",
+    "namespace": "corral-vms",
+    "context": "karnataka-k3s",
+    "url": "http://127.0.0.1:41409/console/corral-vms/tuna-q-variant-diag-pub1112?context=karnataka-k3s",
+    "websocket": "ws://127.0.0.1:41409/api/vnc/corral-vms/tuna-q-variant-diag-pub1112?context=karnataka-k3s"
+  },
+  "portal_request_console": {
+    "requester_sha256": {
+      "tuna-portal-consent.py": "b6f3ddbb5376fc6b2dc7bec612bec6b647fee6ad96a3adaee1c5ab4f98493849",
+      "tuna-portal-screenshot-client.py": "69de07c8d3dc1d2914fd96dfd82995dca6bdab0092001cde149982d08ba61dcb"
+    },
+    "coordinator_sha256": "810f6903c299a839e2713059d061046f7d8db7aee5c70a52b9ce655979e029cc",
+    "exchanges": [
+      {
+        "operation": "launch",
+        "at": "2026-11-12T16:46:38+00:00",
+        "exit": 0,
+        "stderr": "",
+        "report": {
+          "session_state": [
+            {
+              "phase": "before-request",
+              "at": "2026-11-12T16:46:36.978+00:00",
+              "exit": 0,
+              "stdout": "(false,)",
+              "stderr": ""
+            }
+          ],
+          "ready": true,
+          "finished": false,
+          "root": "/run/user/1000/tuna-variant-screenshot-454681364213217",
+          "requester_exit": null,
+          "log": "",
+          "response": null,
+          "pid": 4079,
+          "argv": [
+            "/usr/bin/python3",
+            "/run/user/1000/tuna-variant-screenshot-454681364213217/tuna-portal-screenshot-client.py",
+            "/run/user/1000/tuna-variant-screenshot-454681364213217/frame.png",
+            "allow"
+          ],
+          "source_sha256": {
+            "tuna-portal-consent.py": "b6f3ddbb5376fc6b2dc7bec612bec6b647fee6ad96a3adaee1c5ab4f98493849",
+            "tuna-portal-screenshot-client.py": "69de07c8d3dc1d2914fd96dfd82995dca6bdab0092001cde149982d08ba61dcb"
+          }
+        }
+      },
+      {
+        "operation": "consent",
+        "at": "2026-11-12T16:46:45+00:00",
+        "exit": 1,
+        "stderr": "You are using a client virtctl version that is different from the KubeVirt version running in the cluster\nClient Version: v1.8.2\nServer Version: v1.9.1\n\nexit status 1\nexit status 1",
+        "report": {
+          "root": "/run/user/1000/tuna-variant-screenshot-454681364213217",
+          "requester_exit": null,
+          "log": "",
+          "response": null,
+          "active": false,
+          "observer_armed": false,
+          "input": {
+            "argv": [
+              "/usr/bin/python3",
+              "/run/user/1000/tuna-variant-screenshot-454681364213217/tuna-portal-consent.py",
+              "/run/user/1000/tuna-variant-screenshot-454681364213217/consent.json",
+              "grant",
+              "--external-capture",
+              "--kind",
+              "screenshot",
+              "--request-exit",
+              "/run/user/1000/tuna-variant-screenshot-454681364213217/requester.exit"
+            ],
+            "kind": "screenshot",
+            "exit": 1,
+            "stdout": "",
+            "stderr": "Traceback (most recent call last):\n  File \"/run/user/1000/tuna-variant-screenshot-454681364213217/tuna-portal-consent.py\", line 8, in <module>\n    import pyatspi\nModuleNotFoundError: No module named 'pyatspi'\n",
+            "accessible_tree": null,
+            "method": "AT-SPI action on the matching visible GNOME portal consent control",
+            "helper_sha256": "b6f3ddbb5376fc6b2dc7bec612bec6b647fee6ad96a3adaee1c5ab4f98493849"
+          },
+          "error": "actual matching portal consent was not activated",
+          "requester_terminated": true
+        }
+      }
+    ],
+    "session_state": [
+      {
+        "phase": "before-request",
+        "at": "2026-11-12T16:46:36.978+00:00",
+        "exit": 0,
+        "stdout": "(false,)",
+        "stderr": ""
+      }
+    ],
+    "requester_exit": null,
+    "log": "",
+    "response": null,
+    "argv": [
+      "/usr/bin/python3",
+      "/run/user/1000/tuna-variant-screenshot-454681364213217/tuna-portal-screenshot-client.py",
+      "/run/user/1000/tuna-variant-screenshot-454681364213217/frame.png",
+      "allow"
+    ],
+    "pid": 4079,
+    "source_sha256": {
+      "tuna-portal-consent.py": "b6f3ddbb5376fc6b2dc7bec612bec6b647fee6ad96a3adaee1c5ab4f98493849",
+      "tuna-portal-screenshot-client.py": "69de07c8d3dc1d2914fd96dfd82995dca6bdab0092001cde149982d08ba61dcb"
+    },
+    "frame": "portal-screenshot-prompt.png",
+    "sha256": "11c7e3d45ec0d6440028e3cf5076a6c960cbc75949b4d8b08cceaaad0589940d",
+    "meaning": "console after request; prompt visibility requires visual review",
+    "input": {
+      "argv": [
+        "/usr/bin/python3",
+        "/run/user/1000/tuna-variant-screenshot-454681364213217/tuna-portal-consent.py",
+        "/run/user/1000/tuna-variant-screenshot-454681364213217/consent.json",
+        "grant",
+        "--external-capture",
+        "--kind",
+        "screenshot",
+        "--request-exit",
+        "/run/user/1000/tuna-variant-screenshot-454681364213217/requester.exit"
+      ],
+      "kind": "screenshot",
+      "exit": 1,
+      "stdout": "",
+      "stderr": "Traceback (most recent call last):\n  File \"/run/user/1000/tuna-variant-screenshot-454681364213217/tuna-portal-consent.py\", line 8, in <module>\n    import pyatspi\nModuleNotFoundError: No module named 'pyatspi'\n",
+      "accessible_tree": null,
+      "method": "AT-SPI action on the matching visible GNOME portal consent control",
+      "helper_sha256": "b6f3ddbb5376fc6b2dc7bec612bec6b647fee6ad96a3adaee1c5ab4f98493849"
+    }
+  },
+  "portal_requester_sha256": "69de07c8d3dc1d2914fd96dfd82995dca6bdab0092001cde149982d08ba61dcb",
+  "portal_screencast": {
+    "frame_validated": false,
+    "requester_sha256": {
+      "tuna-portal-consent.py": "6966ebe73f0cf4d2393a2f4b49bbb132c55368a187f7d8926f13d72befd42345",
+      "tuna-portal-capture-client.py": "6a3e82bdbf988153feae702fb927f867ff435a56558aef392b382c5d94c15c3c",
+      "tuna-pipewire-dump.py": "a63c93d72b90be6b649909b034d3a241e79eea9daae3b1b64f9f05ba3db05b4f"
+    },
+    "coordinator_sha256": "810f6903c299a839e2713059d061046f7d8db7aee5c70a52b9ce655979e029cc",
+    "exchanges": [
+      {
+        "operation": "launch",
+        "at": "2026-11-12T16:57:25+00:00",
+        "exit": 0,
+        "stderr": "",
+        "report": {
+          "session_state": [
+            {
+              "phase": "before-request",
+              "at": "2026-11-12T16:56:55.016+00:00",
+              "exit": 0,
+              "stdout": "(false,)",
+              "stderr": ""
+            }
+          ],
+          "ready": false,
+          "finished": true,
+          "root": "/run/user/1000/tuna-variant-screencast-455304071236848",
+          "requester_exit": "1",
+          "log": "Traceback (most recent call last):\n  File \"/run/user/1000/tuna-variant-screencast-455304071236848/tuna-portal-capture-client.py\", line 36, in <module>\n    code, result = request(\"CreateSession\", \"(a{sv})\", (opts,))\n                   ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/run/user/1000/tuna-variant-screencast-455304071236848/tuna-portal-capture-client.py\", line 24, in request\n    handle, = call(\"org.freedesktop.portal.ScreenCast\", method, GLib.Variant(signature, args))\n              ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/run/user/1000/tuna-variant-screencast-455304071236848/tuna-portal-capture-client.py\", line 22, in call\n    return bus.call_sync(\"org.freedesktop.portal.Desktop\", path, iface, method, args, None, Gio.DBusCallFlags.NONE, 30000, None).unpack()\n           ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ngi.repository.GLib.GError: g-io-error-quark: Timeout was reached (24)\n",
+          "response": null,
+          "pid": 7289,
+          "argv": [
+            "/usr/bin/python3",
+            "/run/user/1000/tuna-variant-screencast-455304071236848/tuna-portal-capture-client.py",
+            "/run/user/1000/tuna-variant-screencast-455304071236848/frame.png",
+            "revoke"
+          ],
+          "source_sha256": {
+            "tuna-portal-consent.py": "6966ebe73f0cf4d2393a2f4b49bbb132c55368a187f7d8926f13d72befd42345",
+            "tuna-portal-capture-client.py": "6a3e82bdbf988153feae702fb927f867ff435a56558aef392b382c5d94c15c3c",
+            "tuna-pipewire-dump.py": "a63c93d72b90be6b649909b034d3a241e79eea9daae3b1b64f9f05ba3db05b4f"
+          }
+        }
+      }
+    ],
+    "session_state": [
+      {
+        "phase": "before-request",
+        "at": "2026-11-12T16:56:55.016+00:00",
+        "exit": 0,
+        "stdout": "(false,)",
+        "stderr": ""
+      }
+    ],
+    "requester_exit": "1",
+    "log": "Traceback (most recent call last):\n  File \"/run/user/1000/tuna-variant-screencast-455304071236848/tuna-portal-capture-client.py\", line 36, in <module>\n    code, result = request(\"CreateSession\", \"(a{sv})\", (opts,))\n                   ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/run/user/1000/tuna-variant-screencast-455304071236848/tuna-portal-capture-client.py\", line 24, in request\n    handle, = call(\"org.freedesktop.portal.ScreenCast\", method, GLib.Variant(signature, args))\n              ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/run/user/1000/tuna-variant-screencast-455304071236848/tuna-portal-capture-client.py\", line 22, in call\n    return bus.call_sync(\"org.freedesktop.portal.Desktop\", path, iface, method, args, None, Gio.DBusCallFlags.NONE, 30000, None).unpack()\n           ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ngi.repository.GLib.GError: g-io-error-quark: Timeout was reached (24)\n",
+    "response": null,
+    "argv": [
+      "/usr/bin/python3",
+      "/run/user/1000/tuna-variant-screencast-455304071236848/tuna-portal-capture-client.py",
+      "/run/user/1000/tuna-variant-screencast-455304071236848/frame.png",
+      "revoke"
+    ],
+    "pid": 7289,
+    "source_sha256": {
+      "tuna-portal-consent.py": "6966ebe73f0cf4d2393a2f4b49bbb132c55368a187f7d8926f13d72befd42345",
+      "tuna-portal-capture-client.py": "6a3e82bdbf988153feae702fb927f867ff435a56558aef392b382c5d94c15c3c",
+      "tuna-pipewire-dump.py": "a63c93d72b90be6b649909b034d3a241e79eea9daae3b1b64f9f05ba3db05b4f"
+    }
+  }
+}
