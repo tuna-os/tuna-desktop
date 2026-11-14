@@ -391,8 +391,15 @@ mod handlers {
 
     /// Association takes effect on commit; the manager reads the
     /// live `wl_surface()` every reconcile and re-asserts seat focus
-    /// then, so no event is needed here.
-    fn on_surface_associated() {}
+    /// then, so no manager event is needed here. Keyboard grabs
+    /// waiting for this window are decided now.
+    fn on_surface_associated(
+        state: &mut State,
+        wl_surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        surface: &X11Surface,
+    ) {
+        state.xwayland_surface_associated(wl_surface, surface);
+    }
 
     /// The running X11 window manager, or a panic naming the broken
     /// invariant (callbacks only fire while it runs).
@@ -416,18 +423,17 @@ mod handlers {
             impl XWaylandShellHandler for $target {
                 fn xwayland_shell_state(
                     &mut self,
-                ) -> &mut smithay::wayland::xwayland_shell::XWaylandShellState
-                {
+                ) -> &mut smithay::wayland::xwayland_shell::XWaylandShellState {
                     &mut $state(self).xwayland_shell_state
                 }
 
                 fn surface_associated(
                     &mut self,
                     _xwm: XwmId,
-                    _wl_surface: smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
-                    _surface: X11Surface,
+                    wl_surface: smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+                    surface: X11Surface,
                 ) {
-                    on_surface_associated();
+                    on_surface_associated($state(self), &wl_surface, &surface);
                 }
             }
         };
