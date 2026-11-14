@@ -615,159 +615,90 @@ fn hub_lockdown_policy_reaches_sessions_and_restores() {
     assert_locked_without_content(&client_read(&mut client));
 }
 
-/// Administrative lockdown (#357 follow-up): a hung settings backend
-/// never stalls the policy refresh — the tick stays bounded and the
-/// cached policy holds — while a healthy backend still applies and
-/// errors stay fail-safe.
+/// Administrative lockdown (#357, #503): a live read of
+/// `disable-lock-screen` reaches the hub and its sessions at once, moves
+/// only that key, and a later read lifts it again. The reads come from the
+/// compositor's settings watch (`lockdown_settings`), whose own tests cover
+/// a stalled backend, the newest read winning and the absence of any poll;
+/// applying one never waits on a backend.
 #[test]
-fn lockdown_refresh_never_blocks_on_hung_backend() {
+fn live_lock_screen_key_reaches_sessions_and_keeps_the_other_keys() {
     let dir = private_tempdir();
     let path = dir.path().join("control.sock");
     let mut hub = ControlHub::bind(path.clone(), Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
-    assert!(hub.lock_screen_allowed(), "hub starts at GNOME defaults");
-
-    // Hung backend: the refresh returns promptly with policy unchanged.
-    // (The double returns the denied value so its late arrival cannot
-    // flip the assertions below; the detached thread dies with the test
-    // process.)
-    let hung = || {
-        std::thread::sleep(Duration::from_secs(5));
-        Some(true)
-    };
-    let start = std::time::Instant::now();
-    hub.refresh_lockdown_with(hung);
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "hung backend must not stall the tick, took {elapsed:?}"
-    );
-    assert!(
-        hub.lock_screen_allowed(),
-        "cached policy holds during the hang"
-    );
-
-    // Healthy backend: a deny applies once the background read lands.
-    hub.refresh_lockdown_with(|| Some(true));
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while hub.lock_screen_allowed() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-        hub.refresh_lockdown_with(|| None);
-    }
-    assert!(
-        !hub.lock_screen_allowed(),
-        "deny applies once the read lands"
-    );
-
-    // Fail-safe: unreadable reads keep the cached (denied) value.
-    hub.refresh_lockdown_with(|| None);
-    std::thread::sleep(Duration::from_millis(100));
-    hub.refresh_lockdown_with(|| None);
-    assert!(!hub.lock_screen_allowed(), "errors keep the cached value");
-}
-
-/// Last-valid-wins (#357 fd3): a batch whose restriction lands before an
-/// unreadable result keeps the restriction — the trailing `None` (a source
-/// boundary from overlapping readers, not a polling failure) never wipes it.
-#[test]
-fn lockdown_batch_some_then_none_preserves_restriction() {
-    let dir = private_tempdir();
-    let path = dir.path().join("control.sock");
-    let mut hub = ControlHub::bind(path.clone(), Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
-    assert!(hub.lock_screen_allowed(), "hub starts at GNOME defaults");
-
-    // Two overlapping readers land one batch, arrival order
-    // [Some(true), None]: the staggered sleeps keep both in flight
-    // across the two spawns, then land them in order.
-    hub.refresh_lockdown_with(|| {
-        std::thread::sleep(Duration::from_millis(100));
-        Some(true)
-    });
-    hub.refresh_lockdown_with(|| {
-        std::thread::sleep(Duration::from_millis(300));
-        None
-    });
-    std::thread::sleep(Duration::from_secs(1));
-    hub.refresh_lockdown_with(|| None);
-    assert!(
-        !hub.lock_screen_allowed(),
-        "Some-then-None must keep the restriction"
-    );
-
-    // Fail-safe afterwards: further unreadable reads keep denied.
-    std::thread::sleep(Duration::from_millis(100));
-    hub.refresh_lockdown_with(|| None);
-    assert!(!hub.lock_screen_allowed(), "errors keep the cached value");
-}
-
-/// None-then-Some applies the restoration (#357 fd3): starting denied, a
-/// batch whose unreadable result lands before a valid `false` restores.
-#[test]
-fn lockdown_batch_none_then_some_applies_restoration() {
-    let dir = private_tempdir();
-    let path = dir.path().join("control.sock");
-    let mut hub = ControlHub::bind(path.clone(), Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
-    hub.set_lockdown_policy(LockdownPolicy {
-        disable_lock_screen: true,
+    let mut model = two_window_model();
+    let other_keys = LockdownPolicy {
+        disable_log_out: true,
         ..LockdownPolicy::default()
-    });
-    assert!(!hub.lock_screen_allowed(), "hub starts denied");
-
-    // Arrival order [None, Some(false)]: the valid restoration wins.
-    hub.refresh_lockdown_with(|| {
-        std::thread::sleep(Duration::from_millis(100));
-        None
-    });
-    hub.refresh_lockdown_with(|| {
-        std::thread::sleep(Duration::from_millis(300));
-        Some(false)
-    });
-    std::thread::sleep(Duration::from_secs(1));
-    hub.refresh_lockdown_with(|| None);
+    };
+    hub.set_lockdown_policy(other_keys);
     assert!(
         hub.lock_screen_allowed(),
-        "None-then-Some must apply the restoration"
+        "hub starts with the lock allowed"
     );
-}
 
-/// Single-flight bound (#357 fd3): rapid refreshes with slow readers never
-/// stack more than two concurrent readers — excess ticks drain only.
-#[test]
-fn lockdown_concurrent_refreshes_single_flight() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    let mut client = connect(&path);
+    hub.poll(&mut model);
+    client_write(&mut client, &hello());
+    hub.poll(&mut model);
+    assert!(matches!(client_read(&mut client), Message::Hello { .. }));
+    assert_unlocked_with_titles(&client_read(&mut client));
+    assert!(matches!(
+        client_read(&mut client),
+        Message::Overview { open: false }
+    ));
 
-    let dir = private_tempdir();
-    let path = dir.path().join("control.sock");
-    let mut hub = ControlHub::bind(path.clone(), Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
-    let running = Arc::new(AtomicUsize::new(0));
-    let peak = Arc::new(AtomicUsize::new(0));
-    let done = Arc::new(AtomicUsize::new(0));
-    for _ in 0..8 {
-        let running = running.clone();
-        let peak = peak.clone();
-        let done = done.clone();
-        hub.refresh_lockdown_with(move || {
-            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
-            peak.fetch_max(now, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(300));
-            running.fetch_sub(1, Ordering::SeqCst);
-            done.fetch_add(1, Ordering::SeqCst);
-            None
-        });
-    }
-    // Every spawned reader sleeps 300 ms from a near-simultaneous start;
-    // unbounded this would run eight, bounded it runs two.
-    std::thread::sleep(Duration::from_secs(2));
+    // The key reads restricted: the live session's Lock denies.
+    hub.set_lock_screen_disabled(true);
     assert_eq!(
-        done.load(Ordering::SeqCst),
-        2,
-        "only two of eight rapid readers may run"
+        hub.lockdown_policy(),
+        LockdownPolicy {
+            disable_lock_screen: true,
+            ..other_keys
+        },
+        "only the lock key follows the read"
     );
+    client_write(
+        &mut client,
+        &Message::Command {
+            id: 1,
+            kind: CommandKind::Lock,
+        },
+    );
+    hub.poll(&mut model);
+    let Message::CommandResult { id, status } = client_read(&mut client) else {
+        panic!("expected CommandResult for denied Lock");
+    };
+    assert_eq!(id, 1);
     assert!(
-        peak.load(Ordering::SeqCst) <= 2,
-        "peak concurrent readers bounded, got {}",
-        peak.load(Ordering::SeqCst)
+        matches!(status, CommandStatus::Denied { .. }),
+        "got {status:?}"
     );
+    assert!(!hub.is_locked(), "denied Lock flips no flag");
+
+    // The same value read again holds the restriction.
+    hub.set_lock_screen_disabled(true);
+    assert!(!hub.lock_screen_allowed());
+
+    // The key reads allowed again: the restoration applies, the other
+    // keys are as they were, and Lock engages.
+    hub.set_lock_screen_disabled(false);
+    assert_eq!(hub.lockdown_policy(), other_keys);
+    assert!(hub.lock_screen_allowed());
+    client_write(
+        &mut client,
+        &Message::Command {
+            id: 2,
+            kind: CommandKind::Lock,
+        },
+    );
+    hub.poll(&mut model);
+    let Message::CommandResult { id, status } = client_read(&mut client) else {
+        panic!("expected CommandResult for restored Lock");
+    };
+    assert_eq!(id, 2);
+    assert_eq!(status, CommandStatus::Applied);
+    assert!(hub.is_locked());
 }
 
 /// The lock surface reuses the Overlay shape with an empty list: no
