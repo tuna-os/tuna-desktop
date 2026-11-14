@@ -162,11 +162,13 @@ class InstalledPolicy(unittest.TestCase):
             if args[0].startswith('/usr/bin/tuna-'):
                 return Path(args[0]).name + ' 0.1.0'
             return '0.1.0'
-        with patch.object(os, 'getuid', return_value=1000), patch.dict(os.environ, {}, clear=True), patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="26.04"\n'), patch.object(M, 'run', side_effect=command), patch.object(M, 'owner', return_value={'name': 'tuna-desktop', 'version': '0.1.0'}), patch.object(M, 'digest', return_value={'sha256': '0' * 64}), patch.object(M, 'bounded_json', return_value={'commit': 'b' * 40, 'files': {'icon-probe': '0' * 64, 'shortcut-inhibit-client': '0' * 64}}):
+        with patch.object(os, 'getuid', return_value=1000), patch.dict(os.environ, {}, clear=True), patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="26.04"\n'), patch.object(M, 'run', side_effect=command), patch.object(M, 'owner', return_value={'name': 'tuna-desktop', 'version': '0.1.0'}), patch.object(M, 'digest', return_value={'sha256': '0' * 64}), patch.object(M, 'bounded_json', return_value={'commit': 'b' * 40, 'pr_head': 'c' * 40, 'files': {'icon-probe': '0' * 64, 'shortcut-inhibit-client': '0' * 64}}):
             with self.assertRaisesRegex(ValueError, 'companion-source-contract'):
                 M.preflight()
 
-    def _preflight_with(self, deb_version, reported):
+    def _preflight_with(self, deb_version, reported, companion=None):
+        if companion is None:
+            companion = {'commit': 'b' * 40, 'pr_head': None, 'files': {'icon-probe': '0' * 64, 'shortcut-inhibit-client': '0' * 64}}
         def command(args):
             if args == ['dpkg', '--verify', 'tuna-desktop']:
                 return ''
@@ -175,8 +177,21 @@ class InstalledPolicy(unittest.TestCase):
             if args[0].startswith('/usr/bin/tuna-'):
                 return Path(args[0]).name + ' ' + reported
             return deb_version
-        with patch.object(os, 'getuid', return_value=1000), patch.dict(os.environ, {}, clear=True), patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="26.04"\n'), patch.object(M, 'run', side_effect=command), patch.object(M, 'owner', return_value={'name': 'tuna-desktop', 'version': deb_version}), patch.object(M, 'digest', return_value={'sha256': '0' * 64}), patch.object(M, 'bounded_json', return_value={'commit': 'b' * 40, 'files': {'icon-probe': '0' * 64, 'shortcut-inhibit-client': '0' * 64}}):
-            M.preflight()
+        with patch.object(os, 'getuid', return_value=1000), patch.dict(os.environ, {}, clear=True), patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="26.04"\n'), patch.object(M, 'run', side_effect=command), patch.object(M, 'owner', return_value={'name': 'tuna-desktop', 'version': deb_version}), patch.object(M, 'digest', return_value={'sha256': '0' * 64}), patch.object(M, 'bounded_json', return_value=companion):
+            return M.preflight()
+
+    def test_companion_merge_source_and_pr_head_are_retained_separately(self):
+        for pr_head in (None, 'b' * 40):
+            companion = {'commit': 'a' * 40, 'pr_head': pr_head, 'files': {'icon-probe': '0' * 64, 'shortcut-inhibit-client': '0' * 64}}
+            with self.subTest(pr_head=pr_head):
+                result = self._preflight_with('0.1.0', '0.1.0', companion)
+                self.assertEqual(result['companions'], companion)
+
+    def test_companion_missing_or_malformed_pr_head_is_refused(self):
+        base = {'commit': 'a' * 40, 'files': {'icon-probe': '0' * 64, 'shortcut-inhibit-client': '0' * 64}}
+        for companion in [base] + [dict(base, pr_head=head) for head in ('', 'z' * 40, 'a' * 39, 123, True)]:
+            with self.subTest(companion=companion), self.assertRaisesRegex(ValueError, 'companion-source-contract'):
+                self._preflight_with('0.1.0', '0.1.0', companion)
 
     def test_prerelease_package_accepts_semver_binaries(self):
         # 1.0.0~beta.1 is the Debian form of the binaries' 1.0.0-beta.1; the
