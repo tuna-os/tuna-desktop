@@ -388,6 +388,8 @@ pub struct Session<'a> {
     close_menu_unanimated: bool,
     /// Close-dialog answers `(window, response)`, drained by the hub.
     close_dialog_responses: Vec<(u64, tuna_shell_control::CloseDialogResponse)>,
+    /// An admitted `WakeUpScreen`, drained by the hub.
+    wake_up_screen: bool,
 }
 
 impl std::fmt::Debug for Session<'_> {
@@ -490,6 +492,7 @@ impl<'a> Session<'a> {
             pad_osd_closed: Vec::new(),
             close_menu_unanimated: false,
             close_dialog_responses: Vec::new(),
+            wake_up_screen: false,
         };
         let msg = match session.conn.read_frame() {
             Ok(msg) => msg,
@@ -588,6 +591,11 @@ impl<'a> Session<'a> {
     /// The latest `SetIdleTimeout` the shell sent, once (#63).
     pub fn take_idle_timeout(&mut self) -> Option<u64> {
         self.idle_timeout.take()
+    }
+
+    /// Whether the shell woke the locked screen since the last call.
+    pub fn take_wake_up_screen(&mut self) -> bool {
+        std::mem::take(&mut self.wake_up_screen)
     }
 
     /// Replace this session's lockdown policy (#357). The hub pushes
@@ -1196,6 +1204,25 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
+                kind: CommandKind::WakeUpScreen,
+            } => {
+                // screenShield.js `_wakeUpScreen`: only an active shield
+                // wakes; it never unlocks.
+                let status = if self.locked.get() {
+                    self.wake_up_screen = true;
+                    CommandStatus::Applied
+                } else {
+                    CommandStatus::Denied {
+                        reason: "not locked".into(),
+                    }
+                };
+                let applied = status == CommandStatus::Applied;
+                self.conn
+                    .write_frame(&Message::CommandResult { id, status })?;
+                Ok(Handled::CommandResult { id, applied })
+            }
+            Message::Command {
+                id,
                 kind: CommandKind::WindowAction { window, action },
             } => {
                 // The window manager carries it out (drained by the hub);
@@ -1585,6 +1612,7 @@ fn apply_command(
         | CommandKind::PadOsdClosed { .. }
         | CommandKind::CloseMenuUnanimated
         | CommandKind::RespondCloseDialog { .. }
+        | CommandKind::WakeUpScreen
         | CommandKind::SwitchInputSource { .. }
         | CommandKind::SetWindowIconGeometries { .. }
         | CommandKind::SetWellbeingEffects { .. }
@@ -1666,6 +1694,9 @@ pub struct PollOutcome {
     pub close_menu_unanimated: bool,
     /// Close-dialog answers `(window, response)`, in order (#1035).
     pub close_dialog_responses: Vec<(u64, tuna_shell_control::CloseDialogResponse)>,
+    /// The shell asked to wake the locked screen (a lock-screen
+    /// notification, #348).
+    pub wake_up_screen: bool,
     /// Input-source switches to make (`true` backward), in order.
     pub input_source_switches: Vec<bool>,
     /// New switcher thumbnail frames, if the shell sent any.
@@ -2452,6 +2483,7 @@ impl ControlHub {
                         .extend(std::mem::take(&mut session.pad_osd_closed));
                     outcome.close_menu_unanimated |=
                         std::mem::take(&mut session.close_menu_unanimated);
+                    outcome.wake_up_screen |= session.take_wake_up_screen();
                     outcome
                         .close_dialog_responses
                         .extend(std::mem::take(&mut session.close_dialog_responses));

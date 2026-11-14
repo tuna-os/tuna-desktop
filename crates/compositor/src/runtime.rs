@@ -5354,6 +5354,14 @@ impl Runtime {
             self.manager.close_dialog_response(window, response);
         }
         self.queue_close_dialogs();
+        // A lock-screen notification (#348): screenShield.js
+        // `_wakeUpScreen` lights the shield's lightboxes off. The idle
+        // shield starts a fresh stretch, but Mutter's idle monitor saw no
+        // user activity, and the lock stays latched.
+        if outcome.wake_up_screen && self.is_locked() {
+            self.lock.note_input(self.lock_now_ms());
+            self.idle_since = Instant::now();
+        }
         if let Some(request) = self.state.take_shortcut_consent_update() {
             self.control
                 .queue_message(tuna_shell_control::Message::ShortcutConsent { request });

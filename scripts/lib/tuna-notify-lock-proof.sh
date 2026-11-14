@@ -21,6 +21,11 @@
 #                        the locked screen at once; unlocking takes the
 #                        list away and the queued banners, with their
 #                        sound, follow
+#   G-NOTIFY-WAKE        a notification reaching the lock screen's list
+#                        wakes the blanked locked screen and sends
+#                        org.gnome.ScreenSaver WakeUpScreen, unless
+#                        show-banners is off; it never unlocks
+#                        (unlockDialog.js _wakeUpScreenForSource)
 #   G-NOTIFY-SOUND       a banner plays its sound-name (else sound-file)
 #                        through the event-sound player as it shows,
 #                        unless enable-sound-alerts or event-sounds is off
@@ -213,6 +218,50 @@ notify_lock_proof() {
         fail G-NOTIFY-LOCK-LIVE "the global show-in-lock-screen on did not bring the sources back"
     [ "$(nl_sounds)" = "$nl_sounds_locked" ] ||
         fail G-NOTIFY-LOCK-LIVE "a notification sound played while locked"
+
+    # Wake: let the locked screen blank, then notify without input.
+    nl_idle_before=$(gsettings get org.gnome.desktop.session idle-delay)
+    nl_animations_before=$(gsettings get org.gnome.desktop.interface enable-animations)
+    gsettings set org.gnome.desktop.interface enable-animations true
+    gdbus monitor --session --dest org.gnome.ScreenSaver >"$ARTIFACTS/notify-wake-dbus.log" 2>&1 &
+    nl_monitor=$!
+    gsettings set org.gnome.desktop.session idle-delay 3
+    cstate '.locked and .idle_blank_alpha == 1' "locked screen blanked" 30 ||
+        fail G-NOTIFY-WAKE "the locked screen did not blank"
+    # Banners off (GNOME's NotificationsBox reads show-banners): the
+    # list follows, the screen stays dark.
+    gsettings set "$NL_SCHEMA" show-banners false
+    sleep 1
+    nl_wake_quiet=$(nl_notify tuna-lock-private "Private Quiet" "PRIVATE-BODY-QUIET" 1) ||
+        fail G-NOTIFY-WAKE "Notify failed"
+    nl_until wake-quiet 'any(.[]; .showing and .name == "3")' G-NOTIFY-WAKE ||
+        fail G-NOTIFY-WAKE "the arrival with banners off did not reach the lock screen's count"
+    sleep 1
+    cstate '.locked and .idle_blank_alpha == 1' "still blank with banners off" 2 ||
+        fail G-NOTIFY-WAKE "a notification woke the screen with show-banners off"
+    grep -q 'WakeUpScreen' "$ARTIFACTS/notify-wake-dbus.log" &&
+        fail G-NOTIFY-WAKE "WakeUpScreen was sent with show-banners off"
+    gsettings set "$NL_SCHEMA" show-banners true
+    sleep 1
+    nl_wake=$(nl_notify tuna-lock-private "Private Wake" "PRIVATE-BODY-WAKE" 1) ||
+        fail G-NOTIFY-WAKE "Notify failed"
+    nl_ids="$nl_ids $nl_wake_quiet $nl_wake"
+    cstate '.locked and .idle_blank_alpha == 0' "a notification woke the locked screen" 3 ||
+        fail G-NOTIFY-WAKE "a notification for a source on the lock screen did not wake it"
+    nl_shot woken
+    nl_end=$(($(date +%s) + 5))
+    until grep -q 'org.gnome.ScreenSaver.WakeUpScreen' "$ARTIFACTS/notify-wake-dbus.log"; do
+        [ "$(date +%s)" -lt "$nl_end" ] || fail G-NOTIFY-WAKE "org.gnome.ScreenSaver never sent WakeUpScreen"
+        sleep 0.3
+    done
+    kill "$nl_monitor" 2>/dev/null || true
+    wait "$nl_monitor" 2>/dev/null || true
+    showing "$nl_tree" "Private Wake" && fail G-NOTIFY-WAKE "waking revealed a redacted title"
+    cstate '.locked' "still locked after waking" 2 || fail G-NOTIFY-WAKE "waking unlocked the session"
+    gsettings set org.gnome.desktop.session idle-delay "$nl_idle_before"
+    gsettings set org.gnome.desktop.interface enable-animations "$nl_animations_before"
+    pass G-NOTIFY-WAKE "a notification reaching the lock screen's list wakes the blanked screen and sends WakeUpScreen, not with show-banners off, and never unlocks"
+
     xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT * 3 / 4)) click 1
     sleep 1
     xdotool type --delay 30 "$UNLOCK_PASSWORD"

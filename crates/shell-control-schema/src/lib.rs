@@ -227,9 +227,12 @@ impl ProtocolVersion {
     /// `HideCloseDialog`, and the shell-to-compositor `RespondCloseDialog`
     /// (gnome-shell's Force Quit / Wait). Positional postcard peers must
     /// ship together.
+    /// `0.51` appends the shell-to-compositor `WakeUpScreen` command (a
+    /// notification wakes the locked, blanked screen, #348). Positional
+    /// postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 50,
+        minor: 51,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -530,6 +533,13 @@ pub enum CommandKind {
         window: WindowId,
         response: CloseDialogResponse,
     },
+    /// Since 0.51: a notification reached the lock screen's list
+    /// (unlockDialog.js `_wakeUpScreenForSource`): undo the idle shield's
+    /// fade as screenShield.js `_wakeUpScreen` turns its lightbox off,
+    /// without counting as user activity and without unlocking. Denied
+    /// while the session is unlocked (`_wakeUpScreen` returns unless the
+    /// shield is active).
+    WakeUpScreen,
 }
 
 /// mutter 51 `MetaCloseDialogResponse`: what the user chose in the dialog
@@ -2647,11 +2657,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_50() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 50));
-        // A 0.49 shell still negotiates; a newer minor does not.
-        assert!(ProtocolVersion::new(0, 49).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 51).is_compatible_with(&CURRENT_VERSION));
+    fn current_version_is_0_51() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 51));
+        // A 0.50 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 50).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 52).is_compatible_with(&CURRENT_VERSION));
     }
 
     #[test]
@@ -4002,6 +4012,26 @@ mod tablet_osd_wire_order_tests {
         );
         let bytes = postcard::to_slice(&touch, &mut buffer).unwrap();
         assert_eq!(postcard::from_bytes::<Message>(bytes).unwrap(), touch);
+    }
+
+    #[test]
+    fn wake_up_screen_follows_the_0_50_close_dialog_response() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 16];
+        let closed =
+            tag(postcard::to_slice(&CommandKind::CloseMenuUnanimated, &mut buffer).unwrap());
+        let respond = CommandKind::RespondCloseDialog {
+            window: 3,
+            response: CloseDialogResponse::Wait,
+        };
+        assert_eq!(
+            tag(postcard::to_slice(&respond, &mut buffer).unwrap()),
+            closed + 1
+        );
+        let wake = postcard::to_slice(&CommandKind::WakeUpScreen, &mut buffer).unwrap();
+        assert_eq!(wake, [closed + 2]);
+        let back: CommandKind = postcard::from_bytes(&[closed + 2]).unwrap();
+        assert_eq!(back, CommandKind::WakeUpScreen);
     }
 }
 
