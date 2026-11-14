@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Copy working-tree files into a running Corral VM and run a command there.
+
+The pre-push loop for guest-side code (packaging/marlin/vm-lane, the Python
+under scripts/lib): edit on the host, push only the changed files into a
+VM that is already booted, run the proof, read the exit status. No image
+rebuild, no CI queue. See docs/ci-fast-iteration.md.
+
+  scripts/tuna-corral-sync --vm tuna-q-variant-dev \\
+      --path scripts/lib/ci-select-lanes-tests.py -- \\
+      python3 scripts/lib/ci-select-lanes-tests.py
+
+Paths are relative to the repository root and land at the same relative path
+under --dest in the guest; the command runs as root in --dest. Files travel as
+a gzip tar inside `corral ssh -c` arguments (corral ssh does not forward
+stdin), so the payload is bounded: keep it to the files you changed. The exit
+status is 0 when the guest command succeeds and nonzero when it fails (corral
+ssh reports every failure as 1).
+"""
+import argparse
+import base64
+import io
+import shlex
+import subprocess
+import sys
+import tarfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+# Below the kernel's 128 KiB single-argument limit once wrapped in the shell command.
+CHUNK = 90_000
+MAX_PAYLOAD = 2_000_000
+
+
+def pack(paths):
+    """Gzip tar of repository files (directories recurse), names relative to ROOT."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+        for rel in paths:
+            path = (ROOT / rel).resolve()
+            if ROOT not in path.parents and path != ROOT:
+                raise SystemExit(f'{rel}: outside the repository')
+            if not path.exists():
+                raise SystemExit(f'{rel}: no such file')
+            tar.add(path, arcname=str(path.relative_to(ROOT)),
+                    filter=lambda i: None if '__pycache__' in i.name or i.name.endswith('.pyc') else i)
+    data = buf.getvalue()
+    if len(data) > MAX_PAYLOAD:
+        raise SystemExit(f'payload is {len(data)} bytes gzipped (limit {MAX_PAYLOAD}): sync fewer files')
+    return data
+
+
+def corral_ssh(vm, script, timeout):
+    return subprocess.run(['corral', 'ssh', vm, '-u', 'root', '-c', script], timeout=timeout).returncode
+
+
+def upload(vm, data, dest, timeout):
+    """Extract `data` under `dest` in the guest, a base64 chunk per call."""
+    encoded = base64.b64encode(data).decode()
+    chunks = [encoded[i:i + CHUNK] for i in range(0, len(encoded), CHUNK)] or ['']
+    stage = '/var/tmp/tuna-corral-sync.b64'
+    for number, chunk in enumerate(chunks):
+        redirect = '>' if number == 0 else '>>'
+        if corral_ssh(vm, f'printf %s {chunk} {redirect} {stage}', timeout):
+            raise SystemExit(f'upload chunk {number + 1}/{len(chunks)} failed')
+    unpack = (f'mkdir -p {shlex.quote(dest)} && base64 -d {stage} | tar -xzf - -C {shlex.quote(dest)}; '
+              f'status=$?; rm -f {stage}; exit $status')
+    if corral_ssh(vm, unpack, timeout):
+        raise SystemExit('guest could not unpack the payload')
+    return len(chunks)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser.add_argument('--vm', required=True, help='running Corral VM (corral ssh root access)')
+    parser.add_argument('--path', action='append', default=[], help='repository path to copy (repeatable)')
+    parser.add_argument('--dest', default='/var/tmp/tuna-src', help='guest directory (default: %(default)s)')
+    parser.add_argument('--timeout', type=int, default=600, help='seconds per corral ssh call')
+    parser.add_argument('command', nargs=argparse.REMAINDER, help='after --: command to run in --dest')
+    args = parser.parse_args()
+    command = args.command[1:] if args.command[:1] == ['--'] else args.command
+    if not args.path and not command:
+        parser.error('nothing to do: give --path and/or a command after --')
+    started = time.monotonic()
+    if args.path:
+        calls = upload(args.vm, pack(args.path), args.dest, args.timeout)
+        print(f'synced {len(args.path)} path(s) in {calls} call(s), {time.monotonic() - started:.1f}s', file=sys.stderr)
+    if not command:
+        return 0
+    ran = time.monotonic()
+    status = corral_ssh(args.vm, f'cd {shlex.quote(args.dest)} && {shlex.join(command)}', args.timeout)
+    print(f'guest command exit {status} in {time.monotonic() - ran:.1f}s', file=sys.stderr)
+    return status
+
+
+if __name__ == '__main__':
+    sys.exit(main())
