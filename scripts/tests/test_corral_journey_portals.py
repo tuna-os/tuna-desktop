@@ -343,5 +343,44 @@ class ConsentVisibilityTests(unittest.TestCase):
         bus.call_sync.assert_not_called()
 
 
+class FreshAccountSessionTests(unittest.TestCase):
+    """#1050: a fresh account's first GDM login must default to Tuna."""
+
+    def defaults(self, version, conf, template='', record=None):
+        raw = ['@@version', version, '@@custom.conf', *conf.splitlines()]
+        if record is not None:
+            raw += ['@@user', *record.splitlines()]
+        for kind in ('standard', 'administrator'):
+            raw += [f'@@template-{kind}-path', f'/etc/accountsservice/user-templates/{kind}',
+                    f'@@template-{kind}', *template.splitlines()]
+        guest = journey.Guest(Mock())
+        with patch.object(journey.Guest, 'out', return_value='\n'.join(raw)):
+            return guest.session_defaults()
+
+    def effective(self, result):
+        return {kind: t['effective'] for kind, t in result['templates'].items()}
+
+    def test_gdm51_empty_template_uses_daemon_fallback(self):
+        result = self.defaults('GDM 51.1', '[daemon]\nFallbackSession=tuna\n[security]\n',
+                               template='[User]\nSession=\n')
+        self.assertEqual(self.effective(result), {'standard': 'tuna', 'administrator': 'tuna'})
+        self.assertEqual(result['saved'], {'record': False, 'session': None})
+        self.assertEqual(result['templates']['standard']['path'], '/etc/accountsservice/user-templates/standard')
+
+    def test_older_gdm_uses_template_session(self):
+        result = self.defaults('GDM 47.0', '[daemon]\n', template='[User]\nSession=tuna\n')
+        self.assertEqual(self.effective(result), {'standard': 'tuna', 'administrator': 'tuna'})
+
+    def test_fallback_outside_daemon_or_on_older_gdm_is_not_tuna(self):
+        self.assertEqual(set(self.effective(self.defaults('GDM 51.1', '[security]\nFallbackSession=tuna\n')).values()),
+                         {None})
+        self.assertEqual(set(self.effective(self.defaults('GDM 47.0', '[daemon]\nFallbackSession=tuna\n')).values()),
+                         {None})
+
+    def test_saved_record_is_reported(self):
+        result = self.defaults('GDM 51.1', '[daemon]\nFallbackSession=tuna\n', record='[User]\nSession=gnome\n')
+        self.assertEqual(result['saved'], {'record': True, 'session': 'gnome'})
+
+
 if __name__ == '__main__':
     unittest.main()

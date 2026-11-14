@@ -81,6 +81,46 @@ def corral_json(argv, timeout=120, check=True, input=None):
     return json.loads(r.stdout) if r.stdout.strip() else None
 
 
+def ini_values(text, section, key):
+    """Every `key=` value inside `[section]` of a GDM/AccountsService key file."""
+    values, current = [], None
+    for line in (text or '').splitlines():
+        line = line.strip()
+        if line.startswith('['):
+            current = line
+        elif current == f'[{section}]' and line.startswith(key + '='):
+            values.append(line[len(key) + 1:])
+    return values
+
+
+def fresh_account_session(sections):
+    """Which session a fresh account's first GDM login starts (tunaOS#4055).
+
+    A non-empty AccountsService template `[User] Session` wins. Otherwise
+    GDM 51 and later start `[daemon] FallbackSession`; older GDM picks its own
+    preference (GNOME), which no configuration here makes Tuna."""
+    version = re.search(r'(\d+)\.\d+', sections.get('version', ''))
+    major = int(version.group(1)) if version else None
+    fallback = ini_values(sections.get('custom.conf'), 'daemon', 'FallbackSession')
+    result = {'gdm_version': sections.get('version', '').strip(), 'gdm_major': major,
+              'fallback_session': fallback, 'templates': {}}
+    for kind in ('standard', 'administrator'):
+        text = sections.get(f'template-{kind}')
+        session = (ini_values(text, 'User', 'Session') or [''])[-1]
+        if session:
+            effective = session
+        elif major is not None and major >= 51 and len(fallback) == 1:
+            effective = fallback[0]
+        else:
+            effective = None
+        result['templates'][kind] = {'path': (sections.get(f'template-{kind}-path') or '').strip() or None,
+                                     'session': session, 'effective': effective}
+    record = sections.get('user')
+    result['saved'] = {'record': record is not None,
+                       'session': (ini_values(record, 'User', 'Session') or [''])[-1] if record is not None else None}
+    return result
+
+
 class Guest:
     """Root shell in the VM over `corral ssh` (virtctl ssh on KubeVirt)."""
 
@@ -118,6 +158,25 @@ class Guest:
 
     def greeter_session(self):
         return self.out("loginctl list-sessions --no-legend | awk '$6==\"greeter\" && $4==\"seat0\"{print $1}'")
+
+    def session_defaults(self):
+        """GDM's version and `[daemon]`, the AccountsService templates and the
+        test account's own record, read in one exchange."""
+        raw = self.out(
+            'gdm=$(command -v gdm || command -v gdm3); echo "@@version"; "$gdm" --version 2>&1 || true; '
+            'echo "@@custom.conf"; cat /etc/gdm3/custom.conf 2>/dev/null || cat /etc/gdm/custom.conf 2>/dev/null || true; '
+            f'if [ -f /var/lib/AccountsService/users/{USER} ]; then echo "@@user"; cat /var/lib/AccountsService/users/{USER}; fi; '
+            'for t in standard administrator; do for d in /run /etc /usr/local/share /usr/share; do '
+            'f=$d/accountsservice/user-templates/$t; if [ -f "$f" ]; then echo "@@template-$t-path"; echo "$f"; '
+            'echo "@@template-$t"; cat "$f"; break; fi; done; done')
+        sections, name = {}, None
+        for line in raw.splitlines():
+            if line.startswith('@@'):
+                name = line[2:]
+                sections[name] = ''
+            elif name is not None:
+                sections[name] += line + '\n'
+        return fresh_account_session(sections)
 
     def cursor(self):
         return self.out('journalctl -b -n0 --show-cursor --no-pager | sed -n "s/^-- cursor: //p"')
@@ -323,7 +382,12 @@ def provision(args, guest, receipt, identity):
         raise RuntimeError(f"booted {booted['image']['image']}, not {args.image}")
     receipt['guest'] = {
         'packages': guest.out(
-            'if command -v pacman >/dev/null; then pacman -Q tuna-desktop gdm gnome-shell gnome-control-center nautilus; '
+            # Gentoo (guppy): the VDB lists installed CPVs and their source repository.
+            'if [ -f /etc/gentoo-release ]; then cd /var/db/pkg && for a in gui-wm/tuna-desktop gnome-base/gdm '
+            'gnome-base/gnome-shell gnome-base/gnome-control-center gnome-base/nautilus; do '
+            'm=$(ls -d "$a"-[0-9]* 2>/dev/null); [ -n "$m" ] || { echo "package $a is not installed" >&2; exit 1; }; '
+            'for p in $m; do echo "$p::$(cat "$p/repository")"; done; done; '
+            'elif command -v pacman >/dev/null; then pacman -Q tuna-desktop gdm gnome-shell gnome-control-center nautilus; '
             'elif command -v rpm >/dev/null; then rpm -q tuna-desktop gdm gnome-shell gnome-control-center nautilus; '
             'elif command -v dpkg-query >/dev/null; then dpkg-query -W tuna-desktop gdm3 gnome-shell gnome-control-center nautilus; '
             'else echo "no supported native package query" >&2; exit 1; fi').splitlines(),
@@ -416,6 +480,16 @@ class Journey:
             check('console size', c.size() == [WIDTH, HEIGHT], c.size())
             check('GDM greeter session on seat0', g.greeter_session(), g.greeter_session())
             check('no user session yet', g.seat_session() is None, g.seat_session())
+            # #1050: the first login of an account that never chose a session
+            # must start Tuna through GDM's own default (tunaOS#4055).
+            fresh = g.session_defaults()
+            self.receipt['fresh_account'] = {'before_login': fresh}
+            saved = fresh['saved']['session']
+            check('fresh account has no saved session choice',
+                  saved in (None, '') or saved in {t['session'] for t in fresh['templates'].values()},
+                  fresh['saved'])
+            check('fresh-account default session is tuna (template Session or GDM FallbackSession)',
+                  all(t['effective'] == 'tuna' for t in fresh['templates'].values()), fresh)
         self.step('greeter-user-list', 'GDM shows the user list', greeter)
 
         def select_user(check):
@@ -445,6 +519,9 @@ class Journey:
             env = g.out(f'tr "\\0" "\\n" < /proc/$(pgrep -u {USER} -x tuna-compositor)/environ'
                         ' | grep -E "^XDG_(SESSION_DESKTOP|CURRENT_DESKTOP|SESSION_TYPE)="')
             check('session desktop is tuna', 'XDG_SESSION_DESKTOP=tuna' in env, env.splitlines())
+            after = g.session_defaults()['saved']
+            self.receipt.setdefault('fresh_account', {})['after_login'] = after
+            check('first login saved no other session', after['session'] in (None, '', 'tuna'), after)
         self.step('session-is-tuna', 'Password login starts Tuna Desktop (lands in the overview)', login)
 
         def portals(check):

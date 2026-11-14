@@ -336,7 +336,8 @@ The matrix stops rather than creating another VM if owned cleanup is unproven.
 
 Requirements and console behavior follow [the Corral journey runbook](corral-journey.md):
 Corral bootc plugin/KubeVirt access, `gh`, `skopeo`, Python 3.11+, Pillow and
-Playwright Chromium. The script uses native pacman/RPM/dpkg package queries,
+Playwright Chromium. The script uses native pacman/RPM/dpkg package queries
+and the Gentoo VDB (`/var/db/pkg`, with each package's source repository),
 retains booted digest/package/binary provenance, drives the VM's own noVNC
 canvas, retains frame hashes, and deletes its VM/disks. Failure manifests also
 attempt a Corral framebuffer capture before deletion. No candidate compositor,
