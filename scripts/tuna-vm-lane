@@ -2471,6 +2471,13 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
            "output scanned out a locked frame, logind never overran InhibitDelayMaxUSec, and it was taken again on wake")
     if not locked_frame:
         raise RuntimeError(f"sleep delay not released on a presented lock: {delay_before} -> {delay_after}")
+    # The wake leaves the password prompt already open (lifecycle
+    # unlocked-first-resume.png), not the curtain, so a bare Enter submitted an
+    # empty password: PAM refused it and the typed answer landed while that
+    # attempt was pending (V-LIFECYCLE red since #1170). Escape returns an
+    # open prompt to the clock, as the prelocked path below does, so the Enter
+    # always raises the curtain and the typed password is the first answer.
+    qmp.keys("esc")
     qmp.keys("ret")
     time.sleep(1)
     qmp.keys("ctrl", "a")

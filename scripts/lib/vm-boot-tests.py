@@ -3933,6 +3933,10 @@ class SleepDelayGate(unittest.TestCase):
         self.assertEqual(events[:4], [("inventory", "sleep-delay-before"), ("agent", "sleep-inhibitors"),
                                       ("record", "V-SLEEP-DELAY-INHIBITOR"), ("suspend", "V-SUSPEND-UNLOCKED")])
         self.assertIn(("type", "tuna"), events)
+        # The wake can leave the prompt open: Escape before the Enter that
+        # raises the curtain, or that Enter submits an empty password.
+        keys = [event for event in events if event[0] == "keys"]
+        self.assertEqual(keys[:2], [("keys", ("esc",)), ("keys", ("ret",))])
 
     def test_no_inhibitor_means_no_suspend(self):
         with self.assertRaisesRegex(RuntimeError, "no compositor sleep delay inhibitor"):
