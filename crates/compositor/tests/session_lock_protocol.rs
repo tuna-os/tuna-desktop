@@ -379,6 +379,61 @@ fn rejected_second_client_preserves_the_approved_output_surface() {
 }
 
 #[test]
+fn another_clients_request_does_not_cancel_a_pending_lock() {
+    // The shell locks because the compositor's flag is already set, and
+    // it asks once. If a request from any other client could finish the
+    // shell's before the runtime judged it, the session would stay
+    // locked with no curtain and no prompt.
+    let mut comp = compositor();
+    let mut shell = connect(&mut comp);
+    let (_lock, _role, _surface) = pending_surface(&mut comp, &mut shell, 26);
+    let mut other = connect(&mut comp);
+    let manager: ExtSessionLockManagerV1 = other.bind(1);
+    let foreign = manager.lock(&other.queue.handle(), 27);
+    pump(&mut comp, &mut other);
+    pump(&mut comp, &mut shell);
+    assert!(
+        shell.client.events.is_empty(),
+        "the earlier request is still undecided"
+    );
+    // The runtime judges each request in turn, oldest first.
+    let (first, _) = comp.state.take_lock_request().expect("the shell's request");
+    comp.state.resolve_lock_request(first, true);
+    let (second, _) = comp.state.take_lock_request().expect("the other's request");
+    comp.state.resolve_lock_request(second, false);
+    assert!(comp.state.take_lock_request().is_none());
+    pump(&mut comp, &mut other);
+    pump(&mut comp, &mut shell);
+    assert_eq!(shell.client.events, vec![(26, true)]);
+    assert_eq!(other.client.events, vec![(27, false)]);
+    assert_eq!(comp.state.lock_surfaces().len(), 1);
+    foreign.destroy();
+}
+
+#[test]
+fn refusing_one_client_keeps_a_waiting_clients_early_surface() {
+    // The other client asked first, so it is judged first, while the
+    // shell's request and its early lock surface still wait.
+    let mut comp = compositor();
+    let mut other = connect(&mut comp);
+    let manager: ExtSessionLockManagerV1 = other.bind(1);
+    let foreign = manager.lock(&other.queue.handle(), 28);
+    pump(&mut comp, &mut other);
+    let mut shell = connect(&mut comp);
+    let (_lock, _role, _surface) = pending_surface(&mut comp, &mut shell, 29);
+    let (first, _) = comp.state.take_lock_request().expect("the other's request");
+    comp.state.resolve_lock_request(first, false);
+    let (second, _) = comp.state.take_lock_request().expect("the shell's request");
+    comp.state.resolve_lock_request(second, true);
+    pump(&mut comp, &mut other);
+    pump(&mut comp, &mut shell);
+    assert_eq!(other.client.events, vec![(28, false)]);
+    assert_eq!(shell.client.events, vec![(29, true)]);
+    assert_eq!(comp.state.lock_surfaces().len(), 1);
+    foreign.destroy();
+}
+
+#[test]
 fn unapproved_release_is_a_protocol_error_without_clearing_the_owner() {
     let mut comp = compositor();
     let mut owner = connect(&mut comp);

@@ -5544,8 +5544,8 @@ impl Runtime {
         // ext-session-lock-v1: only the supervised shell may lock, and
         // locking through the protocol engages the compositor's own
         // flag. Anyone else's locker is dropped, which tells it the
-        // lock failed.
-        if let Some((locker, pid)) = self.state.take_lock_request() {
+        // lock failed. Each waiting client gets its own verdict.
+        while let Some((locker, pid)) = self.state.take_lock_request() {
             use crate::session_lock::{lock_request_verdict, LockVerdict};
             let verdict = lock_request_verdict(
                 pid,
