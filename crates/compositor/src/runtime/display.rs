@@ -10,7 +10,7 @@ use smithay::output::Scale;
 
 use super::{clamp_scale, logical_size, Backend, Runtime};
 use crate::display_config::{
-    self, Confirmation, DisplayState, LogicalState, Method, ModeSpec, MonitorState,
+    self, Confirmation, DisplayState, LogicalState, Method, ModeSpec, MonitorState, SwitchConfig,
 };
 use crate::monitors::{MonitorSpec, MonitorsConfig};
 use crate::State;
@@ -102,6 +102,7 @@ impl Runtime {
         self.display_published = Some(key);
         self.wallpaper.monitors_changed();
         self.display_share.publish(self.display_state());
+        self.update_monitor_switch();
     }
 
     /// GNOME's privacy screen setting (#356): a new read of
@@ -135,6 +136,23 @@ impl Runtime {
         method: Method,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     ) {
+        let result = self.apply_monitors_config(config, method);
+        if result.is_ok() {
+            // Another configuration is in effect: none of GNOME's
+            // switch-monitor choices (`current_switch_config`).
+            self.switch_config = None;
+        }
+        self.update_monitor_switch();
+        let _ = reply.send(result);
+    }
+
+    /// The shared tail of `ApplyMonitorsConfig` and the switch-monitor
+    /// popup: confirmation bookkeeping around the backend applying it.
+    fn apply_monitors_config(
+        &mut self,
+        config: MonitorsConfig,
+        method: Method,
+    ) -> Result<(), String> {
         let live = self.display_state().live_config();
         self.display_configs.ensure_current(live);
         self.display_configs.cancel_confirmation();
@@ -148,7 +166,39 @@ impl Runtime {
             Err(error) => eprintln!("tuna-compositor: display configuration refused: {error}"),
         }
         self.publish_display_state();
-        let _ = reply.send(result);
+        result
+    }
+
+    /// GNOME's switch-monitor popup choice (`switch_config_idle_cb`,
+    /// mutter 51 `meta-monitor-manager.c`): the layout for it, built from
+    /// the monitors in effect, applied as a temporary configuration, so no
+    /// confirmation is asked. Nothing happens when the monitors cannot be
+    /// switched or no layout fits.
+    pub(super) fn switch_monitor(&mut self, kind: SwitchConfig) {
+        let state = self.display_state();
+        let Some(config) = display_config::switch_config(&state, kind) else {
+            eprintln!("tuna-compositor: no monitor layout for {kind:?}");
+            return;
+        };
+        match self.apply_monitors_config(config, Method::Temporary) {
+            Ok(()) => self.switch_config = Some(kind),
+            Err(error) => {
+                eprintln!("tuna-compositor: failed to use switch monitor configuration: {error}")
+            }
+        }
+        self.update_monitor_switch();
+    }
+
+    /// Tell the shell what the switch-monitor popup reads
+    /// (`can_switch_config`, `has_builtin_panel`, `get_switch_config`).
+    fn update_monitor_switch(&mut self) {
+        let state = self.display_share.snapshot();
+        self.control
+            .set_monitor_switch(crate::control::MonitorSwitchState {
+                can_switch: display_config::can_switch(&state),
+                has_builtin: display_config::has_builtin(&state),
+                current: self.switch_config,
+            });
     }
 
     /// Mutter's `request_persistent_confirmation`: revert after the
@@ -199,6 +249,7 @@ impl Runtime {
         match self.apply_monitors(&previous) {
             Ok(()) => {
                 self.display_configs.applied(previous, Method::Temporary);
+                self.switch_config = None;
             }
             Err(error) => {
                 eprintln!("tuna-compositor: the previous display configuration failed: {error}")
@@ -283,6 +334,8 @@ impl Runtime {
         }
         let live = self.display_state().live_config();
         self.display_configs.configured(live);
+        // ensure_configured's linear or stored layout is no switch choice.
+        self.switch_config = None;
         self.publish_display_state();
     }
 

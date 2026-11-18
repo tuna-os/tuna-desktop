@@ -563,16 +563,61 @@ fn bluetooth(conn: &gio::DBusConnection, w: &Rc<Widgets>) {
     });
 }
 
+/// GNOME Shell's `last-selected-power-profile` (powerProfiles.js
+/// `LAST_PROFILE_KEY`): the profile the Power Mode tile returns to from
+/// balanced. Held in memory when the schema is not installed.
+struct LastProfile {
+    settings: Option<gio::Settings>,
+    memory: RefCell<String>,
+}
+
+impl LastProfile {
+    const KEY: &'static str = "last-selected-power-profile";
+
+    fn new() -> Self {
+        let settings = gio::SettingsSchemaSource::default()
+            .and_then(|source| source.lookup(crate::SHELL_SCHEMA, true))
+            .filter(|schema| schema.has_key(Self::KEY))
+            .map(|_| gio::Settings::new(crate::SHELL_SCHEMA));
+        Self {
+            settings,
+            memory: RefCell::new(logic::LAST_SELECTED_DEFAULT.to_owned()),
+        }
+    }
+
+    /// Read live, so an external change (dconf, Settings) is honored.
+    fn get(&self) -> String {
+        match &self.settings {
+            Some(settings) => settings.string(Self::KEY).into(),
+            None => self.memory.borrow().clone(),
+        }
+    }
+
+    fn set(&self, profile: &str) {
+        match &self.settings {
+            Some(settings) => {
+                if settings.string(Self::KEY) != profile {
+                    if let Err(error) = settings.set_string(Self::KEY, profile) {
+                        eprintln!("tuna-shell-gtk: {} not saved: {error}", Self::KEY);
+                    }
+                }
+            }
+            None => *self.memory.borrow_mut() = profile.to_owned(),
+        }
+    }
+}
+
 fn power_profiles(conn: &gio::DBusConnection, w: &Rc<Widgets>, which: usize) {
     let Some(&(name, path, iface)) = PPD.get(which) else {
         return;
     };
     let ppd = Remote::new(conn, name, path, iface);
     let profile = Rc::new(RefCell::new(String::from(logic::BALANCED)));
+    let last = Rc::new(LastProfile::new());
     let refresh: Rc<dyn Fn()> = {
-        let (ppd, w, profile) = (ppd.clone(), w.clone(), profile.clone());
+        let (ppd, w, profile, last) = (ppd.clone(), w.clone(), profile.clone(), last.clone());
         Rc::new(move || {
-            let (w, profile) = (w.clone(), profile.clone());
+            let (w, profile, last) = (w.clone(), profile.clone(), last.clone());
             ppd.get_all(move |props| {
                 let Some(active) = props.and_then(|p| dict_string(&p, "ActiveProfile")) else {
                     return;
@@ -596,6 +641,9 @@ fn power_profiles(conn: &gio::DBusConnection, w: &Rc<Widgets>, which: usize) {
                 }
                 for (name, _, ornament) in &w.power_items {
                     ornament.set_visible(*name == active);
+                }
+                if let Some(remembered) = logic::power_mode_remembered(&active) {
+                    last.set(remembered);
                 }
                 *profile.borrow_mut() = active;
             });
@@ -630,8 +678,9 @@ fn power_profiles(conn: &gio::DBusConnection, w: &Rc<Widgets>, which: usize) {
     }
     {
         let ppd = ppd.clone();
+        let last = last.clone();
         w.power_mode.on_user_toggle(move |_| {
-            let next = logic::power_mode_after_click(&profile.borrow());
+            let next = logic::power_mode_after_click(&profile.borrow(), &last.get());
             ppd.set("ActiveProfile", next.to_variant());
         });
     }

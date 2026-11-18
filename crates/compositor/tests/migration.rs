@@ -811,3 +811,162 @@ fn unplug_racing_a_wl_output_bind_keeps_the_client() {
     // The disabled global waits for the runtime to destroy it later.
     assert_eq!(comp.state.take_retired_output_globals().len(), 1);
 }
+
+/// A laptop panel ("left") and a projector ("right") as GetCurrentState
+/// reports them: the panel is built in and primary.
+fn laptop_and_projector() -> tuna_compositor::display_config::DisplayState {
+    use tuna_compositor::display_config::{DisplayState, LogicalState, ModeSpec, MonitorState};
+    use tuna_compositor::monitors::MonitorSpec;
+    let mode = |width, height| ModeSpec {
+        width,
+        height,
+        refresh: 60.0,
+        interlaced: false,
+    };
+    let monitor = |connector: &str, builtin, modes: Vec<ModeSpec>| MonitorState {
+        spec: MonitorSpec::connector(connector),
+        display_name: connector.into(),
+        builtin,
+        width_mm: 0,
+        height_mm: 0,
+        modes,
+        preferred: 0,
+        current: Some(0),
+        privacy_screen: None,
+    };
+    let logical = |connector: &str, x, primary| LogicalState {
+        x,
+        y: 0,
+        scale: 1.0,
+        transform: 0,
+        primary,
+        monitors: vec![connector.into()],
+    };
+    DisplayState {
+        serial: 1,
+        monitors: vec![
+            monitor("left", true, vec![mode(1280, 800), mode(1024, 768)]),
+            monitor("right", false, vec![mode(1920, 1080), mode(1280, 800)]),
+        ],
+        logical: vec![logical("left", 0, true), logical("right", 1280, false)],
+    }
+}
+
+/// What the runtime does after the backend applied a configuration
+/// (`sync_drm_outputs`): lit leaders are the outputs, at their position;
+/// clones and switched-off monitors are not; windows follow.
+fn apply_switch(
+    f: &mut Fixture,
+    display: &tuna_compositor::display_config::DisplayState,
+    kind: tuna_compositor::display_config::SwitchConfig,
+) {
+    let config = tuna_compositor::display_config::switch_config(display, kind)
+        .expect("the laptop and projector can be switched");
+    let layouts = tuna_compositor::display_config::output_layouts(&config);
+    let state = &mut f.comp.state;
+    let before = state.output_slices();
+    let lit: Vec<_> = layouts
+        .iter()
+        .filter_map(|l| {
+            l.enabled
+                .as_ref()
+                .filter(|e| e.mirror_of.is_none())
+                .map(|e| (l.connector.as_str(), e))
+        })
+        .collect();
+    for info in state.output_infos() {
+        if !lit.iter().any(|(name, _)| *name == info.name) {
+            assert!(state.remove_output(&info.name));
+        }
+    }
+    for (name, enabled) in &lit {
+        let mode = enabled.mode.expect("a switch layout names every mode");
+        state.add_output(
+            name,
+            None,
+            (f64::from(mode.width) / enabled.scale).round() as i32,
+            (f64::from(mode.height) / enabled.scale).round() as i32,
+        );
+        state.set_output_location(name, enabled.loc);
+        if enabled.primary {
+            assert!(state.set_primary(name));
+        }
+    }
+    f.manager.relocate_for_monitors_changed(state, &before);
+}
+
+/// GNOME's switch-monitor popup on a laptop and a projector (#1195),
+/// like the hotplug proofs above: each choice's layout is applied to the
+/// two outputs and the windows follow it. External Only switches the
+/// panel off (its windows move to the projector), Join Displays puts it
+/// back beside it, Mirror shows one picture at the common resolution,
+/// Built-in Only switches the projector off.
+#[test]
+fn switch_monitor_choices_rearrange_two_outputs_and_carry_their_windows() {
+    use tuna_compositor::display_config::SwitchConfig;
+    let display = laptop_and_projector();
+    let mut f = two_windows_dual();
+    let placed = f.manager.geometry(f.id_b).unwrap();
+    assert!(f
+        .manager
+        .move_window(f.id_b, 1312 - placed.loc.x, 32 - placed.loc.y));
+    let geo_a = f.manager.geometry(f.id_a).unwrap();
+    let names = |f: &Fixture| -> Vec<(String, i32, i32, bool)> {
+        f.comp
+            .state
+            .output_infos()
+            .into_iter()
+            .map(|o| (o.name, o.width, o.height, o.primary))
+            .collect()
+    };
+    let on_output = |f: &Fixture, id, width: i32, height: i32, x: i32| {
+        let geo = f.manager.geometry(id).unwrap();
+        geo.loc.x >= x
+            && geo.loc.x + geo.size.w <= x + width
+            && geo.loc.y >= 0
+            && geo.loc.y + geo.size.h <= height
+    };
+
+    // Join Displays: the layout the session already has; nothing moves.
+    apply_switch(&mut f, &display, SwitchConfig::AllLinear);
+    assert_eq!(
+        names(&f),
+        [
+            ("left".to_owned(), 1280, 800, true),
+            ("right".to_owned(), 1920, 1080, false)
+        ]
+    );
+    assert_eq!(f.manager.geometry(f.id_a).unwrap(), geo_a);
+    assert!(on_output(&f, f.id_b, 1920, 1080, 1280));
+
+    // External Only: the panel is switched off, the projector leads, and
+    // the panel's window joins beta on it.
+    apply_switch(&mut f, &display, SwitchConfig::External);
+    assert_eq!(names(&f), [("right".to_owned(), 1920, 1080, true)]);
+    assert!(on_output(&f, f.id_a, 1920, 1080, 0));
+    assert!(on_output(&f, f.id_b, 1920, 1080, 0));
+
+    // Join Displays again: both outputs, the primary first at x 0.
+    apply_switch(&mut f, &display, SwitchConfig::AllLinear);
+    let joined = names(&f);
+    assert_eq!(joined.len(), 2);
+    assert_eq!(joined.iter().filter(|o| o.3).count(), 1, "one primary");
+
+    // Mirror: one picture at the largest resolution both offer, so the
+    // clone is no output of its own and every window is on the one.
+    let mut state = display.clone();
+    state.logical[0].primary = true;
+    state.logical[1].primary = false;
+    apply_switch(&mut f, &state, SwitchConfig::AllMirror);
+    assert_eq!(names(&f), [("left".to_owned(), 1280, 800, true)]);
+    assert!(on_output(&f, f.id_a, 1280, 800, 0));
+    assert!(on_output(&f, f.id_b, 1280, 800, 0));
+
+    // Built-in Only on a session that has the projector joined again.
+    apply_switch(&mut f, &state, SwitchConfig::AllLinear);
+    apply_switch(&mut f, &state, SwitchConfig::Builtin);
+    assert_eq!(names(&f), [("left".to_owned(), 1280, 800, true)]);
+    assert!(on_output(&f, f.id_a, 1280, 800, 0));
+    assert!(on_output(&f, f.id_b, 1280, 800, 0));
+    assert_eq!(f.manager.model().windows().count(), 2, "no window is lost");
+}

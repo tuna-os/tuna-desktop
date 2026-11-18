@@ -102,6 +102,9 @@ pub enum Action {
     Workspace(Target),
     /// Move the focused window there and follow it.
     MoveToWorkspace(Target),
+    /// GNOME's switch-monitor popup (`switch-monitor`, switchMonitor.js):
+    /// Mirror, Join Displays, External Only, Built-in Only.
+    SwitchMonitor,
 }
 
 /// A workspace a key goes to.
@@ -467,6 +470,16 @@ fn specs() -> Vec<Spec> {
             key: "toggle-tiled-right".into(),
             action: Action::TileRight,
             defaults: vec!["<Super>Right"],
+            modes: NORMAL_OVERVIEW,
+        },
+        // windowManager.js `setCustomKeybindingHandler('switch-monitor',
+        // NORMAL | OVERVIEW)`; mutter's gschema binds Super+P and the
+        // laptop's display key.
+        Spec {
+            schema: Schema::Mutter,
+            key: "switch-monitor".into(),
+            action: Action::SwitchMonitor,
+            defaults: vec!["<Super>p", "XF86Display"],
             modes: NORMAL_OVERVIEW,
         },
         wm("begin-move", Action::BeginMove, vec!["<Alt>F7"]),
@@ -908,6 +921,7 @@ mod tests {
         assert_eq!(find(Action::Close), ["<Alt>F4"]);
         assert_eq!(find(Action::TileLeft), ["<Super>Left"]);
         assert_eq!(find(Action::TileRight), ["<Super>Right"]);
+        assert_eq!(find(Action::SwitchMonitor), ["<Super>p", "XF86Display"]);
         assert_eq!(
             find(Action::NextInputSource),
             ["<Super>space", "XF86Keyboard"]

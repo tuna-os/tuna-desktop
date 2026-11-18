@@ -23,6 +23,9 @@ use glib::translate::IntoGlib;
 
 pub const NAME: &str = "org.gnome.Shell";
 pub const PATH: &str = "/org/gnome/Shell";
+/// The GNOME Shell version Tuna Desktop matches: the `ShellVersion`
+/// property, and what the welcome dialog records as shown.
+pub const SHELL_VERSION: &str = "51.0";
 
 /// GNOME's DBusSenderChecker allowlist for these methods.
 pub const ALLOWED_SENDERS: &[&str] = &[
@@ -885,7 +888,7 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                 .property(move |_, _, _, _, property| match property {
                     "Mode" => "user".to_variant(),
                     "OverviewActive" => props.overview_active().to_variant(),
-                    "ShellVersion" => "51.0".to_variant(),
+                    "ShellVersion" => SHELL_VERSION.to_variant(),
                     _ => ().to_variant(),
                 })
                 .build();

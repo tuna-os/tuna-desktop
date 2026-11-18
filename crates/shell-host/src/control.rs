@@ -149,6 +149,14 @@ pub enum Handled {
     /// Hide this window's close dialog (it answered, went away or left
     /// the screen, or the session locked).
     HideCloseDialog(u64),
+    /// What the switch-monitor popup reads from the compositor (0.56):
+    /// whether the monitors can be switched, whether there is a built-in
+    /// panel (Built-in Only and External Only), and the choice in effect.
+    MonitorSwitch {
+        can_switch: bool,
+        has_builtin: bool,
+        current: Option<tuna_shell_control::MonitorSwitchConfig>,
+    },
     /// The keyboard switched Sticky or Slow Keys: save and confirm.
     KeyboardAidToggled {
         aid: tuna_shell_control::KeyboardAid,
@@ -778,6 +786,23 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// GNOME's switch-monitor popup choice (`MonitorManager.switch_config`):
+    /// the compositor applies mutter's layout for it. The result is
+    /// `Applied` once it accepted the request, not once the monitors
+    /// changed; the popup learns the outcome from
+    /// [`Handled::MonitorSwitch`].
+    pub fn switch_monitor(
+        &mut self,
+        config: tuna_shell_control::MonitorSwitchConfig,
+    ) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::SwitchMonitor { config },
+        })?;
+        Ok(id)
+    }
+
     /// Ask the compositor to show the pad OSD for `target`
     /// (`org.gnome.Shell.Wacom.PadOsd.Show` or the pad chooser). The
     /// result is `Denied` when the pad is unknown or has no layout.
@@ -1265,6 +1290,15 @@ impl ControlClient {
                 height,
             })),
             Message::HideCloseDialog { window } => Ok(Handled::HideCloseDialog(window)),
+            Message::MonitorSwitch {
+                can_switch,
+                has_builtin,
+                current,
+            } => Ok(Handled::MonitorSwitch {
+                can_switch,
+                has_builtin,
+                current,
+            }),
             Message::KeyboardAidToggled { aid, enabled } => {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
@@ -1588,6 +1622,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::OverviewSwipe { .. } => "OverviewSwipe",
         Message::ShowCloseDialog { .. } => "ShowCloseDialog",
         Message::HideCloseDialog { .. } => "HideCloseDialog",
+        Message::MonitorSwitch { .. } => "MonitorSwitch",
     }
 }
 

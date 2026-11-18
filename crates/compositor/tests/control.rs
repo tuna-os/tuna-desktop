@@ -938,6 +938,78 @@ fn hub_replays_shown_close_dialogs_to_newcomers_and_gates_minor50() {
     assert_eq!(client_read(&mut old), Message::Overview { open: true });
 }
 
+/// What GNOME's switch-monitor popup reads (#1195): broadcast when it
+/// changes, replayed to a newcomer, never sent to a peer older than 0.56;
+/// the popup's choice reaches the runtime.
+#[test]
+fn hub_carries_the_switch_monitor_state_and_choices() {
+    use tuna_compositor::control::MonitorSwitchState;
+    use tuna_shell_control::MonitorSwitchConfig;
+    let state = MonitorSwitchState {
+        can_switch: true,
+        has_builtin: true,
+        current: Some(MonitorSwitchConfig::External),
+    };
+    let wire = Message::MonitorSwitch {
+        can_switch: true,
+        has_builtin: true,
+        current: Some(MonitorSwitchConfig::External),
+    };
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub =
+        ControlHub::bind(path.clone(), std::rc::Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = StateModel::new();
+    let mut client = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut client);
+    // Nothing to switch is what a shell assumes: no frame for it.
+    hub.set_monitor_switch(MonitorSwitchState::default());
+    hub.poll(&mut model);
+    hub.set_monitor_switch(state);
+    hub.poll(&mut model);
+    assert_eq!(client_read(&mut client), wire);
+
+    let mut newcomer = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut newcomer);
+    assert_eq!(client_read(&mut newcomer), wire);
+
+    // The choice arrives, in order, as one applied command each.
+    for (id, config) in [
+        (1, MonitorSwitchConfig::AllMirror),
+        (2, MonitorSwitchConfig::Builtin),
+    ] {
+        client_write(
+            &mut client,
+            &Message::Command {
+                id,
+                kind: CommandKind::SwitchMonitor { config },
+            },
+        );
+        assert_eq!(hub.poll(&mut model).switch_monitor, vec![config]);
+        assert_eq!(
+            client_read(&mut client),
+            Message::CommandResult {
+                id,
+                status: CommandStatus::Applied,
+            }
+        );
+    }
+
+    let (conn, mut old) = pair();
+    client_write(
+        &mut old,
+        &Message::Hello {
+            version: ProtocolVersion::new(CURRENT_VERSION.major, 55),
+        },
+    );
+    let mut session = Session::handshake(conn, &StateModel::new()).unwrap();
+    assert!(matches!(client_read(&mut old), Message::Hello { .. }));
+    assert!(matches!(client_read(&mut old), Message::Snapshot { .. }));
+    session.send_monitor_switch(state).unwrap();
+    session.send_overview(true).unwrap();
+    assert_eq!(client_read(&mut old), Message::Overview { open: true });
+}
+
 /// Force Quit and Wait reach the window manager for a known window only.
 #[test]
 fn close_dialog_answers_reach_the_hub_outcome_for_known_windows() {

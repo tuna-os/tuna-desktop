@@ -136,6 +136,7 @@ mod lockdown;
 mod logic;
 mod magnifier_sync;
 mod media_keys;
+mod monitor_switch;
 mod motion;
 mod mount_operation;
 mod network_agent;
@@ -182,6 +183,7 @@ mod user_switch;
 mod wall_clock;
 mod weather;
 mod weather_section;
+mod welcome;
 mod wellbeing;
 mod wifi;
 mod window_menu;
@@ -272,6 +274,8 @@ struct Drained {
     tablet: Vec<TabletUi>,
     /// Mutter's seat touch-mode, when the compositor changed it.
     touch_mode: Option<bool>,
+    /// What the switch-monitor popup reads, when the compositor changed it.
+    monitor_switch: Option<(bool, bool, Option<tuna_shell_control::MonitorSwitchConfig>)>,
 }
 
 /// One compositor request for the tablet OSDs (wire 0.45).
@@ -420,6 +424,11 @@ fn drain(
             }
             Handled::ClosePadOsd { pad } => out.tablet.push(TabletUi::Close(pad)),
             Handled::SeatTouchMode(touch_mode) => out.touch_mode = Some(touch_mode),
+            Handled::MonitorSwitch {
+                can_switch,
+                has_builtin,
+                current,
+            } => out.monitor_switch = Some((can_switch, has_builtin, current)),
             Handled::CommandResult { id, status } => out.results.push((
                 id,
                 matches!(status, tuna_shell_control::CommandStatus::Applied),
@@ -3119,6 +3128,21 @@ fn build(app: &adw::Application) {
     };
     lock_ui.set_osk(osk.clone());
 
+    // GNOME's switch-monitor popup (Super+P, XF86Display, #1195): the
+    // compositor applies the choice as mutter's `switch_config`.
+    let monitor_switch_popup = {
+        let shell = shell.clone();
+        monitor_switch::MonitorSwitchPopup::new(
+            app.upcast_ref(),
+            Rc::new(move |config| {
+                if let Some(control) = shell.borrow_mut().control.as_mut() {
+                    if let Err(e) = control.switch_monitor(config) {
+                        eprintln!("tuna-shell-gtk: switch monitor: {e}");
+                    }
+                }
+            }),
+        )
+    };
     // GNOME Shell's own keybindings (org.gnome.shell.keybindings).
     {
         // The accelerator that fired, for the input-source popup's
@@ -3126,6 +3150,7 @@ fn build(app: &adw::Application) {
         let fired_accelerator: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let run: Rc<dyn Fn(keybindings::Action, u32)> = {
             let input_sources = input_sources.clone();
+            let monitor_switch_popup = monitor_switch_popup.clone();
             let fired_accelerator = fired_accelerator.clone();
             let (shell, overview_ui, clock, system) = (
                 shell.clone(),
@@ -3260,6 +3285,10 @@ fn build(app: &adw::Application) {
                     }
                     Action::RunDialog => {
                         run_dialog.open();
+                    }
+                    Action::SwitchMonitor => {
+                        let accelerator = fired_accelerator.borrow().clone();
+                        monitor_switch_popup.binding(&accelerator);
                     }
                     Action::ShowScreenshotUi => screenshot_ui.open(),
                     Action::ShowScreenRecordingUi => screenshot_ui.open_recording(),
@@ -4061,6 +4090,7 @@ fn build(app: &adw::Application) {
             let (chrome, notify, switcher_ui) =
                 (chrome.clone(), notify.clone(), switcher_ui.clone());
             let input_sources = input_sources.clone();
+            let monitor_switch_popup = monitor_switch_popup.clone();
             let shell_rc = shell_rc.clone();
             let (osd_ui, pad_osd_ui, pad_osd_service) =
                 (osd_ui.clone(), pad_osd_ui.clone(), pad_osd_service.clone());
@@ -4084,6 +4114,7 @@ fn build(app: &adw::Application) {
                     tablet,
                     osk: osk_updates,
                     touch_mode,
+                    monitor_switch: monitor_switch_state,
                 } = drained;
                 let mut shell = shell.borrow_mut();
                 let locked = shell.control.as_ref().is_some_and(|c| c.locked());
@@ -4148,6 +4179,9 @@ fn build(app: &adw::Application) {
                 ibus_properties.sync_lock();
                 if let Some(touch_mode) = touch_mode {
                     lock_ui.set_touch_mode(touch_mode);
+                }
+                if let Some((can_switch, has_builtin, current)) = monitor_switch_state {
+                    monitor_switch_popup.set_monitors(can_switch, has_builtin, current);
                 }
                 lock_ui.sync_connection_generation(auth_generation);
                 if let Some(locked) = authoritative_lock {
@@ -4471,6 +4505,28 @@ fn build(app: &adw::Application) {
         if let Some(first) = first {
             first(link);
         }
+    }
+
+    // GNOME's `startup-complete` welcome dialog (main.js
+    // `_handleShowWelcomeScreen`), once the panel is up.
+    {
+        let app = app.clone();
+        let shell = shell.clone();
+        glib::idle_add_local_once(move || {
+            let hide_overview: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(control) = shell.borrow_mut().control.as_mut() {
+                    if control.model().is_overview_open() {
+                        let _ = control.toggle_overview();
+                    }
+                }
+            });
+            welcome::handle_startup(
+                app.upcast_ref(),
+                settings(SHELL_SCHEMA).as_ref(),
+                shell_dbus::SHELL_VERSION,
+                hide_overview,
+            );
+        });
     }
 
     window.present();

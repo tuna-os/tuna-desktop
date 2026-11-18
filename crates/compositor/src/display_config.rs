@@ -889,6 +889,203 @@ pub fn hotplug_layouts(
     layouts
 }
 
+/// GNOME's switch-monitor choices (mutter's `MetaMonitorSwitchConfigType`).
+pub use tuna_shell_control::MonitorSwitchConfig as SwitchConfig;
+
+/// `meta_monitor_manager_can_switch_config`: more than one available
+/// monitor. Every connected monitor is available here.
+pub fn can_switch(state: &DisplayState) -> bool {
+    state.monitors.len() > 1
+}
+
+/// `meta_monitor_manager_get_builtin_monitor` exists (`has_builtin_panel`).
+pub fn has_builtin(state: &DisplayState) -> bool {
+    state.monitors.iter().any(|m| m.builtin)
+}
+
+/// `find_primary_monitor` among `candidates` (indices into the monitors):
+/// the system's primary monitor, else the built-in panel, else the one
+/// with the largest preferred resolution (the first among equals).
+fn switch_primary(state: &DisplayState, candidates: &[usize]) -> Option<usize> {
+    let system = state
+        .logical
+        .iter()
+        .find(|l| l.primary)
+        .and_then(|l| l.monitors.first())
+        .and_then(|connector| {
+            candidates
+                .iter()
+                .copied()
+                .find(|&i| state.monitors[i].spec.connector == *connector)
+        });
+    system
+        .or_else(|| {
+            candidates
+                .iter()
+                .copied()
+                .find(|&i| state.monitors[i].builtin)
+        })
+        .or_else(|| {
+            let area = |i: usize| {
+                let mode = &state.monitors[i].modes[state.monitors[i].preferred];
+                i64::from(mode.width) * i64::from(mode.height)
+            };
+            candidates
+                .iter()
+                .copied()
+                .fold(None, |best: Option<usize>, i| match best {
+                    Some(b) if area(b) >= area(i) => Some(b),
+                    _ => Some(i),
+                })
+        })
+}
+
+/// `compute_scale_for_monitor`: the scale for the monitor's preferred mode.
+fn switch_scale(monitor: &MonitorState) -> f64 {
+    let mode = &monitor.modes[monitor.preferred];
+    f64::from(calculate_scale(mode, monitor.width_mm, monitor.height_mm))
+}
+
+/// The logical size of `width`x`height` at `scale` (`scale_logical_monitor_width`).
+fn switch_logical_width(width: i32, scale: f64) -> i32 {
+    (f64::from(width) / scale).round() as i32
+}
+
+/// A configuration showing `shown` (monitor indices, the primary first)
+/// and switching every other monitor off.
+fn switch_finish(
+    state: &DisplayState,
+    shown: &[usize],
+    logical: Vec<LogicalMonitorConfig>,
+) -> MonitorsConfig {
+    MonitorsConfig {
+        logical,
+        disabled: (0..state.monitors.len())
+            .filter(|i| !shown.contains(i))
+            .map(|i| state.monitors[i].spec.clone())
+            .collect(),
+    }
+}
+
+/// `create_monitors_config` with linear positioning: the monitors
+/// `matching` (the primary first) at their preferred modes and scales,
+/// side by side from x 0.
+fn switch_linear(
+    state: &DisplayState,
+    matching: impl Fn(&MonitorState) -> bool,
+) -> Option<MonitorsConfig> {
+    let candidates: Vec<usize> = (0..state.monitors.len())
+        .filter(|&i| matching(&state.monitors[i]) && !state.monitors[i].modes.is_empty())
+        .collect();
+    let primary = switch_primary(state, &candidates)?;
+    let order: Vec<usize> = std::iter::once(primary)
+        .chain(candidates.iter().copied().filter(|&i| i != primary))
+        .collect();
+    let mut x = 0;
+    let logical = order
+        .iter()
+        .map(|&i| {
+            let monitor = &state.monitors[i];
+            let mode = monitor.modes[monitor.preferred];
+            let scale = switch_scale(monitor);
+            let config = LogicalMonitorConfig {
+                x,
+                y: 0,
+                scale,
+                transform: 0,
+                primary: i == primary,
+                monitors: vec![MonitorConfig {
+                    spec: monitor.spec.clone(),
+                    mode: Some(mode),
+                }],
+            };
+            x += switch_logical_width(mode.width, scale);
+            config
+        })
+        .collect();
+    Some(switch_finish(state, &order, logical))
+}
+
+/// `create_for_switch_config_all_mirror`: one logical monitor at the
+/// largest resolution every monitor offers, at the largest of their
+/// preferred scales (never below 1).
+fn switch_mirror(state: &DisplayState) -> Option<MonitorsConfig> {
+    let all: Vec<usize> = (0..state.monitors.len())
+        .filter(|&i| !state.monitors[i].modes.is_empty())
+        .collect();
+    let primary = switch_primary(state, &all)?;
+    let first = &state.monitors[*all.first()?];
+    let common = |width: i32, height: i32| {
+        all.iter().all(|&i| {
+            state.monitors[i]
+                .modes
+                .iter()
+                .any(|m| m.width == width && m.height == height)
+        })
+    };
+    let (width, height) = first
+        .modes
+        .iter()
+        .filter(|m| common(m.width, m.height))
+        .map(|m| (m.width, m.height))
+        .fold((0, 0), |best, (w, h)| {
+            if i64::from(best.0) * i64::from(best.1) < i64::from(w) * i64::from(h) {
+                (w, h)
+            } else {
+                best
+            }
+        });
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let order: Vec<usize> = std::iter::once(primary)
+        .chain(all.iter().copied().filter(|&i| i != primary))
+        .collect();
+    let scale = order
+        .iter()
+        .map(|&i| switch_scale(&state.monitors[i]))
+        .fold(1.0, f64::max);
+    let monitors = order
+        .iter()
+        .filter_map(|&i| {
+            let monitor = &state.monitors[i];
+            let mode = monitor
+                .modes
+                .iter()
+                .find(|m| m.width == width && m.height == height)?;
+            Some(MonitorConfig {
+                spec: monitor.spec.clone(),
+                mode: Some(*mode),
+            })
+        })
+        .collect();
+    let logical = vec![LogicalMonitorConfig {
+        x: 0,
+        y: 0,
+        scale,
+        transform: 0,
+        primary: true,
+        monitors,
+    }];
+    Some(switch_finish(state, &order, logical))
+}
+
+/// `meta_monitor_config_manager_create_for_switch_config`: the layout
+/// GNOME's switch-monitor popup applies for `kind`, or `None` when the
+/// monitors cannot be switched or none matches (Built-in Only without a
+/// panel).
+pub fn switch_config(state: &DisplayState, kind: SwitchConfig) -> Option<MonitorsConfig> {
+    if !can_switch(state) {
+        return None;
+    }
+    match kind {
+        SwitchConfig::AllMirror => switch_mirror(state),
+        SwitchConfig::AllLinear => switch_linear(state, |_| true),
+        SwitchConfig::External => switch_linear(state, |m| !m.builtin),
+        SwitchConfig::Builtin => switch_linear(state, |m| m.builtin),
+    }
+}
+
 /// Mutter's current configuration and its history
 /// (`MetaMonitorConfigManager`), plus the pending confirmation of a
 /// persistent change (`persistent_timeout_id`).
@@ -1841,5 +2038,193 @@ mod tests {
         assert!(linear
             .iter()
             .all(|l| l.enabled.as_ref().unwrap().scale == 1.0));
+    }
+
+    /// A laptop panel (primary, 1920x1080) and a larger external monitor.
+    fn laptop_and_external() -> DisplayState {
+        let mut state = two_monitors();
+        state.monitors[0].builtin = true;
+        state.monitors[1].modes = vec![mode(2560, 1440, 60.0), mode(1920, 1080, 60.0)];
+        state.logical[1].x = 1920;
+        state
+    }
+
+    /// Per switch configuration: each logical monitor as
+    /// (position, primary, connectors with modes), then the disabled ones.
+    type SwitchSummary = (Vec<((i32, i32), bool, Vec<(String, String)>)>, Vec<String>);
+
+    fn switched(state: &DisplayState, kind: SwitchConfig) -> Option<SwitchSummary> {
+        let config = switch_config(state, kind)?;
+        // Whatever the popup applies must pass ApplyMonitorsConfig's checks.
+        let requested: Vec<LogicalRequest> = config
+            .logical
+            .iter()
+            .map(|l| LogicalRequest {
+                x: l.x,
+                y: l.y,
+                scale: l.scale,
+                transform: l.transform,
+                primary: l.primary,
+                monitors: l
+                    .monitors
+                    .iter()
+                    .map(|m| MonitorRequest {
+                        connector: m.spec.connector.clone(),
+                        mode_id: m.mode.unwrap().id(),
+                        underscanning: None,
+                        color_mode: None,
+                    })
+                    .collect(),
+            })
+            .collect();
+        assert_eq!(
+            verify(state, state.serial, None, &requested).as_ref(),
+            Ok(&config),
+            "{kind:?} must verify as ApplyMonitorsConfig would"
+        );
+        Some((
+            config
+                .logical
+                .iter()
+                .map(|l| {
+                    (
+                        (l.x, l.y),
+                        l.primary,
+                        l.monitors
+                            .iter()
+                            .map(|m| (m.spec.connector.clone(), m.mode.unwrap().id()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            config
+                .disabled
+                .iter()
+                .map(|s| s.connector.clone())
+                .collect(),
+        ))
+    }
+
+    fn shown(connector: &str, mode: &str) -> (String, String) {
+        (connector.to_owned(), mode.to_owned())
+    }
+
+    /// GNOME's switch-monitor popup (switchMonitor.js) applies mutter's
+    /// `create_for_switch_config`: mirror at the largest common
+    /// resolution, join side by side from the primary, external only,
+    /// built-in only (meta-monitor-config-manager.c).
+    #[test]
+    fn switch_monitor_layouts_follow_mutter() {
+        let state = laptop_and_external();
+        assert!(can_switch(&state) && has_builtin(&state));
+        assert_eq!(
+            switched(&state, SwitchConfig::AllMirror),
+            Some((
+                vec![(
+                    (0, 0),
+                    true,
+                    vec![
+                        shown("eDP-1", "1920x1080@60.000"),
+                        shown("HDMI-A-1", "1920x1080@60.000")
+                    ]
+                )],
+                vec![]
+            ))
+        );
+        assert_eq!(
+            switched(&state, SwitchConfig::AllLinear),
+            Some((
+                vec![
+                    ((0, 0), true, vec![shown("eDP-1", "1920x1080@60.000")]),
+                    (
+                        (1920, 0),
+                        false,
+                        vec![shown("HDMI-A-1", "2560x1440@60.000")]
+                    ),
+                ],
+                vec![]
+            ))
+        );
+        assert_eq!(
+            switched(&state, SwitchConfig::External),
+            Some((
+                vec![((0, 0), true, vec![shown("HDMI-A-1", "2560x1440@60.000")])],
+                vec!["eDP-1".to_owned()]
+            ))
+        );
+        assert_eq!(
+            switched(&state, SwitchConfig::Builtin),
+            Some((
+                vec![((0, 0), true, vec![shown("eDP-1", "1920x1080@60.000")])],
+                vec!["HDMI-A-1".to_owned()]
+            ))
+        );
+        // The system primary leads the join, wherever it sits now.
+        let mut external_primary = state.clone();
+        external_primary.logical[0].primary = false;
+        external_primary.logical[1].primary = true;
+        assert_eq!(
+            switched(&external_primary, SwitchConfig::AllLinear),
+            Some((
+                vec![
+                    ((0, 0), true, vec![shown("HDMI-A-1", "2560x1440@60.000")]),
+                    ((2560, 0), false, vec![shown("eDP-1", "1920x1080@60.000")]),
+                ],
+                vec![]
+            ))
+        );
+        // A switched-off monitor still takes part in joining and mirroring.
+        let mut off = state.clone();
+        off.monitors[1].current = None;
+        off.logical.truncate(1);
+        assert_eq!(switched(&off, SwitchConfig::AllLinear).unwrap().0.len(), 2);
+    }
+
+    #[test]
+    fn switch_monitor_needs_two_monitors_a_panel_and_a_common_mode() {
+        let mut state = laptop_and_external();
+        // Mirroring needs a resolution every monitor offers.
+        state.monitors[1].modes = vec![mode(2560, 1440, 60.0)];
+        assert_eq!(switch_config(&state, SwitchConfig::AllMirror), None);
+        assert!(switch_config(&state, SwitchConfig::AllLinear).is_some());
+        // Without a built-in panel there is nothing for Built-in Only.
+        let mut desktop = laptop_and_external();
+        desktop.monitors[0].builtin = false;
+        assert!(!has_builtin(&desktop));
+        assert_eq!(switch_config(&desktop, SwitchConfig::Builtin), None);
+        // One monitor cannot be switched (can_switch_config).
+        let mut single = laptop_and_external();
+        single.monitors.truncate(1);
+        single.logical.truncate(1);
+        assert!(!can_switch(&single));
+        for kind in [
+            SwitchConfig::AllMirror,
+            SwitchConfig::AllLinear,
+            SwitchConfig::External,
+            SwitchConfig::Builtin,
+        ] {
+            assert_eq!(switch_config(&single, kind), None, "{kind:?}");
+        }
+    }
+
+    /// Mirroring takes the largest of the monitors' preferred scales
+    /// (`best_scale`, never below 1), and joined monitors advance by their
+    /// own scaled width.
+    #[test]
+    fn switch_monitor_scales_follow_the_preferred_modes() {
+        let mut state = laptop_and_external();
+        state.monitors[0].width_mm = 290;
+        state.monitors[0].height_mm = 170;
+        let laptop_scale = f64::from(calculate_scale(&state.monitors[0].modes[0], 290, 170));
+        assert!(laptop_scale > 1.0, "the fixture needs a HiDPI panel");
+        let mirror = switch_config(&state, SwitchConfig::AllMirror).unwrap();
+        assert_eq!(mirror.logical[0].scale, laptop_scale);
+        let join = switch_config(&state, SwitchConfig::AllLinear).unwrap();
+        assert_eq!(join.logical[0].scale, laptop_scale);
+        assert_eq!(
+            join.logical[1].x,
+            (1920.0 / laptop_scale).round() as i32,
+            "the next monitor starts after the laptop's logical width"
+        );
     }
 }

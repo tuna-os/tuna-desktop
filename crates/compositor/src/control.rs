@@ -335,6 +335,8 @@ pub struct Session<'a> {
     shortcut_consent: Vec<(u64, bool)>,
     /// Display-change dialog answers (`true` keeps), drained by the hub.
     display_change: Vec<bool>,
+    /// Switch-monitor popup choices, drained by the hub.
+    switch_monitor: Vec<tuna_shell_control::MonitorSwitchConfig>,
     /// Latest `SetOverviewSearch` from the shell, drained by the hub.
     overview_search: Option<bool>,
     /// Latest `SetOverviewAppGrid` from the shell, drained by the hub.
@@ -466,6 +468,7 @@ impl<'a> Session<'a> {
             window_actions: Vec::new(),
             shortcut_consent: Vec::new(),
             display_change: Vec::new(),
+            switch_monitor: Vec::new(),
             overview_search: None,
             overview_app_grid: None,
             unlock_request: None,
@@ -702,6 +705,19 @@ impl<'a> Session<'a> {
         }
         self.conn
             .write_frame(&Message::SeatTouchMode { touch_mode })
+    }
+
+    /// Send what GNOME's switch-monitor popup reads (#1195). Peers older
+    /// than 0.56 cannot decode it and receive nothing.
+    pub fn send_monitor_switch(&mut self, state: MonitorSwitchState) -> Result<(), ControlError> {
+        if self.peer_minor < 56 {
+            return Ok(());
+        }
+        self.conn.write_frame(&Message::MonitorSwitch {
+            can_switch: state.can_switch,
+            has_builtin: state.has_builtin,
+            current: state.current,
+        })
     }
 
     /// Send where the overview's window previews sit.
@@ -1111,6 +1127,19 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
+                kind: CommandKind::SwitchMonitor { config },
+            } => {
+                if !self.locked.get() {
+                    self.switch_monitor.push(config);
+                }
+                self.conn.write_frame(&Message::CommandResult {
+                    id,
+                    status: CommandStatus::Applied,
+                })?;
+                Ok(Handled::CommandResult { id, applied: true })
+            }
+            Message::Command {
+                id,
                 kind:
                     CommandKind::RequestPadOsd {
                         target,
@@ -1344,6 +1373,7 @@ impl<'a> Session<'a> {
             | Message::OverviewSwipe { .. }
             | Message::ShowCloseDialog { .. }
             | Message::HideCloseDialog { .. }
+            | Message::MonitorSwitch { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
                     kind: ErrorKind::UnknownCommand,
@@ -1407,6 +1437,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::OverviewSwipe { .. } => "OverviewSwipe",
         Message::ShowCloseDialog { .. } => "ShowCloseDialog",
         Message::HideCloseDialog { .. } => "HideCloseDialog",
+        Message::MonitorSwitch { .. } => "MonitorSwitch",
     }
 }
 
@@ -1578,6 +1609,7 @@ fn apply_command(
         | CommandKind::WindowAction { .. }
         | CommandKind::ShortcutConsent { .. }
         | CommandKind::CompleteDisplayChange { .. }
+        | CommandKind::SwitchMonitor { .. }
         | CommandKind::BeginVerification { .. }
         | CommandKind::AnswerQuery { .. }
         | CommandKind::CancelVerification
@@ -1658,6 +1690,8 @@ pub struct PollOutcome {
     pub shortcut_consent: Vec<(u64, bool)>,
     /// Display-change dialog answers (`true` = Keep Changes), in order.
     pub display_change: Vec<bool>,
+    /// Switch-monitor choices (#1195), in order.
+    pub switch_monitor: Vec<tuna_shell_control::MonitorSwitchConfig>,
     /// Admitted pad OSD requests (pad id, edition mode), in order.
     pub pad_osd_requests: Vec<(u32, bool)>,
     /// Pad OSDs the shell closed, in order.
@@ -1689,6 +1723,19 @@ pub struct OskBroadcast {
     pub show: bool,
     /// Touch-mode auto-show.
     pub touch_auto: bool,
+}
+
+/// What GNOME's switch-monitor popup reads from mutter's monitor manager
+/// (`Message::MonitorSwitch`, #1195). The default is what a shell assumes
+/// before any message: nothing to switch.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorSwitchState {
+    /// `can_switch_config`: more than one available monitor.
+    pub can_switch: bool,
+    /// `has_builtin_panel`.
+    pub has_builtin: bool,
+    /// `get_switch_config`: `None` when any other configuration is in effect.
+    pub current: Option<tuna_shell_control::MonitorSwitchConfig>,
 }
 
 /// Peers accepted but not yet handshaken are capped so a same-user
@@ -1826,6 +1873,10 @@ pub struct ControlHub {
     /// value every live session holds (#502).
     touch_mode: bool,
     touch_mode_sent: Option<bool>,
+    /// What the switch-monitor popup reads, as last set by the runtime,
+    /// and the value every live session holds (#1195).
+    monitor_switch: MonitorSwitchState,
+    monitor_switch_sent: Option<MonitorSwitchState>,
     /// Output inventory last handed to [`set_outputs`](Self::set_outputs)
     /// (multi-monitor): the runtime refreshes this every tick from the
     /// compositor's tracking, and [`poll`](Self::poll) broadcasts it
@@ -1925,6 +1976,8 @@ impl ControlHub {
             // No touch-mode is what a shell assumes before any message.
             touch_mode: false,
             touch_mode_sent: Some(false),
+            monitor_switch: MonitorSwitchState::default(),
+            monitor_switch_sent: Some(MonitorSwitchState::default()),
             outputs: Vec::new(),
             native_outputs: Vec::new(),
             pointer_output: None,
@@ -2073,6 +2126,7 @@ impl ControlHub {
             || !self.switcher_queue.is_empty()
             || self.osk_sent != Some(self.osk)
             || self.touch_mode_sent != Some(self.touch_mode)
+            || self.monitor_switch_sent != Some(self.monitor_switch)
             || !self.accelerator_queue.is_empty()
             || !self.menu_queue.is_empty()
             || self.sessions.iter().any(|s| s.owes_deltas(model));
@@ -2142,6 +2196,12 @@ impl ControlHub {
     /// [`poll`](Self::poll) broadcasts a change.
     pub fn set_seat_touch_mode(&mut self, touch_mode: bool) {
         self.touch_mode = touch_mode;
+    }
+
+    /// Refresh what the switch-monitor popup reads (#1195); the next
+    /// [`poll`](Self::poll) broadcasts a change.
+    pub fn set_monitor_switch(&mut self, state: MonitorSwitchState) {
+        self.monitor_switch = state;
     }
 
     /// Set the session environment (#59); the next [`poll`](Self::poll)
@@ -2445,6 +2505,9 @@ impl ControlHub {
                         .display_change
                         .extend(std::mem::take(&mut session.display_change));
                     outcome
+                        .switch_monitor
+                        .extend(std::mem::take(&mut session.switch_monitor));
+                    outcome
                         .pad_osd_requests
                         .extend(std::mem::take(&mut session.pad_osd_requests));
                     outcome
@@ -2661,6 +2724,17 @@ impl ControlHub {
                 self.touch_mode_sent = Some(self.touch_mode);
             }
         }
+        if self.monitor_switch_sent != Some(self.monitor_switch) {
+            let mut all_sent = true;
+            for session in &mut self.sessions {
+                if session.send_monitor_switch(self.monitor_switch).is_err() {
+                    all_sent = false;
+                }
+            }
+            if all_sent {
+                self.monitor_switch_sent = Some(self.monitor_switch);
+            }
+        }
         if self.outputs != self.outputs_sent {
             let mut all_sent = true;
             for session in &mut self.sessions {
@@ -2773,6 +2847,9 @@ impl ControlHub {
                 }
                 if self.touch_mode {
                     let _ = session.send_seat_touch_mode(true);
+                }
+                if self.monitor_switch != MonitorSwitchState::default() {
+                    let _ = session.send_monitor_switch(self.monitor_switch);
                 }
                 if self.pointer_output.is_some() {
                     let _ = session.send_window_menu(&Message::PointerOutput {

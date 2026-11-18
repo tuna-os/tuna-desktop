@@ -841,6 +841,9 @@ pub struct Runtime {
     /// Mutter's current configuration, its history and the pending
     /// confirmation of a persistent change.
     display_configs: crate::display_config::ConfigManager,
+    /// GNOME's switch-monitor choice in effect (`current_switch_config`):
+    /// `None` once another configuration is.
+    switch_config: Option<crate::display_config::SwitchConfig>,
     capture_authority: crate::capture_security::Authority,
     cast_grants: std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     remote_held: std::collections::HashMap<u64, RemoteHeld>,
@@ -1610,6 +1613,7 @@ impl Runtime {
             display_share,
             display_published: None,
             display_configs: Default::default(),
+            switch_config: None,
             capture_authority,
             cast_grants: Default::default(),
             remote_held: Default::default(),
@@ -5404,6 +5408,12 @@ impl Runtime {
         // GNOME Shell's "Keep these display settings?" answer (#340).
         for keep in outcome.display_change {
             self.complete_display_change(keep);
+        }
+        // The switch-monitor popup's choices (#1195).
+        for config in outcome.switch_monitor {
+            if !self.is_locked() {
+                self.switch_monitor(config);
+            }
         }
         // The shell's pad OSD (P-IN-05): shown on request, closed by it.
         for (pad, edition_mode) in outcome.pad_osd_requests {

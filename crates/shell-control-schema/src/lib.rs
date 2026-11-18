@@ -227,9 +227,14 @@ impl ProtocolVersion {
     /// `HideCloseDialog`, and the shell-to-compositor `RespondCloseDialog`
     /// (gnome-shell's Force Quit / Wait). Positional postcard peers must
     /// ship together.
+    /// `0.56` appends GNOME's switch-monitor popup (#1195): the
+    /// shell-to-compositor `SwitchMonitor` command and the
+    /// compositor-to-shell `MonitorSwitch` state (can switch, built-in
+    /// panel present, switch configuration in effect). Positional
+    /// postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 50,
+        minor: 56,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -530,6 +535,25 @@ pub enum CommandKind {
         window: WindowId,
         response: CloseDialogResponse,
     },
+    /// Since 0.56: the switch-monitor popup's choice
+    /// (`MonitorManager.switch_config`, gnome-shell 51
+    /// `switchMonitor.js _finish`): the compositor builds and applies
+    /// mutter's layout for it as a temporary display configuration.
+    /// Denied while locked or when the monitors cannot be switched.
+    SwitchMonitor { config: MonitorSwitchConfig },
+}
+
+/// mutter 51 `MetaMonitorSwitchConfigType`, in its order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MonitorSwitchConfig {
+    /// `ALL_MIRROR`: every monitor shows the same picture.
+    AllMirror,
+    /// `ALL_LINEAR`: every monitor side by side.
+    AllLinear,
+    /// `EXTERNAL`: only the external monitors, side by side.
+    External,
+    /// `BUILTIN`: only the built-in panel.
+    Builtin,
 }
 
 /// mutter 51 `MetaCloseDialogResponse`: what the user chose in the dialog
@@ -1191,6 +1215,19 @@ pub enum Message {
     /// (`meta_window_set_alive (TRUE)`), went away, left the screen, or
     /// the session locked. Sent only to peers advertising minor >= 50.
     HideCloseDialog { window: WindowId },
+    /// Since 0.56: what GNOME's switch-monitor popup (`switchMonitor.js`)
+    /// reads from mutter's monitor manager: `can_switch`
+    /// (`meta_monitor_manager_can_switch_config`: more than one available
+    /// monitor), `has_builtin` (`has_builtin_panel`, which adds External
+    /// Only and Built-in Only) and `current` (`get_switch_config`: the
+    /// switch configuration in effect, `None` for any other). Sent on
+    /// connect and whenever it changes, only to peers advertising minor
+    /// >= 56.
+    MonitorSwitch {
+        can_switch: bool,
+        has_builtin: bool,
+        current: Option<MonitorSwitchConfig>,
+    },
 }
 
 /// [`Message::WorkspaceProgress`] positions are workspace indices times
@@ -2429,6 +2466,7 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
             }
         }
         Message::HideCloseDialog { .. } => {}
+        Message::MonitorSwitch { .. } => {}
     }
     Ok(())
 }
@@ -2647,11 +2685,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_50() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 50));
-        // A 0.49 shell still negotiates; a newer minor does not.
-        assert!(ProtocolVersion::new(0, 49).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 51).is_compatible_with(&CURRENT_VERSION));
+    fn current_version_is_0_56() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 56));
+        // A 0.55 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 55).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 57).is_compatible_with(&CURRENT_VERSION));
     }
 
     #[test]
@@ -4213,6 +4251,60 @@ mod close_dialog_wire_tests {
             );
             let command = Message::Command { id: 11, kind };
             assert_eq!(decode_frame(&encode_frame(&command)).unwrap(), command);
+        }
+    }
+}
+
+#[cfg(test)]
+mod monitor_switch_wire_tests {
+    use super::*;
+
+    #[test]
+    fn monitor_switch_follows_the_close_dialog_and_roundtrips() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 64];
+        let hide =
+            tag(postcard::to_slice(&Message::HideCloseDialog { window: 1 }, &mut buffer).unwrap());
+        let state = Message::MonitorSwitch {
+            can_switch: true,
+            has_builtin: true,
+            current: Some(MonitorSwitchConfig::External),
+        };
+        assert_eq!(
+            tag(postcard::to_slice(&state, &mut buffer).unwrap()),
+            hide + 1
+        );
+        let respond = tag(postcard::to_slice(
+            &CommandKind::RespondCloseDialog {
+                window: 1,
+                response: CloseDialogResponse::Wait,
+            },
+            &mut buffer,
+        )
+        .unwrap());
+        for config in [
+            MonitorSwitchConfig::AllMirror,
+            MonitorSwitchConfig::AllLinear,
+            MonitorSwitchConfig::External,
+            MonitorSwitchConfig::Builtin,
+        ] {
+            let kind = CommandKind::SwitchMonitor { config };
+            assert_eq!(
+                tag(postcard::to_slice(&kind, &mut buffer).unwrap()),
+                respond + 1
+            );
+            let command = Message::Command { id: 3, kind };
+            assert_eq!(decode_frame(&encode_frame(&command)).unwrap(), command);
+        }
+        for message in [
+            state,
+            Message::MonitorSwitch {
+                can_switch: false,
+                has_builtin: false,
+                current: None,
+            },
+        ] {
+            assert_eq!(decode_frame(&encode_frame(&message)).unwrap(), message);
         }
     }
 }

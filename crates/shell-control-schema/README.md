@@ -51,6 +51,12 @@ before decoding.
   lock). The shell answers `CommandKind::RespondCloseDialog { window,
   response }` with `CloseDialogResponse::ForceClose` or `Wait`. Texts are
   bounded by `MAX_TITLE_LEN`, sides by `MAX_CLOSE_DIALOG_SIDE`.
+- Switch monitor (0.56): `Message::MonitorSwitch { can_switch,
+  has_builtin, current }` (peers >=56 only) is what GNOME's switch-monitor
+  popup reads from mutter (`can_switch_config`, `has_builtin_panel`,
+  `get_switch_config`), sent on connect and on change; the shell answers
+  `CommandKind::SwitchMonitor { config: MonitorSwitchConfig }` and the
+  compositor applies mutter's layout for it as a temporary configuration.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
   `ErrorKind`.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,

@@ -658,14 +658,26 @@ pub fn power_mode_checked(profile: &str) -> bool {
     profile != BALANCED
 }
 
-/// Profile a Power Mode tile click switches to: back to balanced when
-/// checked, else to power saver (GNOME's quick toggle shape).
-pub fn power_mode_after_click(profile: &str) -> &'static str {
+/// `last-selected-power-profile`'s schema default (GNOME's
+/// `org.gnome.shell` key): what the tile switches to until the user has
+/// picked another non-balanced profile.
+pub const LAST_SELECTED_DEFAULT: &str = "power-saver";
+
+/// Profile a Power Mode tile click switches to (powerProfiles.js
+/// `clicked`): back to balanced when checked, else the last non-balanced
+/// profile the user had active.
+pub fn power_mode_after_click(profile: &str, last_selected: &str) -> String {
     if power_mode_checked(profile) {
-        BALANCED
+        BALANCED.to_owned()
     } else {
-        "power-saver"
+        last_selected.to_owned()
     }
+}
+
+/// The profile to remember in `last-selected-power-profile` after the
+/// daemon reports `profile` (powerProfiles.js `_sync`): any checked one.
+pub fn power_mode_remembered(profile: &str) -> Option<&str> {
+    power_mode_checked(profile).then_some(profile)
 }
 
 /// Alt+Tab icon size (altTab.js `_setIconSize`): the largest of 96, 64,
@@ -735,21 +747,25 @@ pub fn time_span(seconds: u64) -> String {
     }
 }
 
-/// Icon for a power profile, as GNOME's Power Mode toggle shows it.
+/// Icon for a power profile, as GNOME's Power Mode toggle shows it
+/// (`PROFILE_PARAMS`, else `FALLBACK_PARAMS`).
 pub fn power_mode_icon(profile: &str) -> &'static str {
     match profile {
         "power-saver" => "power-profile-power-saver-symbolic",
         "performance" => "power-profile-performance-symbolic",
-        _ => "power-profile-balanced-symbolic",
+        "balanced" => "power-profile-balanced-symbolic",
+        _ => "gnome-power-manager-symbolic",
     }
 }
 
-/// Tile subtitle for a power profile, in GNOME's words.
+/// Tile subtitle for a power profile, in GNOME's words: the active
+/// profile's name, `Custom` for one the shell does not know.
 pub fn power_mode_label(profile: &str) -> &'static str {
     match profile {
         "power-saver" => "Power Saver",
         "performance" => "Performance",
-        _ => "Balanced",
+        "balanced" => "Balanced",
+        _ => "Custom",
     }
 }
 
@@ -820,11 +836,36 @@ mod service_tests {
         assert!(!power_mode_checked("balanced"));
         assert!(power_mode_checked("power-saver"));
         assert!(power_mode_checked("performance"));
-        assert_eq!(power_mode_after_click("balanced"), "power-saver");
-        assert_eq!(power_mode_after_click("power-saver"), "balanced");
-        assert_eq!(power_mode_after_click("performance"), "balanced");
         assert_eq!(power_mode_label("power-saver"), "Power Saver");
-        assert_eq!(power_mode_label("unknown"), "Balanced");
+        assert_eq!(power_mode_label("balanced"), "Balanced");
+        // powerProfiles.js FALLBACK_PARAMS: a profile the shell does not know.
+        assert_eq!(power_mode_label("unknown"), "Custom");
+        assert_eq!(power_mode_icon("unknown"), "gnome-power-manager-symbolic");
+    }
+
+    #[test]
+    fn power_mode_click_returns_to_the_last_non_balanced_profile() {
+        // Balanced -> the key's value; any other profile -> balanced.
+        assert_eq!(
+            power_mode_after_click("balanced", "performance"),
+            "performance"
+        );
+        assert_eq!(
+            power_mode_after_click("balanced", LAST_SELECTED_DEFAULT),
+            "power-saver"
+        );
+        assert_eq!(
+            power_mode_after_click("performance", "performance"),
+            "balanced"
+        );
+        assert_eq!(
+            power_mode_after_click("power-saver", "performance"),
+            "balanced"
+        );
+        // Only checked (non-balanced) profiles are remembered.
+        assert_eq!(power_mode_remembered("performance"), Some("performance"));
+        assert_eq!(power_mode_remembered("power-saver"), Some("power-saver"));
+        assert_eq!(power_mode_remembered("balanced"), None);
     }
 
     #[test]
