@@ -510,7 +510,8 @@ def inventory():
                          | {k: state.get(k) for k in ("overview_open", "pointer_position",
                                                       "native_relative_motion_count", "input_devices",
                                                       "mouse_left_handed", "touchpad_left_handed",
-                                                      "hot_corners", "auth_owner", "power_save_mode")},
+                                                      "hot_corners", "auth_owner", "power_save_mode",
+                                                      "sleep_delay")},
                 "processes": sorted(processes, key=lambda item: item["pid"])}
     except Exception as error:
         error.inventory_stage = stage
@@ -3131,6 +3132,11 @@ print(json.dumps(result))
         result = {"session": session,
                   "locked_hint": call("loginctl", "show-session", session, "--property=LockedHint",
                                       "--value")}
+    elif action == "sleep-inhibitors":
+        # logind's inhibitors, the rows `systemd-inhibit --list` prints,
+        # with that listing as evidence.
+        result = {"inhibitors": logind_inhibitors(),
+                  "listing": call("systemd-inhibit", "--list", "--no-pager", check=False)[-16384:]}
     elif action in ("lock-session", "unlock-session"):
         # The session owner's own loginctl, as typed in a terminal: logind
         # authorizes the owner and emits Lock/Unlock on the session object.

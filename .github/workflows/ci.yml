@@ -25,6 +25,15 @@ concurrency:
 permissions:
   contents: read
 
+# A stalled HTTPS transfer aborts instead of hanging until the job timeout.
+# On the karnataka pool, actions/checkout's fetch (even --depth=1) has sat
+# with no progress for 10-45 min until timeout-minutes cancelled the job
+# (runs 44281412108, 44239288863, 44154536425, ...), which failed ci-gate.
+# git aborts a transfer below 1 KiB/s for 60 s; checkout then retries it.
+env:
+  GIT_HTTP_LOW_SPEED_LIMIT: "1024"
+  GIT_HTTP_LOW_SPEED_TIME: "60"
+
 jobs:
   select-lanes:
     timeout-minutes: 10

@@ -146,13 +146,7 @@ All landing candidates need review of the actual final tree, DCO sign-off, and s
 - Performance versus GNOME: #503 and #315; #719 is an implemented optimization and #547 is the landed regression gate, while the performance outcome remains open.
 - Provenance and images: current package/image qualification for every variant or an unsupported disposition; Marlin remains the comparison platform.
 - Release checklist: publish additional beta tags only from qualified main under ADR 0008. GA has no promised calendar date before [v1](v1.md) and the global gates pass; this refresh does not invent a Q4 commitment.
-
-### Far-future backlog (post-1.0, not scheduled)
-
-- High-performance GDM replacement: a from-scratch login experience
-  matching GDM (fingerprint, smartcard, a11y, i18n, session handoff)
-  without the GNOME weight. Deferred: the greeter moves to stock GDM
-  for v1, which already provides all of the above.
+- Login screen: Tuna greeter on GDM's daemon, replacing the GNOME Shell greeter on every variant ([ADR 0008](adr/0008-v1-beta-track-and-release-scope.md) item 6, epic [#1164](https://github.com/tuna-os/tuna-desktop/issues/1164), ledger P-LK-03).
 
 ## Spek and plan registry
 

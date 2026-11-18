@@ -72,7 +72,7 @@ and this page together.
 | wp_fractional_scale_manager_v1 | 1 | preferred scale 1 until #59 |
 | wp_single_pixel_buffer_manager_v1 | 1 | |
 | wp_cursor_shape_manager_v1 | 2 | shapes accepted; the compositor cursor is still the default arrow |
-| zwp_idle_inhibit_manager_v1 | 1 | a live inhibitor holds off the idle lock |
+| zwp_idle_inhibit_manager_v1 | 1 | an inhibitor holds off the idle lock while its surface is mapped and on screen: one on an unmapped surface, a window that never drew, a hidden or occluded window or one off every output lapses, as the protocol says |
 | zwp_text_input_manager_v3 | 1 | text fields reach the input method (#60) |
 | zwp_input_method_manager_v2 | 1 | private to the compositor-supervised IBus connection, using the same server-owned transport authorization as virtual keyboard; ordinary applications cannot discover or force-bind it. This is not a public GNOME IME API. One exact live input-method resource owns the seat; unavailable objects and their inert child IDs cannot type, observe surrounding text, reserve popup roles, take grabs or retire the owner |
 | zwp_pointer_gestures_v1 | 3 | swipes reach apps; three-finger swipes are the shell's (overview, workspaces) |

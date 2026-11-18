@@ -157,6 +157,55 @@ def auth_uint(value):
     return type(value) is int and 0 < value <= (1 << 64) - 1
 
 
+# The compositor's logind sleep delay inhibitor (G3), as GNOME 51's screen
+# shield holds "GNOME Shell"'s while the session is unlocked.
+SLEEP_DELAY_WHO = "Tuna Desktop"
+SLEEP_DELAY_COUNTS = ("prepared", "released_locked", "released_unlocked", "overrun")
+
+
+def sleep_delay_inhibitor(rows, compositor_pid, uid):
+    """The compositor's own `delay` inhibitor on sleep among logind's
+    ListInhibitors rows (what `systemd-inhibit --list` prints), or None."""
+    for row in rows if type(rows) is list else ():
+        if (type(row) is dict and row.get("who") == SLEEP_DELAY_WHO and row.get("mode") == "delay"
+                and "sleep" in str(row.get("what", "")).split(":")
+                and row.get("pid") == compositor_pid and row.get("uid") == uid):
+            return row
+    return None
+
+
+def sleep_delay_record(value):
+    """A compositor `sleep_delay` snapshot record, or None if malformed."""
+    if (type(value) is not dict or type(value.get("held")) is not bool
+            or not all(type(value.get(key)) is int and value[key] >= 0 for key in SLEEP_DELAY_COUNTS)):
+        return None
+    return value
+
+
+def sleep_delay_held(snapshot, rows):
+    """Before suspending: an unlocked desktop whose compositor records its
+    delay inhibitor held, and logind lists it for that compositor's PID."""
+    state = snapshot.get("state") if type(snapshot) is dict else None
+    if type(state) is not dict or state.get("locked") is not False:
+        return False
+    record = sleep_delay_record(state.get("sleep_delay"))
+    compositors = [p.get("pid") for p in snapshot.get("processes") or () if p.get("executable") == "tuna-compositor"]
+    return (record is not None and record["held"] and len(compositors) == 1
+            and sleep_delay_inhibitor(rows, compositors[0], snapshot.get("session_uid")) is not None)
+
+
+def sleep_delay_released_locked(before, after):
+    """One sleep from an unlocked desktop whose delay inhibitor, held before
+    it, was released only once every lit output showed a locked frame, with
+    logind never giving up first; taken again after the wake."""
+    before, after = sleep_delay_record(before), sleep_delay_record(after)
+    if before is None or after is None:
+        return False
+    delta = {key: after[key] - before[key] for key in SLEEP_DELAY_COUNTS}
+    return (before["held"] and after["held"]
+            and delta == {"prepared": 1, "released_locked": 1, "released_unlocked": 0, "overrun": 0})
+
+
 def sleep_auth_attempt(snapshot):
     """Bind a pending original password attempt before real S3; no secret data."""
     state = snapshot.get('state', {})
@@ -2336,6 +2385,10 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
             record(test_id, False, "logind suspend never reached QEMU SUSPENDED; no pause substitute")
             raise RuntimeError("real suspend did not occur")
         suspended_frame = frame(f"{label}suspended")
+        # What QEMU's display holds while the guest sleeps (non-gating:
+        # virtio-gpu may show a placeholder rather than the last scanout).
+        log(f"{test_id}-SUSPENDED-FRAME observation (non-gating): varied lock mask="
+            f"{varied_mask(suspended_frame)}, desktop difference {difference(base_frame, suspended_frame):.2%}")
         wake_trace_offset = os.path.getsize(gpu_log) if os.path.exists(gpu_log) else 0
         with open(os.path.join(evidence, f"{label}gpu-trace-wake.json"), "w") as stream:
             json.dump({"log": os.path.basename(gpu_log), "offset": wake_trace_offset}, stream, indent=2)
@@ -2396,10 +2449,57 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
 
         return resumed
 
-    # Preserve the authorized single-S3 contract for this performance lane.
-    # It combines plain and stale-auth wake checks with a prelocked session;
-    # the main lifecycle lane separately qualified prepare-for-sleep locking
-    # from an unlocked desktop. Keep fresh GPU upload and client repaint gates.
+    # Suspend the UNLOCKED desktop (G3). As GNOME 51's screen shield, the
+    # compositor holds a logind sleep delay inhibitor while unlocked; on
+    # PrepareForSleep it locks and releases the inhibitor only once every lit
+    # output scanned out a locked frame, so the frame left at suspend is the
+    # lock. Its own record of that release is read back after the wake.
+    unlocked_state = inventory("sleep-delay-before")
+    delay_before = unlocked_state["state"].get("sleep_delay")
+    delay_listed = agent.run("sleep-inhibitors")
+    with open(os.path.join(evidence, "sleep-delay-before.json"), "w") as stream:
+        json.dump({"sleep_delay": delay_before, "logind": delay_listed}, stream, indent=2)
+    delay_held = (same_apps(before, unlocked_state)
+                  and sleep_delay_held(unlocked_state, delay_listed["inhibitors"]))
+    record("V-SLEEP-DELAY-INHIBITOR", delay_held,
+           "unlocked desktop: the compositor holds logind's 'Tuna Desktop' delay inhibitor on sleep, "
+           "listed by systemd-inhibit for the session user's compositor PID")
+    if not delay_held:
+        raise RuntimeError("no compositor sleep delay inhibitor on the unlocked desktop")
+    suspend_and_check("unlocked-", "V-SUSPEND-UNLOCKED")
+    delay_after = None
+    try:
+        retaken = await_state(lambda value: (sleep_delay_record(value["state"].get("sleep_delay")) or {}).get("held") is True,
+                              timeout=15, label="sleep-delay-retaken")
+        delay_after = retaken["state"]["sleep_delay"]
+    finally:
+        with open(os.path.join(evidence, "sleep-delay-after.json"), "w") as stream:
+            json.dump({"before": delay_before, "after": delay_after}, stream, indent=2)
+    locked_frame = sleep_delay_released_locked(delay_before, delay_after)
+    record("V-SUSPEND-LOCKED-FRAME", locked_frame,
+           "real S3 from the unlocked desktop: the compositor released its delay inhibitor only after every lit "
+           "output scanned out a locked frame, logind never overran InhibitDelayMaxUSec, and it was taken again on wake")
+    if not locked_frame:
+        raise RuntimeError(f"sleep delay not released on a presented lock: {delay_before} -> {delay_after}")
+    # The wake leaves the password prompt already open (lifecycle
+    # unlocked-first-resume.png), not the curtain, so a bare Enter submitted an
+    # empty password: PAM refused it and the typed answer landed while that
+    # attempt was pending (V-LIFECYCLE red since #1170). Escape returns an
+    # open prompt to the clock, as the prelocked path below does, so the Enter
+    # always raises the curtain and the typed password is the first answer.
+    qmp.keys("esc")
+    qmp.keys("ret")
+    time.sleep(1)
+    qmp.keys("ctrl", "a")
+    qmp.type_text("tuna")
+    qmp.keys("ret")
+    unlocked_again = await_state(lambda state: not state["state"]["locked"], timeout=15)
+    if not same_apps(before, unlocked_again):
+        raise RuntimeError("unlock after the unlocked-desktop suspend replaced the session")
+
+    # The second S3 keeps the stale-auth contract: it combines plain and
+    # stale-auth wake checks with a prelocked session. Keep fresh GPU upload
+    # and client repaint gates.
     # Admit an actual helper with a real delayed PAM stack before sleep.
     # Sleep must cancel and physically retire it without unlocking. The separate
     # controlled late-success epoch proof still tests queued accepted results.

@@ -3820,6 +3820,134 @@ class S3AbsoluteDeadline(unittest.TestCase):
         self.assertIn("no guest-exec", receipt["scope"])
 
 
+class SleepDelayGate(unittest.TestCase):
+    """G3: the unlocked desktop's logind sleep delay inhibitor, released
+    only once the lock showed on every output."""
+    UID = 1000
+    RECORD = {"held": True, "prepared": 0, "released_locked": 0,
+              "released_unlocked": 0, "overrun": 0}
+
+    def row(self, **changes):
+        return {"what": "sleep", "who": "Tuna Desktop", "why": "Tuna Desktop needs to lock the screen",
+                "mode": "delay", "uid": self.UID, "pid": 4242, **changes}
+
+    def snapshot(self, **state):
+        return {"session_uid": self.UID,
+                "state": {"locked": False, "sleep_delay": dict(self.RECORD), **state},
+                "processes": [{"pid": 4242, "executable": "tuna-compositor"},
+                              {"pid": 4300, "executable": "tuna-shell-gtk"}]}
+
+    def test_held_needs_the_unlocked_record_and_the_compositor_delay_row(self):
+        rows = [self.row(what="handle-power-key", mode="block", pid=77), self.row()]
+        self.assertTrue(lane.sleep_delay_held(self.snapshot(), rows))
+        self.assertTrue(lane.sleep_delay_held(self.snapshot(), [self.row(what="shutdown:sleep")]))
+        for name, snapshot, listed in (
+            ("locked", self.snapshot(locked=True), rows),
+            ("record released", self.snapshot(sleep_delay={**self.RECORD, "held": False}), rows),
+            ("published build without the record", self.snapshot(sleep_delay=None), rows),
+            ("malformed count", self.snapshot(sleep_delay={**self.RECORD, "overrun": True}), rows),
+            ("block mode", self.snapshot(), [self.row(mode="block")]),
+            ("not sleep", self.snapshot(), [self.row(what="shutdown")]),
+            ("other holder", self.snapshot(), [self.row(who="GNOME Shell")]),
+            ("other pid", self.snapshot(), [self.row(pid=4300)]),
+            ("other uid", self.snapshot(), [self.row(uid=0)]),
+            ("nothing listed", self.snapshot(), []),
+        ):
+            with self.subTest(name):
+                self.assertFalse(lane.sleep_delay_held(snapshot, listed))
+
+    def test_released_locked_needs_one_release_on_a_shown_lock_and_a_retaken_inhibitor(self):
+        after = {**self.RECORD, "prepared": 1, "released_locked": 1}
+        self.assertTrue(lane.sleep_delay_released_locked(self.RECORD, after))
+        for name, before, changed in (
+            ("logind overran the delay", self.RECORD, {**after, "overrun": 1}),
+            ("released unlocked", self.RECORD, {**after, "released_locked": 0, "released_unlocked": 1}),
+            ("never released", self.RECORD, {**after, "released_locked": 0}),
+            ("no sleep seen", self.RECORD, {**after, "prepared": 0}),
+            ("two sleeps", self.RECORD, {**after, "prepared": 2, "released_locked": 2}),
+            ("not taken again", self.RECORD, {**after, "held": False}),
+            ("not held before", {**self.RECORD, "held": False}, after),
+            ("missing record", self.RECORD, None),
+        ):
+            with self.subTest(name):
+                self.assertFalse(lane.sleep_delay_released_locked(before, changed))
+
+    def lifecycle_block(self):
+        source = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+        lifecycle = next(n for n in ast.parse(source.read_text()).body
+                         if isinstance(n, ast.FunctionDef) and n.name == "run_lifecycle")
+        body = lifecycle.body
+        start = next(i for i, n in enumerate(body) if "sleep-delay-before" in ast.dump(n))
+        end = next(i for i, n in enumerate(body) if i > start and "unlocked_again" in ast.dump(n)
+                   and isinstance(n, ast.If))
+        return source, body, start, end
+
+    def test_the_unlocked_desktop_suspends_before_the_prelocked_stale_auth_sleep(self):
+        _, body, start, end = self.lifecycle_block()
+        unlocked = next(i for i, n in enumerate(body) if "V-SUSPEND-UNLOCKED" in ast.dump(n))
+        prelocked = next(i for i, n in enumerate(body) if "delay-unlock" in ast.dump(n))
+        self.assertLess(start, unlocked)
+        self.assertLess(end, prelocked)
+
+    def run_block(self, before_state, after_state):
+        source, body, start, end = self.lifecycle_block()
+        events, records = [], {}
+        before = self.snapshot()
+        unlocked = {**before, "state": {**before["state"], "locked": False}}
+        def inventory(label):
+            events.append(("inventory", label))
+            return {**before, "state": {**before["state"], "sleep_delay": before_state}}
+        def await_state(predicate, timeout=15, label=None):
+            for state in ({**before, "state": {**before["state"], "locked": True, "sleep_delay": after_state}},
+                          unlocked):
+                if predicate(state):
+                    events.append(("await", label))
+                    return state
+            raise RuntimeError("state never observed")
+        agent = SimpleNamespace(run=lambda action: events.append(("agent", action))
+                                or {"inhibitors": [self.row()], "listing": "Tuna Desktop sleep delay"})
+        with tempfile.TemporaryDirectory() as tmp:
+            scope = dict(inventory=inventory, await_state=await_state, agent=agent, evidence=tmp,
+                         os=lane.os, json=json, before=before,
+                         same_apps=lambda old, new: old["processes"] == new["processes"],
+                         sleep_delay_held=lane.sleep_delay_held,
+                         sleep_delay_record=lane.sleep_delay_record,
+                         sleep_delay_released_locked=lane.sleep_delay_released_locked,
+                         record=lambda name, ok, detail: events.append(("record", name))
+                         or records.__setitem__(name, ok),
+                         suspend_and_check=lambda label, test_id: events.append(("suspend", test_id)),
+                         qmp=SimpleNamespace(keys=lambda *keys: events.append(("keys", keys)),
+                                             type_text=lambda text: events.append(("type", text))),
+                         time=SimpleNamespace(sleep=lambda _: None))
+            try:
+                exec(compile(ast.Module(body=body[start:end + 1], type_ignores=[]), str(source), "exec"), scope)
+            finally:
+                with open(os.path.join(tmp, "sleep-delay-before.json")) as stream:
+                    self.assertEqual(json.load(stream)["sleep_delay"], before_state)
+        return events, records
+
+    def test_lifecycle_gates_the_unlocked_suspend_on_the_delay_record(self):
+        after = {**self.RECORD, "prepared": 1, "released_locked": 1}
+        events, records = self.run_block(dict(self.RECORD), after)
+        self.assertEqual(records, {"V-SLEEP-DELAY-INHIBITOR": True, "V-SUSPEND-LOCKED-FRAME": True})
+        self.assertEqual(events[:4], [("inventory", "sleep-delay-before"), ("agent", "sleep-inhibitors"),
+                                      ("record", "V-SLEEP-DELAY-INHIBITOR"), ("suspend", "V-SUSPEND-UNLOCKED")])
+        self.assertIn(("type", "tuna"), events)
+        # The wake can leave the prompt open: Escape before the Enter that
+        # raises the curtain, or that Enter submits an empty password.
+        keys = [event for event in events if event[0] == "keys"]
+        self.assertEqual(keys[:2], [("keys", ("esc",)), ("keys", ("ret",))])
+
+    def test_no_inhibitor_means_no_suspend(self):
+        with self.assertRaisesRegex(RuntimeError, "no compositor sleep delay inhibitor"):
+            self.run_block({**self.RECORD, "held": False}, None)
+
+    def test_overrun_fails_the_locked_frame_gate(self):
+        after = {**self.RECORD, "prepared": 1, "overrun": 1}
+        with self.assertRaisesRegex(RuntimeError, "sleep delay not released on a presented lock"):
+            self.run_block(dict(self.RECORD), after)
+
+
 class ShippedSnapshotInventory(unittest.TestCase):
     # Run 37696030597: the graphical PAM login produced a real login
     # session, yet every inventory() probe failed because the published
@@ -3886,6 +4014,16 @@ class ShippedSnapshotInventory(unittest.TestCase):
         self.assertTrue(result["state"]["overview_open"])
         self.assertIsNone(result["state"]["pointer_position"])
         self.assertIsNone(result["state"]["native_relative_motion_count"])
+        self.assertIsNone(result["state"]["sleep_delay"])
+
+    def test_inventory_reports_the_compositor_sleep_delay_record(self):
+        uid = os.getuid()
+        record = {"held": True, "prepared": 0, "released_locked": 0,
+                  "released_unlocked": 0, "overrun": 0}
+        result = self.run_inventory({**self.SHIPPED_STATE, "sleep_delay": record}, [
+            ("3", f"{uid} tuna-test seat0 tty1"),
+        ])
+        self.assertEqual(result["state"]["sleep_delay"], record)
 
     def test_historical_archive_inventory_reports_actual_retired_executable(self):
         # Inventory reports archival identities verbatim; it does not qualify them.

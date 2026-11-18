@@ -921,6 +921,9 @@ pub struct Runtime {
     unlock_worker: Option<UnlockWorker>,
     unlock_quarantined: Option<crate::auth_owner::Attempt>,
     unlock_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// logind's sleep delay inhibitor, held until the lock shows (G3).
+    #[cfg(feature = "drm")]
+    sleep_delay: crate::sleep::Delay,
     /// The lock screen's password and fingerprint conversations (#366).
     auth: auth::Conversations,
     /// org.gnome.Mutter.IdleMonitor.
@@ -1620,6 +1623,8 @@ impl Runtime {
             unlock_worker: None,
             unlock_quarantined: None,
             unlock_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "drm")]
+            sleep_delay: crate::sleep::Delay::default(),
             auth: auth::Conversations::default(),
             idle_monitor: crate::idle_monitor::start(),
             session_manager: crate::session_manager::start(),
@@ -1844,6 +1849,43 @@ impl Runtime {
         }
     }
 
+    /// Surface trees on screen, each where it sits: what a frame draws,
+    /// less the windows nothing on screen shows (#503).
+    fn shown_surfaces(
+        &self,
+    ) -> Vec<(
+        smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        Point<i32, Logical>,
+    )> {
+        let clones_shown = self.overview_motion.progress() > 0.0
+            || !self.switcher_thumbnails.is_empty()
+            || !self.casts.is_empty();
+        let shown_ids = shown_ids(
+            &self.manager,
+            &self.frame_costs,
+            clones_shown,
+            self.is_locked(),
+        );
+        let hidden = hidden_surfaces(&self.manager, &shown_ids);
+        let mut shown =
+            crate::frame_timing::drawn_roots(&self.state, &self.manager, self.is_locked());
+        shown.retain(|(surface, _)| !hidden.contains(surface));
+        shown
+    }
+
+    /// logind's sleep delay (see [`crate::sleep`]): held while the session
+    /// owns its VT and may lock, and given up during a sleep once it is
+    /// locked and every lit output scans out a locked frame.
+    #[cfg(feature = "drm")]
+    fn sync_sleep_delay(&mut self, monitor: &crate::sleep::Monitor) {
+        let (active, shown) = match &self.backend {
+            Backend::Drm(drm) => (drm.active, self.is_locked() && drm.shows_locked()),
+            Backend::Winit(_) => (false, false),
+        };
+        let allowed = self.control.lock_screen_allowed();
+        self.sleep_delay.sync(monitor, active, allowed, shown);
+    }
+
     #[cfg(feature = "drm")]
     fn on_session_event(&mut self, event: smithay::backend::session::Event) {
         let activated = matches!(event, smithay::backend::session::Event::ActivateSession);
@@ -1901,6 +1943,10 @@ impl Runtime {
         // GNOME's lock closes the open menus and their grabs: a shell
         // menu left open behind the lock kept the lock screen's keys.
         self.state.dismiss_popup_grab_for_lock();
+        // A client drag ends cancelled: its icon would draw above the
+        // lock, as nothing else may.
+        self.state
+            .cancel_client_dnd(crate::state::system_millis() as u32);
         // The shield covers GNOME's switcher popup and its window clones;
         // no window image may draw over the lock.
         self.switcher_thumbnails.clear();
@@ -3070,6 +3116,10 @@ impl Runtime {
         } else {
             serde_json::Value::Null
         };
+        #[cfg(feature = "drm")]
+        {
+            doc["sleep_delay"] = serde_json::json!(self.sleep_delay.record());
+        }
         doc["pointer_fullscreen_blocked"] = serde_json::json!(
             (!self.is_locked()).then(|| self.manager.fullscreen_at(self.manager.pointer_pos()))
         );
@@ -5494,8 +5544,8 @@ impl Runtime {
         // ext-session-lock-v1: only the supervised shell may lock, and
         // locking through the protocol engages the compositor's own
         // flag. Anyone else's locker is dropped, which tells it the
-        // lock failed.
-        if let Some((locker, pid)) = self.state.take_lock_request() {
+        // lock failed. Each waiting client gets its own verdict.
+        while let Some((locker, pid)) = self.state.take_lock_request() {
             use crate::session_lock::{lock_request_verdict, LockVerdict};
             let verdict = lock_request_verdict(
                 pid,
@@ -5565,13 +5615,20 @@ impl Runtime {
         }
         self.idle_monitor.tick();
         // Idle timeout from input timestamps: lock the untouched session.
-        // A live idle inhibitor (video, presentation) counts as activity,
-        // and so does its end: the loop may have slept through the
-        // inhibited stretch, so the idle clock restarts when it ends
-        // instead of the session locking at once (#503). An idle
-        // inhibitor held through org.gnome.SessionManager (a portal or
+        // An idle inhibitor on a surface the user sees (video,
+        // presentation) counts as activity, and so does its end: the loop
+        // may have slept through the inhibited stretch, so the idle clock
+        // restarts when it ends instead of the session locking at once
+        // (#503). An unmapped, hidden or occluded surface's inhibitor
+        // lapses, as zwp_idle_inhibit_v1 says. An idle inhibitor held
+        // through org.gnome.SessionManager (a portal or
         // org.freedesktop.ScreenSaver caller) counts the same way.
-        let inhibited = self.state.idle_inhibited() || self.session_manager.idle_inhibited();
+        let shown = if self.state.protocols.inhibitors.is_empty() {
+            Vec::new()
+        } else {
+            self.shown_surfaces()
+        };
+        let inhibited = self.state.idle_inhibited(&shown) || self.session_manager.idle_inhibited();
         if self
             .lock
             .inhibitor_activity(self.idle_inhibited, inhibited, self.lock_now_ms())
@@ -6440,12 +6497,14 @@ impl Runtime {
                         view,
                         &switcher_previews(&self.manager, &self.switcher_thumbnails),
                     );
-                    elements.top.extend(dnd_icon_elements(
-                        renderer,
-                        &self.state,
-                        view,
-                        self.manager.pointer_pos(),
-                    ));
+                    if !locked {
+                        elements.top.extend(dnd_icon_elements(
+                            renderer,
+                            &self.state,
+                            view,
+                            self.manager.pointer_pos(),
+                        ));
+                    }
                     elements.flashes = screenshot_flash_elements(&flashes, view);
                     install_bell(&mut elements, view, bell, desktop);
                     let decor = decor_for_output(&decor_global, view);
@@ -6798,12 +6857,14 @@ impl Runtime {
                         view,
                         &switcher_previews(&self.manager, &self.switcher_thumbnails),
                     );
-                    elements.top.extend(dnd_icon_elements(
-                        renderer,
-                        &self.state,
-                        view,
-                        self.manager.pointer_pos(),
-                    ));
+                    if !locked {
+                        elements.top.extend(dnd_icon_elements(
+                            renderer,
+                            &self.state,
+                            view,
+                            self.manager.pointer_pos(),
+                        ));
+                    }
                     elements.flashes = screenshot_flash_elements(&flashes, view);
                     install_bell(&mut elements, view, bell, desktop);
                     let decor = decor_for_output(&decor_global, view);
@@ -7074,6 +7135,7 @@ impl Runtime {
                     out.mode_committed();
                     out.trace_wake_submission();
                     out.pending = true;
+                    out.scanout_lock.queued(locked);
                     if index == 0 {
                         self.performance_trace.queued(
                             Duration::from(self.state.presentation_now()),
@@ -8833,6 +8895,7 @@ fn run_loop(
         if let Some(monitor) = &sleep_monitor {
             let (lock, wake) = monitor.take();
             runtime.on_sleep_update(lock, wake);
+            runtime.sync_sleep_delay(monitor);
         }
         #[cfg(feature = "drm")]
         match logind_session.as_ref().and_then(|session| session.take()) {

@@ -78,7 +78,7 @@ Tuna evidence; archival inventory is not current feature qualification.
 | Install and boot | `bootc install to-disk` of the digest, `V-DRM`, `V-SHELL`, `V-PANEL`, `V-NOPANIC`, `V-REPEAT` |
 | Greeter | `V-GREETER-LIST`, `V-GDM-FALLBACK`, `V-GDM-LOGIN`, `V-DISPLAY-MANAGER` |
 | Session and portals | `V-CALENDAR`, `V-PORTAL`, `V-PORTAL-GNOME`, `V-PORTAL-SCREENSHOT`, `V-PORTAL-SCREENCAST` |
-| Lock and sleep | `V-LOCK`, `V-AUTH-FAIL-CLOSED`, `V-SLEEP-AUTH-FAIL-CLOSED`, `V-SLEEP-FRESH-AUTH`, `V-LIFECYCLE` |
+| Lock and sleep | `V-LOCK`, `V-AUTH-FAIL-CLOSED`, `V-SLEEP-DELAY-INHIBITOR`, `V-SUSPEND-UNLOCKED`, `V-SUSPEND-LOCKED-FRAME`, `V-SLEEP-AUTH-FAIL-CLOSED`, `V-SLEEP-FRESH-AUTH`, `V-LIFECYCLE` |
 | Bounded soak | `V-SOAK` and the startup checks on a sixth pristine boot ([soak](soak.md)) |
 
 The VM profile is the existing q35/OVMF KVM guest: four CPUs, 6 GiB RAM,

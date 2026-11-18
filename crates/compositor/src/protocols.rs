@@ -11,8 +11,9 @@
 //!   shape). Valid requests focus and raise the window.
 //! - viewporter, fractional-scale v1 (preferred scale follows the target output),
 //!   single-pixel-buffer, cursor-shape v1.
-//! - idle-inhibit: a live inhibitor holds off the idle lock (video
-//!   players, presentations).
+//! - idle-inhibit: an inhibitor on a surface the user sees holds off the
+//!   idle lock (video players, presentations); an unmapped, hidden or
+//!   off-screen one holds off nothing.
 //!
 //! - text-input v3 and input-method v2 (#60): IMEs such as fcitx5 type
 //!   into GTK apps; smithay relays focus and text, candidate popups are
@@ -344,10 +345,34 @@ impl State {
         self.protocols.preferred_scale = scale;
     }
 
-    /// Whether a live, mapped surface holds an idle inhibitor.
-    pub fn idle_inhibited(&mut self) -> bool {
+    /// Whether a surface the user sees holds an idle inhibitor. The
+    /// protocol lets an inhibitor lapse while its surface is unmapped,
+    /// occluded or not visible: it counts only if the surface has a
+    /// buffer and its tree is in `shown` (what the screen draws, each
+    /// tree where it sits, as [`crate::frame_timing::drawn_roots`]
+    /// gives it) on some output.
+    pub fn idle_inhibited(&mut self, shown: &[(WlSurface, Point<i32, Logical>)]) -> bool {
         self.protocols.inhibitors.retain(|s| s.is_alive());
-        !self.protocols.inhibitors.is_empty()
+        self.protocols.inhibitors.iter().any(|surface| {
+            let mut root = surface.clone();
+            while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
+                root = parent;
+            }
+            let mapped = smithay::wayland::compositor::with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+                    .and_then(|data| data.lock().ok().and_then(|data| data.surface_size()))
+                    .is_some()
+            });
+            mapped
+                && shown.iter().any(|(tree, at)| {
+                    *tree == root
+                        && self.outputs.iter().any(|output| {
+                            Rectangle::new(output.loc.into(), output.size).contains(*at)
+                        })
+                })
+        })
     }
 
     /// Where `surface`'s buffer origin lands globally: a mapped

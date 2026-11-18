@@ -1753,9 +1753,11 @@ impl TestCompositor {
     }
 
     /// The runtime's idle tick at `now`: ext-idle-notify notifications
-    /// due by then fire, held back by live idle inhibitors.
-    pub fn idle_tick(&mut self, now: std::time::Instant) {
-        let inhibited = self.state.idle_inhibited();
+    /// due by then fire, held back by idle inhibitors on surfaces
+    /// `manager` shows.
+    pub fn idle_tick(&mut self, manager: &windows::WindowManager, now: std::time::Instant) {
+        let shown = crate::frame_timing::drawn_roots(&self.state, manager, false);
+        let inhibited = self.state.idle_inhibited(&shown);
         self.state.protocols.idle_notifier.tick(now, inhibited);
     }
 

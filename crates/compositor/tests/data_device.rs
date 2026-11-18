@@ -1183,8 +1183,19 @@ fn native_drag_case(
         pump_one(&mut comp, &mut queue, &mut client, |c| c.synced);
     }
     if cancel {
+        assert_eq!(
+            comp.state.dnd_icon().is_some(),
+            icon_present && !destroy_icon,
+            "a live drag icon is drawn at the pointer"
+        );
         assert!(comp.cancel_client_dnd(13));
         assert!(!comp.client_dnd_active());
+        // The lock cancels a drag this way (`engage_lock`): no icon is
+        // left to draw above the lock surface.
+        assert!(
+            comp.state.dnd_icon().is_none(),
+            "the icon ends with the drag"
+        );
         assert!(!comp.cancel_client_dnd(14));
         if let Some(offer) = &offer {
             // Requests already queued by the target cannot revive a cancelled offer.
@@ -1303,6 +1314,10 @@ fn native_drag_cancel_without_icon_is_terminal_and_idempotent() {
 #[test]
 fn native_drag_cancel_with_destroyed_icon_keeps_real_ownership() {
     native_drag_case(true, true, true, false, false, false);
+}
+#[test]
+fn native_drag_cancel_with_live_icon_leaves_no_icon_to_draw() {
+    native_drag_case(true, true, false, false, false, false);
 }
 #[test]
 fn native_drag_dead_source_cannot_commit() {
