@@ -65,7 +65,7 @@ RUN --mount=type=bind,source=packaging/marlin/vm-lane/tuna-vm-published-pacman,t
          /usr/share/tunaos/gdm-theme/gnome-shell-*.css > /usr/share/tuna-vm/shipped-payload.sha256 \
     && test "$(readlink -f /etc/systemd/system/display-manager.service)" = /usr/lib/systemd/system/gdm.service \
     && ! grep -Eiq '^[[:space:]]*(AutomaticLoginEnable|TimedLoginEnable)[[:space:]]*=[[:space:]]*(true|yes|y|1)[[:space:]]*$' /etc/gdm/custom.conf \
-    && bash /run/tuna-vm-published-pacman qemu-guest-agent python python-gobject grim wtype wayland-utils gnome-disk-utility gnome-system-monitor \
+    && bash /run/tuna-vm-published-pacman qemu-guest-agent python python-gobject grim wtype wayland-utils gnome-disk-utility gnome-system-monitor libnotify \
     && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test \
     && echo 'tuna-test:tuna' | chpasswd \
     && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-shell-focus \
