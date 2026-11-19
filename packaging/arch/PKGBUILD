@@ -45,6 +45,8 @@ depends=(
     'libxkbcommon-x11'
     'mesa'
     'pipewire'
+    # Interpreter of the shipped /usr/libexec/tuna-geoclue-agent-policy.
+    'python'
     'seatd'
     'sound-theme-freedesktop'
     'systemd-libs'
@@ -59,7 +61,9 @@ optdepends=(
     'ibus: input methods (tuna-ibus-bridge, as GNOME uses IBus)'
     'gst-plugin-pipewire: screen recording from the screenshot UI'
     'gst-plugins-good: screen recording (VP8 and WebM)'
-    'geoclue: location services with the real Tuna desktop agent'
+    # Optional: without the service the shell's location agent hides its
+    # indicator; an image running tuna-geoclue-agent-policy must install it.
+    'geoclue: location services (the shell agent; tuna-geoclue-agent-policy image hook)'
 )
 options=('!lto' '!debug')
 backup=('etc/pam.d/tuna-lock' 'etc/pam.d/roost-lock')  # tuna-rename: keep

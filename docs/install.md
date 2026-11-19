@@ -45,7 +45,11 @@ sudo apt install ./tuna-desktop_X.Y.Z_amd64.deb
 ```
 
 Dependencies resolve automatically on a target with the declared runtime
-packages available. After installing, the Tuna Desktop session is
+packages available: GTK at least 4.14, libadwaita, gtk4-layer-shell,
+libgweather 4.4 and `python3` for the shipped GeoClue agent-policy helper. Location services
+need `geoclue-2.0`, which the package recommends rather than requires;
+without it the session runs and hides the location indicator. After
+installing, the Tuna Desktop session is
 selectable from the login screen. Upgrading installs the newer package over
 the older one; the [legacy-upgrade guide](legacy-upgrade.md) explains the
 temporary two-file bridge, explicit session reselection, preserved settings
@@ -63,10 +67,9 @@ Install the complete package list in
 matching the CI `check` job). The compositor builds its DRM and PipeWire
 features by default, so it needs the libseat, libinput, libudev, GBM, libdrm,
 PipeWire, libclang and xkbcommon development packages
-(`crates/compositor/Cargo.toml`); the GTK shell and greeter need GTK 4,
-libadwaita and gtk4-layer-shell, and the shell also libgweather 4 for the
-date menu's world clocks and weather (`crates/shell-gtk/Cargo.toml`,
-`crates/greeter/Cargo.toml`). Where the distribution has no gtk4-layer-shell
+(`crates/compositor/Cargo.toml`); the GTK shell needs GTK 4, libadwaita,
+gtk4-layer-shell and, for the date menu's world clocks and weather,
+libgweather 4 (`crates/shell-gtk/Cargo.toml`). Where the distribution has no gtk4-layer-shell
 package, `scripts/ci-install-gtk4-layer-shell` builds it. At run time the
 nested backend additionally dlopens the EGL/Mesa display libraries
 (`libegl1`, `libgl1-mesa-dri`, `libgbm1` on Ubuntu).

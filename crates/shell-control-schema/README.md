@@ -54,8 +54,8 @@ before decoding.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
   `ErrorKind`.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,
-  `NativeOutputInfo`, `InputSettings`, `WindowId`, `WorkspaceId`,
-  `dynamic_workspace_count`.
+  `NativeOutputInfo` (re-exported from `tuna-output`), `InputSettings`,
+  `WindowId`, `WorkspaceId`, `dynamic_workspace_count`.
 - Pointer devices: `InputSettings::mouse_accel_profile` plus the appended
   `touchpad`, `mouse`, `trackball` and `pointing_stick` groups
   (`TouchpadSettings`, `MouseSettings`, `TrackballSettings`,

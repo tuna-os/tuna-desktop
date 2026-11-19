@@ -4,6 +4,7 @@ exclude = ["third-party/reis", "third-party/smithay"]
 members = [
     "crates/backlight",
     "crates/compositor",
+    "crates/output",
     "crates/shell-control-schema",
     "crates/shell-host",
     "crates/shell-gtk",

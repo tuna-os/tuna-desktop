@@ -10,9 +10,11 @@ delivery tier (nested developer preview) is explicitly "not a secure
 daily-driver session" ([architecture](architecture.md#delivery-tiers)). The
 [ADR register](adr/README.md#decision-register) still lists the same-UID
 threat model, trusted lock/portal identity and the production lock/auth and
-portal/capture grant lifecycle as open 1.0 release blockers. Everything
-below describes what the code on `main` does today. Planned behaviour is
-labelled **target**.
+portal/capture grant lifecycle as 1.0 release blockers.
+[ADR 0010](adr/0010-same-uid-trusted-identity.md) and
+[ADR 0011](adr/0011-lock-auth-and-capture-grant-lifecycle.md) propose them;
+the owner has not decided. Everything below describes what the code on
+`main` does today. Planned behaviour is labelled **target**.
 
 ## What is protected
 
@@ -34,12 +36,18 @@ labelled **target**.
 
 1. **Ordinary Wayland clients**, sandboxed or not. They may send arbitrary
    protocol requests, claim any app ID or title, and connect and disconnect
-   at will. They must not capture the screen, type into other clients, see
-   other windows' contents, place shell layers or get past the lock.
-2. **Session-bus callers.** Any same-user process on the session bus may
-   call the compositor's and shell's D-Bus interfaces, and may claim
-   well-known names that nobody owns yet. Capture, remote input and window
-   introspection must not be granted on the strength of a claimed name.
+   at will. Through Wayland they must not capture the screen, type into
+   other clients, see other windows' contents, place shell layers or get
+   past the lock. What a native client can do outside Wayland is covered
+   under [Out of scope](#out-of-scope).
+2. **Sandboxed and non-native session-bus callers.** Flatpak and other
+   sandboxed applications reach the session bus through a filtering proxy,
+   and other callers may not be native processes of the session user. They
+   may call the compositor's and shell's D-Bus interfaces they can reach,
+   and may claim well-known names that nobody owns yet. Capture, remote
+   input and window introspection must not be granted on the strength of a
+   claimed name. Native same-user processes are out of scope
+   ([ADR 0010](adr/0010-same-uid-trusted-identity.md)).
 3. **Processes of other users.** They must not reach the control socket or
    any per-session state.
 4. **A person at a locked screen.** They can type and click on the lock
@@ -53,12 +61,20 @@ labelled **target**.
 
 ## Out of scope
 
-- **Same-UID processes that can debug or rewrite the shell or compositor.**
-  ADR 0005 records that a process able to `ptrace` the shell "still wins;
-  that is the platform's same-uid boundary, not something a socket can fix"
+- **Native same-UID processes.** A native process running as the session
+  user can kill the portal or gnome-remote-desktop and start the genuine,
+  root-owned binary with `LD_PRELOAD`. That needs no `ptrace`, and Yama
+  does not stop it. Every identity check then passes, and the process gets
+  screen capture and remote input with no consent. No check of process
+  attributes can prevent this under one UID; GNOME 51 makes the same choice
+  with weaker checks
+  ([ADR 0010](adr/0010-same-uid-trusted-identity.md#residual-risks), R1).
+  ADR 0005 likewise records that a process able to `ptrace` the shell
+  "still wins; that is the platform's same-uid boundary, not something a
+  socket can fix"
   ([ADR 0005](adr/0005-control-socket-peer-authentication.md#consequences)).
-  The same applies to a same-user process that edits the user's
-  configuration, autostart entries or extension directory.
+  The same applies to a same-user process that edits the user's login
+  environment, configuration, autostart entries or extension directory.
 - **root, the kernel, GPU drivers and firmware.** Executable-identity
   checks trust root-owned, non-writable installed binaries (see below), so
   a root compromise defeats them by design.
@@ -122,7 +138,10 @@ locked state to the capture authority and closes the overview
 (`runtime.rs:1661-1687`). Unlock runs the session user's own PAM
 transaction against the `tuna-lock` service (`share/pam.d/tuna-lock`) in a
 private helper. Attempts are bound to the control connection, request,
-attempt serial and lock epoch. See:
+attempt serial and lock epoch. Fingerprint unlock does not run through PAM
+yet: a fprintd match unlocks without the account stack (a fix is in
+progress; [ADR 0011](adr/0011-lock-auth-and-capture-grant-lifecycle.md), F5).
+See:
 
 - [Lock-screen authentication conversations](security/lock-conversations.md)
 - [Password result ownership](security/password-owner-epoch.md)
@@ -218,7 +237,10 @@ refuse locked frames. Full detail and the qualification evidence:
   listener 250 ms and is retried, instead of ending the event loop and the
   session (#1071, `security_listener.rs`;
   `crates/compositor/tests/security_context_accept.rs`).
-- Input-method v2 is open to any client, as on GNOME (`protocols.rs:165-166`).
+- Input-method v2 is visible and bindable only to the compositor's IBus
+  bridge, like the virtual keyboard (`protocols.rs`, `_input_method`).
+  Evidence: `crates/compositor/tests/input_protocols.rs`
+  (`ordinary_and_spoofed_clients_cannot_discover_or_force_bind_privileged_input_managers`).
 
 ### Session-bus interfaces
 
@@ -297,9 +319,14 @@ UI classification remain required for both legs.
 
 ## Known limitations
 
-- **Same-UID boundary.** PID-based shell identity and executable-identity
-  checks stop name spoofing. They do not stop a same-user process that can
-  `ptrace` or inject into the shell or portal.
+- **Same-UID boundary.** Shell identity and executable-identity
+  checks stop processes that only claim an identity. They do not stop a
+  native same-user process, and it needs no `ptrace`: `LD_PRELOAD` into the
+  genuine portal or grd binary is enough. Mitigations: a GNOME-style
+  screen-sharing and remote-access indicator with Stop and
+  gnome-remote-desktop sessions only while Remote Desktop is enabled in
+  gsettings are being built; pidfd-pinned shell identity is #1171
+  ([ADR 0010](adr/0010-same-uid-trusted-identity.md#review-findings-and-dispositions)).
 - **Name-based allowlists.** The `org.gnome.Shell` allowlist trusts
   whoever owns an allowlisted well-known name, as GNOME does. A same-user
   process that claims `org.gnome.Settings` first passes it. Those methods
@@ -337,8 +364,12 @@ quality:
 - Requirements R6 (session/lock), R11 (extension boundary) and R14
   (capture/privileged surfaces) with their security cases
   ([requirements](requirements.md)).
-- The open ADR register rows for same-UID identity and the production
-  lock/auth and portal/capture lifecycle
+- The ADR register rows for same-UID identity and the production
+  lock/auth and portal/capture lifecycle, proposed in
+  [ADR 0010](adr/0010-same-uid-trusted-identity.md) and
+  [ADR 0011](adr/0011-lock-auth-and-capture-grant-lifecycle.md) (#1162) and
+  awaiting the owner's decision. Their residual risks, including the gaps
+  they record, are part of the gate 4 review
   ([ADR register](adr/README.md#decision-register)).
 
 The `portal-security` and `remote-security` CI lanes run the packaged

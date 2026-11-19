@@ -9,3 +9,4 @@ license.workspace = true
 [dependencies]
 postcard.workspace = true
 serde = { version = "1", features = ["derive"] }
+tuna-output = { path = "../output", version = "0.1.0" }

@@ -129,7 +129,8 @@ Version: 0.1.0~beta.1
 Architecture: amd64
 Maintainer: Tuna fixture <fixture@example.invalid>
 Description: disposable archive policy fixture
-Depends: libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.0), libgweather-4-0t64 (>= 4.4) | libgweather-4-0 (>= 4.4), libpam0g, gsettings-desktop-schemas, gnome-settings-daemon-common
+Depends: libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.0), libgweather-4-0t64 (>= 4.4) | libgweather-4-0 (>= 4.4), libpam0g, gsettings-desktop-schemas, gnome-settings-daemon-common, python3
+Recommends: geoclue-2.0
 Replaces: roost
 Conflicts: roost
 Provides: roost
@@ -139,9 +140,12 @@ Provides: roost
             path.write_text(body)
             path.chmod(0o644)
         shutil.copytree(ROOT / 'share/tuna-desktop/icons', cls.stage / 'usr/share/tuna-desktop/icons', symlinks=True)
+        (cls.stage / 'usr/libexec').mkdir()
+        shutil.copyfile(ROOT / 'packaging/marlin/tuna-geoclue-agent-policy', cls.stage / 'usr/libexec/tuna-geoclue-agent-policy')
         for path in cls.stage.rglob('*'):
             if not path.is_symlink():
-                path.chmod(0o755 if path.is_dir() or path.parent == cls.stage / 'usr/bin' else 0o644)
+                executable = path.parent in (cls.stage / 'usr/bin', cls.stage / 'usr/libexec')
+                path.chmod(0o755 if path.is_dir() or executable else 0o644)
         cls.baseline = cls.root / 'genuine.deb'
         subprocess.run(['dpkg-deb', '--root-owner-group', '-Znone', '--build', str(cls.stage), str(cls.baseline)],
                        check=True, capture_output=True, timeout=120)
@@ -423,6 +427,20 @@ package
         for name in (OLD_PAM, PAM):
             rules = [line.split() for line in (stage / name).read_text().splitlines() if line.strip() and not line.startswith('#')]
             self.assertEqual(rules, [['auth', 'include', 'login'], ['account', 'include', 'login']])
+
+    def test_arch_package_requires_helper_interpreter_and_keeps_geoclue_optional(self):
+        result = subprocess.run(['bash', '-euc', '''source "$1"
+printf 'depends %s\n' "${depends[@]}"
+printf 'optdepends %s\n' "${optdepends[@]%%:*}"
+''', 'fixture', str(ROOT / 'packaging/arch/PKGBUILD')],
+            env=dict(os.environ, TUNA_LOCAL_SRC=str(ROOT)), text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        # The shipped tuna-geoclue-agent-policy needs python; GeoClue stays
+        # optional because the shell's location agent runs without it.
+        self.assertIn('depends python', lines)
+        self.assertIn('optdepends geoclue', lines)
+        self.assertNotIn('depends geoclue', lines)
 
 
 if __name__ == '__main__':

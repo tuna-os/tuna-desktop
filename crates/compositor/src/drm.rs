@@ -78,7 +78,7 @@ pub struct DrmOutput {
     /// CRTC driving the connector.
     pub crtc: crtc::Handle,
     pub connector: connector::Handle,
-    native_owner: Option<tuna_shell_control::NativeOutputInfo>,
+    native_owner: Option<tuna_output::NativeOutputInfo>,
     /// GBM swapchain bound to the CRTC.
     pub surface: ScanoutSurface,
     /// Protocol output advertised to clients.
@@ -564,7 +564,7 @@ impl Lighting<'_> {
 }
 
 impl DrmBackend {
-    pub fn native_outputs(&self) -> Vec<tuna_shell_control::NativeOutputInfo> {
+    pub fn native_outputs(&self) -> Vec<tuna_output::NativeOutputInfo> {
         use std::os::fd::AsFd;
         if !self.active || !self.drm.is_active() {
             return Vec::new();

@@ -4,6 +4,7 @@
 - Date: 2026-10-01
 - Owner: project
 - Dependent speks: 001 (control API), 004 (secure session)
+- Amended: #1171 (see [ADR 0010](0010-same-uid-trusted-identity.md))
 
 ## Context
 
@@ -27,6 +28,14 @@ Three layers, none of which needs a protocol change:
    supervised child's pid may hold a session; between restarts nobody
    may. A shell restart under a new pid evicts sessions held by the old
    one. Pending, un-handshaken peers are capped at 8.
+
+> **Amendment (#1171).** Layer 3's numeric-PID match is superseded. The
+> shell's gate, `PeerGate::Pid`, now admits a peer only through its live
+> `SO_PEERPIDFD` pin (`PeerCred::pinned_pid`). A bare `SO_PEERCRED` PID,
+> the pin of an exited process, and every peer on a kernel without
+> `SO_PEERPIDFD` are refused, so a PID recycled onto a restarted shell
+> cannot hold a session. Evidence: `crates/compositor/tests/peer_auth.rs`
+> (`the_shell_gate_requires_a_pin`, `a_recycled_shell_pid_is_refused`).
 
 ## Alternatives considered
 

@@ -7,7 +7,7 @@ description = "Bounded kernel backlight and owned DRM connector observations sha
 
 [dependencies]
 libc = "0.2"
-tuna-shell-control = { path = "../shell-control-schema", version = "0.1.0" }
+tuna-output = { path = "../output", version = "0.1.0" }
 
 [dev-dependencies]
 tempfile = "3"
