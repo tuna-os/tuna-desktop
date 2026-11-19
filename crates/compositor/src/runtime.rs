@@ -5162,6 +5162,9 @@ impl Runtime {
             self.manager.focus_deadline(),
             // Mutter's alive checks: a ping timing out, Wait, re-pings.
             self.manager.alive_deadline(),
+            // A held primary press on the bare wallpaper: GNOME's long
+            // press that opens the background menu.
+            self.manager.background_menu_deadline(),
             // Window sessions are written 3 s after a change (Mutter).
             self.state.window_sessions().save_deadline(),
             // The lock conversation's shared idle/total deadline.
@@ -5515,6 +5518,20 @@ impl Runtime {
                     workspace_left: self.manager.workspace_left_of(window),
                     workspace_right: self.manager.workspace_right_of(window),
                 });
+        }
+        // Right clicks and long presses on the bare wallpaper: GNOME's
+        // background menu, drawn by the shell.
+        let locked = self.is_locked();
+        for message in self
+            .manager
+            .take_background_menus(&self.state, Instant::now(), locked)
+        {
+            self.control.queue_message(message);
+        }
+        // Windows that asked for focus without the right to, or mapped
+        // behind the focused one: gnome-shell's "is ready" notification.
+        for message in self.manager.take_attention(locked) {
+            self.control.queue_message(message);
         }
         if !self.control.overview_open() {
             self.overview_search = false;

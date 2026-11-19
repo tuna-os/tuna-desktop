@@ -26,6 +26,10 @@
 #   bound of its warm state, #1088) and G-SHELL-STABLE only.
 #   --lock-menu-only runs panel readiness, G-LOCK-WITH-MENU-OPEN and
 #   G-SHELL-STABLE only (needs pam_wrapper).
+#   --shell-gaps-only runs panel readiness, the GNOME 51 shell-gap gates
+#   (G-BACKGROUND-MENU, G-MONITOR-LABELS, G-WINDOW-ATTENTION,
+#   G-KEYRING-PROMPTER, G-KEYRING-ISOLATION) and
+#   G-SHELL-STABLE only.
 #   --grid-cancel-only --grid-cancel-admission FILE is an exact CI comparison slice.
 #   --expect-grid-cancel-old-negative is permitted only in that admitted slice.
 #   Run at most one --*-only slice at a time.
@@ -531,6 +535,7 @@ DATEMENU_ONLY=0
 SEARCH_LEAK_ONLY=0
 WINDOW_LEAK_ONLY=0
 LOCK_MENU_ONLY=0
+SHELL_GAPS_ONLY=0
 GRID_CANCEL_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
 GRID_CANCEL_ADMISSION=""
@@ -576,6 +581,7 @@ while [ $# -gt 0 ]; do
         --search-leak-only) SEARCH_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --window-leak-only) WINDOW_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --lock-menu-only) LOCK_MENU_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
+        --shell-gaps-only) SHELL_GAPS_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --help|-h) sed -n '2,/^# end of --help$/{/^# end of --help$/!p;}' "$0"; exit 0 ;;
@@ -1913,6 +1919,479 @@ if [ "$WINDOW_LEAK_ONLY" = 1 ]; then
     # Let the startup cover settle before the first window.
     sleep 3
     window_leak_proof
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
+# GNOME 51 backgroundMenu.js: a right click, or a primary press held 500 ms,
+# on the bare wallpaper opens "Change Background…", "Display Settings" and
+# "Settings"; each opens its Settings panel (gnome-control-center is a
+# stand-in recording its arguments), Escape closes, a short click opens
+# nothing.
+background_menu_proof() {
+    cc_calls="$ARTIFACTS/control-center-calls"
+    : >"$cc_calls"
+    cat >"$ARTIFACTS/bin/gnome-control-center" <<CONTROL_CENTER
+#!/bin/sh
+printf '%s\\n' "\$*" >>"$cc_calls"
+CONTROL_CENTER
+    chmod +x "$ARTIFACTS/bin/gnome-control-center"
+    bg_x=$((WIDTH / 2))
+    bg_y=$((HEIGHT / 2))
+    bg_dump() {
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-background-menu-$1.json" 20 ${2:+--press "$2"} ||
+            fail G-BACKGROUND-MENU "accessibility dump failed ($1)"
+    }
+    bg_calls() {
+        end=$(($(date +%s) + 10))
+        while [ "$(date +%s)" -le "$end" ]; do
+            [ "$(wc -l <"$cc_calls")" -ge "$1" ] && return 0
+            sleep 0.3
+        done
+        return 1
+    }
+    # A short click opens nothing.
+    xdotool mousemove --window "$WID" $bg_x $bg_y click 1
+    sleep 1.2
+    bg_dump short
+    hidden "$ARTIFACTS/a11y-background-menu-short.json" "Change Background…" ||
+        fail G-BACKGROUND-MENU "a short primary click opened the background menu"
+    # The secondary button recognizes on press.
+    xdotool mousemove --window "$WID" $bg_x $bg_y click 3
+    sleep 1.5
+    bg_dump right
+    for bg_row in "Change Background…" "Display Settings" "Settings"; do
+        showing "$ARTIFACTS/a11y-background-menu-right.json" "$bg_row" ||
+            fail G-BACKGROUND-MENU "the right click on the wallpaper did not show \"$bg_row\""
+    done
+    scrot "$ARTIFACTS/background-menu.png" >/dev/null
+    bg_dump display "Display Settings"
+    bg_calls 1 || fail G-BACKGROUND-MENU "Display Settings did not open Settings"
+    [ "$(sed -n 1p "$cc_calls")" = "display" ] ||
+        fail G-BACKGROUND-MENU "Display Settings ran gnome-control-center $(sed -n 1p "$cc_calls"), not display"
+    sleep 1
+    bg_dump closed
+    hidden "$ARTIFACTS/a11y-background-menu-closed.json" "Display Settings" ||
+        fail G-BACKGROUND-MENU "choosing a row left the menu open"
+    # A primary press held past 500 ms is GNOME's long press.
+    xdotool mousemove --window "$WID" $bg_x $bg_y mousedown 1
+    sleep 1
+    xdotool mouseup 1
+    sleep 1.5
+    bg_dump long
+    showing "$ARTIFACTS/a11y-background-menu-long.json" "Change Background…" ||
+        fail G-BACKGROUND-MENU "a held primary press did not open the background menu"
+    bg_dump change "Change Background…"
+    bg_calls 2 || fail G-BACKGROUND-MENU "Change Background… did not open Settings"
+    [ "$(sed -n 2p "$cc_calls")" = "background" ] ||
+        fail G-BACKGROUND-MENU "Change Background… ran gnome-control-center $(sed -n 2p "$cc_calls"), not background"
+    sleep 1
+    xdotool mousemove --window "$WID" $bg_x $bg_y click 3
+    sleep 1.5
+    bg_dump settings "Settings"
+    bg_calls 3 || fail G-BACKGROUND-MENU "Settings did not open Settings"
+    [ -z "$(sed -n 3p "$cc_calls")" ] ||
+        fail G-BACKGROUND-MENU "Settings ran gnome-control-center $(sed -n 3p "$cc_calls"), not the app itself"
+    sleep 1
+    # Escape closes the menu.
+    xdotool mousemove --window "$WID" $bg_x $bg_y click 3
+    sleep 1.5
+    bg_dump again
+    showing "$ARTIFACTS/a11y-background-menu-again.json" "Display Settings" ||
+        fail G-BACKGROUND-MENU "the menu did not open a second time"
+    xdotool key Escape
+    sleep 1
+    bg_dump escaped
+    hidden "$ARTIFACTS/a11y-background-menu-escaped.json" "Display Settings" ||
+        fail G-BACKGROUND-MENU "Escape left the background menu open"
+    pass G-BACKGROUND-MENU "a right click or held press on the wallpaper opens GNOME's menu; its rows open Settings' Background, Display and main pages; Escape closes it; a short click opens nothing"
+}
+# GNOME 51 osdMonitorLabeler.js: Settings (org.gnome.Settings, the probe)
+# asks org.gnome.Shell to label every monitor with its number; the label
+# sits at the top-left of the monitor's work area, goes away on
+# HideMonitorLabels or when its client leaves the bus, and a caller
+# outside the allowlist is refused.
+monitor_labels_proof() {
+    ml_marker="$ARTIFACTS/monitor-labels.marker"
+    ml_probe="$ROOT/scripts/lib/tuna-monitor-labels-probe.py"
+    : >"$ml_marker"
+    ml_wait() {
+        end=$(($(date +%s) + 15))
+        while [ "$(date +%s)" -le "$end" ]; do
+            grep -q "^$1" "$ml_marker" && return 0
+            sleep 0.3
+        done
+        return 1
+    }
+    ml_labels() {
+        cstate "[.layers[] | select(.namespace == \"tuna-monitor-label\")] | length == $1" "monitor labels $1" 10
+    }
+    ml_labels 0 || fail G-MONITOR-LABELS "a label showed before Settings asked"
+    # GNOME's sender allowlist: a caller that is not Settings is refused.
+    "$PY" "$ml_probe" "$ml_marker" --stranger >"$ARTIFACTS/monitor-labels-stranger.log" 2>&1
+    ml_wait "denied org.freedesktop.DBus.Error.AccessDenied" ||
+        fail G-MONITOR-LABELS "a caller outside the allowlist was not refused ($(cat "$ml_marker"))"
+    ml_labels 0 || fail G-MONITOR-LABELS "a refused caller still put labels on screen"
+    : >"$ml_marker"
+    "$PY" "$ml_probe" "$ml_marker" >"$ARTIFACTS/monitor-labels.log" 2>&1 &
+    ml_pid=$!
+    ml_wait shown || fail G-MONITOR-LABELS "ShowMonitorLabels from Settings failed ($(cat "$ml_marker"))"
+    ml_count="$(sed -n 's/^monitors //p' "$ml_marker" | wc -w)"
+    [ "$ml_count" -ge 1 ] || fail G-MONITOR-LABELS "DisplayConfig listed no monitor"
+    ml_labels "$ml_count" ||
+        fail G-MONITOR-LABELS "ShowMonitorLabels did not put one label on each of the $ml_count monitors"
+    cstate "[.layers[] | select(.namespace == \"tuna-monitor-label\")] | all(.rect[0] == 0 and .rect[1] > 0 and .rect[2] < $WIDTH / 2 and .rect[3] < $HEIGHT / 2)" \
+        "label at the corner of the work area" 10 ||
+        fail G-MONITOR-LABELS "a label is not at the top-left of the work area below the panel"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-monitor-labels.json" 20 ||
+        fail G-MONITOR-LABELS "accessibility dump failed"
+    jq -e 'any(.[]; .role == "label" and .name == "1" and .showing)' "$ARTIFACTS/a11y-monitor-labels.json" >/dev/null ||
+        fail G-MONITOR-LABELS "no label shows the number 1 that Settings sent"
+    scrot "$ARTIFACTS/monitor-labels.png" >/dev/null
+    kill -USR1 "$ml_pid"
+    ml_wait hidden || fail G-MONITOR-LABELS "HideMonitorLabels failed ($(cat "$ml_marker"))"
+    ml_labels 0 || fail G-MONITOR-LABELS "HideMonitorLabels left labels on screen"
+    kill -USR2 "$ml_pid"
+    wait "$ml_pid" 2>/dev/null || true
+    # A client that leaves the bus without hiding them takes them down.
+    : >"$ml_marker"
+    "$PY" "$ml_probe" "$ml_marker" >"$ARTIFACTS/monitor-labels-leave.log" 2>&1 &
+    ml_pid=$!
+    ml_wait shown || fail G-MONITOR-LABELS "a second ShowMonitorLabels failed ($(cat "$ml_marker"))"
+    ml_labels "$ml_count" || fail G-MONITOR-LABELS "the labels did not return for a new Settings"
+    kill -USR2 "$ml_pid"
+    wait "$ml_pid" 2>/dev/null || true
+    ml_labels 0 || fail G-MONITOR-LABELS "the labels stayed after Settings left the bus"
+    pass G-MONITOR-LABELS "ShowMonitorLabels from Settings puts a numbered label at the corner of every monitor's work area; HideMonitorLabels or Settings leaving the bus removes them; a caller outside the allowlist is refused"
+}
+# GNOME 51 components/keyring.js on gcr's system prompter: gnome-keyring
+# and other gcr clients ask org.gnome.keyring.SystemPrompter for a
+# password, a new password with a confirmation, a choice or a yes/no, and
+# the shell shows a system-modal dialog over the dimmed screen. The client
+# is a fixture that speaks gcr's prompter protocol with its own
+# implementation of the sx-aes-1 secret exchange (keyring_sx_aes.py, checked
+# against libgcr); the password the user types reaches it only encrypted.
+keyring_prompter_proof() {
+    kp_marker="$ARTIFACTS/keyring-prompter.marker"
+    kp_probe="$ROOT/scripts/lib/tuna-keyring-prompter-probe.py"
+    kp_wait() {
+        end=$(($(date +%s) + ${2:-20}))
+        while [ "$(date +%s)" -le "$end" ]; do
+            grep -q "$1" "$kp_marker" && return 0
+            sleep 0.3
+        done
+        return 1
+    }
+    # kp_dialog N: the dialog's layer surface is mapped (1) or gone (0).
+    kp_dialog() {
+        cstate "[.layers[] | select(.namespace == \"tuna-keyring-prompt\")] | length == $1" "keyring dialog $1" 15
+    }
+    kp_start() {
+        : >"$kp_marker"
+        "$PY" "$kp_probe" "$kp_marker" "$1" >"$ARTIFACTS/keyring-$1.log" 2>&1 &
+        kp_pid=$!
+    }
+    kp_end() {
+        wait "$kp_pid" 2>/dev/null || fail G-KEYRING-PROMPTER "the fixture failed ($(tail -3 "$ARTIFACTS/keyring-$1.log" | tr '\n' ' '))"
+    }
+    kp_note() {
+        sed -n "s/^$1 //p" "$kp_marker" | head -1
+    }
+    kp_dump() {
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-keyring-$1.json" 20 ||
+            fail G-KEYRING-PROMPTER "accessibility dump failed ($1)"
+    }
+    kp_dialog 0 || fail G-KEYRING-PROMPTER "a keyring dialog showed before any client asked"
+    gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.GetNameOwner org.gnome.keyring.SystemPrompter >/dev/null 2>&1 ||
+        fail G-KEYRING-PROMPTER "nothing owns org.gnome.keyring.SystemPrompter"
+    scrot "$ARTIFACTS/keyring-before.png" >/dev/null
+    kp_corner_x=$((WIDTH - 40))
+    kp_corner_y=$((HEIGHT - 40))
+    kp_before="$(px "$ARTIFACTS/keyring-before.png" "$kp_corner_x" "$kp_corner_y")"
+
+    # A password prompt with a message, a description and a choice.
+    kp_start password
+    kp_wait '^begun' || fail G-KEYRING-PROMPTER "the fixture never began prompting ($(cat "$kp_marker"))"
+    kp_dialog 1 || fail G-KEYRING-PROMPTER "PerformPrompt did not show the dialog"
+    sleep 1
+    kp_dump password
+    kp_a11y="$ARTIFACTS/a11y-keyring-password.json"
+    showing "$kp_a11y" "Unlock Login keyring" || fail G-KEYRING-PROMPTER "the message is not the dialog's title"
+    showing "$kp_a11y" 'An application wants access to the keyring “Login”, but it is locked.' ||
+        fail G-KEYRING-PROMPTER "the description is missing"
+    showing "$kp_a11y" "Password" || fail G-KEYRING-PROMPTER "no password entry"
+    hidden "$kp_a11y" "Confirm Password" || fail G-KEYRING-PROMPTER "a confirmation entry shows for an existing password"
+    button_showing "$kp_a11y" "Unlock" || fail G-KEYRING-PROMPTER "the client's continue label (Unlock, mnemonic dropped) is not a button"
+    button_showing "$kp_a11y" "Cancel" || fail G-KEYRING-PROMPTER "no Cancel button"
+    jq -e 'any(.[]; (.role | test("check")) and .name == "Automatically unlock this keyring whenever I'"'"'m logged in" and .showing)' \
+        "$kp_a11y" >/dev/null || fail G-KEYRING-PROMPTER "the choice check box is missing"
+    cstate "[.layers[] | select(.namespace == \"tuna-keyring-prompt\")][0].rect == [0, 0, $WIDTH, $HEIGHT]" \
+        "dialog covers the screen" 5 || fail G-KEYRING-PROMPTER "the dialog does not cover the screen"
+    scrot "$ARTIFACTS/keyring-password.png" >/dev/null
+    kp_after="$(px "$ARTIFACTS/keyring-password.png" "$kp_corner_x" "$kp_corner_y")"
+    kp_sum() { echo "$1" | awk '{print $1 + $2 + $3}'; }
+    [ "$(kp_sum "$kp_before")" -ge 60 ] ||
+        fail G-KEYRING-PROMPTER "the desktop at the corner is too dark to tell a dimmed screen ($kp_before)"
+    [ "$(($(kp_sum "$kp_after") * 100))" -le "$(($(kp_sum "$kp_before") * 40))" ] ||
+        fail G-KEYRING-PROMPTER "the screen is not dimmed behind the dialog (corner $kp_before -> $kp_after)"
+    xdotool type --delay 30 "hunter2-Pass"
+    xdotool key Tab
+    xdotool key space
+    xdotool key shift+Tab
+    xdotool key Return
+    kp_wait '^reply yes' || fail G-KEYRING-PROMPTER "the password was not answered ($(cat "$kp_marker"))"
+    [ "$(kp_note secret)" = "hunter2-Pass" ] ||
+        fail G-KEYRING-PROMPTER "the client got \"$(kp_note secret)\", not what was typed"
+    grep -q '^props .*choice-chosen=True' "$kp_marker" || fail G-KEYRING-PROMPTER "the ticked choice did not come back"
+    grep -q '^props .*password-strength=' "$kp_marker" || fail G-KEYRING-PROMPTER "no password strength came back"
+    kp_wait '^done' || fail G-KEYRING-PROMPTER "StopPrompting was not answered with PromptDone"
+    kp_end password
+    kp_dialog 0 || fail G-KEYRING-PROMPTER "the dialog stayed after StopPrompting"
+
+    # A new password needs a confirmation that matches; the client may ask
+    # again with a warning of its own.
+    kp_start new
+    kp_wait '^begun' || fail G-KEYRING-PROMPTER "the new-password fixture never began ($(cat "$kp_marker"))"
+    kp_dialog 1 || fail G-KEYRING-PROMPTER "the new-password dialog did not show"
+    sleep 1
+    kp_dump new
+    showing "$ARTIFACTS/a11y-keyring-new.json" "Confirm Password" ||
+        fail G-KEYRING-PROMPTER "a new password shows no confirmation entry"
+    scrot "$ARTIFACTS/keyring-new.png" >/dev/null
+    xdotool type --delay 30 "abc"
+    xdotool key Return
+    xdotool type --delay 30 "abd"
+    xdotool key Return
+    sleep 1.5
+    kp_dump new-mismatch
+    showing "$ARTIFACTS/a11y-keyring-new-mismatch.json" "Passwords do not match" ||
+        fail G-KEYRING-PROMPTER "mismatched passwords did not say so"
+    grep -q '^reply' "$kp_marker" && fail G-KEYRING-PROMPTER "mismatched passwords were sent to the client"
+    xdotool key ctrl+a
+    xdotool type --delay 30 "good-pass-1"
+    xdotool key Return
+    xdotool key ctrl+a
+    xdotool type --delay 30 "good-pass-1"
+    xdotool key Return
+    kp_wait '^reply yes' || fail G-KEYRING-PROMPTER "the matching new password was not answered ($(cat "$kp_marker"))"
+    [ "$(kp_note secret)" = "good-pass-1" ] ||
+        fail G-KEYRING-PROMPTER "the client got \"$(kp_note secret)\" for the new password"
+    kp_wait '^shown2' || fail G-KEYRING-PROMPTER "the client's second prompt did not show"
+    sleep 1.5
+    kp_dump new2
+    showing "$ARTIFACTS/a11y-keyring-new2.json" "The passwords were too weak. Try again." ||
+        fail G-KEYRING-PROMPTER "the client's warning is not shown on its second prompt"
+    xdotool type --delay 30 "x1"
+    xdotool key Return
+    xdotool type --delay 30 "x1"
+    xdotool key Return
+    kp_wait '^reply2 yes' || fail G-KEYRING-PROMPTER "the second new password was not answered ($(cat "$kp_marker"))"
+    [ "$(kp_note secret2)" = "x1" ] || fail G-KEYRING-PROMPTER "the client got \"$(kp_note secret2)\" the second time"
+    kp_wait '^done' || fail G-KEYRING-PROMPTER "the new-password client never got PromptDone"
+    kp_end new
+    kp_dialog 0 || fail G-KEYRING-PROMPTER "the new-password dialog stayed"
+
+    # A confirm prompt has no entries and the client's own button labels;
+    # Continue answers yes, Escape no.
+    kp_start confirm
+    kp_wait '^begun' || fail G-KEYRING-PROMPTER "the confirm fixture never began ($(cat "$kp_marker"))"
+    kp_dialog 1 || fail G-KEYRING-PROMPTER "the confirm dialog did not show"
+    sleep 1
+    kp_dump confirm
+    kp_a11y="$ARTIFACTS/a11y-keyring-confirm.json"
+    showing "$kp_a11y" "Replace keyring?" || fail G-KEYRING-PROMPTER "the confirm message is missing"
+    button_showing "$kp_a11y" "Replace" || fail G-KEYRING-PROMPTER "the client's continue label is missing"
+    button_showing "$kp_a11y" "Keep" || fail G-KEYRING-PROMPTER "the client's cancel label is missing"
+    hidden "$kp_a11y" "Password" || fail G-KEYRING-PROMPTER "a confirm prompt shows a password entry"
+    xdotool key Return
+    kp_wait '^reply yes' || fail G-KEYRING-PROMPTER "Continue on a confirm prompt did not answer yes ($(cat "$kp_marker"))"
+    kp_wait '^shown2' || fail G-KEYRING-PROMPTER "the second confirm did not show"
+    sleep 1
+    kp_dump confirm2
+    showing "$ARTIFACTS/a11y-keyring-confirm2.json" "Delete keyring?" || fail G-KEYRING-PROMPTER "the second confirm message is missing"
+    xdotool key Escape
+    kp_wait '^reply2 no' || fail G-KEYRING-PROMPTER "Escape on a confirm prompt did not answer no ($(cat "$kp_marker"))"
+    kp_wait '^done' || fail G-KEYRING-PROMPTER "the confirm client never got PromptDone"
+    kp_end confirm
+    kp_dialog 0 || fail G-KEYRING-PROMPTER "the confirm dialog stayed"
+    grep -q "keyring prompt callback" "$LOG" &&
+        fail G-KEYRING-PROMPTER "the shell could not call a client back ($(grep 'keyring prompt callback' "$LOG" | head -2))"
+    pass G-KEYRING-PROMPTER "a gcr client's password, new-password (with a confirmation that must match) and confirm prompts show GNOME's dialog over a dimmed screen with the client's message, labels, warning and choice; Continue, Escape and StopPrompting answer them; the password reaches the client through the sx-aes-1 exchange"
+
+    # Isolation: another client cannot answer, change or stop this client's
+    # prompt or take its turn, and a process that watches the bus sees
+    # ciphertext only.
+    kp_start isolation
+    kp_wait '^shown' || fail G-KEYRING-ISOLATION "client A's prompt never showed ($(cat "$kp_marker"))"
+    kp_wait '^b-queued' 30 || fail G-KEYRING-ISOLATION "the second client was not queued ($(cat "$kp_marker"))"
+    grep -q '^b-perform-refused' "$kp_marker" ||
+        fail G-KEYRING-ISOLATION "another client could perform A's prompt ($(cat "$kp_marker"))"
+    grep -q '^b-stop-ignored' "$kp_marker" || fail G-KEYRING-ISOLATION "stopping A's prompt from another client was not ignored"
+    kp_dialog 1 || fail G-KEYRING-ISOLATION "A's dialog went away"
+    kp_dump isolation
+    showing "$ARTIFACTS/a11y-keyring-isolation.json" "Isolation: A's prompt" ||
+        fail G-KEYRING-ISOLATION "the dialog does not show A's prompt"
+    hidden "$ARTIFACTS/a11y-keyring-isolation.json" "B takes over" ||
+        fail G-KEYRING-ISOLATION "another client changed what the dialog says"
+    xdotool type --delay 30 "isolation-secret-7"
+    xdotool key Return
+    kp_wait '^monitor-' 40 || fail G-KEYRING-ISOLATION "the fixture never finished ($(cat "$kp_marker"))"
+    kp_wait '^monitor-cannot-decrypt\|^monitor-DECRYPTED' 20 || true
+    kp_end isolation
+    [ "$(kp_note a-secret)" = "isolation-secret-7" ] ||
+        fail G-KEYRING-ISOLATION "client A got \"$(kp_note a-secret)\", not what was typed"
+    grep -q '^b-ready' "$kp_marker" || fail G-KEYRING-ISOLATION "client B never got its turn after A stopped ($(cat "$kp_marker"))"
+    grep -q '^b-own-key' "$kp_marker" || fail G-KEYRING-ISOLATION "client B was given A's key ($(cat "$kp_marker"))"
+    grep -q '^monitor-clean' "$kp_marker" ||
+        fail G-KEYRING-ISOLATION "a process watching the bus saw the password ($(cat "$kp_marker"))"
+    grep -q '^monitor-cannot-decrypt' "$kp_marker" ||
+        fail G-KEYRING-ISOLATION "a process watching the bus decrypted the password ($(cat "$kp_marker"))"
+    kp_dialog 0 || fail G-KEYRING-ISOLATION "the dialog stayed after both clients stopped"
+    pass G-KEYRING-ISOLATION "a second client cannot perform, stop or take over another client's prompt, waits for its turn and gets its own key; a process watching the bus sees the exchange but neither the password nor a way to decrypt it"
+}
+# GNOME 51 windowAttentionHandler.js with mutter's activation: a client
+# that is not focused asks for focus with a token the compositor will not
+# honor (a real xdg-activation client, tuna-activation-client), and the
+# shell posts "“Title” is ready"; clicking it focuses the window, it is
+# withdrawn once the window has focus without a click, and a window that
+# maps behind the focused one after such a request announces itself too.
+window_attention_proof() {
+    wa_client="${TUNA_PROOF_BIN_DIR:-$ROOT/target/debug}/examples/tuna-activation-client"
+    [ -x "$wa_client" ] ||
+        fail G-WINDOW-ATTENTION "$wa_client is not built (cargo build -p tuna-compositor --example tuna-activation-client)"
+    # GNOME's banner titles, single-quoted for their typographic quotes.
+    wa_alpha='“Alpha” is ready'
+    wa_gamma='“Gamma” is ready'
+    wa_title='“Title” is ready'
+    wa_start() {
+        : >"$ARTIFACTS/attention-$1.cmd"
+        WAYLAND_DISPLAY="$SOCKET_NAME" "$wa_client" "$ARTIFACTS/attention-$1.cmd" "tuna-attn-$1" \
+            >"$ARTIFACTS/attention-$1.log" 2>&1 &
+        wa_pid=$!
+        wa_wait "$1" '^ready' || fail G-WINDOW-ATTENTION "client $1 never connected"
+    }
+    # wa_wait CLIENT PATTERN: the client's log shows PATTERN.
+    wa_wait() {
+        end=$(($(date +%s) + 15))
+        while [ "$(date +%s)" -le "$end" ]; do
+            grep -q "$2" "$ARTIFACTS/attention-$1.log" && return 0
+            sleep 0.3
+        done
+        return 1
+    }
+    # wa_do CLIENT COMMAND LOG-PATTERN
+    wa_do() {
+        echo "$2" >>"$ARTIFACTS/attention-$1.cmd"
+        wa_wait "$1" "$3" || fail G-WINDOW-ATTENTION "client $1 never answered \"$2\" ($(tail -3 "$ARTIFACTS/attention-$1.log" | tr '\n' ' '))"
+    }
+    wa_focus() {
+        cstate ".focused_app_id == \"tuna-attn-$1\"" "focus on $1" 10
+    }
+    wa_dump() {
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-attention-$1.json" 20 ||
+            fail G-WINDOW-ATTENTION "accessibility dump failed ($1)"
+    }
+    # The calendar lists the notifications; Escape closes it.
+    wa_listed() {
+        xdotool mousemove --window "$WID" $((WIDTH / 2)) 16 click 1
+        sleep 2
+        wa_dump "list-$1"
+        showing "$ARTIFACTS/a11y-attention-list-$1.json" "$2"
+        wa_listed_status=$?
+        xdotool key Escape
+        sleep 1
+        return $wa_listed_status
+    }
+    # wa_click_banner TEXT DUMP: click the banner showing TEXT in DUMP.
+    wa_click_banner() {
+        wcb_at="$(jq -r --arg n "$1" '[.[] | select(.name == $n and .showing and .bounds != null)][0] | "\(.bounds[0] + .bounds[2] / 2 | floor) \(.bounds[1] + .bounds[3] / 2 | floor)"' "$2")"
+        wcb_layer="$(jq -r '.layers[] | select(.namespace == "tuna-shell-banners") | "\(.rect[0]) \(.rect[1])"' "$CSTATE")"
+        # shellcheck disable=SC2086
+        set -- $wcb_at $wcb_layer
+        [ "$#" = 4 ] || fail G-WINDOW-ATTENTION "the banner has no place on screen ($wcb_at / $wcb_layer)"
+        xdotool mousemove --window "$WID" $(($1 + $3)) $(($2 + $4)) click 1
+    }
+    wa_start a
+    wa_pid_a=$wa_pid
+    wa_start b
+    wa_pid_b=$wa_pid
+    wa_do a "open Alpha" '^opened Alpha'
+    wa_focus a || fail G-WINDOW-ATTENTION "Alpha did not take focus on map"
+    wa_do b "open Bravo" '^opened Bravo'
+    wa_focus b || fail G-WINDOW-ATTENTION "Bravo did not take focus on map"
+    # A refused token: Alpha's client is not the one holding the keyboard.
+    xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2))
+    wa_do a "refuse Alpha" '^activated Alpha'
+    sleep 0.5
+    wa_dump refused
+    showing "$ARTIFACTS/a11y-attention-refused.json" "$wa_alpha" ||
+        fail G-WINDOW-ATTENTION "no \"$wa_alpha\" banner after the refused activation"
+    showing "$ARTIFACTS/a11y-attention-refused.json" "tuna-attn-a" ||
+        fail G-WINDOW-ATTENTION "the banner is not under the app's name"
+    wa_focus b || fail G-WINDOW-ATTENTION "a refused activation moved focus to Alpha"
+    scrot "$ARTIFACTS/window-attention.png" >/dev/null
+    # Clicking it activates the window, and the notification goes.
+    wa_click_banner "$wa_alpha" "$ARTIFACTS/a11y-attention-refused.json"
+    wa_focus a || fail G-WINDOW-ATTENTION "clicking the notification did not focus Alpha"
+    sleep 1
+    if wa_listed click "$wa_alpha"; then
+        fail G-WINDOW-ATTENTION "the notification is still listed after Alpha was focused by its click"
+    fi
+    # Withdrawn on focus without a click: Alpha demands again behind
+    # Bravo's second window, then Bravo's windows close and Alpha is
+    # what is left to focus.
+    wa_do b "open Bravo again" '^opened Bravo again'
+    wa_focus b || fail G-WINDOW-ATTENTION "Bravo again did not take focus on map"
+    xdotool mousemove --window "$WID" $((WIDTH / 3 + 40)) $((HEIGHT / 2))
+    wa_do a "refuse Alpha" '^activated Alpha'
+    sleep 1
+    wa_dump again
+    showing "$ARTIFACTS/a11y-attention-again.json" "$wa_alpha" ||
+        fail G-WINDOW-ATTENTION "Alpha did not demand attention a second time after it had been focused"
+    wa_listed second "$wa_alpha" ||
+        fail G-WINDOW-ATTENTION "the calendar does not list Alpha's notification"
+    wa_do b quit 'ready'
+    wait "$wa_pid_b" 2>/dev/null || true
+    wa_focus a || fail G-WINDOW-ATTENTION "Alpha did not get focus back when Bravo's windows closed"
+    sleep 1
+    if wa_listed third "$wa_alpha"; then
+        fail G-WINDOW-ATTENTION "the notification stayed in the list after Alpha got focus"
+    fi
+    # A window that maps behind the focused one after a refused request.
+    wa_start c
+    wa_pid_c=$wa_pid
+    wa_do c "open Charlie" '^opened Charlie'
+    wa_focus c || fail G-WINDOW-ATTENTION "Charlie did not take focus on map"
+    xdotool mousemove --window "$WID" $((WIDTH / 3)) $((HEIGHT / 2 + 40))
+    wa_do a "open-refused Gamma" '^opened Gamma'
+    sleep 1
+    wa_focus c || fail G-WINDOW-ATTENTION "a window opened with a refused token took focus from Charlie"
+    wa_dump gamma
+    showing "$ARTIFACTS/a11y-attention-gamma.json" "$wa_gamma" ||
+        fail G-WINDOW-ATTENTION "no \"$wa_gamma\" banner for the window opened behind Charlie"
+    cstate '[.windows[] | select(.app_id == "tuna-attn-a")] | length == 2' "Gamma mapped" 5 ||
+        fail G-WINDOW-ATTENTION "Gamma never mapped"
+    # Its client leaving takes its windows and their notifications.
+    wa_do a quit 'ready'
+    wait "$wa_pid_a" 2>/dev/null || true
+    sleep 1
+    if wa_listed gone "$wa_gamma"; then
+        fail G-WINDOW-ATTENTION "Gamma's notification stayed after the window closed"
+    fi
+    wa_do c quit 'ready'
+    wait "$wa_pid_c" 2>/dev/null || true
+    pass G-WINDOW-ATTENTION "a refused xdg-activation token, or a window mapped behind the focused one after one, posts \"$wa_title\" under the app's name without moving focus; clicking it focuses the window; it is withdrawn once the window has focus or closes"
+}
+if [ "$SHELL_GAPS_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "shell gaps desktop ready" ||
+        fail G-BACKGROUND-MENU "desktop never became ready"
+    # Let the startup cover settle before the first click.
+    sleep 3
+    background_menu_proof
+    monitor_labels_proof
+    window_attention_proof
+    keyring_prompter_proof
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
     exit 0

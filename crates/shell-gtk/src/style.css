@@ -1423,6 +1423,25 @@ window.tuna-osd .level.after-label {
   margin-bottom: 4px;
 }
 
+/* GNOME 51's monitor number label (_osd.scss `.osd-monitor-label`): the
+   accent color, 3em bold with tabular figures, 18px corners, 12px of
+   margin and padding, at the corner of the work area. */
+window.tuna-monitor-label {
+  background: none;
+  font-family: "Adwaita Sans", "Cantarell", sans-serif;
+  font-size: 11pt;
+}
+window.tuna-monitor-label .osd-monitor-label {
+  background-color: @accent_bg_color;
+  color: @accent_fg_color;
+  border-radius: 18px;
+  font-size: 3em;
+  font-weight: bold;
+  font-feature-settings: "tnum";
+  margin: 12px;
+  padding: 12px;
+}
+
 /* GNOME 51's pad OSD (_osd.scss `.pad-osd-window`): 32px of padding on
    80% black over the whole monitor; the bold title (padOsd.js's
    "font-side: larger" typo leaves the size alone). */

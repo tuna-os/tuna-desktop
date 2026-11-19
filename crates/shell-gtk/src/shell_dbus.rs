@@ -36,6 +36,8 @@ const XML: &str = r#"<node>
     <method name="ShowOSD"><arg type="a{sv}" direction="in" name="params"/></method>
     <method name="FocusSearch"/>
     <method name="ShowApplications"/>
+    <method name="ShowMonitorLabels"><arg type="a{sv}" direction="in" name="params"/></method>
+    <method name="HideMonitorLabels"/>
     <method name="GrabAccelerator">
       <arg type="s" direction="in" name="accelerator"/>
       <arg type="u" direction="in" name="modeFlags"/>
@@ -73,6 +75,10 @@ pub trait ShellActions {
     fn show_osd(&self, request: &OsdRequest);
     fn focus_search(&self);
     fn show_applications(&self);
+    /// `ShowMonitorLabels` / `HideMonitorLabels` from `sender` (its unique
+    /// bus name), the client that holds the labels.
+    fn show_monitor_labels(&self, sender: &str, labels: &[(String, String)]);
+    fn hide_monitor_labels(&self, sender: &str);
     fn overview_active(&self) -> bool;
     /// Hand the compositor the full set of grabs with their flags: its
     /// connection generation and request id, or `None` if nothing was sent.
@@ -822,6 +828,15 @@ pub fn start(actions: Rc<dyn ShellActions>) -> Rc<Service> {
                             calls.show_applications();
                             None
                         }
+                        "ShowMonitorLabels" => {
+                            let labels = crate::monitor_labels::parse_labels(&params);
+                            calls.show_monitor_labels(&sender, &labels);
+                            None
+                        }
+                        "HideMonitorLabels" => {
+                            calls.hide_monitor_labels(&sender);
+                            None
+                        }
                         "GrabAccelerator" => {
                             let Some((accel, modes, flags)) = params.get::<(String, u32, u32)>()
                             else {
@@ -1025,6 +1040,8 @@ mod tests {
         fn show_osd(&self, _: &OsdRequest) {}
         fn focus_search(&self) {}
         fn show_applications(&self) {}
+        fn show_monitor_labels(&self, _: &str, _: &[(String, String)]) {}
+        fn hide_monitor_labels(&self, _: &str) {}
         fn overview_active(&self) -> bool {
             false
         }

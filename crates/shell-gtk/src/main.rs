@@ -101,11 +101,13 @@ mod anim_clock;
 mod app_integration;
 mod audio_selection;
 mod audio_state;
+mod background_menu;
 mod background_settings;
 mod brightness;
 mod brightness_service;
 mod bt_menu;
 mod calendar;
+mod camera_indicator;
 mod captive_portal;
 mod close_dialog;
 mod dash_motion;
@@ -125,6 +127,9 @@ mod introspect_forward;
 mod kbd_a11y;
 mod kbd_backlight;
 mod keybindings;
+mod keyring_dialog;
+mod keyring_exchange;
+mod keyring_prompter;
 mod live_apps;
 mod location;
 mod lock;
@@ -136,6 +141,7 @@ mod lockdown;
 mod logic;
 mod magnifier_sync;
 mod media_keys;
+mod monitor_labels;
 mod motion;
 mod mount_operation;
 mod network_agent;
@@ -184,6 +190,7 @@ mod weather;
 mod weather_section;
 mod wellbeing;
 mod wifi;
+mod window_attention;
 mod window_menu;
 mod wired;
 mod world_clocks;
@@ -248,6 +255,12 @@ struct Drained {
     /// Grabbed accelerator presses and releases `(action, time, mode, released)`.
     accelerators: Vec<(u32, u32, u32, bool)>,
     menus: Vec<tuna_shell_host::control::WindowMenuRequest>,
+    /// Right clicks and long presses on the wallpaper (GNOME's background
+    /// menu), in order.
+    background_menus: Vec<tuna_shell_host::control::BackgroundMenuRequest>,
+    /// Windows that demand attention (GNOME's "is ready" notification),
+    /// in order.
+    window_attention: Vec<u64>,
     consent: Option<Option<(u64, String)>>,
     /// The latest display-change confirmation countdown, in seconds.
     display_change: Option<u32>,
@@ -355,6 +368,8 @@ fn drain(
                 let _ = control.request_snapshot();
             }
             Handled::WindowMenu(request) => out.menus.push(request),
+            Handled::BackgroundMenu(request) => out.background_menus.push(request),
+            Handled::WindowDemandsAttention(window) => out.window_attention.push(window),
             Handled::ShortcutConsent(request) => out.consent = Some(request),
             Handled::ConfirmDisplayChange(secs) => out.display_change = Some(secs),
             Handled::ShowCloseDialog(request) => {
@@ -559,6 +574,7 @@ struct GnomeShellDbus {
     osd: Rc<osd::OsdUi>,
     overview: Rc<RefCell<overview::OverviewUi>>,
     shell: Rc<RefCell<Shell>>,
+    monitor_labels: Rc<monitor_labels::MonitorLabels>,
 }
 
 impl shell_dbus::ShellActions for GnomeShellDbus {
@@ -572,6 +588,14 @@ impl shell_dbus::ShellActions for GnomeShellDbus {
 
     fn show_applications(&self) {
         overview::OverviewUi::show_apps(&self.overview);
+    }
+
+    fn show_monitor_labels(&self, sender: &str, labels: &[(String, String)]) {
+        self.monitor_labels.show(sender, labels);
+    }
+
+    fn hide_monitor_labels(&self, sender: &str) {
+        self.monitor_labels.hide(sender);
     }
 
     fn overview_active(&self) -> bool {
@@ -1120,6 +1144,7 @@ fn qs_round(icon: &str, label: &str) -> gtk::Button {
 
 /// The panel's status icons that quick-settings services drive.
 struct PanelIcons {
+    camera: gtk::Image,
     mic: gtk::Image,
     network: gtk::Image,
     location: gtk::Image,
@@ -1767,6 +1792,7 @@ fn quick_settings_popover(
         power_mode,
         power_header: power_menu_ui.header_icon.clone(),
         power_items,
+        panel_camera: icons.camera,
         panel_mic: icons.mic,
         mic,
         mic_mute,
@@ -2205,8 +2231,10 @@ fn build(app: &adw::Application) {
         indicators.append(&image);
         image
     };
-    // Privacy indicators lead (the microphone in use, orange unless
-    // muted).
+    // Privacy indicators lead, as in panel.js (camera, then microphone):
+    // in use, orange unless the microphone is muted.
+    let panel_camera = status_icon(camera_indicator::ICON, false);
+    panel_camera.update_property(&[gtk::accessible::Property::Label(camera_indicator::LABEL)]);
     let panel_mic = status_icon("microphone-sensitivity-medium-symbolic", false);
     panel_mic.update_property(&[gtk::accessible::Property::Label("Microphone in use")]);
     let panel_network = status_icon("network-wired-symbolic", false);
@@ -2371,6 +2399,7 @@ fn build(app: &adw::Application) {
         &power_ui,
         &brightness_controller,
         PanelIcons {
+            camera: panel_camera,
             mic: panel_mic,
             network: panel_network,
             location: panel_location,
@@ -3045,6 +3074,7 @@ fn build(app: &adw::Application) {
         osd: osd_ui.clone(),
         overview: overview_ui.clone(),
         shell: shell.clone(),
+        monitor_labels: monitor_labels::MonitorLabels::new(app.upcast_ref()),
     }));
 
     // GNOME's screenshot UI (Print).
@@ -3071,6 +3101,9 @@ fn build(app: &adw::Application) {
     polkit::start(app.upcast_ref());
     // GNOME's NetworkManager secret agent (Wi-Fi passwords).
     network_agent::start(app.upcast_ref());
+    // GNOME's keyring system prompter (components/keyring.js): password
+    // prompts for gnome-keyring and gcr clients.
+    let keyring_prompter = keyring_prompter::start(app.upcast_ref());
     // GNOME's captive-portal sign-in through its portal helper (#1042).
     captive_portal::start(notify.clone());
     // GNOME's automount and autorun components (#361); off until the
@@ -4034,6 +4067,13 @@ fn build(app: &adw::Application) {
             chrome
         };
         let chrome_apps = apps.clone();
+        let window_attention = {
+            let actions = ShellActions(shell.clone());
+            window_attention::WindowAttention::new(
+                notify.clone(),
+                Rc::new(move |id| overview::OverviewActions::activate_window(&actions, id)),
+            )
+        };
         let shell_rc = shell.clone();
         let activities_button = activities.clone();
         let last_frames: RefCell<Vec<tuna_shell_control::SwitcherThumbnail>> = RefCell::default();
@@ -4066,12 +4106,15 @@ fn build(app: &adw::Application) {
                 (osd_ui.clone(), pad_osd_ui.clone(), pad_osd_service.clone());
             let resync_after = resync_after.clone();
             let gnome_shell = gnome_shell.clone();
+            let window_attention = window_attention.clone();
             Rc::new(move |drained: Drained| {
                 let Drained {
                     results,
                     auth_events,
                     accelerators,
                     menus,
+                    background_menus,
+                    window_attention: attention_demands,
                     consent,
                     display_change,
                     close_dialogs: close_dialog_updates,
@@ -4136,8 +4179,41 @@ fn build(app: &adw::Application) {
                             .map(|w| input_sources::Holder::Window(w.id))
                     })
                 };
+                let attention_windows: Vec<window_attention::WindowView> = shell
+                    .control
+                    .as_ref()
+                    .map(|c| {
+                        c.model()
+                            .windows()
+                            .iter()
+                            .map(|w| window_attention::WindowView {
+                                id: w.id,
+                                title: w.title.clone(),
+                                app_id: w.app_id.clone(),
+                                focused: w.active,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 drop(shell);
                 input_sources.focus(holder);
+                // GNOME's "“Title” is ready" for the windows that demand
+                // attention, withdrawn once they have focus.
+                for window in attention_demands {
+                    window_attention.demand(window);
+                }
+                {
+                    let apps = chrome_apps.get();
+                    window_attention.sync(&attention_windows, &|app_id| {
+                        let entry = app_id.and_then(|id| providers::provider_app(&apps, id));
+                        (
+                            close_dialog::app_name(entry.map(|entry| entry.name.as_str()), app_id),
+                            entry
+                                .and_then(|entry| entry.icon.clone())
+                                .unwrap_or_else(|| "application-x-executable".to_owned()),
+                        )
+                    });
+                }
                 // No banners while locked (GNOME's lock screen session
                 // mode); the lock screen lists what arrives instead.
                 notify.set_locked(locked);
@@ -4161,6 +4237,9 @@ fn build(app: &adw::Application) {
                 }
                 // Thunderbolt devices enrol only in an unlocked session.
                 thunderbolt.sync_lock(authoritative_lock);
+                // The keyring's prompts work only in an unlocked session
+                // (keyring.js `enable`/`disable` by session mode).
+                keyring_prompter.sync_lock(authoritative_lock);
                 screensaver.sync(locked);
                 // The session keyboard never shows over the lock screen.
                 osk.set_locked(locked);
@@ -4223,6 +4302,16 @@ fn build(app: &adw::Application) {
                 }
                 for request in menus {
                     window_menu.open(&request);
+                }
+                // The wallpaper's menu is no business of the lock screen.
+                if !locked {
+                    for request in &background_menus {
+                        background_menu::show(
+                            &window_menu,
+                            request,
+                            Rc::new(background_menu::open_panel),
+                        );
+                    }
                 }
                 for (index, count) in popups {
                     workspace_popup.display(index, count);

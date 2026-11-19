@@ -342,6 +342,8 @@ pub struct Widgets {
     pub battery_icon: gtk::Image,
     pub battery_percentage: gtk::Label,
     pub battery_summary: gtk::Label,
+    /// The camera: the panel's privacy indicator (`camera.js`).
+    pub panel_camera: gtk::Image,
     /// The microphone: the panel's privacy indicator and the slider row.
     pub panel_mic: gtk::Image,
     pub mic: gtk::Scale,
@@ -921,6 +923,7 @@ struct AudioUi {
     widgets: Rc<Widgets>,
     state: RefCell<crate::audio_state::AudioState>,
     last: RefCell<crate::audio_state::Snapshot>,
+    camera: Rc<crate::camera_indicator::CameraIndicator>,
     syncing: Cell<bool>,
     process: RefCell<Option<gio::Subprocess>>,
     stopping: Cell<bool>,
@@ -1087,6 +1090,7 @@ impl AudioUi {
         let recording = snapshot.recording && snapshot.source.is_some();
         w.mic_row.set_visible(recording);
         w.panel_mic.set_visible(recording);
+        self.camera.set_in_use(snapshot.camera_in_use);
         if let Some((percent, muted)) = snapshot.source {
             let icon = logic::mic_icon(percent, muted);
             w.panel_mic.set_icon_name(Some(icon));
@@ -1265,6 +1269,8 @@ impl AudioUi {
         }
         *self.state.borrow_mut() = crate::audio_state::AudioState::default();
         self.update(crate::audio_state::Snapshot::default());
+        // `on_core_error`: a lost connection clears the camera at once.
+        self.camera.reset();
         if self.stopping.get() {
             return;
         }
@@ -1404,6 +1410,7 @@ fn audio(w: &Rc<Widgets>) {
         widgets: w.clone(),
         state: RefCell::default(),
         last: RefCell::default(),
+        camera: crate::camera_indicator::CameraIndicator::new(w.panel_camera.clone()),
         syncing: Cell::new(false),
         process: RefCell::new(None),
         stopping: Cell::new(false),

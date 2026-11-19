@@ -31,6 +31,11 @@ pub struct Snapshot {
     pub sink: Option<(f64, bool)>,
     /// None until the default node reports a recognized playback state.
     pub sink_running: Option<bool>,
+    /// A PipeWire node with `media.role = Camera` is running: gnome-shell's
+    /// `Shell.CameraMonitor` `cameras-in-use` (`src/shell-camera-monitor.c`
+    /// `node_event_info`). Unlike the microphone this is any such node,
+    /// whatever its media class: the portal's camera streams carry the role.
+    pub camera_in_use: bool,
     pub outputs: Vec<Output>,
 }
 
@@ -266,6 +271,14 @@ impl AudioState {
                 })
             {
                 snapshot.recording = true;
+            }
+            if props["media.role"] == "Camera"
+                && object["info"]["state"] == "running"
+                && object["type"]
+                    .as_str()
+                    .is_none_or(|kind| kind == "PipeWire:Interface:Node")
+            {
+                snapshot.camera_in_use = true;
             }
             let is_default_sink =
                 props["node.name"].as_str() == default_sink.as_deref() && default_sink.is_some();
@@ -665,5 +678,45 @@ mod tests {
         });
         assert_eq!(scan.mute_required, BTreeSet::from([50]));
         assert!(scan.muted_now.is_empty());
+    }
+    /// gnome-shell 51 `shell-camera-monitor.c`: nodes whose `media.role`
+    /// is `Camera` and whose state is running are cameras in use.
+    #[test]
+    fn a_running_camera_role_node_is_a_camera_in_use() {
+        let mut s = AudioState::default();
+        assert!(!s.snapshot().camera_in_use);
+        feed(
+            &mut s,
+            json!([
+                {"id":80,"type":"PipeWire:Interface:Node","info":{"state":"suspended","props":{"media.class":"Stream/Input/Video","media.role":"Camera"}}}
+            ]),
+        );
+        assert!(!s.snapshot().camera_in_use, "a suspended node is no use");
+        feed(
+            &mut s,
+            json!([
+                {"id":80,"type":"PipeWire:Interface:Node","info":{"state":"running","props":{"media.class":"Stream/Input/Video","media.role":"Camera"}}}
+            ]),
+        );
+        assert!(s.snapshot().camera_in_use);
+        feed(&mut s, json!([{"id":80,"info":null}]));
+        assert!(!s.snapshot().camera_in_use, "a removed node is no use");
+    }
+
+    #[test]
+    fn only_the_camera_role_counts_as_a_camera_in_use() {
+        let mut s = AudioState::default();
+        feed(
+            &mut s,
+            json!([
+                {"id":81,"type":"PipeWire:Interface:Node","info":{"state":"running","props":{"media.class":"Stream/Input/Video","media.role":"Screen"}}},
+                {"id":82,"type":"PipeWire:Interface:Node","info":{"state":"running","props":{"media.class":"Stream/Input/Video"}}},
+                {"id":83,"type":"PipeWire:Interface:Node","info":{"state":"running","props":{"media.class":"Stream/Input/Audio","media.role":"Communication"}}},
+                {"id":84,"type":"PipeWire:Interface:Device","info":{"state":"running","props":{"media.role":"Camera"}}}
+            ]),
+        );
+        let snapshot = s.snapshot();
+        assert!(!snapshot.camera_in_use);
+        assert!(snapshot.recording, "the microphone path is unchanged");
     }
 }

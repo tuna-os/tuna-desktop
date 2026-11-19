@@ -7558,3 +7558,137 @@ mod unresponsive_windows {
         assert!(f.manager.take_close_dialogs().is_empty());
     }
 }
+
+/// gnome-shell 51 `backgroundMenu.js`: a right click, or a primary press
+/// held 500 ms, on the bare wallpaper opens the background menu; presses
+/// that land on a window, the overview or the lock screen do not.
+mod background_menu {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use tuna_compositor::background_menu::{CANCEL_THRESHOLD, LONG_PRESS};
+    use tuna_shell_control::Message;
+
+    const BTN_RIGHT: u32 = 0x111;
+
+    fn output(f: &mut Fixture) {
+        f.comp.state.set_output_size(1280, 800);
+    }
+
+    fn click(f: &mut Fixture, button: u32, at: Point<f64, Logical>) {
+        f.manager.pointer_motion(&mut f.comp.state, at, 1);
+        f.manager.pointer_button(&mut f.comp.state, button, true, 2);
+    }
+
+    fn menus(f: &mut Fixture, now: Instant, locked: bool) -> Vec<Message> {
+        f.manager.take_background_menus(&f.comp.state, now, locked)
+    }
+
+    #[test]
+    fn a_right_click_on_the_bare_wallpaper_opens_the_menu_at_the_pointer() {
+        let mut f = two_windows();
+        output(&mut f);
+        click(&mut f, BTN_RIGHT, desktop());
+        assert_eq!(
+            menus(&mut f, Instant::now(), false),
+            vec![Message::BackgroundMenu {
+                connector: Some("tuna-0".into()),
+                x: 1000,
+                y: 700,
+            }]
+        );
+        assert!(menus(&mut f, Instant::now(), false).is_empty(), "once");
+    }
+
+    #[test]
+    fn a_right_click_on_a_window_leaves_the_menu_to_the_app() {
+        let mut f = two_windows();
+        output(&mut f);
+        click(&mut f, BTN_RIGHT, alpha_only());
+        click(&mut f, BTN_RIGHT, beta_only());
+        assert!(menus(&mut f, Instant::now() + LONG_PRESS, false).is_empty());
+    }
+
+    #[test]
+    fn a_held_primary_press_on_the_wallpaper_opens_it_after_500_ms() {
+        let mut f = two_windows();
+        output(&mut f);
+        let pressed = Instant::now();
+        click(&mut f, BTN_LEFT, desktop());
+        assert!(f.manager.background_menu_deadline().is_some());
+        assert!(menus(&mut f, pressed, false).is_empty(), "not yet");
+        // A wobble inside the threshold keeps the long press.
+        f.manager.pointer_motion(
+            &mut f.comp.state,
+            desktop() + Point::from((CANCEL_THRESHOLD - 1.0, 0.0)),
+            3,
+        );
+        let opened = menus(
+            &mut f,
+            pressed + LONG_PRESS + Duration::from_millis(50),
+            false,
+        );
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        assert!(f.manager.background_menu_deadline().is_none());
+    }
+
+    #[test]
+    fn a_released_or_dragged_press_is_no_long_press() {
+        let mut f = two_windows();
+        output(&mut f);
+        let pressed = Instant::now();
+        click(&mut f, BTN_LEFT, desktop());
+        f.manager
+            .pointer_button(&mut f.comp.state, BTN_LEFT, false, 3);
+        assert!(f.manager.background_menu_deadline().is_none());
+        assert!(menus(&mut f, pressed + LONG_PRESS, false).is_empty());
+        click(&mut f, BTN_LEFT, desktop());
+        f.manager.pointer_motion(
+            &mut f.comp.state,
+            desktop() + Point::from((CANCEL_THRESHOLD + 1.0, 0.0)),
+            4,
+        );
+        assert!(menus(&mut f, pressed + LONG_PRESS, false).is_empty());
+    }
+
+    #[test]
+    fn a_press_on_a_window_is_no_long_press() {
+        let mut f = two_windows();
+        output(&mut f);
+        click(&mut f, BTN_LEFT, alpha_only());
+        assert!(f.manager.background_menu_deadline().is_none());
+    }
+
+    #[test]
+    fn the_overview_and_the_lock_screen_open_no_menu() {
+        let mut f = two_windows();
+        output(&mut f);
+        f.manager.set_overview_open(true);
+        click(&mut f, BTN_RIGHT, desktop());
+        assert!(menus(&mut f, Instant::now(), false).is_empty());
+        f.manager.set_overview_open(false);
+        click(&mut f, BTN_RIGHT, desktop());
+        // The session locks before the runtime hands the click on.
+        assert!(menus(&mut f, Instant::now(), true).is_empty());
+        assert!(
+            menus(&mut f, Instant::now(), false).is_empty(),
+            "a click made before the lock is dropped, not delivered after"
+        );
+    }
+
+    #[test]
+    fn the_menu_position_is_local_to_the_output_it_is_on() {
+        let mut f = two_windows();
+        f.comp.state.add_output("DP-1", None, 1280, 800);
+        f.comp.state.add_output("DP-2", None, 1920, 1080);
+        // DP-2 tiles to the right of DP-1.
+        click(&mut f, BTN_RIGHT, (1280.0 + 400.0, 900.0).into());
+        assert_eq!(
+            menus(&mut f, Instant::now(), false),
+            vec![Message::BackgroundMenu {
+                connector: Some("DP-2".into()),
+                x: 400,
+                y: 900,
+            }]
+        );
+    }
+}

@@ -8,7 +8,9 @@
 //! - xdg-activation v1: an app may hand focus to another only with a
 //!   token minted while the requesting client held keyboard focus,
 //!   used within [`ACTIVATION_TOKEN_TTL`] (Mutter's focus-stealing
-//!   shape). Valid requests focus and raise the window.
+//!   shape). Valid requests focus and raise the window; a refused or
+//!   stale one makes it demand attention instead (`WindowDemandsAttention`,
+//!   #1185).
 //! - viewporter, fractional-scale v1 (preferred scale follows the target output),
 //!   single-pixel-buffer, cursor-shape v1.
 //! - idle-inhibit: an inhibitor on a surface the user sees holds off the
@@ -140,6 +142,12 @@ use crate::{State, WindowRequest};
 /// seconds between the launching click and the new window's request).
 pub const ACTIVATION_TOKEN_TTL: Duration = Duration::from_secs(10);
 
+/// How long a token is remembered, used or not: Mutter's startup
+/// sequence timeout (`STARTUP_TIMEOUT_MS`). One older than
+/// [`ACTIVATION_TOKEN_TTL`] but still remembered is stale, and activating
+/// with it demands attention; past this it is unknown and ignored.
+pub const ACTIVATION_TOKEN_RETENTION: Duration = Duration::from_secs(15);
+
 /// Protocol states held for the lifetime of the display.
 pub(crate) struct Protocols {
     #[cfg(feature = "xwayland")]
@@ -147,6 +155,12 @@ pub(crate) struct Protocols {
     pub(crate) dmabuf_state: DmabufState,
     pub(crate) dmabuf_global: Option<DmabufGlobal>,
     pub(crate) activation_state: XdgActivationState,
+    /// Tokens minted without the right to activate (a background client,
+    /// no input serial); an activation with one demands attention.
+    pub(crate) refused_tokens: std::collections::HashSet<XdgActivationToken>,
+    /// Surfaces whose activation was refused, not yet taken by the window
+    /// manager.
+    pub(crate) attention_requests: Vec<WlSurface>,
     _viewporter: ViewporterState,
     _fractional_scale: FractionalScaleManagerState,
     _single_pixel_buffer: SinglePixelBufferState,
@@ -208,6 +222,8 @@ impl Protocols {
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
             activation_state: XdgActivationState::new::<State>(dh),
+            refused_tokens: Default::default(),
+            attention_requests: Vec::new(),
             _viewporter: ViewporterState::new::<State>(dh),
             _fractional_scale: FractionalScaleManagerState::new::<State>(dh),
             _single_pixel_buffer: SinglePixelBufferState::new::<State>(dh),
@@ -559,6 +575,13 @@ impl State {
         std::mem::take(&mut self.protocols.pointer_warps)
     }
 
+    /// Drain the surfaces whose activation was refused (a token that is
+    /// refused or stale): the window manager makes them demand attention,
+    /// before it adopts any toplevel that arrived with the request.
+    pub(crate) fn take_attention_requests(&mut self) -> Vec<WlSurface> {
+        std::mem::take(&mut self.protocols.attention_requests)
+    }
+
     /// Client that currently holds keyboard focus, if any.
     fn keyboard_client(&self) -> Option<smithay::reexports::wayland_server::backend::ClientId> {
         let keyboard = self.seat.get_keyboard()?;
@@ -593,10 +616,27 @@ impl XdgActivationHandler for State {
 
     /// Mint only for the client holding keyboard focus, and only with
     /// an input serial: a background app cannot mint its way to focus.
-    fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
-        data.serial.is_some()
+    fn token_created(&mut self, token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
+        let allowed = data.serial.is_some()
             && data.client_id.is_some()
-            && data.client_id == self.keyboard_client()
+            && data.client_id == self.keyboard_client();
+        // Mutter keeps every committed token until its startup sequence
+        // times out, and an activation with one it will not honor
+        // demands attention instead (`maybe_activate`): keep the refused
+        // ones too, so `request_activation` can tell them from tokens it
+        // never issued, which Mutter ignores.
+        let protocols = &mut self.protocols;
+        protocols
+            .activation_state
+            .retain_tokens(|_, data| data.timestamp.elapsed() < ACTIVATION_TOKEN_RETENTION);
+        let known = &protocols.activation_state;
+        protocols
+            .refused_tokens
+            .retain(|token| known.data_for_token(token).is_some());
+        if !allowed {
+            protocols.refused_tokens.insert(token);
+        }
+        true
     }
 
     fn request_activation(
@@ -607,9 +647,15 @@ impl XdgActivationHandler for State {
     ) {
         // One use per token (ADR 0002's policy, now on the protocol).
         self.protocols.activation_state.remove_token(&token);
-        if token_data.timestamp.elapsed() < ACTIVATION_TOKEN_TTL {
+        let refused = self.protocols.refused_tokens.remove(&token);
+        if !refused && token_data.timestamp.elapsed() < ACTIVATION_TOKEN_TTL {
             self.window_requests
                 .push((surface, WindowRequest::Activate));
+        } else {
+            // `meta_window_set_demands_attention`: the app asked for
+            // focus it has no right to (a background client's token, one
+            // without an input serial, or one too old).
+            self.protocols.attention_requests.push(surface);
         }
     }
 }

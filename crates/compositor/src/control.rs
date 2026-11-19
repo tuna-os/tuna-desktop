@@ -616,7 +616,9 @@ impl<'a> Session<'a> {
     /// Peers older than 0.42 cannot decode `ConfirmDisplayChange`, nor
     /// older than 0.45 the tablet OSD messages, nor older than 0.48
     /// `WorkspaceProgress`, nor older than 0.49 `OverviewSwipe`, nor older
-    /// than 0.50 the close-dialog messages, and receive nothing.
+    /// than 0.50 the close-dialog messages, nor older than 0.54
+    /// `BackgroundMenu`, nor older than 0.55 `WindowDemandsAttention`, and
+    /// receive nothing.
     pub fn send_window_menu(&mut self, menu: &Message) -> Result<(), ControlError> {
         if matches!(menu, Message::ConfirmDisplayChange { .. }) && self.peer_minor < 42 {
             return Ok(());
@@ -632,6 +634,12 @@ impl<'a> Session<'a> {
             Message::ShowCloseDialog { .. } | Message::HideCloseDialog { .. }
         ) && self.peer_minor < 50
         {
+            return Ok(());
+        }
+        if matches!(menu, Message::BackgroundMenu { .. }) && self.peer_minor < 54 {
+            return Ok(());
+        }
+        if matches!(menu, Message::WindowDemandsAttention { .. }) && self.peer_minor < 55 {
             return Ok(());
         }
         let tablet = matches!(
@@ -1344,6 +1352,8 @@ impl<'a> Session<'a> {
             | Message::OverviewSwipe { .. }
             | Message::ShowCloseDialog { .. }
             | Message::HideCloseDialog { .. }
+            | Message::BackgroundMenu { .. }
+            | Message::WindowDemandsAttention { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
                     kind: ErrorKind::UnknownCommand,
@@ -1407,6 +1417,8 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::OverviewSwipe { .. } => "OverviewSwipe",
         Message::ShowCloseDialog { .. } => "ShowCloseDialog",
         Message::HideCloseDialog { .. } => "HideCloseDialog",
+        Message::BackgroundMenu { .. } => "BackgroundMenu",
+        Message::WindowDemandsAttention { .. } => "WindowDemandsAttention",
     }
 }
 
@@ -3414,6 +3426,14 @@ mod switcher_thumbnail_tests {
             .collect()
     }
 
+    /// The peer leaves. Shut the socket down rather than only dropping it:
+    /// a concurrently forked test child holds a duplicate of every open
+    /// descriptor until it execs, so a bare drop may not reach the hub as
+    /// EOF within `applied`'s rounds.
+    fn depart(client: ControlConn) {
+        client.stream.shutdown(std::net::Shutdown::Both).unwrap();
+    }
+
     #[test]
     fn a_departed_shell_takes_its_switcher_thumbnails_with_it() {
         let (_dir, mut hub, mut model) = setup();
@@ -3425,11 +3445,11 @@ mod switcher_thumbnail_tests {
         assert_eq!(drawn[0].len(), 2);
         assert_eq!(drain(&mut shell), [(1, CommandStatus::Applied)]);
         // Another peer leaving changes nothing.
-        drop(other);
+        depart(other);
         assert!(applied(&mut hub, &mut model).is_empty());
         assert_eq!(hub.sessions.len(), 1);
         // The shell dies mid-fade: the hub clears the drawn images once.
-        drop(shell);
+        depart(shell);
         assert_eq!(applied(&mut hub, &mut model), [Vec::new()]);
         assert!(hub.sessions.is_empty());
         assert!(applied(&mut hub, &mut model).is_empty());
@@ -3440,7 +3460,7 @@ mod switcher_thumbnail_tests {
         assert_eq!(applied(&mut hub, &mut model).len(), 1);
         send_thumbnails(&mut shell, 3, &[]);
         assert_eq!(applied(&mut hub, &mut model), [Vec::new()]);
-        drop(shell);
+        depart(shell);
         assert!(applied(&mut hub, &mut model).is_empty());
 
         // A replaced shell: the gate narrows to the new process and

@@ -38,11 +38,12 @@ pub mod layer_namespaces;
 pub use layer_namespaces::{
     APP_GRID_NAMESPACE, BANNER_NAMESPACE, CLOSE_DIALOG_NAMESPACE, DISPLAY_CHANGE_NAMESPACE,
     DOCK_NAMESPACE, END_SESSION_NAMESPACE, FOLDER_DIALOG_NAMESPACE, GTK_BANNERS_NAMESPACE,
-    GTK_PANEL_NAMESPACE, IBUS_CANDIDATES_NAMESPACE, KBD_A11Y_NAMESPACE, MOUNT_OPERATION_NAMESPACE,
-    NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE, OSK_NAMESPACE, OVERVIEW_NAMESPACE, PAD_OSD_NAMESPACE,
-    PANEL_NAMESPACE, POINTER_A11Y_NAMESPACE, POLKIT_NAMESPACE, PREVIEW_CHROME_NAMESPACE,
-    SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE, SWITCHER_NAMESPACE,
-    SWITCHER_THUMBNAILS_NAMESPACE, WINDOW_MENU_NAMESPACE, WORKSPACE_POPUP_NAMESPACE,
+    GTK_PANEL_NAMESPACE, IBUS_CANDIDATES_NAMESPACE, KBD_A11Y_NAMESPACE, KEYRING_PROMPT_NAMESPACE,
+    MONITOR_LABEL_NAMESPACE, MOUNT_OPERATION_NAMESPACE, NETWORK_AGENT_NAMESPACE, OSD_NAMESPACE,
+    OSK_NAMESPACE, OVERVIEW_NAMESPACE, PAD_OSD_NAMESPACE, PANEL_NAMESPACE, POINTER_A11Y_NAMESPACE,
+    POLKIT_NAMESPACE, PREVIEW_CHROME_NAMESPACE, SCREENSHOT_NAMESPACE, SHORTCUT_CONSENT_NAMESPACE,
+    SWITCHER_NAMESPACE, SWITCHER_THUMBNAILS_NAMESPACE, WINDOW_MENU_NAMESPACE,
+    WORKSPACE_POPUP_NAMESPACE,
 };
 
 /// Panel height in pixels (compositor ↔ shell contract).
@@ -227,9 +228,19 @@ impl ProtocolVersion {
     /// `HideCloseDialog`, and the shell-to-compositor `RespondCloseDialog`
     /// (gnome-shell's Force Quit / Wait). Positional postcard peers must
     /// ship together.
+    /// `0.51`-`0.53` belong to other branches (pidfd identity, mutter
+    /// gaps, remote access); this branch skips to `0.54`, which appends
+    /// the compositor-to-shell `BackgroundMenu` (a right click or long
+    /// press on the bare wallpaper opens gnome-shell's background menu,
+    /// #1184). Positional postcard peers must ship together.
+    /// `0.55` appends the compositor-to-shell `WindowDemandsAttention`
+    /// (a window that asked for focus without the right to, or opened
+    /// behind the focused one, gets gnome-shell's "is ready" notification,
+    /// #1185); it goes after `BackgroundMenu`, so the variants other
+    /// branches add at 0.51-0.53 must be placed before both.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 50,
+        minor: 55,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -1181,6 +1192,27 @@ pub enum Message {
     /// (`meta_window_set_alive (TRUE)`), went away, left the screen, or
     /// the session locked. Sent only to peers advertising minor >= 50.
     HideCloseDialog { window: WindowId },
+    /// Since 0.54: a right click, or a press held 500 ms within 36 px, on
+    /// the bare wallpaper (no window, layer surface or popup under the
+    /// pointer): open gnome-shell 51's background menu (`backgroundMenu.js`,
+    /// "Change Background…", "Display Settings", "Settings") at the
+    /// pointer. `x`/`y` are logical pixels local to the output
+    /// `connector` (`None`: the primary output). Sent only to peers
+    /// advertising minor >= 54, never while locked.
+    BackgroundMenu {
+        connector: Option<String>,
+        x: i32,
+        y: i32,
+    },
+    /// Since 0.55: `window` demands attention (`meta_window_set_demands_attention`):
+    /// it asked for focus without the right to take it (an xdg-activation
+    /// token that is refused or stale, `meta-wayland-activation.c`), or it
+    /// mapped behind the focused window (`window.c` `meta_window_show`).
+    /// The shell posts gnome-shell's "“Title” is ready" notification
+    /// (`windowAttentionHandler.js`) and withdraws it once the window is
+    /// focused or gone. Sent once per demand, only to peers advertising
+    /// minor >= 55, never for the focused window.
+    WindowDemandsAttention { window: WindowId },
 }
 
 /// [`Message::WorkspaceProgress`] positions are workspace indices times
@@ -2419,6 +2451,12 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
             }
         }
         Message::HideCloseDialog { .. } => {}
+        Message::BackgroundMenu { connector, .. } => {
+            if let Some(connector) = connector {
+                check_title(connector)?;
+            }
+        }
+        Message::WindowDemandsAttention { .. } => {}
     }
     Ok(())
 }
@@ -2637,11 +2675,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_50() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 50));
-        // A 0.49 shell still negotiates; a newer minor does not.
-        assert!(ProtocolVersion::new(0, 49).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 51).is_compatible_with(&CURRENT_VERSION));
+    fn current_version_is_0_55() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 55));
+        // A 0.50 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 50).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 56).is_compatible_with(&CURRENT_VERSION));
     }
 
     #[test]
@@ -4204,5 +4242,77 @@ mod close_dialog_wire_tests {
             let command = Message::Command { id: 11, kind };
             assert_eq!(decode_frame(&encode_frame(&command)).unwrap(), command);
         }
+    }
+}
+
+#[cfg(test)]
+mod background_menu_wire_tests {
+    use super::*;
+
+    #[test]
+    fn background_menu_follows_hide_close_dialog_and_roundtrips() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 256];
+        let hide =
+            tag(postcard::to_slice(&Message::HideCloseDialog { window: 1 }, &mut buffer).unwrap());
+        let menu = Message::BackgroundMenu {
+            connector: Some("DP-1".into()),
+            x: 640,
+            y: 360,
+        };
+        assert_eq!(
+            tag(postcard::to_slice(&menu, &mut buffer).unwrap()),
+            hide + 1
+        );
+        for message in [
+            menu,
+            Message::BackgroundMenu {
+                connector: None,
+                x: 0,
+                y: 0,
+            },
+        ] {
+            assert_eq!(decode_frame(&encode_frame(&message)).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn background_menu_connector_is_bounded() {
+        let long = Message::BackgroundMenu {
+            connector: Some("a".repeat(MAX_TITLE_LEN + 1)),
+            x: 0,
+            y: 0,
+        };
+        assert!(matches!(
+            decode_frame(&encode_frame(&long)),
+            Err(DecodeError::TitleTooLong { .. })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod window_attention_wire_tests {
+    use super::*;
+
+    #[test]
+    fn window_demands_attention_follows_background_menu_and_roundtrips() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 256];
+        let menu = tag(postcard::to_slice(
+            &Message::BackgroundMenu {
+                connector: None,
+                x: 0,
+                y: 0,
+            },
+            &mut buffer,
+        )
+        .unwrap());
+        let attention = Message::WindowDemandsAttention { window: 7 };
+        assert_eq!(
+            tag(postcard::to_slice(&attention, &mut buffer).unwrap()),
+            menu + 1,
+            "variant tags are positional: new messages go last"
+        );
+        assert_eq!(decode_frame(&encode_frame(&attention)).unwrap(), attention);
     }
 }

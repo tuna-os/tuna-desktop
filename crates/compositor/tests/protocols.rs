@@ -667,6 +667,222 @@ fn background_clients_and_serial_less_tokens_cannot_steal_focus() {
     assert_eq!(focused_title(&manager).as_deref(), Some("front"));
 }
 
+fn window_id(manager: &WindowManager, title: &str) -> u64 {
+    manager
+        .model()
+        .windows()
+        .find(|w| w.title == title)
+        .map(|w| w.id)
+        .unwrap_or_else(|| panic!("no window titled {title}"))
+}
+
+fn demands(window: u64) -> tuna_shell_control::Message {
+    tuna_shell_control::Message::WindowDemandsAttention { window }
+}
+
+/// A toplevel that has not committed, so it is not mapped yet.
+fn unmapped_window(peer: &mut Peer, title: &str) -> WlSurface {
+    let qh = peer.queue.handle();
+    let surface = peer
+        .client
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_surface(&qh, ());
+    let xdg = peer
+        .client
+        .wm
+        .as_ref()
+        .unwrap()
+        .get_xdg_surface(&surface, &qh, ());
+    let toplevel = xdg.get_toplevel(&qh, ());
+    toplevel.set_title(title.into());
+    std::mem::forget((xdg, toplevel));
+    surface
+}
+
+/// An activation with a token Mutter keeps but will not honor (a
+/// background client's, or one without an input serial) demands
+/// attention instead of moving focus (`meta_window_set_demands_attention`),
+/// once until the window is focused, never for the focused window.
+#[test]
+fn a_refused_activation_demands_attention_until_the_window_is_focused() {
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    let mut back = connect(&mut comp);
+    let mut front = connect(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    let back_window = window(&mut back, "back");
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    let front_window = window(&mut front, "front");
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    let (back_id, front_id) = (window_id(&manager, "back"), window_id(&manager, "front"));
+    assert_eq!(manager.model().focused(), Some(front_id));
+    assert!(manager.take_attention(false).is_empty(), "nothing yet");
+
+    let refuse = |comp: &mut TestCompositor,
+                  manager: &mut WindowManager,
+                  back: &mut Peer,
+                  front: &mut Peer| {
+        let _t = mint(back, true);
+        pump(comp, manager, &mut [back, front]);
+        let token = back.client.token.take().expect("a token string is sent");
+        back.client
+            .activation
+            .as_ref()
+            .unwrap()
+            .activate(token, &back_window);
+        pump(comp, manager, &mut [back, front]);
+    };
+
+    refuse(&mut comp, &mut manager, &mut back, &mut front);
+    assert_eq!(
+        focused_title(&manager).as_deref(),
+        Some("front"),
+        "focus stays"
+    );
+    assert_eq!(manager.take_attention(false), [demands(back_id)]);
+
+    // Demanding already: asking again says nothing new.
+    refuse(&mut comp, &mut manager, &mut back, &mut front);
+    assert!(manager.take_attention(false).is_empty());
+
+    // Focus clears it; the next refusal is a new demand.
+    manager.focus(&mut comp.state, Some(back_id));
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    manager.focus(&mut comp.state, Some(front_id));
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    refuse(&mut comp, &mut manager, &mut back, &mut front);
+    assert_eq!(manager.take_attention(false), [demands(back_id)]);
+
+    // The focused window demands nothing, and nothing is posted over
+    // the lock screen.
+    let _t = mint(&mut front, false);
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    let token = front.client.token.take().expect("token string");
+    front
+        .client
+        .activation
+        .as_ref()
+        .unwrap()
+        .activate(token, &front_window);
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    assert!(manager.take_attention(false).is_empty());
+    manager.focus(&mut comp.state, Some(back_id));
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    manager.focus(&mut comp.state, Some(front_id));
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    refuse(&mut comp, &mut manager, &mut back, &mut front);
+    assert!(manager.take_attention(true).is_empty(), "locked");
+}
+
+/// A token Mutter still remembers but that is too old demands attention;
+/// one it never issued is ignored; a fresh one still activates.
+#[test]
+fn a_stale_token_demands_attention_and_an_unknown_one_is_ignored() {
+    use smithay::wayland::xdg_activation::{XdgActivationHandler, XdgActivationTokenData};
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    let mut peer = connect(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let first = window(&mut peer, "first");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let _second = window(&mut peer, "second");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let first_id = window_id(&manager, "first");
+    assert_eq!(focused_title(&manager).as_deref(), Some("second"));
+
+    let activate =
+        |comp: &mut TestCompositor, manager: &mut WindowManager, peer: &mut Peer, token: String| {
+            peer.client
+                .activation
+                .as_ref()
+                .unwrap()
+                .activate(token, &first);
+            pump(comp, manager, &mut [peer]);
+        };
+
+    activate(&mut comp, &mut manager, &mut peer, "never-issued".into());
+    assert_eq!(focused_title(&manager).as_deref(), Some("second"));
+    assert!(manager.take_attention(false).is_empty(), "unknown: ignored");
+
+    let stale = comp
+        .state
+        .activation_state()
+        .create_external_token(XdgActivationTokenData {
+            timestamp: Instant::now() - Duration::from_secs(11),
+            ..Default::default()
+        })
+        .0
+        .to_string();
+    activate(&mut comp, &mut manager, &mut peer, stale);
+    assert_eq!(focused_title(&manager).as_deref(), Some("second"));
+    assert_eq!(manager.take_attention(false), [demands(first_id)]);
+
+    let fresh = comp
+        .state
+        .activation_state()
+        .create_external_token(XdgActivationTokenData::default())
+        .0
+        .to_string();
+    activate(&mut comp, &mut manager, &mut peer, fresh);
+    assert_eq!(focused_title(&manager).as_deref(), Some("first"));
+    assert!(manager.take_attention(false).is_empty());
+}
+
+/// A window that presented a refused token before it mapped
+/// (`add_pending_activate`) maps without focus, below the window that
+/// has it, and demands attention because that window hides it
+/// (`meta_window_show`); an ordinary new window still takes focus.
+#[test]
+fn a_window_mapping_after_a_refused_activation_opens_behind_the_focused_one() {
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    let mut back = connect(&mut comp);
+    let mut front = connect(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    let _first = window(&mut back, "first");
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    let _front_window = window(&mut front, "front");
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    let front_id = window_id(&manager, "front");
+    assert_eq!(manager.model().focused(), Some(front_id));
+
+    // A client's toplevel and its activation arrive together, before the
+    // compositor adopts the window.
+    let _t = mint(&mut back, true);
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    let token = back.client.token.take().expect("a token string is sent");
+    let late = unmapped_window(&mut back, "late");
+    back.client
+        .activation
+        .as_ref()
+        .unwrap()
+        .activate(token, &late);
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    late.commit();
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+
+    let late_id = window_id(&manager, "late");
+    assert_eq!(
+        manager.model().focused(),
+        Some(front_id),
+        "the denied window did not take focus"
+    );
+    let stack = manager.stacking_order();
+    let position = |id: u64| stack.iter().position(|other| *other == id).unwrap();
+    assert!(
+        position(late_id) < position(front_id),
+        "it opened below the focused window: {stack:?}"
+    );
+    assert_eq!(manager.take_attention(false), [demands(late_id)]);
+
+    // Without a refused request a new window takes focus as before.
+    let _plain = window(&mut back, "plain");
+    pump(&mut comp, &mut manager, &mut [&mut back, &mut front]);
+    assert_eq!(focused_title(&manager).as_deref(), Some("plain"));
+    assert!(manager.take_attention(false).is_empty());
+}
 #[test]
 fn toplevel_icon_assignment_is_double_buffered_and_survives_resource_destroy() {
     let mut comp = TestCompositor::new();

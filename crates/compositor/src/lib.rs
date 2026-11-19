@@ -86,6 +86,7 @@ mod a11y_shadow;
 pub mod animation;
 pub mod animation_clock;
 mod auth_owner;
+pub mod background_menu;
 mod bell;
 pub mod buffer_upload;
 pub mod capture_security;

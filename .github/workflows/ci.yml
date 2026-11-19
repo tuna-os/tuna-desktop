@@ -202,6 +202,7 @@ jobs:
       - run: python3 scripts/tests/test_fresh_accounts.py
       - run: python3 scripts/tests/test_try_tuna_signature_gate.py
       - run: python3 scripts/lib/keyring-owner-proof-tests.py
+      - run: python3 scripts/lib/keyring-sx-aes-tests.py
       - run: python3 scripts/lib/tray-absence-proof-tests.py
       - run: python3 scripts/lib/ledger-tests.py
       - run: python3 scripts/lib/ci-select-lanes-tests.py
@@ -1014,6 +1015,8 @@ jobs:
               ('menu-motion', 'TUNA_REQUIRE_MENU_MOTION=1', 'transient::gtk_menu_tests::actual_gtk_menus_close_at_once_and_switch_fade_only', 'MENU-MOTION pass ', 'actual GTK widgets, frame clock and GLib timers under private X11; Wayland layer-shell and the compositor-drawn close are proven by G-TRANSIENT-CLOSE-CLOCK'),
               ('popup-submenu', 'TUNA_REQUIRE_MENU_MOTION=1', 'transient::gtk_menu_tests::actual_gtk_popup_submenus_ease_open_and_closed', 'POPUP-SUBMENU pass ', 'actual GTK widgets, frame clock and GLib timers under private X11 (PopupSubMenu height and arrow, #501); the NetworkManager and IBus menus holding them are not driven by a proof'),
               ('lock-curtain', 'TUNA_REQUIRE_LOCK_CURTAIN=1', 'lock_curtain::gtk_curtain_tests::actual_gtk_curtain_pages_follow_progress_and_policy', 'LOCK-CURTAIN pass ', 'actual GTK widget allocation, focus and frame clock under private X11; the session-lock surface, real input and frozen-clock frames are proven by G-LOCK-CURTAIN-CLOCK, G-LOCK-CURTAIN-POLICY and G-LOCK-CURTAIN-DRAG'),
+              ('camera-indicator', 'TUNA_REQUIRE_CAMERA_INDICATOR=1', 'camera_indicator::tests::actual_gtk_camera_icon_follows_the_monitor_with_a_hold_off', 'CAMERA-INDICATOR pass ', 'actual GTK image visibility and GLib timers under private X11; which PipeWire nodes count is proven by the audio_state camera tests on pw-dump events'),
+              ('background-menu', 'TUNA_REQUIRE_BACKGROUND_MENU=1', 'background_menu::tests::actual_gtk_background_menu_lists_gnomes_rows_and_opens_their_panels', 'BACKGROUND-MENU pass ', 'actual GTK popup rows and buttons under private X11; the compositor gestures, the layer surface and the real click are proven by G-BACKGROUND-MENU'),
           ]
           for name, admit, test, marker, scope in proofs:
               artifacts = pathlib.Path('gtk-shell-artifacts') / name
@@ -1064,6 +1067,17 @@ jobs:
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/tuna-gtk-shell-proof --window-leak-only --artifacts gtk-shell-artifacts/window-leak
+      # GNOME 51 shell gaps (#1184-#1188): the background menu, monitor
+      # labels, window-attention notifications and the keyring prompter,
+      # each against the real compositor and shell in one nested session.
+      - name: GNOME 51 shell gaps
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: |
+          cargo build --locked -p tuna-compositor --example tuna-activation-client
+          scripts/tuna-gtk-shell-proof --shell-gaps-only --artifacts gtk-shell-artifacts/shell-gaps
       # Initial DnD target focus must not wait for another physical motion.
       # Run the unchanged shared hover/reorder assertions independently of
       # unrelated full-suite assertions, using this job's just-built binaries.
@@ -2171,6 +2185,7 @@ jobs:
           --assertions ledger-in/gtk-shell/session-restore/assertions.txt
           --assertions ledger-in/gtk-shell/osk/assertions.txt
           --assertions ledger-in/gtk-shell/lock-auth/assertions.txt
+          --assertions ledger-in/gtk-shell/shell-gaps/assertions.txt
           --assertions ledger-in/orca-speech/assertions.txt
           --assertions ledger-in/drm-smoke/assertions.txt
           --assertions ledger-in/marlin-vm/assertions.txt

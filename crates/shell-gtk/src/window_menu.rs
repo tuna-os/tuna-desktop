@@ -98,8 +98,30 @@ pub fn rows(req: &WindowMenuRequest) -> Vec<Row> {
     rows
 }
 
+/// Where a menu of `size` opens for a click at `(x, y)` on a screen of
+/// `screen`: 7px below the click (the boxpointer's 6px rise and its
+/// edge), kept on the screen.
+pub fn place(x: i32, y: i32, size: (i32, i32), screen: (i32, i32)) -> (i32, i32) {
+    (
+        x.min(screen.0 - size.0).max(0),
+        (y + 7).min(screen.1 - size.1).max(0),
+    )
+}
+
 /// Carries out a chosen item on a window.
 pub type Run = Rc<dyn Fn(u64, Item)>;
+
+/// One row of a menu [`WindowMenu::show`] draws.
+pub enum Entry {
+    /// `PopupSeparatorMenuItem`.
+    Separator,
+    /// A row; without an `action` it stays visible but greyed.
+    Item {
+        label: &'static str,
+        checked: bool,
+        action: Option<Rc<dyn Fn()>>,
+    },
+}
 
 pub struct WindowMenu {
     window: gtk::Window,
@@ -170,46 +192,92 @@ impl WindowMenu {
         ui
     }
 
+    /// The menu's layer surface window (for the tests that look inside).
+    #[cfg(test)]
+    pub fn window(&self) -> &gtk::Window {
+        &self.window
+    }
+
     /// Open GNOME's menu for `req`.
     pub fn open(self: &Rc<Self>, req: &WindowMenuRequest) {
+        let entries = rows(req)
+            .into_iter()
+            .map(|row| {
+                let Some(item) = row.item else {
+                    return Entry::Separator;
+                };
+                // Rows without an action of ours stay visible but greyed.
+                let action = row.sensitive.then(|| {
+                    let (run, window) = (self.run.clone(), req.window);
+                    Rc::new(move || run(window, item)) as Rc<dyn Fn()>
+                });
+                Entry::Item {
+                    label: row.label,
+                    checked: row.checked,
+                    action,
+                }
+            })
+            .collect();
+        // windowMenu.js:239: menu.open({fadeOnly: true}).
+        self.show(entries, None, req.x, req.y, true);
+    }
+
+    /// Open a menu of `entries` with its top-left corner 7px below
+    /// `(x, y)`, local to `monitor` (`None`: the compositor's choice of
+    /// output, whose first monitor bounds the menu), kept on the screen.
+    /// `fade_only` opens with BoxPointer's fade alone, otherwise its full
+    /// fade and slide (`PopupMenu.open`'s default).
+    pub fn show(
+        self: &Rc<Self>,
+        entries: Vec<Entry>,
+        monitor: Option<gtk::gdk::Monitor>,
+        x: i32,
+        y: i32,
+        fade_only: bool,
+    ) {
         self.drop_shown();
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
         menu.add_css_class("popup-menu-content");
         let mut first: Option<gtk::Button> = None;
-        for row in rows(req) {
-            if row.label.is_empty() {
-                let sep = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                sep.add_css_class("popup-separator-menu-item");
-                let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-                line.add_css_class("popup-separator-menu-item-separator");
-                line.set_valign(gtk::Align::Center);
-                line.set_vexpand(true);
-                sep.append(&line);
-                menu.append(&sep);
-                continue;
+        for entry in entries {
+            let (label, checked, action) = match entry {
+                Entry::Separator => {
+                    let sep = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                    sep.add_css_class("popup-separator-menu-item");
+                    let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                    line.add_css_class("popup-separator-menu-item-separator");
+                    line.set_valign(gtk::Align::Center);
+                    line.set_vexpand(true);
+                    sep.append(&line);
+                    menu.append(&sep);
+                    continue;
+                }
+                Entry::Item {
+                    label,
+                    checked,
+                    action,
+                } => (label, checked, action),
             };
             let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             let ornament = gtk::Image::new();
             ornament.add_css_class("popup-menu-ornament");
             ornament.set_pixel_size(16);
-            if row.checked {
+            if checked {
                 ornament.set_icon_name(Some("object-select-symbolic"));
             }
             content.append(&ornament);
-            let label = gtk::Label::new(Some(row.label));
+            let label = gtk::Label::new(Some(label));
             label.set_xalign(0.0);
             content.append(&label);
             let button = gtk::Button::builder().child(&content).build();
             button.add_css_class("popup-menu-item");
-            // Rows without an action of ours stay visible but greyed.
-            let sensitive = row.sensitive && row.item.is_some();
-            button.set_sensitive(sensitive);
-            if let Some(item) = row.item.filter(|_| sensitive) {
-                let (weak, window) = (Rc::downgrade(self), req.window);
+            button.set_sensitive(action.is_some());
+            if let Some(action) = action {
+                let weak = Rc::downgrade(self);
                 button.connect_clicked(move |_| {
                     if let Some(ui) = weak.upgrade() {
                         ui.close();
-                        (ui.run)(window, item);
+                        action();
                     }
                 });
                 if first.is_none() {
@@ -222,15 +290,18 @@ impl WindowMenu {
         // kept on the screen.
         let (_, natural) = menu.preferred_size();
         let (w, h) = (natural.width(), natural.height());
-        let screen = WidgetExt::display(&self.window)
-            .monitors()
-            .item(0)
-            .and_then(|m| m.downcast::<gtk::gdk::Monitor>().ok())
+        let screen = monitor
+            .clone()
+            .or_else(|| {
+                WidgetExt::display(&self.window)
+                    .monitors()
+                    .item(0)
+                    .and_then(|m| m.downcast::<gtk::gdk::Monitor>().ok())
+            })
             .map(|m| m.geometry())
             .map(|g| (g.width(), g.height()))
             .unwrap_or((1280, 800));
-        let x = req.x.min(screen.0 - w).max(0);
-        let y = (req.y + 7).min(screen.1 - h).max(0);
+        let (x, y) = place(x, y, (w, h), screen);
         let bin = MotionBin::box_pointer(&menu);
         bin.set_frame(Frame {
             opacity: 0.0,
@@ -239,6 +310,7 @@ impl WindowMenu {
         self.fixed.put(&bin, f64::from(x), f64::from(y));
         *self.shown.borrow_mut() = Some(bin.clone());
         self.closing.set(false);
+        self.window.set_monitor(monitor.as_ref());
         self.window.set_keyboard_mode(KeyboardMode::Exclusive);
         self.window.present();
         // Clicks anywhere reach the menu again (a close emptied them).
@@ -248,11 +320,16 @@ impl WindowMenu {
         if let Some(first) = first {
             first.grab_focus();
         }
-        // windowMenu.js:239: menu.open({fadeOnly: true}).
         bin.animate(
             &self.player,
             MENU_MS,
-            |_, t| menu_open(t).without_motion(),
+            move |_, t| {
+                if fade_only {
+                    menu_open(t).without_motion()
+                } else {
+                    menu_open(t)
+                }
+            },
             || {},
         );
     }
@@ -339,5 +416,15 @@ mod tests {
         assert!(maximized
             .iter()
             .any(|r| r.label == "Move to Workspace Left"));
+    }
+
+    #[test]
+    fn menus_open_7px_below_the_click_and_stay_on_the_screen() {
+        assert_eq!(place(100, 120, (200, 150), (1280, 800)), (100, 127));
+        // Past the right edge: pushed in; past the bottom: lifted.
+        assert_eq!(place(1200, 120, (200, 150), (1280, 800)), (1080, 127));
+        assert_eq!(place(100, 780, (200, 150), (1280, 800)), (100, 650));
+        // Larger than the screen: the top-left corner stays visible.
+        assert_eq!(place(10, 10, (2000, 1000), (1280, 800)), (0, 0));
     }
 }

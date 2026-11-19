@@ -260,6 +260,40 @@ Each interface checks its caller itself. The main policies:
 Neither `UNRESTRICTED` variable is set by the packaged session
 (`share/wayland-sessions/tuna.desktop`, `crates/compositor/src/bin/tuna-session.rs`).
 
+#### Keyring system prompter (`org.gnome.keyring.SystemPrompter`)
+
+The GTK shell owns this name as GNOME Shell's `components/keyring.js` does,
+and serves gcr's `org.gnome.keyring.internal.Prompter` so gnome-keyring and
+other gcr clients can ask for a password, a new password or a yes/no in a
+system-modal dialog over the dimmed screen (`shell-gtk/src/keyring_prompter.rs`,
+`keyring_dialog.rs`). Any process of the session may be a client; that is
+the protocol. What it gets and what it cannot get:
+
+- A prompt is the pair (the caller's unique bus name, its callback path).
+  The bus supplies the name, so a client cannot answer, change, stop or take
+  the turn of another client's prompt; `PerformPrompt` and `StopPrompting` find
+  the prompt by that pair. Prompts queue one at a time; a client has at most
+  four and the session 32; property text is cut at 8 KiB and never parsed as
+  markup. A client that leaves the bus ends its prompts at once.
+- The answer is called back only on the unique name that began the prompt,
+  inside a gcr `sx-aes-1` secret exchange: 1536-bit MODP Diffie-Hellman
+  (RFC 3526 group 5), HKDF-SHA256, AES-128-CBC (`keyring_exchange.rs`; known
+  answers from an independent Python implementation that is itself checked
+  against libgcr, `scripts/lib/keyring-sx-aes-tests.py`). A process that only
+  reads the bus sees ciphertext (G-KEYRING-ISOLATION runs `dbus-monitor` against
+  it). Public keys are not authenticated, so a process that can rewrite
+  messages on the session bus could substitute its own key. gcr has the same
+  limit: the exchange keeps a bus eavesdropper out, and the session bus
+  itself stays the same-user trust boundary.
+- The password exists in this process only: in the dialog's entry, then in
+  zeroizing buffers until it is encrypted. `num-bigint` and GTK's text widget
+  do not zeroize; copies of the private exponent's integer form and of the
+  entry's text may linger in freed memory.
+- The name is requested without queueing: if another process owns it, the
+  shell does nothing and serves nothing. It allows replacement; a replaced
+  prompter tells its clients they are done. While the session is locked every
+  prompt is cancelled at once, as GNOME's `KeyringDummyDialog` does.
+
 ### Native CI reference observer (not product authority)
 
 `packaging/marlin/vm-lane/tuna-vm-gnome-reference` is a fixed, finite CI

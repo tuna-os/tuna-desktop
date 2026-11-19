@@ -33,6 +33,14 @@ roxmltree = "0.21"
 # The pad OSD's libwacom layout diagram (pad_osd.rs).
 resvg.workspace = true
 svgtypes = "0.16"
+# The keyring prompter's gcr "sx-aes-1" secret exchange (keyring_exchange.rs):
+# 1536-bit MODP Diffie-Hellman, HKDF-SHA256, AES-128-CBC; secrets are zeroized.
+aes = "0.9"
+cbc = "0.2"
+hkdf = "0.13"
+sha2 = "0.11"
+num-bigint = "0.4"
+zeroize = "1"
 tuna-shell-host = { path = "../shell-host", version = "0.1.0" }
 tuna-shell-control = { path = "../shell-control-schema", version = "0.1.0" }
 tuna-output = { path = "../output", version = "0.1.0" }

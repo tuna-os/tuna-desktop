@@ -426,6 +426,17 @@ pub struct WindowManager {
     /// Window-menu requests `(window, x, y)` in global logical pixels,
     /// drained by the runtime for the shell.
     menu_requests: Vec<(u64, i32, i32)>,
+    /// The wallpaper's right click and long press (GNOME's background
+    /// menu); the runtime drains what they recognized for the shell.
+    background: crate::background_menu::Gestures,
+    /// Windows demanding attention that have not been focused since
+    /// (`wm_state_demands_attention`), and those not yet announced to the
+    /// shell.
+    attention: HashSet<u64>,
+    attention_queue: Vec<u64>,
+    /// Surfaces whose xdg-activation request was refused before they
+    /// mapped: they map without taking focus.
+    denied_map: HashSet<WlSurface>,
     /// The active workspace at the last reconcile.
     last_active_workspace: Option<u32>,
     /// The modifiers of the chord that opened the switcher, Shift
@@ -725,6 +736,10 @@ impl WindowManager {
             lock_swipe: false,
             tablet: tablet_input::TabletFocus::default(),
             menu_requests: Vec::new(),
+            background: crate::background_menu::Gestures::default(),
+            attention: HashSet::new(),
+            attention_queue: Vec::new(),
+            denied_map: HashSet::new(),
             last_active_workspace: None,
             switcher_opener: 0,
             switcher_keys: None,
@@ -1627,6 +1642,19 @@ impl WindowManager {
             let time = (crate::state::system_millis() & u64::from(u32::MAX)) as u32;
             self.pointer_motion(state, pos, time);
         }
+        // Refused activations come before any toplevel that arrived with
+        // one is adopted: `add_pending_activate` holds the request for a
+        // window that has not mapped, and it maps without taking focus.
+        for wl in state.take_attention_requests() {
+            match self.surface_index.get(&wl).copied() {
+                Some(id) => self.demand_attention(id),
+                None if wl.is_alive() => {
+                    self.denied_map.retain(|surface| surface.is_alive());
+                    self.denied_map.insert(wl);
+                }
+                None => {}
+            }
+        }
         let live: Vec<ToplevelSurface> = state.toplevels();
         let mut seen = Vec::with_capacity(live.len());
         for surface in &live {
@@ -1853,13 +1881,14 @@ impl WindowManager {
             restore.announce();
             self.apply_session_restore(state, id, &restore.state);
         }
-        self.finish_map(state, id);
+        let denied = self.denied_map.remove(surface.wl_surface());
+        self.finish_map(state, id, denied);
         id
     }
 
     /// Shared tail of every map path (native and X11): stacking slot,
     /// scroll-mode membership, initial configure, and focus.
-    fn finish_map(&mut self, state: &mut State, id: u64) {
+    fn finish_map(&mut self, state: &mut State, id: u64, denied: bool) {
         // niri opens a new column right of the focused one; floating
         // windows go on top.
         let after_focused = (self.mode == SessionMode::Scroll)
@@ -1888,6 +1917,9 @@ impl WindowManager {
                 .is_some_and(|entry| entry.workspace != self.model.active_workspace());
         if elsewhere || self.hidden_by_minimize().contains(&id) {
             self.configure(id, false);
+            return;
+        }
+        if denied && self.map_without_focus(id) {
             return;
         }
         self.configure(id, true);
@@ -2229,7 +2261,7 @@ impl WindowManager {
             self.place_above(parent, id);
         }
         self.note_preferred_output(state, id);
-        self.finish_map(state, id);
+        self.finish_map(state, id, false);
         id
     }
 
@@ -2487,6 +2519,7 @@ impl WindowManager {
             self.pointer_window = None;
         }
         self.model.remove(id);
+        self.attention.remove(&id);
         if self
             .grab
             .and_then(Self::strip_grab_owner)
@@ -2712,6 +2745,10 @@ impl WindowManager {
         let id = id.map(|id| self.activation_target(id));
         let previous = self.model.focused();
         self.model.set_focused(id);
+        if let Some(id) = id {
+            // `meta_window_unset_demands_attention` on focus.
+            self.attention.remove(&id);
+        }
         // meta_display_set_input_focus drops another window's auto-raise.
         if self
             .auto_raise
@@ -3759,6 +3796,7 @@ impl WindowManager {
         };
         let travelled = (pos.x - self.pointer_pos.x).hypot(pos.y - self.pointer_pos.y);
         self.pointer_pos = pos;
+        self.background.motion(pos);
         // An interactive move/resize owns the pointer until release.
         if self.grab_motion(state, pos) {
             return;
@@ -4094,6 +4132,13 @@ impl WindowManager {
     /// IBus's candidate window does) so panel menus take keys; the
     /// button itself follows pointer focus from the last motion.
     pub fn pointer_button(&mut self, state: &mut State, button: u32, pressed: bool, time: u32) {
+        if pressed {
+            // A new press first ends any long press in progress; one that
+            // lands on the bare wallpaper begins its own below.
+            self.background.cancel();
+        } else {
+            self.background.release(button);
+        }
         let trace = std::env::var_os("TUNA_POINTER_TRACE").is_some();
         if trace {
             // Everything that decides where a press lands, before it acts:
@@ -4295,6 +4340,10 @@ impl WindowManager {
                     // every raise-on-click press raises, focused or not.
                     self.raise_family(id);
                 }
+            } else if !self.lock_input_active {
+                // Nothing under the pointer: the bare wallpaper.
+                self.background
+                    .press(button, pos, std::time::Instant::now());
             }
         }
         // Mapping, closing or restacking a surface can change what lies
@@ -5029,6 +5078,133 @@ impl WindowManager {
     /// Window-menu requests since the last call: `(window, x, y)`.
     pub fn take_menu_requests(&mut self) -> Vec<(u64, i32, i32)> {
         std::mem::take(&mut self.menu_requests)
+    }
+
+    /// The shell's `WindowDemandsAttention` messages for the windows that
+    /// began demanding attention since the last call and are still
+    /// unfocused (`window-demands-attention`). Nothing is posted over the
+    /// lock screen, and a window that gained focus meanwhile is not
+    /// announced.
+    pub fn take_attention(&mut self, locked: bool) -> Vec<tuna_shell_control::Message> {
+        let queued = std::mem::take(&mut self.attention_queue);
+        if locked {
+            self.attention.clear();
+            return Vec::new();
+        }
+        queued
+            .into_iter()
+            .filter(|id| self.attention.contains(id))
+            .map(|window| tuna_shell_control::Message::WindowDemandsAttention { window })
+            .collect()
+    }
+
+    /// `meta_window_set_demands_attention`: flag `id` and queue it for the
+    /// shell, once until it is focused. The focused window never
+    /// demands attention.
+    fn demand_attention(&mut self, id: u64) {
+        if self.model.focused() == Some(id) {
+            return;
+        }
+        if self.attention.insert(id) {
+            self.attention_queue.push(id);
+        }
+    }
+
+    /// `meta_window_show` (window.c) for a window denied focus on map: it
+    /// maps behind the focused window, raised above it only when it does
+    /// not overlap it, and demands attention when the focused window
+    /// hides it. False when the window takes focus as usual: nothing is
+    /// focused, the focused window is its transient parent, or the
+    /// overview holds focus.
+    fn map_without_focus(&mut self, id: u64) -> bool {
+        if self.mode != SessionMode::Gnome || self.overview_held.is_some() {
+            return false;
+        }
+        let visible: HashSet<_> = self.visible_entries().into_iter().map(|e| e.0).collect();
+        let Some(focus) = self
+            .model
+            .focused()
+            .filter(|focus| *focus != id && visible.contains(focus))
+        else {
+            return false;
+        };
+        // `meta_window_is_ancestor_of_transient`: a dialog of the focused
+        // window takes focus.
+        let mut ancestor = self.transient_parent(id);
+        for _ in 0..64 {
+            match ancestor {
+                Some(parent) if parent == focus => return false,
+                Some(parent) => ancestor = self.transient_parent(parent),
+                None => break,
+            }
+        }
+        let overlap = match (self.windows.get(&id), self.windows.get(&focus)) {
+            (Some(new), Some(focused)) => new.geometry.overlaps(focused.geometry),
+            _ => false,
+        };
+        // "We don't want the denied-focus window to obscure the focus
+        // window", and in click mode with raise-on-click the stacking
+        // order is the focus order.
+        if overlap
+            || (!self.focus_policy.mode.follows_pointer() && self.focus_policy.raise_on_click)
+        {
+            self.stacking.retain(|other| *other != id);
+            let at = self
+                .stacking
+                .iter()
+                .position(|other| *other == focus)
+                .unwrap_or(self.stacking.len());
+            self.stacking.insert(at, id);
+        }
+        self.configure(id, false);
+        if overlap {
+            self.demand_attention(id);
+        }
+        true
+    }
+
+    /// When an armed long press on the wallpaper is due.
+    pub fn background_menu_deadline(&self) -> Option<std::time::Instant> {
+        self.background.deadline()
+    }
+
+    /// The shell's `BackgroundMenu` messages for the right clicks and long
+    /// presses on the bare wallpaper recognized by `now`: where each
+    /// opens, local to the output it is on. Nothing opens over the lock
+    /// screen.
+    pub fn take_background_menus(
+        &mut self,
+        state: &State,
+        now: std::time::Instant,
+        locked: bool,
+    ) -> Vec<tuna_shell_control::Message> {
+        if locked || self.lock_input_active {
+            self.background.cancel();
+            self.background.take();
+            return Vec::new();
+        }
+        self.background.tick(now);
+        let slices = state.output_slices();
+        self.background
+            .take()
+            .into_iter()
+            .map(|at| {
+                let (x, y) = (at.x.floor() as i32, at.y.floor() as i32);
+                let slice = slices
+                    .iter()
+                    .find(|(_, area)| area.contains((x, y)))
+                    .or_else(|| slices.first());
+                let (connector, origin) = match slice {
+                    Some((name, area)) => (Some(name.clone()), area.loc),
+                    None => (None, (0, 0).into()),
+                };
+                tuna_shell_control::Message::BackgroundMenu {
+                    connector,
+                    x: x - origin.x,
+                    y: y - origin.y,
+                }
+            })
+            .collect()
     }
 
     /// Replace the accelerator grabs (org.gnome.Shell GrabAccelerators).

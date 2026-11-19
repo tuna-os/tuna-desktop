@@ -1,0 +1,31 @@
+{
+ "private_a": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+ "private_b": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+ "a_begin": "[sx-aes-1]\npublic=xJq+iqU3fxggYf2ioBbNNogB2ceMBfi6kw9fuzglEpWuXmn8U0WQcVDotO+PDpGoziz2D7vTK3t+LWh8sxEY/+WKo8SsKQKrQs0jNQ1Go/0qFQDU1PUQSUod8+P3sgTEHed2BUnq/vI0ljhCbOm/YpPmQXkhLoeF1eOIDkKVXDi2o0moaiibBq1ia0P61gLHD9Gx/iNfopxlY0SCr4kxSZr/9Qvvw7FQIj+Hvl5GbRUTnarJA82BtLhLHomUFaYH\n",
+ "b_begin": "[sx-aes-1]\npublic=L2dj5jy5BpeJypykZu8FHN8KVnyGD9WElsGFIGAvrQ4CzPaSMPcT8N5I4X2Qvaz2k2y7z2olld3CceZyc/3rYpZnbjxQFK5jDHdPSvTkSQBYXSzimq6TZjuGjO+XcFpY5EtAjKAb7lCMCXLxFS6qAK4Gxc71OJ4Z3OQGVK38umf0bY9uNE27j4YVolitbBfryq8L6GIY147e9na0oBXGO2FHiBimEAVqoZ+LWN2MkkzvkICCApf2QsMK1ysSy1dB\n",
+ "shared_sha256": "50bd9bbe59e9a55eacb4ca133559d3dcfe559f51c1f05cd8118e953926caef8f",
+ "key": "6e397ffb2afeb511ac5ade9024c80148",
+ "iv": "101112131415161718191a1b1c1d1e1f",
+ "b_send": [
+  {
+   "secret": "correct horse battery staple",
+   "exchange": "[sx-aes-1]\npublic=L2dj5jy5BpeJypykZu8FHN8KVnyGD9WElsGFIGAvrQ4CzPaSMPcT8N5I4X2Qvaz2k2y7z2olld3CceZyc/3rYpZnbjxQFK5jDHdPSvTkSQBYXSzimq6TZjuGjO+XcFpY5EtAjKAb7lCMCXLxFS6qAK4Gxc71OJ4Z3OQGVK38umf0bY9uNE27j4YVolitbBfryq8L6GIY147e9na0oBXGO2FHiBimEAVqoZ+LWN2MkkzvkICCApf2QsMK1ysSy1dB\nsecret=wQS/5XT+k3HiKfJUQ2uiOj6+BbvVL7Jgpl+YACnQYV0=\niv=EBESExQVFhcYGRobHB0eHw==\n"
+  },
+  {
+   "secret": "pässwörd 🔑",
+   "exchange": "[sx-aes-1]\npublic=L2dj5jy5BpeJypykZu8FHN8KVnyGD9WElsGFIGAvrQ4CzPaSMPcT8N5I4X2Qvaz2k2y7z2olld3CceZyc/3rYpZnbjxQFK5jDHdPSvTkSQBYXSzimq6TZjuGjO+XcFpY5EtAjKAb7lCMCXLxFS6qAK4Gxc71OJ4Z3OQGVK38umf0bY9uNE27j4YVolitbBfryq8L6GIY147e9na0oBXGO2FHiBimEAVqoZ+LWN2MkkzvkICCApf2QsMK1ysSy1dB\nsecret=4XK4OOgGFDHIGzqnI7+rLw==\niv=EBESExQVFhcYGRobHB0eHw==\n"
+  },
+  {
+   "secret": "",
+   "exchange": "[sx-aes-1]\npublic=L2dj5jy5BpeJypykZu8FHN8KVnyGD9WElsGFIGAvrQ4CzPaSMPcT8N5I4X2Qvaz2k2y7z2olld3CceZyc/3rYpZnbjxQFK5jDHdPSvTkSQBYXSzimq6TZjuGjO+XcFpY5EtAjKAb7lCMCXLxFS6qAK4Gxc71OJ4Z3OQGVK38umf0bY9uNE27j4YVolitbBfryq8L6GIY147e9na0oBXGO2FHiBimEAVqoZ+LWN2MkkzvkICCApf2QsMK1ysSy1dB\nsecret=yICXbsXXKbh7ya/j4hyt2A==\niv=EBESExQVFhcYGRobHB0eHw==\n"
+  },
+  {
+   "secret": null,
+   "exchange": "[sx-aes-1]\npublic=L2dj5jy5BpeJypykZu8FHN8KVnyGD9WElsGFIGAvrQ4CzPaSMPcT8N5I4X2Qvaz2k2y7z2olld3CceZyc/3rYpZnbjxQFK5jDHdPSvTkSQBYXSzimq6TZjuGjO+XcFpY5EtAjKAb7lCMCXLxFS6qAK4Gxc71OJ4Z3OQGVK38umf0bY9uNE27j4YVolitbBfryq8L6GIY147e9na0oBXGO2FHiBimEAVqoZ+LWN2MkkzvkICCApf2QsMK1ysSy1dB\n"
+  }
+ ],
+ "gcr_send": {
+  "secret": "gcr says hi",
+  "exchange": "[sx-aes-1]\npublic=7l1UL3t8xvjw7/X9zYJZg+oNBt4puWG7S4Zxp5Fe/PaQHmBnj0lL7ols15TDQOz1j+u8s+WBCmnJjHCyqZVgb08qWfeen0qJsto/oCz+6DT6T1HZNakS1Td7yLZI29dXoQJrA2/ihaVbKHqyO5KCrLlXdyM5OVYzDlP1UaEAZ5nMl7ZF/LKr1Is6hP8ExnXhVcdNxkQiY96W2fxay/KFn6JIG/OmPlltsCxgS6OnNTAB0aSP5X0jubCWwZTUAjVo\nsecret=9ut41ecJk2K+WJ8zWgJ7fA==\niv=J1ShFl5nY40yobs+FJpTgg==\n"
+ }
+}
