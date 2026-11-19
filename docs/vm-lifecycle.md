@@ -47,6 +47,20 @@ and 120-second phase deadlines remain unchanged. No updater service,
 notification policy or failure log is disabled; acknowledging a banner does
 not qualify the update operation that produced it.
 
+Banners queue, as in GNOME's message tray: the shell shows one at a time and
+never times out a critical one, so closing it drops the next into the same
+layer. The probe closes each in turn, as a user would. The observer reports
+each Close control's accessible object path, which names that widget
+instance and not its content; the shell builds a new card for every banner
+it shows. A Close instance receives Return at most once. When the banner
+layer is still there 0.6 s after Return, the probe observes it again. A new
+Close instance gets the same Super+N, Tab and focused-Return sequence. The
+one it already activated is never activated again, and the capture deadline
+then fails the case. In marlin-vm run 44442598008, uupd failed three times
+and queued three critical "Some System Updates Failed" banners. The probe
+closed only the first, and the next one covered the frame until
+`V-STRIP-INSTALLED` timed out.
+
 The column-height capture also submits a real critical notification through
 the session's public notification service. It cannot pass until the original
 shell shows the fixed public fixture title, its sensitive Close button receives
@@ -685,7 +699,9 @@ That control must belong to the original shell process and its AT-SPI bus.
 It must report `FOCUSED`.
 A layer namespace alone is not proof of that owner.
 
-After the normal Close action, the banner must be absent and all keys released.
+After the normal Close action, the banner must be absent and all keys released;
+a queued banner that drops in instead gets its own focused Close (see
+"Installed strip captures").
 Original windows, focus, workspace and session mode must remain unchanged.
 Both PNG and PPM still need all original 25 color checks.
 No pointer coordinates or empirical offsets select the control.

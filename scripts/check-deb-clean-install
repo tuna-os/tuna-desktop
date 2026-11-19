@@ -97,7 +97,7 @@ helper=/usr/libexec/tuna-geoclue-agent-policy
     || fail "tuna-shell-gtk is not beside tuna-compositor"
 # Fresh-install contents only: upgrade/PAM/display-manager proofs are separate.
 # tuna-rename: keep-begin
-for path in /usr/share/wayland-sessions/roost.desktop /etc/pam.d/roost-lock /etc/pam.d/tuna-lock; do
+for path in /usr/share/wayland-sessions/roost.desktop /etc/pam.d/roost-lock /etc/pam.d/tuna-lock /etc/pam.d/tuna-lock-fingerprint; do
     [ -f "$path" ] && [ ! -L "$path" ] || fail "invalid retained regular file $path"
     [ "$(stat -c "%u:%g %a" "$path")" = "0:0 644" ] || fail "$path not root-owned 0644"
 done
@@ -116,9 +116,11 @@ for service in tuna-lock roost-lock; do
     [ "$rules" = "$(printf "auth include login\naccount include login")" ] || fail "invalid PAM bridge $service"
 done
 # tuna-rename: keep-end
+rules="$(sed -e "/^[[:space:]]*#/d" -e "/^[[:space:]]*$/d" /etc/pam.d/tuna-lock-fingerprint | awk "{print \$1, \$2, \$3}")"
+[ "$rules" = "$(printf "auth required pam_fprintd.so\naccount include login")" ] || fail "invalid PAM service tuna-lock-fingerprint"
 EXEC="$(sed -n "s/^Exec=\([^ ]*\).*/\1/p" /usr/share/wayland-sessions/tuna.desktop)"
 command -v "$EXEC" >/dev/null || fail "session Exec $EXEC not installed"
-for path in /usr/lib/systemd/user/tuna-session.target /etc/pam.d/tuna-lock; do
+for path in /usr/lib/systemd/user/tuna-session.target /etc/pam.d/tuna-lock /etc/pam.d/tuna-lock-fingerprint; do
     [ "$(stat -c "%u:%g" "$path")" = "0:0" ] || fail "$path not root-owned"
 done
 ' || fail "clean install on $IMAGE failed"

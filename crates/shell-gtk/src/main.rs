@@ -420,6 +420,9 @@ fn drain(
             }
             Handled::ClosePadOsd { pad } => out.tablet.push(TabletUi::Close(pad)),
             Handled::SeatTouchMode(touch_mode) => out.touch_mode = Some(touch_mode),
+            // Read back through `lock_screen_shown`; a frame was handled,
+            // so the screen saver syncs after this drain.
+            Handled::LockScreenShown(_) => {}
             Handled::CommandResult { id, status } => out.results.push((
                 id,
                 matches!(status, tuna_shell_control::CommandStatus::Applied),
@@ -2939,7 +2942,13 @@ fn build(app: &adw::Application) {
         },
         {
             let shell = shell.clone();
-            Rc::new(move || shell.borrow().control.as_ref().is_some_and(|c| c.locked()))
+            Rc::new(move || {
+                shell
+                    .borrow()
+                    .control
+                    .as_ref()
+                    .is_some_and(|c| c.lock_screen_shown())
+            })
         },
     );
     // Wellbeing (#354): screen-time history/limits and break reminders.
@@ -4087,6 +4096,10 @@ fn build(app: &adw::Application) {
                 } = drained;
                 let mut shell = shell.borrow_mut();
                 let locked = shell.control.as_ref().is_some_and(|c| c.locked());
+                let lock_shown = shell
+                    .control
+                    .as_ref()
+                    .is_some_and(|c| c.lock_screen_shown());
                 let auth_generation = shell.control.as_ref().map(|c| c.connection_generation());
                 let authoritative_lock = shell
                     .control
@@ -4161,7 +4174,12 @@ fn build(app: &adw::Application) {
                 }
                 // Thunderbolt devices enrol only in an unlocked session.
                 thunderbolt.sync_lock(authoritative_lock);
-                screensaver.sync(locked);
+                // Active once the curtain has landed, as gnome-shell's
+                // `_lockScreenShown`: gnome-settings-daemon blanks the
+                // screen on ActiveChanged(true), which mid-slide would
+                // freeze the curtain off screen. Each confirmed unlock
+                // wakes the screen first, as `_continueDeactivate` does.
+                screensaver.sync(authoritative_lock, lock_shown);
                 // The session keyboard never shows over the lock screen.
                 osk.set_locked(locked);
                 for (focus, show, touch_auto) in osk_updates {

@@ -112,11 +112,12 @@ install -m0755 packaging/marlin/tuna-geoclue-agent-policy \
 install -m0644 share/compat/wayland-sessions/roost.desktop \
     "$STAGE/usr/share/wayland-sessions/roost.desktop"
 # tuna-rename: keep-end
-# Both PAM services are conffiles; let dpkg preserve local edits/removals.
+# Every PAM service is a conffile; let dpkg preserve local edits/removals.
 install -m0644 share/pam.d/tuna-lock "$STAGE/etc/pam.d/tuna-lock"
+install -m0644 share/pam.d/tuna-lock-fingerprint "$STAGE/etc/pam.d/tuna-lock-fingerprint"
 # tuna-rename: keep-begin
 install -m0644 share/compat/pam.d/roost-lock "$STAGE/etc/pam.d/roost-lock"
-printf '%s\n' /etc/pam.d/tuna-lock /etc/pam.d/roost-lock >"$STAGE/DEBIAN/conffiles"
+printf '%s\n' /etc/pam.d/tuna-lock /etc/pam.d/tuna-lock-fingerprint /etc/pam.d/roost-lock >"$STAGE/DEBIAN/conffiles"
 # tuna-rename: keep-end
 chmod 0644 "$STAGE/DEBIAN/conffiles"
 # Former package control relations permit replacing the installed package.

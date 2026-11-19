@@ -232,6 +232,7 @@ class PackagePolicy(unittest.TestCase):
                 ('usr/share/wayland-sessions/roost.desktop', 'share/compat/wayland-sessions/roost.desktop'),
                 ('usr/lib/systemd/user/tuna-session.target', 'share/systemd/user/tuna-session.target'),
                 ('etc/pam.d/tuna-lock', 'share/pam.d/tuna-lock'),
+                ('etc/pam.d/tuna-lock-fingerprint', 'share/pam.d/tuna-lock-fingerprint'),
                 ('etc/pam.d/roost-lock', 'share/compat/pam.d/roost-lock')):
             p = self.stage / installed
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -256,7 +257,7 @@ class PackagePolicy(unittest.TestCase):
 --ctrl-tarfile) tar --owner=0 --group=0 -C "$FIXTURE" -cf - ./conffiles ;;
 --fsys-tarfile) tar --owner=0 --group=0 -C "$FIXTURE" -cf - ./usr ./etc ;;
 esac''')
-        (self.stage / 'conffiles').write_text('/etc/pam.d/tuna-lock\n/etc/pam.d/roost-lock\n')  # tuna-rename: keep
+        (self.stage / 'conffiles').write_text('/etc/pam.d/tuna-lock\n/etc/pam.d/tuna-lock-fingerprint\n/etc/pam.d/roost-lock\n')  # tuna-rename: keep
         (self.stage / 'conffiles').chmod(0o644)
         self.tool('ldd', 'echo "libc.so.6 => /lib/libc.so.6 (0)"')
         self.tool('desktop-file-validate', 'exit 0')
@@ -306,7 +307,7 @@ esac''')
                 path.write_text('forbidden\n')
                 self.assertNotEqual(self.check(), 0)
                 path.unlink()
-        for retained in ('usr/share/wayland-sessions/roost.desktop', 'etc/pam.d/roost-lock'):
+        for retained in ('usr/share/wayland-sessions/roost.desktop', 'etc/pam.d/roost-lock', 'etc/pam.d/tuna-lock-fingerprint'):
             with self.subTest(missing=retained):
                 path = self.stage / retained
                 original = path.read_bytes()
@@ -421,9 +422,9 @@ for path in usr usr/libexec usr/share usr/share/wayland-sessions etc etc/pam.d; 
 done
 assert_mode 755 "$3/usr/libexec/tuna-geoclue-agent-policy"
 for path in DEBIAN/control DEBIAN/conffiles; do assert_mode 644 "$3/$path"; done
-printf '%s\\n' /etc/pam.d/tuna-lock /etc/pam.d/roost-lock >"$EXPECTED_CONFFILES"
+printf '%s\\n' /etc/pam.d/tuna-lock /etc/pam.d/tuna-lock-fingerprint /etc/pam.d/roost-lock >"$EXPECTED_CONFFILES"
 cmp "$EXPECTED_CONFFILES" "$3/DEBIAN/conffiles"
-for path in usr/share/wayland-sessions/roost.desktop etc/pam.d/roost-lock; do
+for path in usr/share/wayland-sessions/roost.desktop etc/pam.d/roost-lock etc/pam.d/tuna-lock etc/pam.d/tuna-lock-fingerprint; do
     test -f "$3/$path"; test ! -L "$3/$path"; test "$(stat -c %a "$3/$path")" = 644
 done
 for hook in preinst postinst prerm postrm config triggers; do test ! -e "$3/DEBIAN/$hook"; done
@@ -434,7 +435,7 @@ cp "$3/DEBIAN/control" "$OUTPUT"''')
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('#!/bin/sh\necho "' + name + ' 0.1.0"\nexit ' + str(version_exit if name == 'tuna-shell-gtk' else 0) + '\n')
                 path.chmod(0o755)
-            for name in ('share/wayland-sessions/tuna.desktop', 'share/systemd/user/tuna-session.target', 'share/pam.d/tuna-lock', 'share/xdg-desktop-portal/portals/tuna.portal', 'packaging/marlin/tuna-portals.conf', 'packaging/marlin/tuna-geoclue-agent-policy', 'share/compat/wayland-sessions/roost.desktop', 'share/compat/pam.d/roost-lock'):  # tuna-rename: keep
+            for name in ('share/wayland-sessions/tuna.desktop', 'share/systemd/user/tuna-session.target', 'share/pam.d/tuna-lock', 'share/pam.d/tuna-lock-fingerprint', 'share/xdg-desktop-portal/portals/tuna.portal', 'packaging/marlin/tuna-portals.conf', 'packaging/marlin/tuna-geoclue-agent-policy', 'share/compat/wayland-sessions/roost.desktop', 'share/compat/pam.d/roost-lock'):  # tuna-rename: keep
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / name, path)
@@ -515,6 +516,7 @@ class StartupOverviewPolicy(unittest.TestCase):
             final = after or dict(original, overview_open=False, overview_progress=0)
             (out/'after').write_text(json.dumps(final))
             prelude = r'''set -eu
+. "$ROOT/scripts/lib/tuna-state-snapshot.sh"
 fail() { printf 'FAIL:%s\n' "$1" >>"$ARTIFACTS/events"; exit 9; }
 pass() { :; }
 fixture_a11y() { printf 'a11y\n' >>"$ARTIFACTS/events"; printf '[]' >"$3"; }

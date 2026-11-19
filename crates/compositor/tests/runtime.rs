@@ -171,7 +171,10 @@ fn backend_choice_parses_and_auto_resolves_by_host_display() {
 /// logind session scopes send SIGHUP right after SIGTERM (SendSIGHUP=yes).
 /// The compositor must end through its loop and `Drop` teardown (which
 /// retires the owned screen reader, #836), never by SIGHUP's default
-/// termination. Skips like the launch smoke test without a host display.
+/// termination. SIGHUP goes out the moment the socket appears, while
+/// `launch` is still building the session: the handlers must already be in
+/// place by then (#1174). Skips like the launch smoke test without a host
+/// display.
 #[test]
 fn sighup_ends_the_session_through_teardown() {
     use std::os::unix::process::ExitStatusExt;

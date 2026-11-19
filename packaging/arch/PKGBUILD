@@ -66,7 +66,7 @@ optdepends=(
     'geoclue: location services (the shell agent; tuna-geoclue-agent-policy image hook)'
 )
 options=('!lto' '!debug')
-backup=('etc/pam.d/tuna-lock' 'etc/pam.d/roost-lock')  # tuna-rename: keep
+backup=('etc/pam.d/tuna-lock' 'etc/pam.d/tuna-lock-fingerprint' 'etc/pam.d/roost-lock')  # tuna-rename: keep
 
 if [[ -n "${TUNA_LOCAL_SRC:-}" ]]; then
     source=()
@@ -138,9 +138,11 @@ package() {
     # Private GNOME51 scalable cursor fallback; no system Adwaita file conflicts.
     install -d "$pkgdir/usr/share/tuna-desktop/icons"
     cp -a "$root/share/tuna-desktop/icons/." "$pkgdir/usr/share/tuna-desktop/icons/"
-    # Lock-screen PAM service (#62): the compositor's unlock authenticates here.
+    # Lock-screen PAM services (#62): the compositor's unlock authenticates
+    # here; fingerprint unlock runs tuna-lock-fingerprint (pam_fprintd).
     install -Dm0644 "$root/share/pam.d/tuna-lock" "$pkgdir/etc/pam.d/tuna-lock"
-    # Both PAM services use pacman backup handling; no migration hooks.
+    install -Dm0644 "$root/share/pam.d/tuna-lock-fingerprint" "$pkgdir/etc/pam.d/tuna-lock-fingerprint"
+    # Every PAM service uses pacman backup handling; no migration hooks.
     # tuna-rename: keep-begin
     install -Dm0644 "$root/share/compat/pam.d/roost-lock" "$pkgdir/etc/pam.d/roost-lock"
     # tuna-rename: keep-end

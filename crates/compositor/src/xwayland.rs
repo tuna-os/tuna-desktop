@@ -234,6 +234,9 @@ pub enum X11ManagerEvent {
     Maximize(u32, bool),
     /// An X11 fullscreen/unfullscreen request (X11 window id, on?).
     Fullscreen(u32, bool),
+    /// An X11 window asked to be iconified (ICCCM `WM_CHANGE_STATE`
+    /// IconicState), which Mutter honours by minimizing it (X11 window id).
+    Minimize(u32),
 }
 
 /// Spawn the compatibility server and hook its event source into the
@@ -535,6 +538,12 @@ mod handlers {
                         $state(self),
                         X11ManagerEvent::Fullscreen(window.window_id(), false),
                     );
+                }
+
+                // WM_CHANGE_STATE IconicState. Mutter ignores the NormalState
+                // form (unminimize_request): a client restores by mapping.
+                fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+                    push($state(self), X11ManagerEvent::Minimize(window.window_id()));
                 }
             }
         };

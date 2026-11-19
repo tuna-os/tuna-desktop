@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 use tuna_compositor::pam_helper::{
-    Answer, AnswerText, Event, Identity, Retirement, Style, Supervisor, FLAG,
+    Answer, AnswerText, Event, Identity, Refusal, Retirement, Style, Supervisor, FLAG,
 };
 
 const CHILD: &str = "TUNA_PRIVATE_PAM_TEST_CHILD";
@@ -123,12 +123,22 @@ fn run_actual_helper_cases() {
         let cmdline = std::fs::read(format!("/proc/{}/cmdline", helper.pid())).unwrap();
         assert!(!String::from_utf8_lossy(&cmdline).contains("secret"));
         two_rounds(&mut helper);
-        let Event::Finished { authenticated } = helper.next_event().unwrap() else {
+        let Event::Finished {
+            authenticated,
+            refusal,
+        } = helper.next_event().unwrap()
+        else {
             panic!("missing terminal result")
         };
         assert_eq!(authenticated, mode == "multi");
+        assert_eq!(
+            refusal,
+            (mode != "multi").then_some(Refusal::Failed),
+            "{mode}"
+        );
         retired(&mut helper);
     }
+    fingerprint_cases();
     for mode in ["hang", "crash", "teardown"] {
         let started = Instant::now();
         let mut helper = supervisor(mode, Duration::from_millis(750));
@@ -237,6 +247,69 @@ fn run_actual_helper_cases() {
     assert!(helper.next_event().is_err());
     raw_negative_cases();
     assert_eq!(binary_sha(), source_binary);
+}
+/// The `tuna-lock-fingerprint` shape: a pam_fprintd-like module that only
+/// informs, then login's account stack. The helper reports GDM's failure
+/// classes, and an expired account never authenticates after a match.
+fn fingerprint_cases() {
+    for (mode, authenticated, refusal, messages) in [
+        (
+            "fprint-nm",
+            true,
+            None,
+            vec![Style::Info, Style::Error, Style::Info],
+        ),
+        (
+            "fprint-m-expired",
+            false,
+            Some(Refusal::Expired),
+            vec![Style::Info],
+        ),
+        (
+            "fprint-nnn",
+            false,
+            Some(Refusal::MaxTries),
+            vec![
+                Style::Info,
+                Style::Error,
+                Style::Info,
+                Style::Error,
+                Style::Info,
+                Style::Error,
+            ],
+        ),
+        (
+            "fprint-t",
+            false,
+            Some(Refusal::Unavailable),
+            vec![Style::Info, Style::Info],
+        ),
+    ] {
+        let mut helper = supervisor(mode, Duration::from_secs(5));
+        let mut seen = Vec::new();
+        let (finished, reason) = loop {
+            match helper.next_event().unwrap() {
+                Event::Challenge { sequence, messages } => {
+                    seen.extend(messages.iter().map(|message| message.style));
+                    let answers = messages
+                        .iter()
+                        .map(|message| Answer {
+                            index: message.index,
+                            text: None,
+                        })
+                        .collect();
+                    helper.answer(sequence, answers).unwrap();
+                }
+                Event::Finished {
+                    authenticated,
+                    refusal,
+                } => break (authenticated, refusal),
+            }
+        };
+        assert_eq!((finished, reason), (authenticated, refusal), "{mode}");
+        assert_eq!(seen, messages, "{mode}");
+        retired(&mut helper);
+    }
 }
 struct RawChild {
     child: Child,
@@ -497,6 +570,10 @@ fn private_pam_helper_actual_binary_conversation_and_retirement() {
         "teardown",
         "child",
         "userchange",
+        "fprint-nm",
+        "fprint-m-expired",
+        "fprint-nnn",
+        "fprint-t",
     ] {
         std::fs::write(
             services.join(format!("private-{mode}")),

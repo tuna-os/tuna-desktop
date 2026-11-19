@@ -1536,6 +1536,7 @@ class PublicOrcaNavigation(unittest.TestCase):
         class Node:
             def __init__(self, key, role, name, children=()):
                 self.key, self.role, self.name, self.children = key, role, name, children
+                self.path = f"/org/gtk/a11y/{key}"
             def clear_cache(self):
                 pass
             def get_state_set(self):
@@ -1569,7 +1570,7 @@ class PublicOrcaNavigation(unittest.TestCase):
                  "notification_frames": [], "notification_closes": [], "search_entries": [],
                  "target": {"showing": 0, "focused": 0, "present": 0}, "focused_roles": [],
                  "controlled": False, "end_session": mode == "end-session", "logout_name": None,
-                 "notification": mode == "notification-banner", "deadline": 8,
+                 "notification": mode == "notification-banner", "fixture_control": False, "deadline": 8,
                  "time": SimpleNamespace(monotonic=lambda: 0), "unlocked": lambda: None,
                  "accessibility_query": lambda method, *args: method(*args),
                  "Atspi": SimpleNamespace(
@@ -1599,6 +1600,16 @@ class PublicOrcaNavigation(unittest.TestCase):
         self.assertEqual(scope["notification_closes"], [])
         for private in ("private", "Notifications", "Close"):
             self.assertNotIn(private, json.dumps(scope["nodes"]))
+        # Injected-tree policy coverage only, not native AT-SPI or VM qualification.
+
+    def test_notification_traversal_names_the_close_instance_never_the_content(self):
+        # The strip gate tells queued banners apart by the Close widget's
+        # accessible path (marlin-vm run 44442598008), never by their text.
+        scope, calls, _ = self.focus_mode_tree("notification-banner")
+        self.assertEqual(scope["notification_frames"], [[10, 20, 30, 40]])
+        self.assertEqual(scope["notification_closes"],
+                         [{"rect": [10, 20, 30, 40], "focused": True, "path": "/org/gtk/a11y/close"}])
+        self.assertNotIn("private", json.dumps(scope["notification_closes"]))
         # Injected-tree policy coverage only, not native AT-SPI or VM qualification.
 
     def test_public_speech_tokens_never_retain_arbitrary_presenter_text(self):
@@ -4298,6 +4309,9 @@ class FixtureLoginSession(unittest.TestCase):
                              "display-manager.service)\" = /usr/lib/systemd/system/gdm.service"):
                     self.assertIn(path, containerfile)
                 self.assertNotIn("AutomaticLogin", containerfile.replace("AutomaticLoginEnable|TimedLoginEnable", ""))
+        # Fingerprint unlock's PAM service (#1162 F5) postdates the published
+        # images, so only the current-build fixture hashes it.
+        self.assertIn("/etc/pam.d/tuna-lock /etc/pam.d/tuna-lock-fingerprint", self.fixture("Containerfile"))
 
     def test_both_fixtures_install_the_guest_helpers_the_lifecycle_runs(self):
         # The strict published lifecycle (#994) runs the current build's probes:

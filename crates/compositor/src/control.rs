@@ -704,6 +704,16 @@ impl<'a> Session<'a> {
             .write_frame(&Message::SeatTouchMode { touch_mode })
     }
 
+    /// Send whether the lock screen is shown (the curtain has landed on
+    /// a locked session). Peers older than 0.51 cannot decode it and
+    /// receive nothing.
+    pub fn send_lock_screen_shown(&mut self, shown: bool) -> Result<(), ControlError> {
+        if self.peer_minor < 51 {
+            return Ok(());
+        }
+        self.conn.write_frame(&Message::LockScreenShown { shown })
+    }
+
     /// Send where the overview's window previews sit.
     pub fn send_overview_previews(
         &mut self,
@@ -1344,6 +1354,7 @@ impl<'a> Session<'a> {
             | Message::OverviewSwipe { .. }
             | Message::ShowCloseDialog { .. }
             | Message::HideCloseDialog { .. }
+            | Message::LockScreenShown { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
                     kind: ErrorKind::UnknownCommand,
@@ -1407,6 +1418,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::OverviewSwipe { .. } => "OverviewSwipe",
         Message::ShowCloseDialog { .. } => "ShowCloseDialog",
         Message::HideCloseDialog { .. } => "HideCloseDialog",
+        Message::LockScreenShown { .. } => "LockScreenShown",
     }
 }
 
@@ -1826,6 +1838,10 @@ pub struct ControlHub {
     /// value every live session holds (#502).
     touch_mode: bool,
     touch_mode_sent: Option<bool>,
+    /// Whether the lock screen is shown, as last set by the runtime, and
+    /// the value every live session holds.
+    lock_shown: bool,
+    lock_shown_sent: Option<bool>,
     /// Output inventory last handed to [`set_outputs`](Self::set_outputs)
     /// (multi-monitor): the runtime refreshes this every tick from the
     /// compositor's tracking, and [`poll`](Self::poll) broadcasts it
@@ -1925,6 +1941,8 @@ impl ControlHub {
             // No touch-mode is what a shell assumes before any message.
             touch_mode: false,
             touch_mode_sent: Some(false),
+            lock_shown: false,
+            lock_shown_sent: Some(false),
             outputs: Vec::new(),
             native_outputs: Vec::new(),
             pointer_output: None,
@@ -2073,6 +2091,7 @@ impl ControlHub {
             || !self.switcher_queue.is_empty()
             || self.osk_sent != Some(self.osk)
             || self.touch_mode_sent != Some(self.touch_mode)
+            || self.lock_shown_sent != Some(self.lock_shown)
             || !self.accelerator_queue.is_empty()
             || !self.menu_queue.is_empty()
             || self.sessions.iter().any(|s| s.owes_deltas(model));
@@ -2142,6 +2161,12 @@ impl ControlHub {
     /// [`poll`](Self::poll) broadcasts a change.
     pub fn set_seat_touch_mode(&mut self, touch_mode: bool) {
         self.touch_mode = touch_mode;
+    }
+
+    /// Refresh whether the lock screen is shown (the curtain landed on a
+    /// locked session); the next [`poll`](Self::poll) broadcasts a change.
+    pub fn set_lock_screen_shown(&mut self, shown: bool) {
+        self.lock_shown = shown;
     }
 
     /// Set the session environment (#59); the next [`poll`](Self::poll)
@@ -2661,6 +2686,17 @@ impl ControlHub {
                 self.touch_mode_sent = Some(self.touch_mode);
             }
         }
+        if self.lock_shown_sent != Some(self.lock_shown) {
+            let mut all_sent = true;
+            for session in &mut self.sessions {
+                if session.send_lock_screen_shown(self.lock_shown).is_err() {
+                    all_sent = false;
+                }
+            }
+            if all_sent {
+                self.lock_shown_sent = Some(self.lock_shown);
+            }
+        }
         if self.outputs != self.outputs_sent {
             let mut all_sent = true;
             for session in &mut self.sessions {
@@ -2773,6 +2809,9 @@ impl ControlHub {
                 }
                 if self.touch_mode {
                     let _ = session.send_seat_touch_mode(true);
+                }
+                if self.lock_shown {
+                    let _ = session.send_lock_screen_shown(true);
                 }
                 if self.pointer_output.is_some() {
                     let _ = session.send_window_menu(&Message::PointerOutput {

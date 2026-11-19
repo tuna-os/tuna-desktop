@@ -40,10 +40,69 @@ static void hung_cleanup(pam_handle_t *pamh, void *data, int status) {
     (void)pamh; (void)data; (void)status;
     for (;;) pause();
 }
+/* "fprint-plan" modes read their plan and account state from files the
+ * runtime proof writes under TUNA_AUTH_OWNER_ROOT; the plan is consumed. */
+static int plan_path(char *path, size_t size, const char *name) {
+    const char *root = getenv("TUNA_AUTH_OWNER_ROOT");
+    if (root == NULL || strlen(root) > PATH_MAX - 64) return -1;
+    snprintf(path, size, "%s/%s", root, name);
+    return 0;
+}
+/* pam_fprintd's do_verify, scripted (fprintd pam/pam_fprintd.c): up to
+ * three scans, each announced by an info message; 'r' is a retry status
+ * within the scan (its error message, no try spent), 'm' matches, 'n' is a
+ * no-match error, 't' times out (PAM_AUTHINFO_UNAVAIL); three no-matches
+ * are PAM_MAXTRIES. No reader, daemon or print is involved. */
+static int fingerprint(pam_handle_t *pamh, const char *mode) {
+    char plan[16] = "";
+    const char *script = mode + strlen("fprint-");
+    if (strncmp(script, "plan", 4) == 0) {
+        char path[PATH_MAX];
+        if (plan_path(path, sizeof(path), "fprint-plan") != 0) return PAM_SYSTEM_ERR;
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) return PAM_AUTHINFO_UNAVAIL;
+        ssize_t got = read(fd, plan, sizeof(plan) - 1);
+        close(fd);
+        unlink(path);
+        if (got < 0) return PAM_SYSTEM_ERR;
+        plan[got] = 0;
+        script = plan;
+    }
+    const char *none[] = { NULL };
+    const char *step = script;
+    for (int tries = 0; tries < 3; ++tries) {
+        struct pam_message place = { PAM_TEXT_INFO, "Place your finger on the fingerprint reader" };
+        if (ask(pamh, 1, &place, none) != PAM_SUCCESS) return PAM_AUTHINFO_UNAVAIL;
+        for (; *step == 'r'; ++step) {
+            struct pam_message retry = { PAM_ERROR_MSG, "Place your finger on the reader again" };
+            if (ask(pamh, 1, &retry, none) != PAM_SUCCESS) return PAM_AUTHINFO_UNAVAIL;
+        }
+        char scan = *step ? *step++ : 't';
+        if (scan == 'm') return PAM_SUCCESS;
+        if (scan == 't') {
+            struct pam_message late = { PAM_TEXT_INFO, "Verification timed out" };
+            ask(pamh, 1, &late, none);
+            return PAM_AUTHINFO_UNAVAIL;
+        }
+        struct pam_message miss = { PAM_ERROR_MSG, "Failed to match fingerprint" };
+        if (ask(pamh, 1, &miss, none) != PAM_SUCCESS) return PAM_AUTHINFO_UNAVAIL;
+    }
+    return PAM_MAXTRIES;
+}
+static int fingerprint_account(const char *mode) {
+    if (strcmp(mode, "fprint-plan") == 0) {
+        char path[PATH_MAX];
+        if (plan_path(path, sizeof(path), "fprint-expired") != 0) return PAM_SYSTEM_ERR;
+        return access(path, F_OK) == 0 ? PAM_ACCT_EXPIRED : PAM_SUCCESS;
+    }
+    size_t len = strlen(mode);
+    return len > 8 && strcmp(mode + len - 8, "-expired") == 0 ? PAM_ACCT_EXPIRED : PAM_SUCCESS;
+}
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
     (void)flags;
     const char *mode = argc ? argv[0] : "multi";
     if (strcmp(mode, "hang") == 0) for (;;) pause();
+    if (strncmp(mode, "fprint-", 7) == 0) return fingerprint(pamh, mode);
     if (strcmp(mode, "crash") == 0) abort();
     if (strcmp(mode, "runtime-delay") == 0) {
         const char *root = getenv("TUNA_AUTH_OWNER_ROOT");
@@ -122,5 +181,6 @@ PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const cha
 }
 PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const char **argv) {
     (void)pamh; (void)flags;
+    if (argc && strncmp(argv[0], "fprint-", 7) == 0) return fingerprint_account(argv[0]);
     return argc && (strcmp(argv[0], "accountdeny") == 0 || strcmp(argv[0], "single-accountdeny") == 0) ? PAM_PERM_DENIED : PAM_SUCCESS;
 }

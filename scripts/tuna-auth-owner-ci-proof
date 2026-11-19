@@ -14,7 +14,7 @@ git rev-parse HEAD > "$out/source.txt"
 git rev-parse --show-toplevel > "$out/root.txt"
 git diff --quiet
 git diff --cached --quiet
-sha256sum Cargo.lock crates/compositor/Cargo.toml scripts/lib/auth-owner-admission.py scripts/lib/auth-display-readiness.py scripts/tuna-auth-owner-ci-proof crates/compositor/src/auth_owner.rs crates/compositor/src/main.rs crates/compositor/src/lib.rs crates/compositor/src/control.rs crates/compositor/src/runtime.rs crates/compositor/src/runtime/auth.rs crates/compositor/src/sleep.rs crates/compositor/src/pam.rs crates/compositor/src/pam_backend.rs crates/compositor/src/pam_helper.rs crates/compositor/src/unlock.rs crates/compositor/tests/fixtures/pam_conversation.c crates/compositor/tests/auth_owner_runtime.rs crates/compositor/examples/native-auth-owner-probe.rs > "$out/source-sha256.txt"
+sha256sum Cargo.lock crates/compositor/Cargo.toml scripts/lib/auth-owner-admission.py scripts/lib/auth-display-readiness.py scripts/tuna-auth-owner-ci-proof crates/compositor/src/auth_owner.rs crates/compositor/src/main.rs crates/compositor/src/lib.rs crates/compositor/src/control.rs crates/compositor/src/runtime.rs crates/compositor/src/runtime/auth.rs crates/compositor/src/sleep.rs crates/compositor/src/pam.rs crates/compositor/src/pam_backend.rs crates/compositor/src/pam_helper.rs crates/compositor/src/unlock.rs crates/compositor/src/fprintd.rs crates/compositor/tests/fixtures/pam_conversation.c crates/compositor/tests/auth_owner_runtime.rs crates/compositor/examples/native-auth-owner-probe.rs > "$out/source-sha256.txt"
 cargo metadata --locked --no-deps --format-version=1 > "$out/metadata.json"
 pretest_phase=test_build
 cargo test --locked -p tuna-compositor --test auth_owner_runtime --no-run --message-format=json > "$out/build.json"
@@ -65,6 +65,16 @@ DISPLAY=":$display_num" TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1 TUNA_AUTH_OWNER_ARTIFA
     "$test_executable" --exact actual_main_runtime_pam_conversation_relay --nocapture 2>&1 | tee "$out/test-conversation.log"
 grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$out/test-conversation.log"
 grep -q '^auth owner conversation runtime receipt: ' "$out/test-conversation.log"
+DISPLAY=":$display_num" TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1 TUNA_AUTH_OWNER_ARTIFACTS="$out/runtime-fingerprint" \
+    timeout --kill-after=3s 45s \
+    "$test_executable" --exact actual_main_runtime_fingerprint_through_pam --nocapture 2>&1 | tee "$out/test-fingerprint.log"
+grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$out/test-fingerprint.log"
+grep -q '^auth owner fingerprint runtime receipt: ' "$out/test-fingerprint.log"
+DISPLAY=":$display_num" TUNA_REQUIRE_AUTH_OWNER_RUNTIME=1 TUNA_AUTH_OWNER_ARTIFACTS="$out/runtime-fingerprint-setting" \
+    timeout --kill-after=3s 45s \
+    "$test_executable" --exact actual_main_runtime_fingerprint_setting_enforced --nocapture 2>&1 | tee "$out/test-fingerprint-setting.log"
+grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$out/test-fingerprint-setting.log"
+grep -q '^auth owner fingerprint-setting runtime receipt: ' "$out/test-fingerprint-setting.log"
 python3 - "$out" <<'PY'
 import hashlib,importlib.util,json,pathlib,sys
 sys.dont_write_bytecode=True
@@ -88,6 +98,12 @@ assert pam_receipt['compositor_sha256']==r['executables'][r['compositor']],'actu
 conversation=json.loads((out/'runtime-conversation/success.json').read_text())
 for key in ['fingerprint_unavailable_denied','second_password_conversation_denied','stale_sequence_dropped','distinct_answers_per_question','info_and_error_relayed','wrong_pin_denied_with_problem','cancel_denied_silently','fresh_answers_unlock']:assert conversation[key] is True,key
 assert conversation['compositor_sha256']==r['executables'][r['compositor']],'actual conversation main image differs'
+fingerprint=json.loads((out/'runtime-fingerprint/success.json').read_text())
+for key in ['expired_account_match_denied','max_tries_unavailable','timed_out_unavailable','lock_budget_refuses_before_pam','password_unaffected','retry_then_match_unlocks']:assert fingerprint[key] is True,key
+assert fingerprint['compositor_sha256']==r['executables'][r['compositor']],'actual fingerprint main image differs'
+setting=json.loads((out/'runtime-fingerprint-setting/success.json').read_text())
+assert setting['setting_off_refused_before_pam'] is True
+assert setting['compositor_sha256']==r['executables'][r['compositor']],'actual fingerprint-setting main image differs'
 pam_lines=[l.removeprefix('auth owner pam sha256: ') for l in (out/'test-pam.log').read_text().splitlines() if l.startswith('auth owner pam sha256: ')]
 assert len(pam_lines)==1 and pam_lines[0]==r['executables'][r['compositor']],'PAM source admission differs'
 

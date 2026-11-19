@@ -109,14 +109,20 @@ on the login screen. The entry's `Exec=` line is `tuna-session`, never the
 compositor directly, so shell supervision stays in the loop, and
 `X-GDM-SessionRegisters=true` tells GDM the session registers itself.
 
-The lock screen authenticates through the `tuna-lock` PAM service. The
-packages install it; a source install needs it too, or PAM falls back to the
-`other` service (deny on most distributions) and a locked session cannot be
-unlocked:
+The lock screen authenticates through the `tuna-lock` PAM service, and
+fingerprint unlock through `tuna-lock-fingerprint` (`pam_fprintd` plus your
+`login` account stack, like GDM's `gdm-fingerprint`). The packages install
+both; a source install needs them too. Without `tuna-lock`, PAM falls back to
+the `other` service (deny on most distributions) and a locked session cannot
+be unlocked; without `tuna-lock-fingerprint`, only fingerprint unlock fails:
 
 ```sh
 install -Dm0644 share/pam.d/tuna-lock /etc/pam.d/tuna-lock
+install -Dm0644 share/pam.d/tuna-lock-fingerprint /etc/pam.d/tuna-lock-fingerprint
 ```
+
+Fingerprint unlock also needs `pam_fprintd.so`: the `libpam-fprintd`
+package on Debian and Ubuntu, `fprintd` on Arch.
 
 ## When something goes wrong
 

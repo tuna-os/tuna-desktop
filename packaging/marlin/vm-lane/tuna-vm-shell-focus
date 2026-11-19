@@ -331,7 +331,15 @@ def observe(pid, ticks, executable, display, controlled=False, end_session=False
                 if role == "frame":
                     notification_frames.append(bounds)
                 elif states.contains(Atspi.StateType.SENSITIVE):
-                    notification_closes.append({"rect": bounds, "focused": states.contains(Atspi.StateType.FOCUSED)})
+                    # The accessible's D-Bus object path names this Close
+                    # widget instance, never its notification's content: the
+                    # shell builds a new card for each banner it shows.
+                    path = node.path
+                    if (type(path) is not str or len(path) > 255
+                            or re.fullmatch(r"/[A-Za-z0-9_]+(/[A-Za-z0-9_]+)*", path) is None):
+                        raise RuntimeError("notification Close control has no valid accessible path")
+                    notification_closes.append({"rect": bounds, "focused": states.contains(Atspi.StateType.FOCUSED),
+                                                "path": path})
         elif role in PUBLIC_ROLES or (end_session and role == "label"):
             FOCUS_OPERATION = "tree-name"
             name = accessibility_query(node.get_name)

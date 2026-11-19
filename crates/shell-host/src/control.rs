@@ -149,6 +149,10 @@ pub enum Handled {
     /// Hide this window's close dialog (it answered, went away or left
     /// the screen, or the session locked).
     HideCloseDialog(u64),
+    /// Whether the lock screen is shown: the curtain has landed on the
+    /// locked session (0.51). Read it back through
+    /// [`ControlClient::lock_screen_shown`].
+    LockScreenShown(bool),
     /// The keyboard switched Sticky or Slow Keys: save and confirm.
     KeyboardAidToggled {
         aid: tuna_shell_control::KeyboardAid,
@@ -294,6 +298,9 @@ pub struct ControlClient {
     /// snapshot. Read-only here: the flag lives in the compositor,
     /// never the shell.
     locked: bool,
+    /// The compositor's latest `LockScreenShown`, cleared by an unlocked
+    /// snapshot so a new lock waits for its own curtain.
+    lock_shown: bool,
     /// Output inventory from the latest `Outputs` message (empty
     /// before the first one): name, size, and dock anchor per output.
     /// Read-only here; the shell reconciles its surfaces against it
@@ -349,6 +356,7 @@ impl ControlClient {
             shadow_windows: Vec::new(),
             shadow_workspaces: Vec::new(),
             locked: false,
+            lock_shown: false,
             outputs: Vec::new(),
             native_outputs: Vec::new(),
             pointer_output: None,
@@ -419,6 +427,14 @@ impl ControlClient {
     /// renders from it and never flips it.
     pub fn locked(&self) -> bool {
         self.locked
+    }
+
+    /// Whether the lock screen is shown: the session is locked and the
+    /// compositor says its curtain has landed (screenShield.js
+    /// `_lockScreenShown`). GNOME reports the screen saver active only
+    /// from here, because gnome-settings-daemon blanks the screen then.
+    pub fn lock_screen_shown(&self) -> bool {
+        self.locked && self.lock_shown
     }
 
     /// Whether an input-method menu may dispatch an action. The current peer
@@ -1118,6 +1134,7 @@ impl ControlClient {
                 self.shadow_windows = windows;
                 self.shadow_workspaces = workspaces;
                 self.locked = locked;
+                self.lock_shown &= locked;
                 self.model.apply_snapshot_view(snapshot_view(
                     &self.shadow_windows,
                     &self.shadow_workspaces,
@@ -1265,6 +1282,10 @@ impl ControlClient {
                 height,
             })),
             Message::HideCloseDialog { window } => Ok(Handled::HideCloseDialog(window)),
+            Message::LockScreenShown { shown } => {
+                self.lock_shown = shown;
+                Ok(Handled::LockScreenShown(shown))
+            }
             Message::KeyboardAidToggled { aid, enabled } => {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
@@ -1588,6 +1609,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::OverviewSwipe { .. } => "OverviewSwipe",
         Message::ShowCloseDialog { .. } => "ShowCloseDialog",
         Message::HideCloseDialog { .. } => "HideCloseDialog",
+        Message::LockScreenShown { .. } => "LockScreenShown",
     }
 }
 
@@ -2726,6 +2748,43 @@ mod tests {
         ));
         assert!(!client.locked());
         assert_eq!(client.model().windows().len(), 2);
+    }
+
+    /// The screen saver goes active only once the compositor says the
+    /// curtain landed, and each lock waits for its own landing.
+    #[test]
+    fn lock_screen_shown_needs_the_lock_and_its_own_landing() {
+        let (mut client, mut peer) = handshook();
+        let locked = |revision| Message::Snapshot {
+            revision,
+            windows: vec![],
+            workspaces: vec![workspace(1, true)],
+            locked: true,
+        };
+        server_write(&mut peer, &locked(8));
+        client.poll().expect("locked snapshot");
+        assert!(client.locked());
+        assert!(!client.lock_screen_shown(), "the curtain is still lowering");
+        server_write(&mut peer, &Message::LockScreenShown { shown: true });
+        assert_eq!(
+            client.poll().expect("shown"),
+            Handled::LockScreenShown(true)
+        );
+        assert!(client.lock_screen_shown());
+        // Unlocking hides it before the compositor's `false` arrives.
+        server_write(&mut peer, &snapshot_rev7());
+        client.poll().expect("unlocked snapshot");
+        assert!(!client.lock_screen_shown());
+        // A new lock does not inherit the last landing.
+        server_write(&mut peer, &locked(9));
+        client.poll().expect("locked again");
+        assert!(!client.lock_screen_shown());
+        server_write(&mut peer, &Message::LockScreenShown { shown: true });
+        client.poll().expect("shown again");
+        assert!(client.lock_screen_shown());
+        server_write(&mut peer, &Message::LockScreenShown { shown: false });
+        client.poll().expect("hidden");
+        assert!(!client.lock_screen_shown());
     }
 
     #[test]

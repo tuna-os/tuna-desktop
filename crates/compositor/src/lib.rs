@@ -464,14 +464,15 @@ impl ClientState {
 /// manager drains and applies them once per tick in `reconcile`, so
 /// protocol input and scene mutation stay on one call path for live
 /// events and tests.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum WindowRequest {
     /// Client asked to be maximized.
     Maximize,
     /// Client asked to leave maximized.
     Unmaximize,
-    /// Client asked to cover the output.
-    Fullscreen,
+    /// Client asked to cover an output: the named one it passed to
+    /// `xdg_toplevel.set_fullscreen`, else the one it is on.
+    Fullscreen(Option<String>),
     /// Client asked to leave fullscreen.
     Unfullscreen,
     /// Client started an interactive move (header-bar drag, #58).
@@ -688,14 +689,21 @@ impl XdgShellHandler for State {
             .push((surface.wl_surface().clone(), WindowRequest::Unmaximize));
     }
 
-    /// Queue a client fullscreen request for the manager drain.
+    /// Queue a client fullscreen request, with the output it named, for
+    /// the manager drain.
     fn fullscreen_request(
         &mut self,
         surface: ToplevelSurface,
-        _output: Option<wl_output::WlOutput>,
+        output: Option<wl_output::WlOutput>,
     ) {
-        self.window_requests
-            .push((surface.wl_surface().clone(), WindowRequest::Fullscreen));
+        let output = output
+            .as_ref()
+            .and_then(Output::from_resource)
+            .map(|output| output.name());
+        self.window_requests.push((
+            surface.wl_surface().clone(),
+            WindowRequest::Fullscreen(output),
+        ));
     }
 
     /// Queue a client unfullscreen request for the manager drain.

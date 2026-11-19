@@ -61,29 +61,56 @@ the conversation's Slot attempt, so the VM lanes bind it the same way.
 
 ## Fingerprint conversation
 
-GNOME runs `gdm-fingerprint` (`pam_fprintd`). The compositor runs the same
-loop directly over fprintd's D-Bus API on its own Slot
-(`MethodKind::Fingerprint`, `unlock::run_fingerprint`): it is offered only
-when a reader is present and the user enrolled a print, and makes up to
-three scans of at most 30 s. Each finished non-matching scan reports
-"Failed to match fingerprint"; retry statuses report pam_fprintd's message;
-after three failures GDM's max-tries message ends the conversation and the
-service becomes unavailable, as GDM 51 reports `PAM_MAXTRIES`
-(`report_and_stop_conversation`, `TOO_MANY_RETRIES`): the shell keeps the
-password prompt as it is and begins fingerprint again only after the next
-reset or a return to the clock (gnome-shell 51 `authServices.js` `_canRetry`
-always retries on the unlock screen). A
-timed-out scan reports "Verification timed out" and the service becomes
-unavailable, as `PAM_AUTHINFO_UNAVAIL` does in GDM. `FingerprintScan`
-carries the reader's `scan-type` for GNOME's "(or place finger on reader)"
-or "(or swipe finger across reader)" hint.
+GNOME runs `gdm-fingerprint`: `pam_fprintd` plus that service's account
+stack. The compositor does the same (#1162 F5). The fingerprint conversation
+is a PAM transaction on its own service, `tuna-lock-fingerprint`
+(`share/pam.d/tuna-lock-fingerprint`: `auth required pam_fprintd.so`,
+`account include login`, installed beside `tuna-lock`), in its own private
+helper (`Backend::live_fingerprint`, a second stable owner so it runs beside
+the password helper) on its own Slot (`MethodKind::Fingerprint`). The
+helper runs `pam_authenticate` then `pam_acct_mgmt`, so an expired or
+locked account, `pam_access` or faillock refuses a finger exactly as it
+refuses a password; a match alone never unlocks. The attempt retires only
+on its helper's retirement, like the password conversation's.
 
-`Fprintd::verify_interactive` adds cancellation to the existing bounded
-attempt: the parent polls the cancel flag every 50 ms and retires through
-the deadline's fd-shutdown path, so fprintd drops the claim of the vanished
-client and the claim reaper keeps release-or-quarantine. The fingerprint
-Slot retires only on the joined result of its own worker thread; a later
-scan waits up to 2 s for the previous claim to be released.
+Before PAM runs, a probe off the loop reads
+`org.gnome.login-screen enable-fingerprint-authentication` afresh (the
+compositor enforces it; the shell's choice is not trusted; without GDM's
+schema the key's default, on, applies) and asks fprintd whether a reader is
+present, the user enrolled a print, and the reader's `scan-type`. It never
+claims the reader. Without any of them the service is unavailable.
+
+pam_fprintd's conversation drives the UI as in GNOME 51's
+`authServicesLegacy.js`: an info message ("Place your finger on the
+fingerprint reader", "Verification timed out") is only the cue for
+`FingerprintScan`, GNOME's own "(or place finger on reader)" or "(or swipe
+finger across reader)" hint by scan type; an error message ("Failed to match
+fingerprint", retry statuses) is a `Problem`. A question has no place in this
+conversation and cancels it. pam_fprintd makes up to `max-tries` (3) scans of
+at most `timeout` (30 s); the policy gives a backend phase 60 s, and the
+relay's 120 s inactivity watch bounds the whole conversation, since nothing
+in it is user input.
+
+The helper reports GDM's failure classes (`pam_helper::Refusal`), and the
+compositor answers as GDM 51's session worker does: `PAM_MAXTRIES` is GDM's
+max-tries message, then the service becomes unavailable
+(`TOO_MANY_RETRIES`; the shell keeps the password prompt as it is and
+begins fingerprint again only after the next reset or a return to the
+clock, gnome-shell 51 `authServices.js` `_canRetry`); `PAM_AUTHINFO_UNAVAIL`
+(a timed-out scan, no prints) is service-unavailable; `PAM_ACCT_EXPIRED` and
+`PAM_AUTHTOK_EXPIRED` are "Your account was given a time limit that’s now
+passed."; any other failure is "Sorry, fingerprint authentication didn’t
+work. Please try again." Both of the last two end with a plain denial, so
+the shell resets the prompt. GDM itself skips `pam_acct_mgmt` for
+reauthentication; Tuna runs it for both services, as `tuna-lock` always did.
+
+GNOME bounds nothing across fingerprint conversations on the unlock screen.
+The compositor does: a lock epoch admits three failed fingerprint
+conversations (one that relayed a rejected scan, or that PAM refused), so a
+shell restarting the service can get at most three times `max-tries` scans
+per lock; after that fingerprint is unavailable until the next lock, and the
+password is unaffected. A fingerprint helper that does not retire leaves the
+service refused for the life of the compositor.
 
 ## Grant
 
@@ -103,17 +130,32 @@ idle or sleep lock), origin loss or unlock cancels the conversation.
   distinct secret, info, error, separate PIN); stale sequence, wrong PIN,
   cancellation and a second conversation stay locked; fresh answers unlock.
   Run by `scripts/tuna-auth-owner-ci-proof`.
-- `crates/compositor/src/unlock.rs` and `fprintd.rs` unit tests: the
-  pam_fprintd loop, retry wording, interactive progress, cancel and claim
-  release against the private-bus fprintd stub.
+- `crates/compositor/tests/auth_owner_runtime.rs`
+  `actual_main_runtime_fingerprint_through_pam`: the actual runtime, the
+  fingerprint helper and a pam_fprintd-like controlled module behind a
+  private-bus fprintd probe; a match on an expired account is refused with
+  GDM's account message, max tries and a timed-out scan end the service as
+  GDM does, the fourth failed conversation is refused before PAM runs, the
+  password still unlocks, and a match on a new lock unlocks.
+  `actual_main_runtime_fingerprint_setting_enforced`: with
+  `enable-fingerprint-authentication` off the compositor refuses the service
+  itself and PAM never runs.
+- `crates/compositor/tests/pam_helper.rs`: the actual helper reports
+  `Refusal::{Expired, MaxTries, Unavailable, Failed}` for the fingerprint
+  shapes, and an expired account never authenticates after a match.
+- `crates/compositor/src/fprintd.rs` unit tests: the probe (reader,
+  enrolled prints, scan type) against the private-bus fprintd stub.
 - `scripts/tuna-lock-auth-proof`: the nested GTK lock screen against a
-  pam_wrapper stack (pam_matrix password, then a one-time code) and an
-  emulated fprintd on a private system bus.
+  pam_wrapper `tuna-lock` stack (pam_matrix password, then a one-time code),
+  a `tuna-lock-fingerprint` stack (`scripts/lib/tuna-pam-fprint.c`,
+  pam_fprintd's loop, then an account stack the proof expires for
+  G-LOCK-AUTH-FPRINT-EXPIRED) and an emulated fprintd on a private system
+  bus. `scripts/tests/test_tuna_lock_auth_fixtures.py` proves the fixtures.
 - `scripts/tuna-vm-lane` V-SLEEP-AUTH-FAIL-CLOSED and V-AUTH-FAIL-CLOSED
   (marlin-vm, KVM, CI only): a real delayed PAM helper of an open
   conversation is cancelled and physically retired by real S3 without
   unlocking, and a real `pam_deny` stack refuses a conversation.
 
-Not covered: real readers, smartcards and PIN pads (`pam_pkcs11` or
-`pam_sss` smartcard), web login (GDM's `eidp` extension) and installed PAM
-stacks on the published image.
+Not covered: real readers and the installed `pam_fprintd`, smartcards and
+PIN pads (`pam_pkcs11` or `pam_sss` smartcard), web login (GDM's `eidp`
+extension) and installed PAM stacks on the published image.

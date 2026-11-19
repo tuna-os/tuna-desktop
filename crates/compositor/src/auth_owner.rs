@@ -75,29 +75,16 @@ impl Slot {
         }
         self.retire_exact(attempt)
     }
-    /// Only a PAM retirement result can release PAM/password ownership. This
-    /// cannot accept a fingerprint Match as a retirement receipt.
+    /// Only a PAM retirement result of the attempt's own method can release
+    /// PAM-backed ownership (the password conversation's, or the
+    /// fingerprint conversation's `tuna-lock-fingerprint` helper).
     pub fn retire_pam_method(
         &mut self,
         attempt: Attempt,
         method: MethodKind,
         result: crate::pam_backend::Verification,
     ) -> bool {
-        if method == MethodKind::Fingerprint || self.method != Some(method) || !result.may_retire()
-        {
-            return false;
-        }
-        self.retire_exact(attempt)
-    }
-    /// Fingerprint retirement: only the joined result of the attempt's own
-    /// worker thread is accepted (`joined` exists only after the join), so
-    /// no later callback can produce a result for this attempt.
-    pub fn retire_fingerprint(
-        &mut self,
-        attempt: Attempt,
-        _joined: &crate::unlock::FingerprintEnd,
-    ) -> bool {
-        if self.method != Some(MethodKind::Fingerprint) {
+        if self.method != Some(method) || !result.may_retire() {
             return false;
         }
         self.retire_exact(attempt)
@@ -302,23 +289,30 @@ mod tests {
         let finger = slot
             .begin_method(origin, 7, MethodKind::Fingerprint)
             .unwrap();
+        // Another method's receipt, or an unretired fingerprint helper,
+        // never releases the fingerprint conversation's attempt.
         assert!(!slot.retire_pam_method(
             finger,
-            MethodKind::Fingerprint,
+            MethodKind::PamConversation,
             Verification::Retired {
                 authenticated: true
             }
         ));
+        assert!(!slot.retire_pam_method(finger, MethodKind::Fingerprint, Verification::Unretired));
         assert!(!slot.retire_pam_method(
             pam,
             MethodKind::PamConversation,
             Verification::RejectedBeforeSpawn
         ));
         assert!(!slot.grant(&epoch, 7));
-        assert!(
-            slot.matches(finger),
-            "Matched or PAM receipt cannot retire a fingerprint child"
-        );
+        assert!(slot.matches(finger));
+        assert!(slot.retire_pam_method(
+            finger,
+            MethodKind::Fingerprint,
+            Verification::Retired {
+                authenticated: false
+            }
+        ));
         let mut separate = Slot::default();
         let refused = separate
             .begin_method(origin, 7, MethodKind::PamConversation)

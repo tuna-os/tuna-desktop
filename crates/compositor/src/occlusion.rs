@@ -206,6 +206,9 @@ pub(crate) struct FrameCost {
     pub culled: usize,
     pub damage_rects: usize,
     pub damage_area: i64,
+    /// The box around this frame's damage, in output pixels before any
+    /// rotation: what the frame repainted lies inside it (#1154).
+    pub damage_bounds: Option<PhysicalRect>,
     pub output_area: i64,
     /// Windows with at least one element showing on the output, whether
     /// or not this frame's damage repainted them.
@@ -245,6 +248,7 @@ impl FrameCost {
             culled: drawn.culled,
             damage_rects: damage.len(),
             damage_area: area(damage),
+            damage_bounds: damage.iter().copied().reduce(Rectangle::merge),
             output_area: i64::from(output.w.max(0)) * i64::from(output.h.max(0)),
             drawn_windows,
             culled_windows,
@@ -257,6 +261,7 @@ impl FrameCost {
             "culled": self.culled,
             "damage_rects": self.damage_rects,
             "damage_area": self.damage_area,
+            "damage_bounds": self.damage_bounds.map(|r| [r.loc.x, r.loc.y, r.size.w, r.size.h]),
             "output_area": self.output_area,
             "drawn_windows": self.drawn_windows,
             "culled_windows": self.culled_windows,
@@ -480,6 +485,23 @@ mod tests {
         let json = cost.to_json();
         assert_eq!(json["culled"], 3);
         assert_eq!(json["culled_windows"], serde_json::json!([5]));
+    }
+
+    #[test]
+    fn frame_cost_bounds_the_damage_it_repainted() {
+        let drawn = Drawn::default();
+        // The bar clock's tick and a pointer move: two small rectangles,
+        // published with the box around them (#1154).
+        let damage = [rect(594, 10, 94, 11), rect(637, 399, 24, 24)];
+        let cost = FrameCost::new(&drawn, &[], &damage, OUTPUT.into());
+        assert_eq!(cost.damage_area, 94 * 11 + 24 * 24);
+        assert_eq!(cost.damage_bounds, Some(rect(594, 10, 94, 413)));
+        assert_eq!(
+            cost.to_json()["damage_bounds"],
+            serde_json::json!([594, 10, 94, 413])
+        );
+        let idle = FrameCost::new(&drawn, &[], &[], OUTPUT.into());
+        assert_eq!(idle.to_json()["damage_bounds"], serde_json::Value::Null);
     }
 
     #[test]

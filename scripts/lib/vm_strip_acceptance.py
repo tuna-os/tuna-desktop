@@ -499,6 +499,10 @@ def notification_close_control(sample, original, observer_sha256, *, require_foc
             or min(rect[:2]) < 0 or min(rect[2:]) <= 0
             or rect[0] + rect[2] > width or rect[1] + rect[3] > height):
         raise RuntimeError('notification Close control lies outside its actual banner')
+    path = close.get('path')
+    if path is not None and (type(path) is not str or len(path) > 255
+                             or re.fullmatch(r'/[A-Za-z0-9_]+(/[A-Za-z0-9_]+)*', path) is None):
+        raise RuntimeError('notification Close control accessible path is malformed')
     # WINDOW extents establish membership/size, not Wayland screen coordinates:
     # GTK CSS/surface offsets need not appear in AT-SPI extents. Never infer a
     # pointer target from them. Only normal keys reaching this focused Close
@@ -512,9 +516,24 @@ def notification_close_control(sample, original, observer_sha256, *, require_foc
     return control
 
 
+# After Return, a banner layer still there this long is not the closed one
+# leaving: the shell takes a closed banner away at once (notify.rs
+# sync_banner), and the next queued one drops in within 200 ms.
+NOTIFICATION_NEXT_BANNER_S = 0.6
+
+
 def dismiss_notification_banner(read, observe, send_key, sample, original, observer_sha256, *,
                                 deadline, input_idle, evidence, fixture_control=False, edge=False):
-    """Normal keyboard Close, only after original focused-control observation."""
+    """Normal keyboard Close, only after original focused-control observation.
+
+    Like GNOME's message tray, the shell shows one banner at a time and never
+    times out a critical one; closing it drops the next queued banner into
+    the same layer (marlin-vm run 44442598008: three critical updater
+    failures). A user closes each in turn, and so does this. Each Close
+    widget instance, named by its accessible path, receives Return at most
+    once: a banner its Close does not remove is never activated again, and
+    the unchanged capture deadline decides.
+    """
     layers, banners = notification_layers(sample)
     if not banners:
         return sample
@@ -548,39 +567,67 @@ def dismiss_notification_banner(read, observe, send_key, sample, original, obser
             time.sleep(min(.05, max(0, deadline - time.monotonic())))
         raise TimeoutError('notification key release exceeded capture deadline')
 
+    def close_path(control):
+        return control['notification_banner']['close_controls'][0].get('path')
+
+    activated = []
+
+    def unactivated(control):
+        # An unnamed Close is never told apart from one already activated.
+        path = close_path(control)
+        return not activated or (path is not None and None not in activated and path not in activated)
+
     if time.monotonic() >= deadline:
         raise TimeoutError('notification preparation exceeded capture deadline')
     actual = observe(deadline)
     checked(actual, layers)
-    notification_close_control(actual, original, observer_sha256, fixture_control=fixture_control, edge=edge)
+    control = notification_close_control(actual, original, observer_sha256, fixture_control=fixture_control, edge=edge)
     evidence.update(activation='normal-keyboard-focused-Close', focus_input_sent=False,
                     activated=False, confirmed_absent=False)
-    send_key('meta_l', 'n')
-    evidence['focus_input_sent'] = True
-    release_observed()
-    send_key('tab')
-    release_observed()
-    focused = observe(deadline)
-    checked(focused, layers)
-    evidence['control'] = notification_close_control(
-        focused, original, observer_sha256, require_focused=True, fixture_control=fixture_control, edge=edge)
-    if time.monotonic() >= deadline:
-        raise TimeoutError('notification focus validation exceeded capture deadline')
-    send_key('ret')
-    evidence['activated'] = True
-    while time.monotonic() < deadline:
-        after = read(deadline)
-        after_layers, remaining = checked(after)
-        if not remaining:
-            if after_layers != [layer for layer in layers if layer not in banners]:
-                raise RuntimeError('unexpected layer change across notification input')
-            if after['inventory']['state'].get('seat_pressed_key_count') == 0:
-                evidence.update(confirmed_absent=True, confirmed_absent_monotonic_ns=time.monotonic_ns())
-                return after
-        elif after_layers != layers:
-            raise RuntimeError('notification layer changed ambiguously after input')
-        time.sleep(min(.05, max(0, deadline - time.monotonic())))
-    raise TimeoutError('normal notification Close did not remove actual banner')
+    while True:
+        send_key('meta_l', 'n')
+        evidence['focus_input_sent'] = True
+        release_observed()
+        send_key('tab')
+        release_observed()
+        focused = observe(deadline)
+        checked(focused, layers)
+        evidence['control'] = notification_close_control(
+            focused, original, observer_sha256, require_focused=True, fixture_control=fixture_control, edge=edge)
+        if close_path(evidence['control']) != close_path(control):
+            raise RuntimeError('notification Close control changed before focused activation')
+        if time.monotonic() >= deadline:
+            raise TimeoutError('notification focus validation exceeded capture deadline')
+        send_key('ret')
+        evidence['activated'] = True
+        activated.append(close_path(control))
+        evidence['activations'] = len(activated)
+        control = None
+        next_check = time.monotonic() + NOTIFICATION_NEXT_BANNER_S
+        while control is None:
+            if time.monotonic() >= deadline:
+                raise TimeoutError('normal notification Close did not remove actual banner')
+            after = read(deadline)
+            after_layers, remaining = checked(after)
+            if not remaining:
+                if after_layers != [layer for layer in layers if layer not in banners]:
+                    raise RuntimeError('unexpected layer change across notification input')
+                if after['inventory']['state'].get('seat_pressed_key_count') == 0:
+                    evidence.update(confirmed_absent=True, confirmed_absent_monotonic_ns=time.monotonic_ns())
+                    return after
+            elif after_layers != layers:
+                raise RuntimeError('notification layer changed ambiguously after input')
+            elif time.monotonic() >= next_check:
+                # The banner layer stayed: the same banner, or the next queued one.
+                observed = observe(deadline)
+                checked(observed, layers)
+                candidate = notification_close_control(observed, original, observer_sha256,
+                                                       fixture_control=fixture_control, edge=edge)
+                if unactivated(candidate):
+                    control = candidate
+                    continue
+                next_check = time.monotonic() + NOTIFICATION_NEXT_BANNER_S
+            time.sleep(min(.05, max(0, deadline - time.monotonic())))
 
 
 def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *, edge=False):

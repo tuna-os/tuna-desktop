@@ -103,6 +103,41 @@ enum Request {
         identity: Identity,
     },
 }
+/// How a PAM transaction that did not authenticate ended, in the classes
+/// GDM 51's session worker (`gdm-session-worker.c`) tells apart: they pick
+/// its message and whether the service stays available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Refusal {
+    /// `pam_authenticate` returned `PAM_AUTHINFO_UNAVAIL` or
+    /// `PAM_MODULE_UNKNOWN`: GDM's service-unavailable.
+    Unavailable,
+    /// `PAM_MAXTRIES`: GDM's too-many-retries.
+    MaxTries,
+    /// `PAM_ACCT_EXPIRED` or `PAM_AUTHTOK_EXPIRED`.
+    Expired,
+    /// Any other failure, including a helper-side rejection.
+    Failed,
+}
+impl Refusal {
+    /// The class of a failed `pam_authenticate` (`account == false`) or
+    /// `pam_acct_mgmt` (`account == true`) status, as GDM reads it
+    /// (`gdm_session_worker_authenticate_user`, `_authorize_user`,
+    /// `get_friendly_error_message`).
+    pub fn of_status(status: c_int, account: bool) -> Self {
+        const AUTHINFO_UNAVAIL: c_int = 9;
+        const MAXTRIES: c_int = 11;
+        const ACCT_EXPIRED: c_int = 13;
+        const AUTHTOK_EXPIRED: c_int = 27;
+        const MODULE_UNKNOWN: c_int = 28;
+        match status {
+            AUTHINFO_UNAVAIL | MODULE_UNKNOWN if !account => Self::Unavailable,
+            MAXTRIES => Self::MaxTries,
+            ACCT_EXPIRED | AUTHTOK_EXPIRED => Self::Expired,
+            _ => Self::Failed,
+        }
+    }
+}
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Reply {
@@ -114,6 +149,8 @@ enum Reply {
     Result {
         identity: Identity,
         authenticated: bool,
+        /// Set exactly when `authenticated` is false.
+        refusal: Option<Refusal>,
     },
 }
 
@@ -297,6 +334,8 @@ pub enum Event {
     },
     Finished {
         authenticated: bool,
+        /// Why it did not authenticate; `None` exactly when it did.
+        refusal: Option<Refusal>,
     },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -625,6 +664,7 @@ impl Supervisor {
             Reply::Result {
                 identity,
                 authenticated,
+                refusal,
             } => {
                 if identity != self.identity {
                     return Err(invalid());
@@ -638,8 +678,10 @@ impl Supervisor {
                     .child
                     .try_wait()?
                     .is_some_and(|status| status.success());
+                let authenticated = authenticated && successful_exit;
                 Ok(Event::Finished {
-                    authenticated: authenticated && successful_exit,
+                    authenticated,
+                    refusal: (!authenticated).then(|| refusal.unwrap_or(Refusal::Failed)),
                 })
             }
         }
@@ -1024,7 +1066,7 @@ fn run_helper() -> io::Result<bool> {
     });
     use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
     // SAFETY: signatures follow Linux-PAM; library remains alive through pam_end.
-    let authenticated = unsafe {
+    let (authenticated, refusal) = unsafe {
         let _library =
             Library::open(Some("libpam.so.0"), RTLD_NOW | RTLD_GLOBAL).map_err(|_| invalid())?;
         let scope = Library::this();
@@ -1050,8 +1092,10 @@ fn run_helper() -> io::Result<bool> {
             return Err(invalid());
         }
         let mut status = auth(handle, 0x8000);
+        let mut refusal = (status != 0).then(|| Refusal::of_status(status, false));
         if status == 0 {
             status = account(handle, 0x8000);
+            refusal = (status != 0).then(|| Refusal::of_status(status, true));
         }
         let mut authenticated_user: *const c_void = std::ptr::null();
         let same_user = get_item(handle, 2, &mut authenticated_user) == 0
@@ -1059,7 +1103,11 @@ fn run_helper() -> io::Result<bool> {
             && libc::strnlen(authenticated_user.cast(), TEXT_LIMIT + 1) <= TEXT_LIMIT
             && CStr::from_ptr(authenticated_user.cast()).to_bytes() == user.as_bytes();
         let ended = end(handle, status);
-        status == 0 && ended == 0 && same_user
+        let authenticated = status == 0 && ended == 0 && same_user;
+        (
+            authenticated,
+            (!authenticated).then(|| refusal.unwrap_or(Refusal::Failed)),
+        )
     };
     let mut exchange = exchange.into_inner().map_err(|_| invalid())?;
     send(
@@ -1067,6 +1115,7 @@ fn run_helper() -> io::Result<bool> {
         &Reply::Result {
             identity: exchange.identity.clone(),
             authenticated,
+            refusal,
         },
         exchange.deadline,
     )?;

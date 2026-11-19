@@ -19,6 +19,8 @@ if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ] && command -v dbus-run-session >/dev/nul
 fi
 unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+# shellcheck source=scripts/lib/tuna-state-snapshot.sh
+. "$ROOT/scripts/lib/tuna-state-snapshot.sh"
 DISPLAY_ARG=""
 ARTIFACTS="$ROOT/scale-artifacts"
 SCALE=1.5
@@ -203,7 +205,7 @@ while [ "$(cat "$ARTIFACTS/x11-clicks.txt" 2>/dev/null || true)" != 1 ]; do
 done
 sleep 0.5
 scrot "$ARTIFACTS/05-x11-click.png" >/dev/null
-cp "$CSTATE" "$ARTIFACTS/scaled-native-x11-state.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/scaled-native-x11-state.json"
 pass S-X11-INPUT "physical pointer coordinates reached the X11 button at scale $SCALE"
 
 grep -q panicked "$LOG" && fail S-NOPANIC "panic in nested log"

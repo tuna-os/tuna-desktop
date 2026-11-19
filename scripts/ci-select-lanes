@@ -39,17 +39,18 @@ import sys
 
 # Selectable ci.yml proof jobs, in workflow order.
 LANES = [
-    "fprint-phase-proof", "journey", "app-content", "scroll-proof", "drm-smoke",
+    "journey", "app-content", "scroll-proof", "drm-smoke",
     "grid-cancel-comparison", "gtk-shell", "orca-speech",
     "portal-security", "remote-security", "niri-parity", "arch-package",
     "marlin-image", "marlin-vm", "parity-ledger", "docs-shots",
 ]
 
 # Every code change runs the GTK shell proof: it drives the compositor and
-# the preferred shell together and is what most changes touch. The
-# fingerprint phase and grid-cancel comparison proofs are short and cover
-# authentication and drag paths no rotated lane does.
-CORE = ["fprint-phase-proof", "grid-cancel-comparison", "gtk-shell"]
+# the preferred shell together and is what most changes touch, and its
+# scripts/tuna-lock-auth-proof covers lock authentication, fingerprint
+# included. The grid-cancel comparison proof is short and covers drag paths
+# no rotated lane does.
+CORE = ["grid-cancel-comparison", "gtk-shell"]
 
 # Interchangeable end-to-end coverage of the same build, rotated per run.
 # marlin-image is not here: ci.yml runs it on push, schedule and dispatch
@@ -127,6 +128,8 @@ OWNED = [
     ("scripts/tuna-scroll-proof", ["scroll-proof"]),
     ("scripts/tuna-drm-smoke", ["drm-smoke"]),
     ("scripts/lib/colord-startup.sh", ["drm-smoke"]),
+    # Sourced by the GTK shell (and journey's installed run), DRM and Orca proofs.
+    ("scripts/lib/tuna-state-snapshot.sh", ["gtk-shell", "journey", "drm-smoke", "orca-speech"]),
     ("scripts/tuna-orca-speech-proof", ["orca-speech"]),
     ("scripts/lib/tuna-orca-speech.py", ["orca-speech"]),
     ("scripts/tuna-frame-pacer-build", ["drm-smoke"]),

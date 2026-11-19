@@ -1676,6 +1676,8 @@ fn open_args(params: &glib::Variant) -> Option<(u32, u32, Vec<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
 
     #[test]
     fn a_process_running_the_compositor_binary_is_recognised_by_its_comm() {
@@ -1686,25 +1688,28 @@ mod tests {
         // path it executes, and a freshly written executable can fail with
         // ETXTBSY when another test thread forks while it is still open.
         let _ = std::fs::remove_file(&exe);
-        std::os::unix::fs::symlink("/bin/sleep", &exe).unwrap();
-        let mut child = std::process::Command::new(&exe).arg("5").spawn().unwrap();
-        // Before the child execs, /proc/<pid>/comm still names this test
-        // binary. Wait for the exec (via /proc/<pid>/exe) before reading.
-        let exe_link = format!("/proc/{}/exe", child.id());
-        let sleep = std::fs::canonicalize("/bin/sleep").unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if std::fs::read_link(&exe_link).is_ok_and(|target| target == sleep) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "child {} never exec'd",
-                child.id()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let comm = std::fs::read_to_string(format!("/proc/{}/comm", child.id())).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", &exe).unwrap();
+        // argv[0] stays the real program name: multicall binaries (busybox,
+        // uutils coreutils on Ubuntu 26.04) dispatch on it and refuse a
+        // `tuna-compositor` they do not implement, exiting at once. The
+        // kernel takes comm from the executed path, not argv[0].
+        let mut child = std::process::Command::new(&exe)
+            .arg0("sh")
+            .args(["-c", "echo ready && read -r line"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // spawn() returns once the exec has begun, but the kernel renames
+        // the task late in exec, so comm may still name this test thread.
+        // Output from the new program proves the exec finished.
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        let pid = child.id();
+        assert_eq!(ready, "ready\n", "child {pid} exited before it ran");
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
