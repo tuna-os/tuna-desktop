@@ -789,7 +789,12 @@ jobs:
     # Authentication callback admission requires this run's successful check.
     needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'gtk-shell')
-    timeout-minutes: 60
+    # Green runs on karnataka take 49-52 min, and the proofs alone reached
+    # 55 min under load on 2026-11-19, so the job deadline cancelled the
+    # bounded (10 min) gtk-shell-binaries upload after every proof had
+    # passed (jobs 135256429116, 135256345607, 135256405746, 135256365256).
+    # Leave room for both uploads' own step timeouts.
+    timeout-minutes: 80
     env:
       TUNA_CI_CHECKED_SHA: ${{ needs.check.outputs.tested_sha }}
       TUNA_CI_EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
