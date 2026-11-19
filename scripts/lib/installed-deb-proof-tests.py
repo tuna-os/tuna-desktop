@@ -22,17 +22,6 @@ spec.loader.exec_module(M)
 
 
 class InstalledPolicy(unittest.TestCase):
-    def test_release_keeps_single_versioned_gtk_and_sound_dependencies(self):
-        source = (ROOT / 'scripts/tuna-release').read_text()
-        depends = next(line for line in source.splitlines() if line.startswith('Depends: '))
-        fields = depends[len('Depends: '):].split(', ')
-        for name, floor in [('libgtk-4-1', '(>= 4.12)'), ('libadwaita-1-0', '(>= 1.0)'), ('libgtk4-layer-shell0', '(>= 1.1)')]:
-            matches = [field for field in fields if field.split()[0] == name]
-            self.assertEqual(matches, [name + ' ' + floor])
-        for name in ['gnome-session-canberra', 'libcanberra-pulse', 'sound-theme-freedesktop']:
-            self.assertEqual(fields.count(name), 1)
-        self.assertTrue(fields[0].startswith('$SHLIBS'))
-
     def process_case(self, inode=20, replacement=None, changed_field=None):
         original = {'sha256': 'a' * 64, 'dev': 1, 'ino': 20, 'size': 100}
         executed = SimpleNamespace(st_dev=1, st_ino=inode, st_size=100,
@@ -249,6 +238,10 @@ class PackagePolicy(unittest.TestCase):
             shutil.copyfile(ROOT / source, p)
             p.chmod(0o644)
         # tuna-rename: keep-end
+        helper = self.stage / 'usr/libexec/tuna-geoclue-agent-policy'
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / 'packaging/marlin/tuna-geoclue-agent-policy', helper)
+        helper.chmod(0o755)
         # Use the real shipped private theme and its integrity manifest rather
         # than bypassing asset admission in these controlled package fixtures.
         copy_shipped_icons(self.stage / 'usr/share/tuna-desktop/icons')
@@ -258,7 +251,7 @@ class PackagePolicy(unittest.TestCase):
         self.env = dict(os.environ, PATH=str(self.tools) + ':' + os.environ['PATH'], FIXTURE=str(self.stage))
         self.tool('dpkg-deb', '''case "$1" in
 -c) find "$FIXTURE" -type f | while read -r path; do echo "-rwxr-xr-x $path"; done ;;
--f) case "$3" in Version) echo 0.1.0 ;; Depends) echo 'libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.0), libgweather-4-0t64 (>= 4.4) | libgweather-4-0 (>= 4.4), libpam0g, gsettings-desktop-schemas, gnome-settings-daemon-common' ;; Replaces|Conflicts|Provides) echo roost ;; esac ;;  # tuna-rename: keep
+-f) case "$3" in Version) echo 0.1.0 ;; Depends) echo 'libgtk4-layer-shell0 (>= 1.1), libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.0), libgweather-4-0t64 (>= 4.4) | libgweather-4-0 (>= 4.4), libpam0g, gsettings-desktop-schemas, gnome-settings-daemon-common, python3' ;; Recommends) echo 'geoclue-2.0, ibus' ;; Replaces|Conflicts|Provides) echo roost ;; esac ;;  # tuna-rename: keep
 -x) cp -pR "$FIXTURE/." "$3/" ;;
 --ctrl-tarfile) tar --owner=0 --group=0 -C "$FIXTURE" -cf - ./conffiles ;;
 --fsys-tarfile) tar --owner=0 --group=0 -C "$FIXTURE" -cf - ./usr ./etc ;;
@@ -368,6 +361,28 @@ esac''')
         path.write_text(path.read_text().replace(', gnome-settings-daemon-common', ''))
         self.assertNotEqual(self.check(), 0)
 
+    def test_stale_gtk_floor_rejected(self):
+        path = self.tools / 'dpkg-deb'
+        path.write_text(path.read_text().replace('libgtk-4-1 (>= 4.14)', 'libgtk-4-1 (>= 4.12)'))
+        self.assertNotEqual(self.check(), 0)
+
+    def test_missing_helper_interpreter_dependency_rejected(self):
+        path = self.tools / 'dpkg-deb'
+        path.write_text(path.read_text().replace(', python3', ''))
+        self.assertNotEqual(self.check(), 0)
+
+    def test_missing_geoclue_recommendation_rejected(self):
+        path = self.tools / 'dpkg-deb'
+        path.write_text(path.read_text().replace("'geoclue-2.0, ibus'", "'ibus'"))
+        self.assertNotEqual(self.check(), 0)
+
+    def test_missing_or_non_executable_geoclue_helper_rejected(self):
+        helper = self.stage / 'usr/libexec/tuna-geoclue-agent-policy'
+        helper.chmod(0o644)
+        self.assertNotEqual(self.check(), 0)
+        helper.unlink()
+        self.assertNotEqual(self.check(), 0)
+
     def test_launcher_override_denies_before_any_process(self):
         result = subprocess.run(['sh', str(ROOT / 'scripts/lib/tuna-proof-session-launch'), '1', str(ROOT), 'owned'], env=dict(self.env, TUNA_SHELL_BIN='/tmp/wrong'), timeout=5)
         self.assertNotEqual(result.returncode, 0)
@@ -401,9 +416,10 @@ assert_mode() {
     }
 }
 assert_mode 755 "$3"
-for path in usr usr/share usr/share/wayland-sessions etc etc/pam.d; do
+for path in usr usr/libexec usr/share usr/share/wayland-sessions etc etc/pam.d; do
     assert_mode 755 "$3/$path"
 done
+assert_mode 755 "$3/usr/libexec/tuna-geoclue-agent-policy"
 for path in DEBIAN/control DEBIAN/conffiles; do assert_mode 644 "$3/$path"; done
 printf '%s\\n' /etc/pam.d/tuna-lock /etc/pam.d/roost-lock >"$EXPECTED_CONFFILES"
 cmp "$EXPECTED_CONFFILES" "$3/DEBIAN/conffiles"
@@ -418,7 +434,7 @@ cp "$3/DEBIAN/control" "$OUTPUT"''')
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('#!/bin/sh\necho "' + name + ' 0.1.0"\nexit ' + str(version_exit if name == 'tuna-shell-gtk' else 0) + '\n')
                 path.chmod(0o755)
-            for name in ('share/wayland-sessions/tuna.desktop', 'share/systemd/user/tuna-session.target', 'share/pam.d/tuna-lock', 'share/xdg-desktop-portal/portals/tuna.portal', 'packaging/marlin/tuna-portals.conf', 'share/compat/wayland-sessions/roost.desktop', 'share/compat/pam.d/roost-lock'):  # tuna-rename: keep
+            for name in ('share/wayland-sessions/tuna.desktop', 'share/systemd/user/tuna-session.target', 'share/pam.d/tuna-lock', 'share/xdg-desktop-portal/portals/tuna.portal', 'packaging/marlin/tuna-portals.conf', 'packaging/marlin/tuna-geoclue-agent-policy', 'share/compat/wayland-sessions/roost.desktop', 'share/compat/pam.d/roost-lock'):  # tuna-rename: keep
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / name, path)
@@ -451,6 +467,15 @@ cp "$3/DEBIAN/control" "$OUTPUT"''')
         self.assertIn('gsettings-desktop-schemas', depends)
         self.assertIn('gnome-settings-daemon-common', depends)
         self.assertNotIn('libpam0', depends)
+        # One versioned floor per GTK-stack library; GTK matches gtk4-sys v4_14.
+        for name, floor in [('libgtk-4-1', '(>= 4.14)'), ('libadwaita-1-0', '(>= 1.0)'), ('libgtk4-layer-shell0', '(>= 1.1)')]:
+            self.assertEqual([field for field in depends if field.split()[0] == name], [name + ' ' + floor])
+        for name in ('gnome-session-canberra', 'libcanberra-pulse', 'sound-theme-freedesktop', 'python3'):
+            self.assertEqual(depends.count(name), 1, name)
+        # GeoClue is recommended, never required: the session runs without it.
+        recommends = next(line.removeprefix('Recommends: ') for line in control.splitlines() if line.startswith('Recommends: ')).split(', ')
+        self.assertIn('geoclue-2.0', recommends)
+        self.assertFalse([field for field in depends if field.split()[0].startswith('geoclue')])
 
     def test_release_stages_protected_ancestors_under_group_writable_umask(self):
         # The actual shell builder runs; its controlled dpkg delegate asserts

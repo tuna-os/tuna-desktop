@@ -299,7 +299,7 @@ pub struct ControlClient {
     /// Read-only here; the shell reconciles its surfaces against it
     /// and never edits it.
     outputs: Vec<OutputInfo>,
-    native_outputs: Vec<tuna_shell_control::NativeOutputInfo>,
+    native_outputs: Vec<tuna_output::NativeOutputInfo>,
     pointer_output: Option<String>,
     /// Session environment from the compositor (#59).
     environment: Vec<(String, String)>,
@@ -448,7 +448,7 @@ impl ControlClient {
         self.pointer_output.as_deref()
     }
 
-    pub fn native_outputs(&self) -> &[tuna_shell_control::NativeOutputInfo] {
+    pub fn native_outputs(&self) -> &[tuna_output::NativeOutputInfo] {
         &self.native_outputs
     }
 
@@ -2243,7 +2243,7 @@ mod tests {
         let (mut client, mut peer) = handshook();
         server_write(&mut peer, &snapshot_rev7());
         client.poll().unwrap();
-        let owner = tuna_shell_control::NativeOutputInfo {
+        let owner = tuna_output::NativeOutputInfo {
             name: "eDP-1".into(),
             drm_device: 226,
             connector_id: 39,
@@ -2296,7 +2296,7 @@ mod tests {
             },
         );
         client.await_hello().expect("await hello");
-        let owner = tuna_shell_control::NativeOutputInfo {
+        let owner = tuna_output::NativeOutputInfo {
             name: "eDP-1".into(),
             drm_device: 226,
             connector_id: 39,
@@ -2352,7 +2352,7 @@ mod tests {
             },
         );
         client.await_hello().expect("await hello");
-        let owner = tuna_shell_control::NativeOutputInfo {
+        let owner = tuna_output::NativeOutputInfo {
             name: "eDP-1".into(),
             drm_device: 226,
             connector_id: 39,
@@ -2412,7 +2412,7 @@ mod tests {
     #[test]
     fn native_outputs_cleared_immediately_on_eof() {
         let (mut client, mut peer) = handshook();
-        let owner = tuna_shell_control::NativeOutputInfo {
+        let owner = tuna_output::NativeOutputInfo {
             name: "eDP-1".into(),
             drm_device: 226,
             connector_id: 39,

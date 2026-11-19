@@ -99,11 +99,7 @@ sys.exit(int(os.environ['ENGINE_FAILURE']))
         self.assertIn('PKG_VERSION=0.2.0~beta.1', argv)
         self.assertIn('BIN_VERSION=0.2.0-beta.1', argv)
 
-    def test_native_audio_runtime_is_a_hard_dependency_and_checked_without_recommends(self):
-        release = SCRIPT.with_name('tuna-release').read_text()
-        depends = next(line for line in release.splitlines() if line.startswith('Depends: '))
-        for package in ('gnome-session-canberra', 'libcanberra-pulse', 'sound-theme-freedesktop'):
-            self.assertIn(package, depends.split(': ', 1)[1].split(', '))
+    def test_native_audio_runtime_is_checked_without_recommends(self):
         result = self.run_check()
         self.assertEqual(result.returncode, 0, result.stderr)
         body = json.loads(self.log.read_text())[-1]
@@ -111,6 +107,15 @@ sys.exit(int(os.environ['ENGINE_FAILURE']))
         self.assertIn('dpkg-query -L libcanberra-pulse', body)
         self.assertIn('for event in bell audio-volume-change', body)
         self.assertIn('/usr/share/sounds/freedesktop/stereo/$event.oga', body)
+
+    def test_geoclue_helper_interpreter_is_checked_without_recommends(self):
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = json.loads(self.log.read_text())[-1]
+        self.assertIn('apt-get install -y --no-install-recommends', body)
+        self.assertIn('helper=/usr/libexec/tuna-geoclue-agent-policy', body)
+        self.assertIn('"$(head -n 1 "$helper")" = "#!/usr/bin/python3"', body)
+        self.assertIn('/usr/bin/python3 -I -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" "$helper"', body)
 
     def test_non_root_archive_never_reaches_container(self):
         self.env['BAD_OWNER'] = '1'

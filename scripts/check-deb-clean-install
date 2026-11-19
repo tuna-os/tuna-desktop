@@ -85,6 +85,13 @@ pulse_plugin="$(dpkg-query -L libcanberra-pulse | grep "/libcanberra-pulse\.so$"
 for event in bell audio-volume-change; do
     [ -s "/usr/share/sounds/freedesktop/stereo/$event.oga" ] || fail "event sound asset $event missing"
 done
+# The GeoClue agent-policy helper runs on the declared python3 alone; GeoClue
+# itself is a recommendation, absent from this no-recommends install.
+helper=/usr/libexec/tuna-geoclue-agent-policy
+[ "$(stat -c "%u:%g %a" "$helper")" = "0:0 755" ] || fail "$helper not root-owned 0755"
+[ "$(head -n 1 "$helper")" = "#!/usr/bin/python3" ] || fail "$helper interpreter is not python3"
+/usr/bin/python3 -I -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" "$helper" \
+    || fail "declared python3 cannot parse $helper"
 # The compositor prefers tuna-shell-gtk beside itself over tuna-shell-host.
 [ "$(dirname "$(readlink -f "$(command -v tuna-compositor)")")" = "$(dirname "$(readlink -f "$(command -v tuna-shell-gtk)")")" ] \
     || fail "tuna-shell-gtk is not beside tuna-compositor"

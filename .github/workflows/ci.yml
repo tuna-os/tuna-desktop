@@ -467,7 +467,7 @@ jobs:
       # time (check gets them transitively via GTK).
       # Genuine Ubuntu26.04 distro packages, not /usr/local source libraries.
       - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps x11-utils pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good at-spi2-core python3-pyatspi python3-pil libnotify-bin libsecret-tools gnome-keyring fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libgweather-4-dev meson ninja-build libwayland-dev wayland-protocols libpam-wrapper ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 wayland-utils xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk libgtk4-layer-shell-dev dpkg-dev gsettings-desktop-schemas build-essential desktop-file-utils
-      - run: pkg-config --atleast-version=1.1 gtk4-layer-shell-0 && pkg-config --atleast-version=4.12 gtk4 && pkg-config --atleast-version=1.0 libadwaita-1 && pkg-config --atleast-version=4.4 gweather4
+      - run: pkg-config --atleast-version=1.1 gtk4-layer-shell-0 && pkg-config --atleast-version=4.14 gtk4 && pkg-config --atleast-version=1.0 libadwaita-1 && pkg-config --atleast-version=4.4 gweather4
       - run: shellcheck -x scripts/tuna-journey scripts/tuna-nested scripts/tuna-release scripts/check-release-package scripts/check-deb-clean-install scripts/lib/tuna-introspect.sh scripts/lib/tuna-proof-session-launch scripts/ci-prepare-artifacts
       - run: python3 scripts/lib/installed-deb-proof-tests.py
       - run: python3 scripts/lib/release-deb-ownership-tests.py
@@ -790,7 +790,12 @@ jobs:
     # Authentication callback admission requires this run's successful check.
     needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'gtk-shell')
-    timeout-minutes: 60
+    # Green runs on karnataka take 49-52 min, and the proofs alone reached
+    # 55 min under load on 2026-11-19, so the job deadline cancelled the
+    # bounded (10 min) gtk-shell-binaries upload after every proof had
+    # passed (jobs 135256429116, 135256345607, 135256405746, 135256365256).
+    # Leave room for both uploads' own step timeouts.
+    timeout-minutes: 80
     env:
       TUNA_CI_CHECKED_SHA: ${{ needs.check.outputs.tested_sha }}
       TUNA_CI_EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}

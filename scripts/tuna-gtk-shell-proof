@@ -28,6 +28,8 @@
 #   G-SHELL-STABLE only (needs pam_wrapper).
 #   --grid-cancel-only --grid-cancel-admission FILE is an exact CI comparison slice.
 #   --expect-grid-cancel-old-negative is permitted only in that admitted slice.
+#   Run at most one --*-only slice at a time.
+# end of --help
 #
 # Runs the nested compositor with tuna-shell-gtk as its supervised shell
 # on a private session bus with the AT-SPI accessibility bus, then:
@@ -533,43 +535,65 @@ GRID_CANCEL_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
 GRID_CANCEL_ADMISSION=""
 COMPANIONS="${TUNA_PROOF_COMPANIONS:-$ROOT/target/debug/examples}"
+# Focused slices: each --*-only case arm calls only_mode with its flag and
+# what it leaves out of the full run's setup, so a new slice touches only
+# its own arm. Traits: source-build (refuses --installed-package),
+# no-media-source (no GTK media-source receipt), no-examples (no
+# icon-probe or shortcut-inhibit-client build), no-camera-policy (the
+# camera is not disabled first).
+ONLY_MODES=""
+ONLY_SOURCE_BUILD=""
+ONLY_NO_MEDIA_SOURCE=0
+ONLY_NO_EXAMPLES=0
+ONLY_NO_CAMERA_POLICY=0
+only_mode() {
+    ONLY_MODES="${ONLY_MODES:+$ONLY_MODES }$1"
+    only_flag="$1"
+    shift
+    for only_trait in "$@"; do
+        case "$only_trait" in
+            source-build) ONLY_SOURCE_BUILD="$only_flag" ;;
+            no-media-source) ONLY_NO_MEDIA_SOURCE=1 ;;
+            no-examples) ONLY_NO_EXAMPLES=1 ;;
+            no-camera-policy) ONLY_NO_CAMERA_POLICY=1 ;;
+            *) echo "tuna-gtk-shell-proof: unknown slice trait $only_trait" >&2; exit 1 ;;
+        esac
+    done
+}
 while [ $# -gt 0 ]; do
     case "$1" in
         --installed-package) INSTALLED_PACKAGE=1; shift ;;
-        --grid-cancel-only) GRID_CANCEL_ONLY=1; shift ;;
+        --grid-cancel-only) GRID_CANCEL_ONLY=1; only_mode "$1" no-media-source; shift ;;
         --expect-grid-cancel-old-negative) GRID_CANCEL_OLD_NEGATIVE=1; shift ;;
         --grid-cancel-admission) GRID_CANCEL_ADMISSION="$2"; shift 2 ;;
-        --screenshot-keys-only) SCREENSHOT_KEYS_ONLY=1; shift ;;
-        --a11y-focus-only) A11Y_FOCUS_ONLY=1; shift ;;
-        --notify-lock-only) NOTIFY_LOCK_ONLY=1; shift ;;
-        --tray-only) TRAY_ONLY=1; shift ;;
-        --grid-hover-only) GRID_HOVER_ONLY=1; shift ;;
-        --keyboard-routes-only) KEYBOARD_ROUTES_ONLY=1; shift ;;
-        --datemenu-only) DATEMENU_ONLY=1; shift ;;
-        --search-leak-only) SEARCH_LEAK_ONLY=1; shift ;;
-        --window-leak-only) WINDOW_LEAK_ONLY=1; shift ;;
-        --lock-menu-only) LOCK_MENU_ONLY=1; shift ;;
+        --screenshot-keys-only) SCREENSHOT_KEYS_ONLY=1; only_mode "$1" no-media-source no-examples no-camera-policy; shift ;;
+        --a11y-focus-only) A11Y_FOCUS_ONLY=1; only_mode "$1" no-media-source no-examples no-camera-policy; shift ;;
+        --notify-lock-only) NOTIFY_LOCK_ONLY=1; only_mode "$1"; shift ;;
+        --tray-only) TRAY_ONLY=1; only_mode "$1"; shift ;;
+        --grid-hover-only) GRID_HOVER_ONLY=1; only_mode "$1" no-examples; shift ;;
+        --keyboard-routes-only) KEYBOARD_ROUTES_ONLY=1; only_mode "$1" no-media-source; shift ;;
+        --datemenu-only) DATEMENU_ONLY=1; only_mode "$1" source-build no-media-source no-examples no-camera-policy; shift ;;
+        --search-leak-only) SEARCH_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
+        --window-leak-only) WINDOW_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
+        --lock-menu-only) LOCK_MENU_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
-        --help|-h) sed -n '2,33p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,/^# end of --help$/{/^# end of --help$/!p;}' "$0"; exit 0 ;;
         *) echo "tuna-gtk-shell-proof: unknown argument $1" >&2; exit 1 ;;
     esac
 done
-if [ "$GRID_HOVER_ONLY" = 1 ] && { [ "$SCREENSHOT_KEYS_ONLY" = 1 ] || [ "$A11Y_FOCUS_ONLY" = 1 ] || [ "$GRID_CANCEL_ONLY" = 1 ] || [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; }; then
-    echo "--grid-hover-only cannot be combined with other focused or grid admission flags" >&2; exit 1
-fi
-if [ "$DATEMENU_ONLY" = 1 ] && { [ "$INSTALLED_PACKAGE" = 1 ] || [ "$SCREENSHOT_KEYS_ONLY" = 1 ] || [ "$A11Y_FOCUS_ONLY" = 1 ] || [ "$TRAY_ONLY" = 1 ] || [ "$GRID_HOVER_ONLY" = 1 ] || [ "$KEYBOARD_ROUTES_ONLY" = 1 ] || [ "$SEARCH_LEAK_ONLY" = 1 ] || [ "$WINDOW_LEAK_ONLY" = 1 ] || [ "$LOCK_MENU_ONLY" = 1 ] || [ "$GRID_CANCEL_ONLY" = 1 ] || [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; }; then
-    echo "--datemenu-only cannot be combined with other focused, installed or grid admission flags" >&2; exit 1
+case "$ONLY_MODES" in
+    *" "*) echo "$ONLY_MODES: run one --*-only slice at a time" >&2; exit 1 ;;
+esac
+if [ "$INSTALLED_PACKAGE" = 1 ] && [ -n "$ONLY_SOURCE_BUILD" ]; then
+    echo "$ONLY_SOURCE_BUILD cannot be combined with --installed-package" >&2; exit 1
 fi
 if [ "$GRID_CANCEL_ONLY" = 1 ]; then
-    if [ "$INSTALLED_PACKAGE" != 0 ] || [ "$SCREENSHOT_KEYS_ONLY" != 0 ] || [ "$A11Y_FOCUS_ONLY" != 0 ] || [ "$KEYBOARD_ROUTES_ONLY" != 0 ] || [ -z "$GRID_CANCEL_ADMISSION" ]; then
+    if [ "$INSTALLED_PACKAGE" != 0 ] || [ -z "$GRID_CANCEL_ADMISSION" ]; then
         echo "grid comparison requires an admitted source-mode tuple" >&2; exit 1
     fi
 elif [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ] || [ -n "$GRID_CANCEL_ADMISSION" ]; then
     echo "old-negative/admission flags require --grid-cancel-only" >&2; exit 1
-fi
-if [ "$SCREENSHOT_KEYS_ONLY" = 1 ] && [ "$A11Y_FOCUS_ONLY" = 1 ]; then
-    echo "--screenshot-keys-only and --a11y-focus-only are separate slices" >&2; exit 1
 fi
 mkdir -p "$ARTIFACTS"
 ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
@@ -1475,10 +1499,8 @@ export TUNA_ANIMATION_CLOCK
 # overrides remain useful diagnostics but cannot qualify canonical media.
 MEDIA_SOURCE=0
 "$PY" "$ROOT/scripts/lib/gtk_media_source.py" invalidate "$ROOT" "$ARTIFACTS"
-if [ "$INSTALLED_PACKAGE" = 0 ] && [ "$SCREENSHOT_KEYS_ONLY" = 0 ] &&
-   [ "$A11Y_FOCUS_ONLY" = 0 ] && [ "$KEYBOARD_ROUTES_ONLY" = 0 ] &&
-   [ "$GRID_CANCEL_ONLY" = 0 ] && [ "$DATEMENU_ONLY" = 0 ] &&
-   [ "$SEARCH_LEAK_ONLY" = 0 ] && [ "$WINDOW_LEAK_ONLY" = 0 ] && [ "$LOCK_MENU_ONLY" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ] &&
+if [ "$INSTALLED_PACKAGE" = 0 ] && [ "$ONLY_NO_MEDIA_SOURCE" = 0 ] &&
+   [ -z "${TUNA_PROOF_BIN_DIR:-}" ] &&
    [ -z "${TUNA_PROOF_SHELL_BIN:-}" ] && [ -z "${TUNA_SHELL_BIN:-}" ] &&
    [ -n "${GITHUB_RUN_ID:-}" ] && [ -n "${GITHUB_RUN_ATTEMPT:-}" ] &&
    [ -n "${GITHUB_SHA:-}" ]; then
@@ -1487,7 +1509,7 @@ if [ "$INSTALLED_PACKAGE" = 0 ] && [ "$SCREENSHOT_KEYS_ONLY" = 0 ] &&
 fi
 if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
     cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host
-    if [ "$SCREENSHOT_KEYS_ONLY" = 0 ] && [ "$A11Y_FOCUS_ONLY" = 0 ] && [ "$GRID_HOVER_ONLY" = 0 ] && [ "$DATEMENU_ONLY" = 0 ] && [ "$SEARCH_LEAK_ONLY" = 0 ] && [ "$WINDOW_LEAK_ONLY" = 0 ] && [ "$LOCK_MENU_ONLY" = 0 ]; then
+    if [ "$ONLY_NO_EXAMPLES" = 0 ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example icon-probe
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
     fi
@@ -1500,7 +1522,7 @@ fi
 : >"$LOG"
 # Persist the disabled policy before the GTK publisher starts. The portal
 # probe must observe it on first acquisition, before testing live toggles.
-if [ "$SCREENSHOT_KEYS_ONLY" != 1 ] && [ "$A11Y_FOCUS_ONLY" != 1 ] && [ "$DATEMENU_ONLY" != 1 ]; then
+if [ "$ONLY_NO_CAMERA_POLICY" = 0 ]; then
     gsettings set org.gnome.desktop.privacy disable-camera true
 fi
 if [ -n "$PAM_ON" ]; then

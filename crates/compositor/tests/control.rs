@@ -683,7 +683,7 @@ fn screenshot_pointer_command_rejects_negative_local_coordinates() {
 
 #[test]
 fn native_owner_inventory_is_minor_gated_and_empty_revocation_is_real_wire() {
-    let owner = tuna_shell_control::NativeOutputInfo {
+    let owner = tuna_output::NativeOutputInfo {
         name: "eDP-1".into(),
         drm_device: libc::makedev(226, 0),
         connector_id: 39,

@@ -575,7 +575,7 @@ impl<'a> Session<'a> {
     /// explicitly revokes authority sent earlier.
     pub fn send_native_outputs(
         &mut self,
-        outputs: &[tuna_shell_control::NativeOutputInfo],
+        outputs: &[tuna_output::NativeOutputInfo],
     ) -> Result<(), ControlError> {
         if self.peer_minor < 37 {
             return Ok(());
@@ -1831,12 +1831,12 @@ pub struct ControlHub {
     /// compositor's tracking, and [`poll`](Self::poll) broadcasts it
     /// whenever it differs from `outputs_sent`.
     outputs: Vec<OutputInfo>,
-    native_outputs: Vec<tuna_shell_control::NativeOutputInfo>,
+    native_outputs: Vec<tuna_output::NativeOutputInfo>,
     pointer_output: Option<String>,
     /// Inventory value every live session holds; a mismatch means a
     /// broadcast is still owed (or a newcomer joined mid-state).
     outputs_sent: Vec<OutputInfo>,
-    native_outputs_sent: Vec<tuna_shell_control::NativeOutputInfo>,
+    native_outputs_sent: Vec<tuna_output::NativeOutputInfo>,
     /// Session environment for launched apps (#59), and the last value
     /// every live session holds.
     environment: Vec<(String, String)>,
@@ -2120,7 +2120,7 @@ impl ControlHub {
     /// [`poll`](Self::poll) broadcasts a change as
     /// [`Message::NativeOutputInventory`] (empty revokes it). Nested
     /// sessions always set an empty inventory.
-    pub fn set_native_outputs(&mut self, outputs: Vec<tuna_shell_control::NativeOutputInfo>) {
+    pub fn set_native_outputs(&mut self, outputs: Vec<tuna_output::NativeOutputInfo>) {
         self.native_outputs = outputs;
     }
 

@@ -302,20 +302,10 @@ pub struct OutputInfo {
     pub primary: bool,
 }
 
-/// Actual selected native DRM output authority. Missing inventory means no
-/// authority, including nested sessions; connector text alone is insufficient.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeOutputInfo {
-    pub name: String,
-    /// Actual char-device rdev from the compositor-owned KMS FD.
-    pub drm_device: u64,
-    /// Actual DRM connector object ID, checked against kernel sysfs.
-    pub connector_id: u32,
-    /// Canonical sysfs DRM connector directory under that owned device.
-    pub connector_sysfs: String,
-    pub connector_device: u64,
-    pub connector_inode: u64,
-}
+/// Actual selected native DRM output authority, owned by `tuna-output` so
+/// hardware-facing crates need not depend on this wire protocol (#784).
+/// Re-exported here because `Message::NativeOutputInventory` carries it.
+pub use tuna_output::NativeOutputInfo;
 
 /// One ordered state mutation between two snapshot revisions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -29,7 +29,8 @@ COPY --chmod=0755 packaging/marlin/tuna-image-kernels /usr/libexec/tuna-image-ke
 COPY --chmod=0755 packaging/marlin/tuna-pinned-baseline /usr/libexec/tuna-pinned-baseline
 
 # Install the shell integrations explicitly: the base can omit calendar
-# libraries, portal backends and the optional screen-recording plugins.
+# libraries, portal backends, the optional screen-recording plugins and
+# GeoClue (optional for the package; required by the agent-policy hook below).
 # Refresh, upgrade, and install dependencies in one coherent transaction.
 # Both desktop sessions share the resulting image's packages and kernel.
 RUN set -eux; \
@@ -40,9 +41,9 @@ RUN set -eux; \
         printf '%s  /tmp/tuna.pkg.tar.zst\n' "$TUNA_PKG_SHA256" | sha256sum -c -; \
     else test "$PERF_PINNED_BASELINE" = false; fi \
     && case "$PERF_PINNED_BASELINE" in \
-        false) pacman -Syu --needed --noconfirm librsvg glycin gdk-pixbuf2 fontconfig adwaita-fonts evolution-data-server gnome-keyring xdg-desktop-portal-gnome xdg-desktop-portal-gtk gst-plugin-pipewire gst-plugins-good orca speech-dispatcher ;; \
+        false) pacman -Syu --needed --noconfirm librsvg glycin gdk-pixbuf2 fontconfig adwaita-fonts evolution-data-server gnome-keyring xdg-desktop-portal-gnome xdg-desktop-portal-gtk gst-plugin-pipewire gst-plugins-good orca speech-dispatcher geoclue ;; \
         true) /usr/libexec/tuna-pinned-baseline && \
-            pacman -S --needed --noconfirm librsvg glycin gdk-pixbuf2 fontconfig adwaita-fonts evolution-data-server gnome-keyring xdg-desktop-portal-gnome xdg-desktop-portal-gtk gst-plugin-pipewire gst-plugins-good orca speech-dispatcher ;; \
+            pacman -S --needed --noconfirm librsvg glycin gdk-pixbuf2 fontconfig adwaita-fonts evolution-data-server gnome-keyring xdg-desktop-portal-gnome xdg-desktop-portal-gtk gst-plugin-pipewire gst-plugins-good orca speech-dispatcher geoclue ;; \
         *) exit 1 ;; \
     esac \
     && pacman -U --noconfirm /tmp/tuna.pkg.tar.zst \
