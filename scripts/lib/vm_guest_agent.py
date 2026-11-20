@@ -214,10 +214,11 @@ FAILURE_RECORDS = {"orca-read": ("orca_read_error", valid_orca_read_error),
                    "delayed-auth-state": ("delayed_auth_error", valid_delayed_auth_error),
                    "inventory": ("inventory_error", valid_inventory_error),
                    "autotz": ("autotz_error", valid_autotz_error),
-                   "tour-public-ui": ("tour_public_ui_error", valid_tour_public_ui_error)}
+                   "tour-public-ui": ("tour_public_ui_error", valid_tour_public_ui_error),
+                   "explicit-sync": ("explicit_sync_error", valid_tour_public_ui_error)}
 # Records that must be the whole output and are logged before raising, so a
 # caller's cleanup failure cannot hide them.
-LOGGED_FAILURE_RECORDS = {"delayed-auth-state", "inventory", "autotz"}
+LOGGED_FAILURE_RECORDS = {"delayed-auth-state", "inventory", "autotz", "explicit-sync"}
 def speech_failure_diagnostic(encoded):
     if not isinstance(encoded, str) or len(encoded) > 5464:
         return None

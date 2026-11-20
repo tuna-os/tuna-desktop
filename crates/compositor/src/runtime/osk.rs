@@ -46,7 +46,7 @@ impl Runtime {
         let mut touch_auto = false;
         #[cfg(feature = "drm")]
         if let super::Backend::Drm(drm) = &self.backend {
-            touch_auto = drm.touch_mode().auto();
+            touch_auto = drm.borrow().touch_mode().auto();
         }
         self.control.set_on_screen_keyboard(field, show, touch_auto);
     }

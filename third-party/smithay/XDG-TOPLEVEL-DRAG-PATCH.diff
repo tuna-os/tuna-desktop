@@ -1,0 +1,199 @@
+diff --git a/src/wayland/selection/data_device/device.rs b/src/wayland/selection/data_device/device.rs
+index 5a65527c..65e2acc6 100644
+--- a/src/wayland/selection/data_device/device.rs
++++ b/src/wayland/selection/data_device/device.rs
+@@ -68,8 +68,25 @@ where
+                 serial,
+             } => {
+                 let serial = Serial::from(serial);
++                // An existing DND grab is not an implicit press grab, even if
++                // it still carries the press serial that started it.
++                if super::client_dnd_active(&seat) {
++                    return;
++                }
++                // A serial alone is not authority: a different client can
++                // guess it. The origin must own the actual implicit grab.
++                if !resource.id().same_client_as(&origin.id()) {
++                    return;
++                }
+                 if let Some(pointer) = seat.get_pointer() {
+                     if pointer.has_grab(serial) {
++                        let start_data = pointer.grab_start_data().unwrap();
++                        let owns_origin = start_data.focus.as_ref()
++                            .and_then(|(focus, _)| focus.wl_surface())
++                            .is_some_and(|surface| surface.as_ref() == &origin);
++                        if !owns_origin {
++                            return;
++                        }
+                         if let Some(ref icon) = icon {
+                             if compositor::give_role(icon, DND_ICON_ROLE).is_err() {
+                                 resource.post_error(
+@@ -79,9 +96,12 @@ where
+                                 return;
+                             }
+                         }
+-                        // The StartDrag is in response to a pointer implicit grab, all is good
++                        // The origin owns this implicit pointer grab.
++                        if let Some(source) = &source {
++                            source.data::<super::DataSourceUserData>().unwrap()
++                                .inner.lock().unwrap().drag_started = true;
++                        }
+                         handler.started(source.clone(), icon.clone(), seat.clone());
+-                        let start_data = pointer.grab_start_data().unwrap();
+                         pointer.set_grab(
+                             handler,
+                             dnd_grab::DnDGrab::new_pointer(dh, start_data, source, origin, seat, icon),
+@@ -93,6 +113,13 @@ where
+                 }
+                 if let Some(touch) = seat.get_touch() {
+                     if touch.has_grab(serial) {
++                        let start_data = touch.grab_start_data().unwrap();
++                        let owns_origin = start_data.focus.as_ref()
++                            .and_then(|(focus, _)| focus.wl_surface())
++                            .is_some_and(|surface| surface.as_ref() == &origin);
++                        if !owns_origin {
++                            return;
++                        }
+                         if let Some(ref icon) = icon {
+                             if compositor::give_role(icon, DND_ICON_ROLE).is_err() {
+                                 resource.post_error(
+@@ -102,9 +129,12 @@ where
+                                 return;
+                             }
+                         }
+-                        // The StartDrag is in response to a touch implicit grab, all is good
++                        // The origin owns this implicit touch grab.
++                        if let Some(source) = &source {
++                            source.data::<super::DataSourceUserData>().unwrap()
++                                .inner.lock().unwrap().drag_started = true;
++                        }
+                         handler.started(source.clone(), icon.clone(), seat.clone());
+-                        let start_data = touch.grab_start_data().unwrap();
+                         touch.set_grab(
+                             handler,
+                             dnd_grab::DnDGrab::new_touch(dh, start_data, source, origin, seat, icon),
+@@ -116,6 +146,9 @@ where
+                 debug!(serial = ?serial, client = ?client, "denying drag from client without implicit grab");
+             }
+             wl_data_device::Request::SetSelection { source, .. } => {
++                if !handler.allow_selection(source.as_ref(), &seat, dh) {
++                    return;
++                }
+                 let seat_data = match seat.get_keyboard() {
+                     Some(keyboard) if keyboard.client_of_object_has_focus(&resource.id()) => seat
+                         .user_data()
+@@ -129,6 +162,10 @@ where
+                         return;
+                     }
+                 };
++                if let Some(source) = &source {
++                    source.data::<super::DataSourceUserData>().unwrap()
++                        .inner.lock().unwrap().used_for_selection = true;
++                }
+                 let source = source.map(SelectionSourceProvider::DataDevice);
+ 
+                 handler.new_selection(
+diff --git a/src/wayland/selection/data_device/dnd_grab.rs b/src/wayland/selection/data_device/dnd_grab.rs
+index 88c4c0c8..53858063 100644
+--- a/src/wayland/selection/data_device/dnd_grab.rs
++++ b/src/wayland/selection/data_device/dnd_grab.rs
+@@ -258,6 +258,20 @@ where
+         if !self.origin.alive() || self.data_source.as_ref().is_some_and(|s| !s.alive()) {
+             self.prepare_cancel_offer();
+         }
++        // A drag the handler says always performs its drop (a toplevel moved with it)
++        // reports dnd_drop_performed first, whatever the target does.
++        let drop_performed_first = !self.cancelled.get()
++            && self.data_source.as_ref().is_some_and(|source| {
++                source.alive()
++                    && ClientDndGrabHandler::drop_performed_without_target(data, source, self.seat.clone())
++            });
++        if drop_performed_first {
++            if let Some(source) = self.data_source.as_ref() {
++                if source.version() >= wl_data_source::EVT_DND_DROP_PERFORMED_SINCE {
++                    source.dnd_drop_performed();
++                }
++            }
++        }
+         // the user dropped, proceed to the drop
+         let seat_data = self
+             .seat
+@@ -291,7 +305,9 @@ where
+         if let Some(source) = self.data_source.as_ref().filter(|s| s.alive()) {
+             if !validated {
+                 source.cancelled();
+-            } else if source.version() >= wl_data_source::EVT_DND_DROP_PERFORMED_SINCE {
++            } else if !drop_performed_first
++                && source.version() >= wl_data_source::EVT_DND_DROP_PERFORMED_SINCE
++            {
+                 source.dnd_drop_performed();
+             }
+         }
+diff --git a/src/wayland/selection/data_device/mod.rs b/src/wayland/selection/data_device/mod.rs
+index fcef788f..5f9f2cfe 100644
+--- a/src/wayland/selection/data_device/mod.rs
++++ b/src/wayland/selection/data_device/mod.rs
+@@ -173,6 +173,20 @@ pub trait DataDeviceHandler: Sized + SelectionHandler + ClientDndGrabHandler + S
+     /// [DataDeviceState] getter
+     fn data_device_state(&self) -> &DataDeviceState;
+ 
++    /// Validate a clipboard source before changing selection state.
++    ///
++    /// Extensions may reserve a source for drag-and-drop and post their
++    /// specified protocol error here. Returning false leaves the selection
++    /// untouched. The default preserves ordinary clipboard behavior.
++    fn allow_selection(
++        &mut self,
++        source: Option<&WlDataSource>,
++        seat: &Seat<Self>,
++        dh: &DisplayHandle,
++    ) -> bool {
++        true
++    }
++
+     /// Action chooser for DnD negociation
+     fn action_choice(&mut self, available: DndAction, preferred: DndAction) -> DndAction {
+         default_action_chooser(available, preferred)
+@@ -203,6 +217,18 @@ pub trait ClientDndGrabHandler: SeatHandler + Sized {
+     ///   was cancelled or otherwise not successful.
+     /// * `seat` - The seat on which the DnD action was finished.
+     fn dropped(&mut self, target: Option<WlSurface>, validated: bool, seat: Seat<Self>) {}
++
++    /// Whether releasing this drag reports `wl_data_source.dnd_drop_performed`
++    /// to `source` even when no target accepted it.
++    ///
++    /// Asked once per drag, on a release that was not cancelled, with the source
++    /// still alive. When `true`, the source hears `dnd_drop_performed` before the
++    /// target hears `wl_data_device.drop`, and still hears `cancelled` afterwards
++    /// if no target accepted (Mutter's drag_grab_release for a drag that moves a
++    /// toplevel, xdg_toplevel_drag_v1). The default keeps the upstream behaviour.
++    fn drop_performed_without_target(&mut self, source: &WlDataSource, seat: Seat<Self>) -> bool {
++        false
++    }
+ }
+ 
+ /// Event generated by the interactions of clients with a server initiated drag'n'drop
+diff --git a/src/wayland/selection/data_device/source.rs b/src/wayland/selection/data_device/source.rs
+index d11db789..3b19e1d9 100644
+--- a/src/wayland/selection/data_device/source.rs
++++ b/src/wayland/selection/data_device/source.rs
+@@ -19,6 +19,10 @@ pub struct SourceMetadata {
+     pub mime_types: Vec<String>,
+     /// The Drag'n'Drop actions supported by this source
+     pub dnd_action: DndAction,
++    /// Whether this source has been accepted as a clipboard selection.
++    pub used_for_selection: bool,
++    /// Whether this source has started a drag-and-drop operation.
++    pub drag_started: bool,
+ }
+ 
+ impl Default for SourceMetadata {
+@@ -26,6 +30,8 @@ impl Default for SourceMetadata {
+         Self {
+             mime_types: Vec::new(),
+             dnd_action: DndAction::None,
++            used_for_selection: false,
++            drag_started: false,
+         }
+     }
+ }

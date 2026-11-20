@@ -63,6 +63,17 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
 
 
+    def test_native_protocol_inputs_require_the_real_package_and_vm(self):
+        for path in ("scripts/tuna-explicit-sync-build", "scripts/tuna-protocol-xml-stage",
+                     "scripts/tuna-background-effect-client-build",
+                     "scripts/lib/tuna-explicit-sync-client.c",
+                     "scripts/lib/tuna-explicit-sync-guest.py", "scripts/lib/explicit_sync_vm.py",
+                     "scripts/lib/tuna-background-effect-client.c",
+                     "scripts/lib/background_effect_oracle.py"):
+            for run in (0, 4, 19):
+                selected = set(pr(path, run=run, size=0))
+                self.assertTrue({"arch-package", "marlin-vm"} <= selected, (path, run))
+
     def test_transition_policy_and_suite_always_run_journey(self):
         for path in ('scripts/lib/transition-package-policy.py',
                      'scripts/lib/transition-package-policy-tests.py'):

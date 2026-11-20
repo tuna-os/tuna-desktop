@@ -5,10 +5,24 @@ import json
 from pathlib import Path
 import re
 
+PROTOCOL_MEMBERS = ('/usr/libexec/tuna-explicit-sync-client',
+                    '/usr/libexec/tuna-background-effect-client',
+                    '/usr/share/tuna-explicit-sync/protocol-xml.sha256',
+                    '/usr/share/tuna-explicit-sync/protocol-source.json')
+PROTOCOL_INPUTS = ('scripts/tuna-explicit-sync-build',
+                   'scripts/tuna-background-effect-client-build',
+                   'scripts/lib/tuna-explicit-sync-client.c',
+                   'scripts/lib/tuna-background-effect-client.c')
+
+
 def fixture_members(fixture):
     """Fixed immutable installed observer set, never a caller-selected list."""
     if fixture == 'lifecycle':
         return {}
+    if fixture == 'explicit-sync':
+        return {'/usr/libexec/tuna-vm-explicit-sync': 'scripts/lib/tuna-explicit-sync-guest.py',
+                '/usr/libexec/background_effect_oracle.py': 'scripts/lib/background_effect_oracle.py',
+                '/usr/share/tuna-explicit-sync/native-build.json': 'native-protocol-build.json'}
     if fixture != 'autotz':
         raise ValueError('unknown native image fixture')
     directory = 'packaging/marlin/vm-lane/'
@@ -20,7 +34,6 @@ def fixture_members(fixture):
                     for name in ('autotz.py', 'geoclue_fixture.py')})
     members['/usr/libexec/tuna-geoclue-agent-policy'] = 'packaging/marlin/tuna-geoclue-agent-policy'
     return members
-
 
 
 def canonical_image_id(observed):
@@ -146,6 +159,22 @@ def admission(package, observed, root, commit, image_id, base_image, *, fixture=
         expected['/usr/libexec/' + name] = hashlib.sha256(path.read_bytes()).hexdigest()
     for installed, source in fixture_members(fixture).items():
         expected[installed] = hashlib.sha256((Path(root) / source).read_bytes()).hexdigest()
+    if fixture == 'explicit-sync':
+        build = json.loads((Path(root) / 'native-protocol-build.json').read_bytes())
+        sources = {name: hashlib.sha256((Path(root) / name).read_bytes()).hexdigest()
+                   for name in PROTOCOL_INPUTS}
+        if (set(build) != {'schema', 'source_sha256', 'member_sha256'}
+                or build['schema'] != 1 or build['source_sha256'] != sources):
+            raise ValueError('native protocol build inputs differ from exact source')
+        members = build['member_sha256']
+        if (type(members) is not dict or set(members) != set(PROTOCOL_MEMBERS)
+                or any(not isinstance(value, str) or not re.fullmatch('[0-9a-f]{64}', value)
+                       for value in members.values())):
+            raise ValueError('native protocol original build member identity missing')
+        staged = Path(root) / 'protocol-xml/wayland-protocols/source.json'
+        if members['/usr/share/tuna-explicit-sync/protocol-source.json'] != hashlib.sha256(staged.read_bytes()).hexdigest():
+            raise ValueError('native protocol XML source differs from independently staged locked archive')
+        expected.update(members)
     if observed.get('member_sha256') != expected:
         raise ValueError('final image installed executables differ from package/source bytes')
     digest = package['package']['sha256']
@@ -206,4 +235,6 @@ def inspection_program(fixture='lifecycle'):
     names += ['/usr/libexec/tuna-vm-input', '/usr/libexec/tuna-vm-lifecycle',
               '/usr/libexec/tuna-vm-shell-focus']
     names += list(fixture_members(fixture))
+    if fixture == 'explicit-sync':
+        names += list(PROTOCOL_MEMBERS)
     return 'import hashlib,json,os,stat,sys\nnames=' + repr(names) + '\n' + _INSPECTION_BODY

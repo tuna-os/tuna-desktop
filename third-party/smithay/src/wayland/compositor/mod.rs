@@ -553,6 +553,27 @@ pub fn add_blocker(surface: &WlSurface, blocker: impl Blocker + Send + 'static) 
     PrivateSurfaceData::add_blocker(surface, blocker)
 }
 
+#[derive(Default)]
+struct AbortedCommit(std::sync::atomic::AtomicBool);
+
+/// Abort this pending commit after a pre-commit hook posts a fatal protocol
+/// error. Unlike a cancelled blocker, this never caches or applies its state.
+pub fn abort_pending_commit(surface: &WlSurface) {
+    with_states(surface, |states| {
+        states.data_map.insert_if_missing_threadsafe(AbortedCommit::default);
+        states.data_map.get::<AbortedCommit>().unwrap().0
+            .store(true, std::sync::atomic::Ordering::Release);
+    });
+}
+
+fn take_aborted_commit(surface: &WlSurface) -> bool {
+    with_states(surface, |states| {
+        states.data_map.get::<AbortedCommit>().is_some_and(|aborted| {
+            aborted.0.swap(false, std::sync::atomic::Ordering::AcqRel)
+        })
+    })
+}
+
 /// Handler trait for compositor
 pub trait CompositorHandler {
     /// [CompositorState] getter

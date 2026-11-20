@@ -13,7 +13,6 @@ use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{Duration, Instant};
 
-use smithay::backend::allocator::{Fourcc, Modifier};
 use tuna_compositor::windows::WindowManager;
 use tuna_compositor::TestCompositor;
 use wayland_client::{
@@ -86,10 +85,12 @@ const ROUNDS: usize = 200;
 /// version. linux-dmabuf joins once a renderer reports formats (see
 /// below), and wl_output once an output is connected.
 const EXPECTED: &[(&str, u32)] = &[
+    ("ext_background_effect_manager_v1", 1),
     ("ext_idle_notifier_v1", 2),
     ("ext_session_lock_manager_v1", 1),
     ("wl_compositor", 6),
     ("wl_data_device_manager", 3),
+    ("wl_fixes", 1),
     ("wl_seat", 9),
     ("wl_shm", 2),
     ("wl_subcompositor", 1),
@@ -107,9 +108,10 @@ const EXPECTED: &[(&str, u32)] = &[
     ("xdg_activation_v1", 1),
     ("xdg_session_manager_v1", 1),
     ("xdg_system_bell_v1", 1),
+    ("xdg_toplevel_drag_manager_v1", 1),
     ("xdg_toplevel_icon_manager_v1", 1),
     ("xdg_toplevel_tag_manager_v1", 1),
-    ("xdg_wm_base", 6),
+    ("xdg_wm_base", 7),
     ("xdg_wm_dialog_v1", 1),
     ("zwp_idle_inhibit_manager_v1", 1),
     ("zwp_keyboard_shortcuts_inhibit_manager_v1", 1),
@@ -119,7 +121,9 @@ const EXPECTED: &[(&str, u32)] = &[
     ("zwp_relative_pointer_manager_v1", 1),
     ("zwp_tablet_manager_v2", 2),
     ("zwp_text_input_manager_v3", 1),
+    ("zxdg_exporter_v1", 1),
     ("zxdg_exporter_v2", 1),
+    ("zxdg_importer_v1", 1),
     ("zxdg_importer_v2", 1),
     ("zxdg_output_manager_v1", 3),
 ];
@@ -135,6 +139,13 @@ const SHELL_ONLY: &[(&str, u32)] = &[
 
 /// Globals of `EXPECTED` a client inside a wp_security_context_v1 does
 /// not see (#1046): it cannot lock the session or nest a context.
+///
+/// Of the globals no headless registry holds, wp_drm_lease_device_v1
+/// (native backend) is filtered the same way, and
+/// zwp_xwayland_keyboard_grab_manager_v1 is offered to the Xwayland
+/// client alone. wl_fixes, ext-background-effect, xdg-toplevel-drag and
+/// xdg-foreign v1 act on the client's own objects, as do linux-dmabuf
+/// and linux-drm-syncobj, so sandboxed clients keep them.
 const SANDBOX_HIDDEN: &[&str] = &[
     "ext_session_lock_manager_v1",
     "wp_security_context_manager_v1",
@@ -158,6 +169,8 @@ struct Client {
     icons: Option<XdgToplevelIconManagerV1>,
     shm: Option<wayland_client::protocol::wl_shm::WlShm>,
     keyboard_serial: Option<u32>,
+    /// Interfaces each tagged registry announced.
+    tagged: BTreeMap<u32, Vec<String>>,
     token: Option<String>,
     /// ext-idle-notify events by notification tag: `true` for idled.
     idle_events: Vec<(u32, bool)>,
@@ -282,6 +295,23 @@ wayland_client::delegate_noop!(Client: ignore WlCompositor);
 wayland_client::delegate_noop!(Client: ignore WlSurface);
 wayland_client::delegate_noop!(Client: ignore XdgToplevel);
 wayland_client::delegate_noop!(Client: ignore XdgActivationV1);
+wayland_client::delegate_noop!(Client: ignore wayland_client::protocol::wl_fixes::WlFixes);
+
+/// A second registry, tagged: the interfaces each one announced.
+impl Dispatch<WlRegistry, u32> for Client {
+    fn event(
+        state: &mut Self,
+        _: &WlRegistry,
+        event: wl_registry::Event,
+        tag: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global { interface, .. } = event {
+            state.tagged.entry(*tag).or_default().push(interface);
+        }
+    }
+}
 
 impl Dispatch<ExtIdleNotificationV1, u32> for Client {
     fn event(
@@ -514,25 +544,65 @@ fn layer_shell_is_visible_and_bindable_only_by_the_supervised_shell() {
 }
 
 #[test]
-fn dmabuf_is_advertised_only_with_renderer_formats() {
+fn native_buffer_protocols_are_absent_without_a_renderer() {
     let mut comp = TestCompositor::new();
     let mut manager = comp.window_manager();
-    comp.state.enable_dmabuf(Vec::new());
     let mut peer = connect(&mut comp);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert!(!peer.client.globals.contains_key("zwp_linux_dmabuf_v1"));
+    assert!(!peer
+        .client
+        .globals
+        .contains_key("wp_linux_drm_syncobj_manager_v1"));
+}
 
-    comp.state
-        .enable_dmabuf(vec![smithay::backend::allocator::Format {
-            code: Fourcc::Argb8888,
-            modifier: Modifier::Linear,
-        }]);
-    let mut late = connect(&mut comp);
-    pump(&mut comp, &mut manager, &mut [&mut late]);
-    assert_eq!(
-        late.client.globals.get("zwp_linux_dmabuf_v1").map(|g| g.1),
-        Some(3)
+#[test]
+fn wl_fixes_destroys_a_registry_and_its_announcements_stop() {
+    // Mutter 51 (meta-wayland-fixes.c): destroy_registry destroys the
+    // registry resource; later globals are announced to live registries
+    // only.
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    let mut peer = connect(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let qh = peer.queue.handle();
+    let (name, version) = peer.client.globals["wl_fixes"];
+    assert_eq!(version, 1);
+    let kept = peer._conn.display().get_registry(&qh, 1u32);
+    let dropped = peer._conn.display().get_registry(&qh, 2u32);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let fixes: wayland_client::protocol::wl_fixes::WlFixes = kept.bind(name, 1, &qh, ());
+    assert!(peer.client.tagged[&2].iter().any(|i| i == "wl_compositor"));
+    fixes.destroy_registry(&dropped);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+
+    // A new real Wayland global, independent of any renderer capability.
+    let interface = "wl_output";
+    assert!(!peer.client.tagged[&1].iter().any(|i| i == interface));
+    let output = smithay::output::Output::new(
+        "registry-lifecycle-output".into(),
+        smithay::output::PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: smithay::output::Subpixel::Unknown,
+            make: "Tuna".into(),
+            model: "Registry lifecycle".into(),
+        },
     );
+    let _global = output.create_global::<tuna_compositor::State>(&comp.display.handle());
+    comp.state
+        .add_output("registry-lifecycle-output", Some(output), 1280, 800);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(
+        peer.client.tagged[&1].iter().any(|i| i == interface),
+        "a live registry hears the new global"
+    );
+    assert!(
+        !peer.client.tagged[&2].iter().any(|i| i == interface),
+        "a destroyed registry hears nothing more"
+    );
+    fixes.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(peer.queue.dispatch_pending(&mut peer.client).is_ok());
 }
 
 fn mint(peer: &mut Peer, with_serial: bool) -> XdgActivationTokenV1 {

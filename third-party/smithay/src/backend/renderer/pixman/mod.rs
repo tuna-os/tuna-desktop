@@ -648,6 +648,14 @@ impl Frame for PixmanFrame<'_, '_> {
         sync.wait().map_err(|_| PixmanError::SyncInterrupted)
     }
 
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    fn note_buffer_access(&mut self, buffer: &super::utils::Buffer) -> Result<(), Self::Error> {
+        if let Some(acquire) = buffer.acquire_point() {
+            self.wait(&SyncPoint::from(acquire.clone()))?;
+        }
+        Ok(())
+    }
+
     #[profiling::function]
     fn finish(mut self) -> Result<SyncPoint, Self::Error> {
         self.finish_internal()

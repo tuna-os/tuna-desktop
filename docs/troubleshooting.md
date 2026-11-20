@@ -79,10 +79,18 @@ followed by the step that failed (`crates/compositor/src/drm.rs:390-433`):
 | `open drm device: /dev/dri/cardN: ... Operation not permitted` | The seat did not grant the device: the session is not the active one on that seat. |
 | `egl display`, `egl context`, `gles` | The GPU's Mesa driver is missing or broken. |
 
-With several GPUs, `TUNA_DRM_DEVICE=/dev/dri/cardN` chooses one. CI proves
-the backend on the kernel's virtual KMS driver (`scripts/tuna-drm-smoke`,
-[running tests locally](testing.md#nested-proofs)); physical GPUs are not
-qualified yet.
+With several GPUs, the compositor renders on the primary one (the udev
+`mutter-device-preferred-primary` tag, else a boot GPU that can render,
+else a GPU that renders and drives a connected monitor) and shows the
+monitors of the other GPUs through a CPU copy, as Mutter does for a GPU that
+cannot import the primary GPU's buffers. The log names each with
+`connector ... shows a secondary GPU copy`; a name another GPU already uses
+gets the GPU's prefix (`card1-Virtual-1`). `TUNA_DRM_DEVICE=/dev/dri/cardN`
+drives that one device alone. CI proves the backend on the kernel's virtual
+KMS driver (`scripts/tuna-drm-smoke`,
+[running tests locally](testing.md#nested-proofs)) and on QEMU's std VGA
+beside a virgl virtio-gpu (the `native-explicit-sync` VM lane); physical
+GPUs are not qualified yet.
 
 ## Installing and upgrading
 

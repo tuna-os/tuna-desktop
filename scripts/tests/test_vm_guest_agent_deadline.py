@@ -213,6 +213,23 @@ class Tests(unittest.TestCase):
             actor.command('guest-ping')
         self.assertTrue(actor.poisoned)
 
+    def test_caller_deadline_bounds_actual_nested_exec_socket(self):
+        actor, peer = self.actor()
+        def exec_then_stall(peer, stop):
+            request = json.loads(peer.recv(65536))
+            peer.sendall(json.dumps({'return': {'pid': 51}, 'id': request['id']}).encode() + b'\n')
+            peer.recv(65536)
+            stop.wait(.4)
+        self.server(peer, exec_then_stall)
+        began = time.monotonic()
+        actor._caller_deadline = began + .05
+        with self.assertRaises(TimeoutError):
+            actor.run('explicit-sync', 'state', '{}', timeout=30)
+        self.assertLess(time.monotonic() - began, .7)
+        self.assertEqual(actor.pending_guest_pid, 51)
+        self.assertEqual(actor.guest_exec_state, 'known')
+        self.assertTrue(actor.poisoned)
+
     def test_caller_deadline_caps_longer_nested_command(self):
         actor, _ = self.actor()
         began = time.monotonic()
