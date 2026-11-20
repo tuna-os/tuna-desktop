@@ -231,6 +231,8 @@ class PackagePolicy(unittest.TestCase):
                 ('usr/share/wayland-sessions/tuna.desktop', 'share/wayland-sessions/tuna.desktop'),
                 ('usr/share/wayland-sessions/roost.desktop', 'share/compat/wayland-sessions/roost.desktop'),
                 ('usr/lib/systemd/user/tuna-session.target', 'share/systemd/user/tuna-session.target'),
+                ('usr/lib/systemd/user/tuna-greeter.service', 'share/systemd/user/tuna-greeter.service'),
+                ('usr/share/tuna-desktop/greeter/gnome-login.session.conf', 'share/greeter/gnome-login.session.conf'),
                 ('etc/pam.d/tuna-lock', 'share/pam.d/tuna-lock'),
                 ('etc/pam.d/tuna-lock-fingerprint', 'share/pam.d/tuna-lock-fingerprint'),
                 ('etc/pam.d/roost-lock', 'share/compat/pam.d/roost-lock')):
@@ -404,7 +406,7 @@ class ReleaseDelegatePolicy(unittest.TestCase):
                 path.write_text('#!/bin/sh\nset -eu\n' + body + '\n')
                 path.chmod(0o755)
             tool('git', 'echo v0.1.0')
-            tool('cargo', 'test "$*" = "build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host"')
+            tool('cargo', 'test "$*" = "build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host -p tuna-greeter"')
             tool('dpkg-shlibdeps', 'exit 9' if failure == 'shlibs' else ('echo unknown' if failure == 'malformed' else 'echo "shlibs:Depends=libc6 (>= 2.36)"'))
             # tuna-rename: keep-begin
             tool('dpkg-deb', '''test "$1" = --root-owner-group
@@ -435,7 +437,7 @@ cp "$3/DEBIAN/control" "$OUTPUT"''')
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('#!/bin/sh\necho "' + name + ' 0.1.0"\nexit ' + str(version_exit if name == 'tuna-shell-gtk' else 0) + '\n')
                 path.chmod(0o755)
-            for name in ('share/wayland-sessions/tuna.desktop', 'share/systemd/user/tuna-session.target', 'share/pam.d/tuna-lock', 'share/pam.d/tuna-lock-fingerprint', 'share/xdg-desktop-portal/portals/tuna.portal', 'packaging/marlin/tuna-portals.conf', 'packaging/marlin/tuna-geoclue-agent-policy', 'share/compat/wayland-sessions/roost.desktop', 'share/compat/pam.d/roost-lock'):  # tuna-rename: keep
+            for name in ('share/wayland-sessions/tuna.desktop', 'share/systemd/user/tuna-session.target', 'share/systemd/user/tuna-greeter.service', 'share/greeter/gnome-login.session.conf', 'share/pam.d/tuna-lock', 'share/pam.d/tuna-lock-fingerprint', 'share/xdg-desktop-portal/portals/tuna.portal', 'packaging/marlin/tuna-portals.conf', 'packaging/marlin/tuna-geoclue-agent-policy', 'share/compat/wayland-sessions/roost.desktop', 'share/compat/pam.d/roost-lock'):  # tuna-rename: keep
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / name, path)

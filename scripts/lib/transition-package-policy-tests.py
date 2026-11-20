@@ -29,7 +29,9 @@ M = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(M)
 # Expectations are maintained here, never imported from the policy under test.
 BINS = ('tuna-compositor', 'tuna-session', 'tuna-shell-gtk', 'tuna-shell-host',
-        'tuna-ibus-bridge', 'tuna-wallpaper-svg')
+        'tuna-ibus-bridge', 'tuna-wallpaper-svg', 'tuna-greeter')
+GREETER_UNIT = 'usr/lib/systemd/user/tuna-greeter.service'
+GREETER_DROP_IN = 'usr/share/tuna-desktop/greeter/gnome-login.session.conf'
 SESSION = 'usr/share/wayland-sessions/tuna.desktop'
 OLD_SESSION = 'usr/share/wayland-sessions/roost.desktop'
 PAM = 'etc/pam.d/tuna-lock'
@@ -126,6 +128,8 @@ int main(int argc, char **argv) {
         for name, body in ((SESSION, DESKTOP), (OLD_SESSION, DESKTOP + 'NoDisplay=true\n'),
                            (PAM, PAM_TEXT), (FP_PAM, FP_PAM_TEXT), (OLD_PAM, PAM_TEXT),
                            ('usr/lib/systemd/user/tuna-session.target', '[Unit]\nDescription=Fixture session\n'),
+                           (GREETER_UNIT, (ROOT / 'share/systemd/user/tuna-greeter.service').read_text()),
+                           (GREETER_DROP_IN, (ROOT / 'share/greeter/gnome-login.session.conf').read_text()),
                            ('DEBIAN/conffiles', CONFFILES), ('DEBIAN/control', '''Package: tuna-desktop
 Version: 0.1.0~beta.1
 Architecture: amd64
@@ -201,13 +205,13 @@ Provides: roost
         delegates = work / 'controlled-delegates'
         delegates.mkdir()
         commands = {
-            'cargo': '''test "$*" = 'build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host'
+            'cargo': '''test "$*" = 'build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host -p tuna-greeter'
 test "$TUNA_VERSION" = '0.1.0-beta.1'
 ''',
             'git': '''test "$*" = 'describe --tags --exact-match --match v[0-9]* HEAD'
 printf '%s\\n' v0.1.0-beta.1
 ''',
-            'dpkg-shlibdeps': '''test "$*" = '-O -eusr/bin/tuna-compositor -eusr/bin/tuna-session -eusr/bin/tuna-shell-gtk -eusr/bin/tuna-shell-host -eusr/bin/tuna-ibus-bridge -eusr/bin/tuna-wallpaper-svg'
+            'dpkg-shlibdeps': '''test "$*" = '-O -eusr/bin/tuna-compositor -eusr/bin/tuna-session -eusr/bin/tuna-shell-gtk -eusr/bin/tuna-shell-host -eusr/bin/tuna-ibus-bridge -eusr/bin/tuna-wallpaper-svg -eusr/bin/tuna-greeter'
 printf '%s\\n' 'shlibs:Depends=libc6 (>= 2.34)'
 ''',
         }
@@ -243,6 +247,14 @@ printf '%s\\n' 'shlibs:Depends=libc6 (>= 2.34)'
         self.assertEqual({name for name in data if 'roost' in name.lower()}, {OLD_SESSION, OLD_PAM})
         for name in BINS:
             self.assertEqual(data['usr/bin/' + name][1][:4], b'\x7fELF')
+        # The login screen ships inactive (#1164): the unit and the drop-in
+        # as checked in, nothing under GDM's gnome-login drop-in directory.
+        for name, source in ((GREETER_UNIT, 'share/systemd/user/tuna-greeter.service'),
+                             (GREETER_DROP_IN, 'share/greeter/gnome-login.session.conf')):
+            item, body = data[name]
+            self.assertEqual((item.mode, item.uid, item.gid), (0o644, 0, 0))
+            self.assertEqual(body, (ROOT / source).read_bytes())
+        self.assertFalse([name for name in data if 'gnome-session@' in name])
         checked = subprocess.run([str(SCRIPT), str(package)],
             text=True, capture_output=True, timeout=30, umask=0o002)
         self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
@@ -253,6 +265,16 @@ printf '%s\\n' 'shlibs:Depends=libc6 (>= 2.34)'
         self.reject(data=replace(self.data, path, member(path,
                     '#!/bin/sh\nprintf "tuna-shell-gtk 0.1.0-beta.1\\n"\n', mode=0o755)),
                     reason='tuna-shell-gtk ELF loader check failed')
+
+    def test_greeter_unit_must_start_the_greeter_compositor(self):
+        self.reject(data=replace(self.data, GREETER_UNIT, member(GREETER_UNIT,
+                    '[Service]\nExecStart=/usr/bin/gnome-shell --mode=gdm\n')),
+                    reason='tuna-greeter.service does not start the greeter compositor')
+
+    def test_package_never_enables_the_login_screen_itself(self):
+        active = 'usr/lib/systemd/user/gnome-session@gnome-login.target.d/gnome-login.session.conf'
+        self.reject(data=self.data + [member(active, (ROOT / 'share/greeter/gnome-login.session.conf').read_text())],
+                    reason='the package must not install an active gnome-login drop-in')
 
     def test_current_asset_aliases_and_same_directory_link_chain_are_valid(self):
         aliases = [member('usr/share/tuna-desktop/alias-source', 'current asset\n'),

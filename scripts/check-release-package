@@ -36,8 +36,11 @@ for path in \
     usr/bin/tuna-shell-host \
     usr/bin/tuna-ibus-bridge \
     usr/bin/tuna-wallpaper-svg \
+    usr/bin/tuna-greeter \
     usr/share/wayland-sessions/tuna.desktop \
     usr/lib/systemd/user/tuna-session.target \
+    usr/lib/systemd/user/tuna-greeter.service \
+    usr/share/tuna-desktop/greeter/gnome-login.session.conf \
     usr/libexec/tuna-geoclue-agent-policy \
     etc/pam.d/tuna-lock \
     etc/pam.d/tuna-lock-fingerprint; do
@@ -57,10 +60,20 @@ trap 'rm -rf "$DIR"' EXIT INT TERM
 dpkg-deb -x "$PKG" "$DIR"
 python3 "$ROOT/scripts/tuna-cursor-assets-check" "$DIR/usr/share/tuna-desktop/icons/Adwaita" \
     || fail "bundled cursor assets rejected"
-for path in usr/share/wayland-sessions/tuna.desktop usr/lib/systemd/user/tuna-session.target etc/pam.d/tuna-lock etc/pam.d/tuna-lock-fingerprint; do
+for path in usr/share/wayland-sessions/tuna.desktop usr/lib/systemd/user/tuna-session.target \
+    usr/lib/systemd/user/tuna-greeter.service usr/share/tuna-desktop/greeter/gnome-login.session.conf \
+    etc/pam.d/tuna-lock etc/pam.d/tuna-lock-fingerprint; do
     [ -f "$DIR/$path" ] && [ ! -L "$DIR/$path" ] || fail "invalid required file $path"
 done
-for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus-bridge tuna-wallpaper-svg; do
+# The login screen (#1164): the unit runs the greeter compositor, and the
+# drop-in that selects it ships inactive, never at GDM's own path.
+grep -Fxq 'ExecStart=/usr/bin/tuna-compositor --greeter' "$DIR/usr/lib/systemd/user/tuna-greeter.service" \
+    || fail "tuna-greeter.service does not start the greeter compositor"
+grep -Fxq 'Requires=tuna-greeter.service' "$DIR/usr/share/tuna-desktop/greeter/gnome-login.session.conf" \
+    || fail "gnome-login.session.conf does not require tuna-greeter.service"
+! printf '%s' "$CONTENTS" | grep -q 'gnome-session@gnome-login.target.d' \
+    || fail "the package must not install an active gnome-login drop-in"
+for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus-bridge tuna-wallpaper-svg tuna-greeter; do
     [ -f "$DIR/usr/bin/$bin" ] && [ ! -L "$DIR/usr/bin/$bin" ] && [ -x "$DIR/usr/bin/$bin" ] || fail "invalid executable $bin"
     (ulimit -f 8; timeout 10 "$DIR/usr/bin/$bin" --version) >"$DIR/version-output" || fail "$bin version command failed"
     printf '%s\n' "$bin $SEMVER" >"$DIR/version-expected"

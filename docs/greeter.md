@@ -50,18 +50,33 @@ main, and the installed files of `ghcr.io/tuna-os/marlin` (image
 
 ### Integration point (chosen)
 
-Replace the vendor drop-in by name: ship
+Replace the vendor drop-in by name in `/etc`:
 `/etc/systemd/user/gnome-session@gnome-login.target.d/gnome-login.session.conf`
 with `Requires=gnome-session-basic-services.target` and
-`Requires=tuna-greeter.service`. systemd lets a drop-in in `/etc` override the
-one of the same name in `/usr/lib` (systemd.unit(5), "Drop-in files … with
-the same name"), and dependency lists cannot be emptied by another drop-in,
-so this is the only override that removes the shell. It keeps everything
-else of GDM's design: the `gnome-greeter` session, gnome-session's leader
-and `gnome-login` target, the settings daemon plugins, and GDM's own
-restart of a failed greeter. TunaOS already themes the greeter through
-`/etc/systemd/user/org.gnome.Shell@gdm.service.d/` (the Marlin image has
-`tunaos-gdm-theme.conf` there), so `/etc` is the image's existing seam.
+`Requires=tuna-greeter.service`. Drop-ins of the same name mask each other
+along the unit search path, first directory wins (systemd.unit(5); checked
+with a probe unit), and dependency lists cannot be emptied by another
+drop-in, so a same-name replacement is the only override that removes the
+shell. It keeps everything else of GDM's design: the `gnome-greeter`
+session, gnome-session's leader and `gnome-login` target, the settings
+daemon plugins, and GDM's own restart of a failed greeter.
+
+Why `/etc` and not a vendor directory: the same name under
+`/usr/lib/systemd/user` is GDM's own file (a package conflict).
+`/usr/share/systemd/user` (`$XDG_DATA_DIRS/systemd/user`) precedes
+`/usr/lib/systemd/user` and would override it, but the package would then
+switch the login screen of every system it is installed on, including the
+stock-GNOME reference fixtures (`vm-lane/Containerfile.reference`), the
+preview image and Ubuntu installs of the `.deb`. So every package format
+ships the replacement inactive, as
+`/usr/share/tuna-desktop/greeter/gnome-login.session.conf` (source
+`share/greeter/`), beside `/usr/lib/systemd/user/tuna-greeter.service`
+(`share/systemd/user/`) and `/usr/bin/tuna-greeter`. TunaOS images enable
+it: tunaOS's `tuna-greeter` hook (vendored in `vm-lane/tunaos/`) copies it
+to `/etc` after checking that it equals GDM's drop-in with only the shell
+requirement replaced, and replaces the old `tuna-gdm-theme` GNOME Shell
+stylesheet hook. GDM 48 and older (Debian trixie) start the shell through
+`session.conf` instead and keep GNOME Shell's greeter.
 
 Rejected:
 
@@ -73,7 +88,7 @@ Rejected:
 - A different `gnome-greeter.desktop`: the file belongs to the `gdm`
   package (package conflicts) and the session name is compiled into GDM.
 
-`tuna-greeter.service` (packaging slice, not in this change):
+`tuna-greeter.service` (`share/systemd/user/tuna-greeter.service`):
 
 ```ini
 [Unit]
@@ -227,8 +242,8 @@ logind) → fade out → `StartSessionWhenReady(service, true)`.
 
 ## Proof
 
-`scripts/tuna-greeter-proof` (gtk-shell CI job) runs the real
-`tuna-compositor --greeter` nested on Xvfb with the real `tuna-greeter`;
+`scripts/tuna-greeter-proof` (gtk-shell CI job, on the source build) runs
+the real `tuna-compositor --greeter` nested on Xvfb with the real `tuna-greeter`;
 GDM's daemon and AccountsService are `scripts/lib/tuna-gdm-mock.py` on a
 private system bus, serving the API above with GDM 51.1.1's signal order and
 failure text. Users are chosen and passwords typed with real X11 keys, and
@@ -243,7 +258,15 @@ runs with GDM 51.1.1's `org.gnome.login-screen` schema
 `TUNA_SESSION_KIND=hardware`, and the mock's control interface
 (`org.tuna.Proof.GdmMock`) adds and deletes users and closes GDM's
 channels: `G-GREETER-POLICY`, `-CAPS-LOCK`, `-POWER-MENU`, `-LIVE-USERS`,
-`-RECONNECT`. Nested only: no real GDM, PAM, gnome-session or DRM.
+`-RECONNECT`. Nested only: no real GDM, PAM, gnome-session or DRM. The
+journey CI job runs the same proof against the installed `.deb`'s own binaries
+(`TUNA_PROOF_BIN_DIR=/usr/bin`, artifacts under `journey-artifacts/greeter`),
+and the parity ledger requires both runs' gates to pass.
+`scripts/check-deb-clean-install` (journey; unit suite
+`scripts/lib/deb-clean-install-tests.py`) and arch-package's installed smoke
+check the packaged layout: `tuna-greeter` runs (`--version`) beside the
+compositor, the unit and the inactive drop-in are installed, and no drop-in
+is installed at GDM's `/etc/systemd/user` path.
 
 ## Security model
 
@@ -299,4 +322,4 @@ channels: `G-GREETER-POLICY`, `-CAPS-LOCK`, `-POWER-MENU`, `-LIVE-USERS`,
 | Quick settings (power, volume, network) | yes | power actions (Suspend, Restart…, Power Off… straight to logind) on hardware only | G-GREETER-POWER-MENU; cargo: `power_actions_need_hardware_and_restart_buttons` |
 | Timed/auto login, conflicting session dialog, realmd hint | yes | no | — |
 | Translations | yes | no | — |
-| Greeter on every variant, `org.gnome.Shell@gdm.service` gone | — | no packaging yet | V-GREETER-LIST, V-GDM-LOGIN, V-GDM-FALLBACK |
+| Greeter on every variant, `org.gnome.Shell@gdm.service` gone | — | both packages ship it inactive beside the compositor; the VM lane's tunaOS layer enables it | `check-deb-clean-install` (journey), arch-package installed smoke, journey's installed-package greeter proof, V-GREETER-TUNA; V-GREETER-LIST, V-GDM-LOGIN, V-GDM-FALLBACK |

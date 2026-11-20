@@ -238,3 +238,69 @@ fn arch_package_stamps_and_checks_the_version() {
     assert!(containerfile.contains("test -x \"/usr/bin/$bin\""));
     assert!(containerfile.contains("\"$bin\" --version || exit 1;"));
 }
+
+/// #1164: both package formats ship the login screen, inactive. The unit
+/// replaces GNOME Shell's greeter unit; the drop-in that selects it is data
+/// an image copies over GDM's own drop-in, never a file at GDM's path.
+#[test]
+fn packages_ship_the_login_screen_inactive() {
+    for (path, unit, drop_in) in [
+        (
+            "scripts/tuna-release",
+            "\"$STAGE/usr/lib/systemd/user/tuna-greeter.service\"",
+            "\"$STAGE/usr/share/tuna-desktop/greeter/gnome-login.session.conf\"",
+        ),
+        (
+            "packaging/arch/PKGBUILD",
+            "\"$pkgdir/usr/lib/systemd/user/tuna-greeter.service\"",
+            "\"$pkgdir/usr/share/tuna-desktop/greeter/gnome-login.session.conf\"",
+        ),
+    ] {
+        let body = read_workspace(path);
+        for token in [
+            "-p tuna-greeter",
+            "tuna-wallpaper-svg tuna-greeter; do",
+            "share/systemd/user/tuna-greeter.service",
+            "share/greeter/gnome-login.session.conf",
+            unit,
+            drop_in,
+        ] {
+            assert!(body.contains(token), "{path} ships the greeter ({token})");
+        }
+        assert!(
+            !body.contains("gnome-session@gnome-login.target.d/"),
+            "{path} must not enable the login screen by itself"
+        );
+    }
+    let unit = read_workspace("share/systemd/user/tuna-greeter.service");
+    for line in [
+        "ExecStart=/usr/bin/tuna-compositor --greeter",
+        "Type=simple",
+        "OnFailure=gnome-session-shutdown.target",
+        "CollectMode=inactive-or-failed",
+        "Requisite=gnome-session-initialized.target",
+        "PartOf=gnome-session-initialized.target",
+        "Before=gnome-session-initialized.target",
+        "Restart=no",
+    ] {
+        assert!(
+            unit.lines().any(|l| l == line),
+            "tuna-greeter.service: {line}"
+        );
+    }
+    let drop_in = read_workspace("share/greeter/gnome-login.session.conf");
+    let requires: Vec<&str> = drop_in
+        .lines()
+        .filter(|l| l.starts_with("Requires="))
+        .collect();
+    assert_eq!(
+        requires,
+        [
+            "Requires=gnome-session-basic-services.target",
+            "Requires=tuna-greeter.service"
+        ]
+    );
+    let containerfile = read_workspace("packaging/marlin/Containerfile");
+    assert!(containerfile.contains("tuna-greeter --version"));
+    assert!(containerfile.contains("test -f /usr/lib/systemd/user/tuna-greeter.service"));
+}

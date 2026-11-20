@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -4344,7 +4345,7 @@ class FixtureLoginSession(unittest.TestCase):
 
     def test_current_build_runs_tunaos_tuna_flavor_gdm_steps_in_manifest_order(self):
         containerfile = self.fixture("Containerfile")
-        steps = ["tuna-gdm-theme.sh", "tuna-gdm-default-session.sh", "tuna-hide-other-sessions.sh"]
+        steps = ["tuna-greeter.sh", "tuna-gdm-default-session.sh", "tuna-hide-other-sessions.sh"]
         positions = [containerfile.index(f"bash /tmp/tunaos/{step}") for step in steps]
         self.assertEqual(positions, sorted(positions))
         self.assertLess(containerfile.index("Name=Tuna Desktop/'"), positions[0])
@@ -4504,6 +4505,148 @@ class PublishedFixturePackages(unittest.TestCase):
         self.assertLess(containerfile.index("pacman -Q > /usr/share/tuna-vm/shipped-packages.txt"), install)
         self.assertLess(install, containerfile.index('"fixture installation changed shipped package versions"'))
 
+
+class TunaLoginScreen(unittest.TestCase):
+    """#1164: the current build's login screen is `tuna-compositor --greeter`
+    (tuna-greeter.service) supervising tuna-greeter, with no gnome-shell for
+    GDM's greeter user (V-GREETER-TUNA). The guest probe finds the processes;
+    the lane judges them."""
+    LANE = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane"
+    GDM_51_DROP_IN = b"[Unit]\nRequires=gnome-session-basic-services.target\nRequires=org.gnome.Shell@gdm.service"
+    UNIT = "0::/user.slice/user-{uid}.slice/user@{uid}.service/session.slice/{unit}\n"
+
+    def probe(self, processes):
+        """Run the lifecycle's greeter_processes on a scratch /proc."""
+        uid = os.getuid()
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            for pid, comm, argv, ppid, unit in processes:
+                entry = proc / str(pid)
+                entry.mkdir()
+                (entry / "cmdline").write_bytes(b"".join(arg.encode() + b"\0" for arg in argv))
+                (entry / "stat").write_text(f"{pid} ({comm}) S {ppid} " + " ".join(["0"] * 20))
+                (entry / "cgroup").write_text(self.UNIT.format(uid=uid, unit=unit))
+
+            def fake_call(*args, check=True):
+                if args[:2] != ("pgrep", "-u") or args[3] != "-x" or args[2] != str(uid):
+                    raise AssertionError(f"unexpected probe: {args}")
+                return "".join(f"{pid}\n" for pid, comm, *_ in processes if comm == args[4])
+            import pathlib as real_pathlib
+            fake_pathlib = SimpleNamespace(Path=lambda path: proc / str(path).removeprefix("/proc/")
+                                           if str(path).startswith("/proc/") else real_pathlib.Path(path))
+            scope = lifecycle_scope("greeter_process", "greeter_processes", "COMPOSITOR_COMM", "COMPOSITOR",
+                                    "GREETER", PREFIX="tuna", call=fake_call)
+            scope["pathlib"] = fake_pathlib
+            found = scope["greeter_processes"]([str(uid)])
+        session = {"Id": "c1", "User": str(uid), "Class": "greeter",
+                   "Service": "gdm-launch-environment", "Active": "yes", "VTNr": "1"}
+        return {"manager": "gdm", "manager_active": True, "probe_uid": 0, "compositor_pids": [],
+                "greeter_sessions": [session], **found}
+
+    TUNA = [(901, "tuna-compositor", ["/usr/bin/tuna-compositor", "--greeter"], 880, "tuna-greeter.service"),
+            (912, "tuna-greeter", ["/usr/bin/tuna-greeter"], 901, "tuna-greeter.service")]
+
+    def test_tuna_login_screen_passes_and_is_the_accessibility_principal(self):
+        greeter = self.probe(self.TUNA)
+        self.assertEqual(greeter["greeter_kind"], "tuna-greeter")
+        self.assertEqual(greeter["greeter_comm"], "tuna-greeter")
+        self.assertEqual(greeter["greeter_pids"], ["912"])
+        self.assertEqual(greeter["greeter_shells"], [])
+        ok, detail = lane.greeter_tuna_ok(greeter)
+        self.assertTrue(ok, detail)
+        self.assertIn("tuna-compositor --greeter (pid 901)", detail)
+        self.assertTrue(lane.tuna_greeter_ready(greeter))
+
+    def test_gnome_shell_greeter_is_ready_but_not_tuna(self):
+        greeter = self.probe([(700, "gnome-shell", ["/usr/bin/gnome-shell", "--mode=gdm"], 650,
+                               "org.gnome.Shell@gdm.service")])
+        self.assertEqual((greeter["greeter_kind"], greeter["greeter_pids"]), ("gnome-shell", ["700"]))
+        self.assertTrue(lane.greeter_ready(greeter))
+        self.assertFalse(lane.tuna_greeter_ready(greeter))
+        ok, detail = lane.greeter_tuna_ok(greeter)
+        self.assertFalse(ok)
+        self.assertIn("gnome-shell runs for the greeter user", detail)
+
+    def test_any_gnome_shell_beside_the_tuna_greeter_fails(self):
+        greeter = self.probe(self.TUNA + [(700, "gnome-shell", ["/usr/bin/gnome-shell", "--mode=gdm"], 650,
+                                           "org.gnome.Shell@gdm.service")])
+        self.assertEqual(greeter["greeter_kind"], "tuna-greeter")
+        self.assertFalse(lane.greeter_tuna_ok(greeter)[0])
+
+    def test_compositor_must_be_the_greeter_unit_in_greeter_mode(self):
+        cases = {
+            "user-session compositor": [(901, "tuna-compositor", ["/usr/bin/tuna-compositor"], 880,
+                                         "tuna-session.service"), self.TUNA[1]],
+            "other unit": [self.TUNA[0][:4] + ("org.gnome.Shell@gdm.service",), self.TUNA[1]],
+            "client not supervised": [self.TUNA[0], self.TUNA[1][:3] + (1, "tuna-greeter.service")],
+            "two clients": self.TUNA + [(913, "tuna-greeter", ["/usr/bin/tuna-greeter"], 901,
+                                         "tuna-greeter.service")],
+            "two compositors": self.TUNA + [(902, "tuna-compositor", ["/usr/bin/tuna-compositor", "--greeter"],
+                                             880, "tuna-greeter.service")],
+            "no client yet": self.TUNA[:1],
+        }
+        for name, processes in cases.items():
+            with self.subTest(name):
+                self.assertFalse(lane.greeter_tuna_ok(self.probe(processes))[0])
+
+    def test_tuna_gate_needs_one_active_greeter_session_and_the_new_probe(self):
+        greeter = self.probe(self.TUNA)
+        session = greeter["greeter_sessions"][0]
+        for changes in ({"greeter_sessions": [session | {"Active": "no"}]},
+                        {"greeter_sessions": [session, session | {"Id": "c2"}]},
+                        {"greeter_sessions": [session | {"User": "0"}]}):
+            with self.subTest(changes=changes):
+                self.assertFalse(lane.greeter_tuna_ok(greeter | changes)[0])
+        self.assertFalse(lane.greeter_tuna_ok({k: v for k, v in greeter.items() if k != "greeter_shells"})[0])
+
+    def test_vendored_tunaos_step_replaces_gdm_51_drop_in_with_the_packaged_one(self):
+        packaged = Path(__file__).resolve().parents[2] / "share/greeter/gnome-login.session.conf"
+        drop_in = "usr/lib/systemd/user/gnome-session@gnome-login.target.d/gnome-login.session.conf"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / drop_in).parent.mkdir(parents=True)
+            # GDM 51.1.1 data/gnome-login.session.conf, without a final newline.
+            (root / drop_in).write_bytes(self.GDM_51_DROP_IN)
+            (root / "usr/share/tuna-desktop/greeter").mkdir(parents=True)
+            shutil.copyfile(packaged, root / "usr/share/tuna-desktop/greeter/gnome-login.session.conf")
+            shutil.copyfile(packaged.parents[1] / "systemd/user/tuna-greeter.service",
+                            root / "usr/lib/systemd/user/tuna-greeter.service")
+            (root / "usr/bin").mkdir(parents=True)
+            (root / "usr/bin/tuna-greeter").write_text("#!/bin/sh\n")
+            (root / "usr/bin/tuna-greeter").chmod(0o755)
+            run = lambda: subprocess.run(["bash", str(self.LANE / "tunaos/tuna-greeter.sh")],
+                                         env={**os.environ, "TUNAOS_TUNA_GREETER_ROOT": str(root)},
+                                         capture_output=True, text=True, timeout=10)
+            result = run()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            override = root / "etc/systemd/user" / drop_in.split("user/", 1)[1]
+            self.assertEqual(override.read_bytes(), packaged.read_bytes())
+            self.assertEqual((root / drop_in).read_bytes(), self.GDM_51_DROP_IN)
+            # A requirement GDM adds would be lost by the copy: the step stops.
+            override.unlink()
+            (root / drop_in).write_bytes(self.GDM_51_DROP_IN + b"\nRequires=gdm-new.target\n")
+            self.assertNotEqual(run().returncode, 0)
+            self.assertFalse(override.exists())
+            # GDM 48 starts GNOME Shell through session.conf: nothing to replace.
+            (root / drop_in).unlink()
+            (root / drop_in).with_name("session.conf").write_text("[Unit]\nRequires=org.gnome.Shell.target\n")
+            self.assertEqual(run().returncode, 0)
+            self.assertFalse(override.exists())
+
+    def test_current_build_image_switches_the_login_screen_and_hashes_it(self):
+        containerfile = (self.LANE / "Containerfile").read_text()
+        self.assertNotIn("tuna-gdm-theme", containerfile.split("FROM ${BASE_IMAGE}\n")[-1])
+        for path in ("/usr/bin/tuna-greeter", "/usr/lib/systemd/user/tuna-greeter.service",
+                     "/etc/systemd/user/gnome-session@gnome-login.target.d/gnome-login.session.conf",
+                     "/usr/lib/systemd/user/gnome-session@gnome-login.target.d/gnome-login.session.conf"):
+            self.assertLess(containerfile.index(path), containerfile.index("> /usr/share/tuna-vm/shipped-payload.sha256"))
+        self.assertIn("COPY packaging/marlin/vm-lane/tuna-greeter-trace.conf "
+                      "/usr/lib/systemd/user/tuna-greeter.service.d/90-tuna-vm-lane.conf", containerfile)
+        self.assertIn("Environment=TUNA_GREETER_TRACE=1", (self.LANE / "tuna-greeter-trace.conf").read_text())
+        published = (self.LANE / "Containerfile.published").read_text()
+        # The published flavor hashes whichever login screen it ships.
+        self.assertIn('if test -f "$greeter_drop_in"; then', published)
+        self.assertIn('"$@" > /usr/share/tuna-vm/shipped-payload.sha256', published)
 
 
 class GdmGreeterReadiness(unittest.TestCase):

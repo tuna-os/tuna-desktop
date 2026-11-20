@@ -67,7 +67,7 @@ fail() { echo "check-deb-clean-install (container): $1" >&2; exit 1; }
 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update >/dev/null
 apt-get install -y --no-install-recommends "/pkg/$PKG_NAME" >/dev/null
 echo "installed tuna-desktop $(dpkg-query -W -f "\${Version}" tuna-desktop) on $(sed -n "s/^PRETTY_NAME=//p" /etc/os-release)"
-for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus-bridge tuna-wallpaper-svg; do
+for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus-bridge tuna-wallpaper-svg tuna-greeter; do
     path="/usr/bin/$bin"
     [ "$(stat -c "%u:%g %a" "$path")" = "0:0 755" ] || fail "$path not root-owned 0755"
     if ldd "$path" | grep "not found"; then fail "$bin missing a library on a clean install"; fi
@@ -120,9 +120,16 @@ rules="$(sed -e "/^[[:space:]]*#/d" -e "/^[[:space:]]*$/d" /etc/pam.d/tuna-lock-
 [ "$rules" = "$(printf "auth required pam_fprintd.so\naccount include login")" ] || fail "invalid PAM service tuna-lock-fingerprint"
 EXEC="$(sed -n "s/^Exec=\([^ ]*\).*/\1/p" /usr/share/wayland-sessions/tuna.desktop)"
 command -v "$EXEC" >/dev/null || fail "session Exec $EXEC not installed"
-for path in /usr/lib/systemd/user/tuna-session.target /etc/pam.d/tuna-lock /etc/pam.d/tuna-lock-fingerprint; do
+for path in /usr/lib/systemd/user/tuna-session.target /usr/lib/systemd/user/tuna-greeter.service \
+    /usr/share/tuna-desktop/greeter/gnome-login.session.conf /etc/pam.d/tuna-lock /etc/pam.d/tuna-lock-fingerprint; do
     [ "$(stat -c "%u:%g" "$path")" = "0:0" ] || fail "$path not root-owned"
 done
+# The compositor finds the greeter beside itself, and installing the package
+# leaves the login screen to GDM until an image or administrator enables it.
+[ "$(dirname "$(readlink -f "$(command -v tuna-greeter)")")" = "$(dirname "$(readlink -f "$(command -v tuna-compositor)")")" ] \
+    || fail "tuna-greeter is not beside tuna-compositor"
+[ ! -e /etc/systemd/user/gnome-session@gnome-login.target.d/gnome-login.session.conf ] \
+    || fail "the package enabled the Tuna login screen by itself"
 ' || fail "clean install on $IMAGE failed"
 
 echo "check-deb-clean-install: $PKG OK on $IMAGE (version $VERSION)"

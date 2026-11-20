@@ -12,7 +12,9 @@
 # /etc/pam.d/tuna-lock-fingerprint), and the power menu
 # logs out back to GDM. The "Tuna Desktop (nested preview)" launcher stays for
 # trying Tuna Desktop in a window inside GNOME. The GTK4/libadwaita shell is
-# the default shell.
+# the default shell. The package's Tuna login screen (#1164) ships inactive,
+# so this preview keeps GNOME Shell's greeter for both sessions; the VM
+# lane's tunaOS layer enables Tuna's (docs/greeter.md).
 #
 # Build (CI does this with the package from packaging/arch):
 #   podman build -f packaging/marlin/Containerfile \
@@ -66,6 +68,11 @@ RUN set -eux; \
     done \
     && grep -qx 'Name=Tuna Desktop (preview)' /usr/share/wayland-sessions/tuna.desktop \
     && test -f /usr/lib/systemd/user/tuna-session.target \
+    && tuna-greeter --version \
+    && test -f /usr/lib/systemd/user/tuna-greeter.service \
+    && test -f /usr/share/tuna-desktop/greeter/gnome-login.session.conf \
+    && for unit in gnome-session-manager.target gnome-session-initialized.target gnome-session-basic-services.target; do \
+        test -f "/usr/lib/systemd/user/$unit" || { echo "missing GNOME session unit $unit for tuna-greeter.service" >&2; exit 1; }; done \
     && for unit in $(sed -n 's/^Wants=//p' /usr/lib/systemd/user/tuna-session.target) gnome-session-monitor.service gnome-session-shutdown.target gnome-session-x11-services-ready.target org.gnome.SettingsDaemon.XSettings.service; do \
         test -f "/usr/lib/systemd/user/$unit" || { echo "missing GNOME session unit $unit" >&2; exit 1; }; done \
     && test -x /usr/lib/gnome-session-ctl \

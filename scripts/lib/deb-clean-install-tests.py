@@ -2,7 +2,9 @@
 """Unit-only clean-install orchestration; no real container or install proof.
 
 Original archive policy reads real tar streams; container/package CLI remain
-controlled fixtures. Genuine package checks have a separate transition suite.
+controlled fixtures. The container's login-screen checks also run against a
+fixture /usr/bin and /etc. Genuine package checks have a separate transition
+suite.
 """
 import json
 import os
@@ -150,6 +152,69 @@ sys.exit(int(os.environ['ENGINE_FAILURE']))
                 (self.stage / missing).write_bytes(saved)
                 (self.stage / missing).chmod(0o644)
         # tuna-rename: keep-end
+
+    def greeter_checks(self):
+        """The container's login-screen checks, as the container runs them."""
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = json.loads(self.log.read_text())[-1]
+        start = body.index('# The compositor finds the greeter beside itself')
+        end = body.index('\n', body.index('the package enabled the Tuna login screen by itself')) + 1
+        return body, body[start:end]
+
+    def run_greeter_checks(self, *, greeter='beside', drop_in=False):
+        """Run the container's greeter checks on a fixture /usr/bin and /etc.
+
+        greeter: 'beside' (a file next to tuna-compositor), 'elsewhere' (on
+        PATH in another directory), 'symlink' (beside, linking elsewhere) or
+        'missing'. drop_in: a gnome-login drop-in at GDM's own path.
+        """
+        _, checks = self.greeter_checks()
+        fixture = Path(tempfile.mkdtemp(dir=self.root))
+        usr_bin, other, tools, etc = (fixture / name for name in ('usr-bin', 'other', 'tools', 'etc'))
+        for directory in (usr_bin, other, tools):
+            directory.mkdir()
+        for tool in ('dirname', 'readlink'):
+            (tools / tool).symlink_to(shutil.which(tool))
+        (usr_bin / 'tuna-compositor').write_text('#!/bin/sh\n')
+        (other / 'tuna-greeter').write_text('#!/bin/sh\n')
+        if greeter == 'beside':
+            (usr_bin / 'tuna-greeter').write_text('#!/bin/sh\n')
+        elif greeter == 'symlink':
+            (usr_bin / 'tuna-greeter').symlink_to(other / 'tuna-greeter')
+        for path in (*usr_bin.iterdir(), other / 'tuna-greeter'):
+            path.chmod(0o755)
+        gdm_drop_in = etc / 'systemd/user/gnome-session@gnome-login.target.d/gnome-login.session.conf'
+        if drop_in:
+            gdm_drop_in.parent.mkdir(parents=True)
+            gdm_drop_in.write_text('[Unit]\nRequires=tuna-greeter.service\n')
+        self.assertIn('/etc/systemd/user/gnome-session@gnome-login.target.d/gnome-login.session.conf', checks)
+        checks = checks.replace('/etc/systemd/user/', f'{etc}/systemd/user/')
+        path = [usr_bin, tools] if greeter == 'missing' else [usr_bin, other, tools]
+        script = 'fail() { echo "check-deb-clean-install (container): $1" >&2; exit 1; }\n' + checks
+        return subprocess.run(['/bin/sh', '-euc', script], env={'PATH': os.pathsep.join(map(str, path))},
+                              text=True, capture_output=True, timeout=30)
+
+    def test_greeter_ships_beside_the_compositor_and_inactive(self):
+        body, _ = self.greeter_checks()
+        self.assertIn('tuna-wallpaper-svg tuna-greeter; do', body)
+        self.assertIn('/usr/lib/systemd/user/tuna-greeter.service \\\n'
+                      '    /usr/share/tuna-desktop/greeter/gnome-login.session.conf', body)
+        result = self.run_greeter_checks()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, '')
+
+    def test_greeter_away_from_the_compositor_fails(self):
+        for greeter in ('elsewhere', 'symlink', 'missing'):
+            with self.subTest(greeter=greeter):
+                result = self.run_greeter_checks(greeter=greeter)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('tuna-greeter is not beside tuna-compositor', result.stderr)
+
+    def test_package_enabling_the_login_screen_fails(self):
+        result = self.run_greeter_checks(drop_in=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('the package enabled the Tuna login screen by itself', result.stderr)
 
     def test_container_failure_is_not_a_pass(self):
         self.env['ENGINE_FAILURE'] = '8'

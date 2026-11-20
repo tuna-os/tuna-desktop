@@ -64,6 +64,7 @@ optdepends=(
     # Optional: without the service the shell's location agent hides its
     # indicator; an image running tuna-geoclue-agent-policy must install it.
     'geoclue: location services (the shell agent; tuna-geoclue-agent-policy image hook)'
+    'gdm: the Tuna login screen (tuna-greeter, on GDM 49 or later)'
 )
 options=('!lto' '!debug')
 backup=('etc/pam.d/tuna-lock' 'etc/pam.d/tuna-lock-fingerprint' 'etc/pam.d/roost-lock')  # tuna-rename: keep
@@ -96,12 +97,13 @@ build() {
     export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$srcdir/target}"
     export TUNA_VERSION="v${_semver}"
     cargo build --frozen --release \
-        -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-host -p tuna-shell-gtk
+        -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-host -p tuna-shell-gtk \
+        -p tuna-greeter
 }
 
 check() {
     local bin
-    for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge tuna-wallpaper-svg; do
+    for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge tuna-wallpaper-svg tuna-greeter; do
         local reported
         reported="$("${CARGO_TARGET_DIR:-$srcdir/target}/release/$bin" --version | awk '{print $NF}')"
         if [[ "$reported" != "$_semver" ]]; then
@@ -115,7 +117,7 @@ package() {
     local root target bin
     root="$(_srcroot)"
     target="${CARGO_TARGET_DIR:-$srcdir/target}/release"
-    for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge tuna-wallpaper-svg; do
+    for bin in tuna-compositor tuna-session tuna-shell-host tuna-shell-gtk tuna-ibus-bridge tuna-wallpaper-svg tuna-greeter; do
         install -Dm0755 "$target/$bin" "$pkgdir/usr/bin/$bin"
     done
     install -Dm0644 "$root/share/wayland-sessions/tuna.desktop" \
@@ -127,6 +129,14 @@ package() {
     # tuna-rename: keep-end
     install -Dm0644 "$root/share/systemd/user/tuna-session.target" \
         "$pkgdir/usr/lib/systemd/user/tuna-session.target"
+    # The login screen (#1164): its user unit, and GDM's gnome-login drop-in
+    # that selects it, installed inactive. GDM owns the active drop-in's
+    # /usr/lib path; an image opts in by copying this file over it in /etc
+    # (docs/greeter.md).
+    install -Dm0644 "$root/share/systemd/user/tuna-greeter.service" \
+        "$pkgdir/usr/lib/systemd/user/tuna-greeter.service"
+    install -Dm0644 "$root/share/greeter/gnome-login.session.conf" \
+        "$pkgdir/usr/share/tuna-desktop/greeter/gnome-login.session.conf"
     install -Dm0644 "$root/share/xdg-desktop-portal/portals/tuna.portal" \
         "$pkgdir/usr/share/xdg-desktop-portal/portals/tuna.portal"
     install -Dm0644 "$root/packaging/marlin/tuna-portals.conf" \

@@ -19,10 +19,13 @@ commit, or --changed) can affect:
 - docs and other non-runtime files (including tooling of other workflows,
   see NO_LANE) add no lane;
 - a lane's own proof script, fixtures or packaging runs that lane, and a
-  packaged conffile (share/pam.d/) runs journey's lifecycle and every
-  package consumer; so does a scripts/tests/ file that the lane's job runs
-  (OWNED below; WorkflowSync.test_lane_run_tests_select_their_lane keeps it
-  complete). Tests only the check job runs add no lane;
+  packaged conffile (share/pam.d/) or the login screen's packaged unit and
+  drop-in (share/systemd/user/tuna-greeter.service, share/greeter/) runs
+  journey's lifecycle, the core lanes and every package consumer; so does a
+  scripts/tests/ file that the lane's job runs (OWNED below;
+  WorkflowSync.test_lane_run_tests_select_their_lane keeps it complete), and
+  a scripts/lib/*-tests.py suite the journey job runs. Tests only the check
+  job runs add no lane;
 - anything else (crates, share/, other scripts) runs gtk-shell plus a
   round-robin slice of ROTATION: K lanes starting at
   (run_number * K) mod len(ROTATION), K from --size, $CI_ROUND_ROBIN_SIZE
@@ -93,10 +96,11 @@ OWNED = [
     ("scripts/tuna-session-restore-proof", ["gtk-shell"]),
     # The login screen (#1164): tuna-compositor --greeter and tuna-greeter
     # against a GDM 51 and AccountsService mock, with GDM's own
-    # org.gnome.login-screen schema.
-    ("scripts/tuna-greeter-proof", ["gtk-shell"]),
-    ("scripts/lib/tuna-gdm-mock.py", ["gtk-shell"]),
-    ("scripts/lib/org.gnome.login-screen.gschema.xml", ["gtk-shell"]),
+    # org.gnome.login-screen schema, from the source build (gtk-shell) and
+    # from the installed .deb (journey).
+    ("scripts/tuna-greeter-proof", ["gtk-shell", "journey"]),
+    ("scripts/lib/tuna-gdm-mock.py", ["gtk-shell", "journey"]),
+    ("scripts/lib/org.gnome.login-screen.gschema.xml", ["gtk-shell", "journey"]),
     ("scripts/tuna-walkthrough", ["gtk-shell"]),
     # scripts/tests/* run by a lane job (#1108): a test edit must run the lane
     # that executes it, or it first runs after merge.
@@ -121,8 +125,10 @@ OWNED = [
     ("scripts/tuna-release", ["journey"]),
     ("scripts/check-release-package", ["journey"]),
     ("scripts/check-deb-clean-install", ["journey"]),
-    ("scripts/lib/installed-deb-proof.py", ["journey"]),
-    ("scripts/lib/release-deb-ownership.py", ["journey"]),
+    # Suites only the journey job runs (WorkflowSync keeps this complete).
+    ("scripts/lib/deb-clean-install-tests.py", ["journey"]),
+    ("scripts/lib/installed-deb-proof*", ["journey"]),
+    ("scripts/lib/release-deb-ownership*", ["journey"]),
     ("scripts/lib/transition-package-policy*", ["journey"]),
     ("scripts/lib/legacy-upgrade-*", ["journey"]),
     ("share/compat/*", ["journey", *PACKAGE_CONSUMERS]),
@@ -130,6 +136,10 @@ OWNED = [
     # file: journey's Debian lifecycle prompts on any byte change (#899), the
     # images ship it, and the lock screen authenticates through it.
     ("share/pam.d/*", ["journey", *CORE, *PACKAGE_CONSUMERS]),
+    # The login screen's user unit and its inactive gnome-login drop-in ship
+    # in both packages and the images; journey checks the installed layout.
+    ("share/systemd/user/tuna-greeter.service", ["journey", *CORE, *PACKAGE_CONSUMERS]),
+    ("share/greeter/*", ["journey", *CORE, *PACKAGE_CONSUMERS]),
     ("scripts/tuna-app-content", ["app-content"]),
     ("scripts/tuna-scroll-proof", ["scroll-proof"]),
     ("scripts/tuna-drm-smoke", ["drm-smoke"]),
@@ -152,6 +162,8 @@ OWNED = [
     ("packaging/marlin/*", ["marlin-image", "marlin-vm"]),
     ("scripts/tuna-vm-lane", ["marlin-vm"]),
     ("scripts/lib/vm_guest_agent.py", ["marlin-vm"]),
+    # The fresh-accounts journey (tuna-vm-lane --fresh-accounts).
+    ("scripts/lib/fresh_accounts.py", ["marlin-vm"]),
     ("scripts/lib/vm_gnome_reference.py", ["marlin-vm"]),
     ("scripts/lib/vm_strip_*", ["marlin-vm"]),
     ("scripts/tuna-ledger", ["parity-ledger"]),
