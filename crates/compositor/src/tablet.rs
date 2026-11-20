@@ -6,11 +6,11 @@
 //! - settings paths and keys: `src/backends/meta-input-settings.c`
 //!   (`lookup_device_settings`, `lookup_tool_settings`,
 //!   `update_stylus_pressure`, `update_tablet_*`);
-//! - which monitor a tablet drives: `src/backends/meta-input-mapper.c`
-//!   (`guess_candidates`, `match_config`, `match_edid`, `match_size`)
-//!   and `meta_monitor_manager_get_monitor_matrix`;
-//! - absolute positions: `src/backends/native/meta-input-device-native.c`
-//!   (`meta_input_device_native_translate_coordinates_in_impl`);
+//! - which monitor a tablet drives and absolute positions: the shared
+//!   [`crate::input_mapper`] (`meta-input-mapper.c`,
+//!   `meta_monitor_manager_get_monitor_matrix`,
+//!   `meta_input_device_native_translate_coordinates_in_impl`), plus
+//!   keep-aspect (`update_tablet_keep_aspect`);
 //! - the pressure curve: `src/backends/native/meta-bezier.c` and
 //!   `meta-input-device-tool-native.c` (`translate_pressure_in_impl`);
 //! - stylus buttons: `src/backends/native/meta-seat-impl.c`
@@ -21,8 +21,9 @@
 //! Desktop does not, so every tablet takes the path Mutter takes for a
 //! device libwacom does not know (integrated, not built in).
 
+use crate::input_mapper::{pick_monitor, AbsoluteMapping, InputIdentity, InputKind, Monitor};
 use smithay::backend::input::TabletToolDescriptor;
-use smithay::utils::{Logical, Point, Rectangle};
+use smithay::utils::{Logical, Point};
 use smithay::wayland::tablet_manager::{TabletDescriptor, TabletPadDescriptor};
 
 /// A tool's axes in one frame, already through the stylus settings
@@ -614,254 +615,59 @@ pub fn map_tool_button(
     }
 }
 
-/// One monitor a tablet may be mapped to.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Monitor {
-    pub connector: String,
-    pub vendor: String,
-    pub product: String,
-    pub serial: String,
-    pub width_mm: i32,
-    pub height_mm: i32,
-    /// The logical monitor's rectangle in the desktop.
-    pub rect: Rectangle<i32, Logical>,
-    /// wl_output transform (0..=7).
-    pub transform: u32,
-    /// The current mode's size in pixels.
-    pub mode: (i32, i32),
-}
-
-/// What a tablet device reports for matching (`MetaMapperInputInfo`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct TabletIdentity {
-    pub name: String,
-    /// Physical size in millimetres, when libinput knows it.
-    pub size_mm: Option<(f64, f64)>,
-}
-
-/// `match_config`: the user's `output` names this monitor (the fourth
-/// value, the connector, only disambiguates EDID twins).
-fn match_config(output: &[String], monitor: &Monitor, monitors: &[Monitor]) -> bool {
-    if output.len() < 3 || output[..3].iter().all(String::is_empty) {
-        return false;
-    }
-    let same =
-        |m: &Monitor| m.vendor == output[0] && m.product == output[1] && m.serial == output[2];
-    if !same(monitor) {
-        return false;
-    }
-    let twin = monitors
-        .iter()
-        .any(|m| m.connector != monitor.connector && same(m));
-    if output.len() >= 4 && twin {
-        return monitor.connector == output[3];
-    }
-    true
-}
-
-fn contains_ci(haystack: &str, needle: &str) -> bool {
-    haystack.to_lowercase().contains(&needle.to_lowercase())
-}
-
-/// `match_edid`: the device name mentions the monitor's vendor, then its
-/// serial (full) or a word of its product (partial).
-fn match_edid(name: &str, monitor: &Monitor) -> Option<u32> {
-    if !contains_ci(name, &monitor.vendor) {
-        return None;
-    }
-    if contains_ci(name, &monitor.serial) {
-        return Some(MATCH_EDID_FULL);
-    }
-    if monitor
-        .product
-        .split(' ')
-        .any(|word| contains_ci(name, word))
-    {
-        return Some(MATCH_EDID_PARTIAL);
-    }
-    Some(MATCH_EDID_VENDOR)
-}
-
-/// `match_size`: within 5 % of the monitor's physical size.
-fn match_size(size_mm: Option<(f64, f64)>, monitor: &Monitor) -> bool {
-    let Some((w, h)) = size_mm else {
-        return false;
-    };
-    let w_diff = (1.0 - f64::from(monitor.width_mm) / w).abs();
-    let h_diff = (1.0 - f64::from(monitor.height_mm) / h).abs();
-    w_diff < 0.05 && h_diff < 0.05
-}
-
-const MATCH_EDID_VENDOR: u32 = 0;
-const MATCH_EDID_PARTIAL: u32 = 1;
-const MATCH_EDID_FULL: u32 = 2;
-const MATCH_SIZE: u32 = 3;
-const MATCH_CONFIG: u32 = 5;
-
-/// `guess_candidates` and `mapping_helper_apply`: the monitor this tablet
-/// drives, or `None` for the whole desktop. A set `output` decides alone;
-/// otherwise the name and size pick (libwacom-unknown devices count as
-/// integrated, never as built in).
-pub fn pick_monitor(
-    device: &TabletIdentity,
-    output: Option<&[String]>,
-    monitors: &[Monitor],
-) -> Option<usize> {
-    let mut best: Option<(u32, usize)> = None;
-    for (index, monitor) in monitors.iter().enumerate() {
-        let mut score = 0u32;
-        match output {
-            None => {
-                if let Some(kind) = match_edid(&device.name, monitor) {
-                    score |= 1 << kind;
-                }
-                if match_size(device.size_mm, monitor) {
-                    score |= 1 << MATCH_SIZE;
-                }
-            }
-            Some(output) => {
-                if match_config(output, monitor, monitors) {
-                    score |= 1 << MATCH_CONFIG;
-                }
-            }
-        }
-        // g_array_sort is not stable; ties keep the first monitor here.
-        if score > 0 && best.is_none_or(|(b, _)| score > b) {
-            best = Some((score, index));
-        }
-    }
-    best.map(|(_, index)| index)
-}
-
-/// `transform_matrices` in meta-monitor-manager.c, by wl_output transform.
-const TRANSFORM_MATRICES: [[f64; 6]; 8] = [
-    [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-    [0.0, -1.0, 1.0, 1.0, 0.0, 0.0],
-    [-1.0, 0.0, 1.0, 0.0, -1.0, 1.0],
-    [0.0, 1.0, 0.0, -1.0, 0.0, 1.0],
-    [-1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
-    [0.0, 1.0, 0.0, 1.0, 0.0, 0.0],
-    [1.0, 0.0, 0.0, 0.0, -1.0, 1.0],
-    [0.0, -1.0, 1.0, -1.0, 0.0, 1.0],
-];
-
-/// The desktop's extents: Mutter's screen size, from the origin.
-pub fn stage_size(monitors: &[Monitor]) -> (f64, f64) {
-    monitors.iter().fold((0.0, 0.0), |(w, h), m| {
-        (
-            w.max(f64::from(m.rect.loc.x + m.rect.size.w)),
-            h.max(f64::from(m.rect.loc.y + m.rect.size.h)),
-        )
-    })
-}
-
-/// How one tablet's normalized position becomes a desktop position.
+/// How one tablet's normalized position becomes a desktop position: the
+/// shared input mapper's matrix plus GNOME's keep-aspect and mapping mode.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DeviceMapping {
-    /// `meta_monitor_manager_get_monitor_matrix`, or the identity for the
-    /// whole desktop.
-    pub matrix: [f64; 6],
-    /// The mapped monitor's (or desktop's) aspect ratio when keep-aspect
-    /// is on and the mapping absolute; 0 otherwise.
-    pub output_ratio: f64,
-    /// The tablet's own width / height, 0 when unknown.
-    pub device_ratio: f64,
+    pub absolute: AbsoluteMapping,
     pub mode: Mapping,
 }
 
 impl DeviceMapping {
+    /// The monitor this tablet drives (`None`: the whole desktop) and how
+    /// its position maps there (`update_tablet_keep_aspect`: the
+    /// monitor's ratio only for keep-aspect absolute mapping).
     pub fn new(
-        device: &TabletIdentity,
+        device: &InputIdentity,
         settings: &TabletSettings,
         monitors: &[Monitor],
     ) -> (Self, Option<usize>) {
-        let stage = stage_size(monitors);
-        let picked = pick_monitor(device, settings.output.as_deref(), monitors);
-        let (matrix, (width, height)) = match picked.map(|i| &monitors[i]) {
-            Some(monitor) if stage.0 > 0.0 && stage.1 > 0.0 => {
-                let viewport = [
-                    f64::from(monitor.rect.size.w) / stage.0,
-                    0.0,
-                    f64::from(monitor.rect.loc.x) / stage.0,
-                    0.0,
-                    f64::from(monitor.rect.size.h) / stage.1,
-                    f64::from(monitor.rect.loc.y) / stage.1,
-                ];
-                let t = TRANSFORM_MATRICES[(monitor.transform & 7) as usize];
-                let a = viewport;
-                (
-                    [
-                        a[0] * t[0] + a[1] * t[3],
-                        a[0] * t[1] + a[1] * t[4],
-                        a[0] * t[2] + a[1] * t[5] + a[2],
-                        a[3] * t[0] + a[4] * t[3],
-                        a[3] * t[1] + a[4] * t[4],
-                        a[3] * t[2] + a[4] * t[5] + a[5],
-                    ],
-                    monitor.mode,
-                )
-            }
-            _ => (
-                [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-                (stage.0 as i32, stage.1 as i32),
-            ),
-        };
-        let ratio = if height > 0 {
-            f64::from(width) / f64::from(height)
-        } else {
-            0.0
-        };
-        let output_ratio = if settings.keep_aspect && settings.mapping == Mapping::Absolute {
-            ratio
-        } else {
-            0.0
-        };
-        let device_ratio = device
+        let picked = pick_monitor(
+            InputKind::Tablet,
+            device,
+            settings.output.as_deref(),
+            monitors,
+        )
+        .map(|picked| picked.index);
+        let (mut absolute, ratio) = AbsoluteMapping::new(picked.map(|i| &monitors[i]), monitors);
+        if settings.keep_aspect && settings.mapping == Mapping::Absolute {
+            absolute.output_ratio = ratio;
+        }
+        absolute.device_ratio = device
             .size_mm
             .filter(|(_, h)| *h > 0.0)
             .map_or(0.0, |(w, h)| w / h);
         (
             Self {
-                matrix,
-                output_ratio,
-                device_ratio,
+                absolute,
                 mode: settings.mapping,
             },
             picked,
         )
     }
 
-    fn apply(&self, x: f64, y: f64) -> (f64, f64) {
-        let m = self.matrix;
-        (m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5])
-    }
-
     /// `translate_coordinates_in_impl` for a libinput position already
     /// normalized to [0, 1] (`get_x_transformed` over the desktop).
     pub fn translate(&self, norm: (f64, f64), stage: (f64, f64)) -> Point<f64, Logical> {
-        let (mut x, mut y) = norm;
-        if self.output_ratio > 0.0 && self.device_ratio > 0.0 {
-            let ratio = self.device_ratio / self.output_ratio;
-            if ratio > 1.0 {
-                x *= ratio;
-            } else if ratio < 1.0 {
-                y *= 1.0 / ratio;
-            }
-        }
-        let (min_x, min_y) = self.apply(0.0, 0.0);
-        let (max_x, max_y) = self.apply(1.0, 1.0);
-        let (x, y) = self.apply(x, y);
-        (
-            x.clamp(min_x.min(max_x), min_x.max(max_x)) * stage.0,
-            y.clamp(min_y.min(max_y), min_y.max(max_y)) * stage.1,
-        )
-            .into()
+        self.absolute.translate(norm, stage)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input_mapper::stage_size;
+    use smithay::utils::Rectangle;
 
     fn monitor(connector: &str, x: i32, w: i32, h: i32) -> Monitor {
         Monitor {
@@ -874,11 +680,12 @@ mod tests {
             rect: Rectangle::new((x, 0).into(), (w, h).into()),
             transform: 0,
             mode: (w, h),
+            builtin: false,
         }
     }
 
-    fn pen() -> TabletIdentity {
-        TabletIdentity {
+    fn pen() -> InputIdentity {
+        InputIdentity {
             name: "Wacom Intuos Pro M Pen".into(),
             size_mm: Some((224.0, 148.0)),
         }
@@ -953,63 +760,6 @@ mod tests {
     }
 
     #[test]
-    fn edid_twins_are_told_apart_by_the_connector() {
-        let mut a = monitor("DP-1", 0, 1920, 1080);
-        let mut b = monitor("DP-2", 1920, 1920, 1080);
-        a.serial = "SAME".into();
-        b.serial = "SAME".into();
-        let monitors = [a, b];
-        let output = |connector: &str| {
-            vec![
-                "GSM".to_owned(),
-                "LG ULTRAFINE".to_owned(),
-                "SAME".to_owned(),
-                connector.to_owned(),
-            ]
-        };
-        assert_eq!(
-            pick_monitor(&pen(), Some(&output("DP-2")), &monitors),
-            Some(1)
-        );
-        assert_eq!(
-            pick_monitor(&pen(), Some(&output("DP-1")), &monitors),
-            Some(0)
-        );
-        // Three values match the first twin.
-        assert_eq!(
-            pick_monitor(&pen(), Some(&output("DP-2")[..3]), &monitors),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn display_tablets_find_their_screen_by_name_or_size() {
-        let mut cintiq = monitor("DP-2", 1920, 1920, 1080);
-        cintiq.vendor = "WAC".into();
-        cintiq.product = "Cintiq 16".into();
-        cintiq.width_mm = 345;
-        cintiq.height_mm = 194;
-        let monitors = [monitor("DP-1", 0, 1920, 1080), cintiq];
-        let by_name = TabletIdentity {
-            name: "Wacom Cintiq 16 Pen".into(),
-            size_mm: None,
-        };
-        // "Wacom" holds "WAC" and "Cintiq" a product word.
-        assert_eq!(pick_monitor(&by_name, None, &monitors), Some(1));
-        let by_size = TabletIdentity {
-            name: "Generic display pen".into(),
-            size_mm: Some((344.0, 195.0)),
-        };
-        assert_eq!(pick_monitor(&by_size, None, &monitors), Some(1));
-        // A set output wins over the guess.
-        let settings_output = vec!["GSM".into(), "LG ULTRAFINE".into(), "DP-1".into()];
-        assert_eq!(
-            pick_monitor(&by_name, Some(&settings_output), &monitors),
-            Some(0)
-        );
-    }
-
-    #[test]
     fn rotated_monitors_rotate_the_tablet() {
         let mut portrait = monitor("DP-1", 0, 1080, 1920);
         portrait.transform = 1; // 90°
@@ -1033,7 +783,7 @@ mod tests {
     fn keep_aspect_uses_the_monitor_ratio_only_for_absolute_mapping() {
         let monitors = [monitor("DP-1", 0, 1920, 1080)];
         let stage = stage_size(&monitors);
-        let wide = TabletIdentity {
+        let wide = InputIdentity {
             name: "Pen".into(),
             size_mm: Some((320.0, 100.0)), // 3.2 : 1, wider than 16:9
         };
@@ -1042,14 +792,14 @@ mod tests {
             ..TabletSettings::default()
         };
         let (mapping, _) = DeviceMapping::new(&wide, &settings, &monitors);
-        assert!((mapping.output_ratio - 1920.0 / 1080.0).abs() < 1e-9);
+        assert!((mapping.absolute.output_ratio - 1920.0 / 1080.0).abs() < 1e-9);
         // The right part of the tablet runs off the screen and clamps.
         let ratio = 3.2 / (1920.0 / 1080.0);
         let p = mapping.translate((0.25, 0.5), stage);
         assert!((p.x - 0.25 * ratio * 1920.0).abs() < 1e-6);
         assert_eq!(mapping.translate((0.9, 0.5), stage).x, 1920.0);
         // A tall tablet scales y instead.
-        let tall = TabletIdentity {
+        let tall = InputIdentity {
             name: "Pen".into(),
             size_mm: Some((100.0, 100.0)),
         };
@@ -1067,7 +817,7 @@ mod tests {
             TabletSettings::default(),
         ] {
             let (mapping, _) = DeviceMapping::new(&wide, &settings, &monitors);
-            assert_eq!(mapping.output_ratio, 0.0);
+            assert_eq!(mapping.absolute.output_ratio, 0.0);
             assert_eq!(mapping.translate((0.25, 0.5), stage), (480.0, 540.0).into());
         }
     }

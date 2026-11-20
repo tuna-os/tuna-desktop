@@ -237,9 +237,13 @@ impl ProtocolVersion {
     /// pidfd-pinned socket, and the compositor recognises the shell on
     /// D-Bus by that unique name only (ADR 0010). Positional postcard peers
     /// must ship together.
+    /// `0.61` (provisional: 0.53-0.60 are reserved for other open
+    /// changes) appends GNOME's bottom-edge OSK drag: compositor-to-shell
+    /// `OskGesture` (`ShellEdgeDragGesture` progress, activate, cancel).
+    /// Positional postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 52,
+        minor: 61,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -1209,6 +1213,10 @@ pub enum Message {
     /// each handshake snapshot while shown, only to peers advertising
     /// minor >= 51.
     LockScreenShown { shown: bool },
+    /// Since 0.61: the touchscreen bottom-edge drag (gnome-shell's
+    /// `KeyboardManager` bottom drag gesture) progressed, completed or
+    /// was cancelled. Sent only to peers advertising minor >= 61.
+    OskGesture { phase: OskGesturePhase },
 }
 
 /// [`Message::WorkspaceProgress`] positions are workspace indices times
@@ -1227,6 +1235,21 @@ pub const MAX_OVERVIEW_STATE: u32 = 2 * OVERVIEW_STATE_SCALE;
 /// The longest [`Message::OverviewSwipe`] settle: a minute, far past
 /// GNOME's swipe ceiling times any sane slow-down factor.
 pub const MAX_OVERVIEW_SETTLE_US: u32 = 60_000_000;
+
+/// A phase of the bottom-edge OSK drag (`ShellEdgeDragGesture`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum OskGesturePhase {
+    /// `progress`: vertical distance in logical pixels from the begin point.
+    Progress { distance: f64 },
+    /// `end`: dragged past the threshold; open the keyboard.
+    Activate,
+    /// `cancel`: the drag ended early.
+    Cancel,
+}
+
+// `Message` is `Eq`; decoding rejects a non-finite `distance` as
+// malformed, so reflexivity holds for every decoded message.
+impl Eq for OskGesturePhase {}
 
 /// The click a hover (dwell) makes: GNOME's dwell click types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2447,6 +2470,12 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
             }
         }
         Message::HideCloseDialog { .. } | Message::LockScreenShown { .. } => {}
+        Message::OskGesture {
+            phase: OskGesturePhase::Progress { distance },
+        } if !distance.is_finite() => {
+            return Err(DecodeError::Malformed(postcard::Error::SerdeDeCustom));
+        }
+        Message::OskGesture { .. } => {}
     }
     Ok(())
 }
@@ -2665,11 +2694,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_52() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 52));
-        // A 0.51 shell still negotiates; a newer minor does not.
-        assert!(ProtocolVersion::new(0, 51).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 53).is_compatible_with(&CURRENT_VERSION));
+    fn current_version_is_0_61() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 61));
+        // A 0.52 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 52).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 62).is_compatible_with(&CURRENT_VERSION));
     }
 
     #[test]
@@ -3773,6 +3802,32 @@ mod on_screen_keyboard_wire_tests {
                 },
             }),
             command(CommandKind::CompleteDisplayChange { keep: false }) + 1
+        );
+    }
+
+    #[test]
+    fn osk_gesture_roundtrips_and_sits_last() {
+        for phase in [
+            OskGesturePhase::Progress { distance: 42.5 },
+            OskGesturePhase::Activate,
+            OskGesturePhase::Cancel,
+        ] {
+            let message = Message::OskGesture { phase };
+            assert_eq!(decode_frame(&encode_frame(&message)).unwrap(), message);
+        }
+        let nan = Message::OskGesture {
+            phase: OskGesturePhase::Progress { distance: f64::NAN },
+        };
+        assert!(matches!(
+            decode_frame(&encode_frame(&nan)),
+            Err(DecodeError::Malformed(_))
+        ));
+        let index = |message: &Message| encode_frame(message)[4];
+        assert_eq!(
+            index(&Message::OskGesture {
+                phase: OskGesturePhase::Cancel,
+            }),
+            index(&Message::LockScreenShown { shown: false }) + 1
         );
     }
 

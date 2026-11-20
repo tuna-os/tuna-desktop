@@ -1250,9 +1250,16 @@ impl Router {
                 session.captured_key(keycode, pressed);
                 true
             }
+            // Mutter's capture supports keyboard and pointer only:
+            // touchscreens stay local.
             ManagerInput::SwipeBegin { .. }
             | ManagerInput::SwipeUpdate { .. }
-            | ManagerInput::SwipeEnd { .. } => false,
+            | ManagerInput::SwipeEnd { .. }
+            | ManagerInput::TouchDown { .. }
+            | ManagerInput::TouchMotion { .. }
+            | ManagerInput::TouchUp { .. }
+            | ManagerInput::TouchFrame { .. }
+            | ManagerInput::TouchCancel { .. } => false,
         }
     }
 }

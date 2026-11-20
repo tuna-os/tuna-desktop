@@ -62,6 +62,15 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("scripts/tuna-orca-speech-proof"), ["orca-speech"])
         self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
 
+    def test_touch_fixtures_run_drm_smoke_without_rotation(self):
+        # P-DS-04's emulated devices and settings are D-TOUCH/D-ORIENT's
+        # alone: an edit runs that lane, not gtk-shell plus a rotation.
+        for path in ("scripts/lib/tuna-uinput-touchscreen.py", "scripts/lib/tuna-touch-client.py",
+                     "scripts/lib/tuna-mock-sensor-proxy.py",
+                     "tests/settings/gnome51-peripherals-touchscreen.gschema.xml"):
+            for run in range(len(m.ROTATION)):
+                self.assertEqual(pr(path, run=run), ["drm-smoke"], (path, run))
+
 
     def test_transition_policy_and_suite_always_run_journey(self):
         for path in ('scripts/lib/transition-package-policy.py',

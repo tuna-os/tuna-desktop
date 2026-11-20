@@ -1312,7 +1312,8 @@ impl LocatePointer {
             }
             ManagerInput::Button { .. }
             | ManagerInput::Axis { .. }
-            | ManagerInput::SwipeBegin { .. } => {
+            | ManagerInput::SwipeBegin { .. }
+            | ManagerInput::TouchDown { .. } => {
                 self.armed = None;
                 false
             }

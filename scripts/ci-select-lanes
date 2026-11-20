@@ -128,6 +128,12 @@ OWNED = [
     ("scripts/tuna-scroll-proof", ["scroll-proof"]),
     ("scripts/tuna-drm-smoke", ["drm-smoke"]),
     ("scripts/lib/colord-startup.sh", ["drm-smoke"]),
+    # D-TOUCH, D-ORIENT and G-AUTOROTATE's emulated touchscreen, GTK touch
+    # client, mock iio-sensor-proxy and GNOME touchscreen schema (P-DS-04).
+    ("scripts/lib/tuna-uinput-touchscreen.py", ["drm-smoke"]),
+    ("scripts/lib/tuna-touch-client.py", ["drm-smoke"]),
+    ("scripts/lib/tuna-mock-sensor-proxy.py", ["drm-smoke"]),
+    ("tests/settings/gnome51-peripherals-touchscreen.gschema.xml", ["drm-smoke"]),
     # Sourced by the GTK shell (and journey's installed run), DRM and Orca proofs.
     ("scripts/lib/tuna-state-snapshot.sh", ["gtk-shell", "journey", "drm-smoke", "orca-speech"]),
     ("scripts/tuna-orca-speech-proof", ["orca-speech"]),

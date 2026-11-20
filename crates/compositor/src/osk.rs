@@ -29,6 +29,8 @@ pub const HINT_INHIBIT_OSK: u32 = 0x400;
 struct Pending {
     enable: Option<bool>,
     content: Option<(u32, u32)>,
+    /// `set_cursor_rectangle`: surface-local x, y, width, height.
+    cursor: Option<Option<(i32, i32, i32, i32)>>,
 }
 
 #[derive(Debug)]
@@ -38,6 +40,9 @@ struct Tracked {
     enabled: bool,
     /// Committed (hint, purpose).
     content: (u32, u32),
+    /// Committed cursor rectangle, surface-local (mutter's
+    /// `meta_wayland_text_input_set_cursor_rect`).
+    cursor: Option<(i32, i32, i32, i32)>,
     /// `commit` requests seen: the serial `done` must echo.
     commits: u32,
 }
@@ -69,6 +74,7 @@ impl TextInputs {
                     pending: Pending::default(),
                     enabled: false,
                     content: (0, 0),
+                    cursor: None,
                     commits: 0,
                 });
                 self.tracked.len() - 1
@@ -81,6 +87,7 @@ impl TextInputs {
                 entry.pending = Pending {
                     enable: Some(true),
                     content: Some((0, 0)),
+                    cursor: Some(None),
                 };
             }
             zwp_text_input_v3::Request::Disable => entry.pending.enable = Some(false),
@@ -91,6 +98,12 @@ impl TextInputs {
                 };
                 entry.pending.content = Some((hint, u32::from(*purpose)));
             }
+            zwp_text_input_v3::Request::SetCursorRectangle {
+                x,
+                y,
+                width,
+                height,
+            } => entry.pending.cursor = Some(Some((*x, *y, *width, *height))),
             zwp_text_input_v3::Request::Commit => {
                 entry.commits = entry.commits.wrapping_add(1);
                 let pending = std::mem::take(&mut entry.pending);
@@ -109,6 +122,9 @@ impl TextInputs {
                 }
                 if let Some(content) = pending.content {
                     entry.content = content;
+                }
+                if let Some(cursor) = pending.cursor {
+                    entry.cursor = cursor;
                 }
             }
             zwp_text_input_v3::Request::Destroy => self.destroyed(resource),
@@ -144,6 +160,12 @@ impl TextInputs {
             purpose: t.content.1,
             hints: t.content.0,
         })
+    }
+
+    /// The focused field's cursor rectangle, local to `focus`
+    /// (mutter's input-focus cursor location, GNOME's `FocusTracker`).
+    pub fn cursor_rectangle(&self, focus: Option<&WlSurface>) -> Option<(i32, i32, i32, i32)> {
+        self.active(focus)?.cursor
     }
 
     /// Take the input-panel ON request; only a focused field may make it.
@@ -240,6 +262,105 @@ impl TouchMode {
     }
 }
 
+/// gnome-shell 51 `Keyboard`'s window slide (`setCursorLocation`,
+/// `_setFocusWindow`, `_animateWindow`): while the keyboard shows and the
+/// focused field's cursor would sit under it, the field's window moves up
+/// by the keyboard's height, and back where it started when the keyboard
+/// goes, the field leaves the keyboard's reach or another window takes
+/// the slide. A window the user moves is let go where it is
+/// (`_onFocusWindowMoving`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WindowSlide {
+    /// `_focusWindow`, `_focusWindowStartY` and the keyboard height the
+    /// window was moved up by.
+    focus: Option<(u64, i32, i32)>,
+}
+
+/// The keyboard as `setCursorLocation` measures it, global logical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyboardBox {
+    /// `keyboardY1`: the keyboard's top edge.
+    pub top: i32,
+    /// `keyboardBox.height`.
+    pub height: i32,
+}
+
+/// The focused field: its window and the cursor's global y and height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldCursor {
+    pub window: u64,
+    pub y: i32,
+    pub height: i32,
+}
+
+impl WindowSlide {
+    /// The window shifted for the keyboard, if any.
+    pub fn window(&self) -> Option<u64> {
+        self.focus.map(|(id, _, _)| id)
+    }
+
+    /// One look at the keyboard and the field. `window_y` is a window's
+    /// current frame y. Returns the moves to make: `(window, final y)`.
+    pub fn update(
+        &mut self,
+        keyboard: Option<KeyboardBox>,
+        cursor: Option<FieldCursor>,
+        window_y: impl Fn(u64) -> Option<i32>,
+    ) -> Vec<(u64, i32)> {
+        // `_animateHide` slides the window back; `_close` then clears
+        // the cursor location.
+        let Some(keyboard) = keyboard else {
+            return self.set_focus(None, 0, &window_y);
+        };
+        let Some(cursor) = cursor else {
+            return self.set_focus(None, keyboard.height, &window_y);
+        };
+        if let Some((id, start, moved)) = self.focus.filter(|f| f.0 == cursor.window) {
+            if cursor.y + cursor.height + keyboard.height < keyboard.top {
+                return self.set_focus(None, keyboard.height, &window_y);
+            }
+            // `_animateWindow` moves by `keyboardBox.height`: the layer's
+            // first configure can be smaller than the keyboard it settles
+            // at, so the window follows the settled height.
+            if moved != keyboard.height {
+                self.focus = Some((id, start, keyboard.height));
+                return vec![(id, start - keyboard.height)];
+            }
+            return Vec::new();
+        }
+        let target = (cursor.y + cursor.height >= keyboard.top).then_some(cursor.window);
+        self.set_focus(target, keyboard.height, &window_y)
+    }
+
+    /// `_setFocusWindow` with the keyboard showing.
+    fn set_focus(
+        &mut self,
+        window: Option<u64>,
+        height: i32,
+        window_y: &impl Fn(u64) -> Option<i32>,
+    ) -> Vec<(u64, i32)> {
+        if self.window() == window {
+            return Vec::new();
+        }
+        let mut moves = Vec::new();
+        if let Some((id, start, _)) = self.focus.take() {
+            moves.push((id, start));
+        }
+        if let Some((id, start)) = window.and_then(|id| window_y(id).map(|y| (id, y))) {
+            self.focus = Some((id, start, height));
+            moves.push((id, start - height));
+        }
+        moves
+    }
+
+    /// The user moved `window`, or it went away: let it go where it is.
+    pub fn let_go(&mut self, window: u64) {
+        if self.window() == Some(window) {
+            self.focus = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +431,84 @@ mod tests {
         assert!(mode.auto());
         mode.has_touchscreen = false;
         assert!(!mode.auto());
+    }
+
+    #[test]
+    fn window_slides_up_for_a_covered_field_like_gnome_shell() {
+        let ys = |id: u64| Some(if id == 1 { 500 } else { 100 });
+        let keyboard = Some(KeyboardBox {
+            top: 720,
+            height: 360,
+        });
+        let mut slide = WindowSlide::default();
+        // A field above the keyboard: nothing moves.
+        let above = FieldCursor {
+            window: 1,
+            y: 600,
+            height: 20,
+        };
+        assert!(slide.update(keyboard, Some(above), ys).is_empty());
+        // Under the keyboard's top: up by the keyboard's height.
+        let covered = FieldCursor {
+            window: 1,
+            y: 800,
+            height: 20,
+        };
+        assert_eq!(slide.update(keyboard, Some(covered), ys), vec![(1, 140)]);
+        // The shifted field (now at 440) stays put while near the keyboard.
+        let shifted = FieldCursor { y: 440, ..covered };
+        assert!(slide.update(keyboard, Some(shifted), ys).is_empty());
+        // Far enough above that it would clear the keyboard unshifted:
+        // back to where it started.
+        let high = FieldCursor { y: 300, ..covered };
+        assert_eq!(slide.update(keyboard, Some(high), ys), vec![(1, 500)]);
+        // Another window's covered field takes the slide.
+        assert_eq!(slide.update(keyboard, Some(covered), ys), vec![(1, 140)]);
+        let other = FieldCursor {
+            window: 2,
+            y: 730,
+            height: 20,
+        };
+        assert_eq!(
+            slide.update(keyboard, Some(other), ys),
+            vec![(1, 500), (2, -260)]
+        );
+        // The keyboard hides: back down.
+        assert_eq!(slide.update(None, Some(other), ys), vec![(2, 100)]);
+        assert_eq!(slide.window(), None);
+        // A window the user moves is let go where it is.
+        slide.update(keyboard, Some(covered), ys);
+        slide.let_go(1);
+        assert!(slide.update(None, None, ys).is_empty());
+    }
+
+    #[test]
+    fn slid_window_follows_the_keyboards_settled_height() {
+        let ys = |_| Some(500);
+        let mut slide = WindowSlide::default();
+        let field = FieldCursor {
+            window: 1,
+            y: 640,
+            height: 20,
+        };
+        let first = KeyboardBox {
+            top: 600,
+            height: 200,
+        };
+        assert_eq!(slide.update(Some(first), Some(field), ys), vec![(1, 300)]);
+        let settled = KeyboardBox {
+            top: 534,
+            height: 266,
+        };
+        let shifted = FieldCursor { y: 440, ..field };
+        assert_eq!(
+            slide.update(Some(settled), Some(shifted), ys),
+            vec![(1, 234)]
+        );
+        let settled_field = FieldCursor { y: 374, ..field };
+        assert!(slide
+            .update(Some(settled), Some(settled_field), ys)
+            .is_empty());
+        assert_eq!(slide.update(None, None, ys), vec![(1, 500)]);
     }
 }

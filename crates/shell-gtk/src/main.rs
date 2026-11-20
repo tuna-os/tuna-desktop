@@ -208,6 +208,7 @@ const INTERFACE_SCHEMA: &str = "org.gnome.desktop.interface";
 const A11Y_INTERFACE_SCHEMA: &str = "org.gnome.desktop.a11y.interface";
 const NOTIFICATIONS_SCHEMA: &str = "org.gnome.desktop.notifications";
 const COLOR_SCHEMA: &str = "org.gnome.settings-daemon.plugins.color";
+const TOUCHSCREEN_SCHEMA: &str = "org.gnome.settings-daemon.peripherals.touchscreen";
 const SESSION_SCHEMA: &str = "org.gnome.desktop.session";
 const SHELL_SCHEMA: &str = "org.gnome.shell";
 const SCREENSAVER_SCHEMA: &str = "org.gnome.desktop.screensaver";
@@ -225,6 +226,19 @@ fn settings(schema: &str) -> Option<gio::Settings> {
     let source = gio::SettingsSchemaSource::default()?;
     source.lookup(schema, true)?;
     Some(gio::Settings::new(schema))
+}
+
+/// Mutter 51's orientation lock (`meta-orientation-manager.c` reads
+/// `orientation-lock` from gnome-settings-daemon's touchscreen schema),
+/// published to the compositor as `InputSettings.orientation_lock`.
+/// Without the schema or the key the panel is unlocked, the default.
+fn orientation_lock(touchscreen: Option<&gio::Settings>) -> bool {
+    touchscreen.is_some_and(|settings| {
+        settings
+            .settings_schema()
+            .is_some_and(|schema| schema.has_key("orientation-lock"))
+            && settings.boolean("orientation-lock")
+    })
 }
 
 /// Nothing to read now: the socket would block, or the client deferred
@@ -268,6 +282,8 @@ struct Drained {
     /// The compositor's on-screen keyboard updates, in order: focus, the
     /// input-panel request, touch-mode auto-show.
     osk: Vec<(Option<tuna_shell_control::TextFieldFocus>, bool, bool)>,
+    /// The compositor's bottom-edge OSK drag phases, in order (wire 0.61).
+    osk_gestures: Vec<tuna_shell_control::OskGesturePhase>,
     /// Drawing-tablet OSD messages, in arrival order.
     tablet: Vec<TabletUi>,
     /// Mutter's seat touch-mode, when the compositor changed it.
@@ -379,6 +395,7 @@ fn drain(
                 show,
                 touch_auto,
             } => out.osk.push((focus, show, touch_auto)),
+            Handled::OskGesture(phase) => out.osk_gestures.push(phase),
             Handled::PointerTimeout {
                 kind,
                 duration_ms,
@@ -1572,6 +1589,7 @@ fn quick_settings_popover(
     let night = qs_tile("night-light-symbolic", "Night Light", None);
     let dark = qs_tile("dark-mode-symbolic", "Dark Style", None);
     let dnd_tile = qs_tile("notifications-disabled-symbolic", "Do Not Disturb", None);
+    let auto_rotate = qs_tile("rotation-allowed-symbolic", "Auto Rotate", None);
     // GNOME 51's Keyboard toggle (status/backlight.js): its menu sets no
     // header and holds only the brightness slider or the level buttons.
     let kbd_menu_ui = QsMenu::new(kbd_backlight::ICON, kbd_backlight::TITLE);
@@ -1621,6 +1639,8 @@ fn quick_settings_popover(
     // `_rfkill` after Do Not Disturb.
     grid.add(&kbd_tile, Some(&kbd_menu_ui));
     grid.add(&airplane_tile, None);
+    // GNOME 51 panel.js adds `_autoRotate` after `_rfkill`.
+    grid.add(&auto_rotate, None);
     let (
         wifi_outer,
         wired_outer,
@@ -1753,6 +1773,75 @@ fn quick_settings_popover(
             });
         }
         None => night.present(false),
+    }
+    // GNOME 51 autoRotate.js + systemActions.js: shown only while Mutter's
+    // DisplayConfig manages the panel orientation; checked is the inverse
+    // of the touchscreen orientation-lock key, icon follows the lock.
+    auto_rotate.present(false);
+    if let Some(touch) = settings(TOUCHSCREEN_SCHEMA) {
+        let sync = {
+            let tile = auto_rotate.clone();
+            move |locked: bool| {
+                tile.icon.set_icon_name(Some(if locked {
+                    "rotation-locked-symbolic"
+                } else {
+                    "rotation-allowed-symbolic"
+                }));
+                if tile.button.is_active() == locked {
+                    tile.button.set_active(!locked);
+                }
+            }
+        };
+        sync(touch.boolean("orientation-lock"));
+        touch.connect_changed(Some("orientation-lock"), move |s, key| sync(s.boolean(key)));
+        let managed = Rc::new(Cell::new(false));
+        {
+            let (touch, managed) = (touch.clone(), managed.clone());
+            auto_rotate.button.connect_toggled(move |t| {
+                // activateLockOrientation throws while unmanaged: no write.
+                let locked = !t.is_active();
+                if managed.get() && touch.boolean("orientation-lock") != locked {
+                    let _ = touch.set_boolean("orientation-lock", locked);
+                }
+            });
+        }
+        let tile = auto_rotate.clone();
+        // Asynchronous, never auto-started: DisplayConfig may appear after
+        // the shell; the proxy follows its name owner.
+        gio::DBusProxy::for_bus(
+            gio::BusType::Session,
+            gio::DBusProxyFlags::DO_NOT_AUTO_START,
+            None,
+            "org.gnome.Mutter.DisplayConfig",
+            "/org/gnome/Mutter/DisplayConfig",
+            "org.gnome.Mutter.DisplayConfig",
+            gio::Cancellable::NONE,
+            move |proxy| {
+                let Ok(proxy) = proxy else { return };
+                let update = Rc::new(move |proxy: &gio::DBusProxy| {
+                    let on = proxy.name_owner().is_some()
+                        && proxy
+                            .cached_property("PanelOrientationManaged")
+                            .and_then(|v| v.get::<bool>())
+                            .unwrap_or(false);
+                    managed.set(on);
+                    tile.present(on);
+                });
+                update(&proxy);
+                {
+                    let update = update.clone();
+                    proxy.connect_local("g-properties-changed", false, move |args| {
+                        if let Ok(proxy) = args[0].get::<gio::DBusProxy>() {
+                            update(&proxy);
+                        }
+                        None
+                    });
+                }
+                proxy.connect_notify_local(Some("g-name-owner"), move |proxy, _| update(proxy));
+                // The handlers live as long as the proxy; keep it for the session.
+                std::mem::forget(proxy);
+            },
+        );
     }
     let battery_summary = gtk::Label::new(None);
     battery_summary.set_xalign(0.0);
@@ -3660,6 +3749,7 @@ fn build(app: &adw::Application) {
             pointer_a11y::SCHEMA,
             "org.gnome.desktop.peripherals.trackball",
             "org.gnome.desktop.peripherals.pointingstick",
+            TOUCHSCREEN_SCHEMA,
         ];
         let all: Rc<Vec<Option<gio::Settings>>> =
             Rc::new(schemas.iter().map(|s| settings(s)).collect());
@@ -3825,6 +3915,7 @@ fn build(app: &adw::Application) {
                 }
                 out.keyboard_aids = kbd_a11y::read(all[9].as_ref());
                 out.pointer_aids = pointer_a11y::read(all[10].as_ref());
+                out.orientation_lock = orientation_lock(all[13].as_ref());
                 let keymap = (
                     out.xkb_layout.clone(),
                     out.xkb_variant.clone(),
@@ -4115,6 +4206,7 @@ fn build(app: &adw::Application) {
                     tablet,
                     osk: osk_updates,
                     touch_mode,
+                    osk_gestures,
                 } = drained;
                 let mut shell = shell.borrow_mut();
                 let locked = shell.control.as_ref().is_some_and(|c| c.locked());
@@ -4206,6 +4298,9 @@ fn build(app: &adw::Application) {
                 osk.set_locked(locked);
                 for (focus, show, touch_auto) in osk_updates {
                     osk.update(focus, show, touch_auto);
+                }
+                for phase in osk_gestures {
+                    osk.gesture(phase);
                 }
                 if locked {
                     shortcut_consent.dismiss();
@@ -4549,4 +4644,27 @@ fn main() -> glib::ExitCode {
     app.connect_startup(privacy_portal::start);
     app.connect_activate(build);
     app.run_with_args::<&str>(&[])
+}
+
+#[cfg(test)]
+mod orientation_lock_tests {
+    use super::*;
+    use crate::test_settings::SettingsFixture;
+
+    #[test]
+    fn orientation_lock_reads_the_settings_daemon_key() {
+        let fixture = SettingsFixture::new(include_str!(
+            "../../../tests/settings/gnome51-peripherals-touchscreen.gschema.xml"
+        ));
+        let touch = fixture.settings(TOUCHSCREEN_SCHEMA);
+        assert!(
+            !orientation_lock(Some(&touch)),
+            "GNOME's default is unlocked"
+        );
+        touch.set_boolean("orientation-lock", true).unwrap();
+        assert!(orientation_lock(Some(&touch)));
+        touch.set_boolean("orientation-lock", false).unwrap();
+        assert!(!orientation_lock(Some(&touch)));
+        assert!(!orientation_lock(None), "no schema: unlocked");
+    }
 }

@@ -401,7 +401,7 @@ Consumers re-checked against gnome-shell 51.0, gnome-session 51.0 and gnome-sett
 
 | Key | Status | Reason | Owner |
 |---|---|---|---|
-| output | Ignored | No Tuna Desktop mapping for this libinput/tablet preference; supported subset is listed explicitly | unimplemented — mutter 51 `src/backends/meta-input-mapper.c`; #345 |
+| output | Honored | Per device (`/org/gnome/desktop/peripherals/touchscreens/VID:PID/`), live and on hotplug, with Mutter 51's input mapper: the EDID triple (the connector only tells twins apart) picks the monitor, else automatic EDID-name and size matching, else the built-in panel; contacts go through that monitor's device matrix, rotation included. D-TOUCH proves the key on vkms, which has one output; choosing among several monitors is unit-tested | implemented — mutter 51 `src/backends/meta-input-mapper.c`; proof:D-TOUCH, cargo:touchscreens_fall_back_to_the_builtin_panel, cargo:edid_twins_are_told_apart_by_the_connector, cargo:touchscreen_settings_paths_follow_mutter |
 ## org.gnome.desktop.peripherals.trackball
 
 | Key | Status | Reason | Owner |

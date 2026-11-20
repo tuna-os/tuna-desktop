@@ -206,10 +206,12 @@ pub enum ToLoop {
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
     /// The accelerometer sample changed (iio-sensor-proxy, #345):
-    /// whether a sensor is present and its current orientation.
+    /// whether a sensor is present, its current orientation, and whether
+    /// the accelerometer was claimed just now (Mutter's `::sensor-active`).
     SensorSample {
         present: bool,
         orientation: Option<crate::orientation::SensorOrientation>,
+        claimed: bool,
     },
     /// GNOME Settings Daemon wrote `PowerSaveMode` (#355). The loop
     /// applies it to the outputs and replies once it is published.
@@ -1743,7 +1745,9 @@ pub(crate) fn start(
             // teardown; frames additionally fail closed on lock. A bus that
             // stops answering revokes within OWNER_CHECK_TIMEOUT. With none
             // the scan has nothing to revoke and waits for one to be
-            // created, or for the sensor client (#503).
+            // created, for the sensor client (#503) or for a change of the
+            // orientation flags.
+            let mut managed_sent = false;
             loop {
                 let watching = remote.lock().is_ok_and(|s| !s.is_empty())
                     || sessions.lock().is_ok_and(|s| !s.is_empty())
@@ -1861,6 +1865,25 @@ pub(crate) fn start(
                     let _ = to_loop.send(ToLoop::SensorSample {
                         present: sample.present,
                         orientation: sample.orientation,
+                        claimed: sample.claimed,
+                    });
+                }
+                // `notify::panel-orientation-managed`: GNOME Shell's Auto
+                // Rotate toggle and GNOME Settings follow the property.
+                let managed = orientation.is_managed();
+                if managed != managed_sent {
+                    managed_sent = managed;
+                    let _ = zbus::block_on(async {
+                        let iface: InterfaceRef<DisplayConfig> = conn
+                            .object_server()
+                            .interface("/org/gnome/Mutter/DisplayConfig")
+                            .await?;
+                        let config = iface.get().await;
+                        let emitted = config
+                            .panel_orientation_managed_changed(iface.signal_emitter())
+                            .await;
+                        drop(config);
+                        emitted
                     });
                 }
             }

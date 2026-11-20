@@ -1,10 +1,12 @@
-//! Owned GIO reader for GNOME's per-device tablet, stylus and pad-button
-//! settings (`org.gnome.desktop.peripherals.tablet` at
+//! Owned GIO reader for GNOME's per-device tablet, stylus, pad-button and
+//! touchscreen settings (`org.gnome.desktop.peripherals.tablet` at
 //! `/org/gnome/desktop/peripherals/tablets/VVVV:PPPP/`,
-//! `org.gnome.desktop.peripherals.tablet.stylus` per tool and
+//! `org.gnome.desktop.peripherals.tablet.stylus` per tool,
 //! `org.gnome.desktop.peripherals.tablet.pad-button` per pad button, ring
-//! and strip direction), read by the compositor itself as Mutter's
-//! `meta-input-settings.c` and `meta-pad-action-mapper.c` read them
+//! and strip direction, and `org.gnome.desktop.peripherals.touchscreen`
+//! at `/org/gnome/desktop/peripherals/touchscreens/VVVV:PPPP/`), read by
+//! the compositor itself as Mutter's `meta-input-settings.c`,
+//! `meta-input-mapper.c` and `meta-pad-action-mapper.c` read them
 //! in-process.
 //!
 //! The mechanics are `wm_preferences.rs`'s: native `Settings` and their
@@ -61,6 +63,9 @@ const STYLUS_KEYS: [(&str, &str); 13] = [
     ("tertiary-button-keybinding", "s"),
 ];
 const PAD_BUTTON_KEYS: [(&str, &str); 2] = [("action", "s"), ("keybinding", "s")];
+/// `org.gnome.desktop.peripherals.touchscreen` (GNOME 51).
+pub(crate) const TOUCHSCREEN_SCHEMA: &str = "org.gnome.desktop.peripherals.touchscreen";
+const TOUCHSCREEN_KEYS: [(&str, &str); 1] = [("output", "as")];
 
 /// Which relocatable schema a path holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -68,6 +73,7 @@ pub(crate) enum Kind {
     Tablet,
     Stylus,
     PadButton,
+    Touchscreen,
 }
 
 /// One completed read: every requested path's values.
@@ -76,6 +82,8 @@ pub(crate) struct Snapshot {
     pub tablets: BTreeMap<String, TabletSettings>,
     pub styluses: BTreeMap<String, StylusSettings>,
     pub pad_buttons: BTreeMap<String, PadButtonSettings>,
+    /// Each touchscreen path's `output` user value (`None`: automatic).
+    pub touchscreens: BTreeMap<String, Option<Vec<String>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -449,6 +457,7 @@ struct GioReader {
     tablet: gio::SettingsSchema,
     stylus: gio::SettingsSchema,
     pad_button: gio::SettingsSchema,
+    touchscreen: gio::SettingsSchema,
     backend: Option<gio::SettingsBackend>,
     shared: Weak<Shared>,
     /// One live settings object and its watch per path read so far.
@@ -467,6 +476,7 @@ impl GioReader {
             lookup(TABLET_SCHEMA)?,
             lookup(STYLUS_SCHEMA)?,
             lookup(PAD_BUTTON_SCHEMA)?,
+            lookup(TOUCHSCREEN_SCHEMA)?,
             None,
             shared,
         )
@@ -475,6 +485,7 @@ impl GioReader {
         tablet: gio::SettingsSchema,
         stylus: gio::SettingsSchema,
         pad_button: gio::SettingsSchema,
+        touchscreen: gio::SettingsSchema,
         backend: Option<gio::SettingsBackend>,
         shared: Weak<Shared>,
     ) -> Result<Self, ReadError> {
@@ -487,10 +498,14 @@ impl GioReader {
         if !schema_matches(&pad_button, &PAD_BUTTON_KEYS) {
             return Err(ReadError("pad-button schema key/type mismatch".into()));
         }
+        if !schema_matches(&touchscreen, &TOUCHSCREEN_KEYS) {
+            return Err(ReadError("touchscreen schema key/type mismatch".into()));
+        }
         Ok(Self {
             tablet,
             stylus,
             pad_button,
+            touchscreen,
             backend,
             shared,
             settings: HashMap::new(),
@@ -506,6 +521,7 @@ impl GioReader {
             Kind::Tablet => &self.tablet,
             Kind::Stylus => &self.stylus,
             Kind::PadButton => &self.pad_button,
+            Kind::Touchscreen => &self.touchscreen,
         };
         let settings = gio::Settings::new_full(schema, self.backend.as_ref(), Some(path));
         let shared = self.shared.clone();
@@ -566,6 +582,11 @@ impl NativeReader for GioReader {
                 Kind::PadButton => {
                     settings.set_string("action", "keybinding").unwrap();
                     settings.set_string("keybinding", "<Shift>b").unwrap();
+                }
+                Kind::Touchscreen => {
+                    settings
+                        .set_strv("output", ["BOE", "0x0a1c", "eDP-1"])
+                        .unwrap();
                 }
             }
         }
@@ -671,6 +692,19 @@ impl NativeReader for GioReader {
                         },
                     );
                 }
+                Kind::Touchscreen => {
+                    // meta-input-mapper.c `guess_candidates`: automatic
+                    // mapping while `output` has no user value.
+                    let output = settings
+                        .user_value("output")
+                        .map(|value| {
+                            value
+                                .get::<Vec<String>>()
+                                .ok_or_else(|| ReadError("invalid output".into()))
+                        })
+                        .transpose()?;
+                    snapshot.touchscreens.insert(path.clone(), output);
+                }
             }
         }
         Ok(snapshot)
@@ -698,6 +732,11 @@ mod tests {
     /// schemas, as installed (relocatable, the enums from gdesktop-enums.h).
     const SCHEMAS: &str =
         include_str!("../../../tests/settings/gnome51-peripherals-tablet.gschema.xml");
+    /// gsettings-desktop-schemas 51's touchscreen schema and
+    /// gnome-settings-daemon 51's touchscreen orientation lock.
+    const TOUCHSCREEN_SCHEMAS: &str =
+        include_str!("../../../tests/settings/gnome51-peripherals-touchscreen.gschema.xml");
+    const TOUCHSCREEN_PATH: &str = "/org/gnome/desktop/peripherals/touchscreens/04f3:2c82/";
 
     fn wake_loop() -> (Wake, calloop::EventLoop<'static, usize>) {
         let (wake, source) = Wake::new().unwrap();
@@ -711,6 +750,7 @@ mod tests {
 
     fn compile(dir: &std::path::Path, xml: &str) {
         std::fs::write(dir.join("proof.gschema.xml"), xml).unwrap();
+        std::fs::write(dir.join("touchscreen.gschema.xml"), TOUCHSCREEN_SCHEMAS).unwrap();
         assert!(
             std::process::Command::new("timeout")
                 .args(["--kill-after=2s", "10s", "glib-compile-schemas"])
@@ -730,10 +770,12 @@ mod tests {
                 let tablet = schemas.lookup(TABLET_SCHEMA, false).unwrap();
                 let stylus = schemas.lookup(STYLUS_SCHEMA, false).unwrap();
                 let pad_button = schemas.lookup(PAD_BUTTON_SCHEMA, false).unwrap();
+                let touchscreen = schemas.lookup(TOUCHSCREEN_SCHEMA, false).unwrap();
                 Ok(Box::new(GioReader::from_schemas(
                     tablet,
                     stylus,
                     pad_button,
+                    touchscreen,
                     Some(gio::memory_settings_backend_new()),
                     shared,
                 )?))
@@ -779,6 +821,7 @@ mod tests {
                 (Kind::Tablet, TABLET_PATH),
                 (Kind::Stylus, STYLUS_PATH),
                 (Kind::PadButton, PAD_PATH),
+                (Kind::Touchscreen, TOUCHSCREEN_PATH),
             ]),
             poll_at,
         );
@@ -786,6 +829,8 @@ mod tests {
         assert_eq!(first.tablets[TABLET_PATH], TabletSettings::default());
         assert_eq!(first.styluses[STYLUS_PATH], StylusSettings::default());
         assert_eq!(first.pad_buttons[PAD_PATH], PadButtonSettings::default());
+        // GNOME's default `output` is no user value: automatic mapping.
+        assert_eq!(first.touchscreens[TOUCHSCREEN_PATH], None);
         assert_eq!(reader.status(), CacheStatus::Fresh);
         let source = glib::idle_source_new(
             Some("tuna-tablet-settings-watch-proof"),
@@ -813,6 +858,10 @@ mod tests {
         );
         assert_eq!(tablet.mapping, Mapping::Relative);
         assert!(tablet.keep_aspect);
+        assert_eq!(
+            changed.touchscreens[TOUCHSCREEN_PATH].as_deref(),
+            Some(&["BOE", "0x0a1c", "eDP-1"].map(String::from)[..])
+        );
         let stylus = &changed.styluses[STYLUS_PATH];
         assert_eq!(stylus.pressure_curve, vec![0, 75, 25, 100]);
         assert_eq!(stylus.button_action, ButtonAction::Back);
