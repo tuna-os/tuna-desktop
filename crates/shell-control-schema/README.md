@@ -51,6 +51,10 @@ before decoding.
   lock). The shell answers `CommandKind::RespondCloseDialog { window,
   response }` with `CloseDialogResponse::ForceClose` or `Wait`. Texts are
   bounded by `MAX_TITLE_LEN`, sides by `MAX_CLOSE_DIALOG_SIDE`.
+- Screen wake (0.53): `CommandKind::WakeUpScreen` lifts the idle fade off
+  the locked, blanked screen when a notification reaches the lock screen's
+  list (screenShield.js `_wakeUpScreen`); it is `Denied` while unlocked,
+  never unlocks and does not count as user activity.
 - Lock screen shown (0.51): `Message::LockScreenShown { shown }` (peers
   >=51 only) says the session is locked and the lock curtain has landed
   (screenShield.js `_lockScreenShown`); `false` once it unlocks. The shell

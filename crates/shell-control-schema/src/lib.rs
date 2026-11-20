@@ -237,9 +237,12 @@ impl ProtocolVersion {
     /// pidfd-pinned socket, and the compositor recognises the shell on
     /// D-Bus by that unique name only (ADR 0010). Positional postcard peers
     /// must ship together.
+    /// `0.53` appends the shell-to-compositor `WakeUpScreen` command (a
+    /// notification wakes the locked, blanked screen, #348). Positional
+    /// postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 52,
+        minor: 53,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -537,6 +540,13 @@ pub enum CommandKind {
     /// session that is not the supervised shell is denied. A later
     /// declaration replaces the earlier one.
     DeclareBusName { unique_name: String },
+    /// Since 0.53: a notification reached the lock screen's list
+    /// (unlockDialog.js `_wakeUpScreenForSource`): undo the idle shield's
+    /// fade as screenShield.js `_wakeUpScreen` turns its lightbox off,
+    /// without counting as user activity and without unlocking. Denied
+    /// while the session is unlocked (`_wakeUpScreen` returns unless the
+    /// shield is active).
+    WakeUpScreen,
 }
 
 /// mutter 51 `MetaCloseDialogResponse`: what the user chose in the dialog
@@ -2665,11 +2675,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_52() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 52));
-        // A 0.51 shell still negotiates; a newer minor does not.
-        assert!(ProtocolVersion::new(0, 51).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 53).is_compatible_with(&CURRENT_VERSION));
+    fn current_version_is_0_53() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 53));
+        // A 0.52 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 52).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 54).is_compatible_with(&CURRENT_VERSION));
     }
 
     #[test]
@@ -4020,6 +4030,23 @@ mod tablet_osd_wire_order_tests {
         );
         let bytes = postcard::to_slice(&touch, &mut buffer).unwrap();
         assert_eq!(postcard::from_bytes::<Message>(bytes).unwrap(), touch);
+    }
+
+    #[test]
+    fn wake_up_screen_follows_the_0_52_declare_bus_name() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 64];
+        let declare = tag(postcard::to_slice(
+            &CommandKind::DeclareBusName {
+                unique_name: ":1.42".into(),
+            },
+            &mut buffer,
+        )
+        .unwrap());
+        let wake = postcard::to_slice(&CommandKind::WakeUpScreen, &mut buffer).unwrap();
+        assert_eq!(wake, [declare + 1]);
+        let back: CommandKind = postcard::from_bytes(&[declare + 1]).unwrap();
+        assert_eq!(back, CommandKind::WakeUpScreen);
     }
 }
 

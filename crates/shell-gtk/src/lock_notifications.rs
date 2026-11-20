@@ -163,6 +163,19 @@ fn detail_markup(title: &str, body: &str) -> String {
     }
 }
 
+/// Whether going from `before` to `after` wakes a blanked lock screen
+/// (unlockDialog.js `_wakeUpScreenForSource`): a source box that newly
+/// shows (`_addSource`, `_visibleChanged`) or whose unseen count changed
+/// while it shows (`_countChanged`). A source is its name and icon, as
+/// the box draws it. The caller checks `show-banners`.
+pub fn wakes_screen(before: &[LockEntry], after: &[LockEntry]) -> bool {
+    after.iter().any(|entry| {
+        !before.iter().any(|old| {
+            old.title == entry.title && old.icon == entry.icon && old.count == entry.count
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +187,33 @@ mod tests {
             "<b>A &lt;b&gt;</b> line one line &amp; two"
         );
         assert_eq!(detail_markup("Only", ""), "<b>Only</b> ");
+    }
+
+    #[test]
+    fn a_new_or_recounted_source_wakes_the_screen_like_gnome() {
+        let entry = |title: &str, count| LockEntry {
+            title: title.into(),
+            icon: None,
+            count,
+            critical: false,
+            details: None,
+        };
+        let mail = [entry("Mail", 1)];
+        // `_addSource` (not initial): a source box appears.
+        assert!(wakes_screen(&[], &mail));
+        // `_countChanged`: its count moves, up or down, while it shows.
+        assert!(wakes_screen(&mail, &[entry("Mail", 2)]));
+        assert!(wakes_screen(&[entry("Mail", 2)], &mail));
+        // Nothing that shows changed, or a source left: no wake.
+        assert!(!wakes_screen(&mail, &mail));
+        assert!(!wakes_screen(&[entry("Chat", 1), entry("Mail", 1)], &mail));
+        assert!(!wakes_screen(&mail, &[]));
+        // Details or the critical style alone are no new notification.
+        let detailed = LockEntry {
+            details: Some(vec![("Hi".into(), String::new())]),
+            critical: true,
+            ..entry("Mail", 1)
+        };
+        assert!(!wakes_screen(&mail, &[detailed]));
     }
 }
