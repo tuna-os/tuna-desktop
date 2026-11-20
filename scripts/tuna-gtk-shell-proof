@@ -14,7 +14,8 @@
 #   X11 window is IconicState with _NET_WM_STATE_HIDDEN, #1078) only.
 #   --protocols-only runs panel readiness, G-WAYLAND-INFO and the Mutter 51
 #   protocol gates driven by a real client (G-XDG-WM-BASE-7,
-#   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR; #364, #588) only.
+#   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR, G-SYNCOBJ; #364, #588)
+#   only.
 #   --grid-hover-only runs panel readiness, G-GRID-HOVER, G-GRID-REORDER,
 #   G-GRID-ON-DEMAND and G-SHELL-STABLE only.
 #   --keyboard-routes-only runs panel readiness and the P-A11Y-02 keyboard
@@ -1978,6 +1979,25 @@ BLUR
         fail G-BACKGROUND-BLUR "the probe's windows outlived it"
     pass G-BACKGROUND-BLUR "ext_background_effect_manager_v1 offers blur and a blur region smooths one-pixel stripes behind a clear window (mean step $1) while beside it they stay sharp ($2)"
 }
+# Explicit sync (P-SY-09): Mutter 51 creates wp_linux_drm_syncobj_manager_v1
+# only after its device checks pass (meta-wayland-linux-drm-syncobj.c). The
+# nested session's software renderer has no timeline syncobjs: the
+# compositor must give Mutter's reason, in Mutter's words, and no client
+# may find the global.
+syncobj_gate() {
+    syncobj_why="$(grep -m1 'tuna-compositor: explicit sync disabled: ' "$LOG" | sed 's/.*explicit sync disabled: //')"
+    case "$syncobj_why" in
+        "Missing 'EGL_ANDROID_native_fence_sync'" | \
+        "Failed to find EGL device to initialize linux-drm-syncobj-v1" | \
+        "Failed to open DRM device "* | \
+        "Failed to check DRM syncobj timeline capability" | \
+        "drmSyncobjEventfd failed: linux-drm-syncobj requires eventfd support") ;;
+        "") fail G-SYNCOBJ "the compositor gave no explicit-sync verdict" ;;
+        *) fail G-SYNCOBJ "explicit-sync verdict '$syncobj_why' is none of Mutter's" ;;
+    esac
+    protocol_probe G-SYNCOBJ syncobj-unoffered
+    pass G-SYNCOBJ "without timeline syncobjs the compositor refuses explicit sync as Mutter does ($syncobj_why) and no client finds wp_linux_drm_syncobj_manager_v1"
+}
 protocol_gaps_gates() {
     protocol_probe G-XDG-WM-BASE-7 xdg-wm-base-7
     pass G-XDG-WM-BASE-7 "xdg_wm_base 7: a maximized window is tiled and constrained on every edge; a version 6 bind gets the tiled states alone"
@@ -1986,6 +2006,7 @@ protocol_gaps_gates() {
     protocol_probe G-WL-FIXES wl-fixes
     pass G-WL-FIXES "wl_fixes 1 destroys a registry and the client's connection carries on"
     background_blur_gate
+    syncobj_gate
 }
 
 # G-LOCK-WITH-MENU-OPEN: GNOME's lock dismisses the open shell menu and
