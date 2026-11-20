@@ -14,7 +14,8 @@
 #   X11 window is IconicState with _NET_WM_STATE_HIDDEN, #1078) only.
 #   --protocols-only runs panel readiness, G-WAYLAND-INFO and the Mutter 51
 #   protocol gates driven by a real client (G-XDG-WM-BASE-7,
-#   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR; #364, #588) only.
+#   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR, G-TOPLEVEL-DRAG; #364,
+#   #588) only.
 #   --grid-hover-only runs panel readiness, G-GRID-HOVER, G-GRID-REORDER,
 #   G-GRID-ON-DEMAND and G-SHELL-STABLE only.
 #   --keyboard-routes-only runs panel readiness and the P-A11Y-02 keyboard
@@ -1978,6 +1979,54 @@ BLUR
         fail G-BACKGROUND-BLUR "the probe's windows outlived it"
     pass G-BACKGROUND-BLUR "ext_background_effect_manager_v1 offers blur and a blur region smooths one-pixel stripes behind a clear window (mean step $1) while beside it they stay sharp ($2)"
 }
+# Wait for the probe log $1 to print line $2 while probe $3 lives; else
+# fail gate $4 with the probe's own FAIL line.
+probe_line() {
+    line_end=$(($(date +%s) + 30))
+    until grep -qx "$2" "$1"; do
+        if ! kill -0 "$3" 2>/dev/null || [ "$(date +%s)" -gt "$line_end" ]; then
+            kill "$3" 2>/dev/null || true
+            line_why="$(grep -m1 '^FAIL' "$1")"
+            fail "$4" "${line_why:-the probe never printed $2}"
+        fi
+        sleep 0.2
+    done
+}
+# Toplevel drag (P-SY-09): a browser-style tab detach through
+# xdg_toplevel_drag_v1, driven by real pointer input. Mutter 51 keeps the
+# attached window's origin at the pointer less the offset, and a release
+# over nothing sends dnd_drop_performed, then cancelled, and leaves the
+# window where it fell.
+toplevel_drag_gate() {
+    drag_log="$ARTIFACTS/protocol-toplevel-drag.log"
+    WAYLAND_DISPLAY="$SOCKET_NAME" "$COMPANIONS/protocol-probe" toplevel-drag --state "$CSTATE" \
+        >"$drag_log" 2>&1 &
+    DRAG_PID=$!
+    probe_line "$drag_log" ready "$DRAG_PID" G-TOPLEVEL-DRAG
+    cstate '.focused == ([.windows[] | select(.app_id == "tuna-probe-drag-tabs") | .id][0])' "tab strip focused" ||
+        fail G-TOPLEVEL-DRAG "the tab strip never took focus"
+    # shellcheck disable=SC2046
+    set -- $(jq -r '.windows[] | select(.app_id == "tuna-probe-drag-tabs") | .rect | map(tostring) | join(" ")' "$CSTATE")
+    xdotool mousemove --window "$WID" $(($1 + 100)) $(($2 + 60))
+    sleep 0.3
+    xdotool mousedown 1
+    probe_line "$drag_log" dragging "$DRAG_PID" G-TOPLEVEL-DRAG
+    for drag_to in "400 300" "700 450"; do
+        # shellcheck disable=SC2086
+        set -- $drag_to
+        xdotool mousemove --window "$WID" "$1" "$2"
+        cstate ".windows | any(.app_id == \"tuna-probe-drag-tab\" and .rect[0] == $(($1 - 30)) and .rect[1] == $(($2 - 15)))" "tab at the pointer" || {
+            xdotool mouseup 1
+            fail G-TOPLEVEL-DRAG "the attached window is not at the pointer ($1, $2) less its offset (30, 15)"
+        }
+    done
+    xdotool mouseup 1
+    probe_line "$drag_log" dropped "$DRAG_PID" G-TOPLEVEL-DRAG
+    cstate '.windows | any(.app_id == "tuna-probe-drag-tab" and .rect[0] == 670 and .rect[1] == 435)' "tab where it fell" ||
+        fail G-TOPLEVEL-DRAG "the dropped window did not stay where it fell (670, 435)"
+    wait "$DRAG_PID" || fail G-TOPLEVEL-DRAG "$(grep -m1 '^FAIL' "$drag_log")"
+    pass G-TOPLEVEL-DRAG "a toplevel attached to a real pointer drag (unmapped at attach) shows at the pointer less its offset and follows it; release over nothing sends dnd_drop_performed then cancelled and leaves it where it fell"
+}
 protocol_gaps_gates() {
     protocol_probe G-XDG-WM-BASE-7 xdg-wm-base-7
     pass G-XDG-WM-BASE-7 "xdg_wm_base 7: a maximized window is tiled and constrained on every edge; a version 6 bind gets the tiled states alone"
@@ -1986,6 +2035,7 @@ protocol_gaps_gates() {
     protocol_probe G-WL-FIXES wl-fixes
     pass G-WL-FIXES "wl_fixes 1 destroys a registry and the client's connection carries on"
     background_blur_gate
+    toplevel_drag_gate
 }
 
 # G-LOCK-WITH-MENU-OPEN: GNOME's lock dismisses the open shell menu and

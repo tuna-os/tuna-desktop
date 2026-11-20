@@ -232,8 +232,13 @@ carries on. G-BACKGROUND-BLUR: `ext_background_effect_manager_v1` offers
 blur, and a clear window whose surface is a blur region smooths the
 one-pixel stripes of a maximized window behind it (mean step between
 neighbouring pixels below 16) while beside it they stay sharp (above 128),
-from `background-blur.png`. CI runs the slice in the `gtk-shell` job; its
-`protocols/assertions.txt` feeds the ledger.
+from `background-blur.png`. G-TOPLEVEL-DRAG: a real button press in the
+probe's window starts a drag-and-drop with a new, unmapped toplevel
+attached through `xdg_toplevel_drag_v1` at offset (30, 15); as xdotool
+moves the pointer the window's origin is the pointer less that offset,
+and releasing over nothing sends `dnd_drop_performed` then `cancelled`
+and leaves the window where it fell. CI runs the slice in the `gtk-shell`
+job; its `protocols/assertions.txt` feeds the ledger.
 
 `scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts DIR` runs the same
 held-button hover and persisted reorder assertions as the full GTK proof,
