@@ -237,9 +237,13 @@ impl ProtocolVersion {
     /// pidfd-pinned socket, and the compositor recognises the shell on
     /// D-Bus by that unique name only (ADR 0010). Positional postcard peers
     /// must ship together.
+    /// `0.53` appends text-input-v3 version 2's input-panel OFF request:
+    /// compositor-to-shell `HideInputPanel`, sent after the
+    /// `OnScreenKeyboard` update it belongs to. Positional postcard peers
+    /// must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 52,
+        minor: 53,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -1109,8 +1113,9 @@ pub enum Message {
     /// Since 0.43: what GNOME's on-screen keyboard follows (#349).
     /// `focus` is the enabled text input of the client holding keyboard
     /// focus (none while locked); `show` marks an update carrying the
-    /// input-panel ON request (a focused text input enabled again, GTK's
-    /// click into its field, as mutter treats text-input-v3 version 1);
+    /// input-panel ON request (a focused version-1 text input enabled
+    /// again, GTK's click into its field, or version 2's
+    /// `show_input_panel`, as mutter's text_input_commit_state);
     /// `touch_auto` is `KeyboardManager`'s auto-enable: seat touch-mode
     /// with a touchscreen as the last pointing device. Sent on change and
     /// after each handshake snapshot, only to peers advertising minor >= 43.
@@ -1209,6 +1214,13 @@ pub enum Message {
     /// each handshake snapshot while shown, only to peers advertising
     /// minor >= 51.
     LockScreenShown { shown: bool },
+    /// Since 0.53: the focused text input asked to hide the input panel
+    /// (text-input-v3 version 2 `hide_input_panel`; mutter's
+    /// `clutter_input_focus_set_input_panel_state (OFF)`). Follows the
+    /// `OnScreenKeyboard` update it belongs to; GNOME's keyboard closes at
+    /// once (`_onKeyboardStateChanged`). Sent only to peers advertising
+    /// minor >= 53.
+    HideInputPanel,
 }
 
 /// [`Message::WorkspaceProgress`] positions are workspace indices times
@@ -2350,6 +2362,7 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
         | Message::DwellClickType { .. }
         | Message::PointerTimeout { .. }
         | Message::OnScreenKeyboard { .. }
+        | Message::HideInputPanel
         | Message::ShortcutConsent { .. }
         | Message::Command { .. }
         | Message::CommandResult { .. }
@@ -2665,11 +2678,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_52() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 52));
-        // A 0.51 shell still negotiates; a newer minor does not.
-        assert!(ProtocolVersion::new(0, 51).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 53).is_compatible_with(&CURRENT_VERSION));
+    fn current_version_is_0_53() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 53));
+        // A 0.52 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 52).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 54).is_compatible_with(&CURRENT_VERSION));
     }
 
     #[test]
@@ -4271,5 +4284,31 @@ mod close_dialog_wire_tests {
         );
         let command = Message::Command { id: 12, kind };
         assert_eq!(decode_frame(&encode_frame(&command)).unwrap(), command);
+    }
+}
+
+#[cfg(test)]
+mod input_panel_wire_tests {
+    use super::*;
+
+    #[test]
+    fn hide_input_panel_follows_the_0_51_lock_screen_shown_and_round_trips() {
+        let mut buffer = [0_u8; 64];
+        let shown =
+            postcard::to_slice(&Message::LockScreenShown { shown: true }, &mut buffer).unwrap()[0];
+        let frame = encode_frame(&Message::HideInputPanel);
+        // A bare variant tag after the length prefix: nothing else rides.
+        assert_eq!(&frame[4..], &[shown + 1]);
+        assert_eq!(decode_frame(&frame).unwrap(), Message::HideInputPanel);
+        // The 0.43 update keeps its positional shape for older shells.
+        let update = Message::OnScreenKeyboard {
+            focus: Some(TextFieldFocus {
+                purpose: 8,
+                hints: 0x400,
+            }),
+            show: false,
+            touch_auto: true,
+        };
+        assert_eq!(decode_frame(&encode_frame(&update)).unwrap(), update);
     }
 }

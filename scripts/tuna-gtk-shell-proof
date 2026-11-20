@@ -14,7 +14,8 @@
 #   X11 window is IconicState with _NET_WM_STATE_HIDDEN, #1078) only.
 #   --protocols-only runs panel readiness, G-WAYLAND-INFO and the Mutter 51
 #   protocol gates driven by a real client (G-XDG-WM-BASE-7,
-#   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR; #364, #588) only.
+#   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR, G-OSK-INPUT-PANEL;
+#   #364, #588) only.
 #   --grid-hover-only runs panel readiness, G-GRID-HOVER, G-GRID-REORDER,
 #   G-GRID-ON-DEMAND and G-SHELL-STABLE only.
 #   --keyboard-routes-only runs panel readiness and the P-A11Y-02 keyboard
@@ -1978,6 +1979,21 @@ BLUR
         fail G-BACKGROUND-BLUR "the probe's windows outlived it"
     pass G-BACKGROUND-BLUR "ext_background_effect_manager_v1 offers blur and a blur region smooths one-pixel stripes behind a clear window (mean step $1) while beside it they stay sharp ($2)"
 }
+# Text-input v3 version 2 (P-SY-09): Mutter 51's text_input_commit_state
+# turns show_input_panel and hide_input_panel into input-panel ON and OFF,
+# and GNOME's on-screen keyboard opens and closes on them while the field
+# keeps focus. The probe reads the shell's keyboard layer (tuna-osk) from
+# the state file, as tuna-osk-proof does.
+osk_input_panel_gate() {
+    gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled true
+    # GSettings' keyfile backend reaches the shell through file monitoring.
+    sleep 3
+    protocol_probe G-OSK-INPUT-PANEL text-input-v2
+    cstate 'all(.layers[]; .namespace != "tuna-osk")' "keyboard gone with the field" 5 ||
+        fail G-OSK-INPUT-PANEL "the keyboard outlived the probe's field"
+    gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled false
+    pass G-OSK-INPUT-PANEL "zwp_text_input_manager_v3 2 with the on-screen keyboard enabled: a focused field opens no keyboard until show_input_panel; hide_input_panel closes it while the field keeps focus; show_input_panel opens it again; set_available_actions([none]) raises invalid_action ($(grep '^ok zwp' "$ARTIFACTS/protocol-text-input-v2.log" | sed 's/.*: //'))"
+}
 protocol_gaps_gates() {
     protocol_probe G-XDG-WM-BASE-7 xdg-wm-base-7
     pass G-XDG-WM-BASE-7 "xdg_wm_base 7: a maximized window is tiled and constrained on every edge; a version 6 bind gets the tiled states alone"
@@ -1986,6 +2002,7 @@ protocol_gaps_gates() {
     protocol_probe G-WL-FIXES wl-fixes
     pass G-WL-FIXES "wl_fixes 1 destroys a registry and the client's connection carries on"
     background_blur_gate
+    osk_input_panel_gate
 }
 
 # G-LOCK-WITH-MENU-OPEN: GNOME's lock dismisses the open shell menu and

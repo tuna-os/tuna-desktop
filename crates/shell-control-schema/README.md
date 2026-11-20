@@ -61,6 +61,9 @@ before decoding.
   compositor admits D-Bus capture and Introspect calls as the shell only
   from names the supervised shell's pidfd-pinned control session declared,
   and denies the command from any other session (ADR 0010).
+- Input-panel OFF (0.53): `Message::HideInputPanel` (peers >=53 only)
+  follows the `OnScreenKeyboard` update of a text-input-v3 version 2
+  client's `hide_input_panel`, so the shell's keyboard closes at once.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
   `ErrorKind`.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,

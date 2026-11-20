@@ -16,9 +16,15 @@
 //!   offers blur; a maximized window of one-pixel stripes is mapped with a
 //!   clear window above it whose whole surface is a blur region. Prints
 //!   `ready` and keeps both open until killed; the proof samples pixels.
+//! - `text-input-v2 --state FILE`: with GNOME's on-screen keyboard enabled,
+//!   a zwp_text_input_manager_v3 version 2 field enabled alone opens no
+//!   keyboard; show_input_panel+commit opens the shell's keyboard,
+//!   hide_input_panel+commit closes it while the field keeps focus, and
+//!   show_input_panel opens it again; set_available_actions with 'none'
+//!   raises invalid_action.
 //!
 //! `--state` names the compositor state file (`TUNA_COMPOSITOR_STATE`),
-//! read for window parents and mapping.
+//! read for window parents and mapping and the keyboard layer.
 use std::{
     collections::HashMap,
     io::Write,
@@ -36,6 +42,7 @@ use wayland_client::{
         wl_fixes::WlFixes,
         wl_region::WlRegion,
         wl_registry::{self, WlRegistry},
+        wl_seat::WlSeat,
         wl_shm::{self, WlShm},
         wl_shm_pool::WlShmPool,
         wl_surface::WlSurface,
@@ -45,6 +52,10 @@ use wayland_client::{
 use wayland_protocols::ext::background_effect::v1::client::{
     ext_background_effect_manager_v1::{self, ExtBackgroundEffectManagerV1},
     ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
+};
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3::ZwpTextInputManagerV3,
+    zwp_text_input_v3::{self, ZwpTextInputV3},
 };
 use wayland_protocols::xdg::foreign::{
     zv1::client::{
@@ -106,6 +117,9 @@ struct Probe {
     /// Import tags the compositor destroyed.
     destroyed_imports: Vec<u32>,
     blur_capabilities: Option<u32>,
+    /// The text input got `enter`, and `leave` after it.
+    text_input_entered: bool,
+    text_input_left: bool,
     synced: bool,
 }
 
@@ -254,25 +268,28 @@ fn buffer(probe: &Probe, qh: &QueueHandle<Probe>, fill: Fill, (w, h): (i32, i32)
     buffer
 }
 
-/// The compositor's window record for `app_id`, once it is mapped.
-fn state_window(state: &Path, app_id: &str) -> Option<serde_json::Value> {
+/// The compositor's state, once the file is readable.
+fn session_state(state: &Path) -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(state).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-    json["windows"]
+    serde_json::from_str(&text).ok()
+}
+
+/// `app_id`'s window record in `session`, once it is mapped.
+fn window_of(session: &serde_json::Value, app_id: &str) -> Option<serde_json::Value> {
+    session["windows"]
         .as_array()?
         .iter()
         .find(|w| w["app_id"] == app_id)
         .cloned()
 }
 
-/// Wait until the state file says `check` of `app_id`'s window record,
-/// dispatching `clients` meanwhile.
-fn await_state(
+/// Wait until `check` accepts the state file, dispatching `clients`
+/// meanwhile; on timeout fail with `check`'s last complaint.
+fn await_session(
     clients: &mut [&mut Client],
     state: &Path,
-    app_id: &str,
     what: &str,
-    check: impl Fn(&serde_json::Value) -> bool,
+    check: impl Fn(&serde_json::Value) -> Result<(), String>,
 ) -> serde_json::Value {
     let end = Instant::now() + DEADLINE;
     loop {
@@ -294,19 +311,36 @@ fn await_state(
                 .dispatch_pending(&mut client.probe)
                 .unwrap_or_else(|e| fail(format!("protocol error: {e}")));
         }
-        if let Some(window) = state_window(state, app_id) {
-            if check(&window) {
-                return window;
-            }
-        }
+        let complaint = match session_state(state) {
+            Some(session) => match check(&session) {
+                Ok(()) => return session,
+                Err(complaint) => complaint,
+            },
+            None => "the state file is unreadable".to_owned(),
+        };
         if Instant::now() >= end {
-            fail(format!(
-                "timed out waiting for {what}; {app_id} is {:?}",
-                state_window(state, app_id)
-            ));
+            fail(format!("timed out waiting for {what}; {complaint}"));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Wait until the state file says `check` of `app_id`'s window record,
+/// dispatching `clients` meanwhile.
+fn await_state(
+    clients: &mut [&mut Client],
+    state: &Path,
+    app_id: &str,
+    what: &str,
+    check: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let session = await_session(clients, state, what, |session| {
+        match window_of(session, app_id) {
+            Some(window) if check(&window) => Ok(()),
+            window => Err(format!("{app_id} is {window:?}")),
+        }
+    });
+    window_of(&session, app_id).unwrap()
 }
 
 /// The edge states of a configure: tiled 5-8 and constrained 10-13.
@@ -557,6 +591,180 @@ fn background_blur(state: &Path) {
     }
 }
 
+/// The shell's on-screen keyboard layer (`tuna-osk`): its rectangle while
+/// mapped.
+fn osk_rect(session: &serde_json::Value) -> Option<serde_json::Value> {
+    session["layers"]
+        .as_array()?
+        .iter()
+        .find(|layer| layer["namespace"] == "tuna-osk")
+        .map(|layer| layer["rect"].clone())
+}
+
+/// The field's window still holds keyboard and input-method focus.
+fn field_focused(session: &serde_json::Value, window: &serde_json::Value) -> Result<(), String> {
+    if session["focused"] != *window {
+        return Err(format!(
+            "focus is {}, not the field's window {window}",
+            session["focused"]
+        ));
+    }
+    if session["text_input"].is_null() {
+        return Err("the field has no input-method focus".into());
+    }
+    Ok(())
+}
+
+/// Dispatch `client` for `period`.
+fn pause(client: &mut Client, period: Duration) {
+    let end = Instant::now() + period;
+    client.until("a pause", move |_| Instant::now() >= end);
+}
+
+/// Wait until the shell's keyboard is `shown` (slid in: one rectangle for
+/// half a second) or gone, the field keeping its focus throughout; the
+/// seconds it took from `since`, at most two as in G-OSK-SHOW.
+fn await_keyboard(
+    client: &mut Client,
+    state: &Path,
+    field: &serde_json::Value,
+    shown: bool,
+    since: Instant,
+) -> f64 {
+    let what = if shown {
+        "the keyboard to show"
+    } else {
+        "the keyboard to hide"
+    };
+    await_session(&mut [&mut *client], state, what, |session| {
+        field_focused(session, field)?;
+        match osk_rect(session) {
+            Some(rect) if shown && rect[3].as_i64() >= Some(100) => Ok(()),
+            None if !shown => Ok(()),
+            rect => Err(format!("the keyboard layer is {rect:?}")),
+        }
+    });
+    let took = since.elapsed().as_secs_f64();
+    if took > 2.0 {
+        fail(format!("{what} took {took:.3}s"));
+    }
+    if shown {
+        let mut last = session_state(state).and_then(|s| osk_rect(&s));
+        for _ in 0..20 {
+            pause(client, Duration::from_millis(500));
+            let session = session_state(state).unwrap_or_default();
+            field_focused(&session, field).unwrap_or_else(|why| fail(why));
+            let rect = osk_rect(&session);
+            if rect.is_some() && rect == last {
+                return took;
+            }
+            last = rect;
+        }
+        fail(format!("the keyboard never settled (last {last:?})"));
+    }
+    took
+}
+
+fn text_input_v2(state: &Path) {
+    // Mutter 51: META_ZWP_TEXT_INPUT_V3_VERSION 2; text_input_commit_state
+    // sets the input panel ON or OFF from the show_input_panel or
+    // hide_input_panel before commit, and GNOME's keyboard opens or closes
+    // (keyboard.js `_onKeyboardStateChanged`) while the field keeps focus.
+    let mut client = Client::connect();
+    let seat: WlSeat = client.bind("wl_seat", 1);
+    let manager: ZwpTextInputManagerV3 = client.bind("zwp_text_input_manager_v3", 2);
+    let wm: XdgWmBase = client.bind("xdg_wm_base", 1);
+    let app_id = "tuna-probe-text-input";
+    let index = client.window(&wm, app_id, Fill::Solid(0xffff_ffff), (480, 240));
+    let field = await_state(
+        &mut [&mut client],
+        state,
+        app_id,
+        "the field to map",
+        |_| true,
+    )["id"]
+        .clone();
+    await_session(&mut [&mut client], state, "the field to take focus", |s| {
+        if s["focused"] == field {
+            Ok(())
+        } else {
+            Err(format!("focus is {}", s["focused"]))
+        }
+    });
+    let text_input: ZwpTextInputV3 = manager.get_text_input(&seat, &client.qh(), ());
+    client.until("text-input enter", |p| p.text_input_entered);
+
+    // Focusing the field (GTK's enable) gives it input-method focus and
+    // asks for no panel.
+    text_input.enable();
+    text_input.set_content_type(
+        zwp_text_input_v3::ContentHint::None,
+        zwp_text_input_v3::ContentPurpose::Normal,
+    );
+    text_input.commit();
+    await_session(&mut [&mut client], state, "input-method focus", |s| {
+        field_focused(s, &field)
+    });
+    pause(&mut client, Duration::from_millis(1500));
+    if let Some(rect) = session_state(state).and_then(|s| osk_rect(&s)) {
+        fail(format!(
+            "focusing the field alone opened the keyboard at {rect}"
+        ));
+    }
+
+    // show_input_panel: input-panel ON at commit, the keyboard opens.
+    text_input.show_input_panel();
+    text_input.commit();
+    let opened = await_keyboard(&mut client, state, &field, true, Instant::now());
+    // hide_input_panel: input-panel OFF at commit, the keyboard closes at
+    // once and the field keeps its focus.
+    text_input.hide_input_panel();
+    text_input.commit();
+    let closed = await_keyboard(&mut client, state, &field, false, Instant::now());
+    if client.probe.text_input_left {
+        fail("hiding the input panel took the field's text-input focus");
+    }
+    // A valid action set is taken; show_input_panel opens it again.
+    text_input.set_available_actions(
+        u32::from(zwp_text_input_v3::Action::Submit)
+            .to_ne_bytes()
+            .to_vec(),
+    );
+    text_input.show_input_panel();
+    text_input.commit();
+    let reopened = await_keyboard(&mut client, state, &field, true, Instant::now());
+    println!(
+        "ok zwp_text_input_manager_v3 2: show_input_panel opened the keyboard in {opened:.3}s, hide_input_panel closed it in {closed:.3}s with the field focused, show_input_panel opened it again in {reopened:.3}s"
+    );
+
+    // Mutter's text_input_set_available_actions: 'none' is invalid.
+    let mut actions = Client::connect();
+    let seat: WlSeat = actions.bind("wl_seat", 1);
+    let manager: ZwpTextInputManagerV3 = actions.bind("zwp_text_input_manager_v3", 2);
+    let bad: ZwpTextInputV3 = manager.get_text_input(&seat, &actions.qh(), ());
+    bad.set_available_actions(
+        u32::from(zwp_text_input_v3::Action::None)
+            .to_ne_bytes()
+            .to_vec(),
+    );
+    let _ = actions.queue.roundtrip(&mut actions.probe);
+    match actions.conn.protocol_error() {
+        Some(error)
+            if error.object_interface == "zwp_text_input_v3"
+                && error.code == u32::from(zwp_text_input_v3::Error::InvalidAction) =>
+        {
+            println!("ok set_available_actions([none]) raised zwp_text_input_v3.invalid_action");
+        }
+        raised => fail(format!(
+            "set_available_actions([none]) raised {raised:?}, not zwp_text_input_v3.invalid_action"
+        )),
+    }
+
+    text_input.destroy();
+    client.probe.windows[index].top.destroy();
+    client.roundtrip();
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let state = args
@@ -574,8 +782,9 @@ fn main() {
         Some("xdg-foreign-v1") => xdg_foreign_v1(&need_state()),
         Some("wl-fixes") => wl_fixes(),
         Some("background-blur") => background_blur(&need_state()),
+        Some("text-input-v2") => text_input_v2(&need_state()),
         other => fail(format!(
-            "unknown check {other:?}: xdg-wm-base-7, xdg-foreign-v1, wl-fixes, background-blur"
+            "unknown check {other:?}: xdg-wm-base-7, xdg-foreign-v1, wl-fixes, background-blur, text-input-v2"
         )),
     }
 }
@@ -773,3 +982,22 @@ wayland_client::delegate_noop!(Probe: ZxdgImporterV1);
 wayland_client::delegate_noop!(Probe: ZxdgExporterV2);
 wayland_client::delegate_noop!(Probe: ZxdgImporterV2);
 wayland_client::delegate_noop!(Probe: ignore ExtBackgroundEffectSurfaceV1);
+wayland_client::delegate_noop!(Probe: ignore WlSeat);
+wayland_client::delegate_noop!(Probe: ZwpTextInputManagerV3);
+
+impl Dispatch<ZwpTextInputV3, ()> for Probe {
+    fn event(
+        probe: &mut Self,
+        _: &ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_text_input_v3::Event::Enter { .. } => probe.text_input_entered = true,
+            zwp_text_input_v3::Event::Leave { .. } => probe.text_input_left = true,
+            _ => {}
+        }
+    }
+}

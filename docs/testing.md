@@ -235,6 +235,15 @@ neighbouring pixels below 16) while beside it they stay sharp (above 128),
 from `background-blur.png`. CI runs the slice in the `gtk-shell` job; its
 `protocols/assertions.txt` feeds the ledger.
 
+G-OSK-INPUT-PANEL, in the same slice: with `screen-keyboard-enabled` on, a
+`zwp_text_input_manager_v3` version 2 field (`protocol-probe text-input-v2`)
+enabled alone opens no keyboard; `show_input_panel` and commit open the
+shell's keyboard (its `tuna-osk` layer in the state file, slid in within
+2 s), `hide_input_panel` and commit close it while the field keeps keyboard
+and input-method focus, `show_input_panel` opens it again, and
+`set_available_actions` with `none` raises `invalid_action`, as Mutter 51's
+`text_input_commit_state` and GNOME's keyboard do.
+
 `scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts DIR` runs the same
 held-button hover and persisted reorder assertions as the full GTK proof,
 without the unrelated earlier gates. It adds no target motion or timing
