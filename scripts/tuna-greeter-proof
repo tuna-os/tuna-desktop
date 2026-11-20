@@ -3,7 +3,14 @@
 # nested session (#1164, docs/greeter.md, ledger P-LK-03).
 #
 # Usage:
-#   scripts/tuna-greeter-proof [--display :N] [--artifacts DIR]
+#   scripts/tuna-greeter-proof [--display :N] [--artifacts DIR] [--orca-only]
+#
+# The default run (gtk-shell CI job) proves every gate below except
+# G-GREETER-ORCA, which it skips and says so. --orca-only runs
+# G-GREETER-READY then G-GREETER-ORCA only: it needs Orca 50 or later
+# (orca-speech CI job, as tuna-orca-speech-proof), since the compositor
+# starts Orca without DISPLAY and Orca 46 dies there. Either mode fails
+# when one of its gates fails.
 #
 # Binaries: $TUNA_PROOF_BIN_DIR when set, else a cargo build of
 # tuna-compositor and tuna-greeter (${CARGO_TARGET_DIR:-target}/debug).
@@ -48,18 +55,51 @@
 #                        user list back); with the restart budget spent the
 #                        compositor exits non-zero
 #   G-GREETER-HYGIENE    no password in any artifact; no panic
-# Then a second login screen on the same GDM, with GDM 51.1.1's
-# org.gnome.login-screen schema (scripts/lib) on the keyfile backend and
-# TUNA_SESSION_KIND=hardware (the mock also serves logind's power calls):
+# The login screen's chrome (#1164). The mock also serves logind's power
+# calls, localed (us,de), UPower (a 57 % battery) and NetworkManager (wired);
+# GDM 51.1.1's org.gnome.login-screen schema (scripts/lib) is installed for
+# the greeter, which runs with TUNA_SESSION_KIND=hardware against that bus:
+#   G-GREETER-SERVICES   the compositor owns exactly the gdm mode's session-bus
+#                        names (DisplayConfig, IdleMonitor, a11y.Manager,
+#                        ServiceChannel, ColorManager, Introspect, Screenshot;
+#                        no ScreenCast, RemoteDesktop, InputCapture,
+#                        SettingsDaemon.Color, SessionManager, IBus bridge)
+#   G-GREETER-LOGO       banner text, banner file and logo follow
+#                        org.gnome.login-screen live (F-0-chrome.png)
+#   G-GREETER-INPUT-SOURCE localed's us,de make the compositor's keymap and
+#                        the "Keyboard" indicator; choosing German switches
+#                        the layout; the greeter user's own sources win
+#   G-GREETER-A11Y-MENU  "Accessibility" (bottom right) lists GNOME's ten
+#                        toggles in order; High Contrast restyles, Zoom
+#                        turns the compositor's magnifier on, Visual Alerts
+#                        and Sticky/Slow/Bounce/Mouse Keys reach the
+#                        compositor's bell and keyboard aids
+#   G-GREETER-LARGE-TEXT Large Text sets text-scaling-factor 1.25 and the
+#                        login screen's text grows
+#   G-GREETER-ORCA       (--orca-only) Screen Reader starts the
+#                        compositor's Orca, which speaks (speech-dispatcher
+#                        log), and stops it
+#   G-GREETER-OSK        Screen Keyboard opens the prompt's keyboard on the
+#                        password entry; its keys type the answer GDM gets
+#   G-GREETER-POWER      quick settings show the battery, the wired
+#                        connection and Suspend/Restart…/Power Off…;
+#                        Suspend and the end-session dialog's Power Off
+#                        reach logind, Cancel does not; disable-restart-
+#                        buttons hides all three live
+#   G-GREETER-I18N       a second login screen in de_DE.UTF-8 (localedef into
+#                        a private LOCPATH) shows gnome-shell's msgids in the
+#                        German of a fixture catalog that msgfmt compiled into
+#                        the greeter's data dir (G-1-i18n.png)
+# Then a second login screen on the same GDM, with org.gnome.login-screen
+# set before it starts:
 #   G-GREETER-POLICY     disable-user-list asks "Username" (no list, no Back);
 #                        the banner text and the logo show; allowed-failures
-#                        1 gives up after one wrong password; with
-#                        disable-user-list off a restarted greeter lists
+#                        1 gives up after one wrong password; a greeter
+#                        restarted with disable-user-list off lists, and one
+#                        started under disable-restart-buttons has no power
+#                        button
 #   G-GREETER-CAPS-LOCK  Caps Lock shows "Caps lock is on" under the
 #                        password entry only, and Caps Lock off hides it
-#   G-GREETER-POWER-MENU on hardware "Power Off / Log Out" offers Suspend,
-#                        Restart… and Power Off…; Suspend reaches logind;
-#                        disable-restart-buttons removes the menu
 #   G-GREETER-LIVE-USERS AccountsService's UserAdded adds a row and
 #                        UserDeleted removes it, on the list page
 #   G-GREETER-RECONNECT  GDM closing the greeter's channel: the greeter asks
@@ -67,9 +107,9 @@
 #                        result is denied and begins again on the new
 #                        channel, where the login completes
 # Screenshots (x11grab of the nested window) and AT-SPI dumps for each step;
-# A-1-user-list.png, C-1-prompt.png and P-1-policy.png are the review shots
-# against GNOME 51's login dialog. Writes assertions.txt and receipt.json;
-# exits non-zero naming the failed gate.
+# A-1-user-list.png, C-1-prompt.png, F-0-chrome.png and P-1-policy.png are
+# the review shots against GNOME 51's login dialog. Writes assertions.txt
+# and receipt.json; exits non-zero naming the failed gate.
 set -eu
 
 if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ]; then
@@ -81,11 +121,13 @@ DISPLAY_ARG=""
 ARTIFACTS="$ROOT/greeter-artifacts"
 WIDTH=1280
 HEIGHT=800
+ORCA_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
-        --help|-h) sed -n '2,72p' "$0"; exit 0 ;;
+        --orca-only) ORCA_ONLY=1; shift ;;
+        --help|-h) sed -n '2,112p' "$0"; exit 0 ;;
         *) echo "tuna-greeter-proof: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -126,14 +168,22 @@ GDM_SUPPORTED_SESSION_TYPES=wayland
 GSETTINGS_BACKEND=keyfile
 TUNA_COMPOSITOR_STATE="$CSTATE"
 TUNA_XWAYLAND=0
-export HOME XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME \
-    XDG_DATA_DIRS GDM_SUPPORTED_SESSION_TYPES GSETTINGS_BACKEND TUNA_COMPOSITOR_STATE TUNA_XWAYLAND
-# GDM's own org.gnome.login-screen (GDM 51.1.1, verbatim), compiled for
-# this run; keys are set with gsettings on the keyfile backend.
+# GDM 51.1.1's own org.gnome.login-screen schema, unmodified (scripts/lib),
+# next to the system's GNOME schemas; the keys are set with gsettings.
+mkdir -p "$FIXTURE/schemas"
+cp "$ROOT/scripts/lib/org.gnome.login-screen.gschema.xml" "$FIXTURE/schemas/"
+glib-compile-schemas "$FIXTURE/schemas" ||
+    { echo "tuna-greeter-proof: glib-compile-schemas failed" >&2; exit 1; }
 GSETTINGS_SCHEMA_DIR="$FIXTURE/schemas"
-export GSETTINGS_SCHEMA_DIR
+# The greeter's logind is the mock's (power actions are offered on
+# hardware only); UTF-8 for Orca's speech log and GNOME's ellipses.
+TUNA_SESSION_KIND=hardware
+LANG=C.UTF-8
+export HOME XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME \
+    XDG_DATA_DIRS GDM_SUPPORTED_SESSION_TYPES GSETTINGS_BACKEND TUNA_COMPOSITOR_STATE TUNA_XWAYLAND \
+    GSETTINGS_SCHEMA_DIR TUNA_SESSION_KIND LANG
 unset WAYLAND_DISPLAY WAYLAND_SOCKET DBUS_SYSTEM_BUS_ADDRESS AT_SPI_BUS_ADDRESS NOTIFY_SOCKET \
-    GDM_MESSAGE_TIME_MULTIPLIER TUNA_GREETER_BIN TUNA_SHELL_BIN TUNA_SESSION_KIND
+    GDM_MESSAGE_TIME_MULTIPLIER TUNA_GREETER_BIN TUNA_SHELL_BIN LC_ALL LC_MESSAGES LANGUAGE
 
 # Secrets of this run only: never written below $ARTIFACTS.
 secret() { echo "$1-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"; }
@@ -223,10 +273,11 @@ finish() {
         echo "CLEANUP fail $RUN_PRIV remains" >>"$ASSERTIONS"
         FAILED_GATE="${FAILED_GATE:-CLEANUP}"
     fi
-    "$PY" - "$ARTIFACTS" "$ROOT" "$BIN_DIR" "$FAILED_GATE" "$swept" "$COMPOSITOR_STATUS" <<'RECEIPT'
+    "$PY" - "$ARTIFACTS" "$ROOT" "$BIN_DIR" "$FAILED_GATE" "$swept" "$COMPOSITOR_STATUS" "$ORCA_ONLY" <<'RECEIPT'
 import hashlib, json, pathlib, subprocess, sys
 out, root, bins, failed, swept, status = (pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]),
                                           pathlib.Path(sys.argv[3]), sys.argv[4], sys.argv[5].split(), sys.argv[6])
+orca_only = sys.argv[7] == '1'
 def sha(path):
     try:
         return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
@@ -244,6 +295,8 @@ for line in (out / 'assertions.txt').read_text().splitlines():
 state = git('status', '--porcelain', '--untracked-files=no')
 receipt = {
     'proof': 'tuna-greeter-proof', 'issue': 1164, 'ledger': 'P-LK-03',
+    'mode': 'orca-only' if orca_only else 'default',
+    'skipped': [] if orca_only else ['G-GREETER-ORCA: needs Orca 50 or later, run with --orca-only'],
     'result': 'fail' if failed else 'pass', 'failed_gate': failed or None,
     'source': {'head': git('rev-parse', 'HEAD'), 'dirty': bool(state),
                'status_sha256': hashlib.sha256((state or '').encode()).hexdigest()},
@@ -253,8 +306,10 @@ receipt = {
         'scripts/lib/org.gnome.login-screen.gschema.xml')},
     'bin_dir': str(bins), 'gates': gates,
     'compositor_exit_status': int(status) if status.isdigit() else None,
-    'review_screenshots': ['A-1-user-list.png', 'C-1-prompt.png', 'C-2-wrong-password.png',
-                           'P-1-policy.png'],
+    'review_screenshots': [] if orca_only else [
+        'A-1-user-list.png', 'C-1-prompt.png', 'C-2-wrong-password.png', 'F-0-chrome.png',
+        'F-1-quick-settings.png', 'F-2-a11y-menu.png', 'F-3-end-session.png', 'F-4-osk.png',
+        'P-1-policy.png', 'G-1-i18n.png'],
     'cleanup': {'swept_pids': swept,
                 'leftover_pids': (out / 'leftover-pids.txt').read_text().split()},
     'scope': 'nested winit session on Xvfb; GDM 51 greeter API and AccountsService as a D-Bus '
@@ -421,7 +476,13 @@ type_password() {
 }
 
 # --- environment ------------------------------------------------------
-for tool in Xvfb xdotool ffmpeg jq gdbus dbus-daemon pgrep sha256sum gsettings glib-compile-schemas; do
+# Orca and speech-dispatcher for G-GREETER-ORCA only; x11grab for the rest.
+if [ "$ORCA_ONLY" = 1 ]; then
+    tools="orca speech-dispatcher"
+else
+    tools="ffmpeg msgfmt localedef"
+fi
+for tool in Xvfb xdotool jq gdbus dbus-daemon pgrep sha256sum gsettings glib-compile-schemas $tools; do
     command -v "$tool" >/dev/null 2>&1 || fail SETUP "$tool is required"
 done
 
@@ -465,6 +526,12 @@ else
 fi
 for _ in $(seq 1 30); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 0.5; done
 xdotool getdisplaygeometry >/dev/null 2>&1 || fail SETUP "no X display at $DISPLAY"
+if [ "$ORCA_ONLY" = 1 ]; then
+    # As tuna-orca-speech-proof: Orca initialises its AT-SPI device even
+    # for --version and segfaults without a display, so ask once one exists.
+    orca --version >"$ARTIFACTS/orca-version.txt" 2>&1 || true
+    speech-dispatcher --version >"$ARTIFACTS/speechd-version.txt" 2>&1 || true
+fi
 
 if [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
     RUSTUP_HOME="${RUSTUP_HOME:-$ORIG_HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$ORIG_HOME/.cargo}" \
@@ -500,19 +567,47 @@ USERS
 printf 'ada:%s\ngrace:%s\nkatherine:%s\n' "$ADA_PASSWORD" "$GRACE_PASSWORD" "$KATHERINE_PASSWORD" \
     >"$RUN_PRIV/secrets"
 chmod 600 "$RUN_PRIV/secrets"
-mkdir -p "$GSETTINGS_SCHEMA_DIR"
-cp "$ROOT/scripts/lib/org.gnome.login-screen.gschema.xml" "$GSETTINGS_SCHEMA_DIR/"
-glib-compile-schemas "$GSETTINGS_SCHEMA_DIR" || fail SETUP "glib-compile-schemas failed"
 gsettings get org.gnome.login-screen enable-password-authentication >/dev/null ||
     fail SETUP "org.gnome.login-screen is not readable"
-# ada's avatar (solid yellow) and the logo (solid magenta): colours the
-# screenshots find.
-"$PY" - "$FIXTURE" <<'IMAGES' || fail SETUP "the avatar and logo fixtures could not be drawn"
+# ada's avatar (solid yellow): a colour the screenshots find.
+"$PY" - "$FIXTURE" <<'IMAGES' || fail SETUP "the avatar fixture could not be drawn"
 import sys
 from PIL import Image
 Image.new('RGB', (96, 96), (255, 255, 0)).save(f'{sys.argv[1]}/ada.png')
-Image.new('RGB', (96, 96), (255, 0, 255)).save(f'{sys.argv[1]}/logo.png')
 IMAGES
+
+# speech-dispatcher, autospawned by the compositor's Orca with this
+# configuration (as tuna-orca-speech-proof): one generic module whose
+# "synthesis" appends each utterance, UTF-8, to spoken.log.
+SPOKEN="$ARTIFACTS/spoken.log"
+: >"$SPOKEN"
+mkdir -p "$XDG_CONFIG_HOME/speech-dispatcher/modules" "$ARTIFACTS/speechd"
+cat >"$XDG_CONFIG_HOME/speech-dispatcher/speechd.conf" <<CONF
+LogLevel 3
+LogDir "$ARTIFACTS/speechd"
+AudioOutputMethod "alsa"
+AddModule "tunalog" "sd_generic" "tunalog.conf"
+DefaultModule tunalog
+DefaultLanguage "en"
+CONF
+cat >"$XDG_CONFIG_HOME/speech-dispatcher/modules/tunalog.conf" <<CONF
+GenericExecuteSynth "printf '%s\\\\n' \\'\$DATA\\' >> $SPOKEN"
+GenericLanguage "en" "en" "UTF-8"
+GenericDefaultCharset "UTF-8"
+AddVoice "en" "MALE1" "tuna"
+DefaultVoice "tuna"
+CONF
+printf 'pcm.!default { type null }\nctl.!default { type null }\n' >"$HOME/.asoundrc"
+if [ "$ORCA_ONLY" = 0 ]; then
+    # The logo (a 120×60 magenta block, easy to find on the screenshot) and
+    # the banner file the login-screen keys point at.
+    "$PY" - "$FIXTURE/logo.png" <<'LOGO' || fail SETUP "the logo fixture could not be drawn"
+import sys
+from PIL import Image
+Image.new('RGB', (120, 60), (255, 0, 255)).save(sys.argv[1])
+LOGO
+    printf 'Banner from a file.' >"$FIXTURE/banner.txt"
+fi
 
 # The private "system" bus: GDM's and AccountsService's only home here.
 cat >"$RUN_PRIV/system-bus.conf" <<BUSCONF
@@ -546,7 +641,7 @@ case "$SYS_ADDR" in unix:path=*) ;; *) fail SETUP "the private system bus did no
 mkdir -m 711 "$RUN_PRIV/gdm-dbus"
 "$PY" "$ROOT/scripts/lib/tuna-gdm-mock.py" --address "$SYS_ADDR" --server-dir "$RUN_PRIV/gdm-dbus" \
     --log "$GDM_LOG" --users "$FIXTURE/users.json" --secrets "$RUN_PRIV/secrets" \
-    --sessions tuna,gnome --fallback-session tuna \
+    --sessions tuna,gnome --fallback-session tuna --localed-layout us,de --localed-variant , \
     >"$ARTIFACTS/gdm-mock.out" 2>"$ARTIFACTS/gdm-mock.err" &
 MOCK_PID=$!
 for _ in $(seq 1 50); do grep -q '^tuna-gdm-mock: ready ' "$ARTIFACTS/gdm-mock.out" && break; sleep 0.1; done
@@ -572,18 +667,72 @@ for _ in $(seq 1 50); do [ -S "$RUN_PRIV/notify" ] && break; sleep 0.1; done
     sha256sum "$BIN_DIR/tuna-compositor" "$BIN_DIR/tuna-greeter"
 } >"$ARTIFACTS/manifest.txt"
 
-env DBUS_SYSTEM_BUS_ADDRESS="$SYS_ADDR" NOTIFY_SOCKET="$RUN_PRIV/notify" \
-    TUNA_GREETER_BIN="$BIN_DIR/tuna-greeter" TUNA_GREETER_TRACE=1 RUST_BACKTRACE=1 \
-    "$BIN_DIR/tuna-compositor" --backend winit --socket "tuna-greeter-$$" --greeter >>"$LOG" 2>&1 &
-COMPOSITOR_PID=$!
-for _ in $(seq 1 90); do
-    alive || fail SETUP "the compositor exited during startup"
-    WID="$(xdotool search --name Smithay 2>/dev/null | head -1 || true)"
-    [ -n "$WID" ] && break
-    sleep 1
-done
-[ -n "$WID" ] || fail SETUP "no nested window"
-xdotool windowfocus --sync "$WID"
+# The nested login screen: `start_login_screen SOCKET [VAR=VALUE...]`, the
+# extra environment for the compositor and so the greeter it supervises.
+start_login_screen() {
+    socket="$1"
+    shift
+    env DBUS_SYSTEM_BUS_ADDRESS="$SYS_ADDR" TUNA_GREETER_BIN="$BIN_DIR/tuna-greeter" \
+        TUNA_GREETER_TRACE=1 RUST_BACKTRACE=1 "$@" \
+        "$BIN_DIR/tuna-compositor" --backend winit --socket "$socket" --greeter --screen-reader \
+        >>"$LOG" 2>&1 &
+    COMPOSITOR_PID=$!
+    WID=""
+    for _ in $(seq 1 90); do
+        alive || fail "$CURRENT_GATE" "the compositor exited during startup"
+        WID="$(xdotool search --name Smithay 2>/dev/null | head -1 || true)"
+        [ -n "$WID" ] && break
+        sleep 1
+    done
+    [ -n "$WID" ] || fail "$CURRENT_GATE" "no nested window"
+    xdotool windowfocus --sync "$WID"
+}
+start_login_screen "tuna-greeter-$$" NOTIFY_SOCKET="$RUN_PRIV/notify"
+
+# --- helpers of the chrome gates (F) and G-GREETER-ORCA -------------------
+gs() { gsettings "$@" 2>>"$ARTIFACTS/gsettings.err"; }
+# The first showing node named $2 in dump $1: its window-relative bounds.
+bounds() {
+    jq -r --arg n "$2" --arg r "${3:-}" \
+        'first(.[] | select(.name == $n and .showing and ($r == "" or .role == $r)) | .bounds | @tsv)' \
+        "$ARTIFACTS/a11y-$1.json"
+}
+# Pixels that differ between two screenshots inside X Y W H.
+pixels_differ() {
+    "$PY" - "$ARTIFACTS/$1.png" "$ARTIFACTS/$2.png" "$3" "$4" "$5" "$6" <<'DIFF'
+import sys
+from PIL import Image, ImageChops
+a, b = (Image.open(p).convert('RGB') for p in sys.argv[1:3])
+x, y, w, h = (int(v) for v in sys.argv[3:7])
+box = (x, y, x + w, y + h)
+diff = ImageChops.difference(a.crop(box), b.crop(box)).convert('L')
+print(sum(1 for v in diff.getdata() if v > 24))
+DIFF
+}
+# Magenta (the logo fixture's) pixels in the bottom band of a screenshot.
+magenta() {
+    "$PY" - "$ARTIFACTS/$1.png" <<'MAGENTA'
+import sys
+from PIL import Image
+img = Image.open(sys.argv[1]).convert('RGB')
+w, h = img.size
+band = img.crop((0, h - 240, w, h))
+print(sum(1 for r, g, b in band.getdata() if r > 230 and g < 30 and b > 230))
+MAGENTA
+}
+# Orca's speech log: `smark`, then wait for a line after it.
+smark() { wc -l <"$SPOKEN" | tr -d ' '; }
+swait() {
+    end=$(($(date +%s) + ${3:-30}))
+    while :; do
+        tail -n "+$(($1 + 1))" "$SPOKEN" | grep -qE -- "$2" && return 0
+        [ "$(date +%s)" -ge "$end" ] && return 1
+        sleep 0.3
+    done
+}
+# Open the accessibility menu (or close it) and press one of its toggles.
+a11y_menu() { dump "$1" --press "Accessibility"; sleep 0.8; }
+a11y_toggle() { dump "$1" --press "$2"; sleep 0.8; }
 
 # --- A: the login screen comes up ---------------------------------------
 CURRENT_GATE=G-GREETER-READY
@@ -598,6 +747,35 @@ gwait 0 '.kind == "connect"' 20 || fail G-GREETER-READY "the greeter never conne
 gwait 0 "$(call RegisterSession)" 20 || fail G-GREETER-READY "the greeter did not register its session with GDM"
 gwait 0 "$(call RegisterDisplay)" 20 || fail G-GREETER-READY "the greeter did not register its display with GDM"
 pass G-GREETER-READY "the tuna-greeter layer mapped and READY=1 reached NOTIFY_SOCKET; OpenSession, the peer channel and RegisterSession/RegisterDisplay reached GDM"
+
+# --orca-only: G-GREETER-ORCA on the login screen just brought up.
+if [ "$ORCA_ONLY" = 1 ]; then
+    CURRENT_GATE=G-GREETER-ORCA
+    cstate '.screen_reader_state == "disabled"' 5 || fail G-GREETER-ORCA "a screen reader ran before it was asked for"
+    twait 0 "greeter users names=ada,grace,katherine" 20 >/dev/null ||
+        fail G-GREETER-ORCA "the greeter did not list its users"
+    a11y_menu F-orca-0
+    s="$(smark)"
+    a11y_toggle F-orca-1 "Screen Reader"
+    cstate '.screen_reader_state == "active" and .screen_reader_pid != null' 90 ||
+        fail G-GREETER-ORCA "Screen Reader did not start the compositor's Orca"
+    READER_PID="$(jq -r .screen_reader_pid "$CSTATE")"
+    swait "$s" '^Screen reader on\.$' 60 || fail G-GREETER-ORCA "Orca did not say 'Screen reader on.'"
+    sleep 2
+    s="$(smark)"
+    a11y_menu F-orca-2
+    swait "$s" 'Accessibility|Ada Lovelace|Grace Hopper|Katherine Johnson|Not listed' 30 ||
+        fail G-GREETER-ORCA "Orca did not read the login screen's focus"
+    said="$(tail -n "+$((s + 1))" "$SPOKEN" | grep -E 'Accessibility|Ada Lovelace|Grace Hopper|Katherine Johnson|Not listed' | head -1)"
+    a11y_menu F-orca-3
+    a11y_toggle F-orca-4 "Screen Reader"
+    cstate '.screen_reader_state == "disabled" and .screen_reader_pid == null' 30 ||
+        fail G-GREETER-ORCA "Screen Reader off did not stop Orca"
+    for _ in $(seq 1 50); do kill -0 "$READER_PID" 2>/dev/null || break; sleep 0.1; done
+    kill -0 "$READER_PID" 2>/dev/null && fail G-GREETER-ORCA "Orca (pid $READER_PID) outlived Screen Reader off"
+    pass G-GREETER-ORCA "Screen Reader started the compositor's Orca (pid $READER_PID, $(head -1 "$ARTIFACTS/orca-version.txt")): 'Screen reader on.', then '$said' for the login screen; off stopped it"
+    exit 0
+fi
 
 CURRENT_GATE=G-GREETER-USER-LIST
 m="$(mark)"
@@ -637,6 +815,287 @@ sleep 1.5
 jq -e '.overview_open == false and .locked == false and ([.layers[].namespace] | unique) == ["tuna-greeter"]' "$CSTATE" >/dev/null ||
     fail G-GREETER-NO-SHELL "Super, the hot corner or Super+L changed the login screen: $(jq -c '{overview_open, locked, layers: [.layers[].namespace]}' "$CSTATE")"
 pass G-GREETER-NO-SHELL "layers $namespaces only; compositor children: $children; Super, the hot corner and Super+L left overview_open=false and locked=false"
+
+# --- F: the login screen's chrome ----------------------------------------
+CURRENT_GATE=G-GREETER-SERVICES
+gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.ListNames >"$ARTIFACTS/session-bus-names.txt" ||
+    fail G-GREETER-SERVICES "the session bus did not list its names"
+# login_services.rs's gdm-mode table: what runs is owned and never
+# reported refused; the rest is neither owned nor running, each refusal said.
+for name in org.gnome.Mutter.DisplayConfig org.gnome.Mutter.IdleMonitor org.freedesktop.a11y.Manager \
+    org.gnome.Mutter.ServiceChannel org.gnome.Mutter.ColorManager org.gnome.Shell.Introspect \
+    org.gnome.Shell.Screenshot; do
+    grep -qF "'$name'" "$ARTIFACTS/session-bus-names.txt" ||
+        fail G-GREETER-SERVICES "$name is not served at the login screen"
+    ! grep -qF "tuna-compositor: greeter: not serving $name (" "$LOG" ||
+        fail G-GREETER-SERVICES "the compositor says it refuses $name, which the gdm mode runs"
+done
+for name in org.gnome.Mutter.ScreenCast org.gnome.Mutter.RemoteDesktop org.gnome.Mutter.InputCapture \
+    org.gnome.SettingsDaemon.Color org.gnome.SessionManager; do
+    ! grep -qF "'$name'" "$ARTIFACTS/session-bus-names.txt" ||
+        fail G-GREETER-SERVICES "$name is served at the login screen"
+    grep -qF "tuna-compositor: greeter: not serving $name (" "$LOG" ||
+        fail G-GREETER-SERVICES "the compositor did not say it refuses $name"
+done
+pgrep -P "$COMPOSITOR_PID" -f tuna-ibus-bridge >/dev/null &&
+    fail G-GREETER-SERVICES "tuna-ibus-bridge runs at the login screen"
+grep -qF "tuna-compositor: greeter: not serving tuna-ibus-bridge (" "$LOG" ||
+    fail G-GREETER-SERVICES "the compositor did not say it starts no IBus bridge"
+pass G-GREETER-SERVICES "DisplayConfig, IdleMonitor, a11y.Manager, ServiceChannel, ColorManager, Introspect and Screenshot are owned; ScreenCast, RemoteDesktop, InputCapture, SettingsDaemon.Color and SessionManager are not, each refusal logged; no tuna-ibus-bridge"
+
+CURRENT_GATE=G-GREETER-LOGO
+twait 0 "greeter logo path=" 5 >/dev/null || fail G-GREETER-LOGO "the greeter did not read the logo key"
+shot F-pre-logo
+[ "$(magenta F-pre-logo)" = 0 ] || fail G-GREETER-LOGO "magenta at the bottom before a logo was set"
+m="$(mark)"
+gs set org.gnome.login-screen logo "$FIXTURE/logo.png"
+twait "$m" "greeter logo path=$FIXTURE/logo.png" 10 >/dev/null || fail G-GREETER-LOGO "the logo key change was not followed"
+sleep 1
+shot F-logo
+logo_px="$(magenta F-logo)"
+[ "$logo_px" -ge 6000 ] || fail G-GREETER-LOGO "the 120×60 logo is not drawn at the bottom ($logo_px magenta pixels)"
+m="$(mark)"
+gs set org.gnome.login-screen banner-message-text "Authorized use only."
+gs set org.gnome.login-screen banner-message-enable true
+twait "$m" "greeter banner shown=true" 10 >/dev/null || fail G-GREETER-LOGO "banner-message-enable was not followed"
+sleep 0.5
+dump F-banner-text
+showing F-banner-text "Authorized use only." || fail G-GREETER-LOGO "the banner text is not showing"
+gs set org.gnome.login-screen banner-message-path "$FIXTURE/banner.txt"
+gs set org.gnome.login-screen banner-message-source file
+sleep 1
+dump F-banner-file
+showing F-banner-file "Banner from a file." || fail G-GREETER-LOGO "the banner file is not showing"
+hidden F-banner-file "Authorized use only." || fail G-GREETER-LOGO "the banner still shows the text key with source=file"
+printf 'The banner file changed.' >"$FIXTURE/banner.txt"
+sleep 2
+dump F-banner-changed
+showing F-banner-changed "The banner file changed." || fail G-GREETER-LOGO "the banner did not follow its file"
+sleep 0.5
+shot F-0-chrome
+pass G-GREETER-LOGO "logo set live ($logo_px logo pixels); banner text, banner file and an edit of that file shown live (F-0-chrome.png)"
+
+CURRENT_GATE=G-GREETER-INPUT-SOURCE
+twait 0 "greeter input-sources from=localed ids=us,de" 20 >/dev/null ||
+    fail G-GREETER-INPUT-SOURCE "localed's us,de did not become the sources"
+cstate '.keyboard.layouts == ["English (US)", "German"]' 10 ||
+    fail G-GREETER-INPUT-SOURCE "the compositor's keymap is not localed's: $(jq -c .keyboard.layouts "$CSTATE")"
+dump F-input-0
+showing F-input-0 "Keyboard" || fail G-GREETER-INPUT-SOURCE "the Keyboard indicator does not show with two sources"
+showing F-input-0 "en" || fail G-GREETER-INPUT-SOURCE "the indicator does not say en"
+dump F-input-1 --press "Keyboard"
+sleep 0.8
+dump F-input-1
+for source in "English (US)" German; do
+    showing F-input-1 "$source" ||
+        fail G-GREETER-INPUT-SOURCE "the indicator's menu does not list English (US) and German"
+done
+checked F-input-1 "English (US)" || fail G-GREETER-INPUT-SOURCE "English (US) is not the current source"
+# The menu is a radio group (as Login Options): the focus starts on a
+# source and moving it selects.
+focused F-input-1 "English (US)" || fail G-GREETER-INPUT-SOURCE "the menu's focus is not on English (US)"
+m="$(mark)"
+xdotool key Down
+twait "$m" "greeter input-source current=1 id=de" 10 >/dev/null || fail G-GREETER-INPUT-SOURCE "choosing German did not switch"
+cstate '.keyboard.layout == "German"' 10 || fail G-GREETER-INPUT-SOURCE "the compositor's layout is $(jq -c .keyboard.layout "$CSTATE"), not German"
+sleep 0.5
+dump F-input-3
+showing F-input-3 "de" || fail G-GREETER-INPUT-SOURCE "the indicator does not say de"
+dump F-input-4 --press "Keyboard"
+sleep 0.8
+dump F-input-5
+if focused F-input-5 "German"; then xdotool key Up; else xdotool key space; fi
+cstate '.keyboard.layout == "English (US)"' 10 || fail G-GREETER-INPUT-SOURCE "switching back to English (US) failed"
+m="$(mark)"
+gs set org.gnome.desktop.input-sources sources "[('xkb', 'fr')]"
+twait "$m" "greeter input-sources from=user ids=fr" 10 >/dev/null ||
+    fail G-GREETER-INPUT-SOURCE "the greeter user's sources did not win over localed's"
+cstate '.keyboard.layouts == ["French"]' 10 || fail G-GREETER-INPUT-SOURCE "the keymap is not the greeter user's fr"
+sleep 0.5
+dump F-input-5
+hidden F-input-5 "Keyboard" || fail G-GREETER-INPUT-SOURCE "the indicator shows with one source"
+m="$(mark)"
+gs reset org.gnome.desktop.input-sources sources
+twait "$m" "greeter input-sources from=localed ids=us,de" 10 >/dev/null ||
+    fail G-GREETER-INPUT-SOURCE "resetting the user's sources did not return to localed's"
+cstate '.keyboard.layouts == ["English (US)", "German"] and .keyboard.layout == "English (US)"' 10 ||
+    fail G-GREETER-INPUT-SOURCE "the keymap did not return to localed's"
+pass G-GREETER-INPUT-SOURCE "localed's us,de became the keymap and the Keyboard indicator (en); German switched the compositor's layout (de) and back; the greeter user's [('xkb','fr')] won (indicator hidden) and its reset returned to localed's"
+
+CURRENT_GATE=G-GREETER-A11Y-MENU
+a11y_menu F-a11y-0
+dump F-a11y-1
+shot F-2-a11y-menu
+# The menu's toggles in tree order (the menu buttons' own toggles carry
+# their buttons' names).
+order="$(jq -c '[.[] | select(.showing and .role == "toggle button" and (.name | IN("High Contrast", "Zoom", "Large Text", "Screen Reader", "Screen Keyboard", "Visual Alerts", "Sticky Keys", "Slow Keys", "Bounce Keys", "Mouse Keys"))) | .name]' "$ARTIFACTS/a11y-F-a11y-1.json")"
+[ "$order" = '["High Contrast","Zoom","Large Text","Screen Reader","Screen Keyboard","Visual Alerts","Sticky Keys","Slow Keys","Bounce Keys","Mouse Keys"]' ] ||
+    fail G-GREETER-A11Y-MENU "the menu's toggles are $order"
+read -r ax ay aw ah <<EOF
+$(bounds F-a11y-1 Accessibility)
+EOF
+[ -n "$ah" ] || fail G-GREETER-A11Y-MENU "no bounds for the Accessibility button"
+if [ "$ax" -le $((WIDTH / 2)) ] || [ "$ay" -le $((HEIGHT / 2)) ]; then
+    fail G-GREETER-A11Y-MENU "the Accessibility button is not at the bottom right ($ax,$ay)"
+fi
+m="$(mark)"
+a11y_toggle F-a11y-hc "High Contrast"
+twait "$m" "greeter a11y high-contrast=true" 10 >/dev/null || fail G-GREETER-A11Y-MENU "High Contrast did not set high-contrast"
+[ "$(gs get org.gnome.desktop.a11y.interface high-contrast)" = true ] || fail G-GREETER-A11Y-MENU "high-contrast is not true"
+sleep 0.5
+shot F-a11y-hc
+hc_px="$(pixels_differ F-2-a11y-menu F-a11y-hc "$ax" "$ay" "$aw" "$ah")"
+[ "$hc_px" -ge 20 ] || fail G-GREETER-A11Y-MENU "High Contrast did not restyle the Accessibility button ($hc_px pixels changed)"
+a11y_toggle F-a11y-hc-off "High Contrast"
+[ "$(gs get org.gnome.desktop.a11y.interface high-contrast)" = false ] || fail G-GREETER-A11Y-MENU "High Contrast did not turn off"
+a11y_toggle F-a11y-zoom "Zoom"
+cstate '.magnifier.active == true' 10 || fail G-GREETER-A11Y-MENU "Zoom did not turn the compositor's magnifier on"
+a11y_toggle F-a11y-zoom-off "Zoom"
+cstate '.magnifier.active == false' 10 || fail G-GREETER-A11Y-MENU "Zoom did not turn the magnifier off"
+a11y_toggle F-a11y-bell "Visual Alerts"
+cstate '.bell.visual == true' 10 || fail G-GREETER-A11Y-MENU "Visual Alerts did not reach the compositor's bell"
+a11y_toggle F-a11y-bell-off "Visual Alerts"
+cstate '.bell.visual == false' 10 || fail G-GREETER-A11Y-MENU "Visual Alerts did not turn off"
+for aid in "Sticky Keys:sticky" "Slow Keys:slow" "Bounce Keys:bounce" "Mouse Keys:mouse"; do
+    a11y_toggle "F-a11y-${aid#*:}" "${aid%%:*}"
+    cstate ".input_aids.${aid#*:} == true" 10 || fail G-GREETER-A11Y-MENU "${aid%%:*} did not reach the compositor"
+    a11y_toggle "F-a11y-${aid#*:}-off" "${aid%%:*}"
+    cstate ".input_aids.${aid#*:} == false" 10 || fail G-GREETER-A11Y-MENU "${aid%%:*} did not turn off"
+done
+pass G-GREETER-A11Y-MENU "Accessibility (bottom right) lists $order; High Contrast restyled the login screen ($hc_px pixels of the button), Zoom drove the compositor's magnifier, Visual Alerts its bell, Sticky/Slow/Bounce/Mouse Keys its keyboard aids, each on and off (F-2-a11y-menu.png)"
+
+CURRENT_GATE=G-GREETER-LARGE-TEXT
+dump F-text-0
+# The name's width follows its font (its height is the row's avatar).
+before="$(bounds F-text-0 "Ada Lovelace" label | cut -f3)"
+m="$(mark)"
+a11y_toggle F-text-1 "Large Text"
+twait "$m" "greeter a11y text-scaling-factor=1.25 dpi=122880" 10 >/dev/null ||
+    fail G-GREETER-LARGE-TEXT "Large Text did not set the 1.25 text scaling"
+[ "$(gs get org.gnome.desktop.interface text-scaling-factor)" = 1.25 ] || fail G-GREETER-LARGE-TEXT "text-scaling-factor is not 1.25"
+sleep 1
+dump F-text-2
+after="$(bounds F-text-2 "Ada Lovelace" label | cut -f3)"
+if [ -z "$before" ] || [ -z "$after" ] || [ $((after * 100)) -lt $((before * 115)) ]; then
+    fail G-GREETER-LARGE-TEXT "the text did not grow ($before → $after px)"
+fi
+a11y_toggle F-text-3 "Large Text"
+[ "$(gs get org.gnome.desktop.interface text-scaling-factor)" = 1.0 ] || fail G-GREETER-LARGE-TEXT "Large Text did not reset the scaling"
+pass G-GREETER-LARGE-TEXT "Large Text set text-scaling-factor 1.25 (gtk-xft-dpi 122880): the 'Ada Lovelace' label grew from $before to $after px wide; off reset it"
+
+# G-GREETER-ORCA needs Orca 50 or later: --orca-only (orca-speech CI job).
+echo "tuna-greeter-proof: G-GREETER-ORCA skipped here: it needs Orca 50 or later and runs with --orca-only"
+
+CURRENT_GATE=G-GREETER-OSK
+m="$(mark)"
+a11y_toggle F-osk-0 "Screen Keyboard"
+twait "$m" "greeter a11y screen-keyboard=true" 10 >/dev/null || fail G-GREETER-OSK "Screen Keyboard did not reach the greeter"
+a11y_menu F-osk-1
+m="$(mark)"; g="$(gmark)"
+dump F-osk-2 --press "Not listed?"
+twait "$m" "greeter page username" 10 >/dev/null || fail G-GREETER-OSK "Not listed? did not ask for a username"
+sleep 1.5
+dump F-osk-3
+showing F-osk-3 "Username" || fail G-GREETER-OSK "no Username entry"
+for key in d a v e; do
+    showing F-osk-3 "$key" || fail G-GREETER-OSK "the screen keyboard's '$key' is not showing over the prompt"
+done
+shot F-4-osk
+for key in d a v e Enter; do dump "F-osk-key-$key" --press "$key"; sleep 0.3; done
+gwait "$g" "$(call BeginVerificationForUser '.args == ["gdm-password", "dave"]')" 10 ||
+    fail G-GREETER-OSK "the username typed on the screen keyboard did not begin gdm-password for dave"
+await_password_prompt "$g" F-osk-4
+sleep 1
+dump F-osk-5
+showing F-osk-5 "o" || fail G-GREETER-OSK "the screen keyboard is not over the password prompt"
+gq="$(gmark)"
+for key in o s k Enter; do dump "F-osk-pw-$key" --press "$key"; sleep 0.3; done
+gwait "$gq" "$(call AnswerQuery ".detail.user == \"dave\" and .detail.answer_sha256 == \"$(sha osk)\"")" 10 ||
+    fail G-GREETER-OSK "the password tapped on the screen keyboard did not reach AnswerQuery"
+m="$(mark)"
+xdotool key Escape
+twait "$m" "greeter page users" 15 >/dev/null || fail G-GREETER-OSK "Back did not return to the user list"
+sleep 0.5
+m="$(mark)"
+a11y_menu F-osk-6
+a11y_toggle F-osk-7 "Screen Keyboard"
+twait "$m" "greeter a11y screen-keyboard=false" 10 >/dev/null || fail G-GREETER-OSK "Screen Keyboard did not turn off"
+a11y_menu F-osk-8
+pass G-GREETER-OSK "Screen Keyboard opened the prompt's keyboard (F-4-osk.png): 'dave' tapped on it began gdm-password for dave and 'osk' + Enter reached AnswerQuery (SHA-256 matches)"
+
+CURRENT_GATE=G-GREETER-POWER
+dump F-power-0 --press "System"
+sleep 1
+dump F-power-1
+showing F-power-1 "57%" || fail G-GREETER-POWER "the battery's 57% is not showing"
+showing F-power-1 "Wired connection 1" || fail G-GREETER-POWER "the wired connection is not showing"
+showing F-power-1 "Power Off Menu" || fail G-GREETER-POWER "the power button is not showing"
+dump F-power-2 --press "Power Off Menu"
+sleep 0.8
+dump F-power-3
+shot F-1-quick-settings
+for item in "Suspend" "Restart…" "Power Off…"; do
+    showing F-power-3 "$item" || fail G-GREETER-POWER "'$item' is not in the power menu"
+done
+g="$(gmark)"
+dump F-power-4 --press "Suspend"
+gwait "$g" "$(call Suspend '.args == [true]')" 10 || fail G-GREETER-POWER "Suspend did not reach logind"
+[ "$(gcount "$g" "$(call Reboot) or $(call PowerOff)")" = 0 ] || fail G-GREETER-POWER "Suspend also rebooted or powered off"
+sleep 0.5
+dump F-power-5 --press "System"
+sleep 0.8
+dump F-power-6 --press "Power Off Menu"
+sleep 0.8
+m="$(mark)"; g="$(gmark)"
+dump F-power-7 --press "Restart…"
+twait "$m" "greeter end-session open=restart" 10 >/dev/null || fail G-GREETER-POWER "Restart… did not open the end-session dialog"
+sleep 0.8
+dump F-power-8
+shot F-3-end-session
+showing F-power-8 "The system will restart automatically in 60 seconds" ||
+    fail G-GREETER-POWER "the dialog does not count down from 60 seconds"
+showing F-power-8 "Cancel" || fail G-GREETER-POWER "the dialog has no Cancel"
+dump F-power-9 --press "Cancel"
+twait "$m" "greeter end-session cancel=restart" 10 >/dev/null || fail G-GREETER-POWER "Cancel did not close the dialog"
+[ "$(gcount "$g" "$(call Reboot)")" = 0 ] || fail G-GREETER-POWER "Cancel still rebooted"
+dump F-power-10 --press "System"
+sleep 0.8
+dump F-power-11 --press "Power Off Menu"
+sleep 0.8
+m="$(mark)"
+dump F-power-12 --press "Power Off…"
+twait "$m" "greeter end-session open=power-off" 10 >/dev/null || fail G-GREETER-POWER "Power Off… did not open the dialog"
+sleep 0.8
+dump F-power-13
+showing F-power-13 "The system will power off automatically in 60 seconds" ||
+    fail G-GREETER-POWER "the power-off dialog does not count down from 60 seconds"
+dump F-power-14 --press "Power Off"
+gwait "$g" "$(call PowerOff '.args == [true]')" 10 || fail G-GREETER-POWER "Power Off did not reach logind"
+twait "$m" "greeter end-session confirm=power-off" 10 >/dev/null || fail G-GREETER-POWER "the dialog did not close on Power Off"
+m="$(mark)"
+gs set org.gnome.login-screen disable-restart-buttons true
+for action in suspend restart power-off; do
+    twait "$m" "greeter power $action available=false" 10 >/dev/null ||
+        fail G-GREETER-POWER "disable-restart-buttons did not hide $action"
+done
+dump F-power-15 --press "System"
+sleep 0.8
+dump F-power-16
+hidden F-power-16 "Power Off Menu" || fail G-GREETER-POWER "the power button shows under disable-restart-buttons"
+dump F-power-17 --press "System"
+m="$(mark)"
+gs reset org.gnome.login-screen disable-restart-buttons
+twait "$m" "greeter power power-off available=true" 10 >/dev/null || fail G-GREETER-POWER "resetting disable-restart-buttons did not bring the actions back"
+pass G-GREETER-POWER "quick settings: 57%, Wired connection 1, Suspend/Restart…/Power Off… (F-1-quick-settings.png); Suspend → logind Suspend(true); Restart… opened the 60-second dialog (F-3-end-session.png) and Cancel rebooted nothing; Power Off → logind PowerOff(true); disable-restart-buttons hid all three live and its reset restored them"
+
+# The rest of the proof runs without banner and logo.
+gs reset org.gnome.login-screen banner-message-enable
+gs reset org.gnome.login-screen banner-message-source
+gs reset org.gnome.login-screen banner-message-text
+gs reset org.gnome.login-screen banner-message-path
+gs reset org.gnome.login-screen logo
+sleep 1
 
 # --- B: Not listed? -----------------------------------------------------
 CURRENT_GATE=G-GREETER-NOT-LISTED
@@ -837,10 +1296,10 @@ grep -qF "tuna-compositor: greeter restart budget exhausted; ending the login sc
     fail G-GREETER-SUPERVISION "the compositor did not say the greeter's budget ran out"
 pass G-GREETER-SUPERVISION "a killed greeter came back as pid $restarted (was $first) with a new GDM channel and the user list; after $kills kills the budget ran out and the compositor exited $COMPOSITOR_STATUS"
 
-# --- P: login-screen policy, the power menu, live users, GDM restarts ----
-# A second login screen on the same GDM and AccountsService: the
-# compositor runs as on hardware (TUNA_SESSION_KIND=hardware, the power
-# menu's logind is the mock's) and org.gnome.login-screen is set first.
+# --- P: login-screen policy, live users, GDM restarts --------------------
+# A second login screen on the same GDM and AccountsService (still as on
+# hardware, TUNA_SESSION_KIND=hardware) with org.gnome.login-screen set
+# before it starts.
 CURRENT_GATE=G-GREETER-POLICY
 login_key() {
     gsettings set org.gnome.login-screen "$@" 2>>"$ARTIFACTS/gsettings.err" ||
@@ -853,19 +1312,7 @@ login_key banner-message-text "'Authorized use only.'"
 login_key logo "'$FIXTURE/logo.png'"
 [ -s "$CSTATE" ] && mv "$CSTATE" "$ARTIFACTS/first-state.json"
 m="$(mark)"; g="$(gmark)"
-env DBUS_SYSTEM_BUS_ADDRESS="$SYS_ADDR" TUNA_SESSION_KIND=hardware \
-    TUNA_GREETER_BIN="$BIN_DIR/tuna-greeter" TUNA_GREETER_TRACE=1 RUST_BACKTRACE=1 \
-    "$BIN_DIR/tuna-compositor" --backend winit --socket "tuna-greeter-p-$$" --greeter >>"$LOG" 2>&1 &
-COMPOSITOR_PID=$!
-WID=""
-for _ in $(seq 1 90); do
-    alive || fail G-GREETER-POLICY "the second compositor exited during startup"
-    WID="$(xdotool search --name Smithay 2>/dev/null | head -1 || true)"
-    [ -n "$WID" ] && break
-    sleep 1
-done
-[ -n "$WID" ] || fail G-GREETER-POLICY "no nested window for the second login screen"
-xdotool windowfocus --sync "$WID"
+start_login_screen "tuna-greeter-p-$$"
 cstate '.layers | any(.namespace == "tuna-greeter")' 120 || fail G-GREETER-POLICY "the greeter's layer never mapped"
 await_greeter "" 10 || fail G-GREETER-POLICY "no tuna-greeter child of the second compositor"
 twait "$m" "greeter users names=ada,grace,katherine" 30 >/dev/null || fail G-GREETER-POLICY "the greeter did not load its users"
@@ -918,29 +1365,14 @@ twait "$m" "greeter page username" 20 >/dev/null || fail G-GREETER-POLICY "givin
 begins="$(gcount "$g" "$(call BeginVerificationForUser '.args == ["gdm-password", "katherine"]')")"
 [ "$begins" = 1 ] || fail G-GREETER-POLICY "$begins begins for katherine instead of 1"
 
-CURRENT_GATE=G-GREETER-POWER-MENU
-sleep 1
-dump P-6-panel
-showing P-6-panel "Power Off / Log Out" || fail G-GREETER-POWER-MENU "the hardware login screen has no power menu"
-dump P-7-power --press "Power Off / Log Out"
-sleep 0.8
-dump P-8-menu
-shot P-8-menu
-for item in "Suspend" "Restart…" "Power Off…"; do
-    showing P-8-menu "$item" || fail G-GREETER-POWER-MENU "'$item' is not in the power menu"
-done
-g="$(gmark)"
-dump P-9-suspend --press "Suspend"
-gwait "$g" "$(call Suspend '.args == [true]')" 10 || fail G-GREETER-POWER-MENU "Suspend did not reach logind"
-[ "$(gcount "$g" "$(call Reboot) or $(call PowerOff)")" = 0 ] || fail G-GREETER-POWER-MENU "Suspend also rebooted or powered off"
-
-# GDM restarts a greeter that read other keys: the list and no power menu.
+# GDM restarts a greeter that read other keys: the list, and no power
+# button once it has asked logind (G-GREETER-POWER hides it live).
 CURRENT_GATE=G-GREETER-POLICY
 login_key disable-user-list false
 login_key disable-restart-buttons true
 gsettings reset org.gnome.login-screen allowed-failures
 first="$GREETER_PID"
-m="$(mark)"
+m="$(mark)"; g="$(gmark)"
 kill -KILL "$first"
 await_greeter "$first" 30 || fail G-GREETER-POLICY "the compositor did not restart the greeter"
 twait "$m" "greeter page users" 30 >/dev/null || fail G-GREETER-POLICY "with disable-user-list off the greeter did not list its users"
@@ -949,10 +1381,15 @@ dump P-10-list
 for name in "Ada Lovelace" "Grace Hopper" "Katherine Johnson" "Not listed?"; do
     showing P-10-list "$name" || fail G-GREETER-POLICY "'$name' is not showing with disable-user-list off"
 done
-pass G-GREETER-POLICY "disable-user-list asked 'Username' with no list, Not listed? or Back; banner 'Authorized use only.' and the logo ($logo_px px) showed (P-1-policy.png); allowed-failures 1 gave up after one wrong password; a greeter started with disable-user-list off listed the users"
-CURRENT_GATE=G-GREETER-POWER-MENU
-hidden P-10-list "Power Off / Log Out" || fail G-GREETER-POWER-MENU "disable-restart-buttons did not remove the power menu"
-pass G-GREETER-POWER-MENU "on hardware 'Power Off / Log Out' offered Suspend, Restart… and Power Off… (P-8-menu.png); Suspend reached logind Suspend(true); under disable-restart-buttons the menu is gone"
+gwait "$g" "$(call CanPowerOff)" 10 || fail G-GREETER-POLICY "the restarted greeter did not ask logind for its power actions"
+sleep 0.5
+dump P-10-system --press "System"
+sleep 0.8
+dump P-10-quick
+showing P-10-quick "57%" || fail G-GREETER-POLICY "the quick settings did not open"
+hidden P-10-quick "Power Off Menu" || fail G-GREETER-POLICY "a greeter started under disable-restart-buttons offers power actions"
+dump P-10-closed --press "System"
+pass G-GREETER-POLICY "disable-user-list asked 'Username' with no list, Not listed? or Back; banner 'Authorized use only.' and the logo ($logo_px px) showed (P-1-policy.png); allowed-failures 1 gave up after one wrong password; a greeter started with disable-user-list off listed the users, and under disable-restart-buttons it offered no power button though logind could"
 
 CURRENT_GATE=G-GREETER-LIVE-USERS
 m="$(mark)"; g="$(gmark)"
@@ -1011,6 +1448,57 @@ pass G-GREETER-RECONNECT "GDM closed the channel: the greeter asked for a new on
 stop_pid "$COMPOSITOR_PID"
 COMPOSITOR_PID=""
 gsettings reset-recursively org.gnome.login-screen
+
+# --- G: the login screen in the system's language -----------------------
+CURRENT_GATE=G-GREETER-I18N
+# GDM starts the greeter in the system's locale (LANG); its words are
+# gnome-shell's msgids from the gnome-shell catalog of the first data dir
+# that has one (i18n.rs), here the greeter's own fixture dir as GDM's
+# /usr/share/gdm/greeter. The runners generate C.UTF-8 only, which ignores
+# catalogs, so de_DE.UTF-8 is built into a private LOCPATH.
+mkdir -p "$FIXTURE/share/locale/de/LC_MESSAGES" "$FIXTURE/locales"
+cat >"$FIXTURE/gnome-shell-de.po" <<'PO'
+msgid ""
+msgstr ""
+"Language: de\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Not listed?"
+msgstr "Nicht aufgeführt?"
+
+msgid "Accessibility"
+msgstr "Barrierefreiheit"
+PO
+msgfmt --check -o "$FIXTURE/share/locale/de/LC_MESSAGES/gnome-shell.mo" "$FIXTURE/gnome-shell-de.po" ||
+    fail G-GREETER-I18N "msgfmt did not compile the fixture catalog"
+localedef -i de_DE -f UTF-8 "$FIXTURE/locales/de_DE.UTF-8" >"$ARTIFACTS/localedef.log" 2>&1 ||
+    [ -s "$FIXTURE/locales/de_DE.UTF-8/LC_MESSAGES/SYS_LC_MESSAGES" ] ||
+    fail G-GREETER-I18N "localedef could not build de_DE.UTF-8"
+rm -f "$CSTATE"
+m="$(mark)"; g="$(gmark)"
+start_login_screen "tuna-greeter-i18n-$$" LOCPATH="$FIXTURE/locales" LANG=de_DE.UTF-8
+cstate '.layers | any(.namespace == "tuna-greeter")' 120 || fail G-GREETER-I18N "the German login screen's layer never mapped"
+await_greeter "" 20 || fail G-GREETER-I18N "no tuna-greeter child of the German login screen's compositor"
+gwait "$g" "$(call RegisterDisplay)" 20 || fail G-GREETER-I18N "the German greeter did not register with GDM"
+twait "$m" "greeter users names=ada,grace,katherine" 20 >/dev/null ||
+    fail G-GREETER-I18N "the German greeter did not list its users"
+tr '\0' '\n' <"/proc/$GREETER_PID/environ" | grep -qx 'LANG=de_DE.UTF-8' ||
+    fail G-GREETER-I18N "the greeter does not run in de_DE.UTF-8"
+sleep 1.5
+dump G-1-i18n
+shot G-1-i18n
+for name in "Nicht aufgeführt?" "Barrierefreiheit" "Ada Lovelace"; do
+    showing G-1-i18n "$name" || fail G-GREETER-I18N "'$name' is not showing"
+done
+for name in "Not listed?" "Accessibility"; do
+    hidden G-1-i18n "$name" || fail G-GREETER-I18N "the English '$name' still shows"
+done
+stop_pid "$COMPOSITOR_PID"
+COMPOSITOR_PID=""
+pass G-GREETER-I18N "in de_DE.UTF-8 the greeter showed 'Nicht aufgeführt?' and 'Barrierefreiheit' from the msgfmt-compiled fixture gnome-shell catalog instead of 'Not listed?' and 'Accessibility' (G-1-i18n.png)"
 
 # --- Z: hygiene ---------------------------------------------------------
 CURRENT_GATE=G-GREETER-HYGIENE

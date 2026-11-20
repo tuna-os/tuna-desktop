@@ -117,6 +117,7 @@ pub mod layer;
 pub mod lock;
 pub mod lockdown;
 pub(crate) mod lockdown_settings;
+pub mod login_services;
 mod logind_session;
 pub mod magnifier;
 pub mod malloc;

@@ -65,6 +65,11 @@ impl Bell {
         })
     }
 
+    /// The live policy (GNOME's `visual-bell`, `audible-bell`, …).
+    pub fn policy(&self) -> &BellPolicy {
+        &self.policy
+    }
+
     pub fn set_policy(&mut self, policy: BellPolicy) {
         if !policy.visual {
             self.visual = None;

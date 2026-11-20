@@ -1109,6 +1109,7 @@ impl PopupSubmenu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tuna_shell_control::gsettings::derive_motion;
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
@@ -1225,7 +1226,7 @@ mod tests {
     fn the_motion_policy_gates_fades_and_motion() {
         // What Player and MotionBin::animate read from the policy.
         let at = |enable, reduced| {
-            let policy = crate::motion::derive(Some(enable), Some(reduced), None);
+            let policy = derive_motion(Some(enable), Some(reduced), None);
             let t = progress(50.0, policy.adjust_ms(BANNER_MS), policy.allows_fades());
             (t, banner_enter(t, 80.0).gated(policy.allows_motion()))
         };
@@ -1239,7 +1240,7 @@ mod tests {
         let (t, off) = at(false, "no-preference");
         assert_eq!((t, off), (1.0, Frame::REST));
         // The slow-down factor stretches durations.
-        let slow = crate::motion::derive(Some(true), None, Some("2"));
+        let slow = derive_motion(Some(true), None, Some("2"));
         assert_eq!(progress(100.0, slow.adjust_ms(MODAL_MS), true), 0.5);
     }
 
@@ -1271,10 +1272,10 @@ mod tests {
         assert_eq!(faded.opacity, mid.opacity);
         assert_eq!((faded.dy, faded.scale), (0.0, 1.0));
         // Animations off and the slow-down factor, as Player reads them.
-        let policy = crate::motion::derive(Some(false), None, None);
+        let policy = derive_motion(Some(false), None, None);
         let t = progress(0.0, policy.adjust_ms(MENU_MS), policy.allows_fades());
         assert_eq!(menu_open(t), Frame::REST);
-        let slow = crate::motion::derive(Some(true), None, Some("2"));
+        let slow = derive_motion(Some(true), None, Some("2"));
         assert_eq!(progress(150.0, slow.adjust_ms(MENU_MS), true), 0.5);
     }
 
@@ -1361,7 +1362,7 @@ mod tests {
         // GNOME never reads reducedMotion here: only animations off (a
         // zero duration in adjustAnimationTime) lands the submenu at once.
         let at = |enable, reduced, slowdown| {
-            let policy = crate::motion::derive(Some(enable), Some(reduced), slowdown);
+            let policy = derive_motion(Some(enable), Some(reduced), slowdown);
             progress(
                 125.0,
                 policy.adjust_ms(POPUP_SUBMENU_MS),

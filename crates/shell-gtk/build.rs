@@ -37,35 +37,6 @@ fn main() {
         manifest.to_str().expect("utf-8"),
         "icons.gresource",
     );
-    compile_osk_layouts(&out);
-}
-
-/// Bundle GNOME Shell's on-screen keyboard layouts and emoji list
-/// (osk-layouts/README.md) as GNOME's gnome-shell-osk-layouts.gresource does.
-fn compile_osk_layouts(out: &str) {
-    let root = Path::new("osk-layouts");
-    println!("cargo:rerun-if-changed={}", root.display());
-    let mut names: Vec<_> = std::fs::read_dir(root)
-        .expect("osk-layouts dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".json"))
-        .collect();
-    names.sort();
-    let mut xml = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<gresources>\n  <gresource prefix=\"/org/tuna/Shell/osk-layouts\">\n",
-    );
-    for name in &names {
-        let _ = writeln!(xml, "    <file>{name}</file>");
-    }
-    xml.push_str("  </gresource>\n</gresources>\n");
-    let manifest = Path::new(out).join("osk-layouts.gresource.xml");
-    write_if_changed(&manifest, &xml);
-    glib_build_tools::compile_resources(
-        &[root],
-        manifest.to_str().expect("utf-8"),
-        "osk-layouts.gresource",
-    );
 }
 
 /// Cargo reruns this script and rebuilds the crate when a file it compiles

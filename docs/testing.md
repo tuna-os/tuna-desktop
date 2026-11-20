@@ -82,6 +82,10 @@ The existing `orca-speech` artifact retains `native-orca-factory.log` and
 version and application-script package ownership). This is nested speech-proof
 evidence, not package or image qualification.
 
+The same job runs `scripts/tuna-greeter-proof --orca-only` (G-GREETER-ORCA,
+[greeter.md](greeter.md)) on that Orca with the same speech-dispatcher capture,
+into `orca-speech-artifacts/greeter`; the gtk-shell job's Orca 46 cannot run it.
+
 This factory revision includes the executable-mode fix from
 [`tunaos-packages#960`](https://github.com/tuna-os/tunaos-packages/pull/960).
 The workflow executes the runner directly through `env`; the factory tracks

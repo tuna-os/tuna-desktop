@@ -477,31 +477,21 @@ pub fn parse_emoji_sections(json: &str) -> Result<Vec<EmojiSection>, Error> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::sync::Once;
-
-    /// Register the bundled layouts once for tests that load them.
+    /// Register the bundled layouts for tests that load them.
     pub(crate) fn register() {
-        static ONCE: Once = Once::new();
-        ONCE.call_once(|| {
-            crate::register_resource(bundled_resource!("osk-layouts.gresource"))
-                .expect("register osk-layouts.gresource");
-        });
+        crate::register_layouts();
     }
 
     #[test]
     fn the_bundled_resources_are_aligned_so_gresource_does_not_copy_them() {
         // g_resource_new_from_data copies a bundle that is not
         // pointer-aligned onto the heap, for the life of the process.
-        for bundle in [
-            bundled_resource!("osk-layouts.gresource"),
-            bundled_resource!("icons.gresource"),
-        ] {
-            assert!(!bundle.is_empty());
-            assert_eq!(
-                bundle.as_ptr() as usize % std::mem::align_of::<*const u8>(),
-                0
-            );
-        }
+        let bundle = crate::bundled_resource!("osk-layouts.gresource");
+        assert!(!bundle.is_empty());
+        assert_eq!(
+            bundle.as_ptr() as usize % std::mem::align_of::<*const u8>(),
+            0
+        );
     }
 
     #[test]

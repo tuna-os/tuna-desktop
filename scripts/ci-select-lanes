@@ -23,6 +23,9 @@ commit, or --changed) can affect:
   package consumer; so does a scripts/tests/ file that the lane's job runs
   (OWNED below; WorkflowSync.test_lane_run_tests_select_their_lane keeps it
   complete). Tests only the check job runs add no lane;
+- code whose proof is a rotated lane's (the login screen's crate and the
+  compositor's login-screen services: orca-speech's G-GREETER-ORCA, OWNED)
+  runs CORE plus that lane, without the rotation;
 - anything else (crates, share/, other scripts) runs gtk-shell plus a
   round-robin slice of ROTATION: K lanes starting at
   (run_number * K) mod len(ROTATION), K from --size, $CI_ROUND_ROBIN_SIZE
@@ -93,10 +96,21 @@ OWNED = [
     ("scripts/tuna-session-restore-proof", ["gtk-shell"]),
     # The login screen (#1164): tuna-compositor --greeter and tuna-greeter
     # against a GDM 51 and AccountsService mock, with GDM's own
-    # org.gnome.login-screen schema.
-    ("scripts/tuna-greeter-proof", ["gtk-shell"]),
-    ("scripts/lib/tuna-gdm-mock.py", ["gtk-shell"]),
-    ("scripts/lib/org.gnome.login-screen.gschema.xml", ["gtk-shell"]),
+    # org.gnome.login-screen schema; orca-speech runs its G-GREETER-ORCA
+    # (--orca-only) on Orca 50.
+    ("scripts/tuna-greeter-proof", ["gtk-shell", "orca-speech"]),
+    ("scripts/lib/tuna-gdm-mock.py", ["gtk-shell", "orca-speech"]),
+    ("scripts/lib/org.gnome.login-screen.gschema.xml", ["gtk-shell", "orca-speech"]),
+    # The greeter's Screen Reader toggle (a11y.rs, control.rs) and the
+    # compositor's gdm-mode services (the a11y Manager Orca listens on)
+    # reach Orca only in orca-speech's G-GREETER-ORCA. An OWNED match
+    # replaces the code rule, so code keeps CORE.
+    ("crates/greeter/*", [*CORE, "orca-speech"]),
+    ("crates/compositor/src/login_services.rs", [*CORE, "orca-speech"]),
+    # Every AT-SPI proof's tree dump: the gtk-shell proofs (journey runs
+    # tuna-gtk-shell-proof installed), the grid-cancel proof's tests and
+    # G-GREETER-ORCA.
+    ("scripts/lib/tuna-a11y-dump.py", [*CORE, "journey", "orca-speech"]),
     ("scripts/tuna-walkthrough", ["gtk-shell"]),
     # scripts/tests/* run by a lane job (#1108): a test edit must run the lane
     # that executes it, or it first runs after merge.

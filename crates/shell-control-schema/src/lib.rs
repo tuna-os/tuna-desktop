@@ -16,6 +16,8 @@
 
 pub mod background;
 pub mod gl;
+#[cfg(feature = "gio")]
+pub mod gsettings;
 pub mod introspect;
 pub mod motion;
 pub use motion::{MotionLevel, MotionPolicy};

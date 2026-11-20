@@ -1,0 +1,18 @@
+[package]
+name = "tuna-osk"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "GNOME 51's on-screen keyboard drawn with GTK, shared by the Tuna shell and the Tuna login screen"
+
+[dependencies]
+gtk4 = { workspace = true, features = ["v4_14"] }
+glib.workspace = true
+gio.workspace = true
+# xkeyboard-config's layout names (xkb.rs).
+roxmltree = "0.21"
+serde_json.workspace = true
+
+[build-dependencies]
+# GNOME Shell's keyboard layouts, compiled in as a GResource (build.rs).
+glib-build-tools = "0.22"

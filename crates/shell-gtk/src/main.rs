@@ -143,8 +143,6 @@ mod notify;
 mod orca;
 mod osd;
 mod osk;
-mod osk_layout;
-mod osk_model;
 mod overview;
 mod pad_osd;
 mod pad_osd_dbus;
@@ -2045,7 +2043,10 @@ fn build(app: &adw::Application) {
                 gtk::pango::Stretch::UltraExpanded => "ultra-expanded",
                 _ => "normal",
             };
-            let css = include_str!("style.css")
+            // The shell's style and the on-screen keyboard's, in the
+            // user's interface font.
+            let css = [include_str!("style.css"), tuna_osk::STYLE]
+                .concat()
                 .replace(
                     "font-family: \"Adwaita Sans\", \"Cantarell\", sans-serif;",
                     &format!(
@@ -2080,7 +2081,7 @@ fn build(app: &adw::Application) {
         gtk::IconTheme::for_display(&display).add_resource_path("/org/tuna/Shell/icons");
     }
     // GNOME Shell's on-screen keyboard layouts and emoji list.
-    register_resource(bundled_resource!("osk-layouts.gresource")).ok();
+    tuna_osk::register_layouts();
     // GNOME's icon theme key, applied the way gnome-settings-daemon's
     // xsettings plugin applies it to GTK.
     if let (Some(gtk_settings), Some(iface)) =
@@ -3645,185 +3646,16 @@ fn build(app: &adw::Application) {
     // GNOME's input settings (#60): keymap, repeat, touchpad, mouse and
     // hot corner, sent now and on every change.
     {
-        let schemas = [
-            "org.gnome.desktop.input-sources",
-            "org.gnome.desktop.peripherals.keyboard",
-            "org.gnome.desktop.peripherals.touchpad",
-            "org.gnome.desktop.peripherals.mouse",
-            INTERFACE_SCHEMA,
-            A11Y_INTERFACE_SCHEMA,
-            "org.gnome.desktop.wm.preferences",
-            "org.gnome.desktop.sound",
-            "org.gnome.mutter",
-            kbd_a11y::SCHEMA,
-            pointer_a11y::SCHEMA,
-            "org.gnome.desktop.peripherals.trackball",
-            "org.gnome.desktop.peripherals.pointingstick",
-        ];
-        let all: Rc<Vec<Option<gio::Settings>>> =
-            Rc::new(schemas.iter().map(|s| settings(s)).collect());
+        let all = Rc::new(tuna_shell_control::gsettings::input_schemas());
         let send: Rc<dyn Fn()> = {
             let (shell, all) = (shell.clone(), all.clone());
             let input_sources = input_sources.clone();
             Rc::new(move || {
-                let mut out = tuna_shell_control::InputSettings::default();
-                if let Some(sources) = all[0].as_ref() {
-                    let list: Vec<(String, String)> =
-                        sources.value("sources").get().unwrap_or_default();
-                    let (layout, variant) = logic::xkb_from_sources(&list);
-                    out.xkb_layout = layout;
-                    out.xkb_variant = variant;
-                    out.xkb_options = sources
-                        .strv("xkb-options")
-                        .iter()
-                        .map(|o| o.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                }
-                if let Some(kbd) = all[1].as_ref() {
-                    out.repeat = kbd.boolean("repeat");
-                    out.repeat_delay_ms = kbd.uint("delay");
-                    out.repeat_interval_ms = kbd.uint("repeat-interval");
-                }
-                if let Some(pad) = all[2].as_ref() {
-                    out.tap_to_click = pad.boolean("tap-to-click");
-                    out.touchpad_natural_scroll = pad.boolean("natural-scroll");
-                    out.touchpad_speed_milli = (pad.double("speed") * 1000.0).round() as i32;
-                    out.disable_while_typing = pad.boolean("disable-while-typing");
-                    out.touchpad = tuna_shell_control::TouchpadSettings {
-                        send_events: tuna_shell_control::SendEvents::from_gsettings(
-                            &pad.string("send-events"),
-                        ),
-                        click_method: tuna_shell_control::TouchpadClickMethod::from_gsettings(
-                            &pad.string("click-method"),
-                        ),
-                        edge_scrolling: pad.boolean("edge-scrolling-enabled"),
-                        two_finger_scrolling: pad.boolean("two-finger-scrolling-enabled"),
-                        tap_and_drag: pad.boolean("tap-and-drag"),
-                        tap_and_drag_lock: pad.boolean("tap-and-drag-lock"),
-                        tap_button_map: tuna_shell_control::TapButtonMap::from_gsettings(
-                            &pad.string("tap-button-map"),
-                        ),
-                        middle_click_emulation: pad.boolean("middle-click-emulation"),
-                        accel_profile: tuna_shell_control::PointerAccelProfile::from_gsettings(
-                            &pad.string("accel-profile"),
-                        ),
-                    };
-                }
-                // GNOME's 0..24 `scroll-wheel-emulation-button` and its lock;
-                // the mouse schema gained them in gsettings-desktop-schemas 51.
-                let wheel_emulation = |s: &gio::Settings| {
-                    let has = |key| {
-                        s.settings_schema()
-                            .is_some_and(|schema| schema.has_key(key))
-                    };
-                    tuna_shell_control::ScrollWheelEmulation {
-                        button: if has("scroll-wheel-emulation-button") {
-                            u32::try_from(s.int("scroll-wheel-emulation-button")).unwrap_or(0)
-                        } else {
-                            0
-                        },
-                        lock: has("scroll-wheel-emulation-button-lock")
-                            && s.boolean("scroll-wheel-emulation-button-lock"),
-                    }
-                };
-                if let Some(mouse) = all[3].as_ref() {
-                    out.mouse_natural_scroll = mouse.boolean("natural-scroll");
-                    out.mouse_speed_milli = (mouse.double("speed") * 1000.0).round() as i32;
-                    out.mouse_left_handed = mouse.boolean("left-handed");
-                    out.mouse_accel_profile =
-                        tuna_shell_control::PointerAccelProfile::from_gsettings(
-                            &mouse.string("accel-profile"),
-                        );
-                    out.mouse = tuna_shell_control::MouseSettings {
-                        middle_click_emulation: mouse.boolean("middle-click-emulation"),
-                        scroll_wheel_emulation: wheel_emulation(mouse),
-                    };
-                }
-                if let Some(trackball) = all[11].as_ref() {
-                    out.trackball = tuna_shell_control::TrackballSettings {
-                        accel_profile: tuna_shell_control::PointerAccelProfile::from_gsettings(
-                            &trackball.string("accel-profile"),
-                        ),
-                        middle_click_emulation: trackball.boolean("middle-click-emulation"),
-                        scroll_wheel_emulation: wheel_emulation(trackball),
-                    };
-                }
-                if let Some(stick) = all[12].as_ref() {
-                    out.pointing_stick = tuna_shell_control::PointingStickSettings {
-                        speed_milli: (stick.double("speed") * 1000.0).round() as i32,
-                        accel_profile: tuna_shell_control::PointerAccelProfile::from_gsettings(
-                            &stick.string("accel-profile"),
-                        ),
-                        scroll_method:
-                            tuna_shell_control::PointingStickScrollMethod::from_gsettings(
-                                &stick.string("scroll-method"),
-                            ),
-                    };
-                }
-                out.touchpad_left_handed = logic::touchpad_left_handed(
-                    all[2]
-                        .as_ref()
-                        .map(|pad| pad.string("left-handed"))
-                        .as_deref()
-                        .unwrap_or("mouse"),
-                    out.mouse_left_handed,
+                let out = tuna_shell_control::gsettings::input_settings(
+                    &all,
+                    gtk::Widget::default_direction() == gtk::TextDirection::Rtl,
                 );
-                if let Some(iface) = all[4].as_ref() {
-                    out.hot_corners = iface.boolean("enable-hot-corners");
-                    // GNOME's cursor and locate-pointer keys (#342): the
-                    // compositor draws its own cursors from them.
-                    out.cursor_theme = iface.string("cursor-theme").to_string();
-                    out.cursor_size = u32::try_from(iface.int("cursor-size")).unwrap_or(0);
-                    out.locate_pointer = iface.boolean("locate-pointer");
-                }
-                out.right_to_left = gtk::Widget::default_direction() == gtk::TextDirection::Rtl;
-                out.motion = motion::from_settings(all[4].as_ref(), all[5].as_ref());
-                if let Some(mutter) = all[8].as_ref() {
-                    if mutter
-                        .settings_schema()
-                        .is_some_and(|schema| schema.has_key("attach-modal-dialogs"))
-                    {
-                        out.attach_modal_dialogs = mutter.boolean("attach-modal-dialogs");
-                    }
-                    if mutter
-                        .settings_schema()
-                        .is_some_and(|schema| schema.has_key("center-new-windows"))
-                    {
-                        out.center_new_windows = mutter.boolean("center-new-windows");
-                    }
-                }
-                if let Some(mutter) = all[8].as_ref() {
-                    if let Some(schema) = mutter.settings_schema() {
-                        if schema.has_key("locate-pointer-key") {
-                            out.locate_pointer_key =
-                                mutter.string("locate-pointer-key").to_string();
-                        }
-                        if schema.has_key("dynamic-workspaces") {
-                            out.workspace_policy.dynamic = mutter.boolean("dynamic-workspaces");
-                        }
-                        if schema.has_key("workspaces-only-on-primary") {
-                            out.workspace_policy.only_on_primary =
-                                mutter.boolean("workspaces-only-on-primary");
-                        }
-                        if schema.has_key("edge-tiling") {
-                            out.workspace_policy.edge_tiling = mutter.boolean("edge-tiling");
-                        }
-                    }
-                }
                 motion::set(out.motion);
-                if let Some(wm) = all[6].as_ref() {
-                    out.workspace_policy.fixed_count = wm.int("num-workspaces").clamp(1, 36) as u32;
-                    out.bell.audible = wm.boolean("audible-bell");
-                    out.bell.visual = wm.boolean("visual-bell");
-                    out.bell.frame_flash = wm.string("visual-bell-type") == "frame-flash";
-                }
-                if let Some(sound) = all[7].as_ref() {
-                    out.bell.event_sounds = sound.boolean("event-sounds");
-                    out.bell.theme = sound.string("theme-name").to_string();
-                }
-                out.keyboard_aids = kbd_a11y::read(all[9].as_ref());
-                out.pointer_aids = pointer_a11y::read(all[10].as_ref());
                 let keymap = (
                     out.xkb_layout.clone(),
                     out.xkb_variant.clone(),
@@ -3871,9 +3703,10 @@ fn build(app: &adw::Application) {
                     .unwrap_or((true, 0));
                 // GNOME's idle shield is a fade: reduced motion keeps it,
                 // and the slow-down factor stretches it (screenShield.js).
-                let fade_ms = motion::from_settings(interface.as_ref(), a11y.as_ref())
-                    .adjust_ms(logic::IDLE_FADE_MS as f64)
-                    .round() as u64;
+                let fade_ms =
+                    tuna_shell_control::gsettings::motion_policy(interface.as_ref(), a11y.as_ref())
+                        .adjust_ms(logic::IDLE_FADE_MS as f64)
+                        .round() as u64;
                 let ms = logic::idle_lock_ms(idle, enabled, delay, fade_ms);
                 // Administrative lockdown (#357): a disabled lock screen
                 // never locks on idle (the compositor backstops this

@@ -103,7 +103,7 @@ struct Screen {
     caps: gtk::Label,
     message: gtk::Label,
     /// GNOME's on-screen keyboard for this prompt (#349), when enabled.
-    _keyboard: Option<Rc<crate::osk::LockKeyboard>>,
+    _keyboard: Option<Rc<tuna_osk::prompt::PromptKeyboard>>,
     message_wiggle: Wiggle,
     /// The clock's hint; the [`lock_curtain::HintWatch`] holds it weakly.
     _hint: Rc<lock_curtain::Hint>,
