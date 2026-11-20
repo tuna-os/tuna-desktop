@@ -120,7 +120,7 @@ relative to the repository root.
   `crates/compositor/tests/peer_auth.rs` (`the_shell_gate_requires_a_pin`,
   `a_recycled_shell_pid_is_refused` and the earlier gate tests).
 - **Session bus.** The shell is the set of unique bus names it declared
-  over its pinned control session (`DeclareBusName`, control protocol 0.51;
+  over its pinned control session (`DeclareBusName`, control protocol 0.52;
   `crates/shell-control-schema`). Only a session bound to the current
   shell child's auth owner may declare, the name must be a unique name, and
   a declaration counts only while that session and its pinned peer are live
@@ -396,7 +396,7 @@ progress" means a fix is still being built.
 | F2 | — | No indicator or Stop for active ScreenCast, RemoteDesktop or InputCapture | ADR 0011 L13 | In progress |
 | F3 | — | Foreign lock requests leave a locked session with no prompt | R5 | Fixed in #1171 |
 | F4 | G1, G2 | Session-lock and D-Bus shell identity are unpinned PIDs | R2 | Fixed in #1171 |
-| F5 | — | Fingerprint unlock bypasses PAM | ADR 0011 lock lifecycle, L14 | In progress: fingerprint will run through PAM |
+| F5 | — | Fingerprint unlock bypasses PAM | ADR 0011 lock lifecycle, L14 | Fixed in #1173 |
 | F6 | G3 | No logind sleep delay inhibitor | ADR 0011 L2 | Fixed in #1170 |
 | F7 | — | A drag icon is drawn above the lock surface | ADR 0011 L11 | Fixed in #1170 |
 | F8 | — | An unmapped idle inhibitor stops the idle lock | ADR 0011 L12 | Fixed in #1170 |

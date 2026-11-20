@@ -6,7 +6,11 @@
 //! launches `tuna-compositor` with itself as the supervised shell and is
 //! an ordinary (foreign) Wayland client; as the shell (`lock` role) it
 //! is the ext-session-lock client. They coordinate through files in a
-//! private directory. Needs an X display (CI: `xvfb-run`) and `xdotool`;
+//! private directory. The shell's authority comes from the runtime's real
+//! Wayland accept path (the `SO_PEERPIDFD`-pinned shell flag): only the
+//! shell is offered layer-shell, and an ordinary client spamming lock
+//! requests while the shell locks neither cancels nor takes its lock.
+//! Needs an X display (CI: `xvfb-run`) and `xdotool`;
 //! `TUNA_REQUIRE_SESSION_LOCK_RUNTIME=1` makes a missing one a failure.
 
 use std::os::fd::AsFd;
@@ -69,6 +73,9 @@ struct Client {
     xdg_serial: Option<u32>,
     lock_fate: Option<LockFate>,
     lock_configure: Option<(u32, u32, u32)>,
+    /// The registry offered `zwlr_layer_shell_v1` (the supervised shell's
+    /// alone).
+    layer_shell: bool,
 }
 
 impl Dispatch<WlRegistry, ()> for Client {
@@ -101,6 +108,7 @@ impl Dispatch<WlRegistry, ()> for Client {
             "ext_session_lock_manager_v1" => {
                 state.lock_manager = Some(registry.bind(name, 1, qh, ()))
             }
+            "zwlr_layer_shell_v1" => state.layer_shell = true,
             _ => {}
         }
     }
@@ -350,7 +358,13 @@ fn lock_client() {
     let runtime = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR");
     let stream = UnixStream::connect(Path::new(&runtime).join(display)).unwrap();
     let mut peer = Peer::new(Connection::from_socket(stream).unwrap());
-    publish(&root.join("shell-ready"), "");
+    // What the runtime's accept path made of this connection.
+    let flag = if peer.client.layer_shell {
+        "layer-shell"
+    } else {
+        "ordinary"
+    };
+    publish(&root.join("shell-ready"), flag);
 
     wait_file(&root.join("go-lock"));
     let qh = peer.queue.handle();
@@ -555,6 +569,11 @@ fn actual_runtime_grants_only_the_shell_lock_and_input_reaches_only_its_curtain(
         std::thread::sleep(Duration::from_millis(20));
     }
     wait_locked(&root, false, "the initial unlocked state");
+    assert_eq!(
+        std::fs::read_to_string(root.join("shell-ready")).unwrap(),
+        "layer-shell",
+        "the accept path flags the supervised shell's pinned connection"
+    );
     let window = host_window();
 
     // An ordinary application: a mapped, focused window.
@@ -587,6 +606,10 @@ fn actual_runtime_grants_only_the_shell_lock_and_input_reaches_only_its_curtain(
     surface.damage_buffer(0, 0, w, h);
     surface.commit();
     app.until("keyboard focus on the new window", |c| c.keyboard_focus);
+    assert!(
+        !app.client.layer_shell,
+        "an ordinary connection is offered no layer-shell"
+    );
 
     // Positive control: unlocked, host input reaches the application.
     inject(&window);
@@ -613,14 +636,33 @@ fn actual_runtime_grants_only_the_shell_lock_and_input_reaches_only_its_curtain(
     );
 
     // The supervised shell's lock is granted and engages the
-    // compositor's own lock.
+    // compositor's own lock, while the application keeps asking to lock
+    // around it: refused on arrival, its requests cannot cancel the
+    // shell's (security review F3).
+    let manager = app.client.lock_manager.clone().unwrap();
+    let mut spam = vec![manager.lock(&qh, ()), manager.lock(&qh, ())];
     publish(&root.join("go-lock"), "");
+    let end = Instant::now() + LIMIT;
+    while !root.join("shell-lock-fate").exists() {
+        assert!(Instant::now() < end, "the shell's lock was never decided");
+        spam.extend((0..8).map(|_| manager.lock(&qh, ())));
+        app.roundtrip();
+    }
     wait_file(&root.join("shell-lock-fate"));
     assert_eq!(
         std::fs::read_to_string(root.join("shell-lock-fate")).unwrap(),
         "Locked"
     );
     wait_locked(&root, true, "the shell's lock to engage");
+    app.roundtrip();
+    assert_eq!(
+        app.client.lock_fate,
+        Some(LockFate::Finished),
+        "every spammed request was refused"
+    );
+    for lock in spam {
+        lock.destroy();
+    }
     wait_file(&root.join("shell-surface-up"));
 
     // While locked, host input reaches only the lock surface.

@@ -1,0 +1,41 @@
+diff --git a/third-party/smithay/src/xwayland/xwm/surface.rs b/third-party/smithay/src/xwayland/xwm/surface.rs
+index 9d82fafca..1f43367fd 100644
+--- a/third-party/smithay/src/xwayland/xwm/surface.rs
++++ b/third-party/smithay/src/xwayland/xwm/surface.rs
+@@ -543,6 +543,36 @@ impl X11Surface {
+         Ok(())
+     }
+ 
++    /// Sets the window iconic (minimized) or normal while it stays mapped,
++    /// as Mutter's `meta_window_x11_set_wm_state` and `set_net_wm_state` do
++    /// for a minimized window: `WM_STATE` becomes `IconicState` and
++    /// `_NET_WM_STATE` gains `_NET_WM_STATE_HIDDEN`, and restoring reverses
++    /// both. Unlike [`X11Surface::set_mapped`] the frame is not unmapped, so
++    /// the compositor keeps the window's contents for its animations; the
++    /// client learns it is hidden and may stop rendering.
++    ///
++    /// It is an error to call this function on override redirect windows
++    pub fn set_iconic(&self, iconic: bool) -> Result<(), X11SurfaceError> {
++        if self.is_override_redirect() {
++            return Err(X11SurfaceError::UnsupportedForOverrideRedirect);
++        }
++        let Some(conn) = self.conn.upgrade() else {
++            return Ok(());
++        };
++        // IconicState 3, NormalState 1.
++        let state = if iconic { 3u32 } else { 1 };
++        conn.change_property32(
++            PropMode::REPLACE,
++            self.window,
++            self.atoms.WM_STATE,
++            self.atoms.WM_STATE,
++            &[state, 0 /*WINDOW_NONE*/],
++        )?;
++        self.set_suspended(iconic)?;
++        conn.flush()?;
++        Ok(())
++    }
++
+     /// Sets the window as activated or not.
+     ///
+     /// Allows the client to reflect this state in their UI.

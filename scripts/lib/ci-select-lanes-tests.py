@@ -96,7 +96,7 @@ class Selection(unittest.TestCase):
         for run in range(len(m.ROTATION)):
             with self.subTest(run=run):
                 self.assertEqual(pr("share/pam.d/tuna-lock", run=run), [
-                    'fprint-phase-proof', 'journey', 'grid-cancel-comparison', 'gtk-shell',
+                    'journey', 'grid-cancel-comparison', 'gtk-shell',
                     'portal-security', 'remote-security', 'niri-parity', 'arch-package',
                     'marlin-image', 'marlin-vm'])
         # Control: other shipped runtime data still rotates journey.

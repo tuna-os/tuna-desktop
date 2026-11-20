@@ -388,6 +388,9 @@ pub struct Session<'a> {
     close_menu_unanimated: bool,
     /// Close-dialog answers `(window, response)`, drained by the hub.
     close_dialog_responses: Vec<(u64, tuna_shell_control::CloseDialogResponse)>,
+    /// The session-bus unique name the supervised shell declared over this
+    /// session (`DeclareBusName`), read by [`ControlHub::shell_bus_names`].
+    bus_name: Option<String>,
 }
 
 impl std::fmt::Debug for Session<'_> {
@@ -490,6 +493,7 @@ impl<'a> Session<'a> {
             pad_osd_closed: Vec::new(),
             close_menu_unanimated: false,
             close_dialog_responses: Vec::new(),
+            bus_name: None,
         };
         let msg = match session.conn.read_frame() {
             Ok(msg) => msg,
@@ -702,6 +706,16 @@ impl<'a> Session<'a> {
         }
         self.conn
             .write_frame(&Message::SeatTouchMode { touch_mode })
+    }
+
+    /// Send whether the lock screen is shown (the curtain has landed on
+    /// a locked session). Peers older than 0.51 cannot decode it and
+    /// receive nothing.
+    pub fn send_lock_screen_shown(&mut self, shown: bool) -> Result<(), ControlError> {
+        if self.peer_minor < 51 {
+            return Ok(());
+        }
+        self.conn.write_frame(&Message::LockScreenShown { shown })
     }
 
     /// Send where the overview's window previews sit.
@@ -1196,6 +1210,38 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
+                kind: CommandKind::DeclareBusName { unique_name },
+            } => {
+                if self.peer_minor < 52 {
+                    self.conn.write_frame(&Message::Error {
+                        kind: ErrorKind::UnknownCommand,
+                        message: "bus name declarations require negotiated minor 52".into(),
+                    })?;
+                    return Ok(Handled::ErrorSent {
+                        kind: ErrorKind::UnknownCommand,
+                    });
+                }
+                // Only a session the hub bound to the supervised shell
+                // child (its pidfd-pinned peer) names the shell on D-Bus.
+                let status = if self.auth_owner.is_none() {
+                    CommandStatus::Denied {
+                        reason: "only the supervised shell declares its bus name".into(),
+                    }
+                } else if !is_unique_bus_name(&unique_name) {
+                    CommandStatus::Denied {
+                        reason: "not a unique bus name".into(),
+                    }
+                } else {
+                    self.bus_name = Some(unique_name);
+                    CommandStatus::Applied
+                };
+                let applied = status == CommandStatus::Applied;
+                self.conn
+                    .write_frame(&Message::CommandResult { id, status })?;
+                Ok(Handled::CommandResult { id, applied })
+            }
+            Message::Command {
+                id,
                 kind: CommandKind::WindowAction { window, action },
             } => {
                 // The window manager carries it out (drained by the hub);
@@ -1344,6 +1390,7 @@ impl<'a> Session<'a> {
             | Message::OverviewSwipe { .. }
             | Message::ShowCloseDialog { .. }
             | Message::HideCloseDialog { .. }
+            | Message::LockScreenShown { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
                     kind: ErrorKind::UnknownCommand,
@@ -1407,6 +1454,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::OverviewSwipe { .. } => "OverviewSwipe",
         Message::ShowCloseDialog { .. } => "ShowCloseDialog",
         Message::HideCloseDialog { .. } => "HideCloseDialog",
+        Message::LockScreenShown { .. } => "LockScreenShown",
     }
 }
 
@@ -1585,6 +1633,7 @@ fn apply_command(
         | CommandKind::PadOsdClosed { .. }
         | CommandKind::CloseMenuUnanimated
         | CommandKind::RespondCloseDialog { .. }
+        | CommandKind::DeclareBusName { .. }
         | CommandKind::SwitchInputSource { .. }
         | CommandKind::SetWindowIconGeometries { .. }
         | CommandKind::SetWellbeingEffects { .. }
@@ -1696,13 +1745,28 @@ pub struct OskBroadcast {
 pub const MAX_PENDING_PEERS: usize = 8;
 
 /// Kernel-reported credentials of a connected control peer
-/// (`SO_PEERCRED`): what the peer *is*, not what it claims.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// (`SO_PEERCRED`, plus `SO_PEERPIDFD`): what the peer *is*, not what it
+/// claims.
+#[derive(Clone, Debug)]
 pub struct PeerCred {
     /// Peer process id at connect time.
     pub pid: u32,
     /// Peer effective user id.
     pub uid: u32,
+    /// Descriptor pinned to the process that connected (`SO_PEERPIDFD`);
+    /// `None` on a kernel without it (before 6.5).
+    pub pidfd: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
+}
+
+impl PeerCred {
+    /// `pid` while the pinned process that connected is still alive. A
+    /// numeric PID without a pin, or the pin of an exited process, is no
+    /// identity: that number may since have been recycled.
+    pub fn pinned_pid(&self) -> Option<u32> {
+        use std::os::fd::AsFd;
+        let pidfd = self.pidfd.as_deref()?;
+        crate::capture_security::pidfd_live(pidfd.as_fd()).then_some(self.pid)
+    }
 }
 
 /// Who may hold a control session (#30).
@@ -1715,7 +1779,8 @@ pub struct PeerCred {
 pub enum PeerGate {
     /// Any peer running as our user (tests, unsupervised development).
     SameUser,
-    /// Only the supervised shell process with this pid, as our user.
+    /// Only the supervised shell process with this pid, as our user,
+    /// pinned by `SO_PEERPIDFD`.
     Pid(u32),
     /// Nobody: no shell is running (between restarts, or none spawned).
     Closed,
@@ -1723,8 +1788,11 @@ pub enum PeerGate {
 
 impl PeerGate {
     /// Whether a peer with `peer` credentials may hold a session.
-    /// Unknown credentials are refused: fail closed.
-    pub fn admits(self, peer: Option<PeerCred>, our_uid: u32) -> bool {
+    /// Unknown credentials are refused: fail closed. The shell's gate
+    /// matches only the live pinned process, so a connection made under a
+    /// PID that was later recycled onto the shell is refused, and so is
+    /// every peer on a kernel without `SO_PEERPIDFD`.
+    pub fn admits(self, peer: Option<&PeerCred>, our_uid: u32) -> bool {
         let Some(peer) = peer else {
             return false;
         };
@@ -1733,7 +1801,7 @@ impl PeerGate {
         }
         match self {
             Self::SameUser => true,
-            Self::Pid(pid) => peer.pid == pid,
+            Self::Pid(pid) => peer.pinned_pid() == Some(pid),
             Self::Closed => false,
         }
     }
@@ -1745,7 +1813,14 @@ pub fn peer_cred(stream: &UnixStream) -> Option<PeerCred> {
     Some(PeerCred {
         pid: u32::try_from(cred.pid.as_raw_nonzero().get()).ok()?,
         uid: cred.uid.as_raw(),
+        pidfd: crate::capture_security::socket_pidfd(stream).map(std::sync::Arc::new),
     })
+}
+
+/// Whether `name` is a connection's unique bus name (`:1.N`), the only
+/// kind the bus never hands to another connection.
+fn is_unique_bus_name(name: &str) -> bool {
+    name.starts_with(':') && zbus::names::UniqueName::try_from(name).is_ok()
 }
 
 /// Our effective uid, for [`PeerGate::admits`].
@@ -1826,6 +1901,10 @@ pub struct ControlHub {
     /// value every live session holds (#502).
     touch_mode: bool,
     touch_mode_sent: Option<bool>,
+    /// Whether the lock screen is shown, as last set by the runtime, and
+    /// the value every live session holds.
+    lock_shown: bool,
+    lock_shown_sent: Option<bool>,
     /// Output inventory last handed to [`set_outputs`](Self::set_outputs)
     /// (multi-monitor): the runtime refreshes this every tick from the
     /// compositor's tracking, and [`poll`](Self::poll) broadcasts it
@@ -1925,6 +2004,8 @@ impl ControlHub {
             // No touch-mode is what a shell assumes before any message.
             touch_mode: false,
             touch_mode_sent: Some(false),
+            lock_shown: false,
+            lock_shown_sent: Some(false),
             outputs: Vec::new(),
             native_outputs: Vec::new(),
             pointer_output: None,
@@ -2009,8 +2090,11 @@ impl ControlHub {
                 session.connection_id == lease.origin.connection
                     && session.auth_lease == Some(lease)
                     && session.auth_owner == Some(lease.owner)
-                    && PeerGate::Pid(lease.owner.pid).admits(self.session_peers[index], our_uid())
-                    && self.gate.admits(self.session_peers[index], our_uid())
+                    && PeerGate::Pid(lease.owner.pid)
+                        .admits(self.session_peers[index].as_ref(), our_uid())
+                    && self
+                        .gate
+                        .admits(self.session_peers[index].as_ref(), our_uid())
                     && session.conn.peer_live()
             })
     }
@@ -2052,6 +2136,30 @@ impl ControlHub {
         self.gate
     }
 
+    /// The session-bus unique names the supervised shell declared over its
+    /// live control sessions: bound to the current shell child, whose
+    /// `SO_PEERPIDFD`-pinned peer is still that child, and still connected.
+    /// Empty between restarts, under any other gate, and once the
+    /// declaring session or process ended. The bus never reuses a unique
+    /// name, so this identity cannot pass to another process.
+    pub fn shell_bus_names(&self) -> impl Iterator<Item = &str> + Clone {
+        let uid = our_uid();
+        let owner = self.auth_owner;
+        let gate = self.gate;
+        self.sessions
+            .iter()
+            .zip(&self.session_peers)
+            .filter(move |(session, peer)| {
+                owner.is_some_and(|owner| {
+                    session.auth_owner == Some(owner)
+                        && PeerGate::Pid(owner.pid).admits(peer.as_ref(), uid)
+                        && gate.admits(peer.as_ref(), uid)
+                        && session.conn.peer_live()
+                })
+            })
+            .filter_map(|(session, _)| session.bus_name.as_deref())
+    }
+
     /// Connections refused so far (gate or pending cap).
     pub fn refused_count(&self) -> u64 {
         self.refused
@@ -2073,6 +2181,7 @@ impl ControlHub {
             || !self.switcher_queue.is_empty()
             || self.osk_sent != Some(self.osk)
             || self.touch_mode_sent != Some(self.touch_mode)
+            || self.lock_shown_sent != Some(self.lock_shown)
             || !self.accelerator_queue.is_empty()
             || !self.menu_queue.is_empty()
             || self.sessions.iter().any(|s| s.owes_deltas(model));
@@ -2144,6 +2253,12 @@ impl ControlHub {
         self.touch_mode = touch_mode;
     }
 
+    /// Refresh whether the lock screen is shown (the curtain landed on a
+    /// locked session); the next [`poll`](Self::poll) broadcasts a change.
+    pub fn set_lock_screen_shown(&mut self, shown: bool) {
+        self.lock_shown = shown;
+    }
+
     /// Set the session environment (#59); the next [`poll`](Self::poll)
     /// broadcasts it when it differs from the last broadcast, and every
     /// newcomer gets it right after the handshake.
@@ -2163,11 +2278,12 @@ impl ControlHub {
         self.sessions.iter().enumerate().any(|(i, session)| {
             session.connection_id == origin.connection
                 && session.owes_auth(origin.request)
-                && self.gate.admits(self.session_peers[i], our_uid())
+                && self.gate.admits(self.session_peers[i].as_ref(), our_uid())
                 && (!self.auth_owner_configured
                     || self.auth_owner.is_some_and(|owner| {
                         session.auth_owner == Some(owner)
-                            && PeerGate::Pid(owner.pid).admits(self.session_peers[i], our_uid())
+                            && PeerGate::Pid(owner.pid)
+                                .admits(self.session_peers[i].as_ref(), our_uid())
                     }))
                 && session.conn.peer_live()
         })
@@ -2369,7 +2485,7 @@ impl ControlHub {
         while let Ok((stream, _)) = self.listener.accept() {
             received = true;
             let cred = peer_cred(&stream);
-            if !self.gate.admits(cred, uid) || self.pending_count() >= MAX_PENDING_PEERS {
+            if !self.gate.admits(cred.as_ref(), uid) || self.pending_count() >= MAX_PENDING_PEERS {
                 // Dropping the stream closes it: the peer sees EOF
                 // before any state crosses the socket.
                 self.refused += 1;
@@ -2391,7 +2507,7 @@ impl ControlHub {
         // A narrowed gate evicts sessions it no longer admits.
         let mut i = 0;
         while i < self.sessions.len() {
-            if self.gate.admits(self.session_peers[i], uid) {
+            if self.gate.admits(self.session_peers[i].as_ref(), uid) {
                 i += 1;
             } else {
                 self.sessions.swap_remove(i);
@@ -2661,6 +2777,17 @@ impl ControlHub {
                 self.touch_mode_sent = Some(self.touch_mode);
             }
         }
+        if self.lock_shown_sent != Some(self.lock_shown) {
+            let mut all_sent = true;
+            for session in &mut self.sessions {
+                if session.send_lock_screen_shown(self.lock_shown).is_err() {
+                    all_sent = false;
+                }
+            }
+            if all_sent {
+                self.lock_shown_sent = Some(self.lock_shown);
+            }
+        }
         if self.outputs != self.outputs_sent {
             let mut all_sent = true;
             for session in &mut self.sessions {
@@ -2720,7 +2847,7 @@ impl ControlHub {
         let uid = our_uid();
         for (stream, peer) in pending.into_iter().zip(peers) {
             // The gate may have narrowed since accept (shell restart).
-            if !self.gate.admits(peer, uid) {
+            if !self.gate.admits(peer.as_ref(), uid) {
                 self.refused += 1;
                 continue;
             }
@@ -2773,6 +2900,9 @@ impl ControlHub {
                 }
                 if self.touch_mode {
                     let _ = session.send_seat_touch_mode(true);
+                }
+                if self.lock_shown {
+                    let _ = session.send_lock_screen_shown(true);
                 }
                 if self.pointer_output.is_some() {
                     let _ = session.send_window_menu(&Message::PointerOutput {

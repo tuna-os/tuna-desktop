@@ -73,7 +73,12 @@ class SourceContracts(unittest.TestCase):
         self.assertIn('self.unlock_slot.retire_pam_method(', runtime)
         owner = (ROOT / 'crates/compositor/src/auth_owner.rs').read_text()
         self.assertIn('if self.active.is_some()', owner.split('pub fn grant(', 1)[1])
-        self.assertIn('method == MethodKind::Fingerprint', owner)
+        # Every method, the fingerprint conversation included (#1162 F5),
+        # retires only on its own method's PAM receipt; no worker join or
+        # fingerprint match is a retirement path.
+        retire = owner.split('pub fn retire_pam_method(', 1)[1].split('\n    }\n', 1)[0]
+        self.assertIn('self.method != Some(method) || !result.may_retire()', retire)
+        self.assertNotIn('retire_fingerprint', owner)
         control = (ROOT / 'crates/compositor/src/control.rs').read_text()
         for name in ('AuthLease', 'bind_auth_lease', 'auth_lease_accepts', 'retire_pam_auth_lease',
                      'auth_lease_binds_socket_child_generation_and_retirement_not_reply'):

@@ -885,6 +885,13 @@ pub struct Runtime {
     /// Signature of the last presented nested frame; unchanged means
     /// no client, cursor, or effect moved, so the tick submits nothing.
     winit_signature: Option<crate::native_repaint::FrameSignature>,
+    /// Buffer age of the nested window's next back buffer, read right
+    /// after each swap. EGL defines it only while the window's surface is
+    /// current; the commits uploaded before a frame (#1084) leave the
+    /// context current without it, where Smithay's query fails and reads
+    /// as 0, so every client commit (the panel clock's minute) repainted
+    /// the whole output (#1154).
+    winit_age: usize,
     /// When hidden windows last got their throttled frame callbacks
     /// ([`HIDDEN_FRAME_INTERVAL`](crate::occlusion::HIDDEN_FRAME_INTERVAL)).
     hidden_beat: Option<Instant>,
@@ -1272,7 +1279,7 @@ impl Runtime {
             |stream, runtime: &mut Runtime| {
                 let mut client_data = ClientState::native_connection(&stream);
                 // Layer-shell is the supervised shell's alone (#1048).
-                client_data.admit_supervised_shell(&stream, runtime.shell.child_pid());
+                client_data.admit_supervised_shell(runtime.shell.child_pid());
                 if runtime
                     .display
                     .handle()
@@ -1571,6 +1578,7 @@ impl Runtime {
             frame_costs: std::collections::BTreeMap::new(),
             winit_tracker: None,
             winit_signature: None,
+            winit_age: 0,
             hidden_beat: None,
             hidden_waiting: false,
             active_at: Instant::now(),
@@ -1932,7 +1940,8 @@ impl Runtime {
         }
         // Input capture never survives the lock (#1040).
         self.input_capture.revoke_all();
-        self.capture_authority.publish(true, self.shell.child_pid());
+        self.capture_authority
+            .publish(true, self.control.shell_bus_names());
         self.state.set_shortcut_inhibition_locked(true);
         // A three-finger swipe under way is the unlocked session's: end
         // it cancelled, so its overview or workspace slide never resumes
@@ -1940,9 +1949,10 @@ impl Runtime {
         // swipeTracker.js `_updateTouchpadGesture`/`_endTouchpadGesture`).
         self.interrupt_shell_swipe(crate::state::system_millis() as u32);
         self.control.set_overview(false);
-        // GNOME's lock closes the open menus and their grabs: a shell
-        // menu left open behind the lock kept the lock screen's keys.
-        self.state.dismiss_popup_grab_for_lock();
+        // GNOME's lock closes its own shell menus and their grabs: a
+        // shell menu left open behind the lock kept the lock screen's
+        // keys. An application's popup grab outlives the lock.
+        self.state.dismiss_shell_popup_grab_for_lock();
         // A client drag ends cancelled: its icon would draw above the
         // lock, as nothing else may.
         self.state
@@ -2125,10 +2135,11 @@ impl Runtime {
         // The lock held the keyboard (`hold_lock_focus`): quarantine
         // lock-origin holds, then hand it back to the session's owner
         // without raising, as GNOME's unlock returns focus to the
-        // focused window. The lock dismissed every popup grab
-        // (`dismiss_popup_grab_for_lock`), so only one taken while locked
-        // is returned to. A second `restore_keyboard_owner` here would
-        // raise that window and take the keyboard from a grabbing popup.
+        // focused window. The lock dismissed the shell's popup grabs
+        // (`dismiss_shell_popup_grab_for_lock`); an application's grab
+        // outlived it and is returned to. A second
+        // `restore_keyboard_owner` here would raise that window and take
+        // the keyboard from a grabbing popup.
         self.manager.unlock_input(&mut self.state);
         self.overlay.hide();
     }
@@ -5544,8 +5555,9 @@ impl Runtime {
         // ext-session-lock-v1: only the supervised shell may lock, and
         // locking through the protocol engages the compositor's own
         // flag. Anyone else's locker is dropped, which tells it the
-        // lock failed. Each waiting client gets its own verdict.
-        while let Some((locker, pid)) = self.state.take_lock_request() {
+        // lock failed. Only the shell's request is ever pending (others
+        // are refused on arrival), so there is at most one to judge.
+        if let Some((locker, pid)) = self.state.take_lock_request() {
             use crate::session_lock::{lock_request_verdict, LockVerdict};
             let verdict = lock_request_verdict(
                 pid,
@@ -5562,7 +5574,7 @@ impl Runtime {
                     eprintln!("tuna-compositor: session lock refused by administrator policy");
                 }
                 LockVerdict::RefusedForeign => {
-                    eprintln!("tuna-compositor: session lock refused for pid {pid:?}");
+                    eprintln!("tuna-compositor: session lock refused for pinned pid {pid:?}");
                 }
             }
             self.state
@@ -5705,8 +5717,6 @@ impl Runtime {
         }
         // Only the supervised shell may hold a control session (#30):
         // between restarts nobody may.
-        self.capture_authority
-            .publish(self.is_locked(), self.shell.child_pid());
         self.control.set_auth_owner(
             self.shell
                 .child_pid()
@@ -5717,6 +5727,10 @@ impl Runtime {
             Some(pid) => PeerGate::Pid(pid),
             None => PeerGate::Closed,
         });
+        // The shell is known on the session bus only by the unique names its
+        // current pinned control session declared (ADR 0010).
+        self.capture_authority
+            .publish(self.is_locked(), self.control.shell_bus_names());
         // Control EOF, manual/protocol/idle gates and shell PID gating are now current.
         // Never grant from a channel callback before those changes are observed.
         self.cancel_invalid_unlock();
@@ -6272,6 +6286,10 @@ impl Runtime {
         self.wallpaper.set_time(now);
         self.transitions
             .advance(now, locked, lock_ready, shell_ready);
+        // The shell reports the screen saver active only once the
+        // curtain has landed: gnome-settings-daemon blanks on it.
+        self.control
+            .set_lock_screen_shown(self.transitions.lock_shown());
         // While locked the curtain carries the lock surface and its
         // background; it never uncovers content (`show_content`).
         let lock_curtain = self.transitions.curtain().filter(|_| locked);
@@ -6453,7 +6471,7 @@ impl Runtime {
             Backend::Winit(backend) => {
                 backend.window().set_cursor_visible(false);
                 let size = backend.window_size();
-                let age = backend.buffer_age().unwrap_or(0);
+                let age = self.winit_age;
                 let mut presented: PresentedFrame = None;
                 {
                     let (renderer, mut framebuffer) = backend
@@ -6742,9 +6760,13 @@ impl Runtime {
                 if let Some((damage, drawn, presented_cursor)) = presented {
                     self.frame_costs.insert("winit".to_owned(), drawn);
                     send_surface_scales(&self.state, &self.manager);
+                    // Unknown until the swap succeeds: a failed one leaves
+                    // the back buffer's contents unknown.
+                    self.winit_age = 0;
                     backend
                         .submit(Some(&damage))
                         .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                    self.winit_age = backend.buffer_age().unwrap_or(0);
                     if let Some(surface) = &presented_cursor {
                         crate::cursor::Cursor::frame_done(
                             &crate::cursor::Pointer::Surface(surface.clone()),
@@ -8771,6 +8793,25 @@ fn run_loop(
     session: &NestedSession,
     mut probe: impl FnMut(&mut AuthOwnerProbe<'_>) -> Option<Duration>,
 ) -> Result<RunStats, RuntimeError> {
+    // Graceful shutdown on SIGTERM/SIGINT/SIGHUP: ending the loop drops the
+    // runtime, whose supervisor kills the shell child (ADR 0003 kill
+    // on exit). Without this a signal would bypass `Drop` and orphan
+    // the shell on a dead socket. logind creates session scopes with
+    // SendSIGHUP=yes, so a session stop sends SIGHUP right after SIGTERM;
+    // left at its default it killed the compositor before teardown, so the
+    // owned Orca was never retired (#836). The flag write is the only work
+    // done in the handler; the loop observes it below. Installed before
+    // `launch` binds the Wayland socket, so a session that is visible is
+    // already one a signal ends through teardown (#1174).
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for signal in [
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGHUP,
+    ] {
+        signal_hook::flag::register(signal, std::sync::Arc::clone(&shutdown))
+            .map_err(|e| RuntimeError::Loop(format!("signal handler failed: {e}")))?;
+    }
     let (mut runtime, mut event_loop) = Runtime::launch(session)?;
     #[cfg(feature = "drm")]
     let _session_services = if matches!(runtime.backend, Backend::Drm(_)) {
@@ -8815,25 +8856,10 @@ fn run_loop(
     if let Some(session) = &logind_session {
         session.set_wake(&runtime.wake);
     }
-    // Graceful shutdown on SIGTERM/SIGINT/SIGHUP: ending the loop drops the
-    // runtime, whose supervisor kills the shell child (ADR 0003 kill
-    // on exit). Without this a signal would bypass `Drop` and orphan
-    // the shell on a dead socket. logind creates session scopes with
-    // SendSIGHUP=yes, so a session stop sends SIGHUP right after SIGTERM;
-    // left at its default it killed the compositor before teardown, so the
-    // owned Orca was never retired (#836). The flag write is the only work
-    // done in the handler; the loop observes it below.
-    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    for signal in [
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGHUP,
-    ] {
-        signal_hook::flag::register(signal, std::sync::Arc::clone(&shutdown))
-            .map_err(|e| RuntimeError::Loop(format!("signal handler failed: {e}")))?;
-    }
     // The same signals, and child exits for the shell, IME and XWayland
-    // supervisors, wake a loop that may be sleeping (#503).
+    // supervisors, wake a loop that may be sleeping (#503). A signal taken
+    // before this source exists is still seen: the flag is read before the
+    // first wait.
     let signals = crate::wake::signal_source(&[
         signal_hook::consts::SIGCHLD,
         signal_hook::consts::SIGTERM,

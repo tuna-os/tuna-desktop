@@ -292,6 +292,13 @@ pub struct LockUi {
     screens: RefCell<Vec<Screen>>,
     /// A lock was asked of the compositor and not yet released.
     requested: Cell<bool>,
+    /// The compositor's lock flag as last synced: a refused lock request
+    /// is retried only while it still says locked.
+    wants_lock: Cell<bool>,
+    /// Refused lock requests since the last granted one, for the backoff.
+    lock_attempts: Cell<u32>,
+    /// A retry is scheduled.
+    retry_pending: Cell<bool>,
     connection_generation: Cell<Option<u64>>,
     clock_format: Box<dyn Fn() -> logic::ClockFormat>,
     /// Wakes the clock on the minute while the lock screens are up.
@@ -325,6 +332,9 @@ impl LockUi {
             applying: Cell::new(false),
             screens: RefCell::new(Vec::new()),
             requested: Cell::new(false),
+            wants_lock: Cell::new(false),
+            lock_attempts: Cell::new(0),
+            retry_pending: Cell::new(false),
             connection_generation: Cell::new(None),
             clock_format,
             wall_clock: RefCell::new(None),
@@ -334,11 +344,24 @@ impl LockUi {
             media: RefCell::new(None),
         });
         {
+            // A refused request (ext_session_lock_v1.finished) leaves the
+            // session locked without a prompt unless the shell asks again:
+            // retry with backoff while the compositor still says locked.
             let weak = Rc::downgrade(&ui);
             ui.instance.connect_failed(move |_| {
                 eprintln!("tuna-shell-gtk: the compositor refused the session lock");
                 if let Some(ui) = weak.upgrade() {
                     ui.release_screens();
+                    ui.requested.set(false);
+                    ui.retry_lock();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&ui);
+            ui.instance.connect_locked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.lock_attempts.set(0);
                 }
             });
         }
@@ -432,6 +455,10 @@ impl LockUi {
     /// Follow the compositor's lock flag: lock when it says locked,
     /// release when it says unlocked.
     pub fn sync(self: &Rc<Self>, locked: bool) {
+        self.wants_lock.set(locked);
+        if !locked {
+            self.lock_attempts.set(0);
+        }
         if locked && !self.requested.get() {
             self.requested.set(true);
             if !self.instance.lock() {
@@ -470,6 +497,25 @@ impl LockUi {
             self.requested.set(false);
             self.instance.unlock();
         }
+    }
+
+    /// Ask for the lock again after a refusal, once the backoff for this
+    /// attempt has passed, if the compositor still says locked by then.
+    fn retry_lock(self: &Rc<Self>) {
+        if self.retry_pending.replace(true) {
+            return;
+        }
+        let attempt = self.lock_attempts.get();
+        self.lock_attempts.set(attempt.saturating_add(1));
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(lock_retry_delay(attempt), move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.retry_pending.set(false);
+                if ui.wants_lock.get() {
+                    ui.sync(true);
+                }
+            }
+        });
     }
 
     /// A transport generation change aborts local entry only. It never releases
@@ -1260,6 +1306,14 @@ impl Drop for Screen {
     }
 }
 
+/// The wait before lock request `attempt` (0 = first retry) after a
+/// refusal: 100 ms, doubling, at most 5 s.
+fn lock_retry_delay(attempt: u32) -> std::time::Duration {
+    const FIRST_MS: u64 = 100;
+    const MAX_MS: u64 = 5_000;
+    std::time::Duration::from_millis(FIRST_MS.saturating_mul(1 << attempt.min(16)).min(MAX_MS))
+}
+
 fn generation_changed(current: &Cell<Option<u64>>, next: Option<u64>) -> bool {
     let previous = current.replace(next);
     previous.is_some() && previous != next
@@ -1640,5 +1694,21 @@ mod auth_transport_ui_tests {
             "the lock window is destroyed"
         );
         assert_eq!(entry.text.text(), "", "nothing typed survives");
+    }
+}
+
+#[cfg(test)]
+mod lock_retry_tests {
+    use super::lock_retry_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn refused_locks_are_retried_with_a_bounded_backoff() {
+        let delays: Vec<_> = (0..8).map(lock_retry_delay).collect();
+        assert_eq!(
+            delays,
+            [100, 200, 400, 800, 1600, 3200, 5000, 5000].map(Duration::from_millis)
+        );
+        assert_eq!(lock_retry_delay(u32::MAX), Duration::from_secs(5));
     }
 }

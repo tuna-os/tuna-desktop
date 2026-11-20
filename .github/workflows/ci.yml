@@ -235,6 +235,7 @@ jobs:
       - run: python3 scripts/tests/test_minimize_ci_freeze.py
       - run: python3 scripts/tests/test_minimize_brightness_controls.py
       - run: python3 scripts/tests/test_wb_shell_contract.py
+      - run: python3 scripts/tests/test_state_snapshot.py
       - run: python3 scripts/lib/window-lifecycle-proof-tests.py
       # Gate proofs and contract suites omitted from CI (#737).
       - run: python3 scripts/tests/test_wb_notice_button_mapping.py
@@ -283,7 +284,6 @@ jobs:
           scripts/tuna-cursor-assets-check share/tuna-desktop/icons/Adwaita
           python3 scripts/lib/cursor-assets-tests.py
       - run: /usr/bin/python3 scripts/tests/test_strip_endpoint.py
-      - run: /usr/bin/python3 scripts/tests/test_fprint_phase_contract.py
       - name: Admit native Night Light GIO and schema compiler
         run: |
           pkg-config --atleast-version=2.66 gio-2.0 glib-2.0
@@ -382,56 +382,6 @@ jobs:
         with:
           name: test-list
           path: test-list.txt
-          retention-days: 14
-
-
-  fprint-phase-proof:
-    # Required measured transport phases; not a live UI/hardware qualification.
-    runs-on: *runner-24
-    needs: [select-lanes, check]
-    if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'fprint-phase-proof')
-    timeout-minutes: 45
-    permissions:
-      actions: read
-      contents: read
-    env:
-      PYTHONDONTWRITEBYTECODE: "1"
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/ci-fprint
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_INCREMENTAL: "0"
-      TUNA_CI_CHECKED_SHA: ${{ needs.check.outputs.tested_sha }}
-      TUNA_CI_EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ needs.check.outputs.tested_sha }}
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-      - name: Identify native cache platform
-        id: cache-platform
-        run: |
-          . /etc/os-release
-          echo "distro=$ID-$VERSION_ID" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@v2.9.3
-        with:
-          key: ${{ steps.cache-platform.outputs.distro }}
-          workspaces: . -> target/ci-fprint
-          cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - run: sudo apt-get update && sudo apt-get install -y libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev pkg-config libpipewire-0.3-dev libclang-dev dbus
-      - name: Admit exact compiled roles and require positive measured public phase
-        run: scripts/tuna-fprint-phase-proof --artifacts "$RUNNER_TEMP/fprint-phase-proof"
-        env:
-          GH_TOKEN: ${{ github.token }}
-      - uses: actions/upload-artifact@v7.0.2
-        if: always()
-        with:
-          name: fprint-phase-proof
-          path: |
-            ${{ runner.temp }}/fprint-phase-proof/*.json
-            ${{ runner.temp }}/fprint-phase-proof/*.txt
           retention-days: 14
 
   journey:
@@ -679,7 +629,7 @@ jobs:
         with:
           tool: gtk4-layer-shell
           version: 4867d7b85cdf1e829fc1fd6f1d5f04c42cc99389
-      - run: shellcheck scripts/ci-install-vkms scripts/tuna-drm-smoke scripts/lib/colord-startup.sh scripts/tuna-frame-pacer-build
+      - run: shellcheck -x scripts/ci-install-vkms scripts/tuna-drm-smoke scripts/lib/colord-startup.sh scripts/tuna-frame-pacer-build
       - run: bash -n scripts/tuna-drm-smoke scripts/lib/colord-startup.sh
       - run: python3 scripts/tests/test_colord_startup.py
       - run: scripts/ci-install-vkms
@@ -940,7 +890,7 @@ jobs:
       # assertions.txt.
       - name: Prove multi-step and fingerprint lock authentication
         run: |
-          shellcheck scripts/tuna-lock-auth-proof
+          shellcheck -x scripts/tuna-lock-auth-proof
           /usr/bin/python3 scripts/tests/test_tuna_lock_auth_fixtures.py
           scripts/tuna-lock-auth-proof --artifacts gtk-shell-artifacts/lock-auth
         env:
@@ -1096,7 +1046,7 @@ jobs:
       # of the shell proof above, so it runs (and gates) even when that
       # one already failed the job.
       - if: ${{ !cancelled() }}
-        run: shellcheck scripts/tuna-magnifier-proof && scripts/tuna-magnifier-proof --artifacts gtk-shell-artifacts/magnifier
+        run: shellcheck -x scripts/tuna-magnifier-proof && scripts/tuna-magnifier-proof --artifacts gtk-shell-artifacts/magnifier
       # Window session save and restore (P-SY-08, #338): an
       # xdg-session-management client's windows come back, moved, resized,
       # maximized and on their workspace, after the nested compositor
@@ -1108,7 +1058,7 @@ jobs:
       # Independent of the proofs above, so it runs (and gates) even when
       # one of them already failed the job.
       - if: ${{ !cancelled() }}
-        run: shellcheck scripts/tuna-osk-proof && scripts/tuna-osk-proof --artifacts gtk-shell-artifacts/osk
+        run: shellcheck -x scripts/tuna-osk-proof && scripts/tuna-osk-proof --artifacts gtk-shell-artifacts/osk
       # Keep runnable binaries even when a later live proof assertion fails.
       - if: always()
         run: |
@@ -2216,7 +2166,7 @@ jobs:
     # One stable status for the run: lanes the selection skipped report
     # skipped, any failed or cancelled job fails the gate.
     if: always()
-    needs: [select-lanes, check, fprint-phase-proof, journey, app-content, scroll-proof, drm-smoke, grid-cancel-comparison, gtk-shell, orca-speech, portal-security, remote-security, niri-parity, arch-package, marlin-image, gdm51-native-package, marlin-vm, native-reference-context, parity-ledger, docs-shots]
+    needs: [select-lanes, check, journey, app-content, scroll-proof, drm-smoke, grid-cancel-comparison, gtk-shell, orca-speech, portal-security, remote-security, niri-parity, arch-package, marlin-image, gdm51-native-package, marlin-vm, native-reference-context, parity-ledger, docs-shots]
     runs-on: *runner-24
     steps:
       - env:

@@ -113,6 +113,18 @@ fn main() {
         parent
     );
     let bus = zbus::block_on(zbus::Connection::session()).unwrap();
+    // The compositor admits this peer's Screenshot call as the shell only
+    // once the shell declares its session-bus unique name (as shell-gtk does).
+    let unique_name = bus
+        .unique_name()
+        .expect("session bus unique name")
+        .to_string();
+    command(
+        &mut stream,
+        &replies,
+        3,
+        CommandKind::DeclareBusName { unique_name },
+    );
     let mut generation = 0;
     loop {
         if unsafe { libc::getppid() } != parent {

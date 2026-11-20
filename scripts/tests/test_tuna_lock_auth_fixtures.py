@@ -2,10 +2,12 @@
 """Runtime self-tests of the lock-auth proof fixtures (#366, P-LK-02).
 
 Drives scripts/lib/tuna-fprintd-mock.py on a private dbus-daemon with
-real D-Bus clients, and scripts/lib/tuna-pam-otp.c compiled and stacked
-behind pam_matrix under pam_wrapper, through libpam's own
-pam_authenticate. These prove the fixtures the nested proof
-(scripts/tuna-lock-auth-proof) relies on; they make no product claim.
+real D-Bus clients, scripts/lib/tuna-pam-otp.c compiled and stacked
+behind pam_matrix under pam_wrapper, and scripts/lib/tuna-pam-fprint.c
+(the pam_fprintd stand-in, #1162 F5) against the mock, through libpam's
+own pam_authenticate and pam_acct_mgmt. These prove the fixtures the
+nested proof (scripts/tuna-lock-auth-proof) relies on; they make no
+product claim.
 
 Run with the distro Python (python3-gi, ctypes over the system libpam):
     /usr/bin/python3 scripts/tests/test_tuna_lock_auth_fixtures.py
@@ -29,6 +31,7 @@ from gi.repository import Gio, GLib  # noqa: E402
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MOCK = ROOT / "scripts/lib/tuna-fprintd-mock.py"
 OTP_SOURCE = ROOT / "scripts/lib/tuna-pam-otp.c"
+FPRINT_SOURCE = ROOT / "scripts/lib/tuna-pam-fprint.c"
 PAM_WRAPPER = pathlib.Path("/usr/lib/x86_64-linux-gnu/libpam_wrapper.so")
 PAM_MATRIX = pathlib.Path("/usr/lib/x86_64-linux-gnu/pam_wrapper/pam_matrix.so")
 DEVICE = "/net/reactivated/Fprint/Device/0"
@@ -64,7 +67,9 @@ def wait_until(predicate, timeout=5.0, step=0.02):
     return predicate()
 
 
-class FprintdMock(unittest.TestCase):
+class MockBus(unittest.TestCase):
+    """A private bus with the fprintd mock; no tests of its own."""
+
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="tuna-fp-mock-"))
         (self.tmp / "bus.conf").write_text(BUS_CONFIG.format(socket=self.tmp / "bus"))
@@ -123,6 +128,8 @@ class FprintdMock(unittest.TestCase):
     def entries(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()]
 
+
+class FprintdMock(MockBus):
     def test_manager_device_and_properties_have_fprintd_shapes(self):
         conn = self.client()
         self.assertEqual(self.call(conn, "GetDefaultDevice", path=MANAGER,
@@ -378,6 +385,83 @@ class OtpPamModule(unittest.TestCase):
         self.assertNotEqual(self.authenticate("tuna-lock", self.password)["auth"], 0)
         outcome = self.authenticate("tuna-otp-nocode", "anything")
         self.assertEqual((outcome["auth"], outcome["messages"]), (3, []))  # PAM_SERVICE_ERR
+
+
+@unittest.skipUnless(PAM_PRESENT or os.environ.get("TUNA_REQUIRE_PAM_WRAPPER"),
+                     "pam_wrapper/pam_matrix not installed")
+class FprintPamModule(MockBus):
+    """tuna-pam-fprint.c against the mock: pam_fprintd's do_auth loop."""
+    PLACE = [4, "Place your finger on the fingerprint reader"]
+    NO_MATCH = [3, "Failed to match fingerprint"]
+
+    def setUp(self):
+        if not PAM_PRESENT:
+            raise AssertionError(f"TUNA_REQUIRE_PAM_WRAPPER: {PAM_WRAPPER} and {PAM_MATRIX} are required")
+        super().setUp()
+        module = self.tmp / "tuna-pam-fprint.so"
+        gio = subprocess.run(["pkg-config", "--cflags", "--libs", "gio-2.0"], check=True,
+                             capture_output=True, text=True).stdout.split()
+        subprocess.run(["cc", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC", "-o", str(module),
+                        str(FPRINT_SOURCE), *gio, "-lpam"], check=True, timeout=120)
+        self.expired = self.tmp / "expired"
+        self.services = self.tmp / "services"
+        self.services.mkdir()
+        (self.services / "tuna-lock-fingerprint").write_text(
+            f"auth required {module}\naccount required {module} expired={self.expired}\n")
+
+    def selected(self):
+        return sum(1 for e in self.entries()
+                   if e["kind"] == "signal" and e["member"] == "VerifyFingerSelected")
+
+    def authenticate(self, *presses):
+        """Run the service, pressing each result once a scan announced itself."""
+        env = dict(os.environ, LD_PRELOAD=str(PAM_WRAPPER), PAM_WRAPPER="1",
+                   PAM_WRAPPER_SERVICE_DIR=str(self.services), DBUS_SYSTEM_BUS_ADDRESS=self.address)
+        run = subprocess.Popen([OtpPamModule.PYTHON, "-c", PAM_HARNESS, "tuna-lock-fingerprint",
+                                "tuna-proof-user"],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        conn = self.client()
+        try:
+            for scan, result in enumerate(presses, 1):
+                self.assertTrue(wait_until(lambda: self.selected() >= scan, timeout=10), self.entries())
+                self.press(conn, result, True)
+            out, err = run.communicate(timeout=20)
+        finally:
+            if run.poll() is None:
+                run.kill()
+                run.wait()
+        self.assertEqual(run.returncode, 0, err)
+        return json.loads(out)
+
+    def calls(self):
+        return [e["member"] for e in self.entries()
+                if (e["kind"] == "call" and e["outcome"] == "ok"
+                    and e["member"] in ("Claim", "VerifyStart", "VerifyStop", "Release"))
+                or (e["kind"] == "auto" and e["member"] == "ClientVanished")]
+
+    def test_match_succeeds_and_simply_disconnects(self):
+        outcome = self.authenticate("verify-match")
+        self.assertEqual((outcome["auth"], outcome["account"], outcome["messages"]),
+                         (0, 0, [self.PLACE]))
+        self.assertTrue(wait_until(lambda: self.calls() == ["Claim", "VerifyStart", "ClientVanished"]),
+                        self.calls())
+
+    def test_three_no_matches_are_max_tries(self):
+        outcome = self.authenticate(*["verify-no-match"] * 3)
+        self.assertEqual((outcome["auth"], outcome["messages"]), (11, [self.PLACE, self.NO_MATCH] * 3))
+        self.assertEqual(self.calls()[:8], ["Claim"] + ["VerifyStart", "VerifyStop"] * 3 + ["Release"])
+
+    def test_expired_account_refuses_after_a_match(self):
+        self.expired.touch()
+        outcome = self.authenticate("verify-match")
+        self.assertEqual((outcome["auth"], outcome["account"]), (0, 13))  # PAM_ACCT_EXPIRED
+
+    def test_no_prints_is_unavailable_without_a_claim(self):
+        self.call(self.client(), "SetEnrolled", GLib.Variant("(b)", (False,)),
+                  iface="net.reactivated.Fprint.Test")
+        outcome = self.authenticate()
+        self.assertEqual((outcome["auth"], outcome["messages"]), (9, []))  # PAM_AUTHINFO_UNAVAIL
+        self.assertNotIn("Claim", self.calls())
 
 
 if __name__ == "__main__":

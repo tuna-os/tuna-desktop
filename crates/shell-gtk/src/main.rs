@@ -421,6 +421,9 @@ fn drain(
             }
             Handled::ClosePadOsd { pad } => out.tablet.push(TabletUi::Close(pad)),
             Handled::SeatTouchMode(touch_mode) => out.touch_mode = Some(touch_mode),
+            // Read back through `lock_screen_shown`; a frame was handled,
+            // so the screen saver syncs after this drain.
+            Handled::LockScreenShown(_) => {}
             Handled::CommandResult { id, status } => out.results.push((
                 id,
                 matches!(status, tuna_shell_control::CommandStatus::Applied),
@@ -876,6 +879,33 @@ fn calendar_popover(
         });
     }
     (popover, cal)
+}
+
+/// `Shell.App.activate()` for a media player's app (mpris.js `raise`):
+/// raise the app's newest window when it runs, else launch it.
+fn activate_app(shell: &RefCell<Shell>, entry: &tuna_shell_host::apps::AppEntry) {
+    let app_id = entry
+        .app_id
+        .strip_suffix(".desktop")
+        .unwrap_or(&entry.app_id);
+    let mut shell = shell.borrow_mut();
+    let window = shell.control.as_ref().and_then(|control| {
+        control
+            .model()
+            .windows()
+            .iter()
+            .rev()
+            .find(|w| w.app_id.as_deref() == Some(app_id))
+            .map(|w| w.id)
+    });
+    match (window, shell.control.as_mut()) {
+        (Some(id), Some(control)) => {
+            let _ = control.activate_window(id);
+        }
+        _ => {
+            let _ = tuna_shell_host::apps::launch(entry);
+        }
+    }
 }
 
 /// One GNOME 51 quick toggle (`.quick-toggle`): icon, bold title and an
@@ -2165,6 +2195,28 @@ fn build(app: &adw::Application) {
     }));
     render_pills(&mut shell.borrow_mut());
     orca::start(shell.clone());
+    // The compositor knows the shell on the session bus only by the unique
+    // name of GIO's shared session connection (the one every shell D-Bus
+    // call and the org.gnome.Shell name use), declared over the pinned
+    // control socket and again after every redial (ADR 0010).
+    {
+        let shell = shell.clone();
+        gio::bus_get(
+            gio::BusType::Session,
+            None::<&gio::Cancellable>,
+            move |conn| {
+                let Some(name) = conn.ok().and_then(|conn| conn.unique_name()) else {
+                    eprintln!("tuna-shell-gtk: no session bus name to declare");
+                    return;
+                };
+                if let Some(control) = shell.borrow_mut().control.as_mut() {
+                    if let Err(e) = control.declare_bus_name(name.to_string()) {
+                        eprintln!("tuna-shell-gtk: declaring the session bus name failed: {e}");
+                    }
+                }
+            },
+        );
+    }
 
     // The compositor toggles the overview on presses over the
     // Activities control (ACTIVITIES_WIDTH_PX); sending a toggle here
@@ -2340,8 +2392,10 @@ fn build(app: &adw::Application) {
             }
         });
     }
-    // GNOME's lock screen lists media players above the notifications
-    // (js/ui/mpris.js, unlockDialog.js `_addPlayer`, #348).
+    // GNOME 51's media players, one MediaMessage each (js/ui/mpris.js):
+    // above the calendar's notifications (messageList.js
+    // `MessageView._setupMpris`, #1037) and on the lock screen
+    // (unlockDialog.js `_addPlayer`, #348), from one MPRIS client.
     {
         let mpris = mpris::Mpris::start();
         let (source, act) = (mpris.clone(), mpris.clone());
@@ -2349,10 +2403,35 @@ fn build(app: &adw::Application) {
             Rc::new(move || source.lock_entries()),
             Rc::new(move |bus_name, action| act.act(bus_name, action)),
         );
-        let lock_ui = Rc::downgrade(&lock_ui);
+        let (source, act, raiser) = (mpris.clone(), mpris.clone(), mpris.clone());
+        let (shell, popover) = (shell.clone(), cal_popover.downgrade());
+        notify.set_media(
+            Rc::new(move || {
+                source
+                    .players()
+                    .into_iter()
+                    .map(|player| {
+                        let visible = mpris::media_visible(&player.policy, false);
+                        (player.entry, visible)
+                    })
+                    .collect::<Vec<_>>()
+            }),
+            Rc::new(move |bus_name: &str, action| act.act(bus_name, action)),
+            Rc::new(move |bus_name: &str| {
+                raiser.raise(bus_name, &|app| activate_app(&shell, app));
+                // `Main.panel.closeCalendar()`.
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
+            }),
+        );
+        let (lock_ui, notify) = (Rc::downgrade(&lock_ui), Rc::downgrade(&notify));
         mpris.connect_changed(move || {
             if let Some(lock_ui) = lock_ui.upgrade() {
                 lock_ui.refresh_media();
+            }
+            if let Some(notify) = notify.upgrade() {
+                notify.refresh_media();
             }
         });
     }
@@ -2956,7 +3035,13 @@ fn build(app: &adw::Application) {
         },
         {
             let shell = shell.clone();
-            Rc::new(move || shell.borrow().control.as_ref().is_some_and(|c| c.locked()))
+            Rc::new(move || {
+                shell
+                    .borrow()
+                    .control
+                    .as_ref()
+                    .is_some_and(|c| c.lock_screen_shown())
+            })
         },
     );
     // Wellbeing (#354): screen-time history/limits and break reminders.
@@ -4104,6 +4189,10 @@ fn build(app: &adw::Application) {
                 } = drained;
                 let mut shell = shell.borrow_mut();
                 let locked = shell.control.as_ref().is_some_and(|c| c.locked());
+                let lock_shown = shell
+                    .control
+                    .as_ref()
+                    .is_some_and(|c| c.lock_screen_shown());
                 let auth_generation = shell.control.as_ref().map(|c| c.connection_generation());
                 let authoritative_lock = shell
                     .control
@@ -4178,7 +4267,12 @@ fn build(app: &adw::Application) {
                 }
                 // Thunderbolt devices enrol only in an unlocked session.
                 thunderbolt.sync_lock(authoritative_lock);
-                screensaver.sync(locked);
+                // Active once the curtain has landed, as gnome-shell's
+                // `_lockScreenShown`: gnome-settings-daemon blanks the
+                // screen on ActiveChanged(true), which mid-slide would
+                // freeze the curtain off screen. Each confirmed unlock
+                // wakes the screen first, as `_continueDeactivate` does.
+                screensaver.sync(authoritative_lock, lock_shown);
                 // The session keyboard never shows over the lock screen.
                 osk.set_locked(locked);
                 for (focus, show, touch_auto) in osk_updates {

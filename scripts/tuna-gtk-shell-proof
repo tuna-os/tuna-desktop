@@ -10,14 +10,17 @@
 #   and notification sound gates only (needs pam_wrapper).
 #   --tray-only runs panel readiness and the AppIndicator pointer, library,
 #   keyboard and X11 tray gates only.
+#   --x11-iconic-only runs panel readiness and G-X11-ICONIC (a minimized
+#   X11 window is IconicState with _NET_WM_STATE_HIDDEN, #1078) only.
 #   --grid-hover-only runs panel readiness, G-GRID-HOVER, G-GRID-REORDER,
 #   G-GRID-ON-DEMAND and G-SHELL-STABLE only.
 #   --keyboard-routes-only runs panel readiness and the P-A11Y-02 keyboard
 #   route gates (G-PANEL-MENU-KEYS, G-QS-MENU-KEY, G-NOTIFICATION-KEYS,
 #   G-SCREENSHOT-CTRL-C) only.
-#   --datemenu-only runs panel readiness, the date menu's gates (G-CAL-OPEN,
-#   G-CAL-EVENTS, G-CAL-PREFS, G-CAL-LAUNCH, G-DATEMENU-WORLD-CLOCKS,
-#   G-DATEMENU-WEATHER), its accessibility golden and G-SHELL-STABLE only.
+#   --datemenu-only runs panel readiness, G-CLOCK-DAMAGE, the date menu's
+#   gates (G-CAL-OPEN, G-CAL-EVENTS, G-CAL-PREFS, G-CAL-LAUNCH,
+#   G-DATEMENU-WORLD-CLOCKS, G-DATEMENU-WEATHER), its accessibility golden
+#   and G-SHELL-STABLE only.
 #   --search-leak-only runs panel readiness, G-SEARCH-LEAK (50 searches with
 #   results leave shm mappings and descriptors where they were, #1084) and
 #   G-SHELL-STABLE only.
@@ -37,6 +40,8 @@
 #   A11Y-PANEL  the panel controls are exposed to screen readers by name
 #   G-SHELL-CAIRO on software GL the compositor starts the shell with
 #               GSK_RENDERER=cairo and the shell loads no Mesa rasterizer (#503)
+#   G-CLOCK-DAMAGE a clock tick repaints the clock's rectangle in the bar,
+#               under 2% of the output, not the whole output (#1154)
 #   G-CAL-EVENTS the calendar server's events for today list in the date
 #               menu's events card, timed as GNOME formats them
 #   G-CAL-OPEN  clicking the clock opens the calendar popover (xdg popup
@@ -120,6 +125,9 @@
 #                    silenced by enable-sound-alerts or event-sounds off
 #   G-NOTIFY-RESTORE re-enabling a disabled app brings what it sent while
 #                    disabled back to the list, with no banner
+#   G-NOTIFY-CALENDAR-MEDIA an MPRIS player lists in the date menu above
+#                    the notifications, its controls reach it, by its
+#                    app's enable, gone when it leaves the bus (#1037)
 #   G-QS-SERVICES    quick settings shows the tiles of the services on
 #                    the bus (stub daemons on a private system bus, #55)
 #   G-QS-WIFI-MENU   the Wi-Fi menu scans, lists NetworkManager's networks
@@ -169,6 +177,8 @@
 #   G-X11-APP      XWayland is on by default: an X11 app launched from
 #                  overview search gets DISPLAY and maps a window (#59)
 #   G-X11-INPUT-FOCUS the X server's input focus is the focused X11 window
+#   G-X11-ICONIC a minimized X11 window is WM_STATE IconicState with
+#                  _NET_WM_STATE_HIDDEN, and NormalState without once restored
 #   G-SETTINGS-CLOCK GNOME's clock-show-seconds key changes the panel clock
 #   G-SETTINGS-INPUT GNOME's input sources set the keymap (Super+Space
 #                  switches), repeat-interval the repeat rate, and
@@ -267,7 +277,9 @@
 #                  with animations off
 #   G-LOCK-SLIDE   the lock curtain lowers on lock and lifts after PAM
 #                  unlocks, fades only under Reduced Motion, instant
-#                  with animations off
+#                  with animations off; the screen saver goes active only
+#                  once the curtain has landed (gnome-settings-daemon
+#                  blanks on ActiveChanged(true))
 #                  (these sample TUNA_ANIMATION_CLOCK at exact delays)
 #   G-LOCK-WITH-MENU-OPEN Super+L with the date menu (then quick
 #                  settings) open closes the menu; the very next typed
@@ -520,6 +532,8 @@ if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ] && command -v dbus-run-session >/dev/nul
 fi
 unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+# shellcheck source=scripts/lib/tuna-state-snapshot.sh
+. "$ROOT/scripts/lib/tuna-state-snapshot.sh"
 DISPLAY_ARG=""
 ARTIFACTS="$ROOT/gtk-shell-artifacts"
 WIDTH=1280
@@ -529,6 +543,7 @@ SCREENSHOT_KEYS_ONLY=0
 A11Y_FOCUS_ONLY=0
 NOTIFY_LOCK_ONLY=0
 TRAY_ONLY=0
+X11_ICONIC_ONLY=0
 GRID_HOVER_ONLY=0
 KEYBOARD_ROUTES_ONLY=0
 DATEMENU_ONLY=0
@@ -580,6 +595,7 @@ while [ $# -gt 0 ]; do
         --search-leak-only) SEARCH_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --window-leak-only) WINDOW_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --lock-menu-only) LOCK_MENU_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
+        --x11-iconic-only) X11_ICONIC_ONLY=1; only_mode "$1"; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --help|-h) sed -n '2,/^# end of --help$/{/^# end of --help$/!p;}' "$0"; exit 0 ;;
@@ -1574,7 +1590,7 @@ if [ "$INSTALLED_PACKAGE" = 1 ]; then
         [ "$(date +%s)" -le "$end" ] || fail G-INSTALLED-START "installed startup overview never became ready"
         sleep 0.3
     done
-    cp "$CSTATE" "$ARTIFACTS/installed-startup-overview.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/installed-startup-overview.json"
     scrot "$ARTIFACTS/installed-startup-overview.png" >/dev/null
     installed_focus="$(timeout 5 xdotool getwindowfocus)"
     installed_host_pid="$(timeout 5 xdotool getwindowpid "$WID")"
@@ -1592,7 +1608,7 @@ if [ "$INSTALLED_PACKAGE" = 1 ]; then
         sleep 0.3
     done
     python3 "$ROOT/scripts/lib/installed-deb-proof.py" stable "$COMPOSITOR_PID" "tuna-gtk-proof-$$" "$ARTIFACTS/installed-package.json" "$ARTIFACTS/installed-start.json" "$ARTIFACTS/installed-after-escape.json"
-    cp "$CSTATE" "$ARTIFACTS/installed-desktop-before-panel.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/installed-desktop-before-panel.json"
 fi
 
 # Tray helpers: dump the shell, wait for a node, aim at a node's live
@@ -1796,6 +1812,86 @@ tray_x11_gate() {
     fi
 }
 
+# G-X11-ICONIC (#1078): a minimized X11 window is told so, as Mutter's
+# meta_window_x11_set_wm_state and set_net_wm_state tell it: WM_STATE
+# IconicState and _NET_WM_STATE_HIDDEN while hidden, NormalState without
+# _NET_WM_STATE_HIDDEN once restored, so the client can pause rendering
+# and playback. Super+H, the window menu's Hide and the client's own ICCCM
+# WM_CHANGE_STATE IconicState request hide it; the overview and Alt+Tab
+# bring it back. Each state read is kept as x11-iconic-<step>.txt.
+x11_iconic_state() {
+    for _ in $(seq 1 25); do
+        DISPLAY="$x11_display" xprop -id "$iconic_window" WM_STATE _NET_WM_STATE \
+            >"$ARTIFACTS/x11-iconic-$2.txt" 2>&1 || true
+        if grep -q "window state: $1" "$ARTIFACTS/x11-iconic-$2.txt"; then
+            if grep -q _NET_WM_STATE_HIDDEN "$ARTIFACTS/x11-iconic-$2.txt"; then
+                [ "$1" = Iconic ] && return 0
+            else
+                [ "$1" = Normal ] && return 0
+            fi
+        fi
+        sleep 0.2
+    done
+    cat "$ARTIFACTS/x11-iconic-$2.txt" >&2
+    return 1
+}
+x11_iconic_pick() {
+    xdotool key Super_L
+    cstate ".overview_open and any(.previews[]; .id == $iconic_id)" "X11 probe preview" || return 1
+    sleep 1
+    iconic_pick="$(jq -r ".previews[] | select(.id == $iconic_id) | .rect | \"\(.[0] + .[2] / 2 | floor) \(.[1] + .[3] / 2 | floor)\"" "$CSTATE")"
+    # shellcheck disable=SC2086
+    xdotool mousemove --window "$WID" $iconic_pick click 1
+    cstate "(.overview_open | not) and .overview_progress == 0 and .focused == $iconic_id" "X11 probe picked"
+}
+x11_iconic_gate() {
+    iconic_before="$(jq -c '[.windows[] | .id]' "$CSTATE")"
+    DISPLAY="$x11_display" xev -name "Tuna Iconic Probe" >/dev/null 2>&1 &
+    ICONIC_PID=$!
+    cstate ".focused != null and (.focused as \$f | $iconic_before | index(\$f) == null)" "X11 probe focused" ||
+        fail G-X11-ICONIC "the X11 probe never took focus"
+    iconic_id="$(jq -r .focused "$CSTATE")"
+    iconic_window="$(DISPLAY="$x11_display" xdotool search --name '^Tuna Iconic Probe$' | head -1)"
+    [ -n "$iconic_window" ] || fail G-X11-ICONIC "the X11 probe's window was not found"
+    x11_iconic_state Normal mapped ||
+        fail G-X11-ICONIC "the mapped X11 window is not NormalState without _NET_WM_STATE_HIDDEN"
+
+    xdotool key super+h
+    cstate "any(.minimized[]; . == $iconic_id)" "Super+H hid the X11 probe" ||
+        fail G-X11-ICONIC "Super+H did not minimize the X11 window"
+    x11_iconic_state Iconic super-h ||
+        fail G-X11-ICONIC "Super+H left the X11 window without IconicState and _NET_WM_STATE_HIDDEN"
+    x11_iconic_pick || fail G-X11-ICONIC "the overview did not bring the X11 window back"
+    x11_iconic_state Normal overview ||
+        fail G-X11-ICONIC "the overview's restore left the X11 window iconic"
+
+    xdotool key alt+space
+    sleep 1.5
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-x11-iconic-menu.json" 20 \
+        --press "Hide" || fail G-X11-ICONIC "the X11 window's menu has no Hide"
+    cstate "any(.minimized[]; . == $iconic_id)" "Hide hid the X11 probe" ||
+        fail G-X11-ICONIC "the window menu's Hide did not minimize the X11 window"
+    x11_iconic_state Iconic window-menu ||
+        fail G-X11-ICONIC "Hide left the X11 window without IconicState and _NET_WM_STATE_HIDDEN"
+    xdotool key alt+Tab
+    cstate ".focused == $iconic_id and (any(.minimized[]; . == $iconic_id) | not)" "Alt+Tab restored the X11 probe" ||
+        fail G-X11-ICONIC "Alt+Tab did not bring the X11 window back"
+    x11_iconic_state Normal alt-tab ||
+        fail G-X11-ICONIC "Alt+Tab's restore left the X11 window iconic"
+
+    # XIconifyWindow: WM_CHANGE_STATE IconicState to the root window.
+    DISPLAY="$x11_display" xdotool windowminimize "$iconic_window"
+    cstate "any(.minimized[]; . == $iconic_id)" "the X11 probe iconified itself" ||
+        fail G-X11-ICONIC "the client's WM_CHANGE_STATE IconicState did not minimize it"
+    x11_iconic_state Iconic wm-change-state ||
+        fail G-X11-ICONIC "the client's iconify left it without IconicState and _NET_WM_STATE_HIDDEN"
+    x11_iconic_pick || fail G-X11-ICONIC "the overview did not bring the iconified X11 window back"
+    x11_iconic_state Normal restored ||
+        fail G-X11-ICONIC "restoring the iconified X11 window left it iconic"
+    kill "$ICONIC_PID" 2>/dev/null || true
+    pass G-X11-ICONIC "Super+H, Hide and the client's own iconify make an X11 window IconicState with _NET_WM_STATE_HIDDEN; the overview and Alt+Tab make it NormalState without"
+}
+
 # G-LOCK-WITH-MENU-OPEN: GNOME's lock dismisses the open shell menu and
 # its grab, and the lock screen has the keyboard at once. Each menu is
 # opened from its keybinding, Super+L locks over it, and the password
@@ -1890,6 +1986,17 @@ if [ "$TRAY_ONLY" = 1 ]; then
     cstate '.x11_display != null' "xwayland" 30 || fail G-TRAY-X11 "XWayland display never advertised"
     x11_display="$(jq -r '.x11_display' "$CSTATE")"
     tray_x11_gate
+    exit 0
+fi
+if [ "$X11_ICONIC_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "X11 iconic desktop ready" ||
+        fail G-X11-ICONIC "desktop never became ready"
+    # Let the startup cover settle before the first window.
+    sleep 3
+    cstate '.x11_display != null' "xwayland" 30 || fail G-X11-ICONIC "XWayland display never advertised"
+    x11_display="$(jq -r '.x11_display' "$CSTATE")"
+    x11_iconic_gate
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     exit 0
 fi
 if [ "$KEYBOARD_ROUTES_ONLY" = 1 ]; then
@@ -1991,6 +2098,7 @@ if [ "$DATEMENU_ONLY" = 1 ]; then
         fail G-CAL-OPEN "desktop never became ready"
     # The startup cover must be gone before frames are read.
     sleep 3
+    clock_damage_proof
     calendar_proof
     datemenu_proof
     xdotool key Escape
@@ -2119,6 +2227,11 @@ gsettings set org.gnome.desktop.background picture-uri-dark "$wallpaper_before_d
 gsettings set org.gnome.desktop.background picture-options "$wallpaper_before_options"
 sleep 1
 pass G-WALLPAPER-URI "spaces, Unicode and literal percent escapes identify the actual selected wallpaper pixels"
+
+# The comparison slice runs old binaries that publish no damage bounds.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    clock_damage_proof
+fi
 
 # A popover counts as open only when its contents are showing in the
 # accessible tree: a pixel diff passes on a mere hover highlight.
@@ -2406,7 +2519,7 @@ EOF2
     sleep 0.5
     cstate ".windows[] | select(.app_id == \"tuna-test-beta\") | .rect[2] == $bw and .rect[3] == $bh and .rect[0] < $bx" "dropped floating" ||
         fail G-EDGE-TILING-OFF "the window tiled or resized with edge-tiling off"
-    cp "$CSTATE" "$ARTIFACTS/edge-tiling-off.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/edge-tiling-off.json"
     # GTK must request the native move while the button is still held.
     # Sending the whole restore before that round trip can retire the
     # implicit grab first. Admission and completion share the original 20s.
@@ -2422,7 +2535,7 @@ EOF2
         ! cstate ".interactive_move_window == $restore_id and .pointer_position == [$((nx + 151)), $((ny + 20))]" "Beta restore move admitted" "$restore_wait"; then
         fail G-EDGE-TILING-OFF "GTK never acquired Beta's native restore move"
     fi
-    cp "$CSTATE" "$ARTIFACTS/edge-tiling-restore-admission.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/edge-tiling-restore-admission.json"
     restore_geometry="$(jq -er --argjson id "$restore_id" \
         --argjson x "$((nx + 151))" --argjson y "$((ny + 20))" '
         select(.interactive_move_window == $id and .pointer_position == [$x, $y]) |
@@ -2741,16 +2854,16 @@ EOF2
     xdotool key super+shift+End
     cstate ". as \$s | any(.windows[]; .id == $mt_gamma and .workspace == \$s.workspaces[3]) and .active_workspace == .workspaces[3]" "gamma on the last fixed workspace" ||
         fail G-WS-FIXED "Super+Shift+End did not move Gamma to the 4th fixed workspace"
-    cp "$CSTATE" "$ARTIFACTS/workspaces-fixed-4.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/workspaces-fixed-4.json"
     gsettings set org.gnome.desktop.wm.preferences num-workspaces 2
     cstate ". as \$s | (.workspaces | length) == 2 and any(.windows[]; .id == $mt_gamma and .workspace == \$s.workspaces[1]) and any(.workspaces[]; . == \$s.active_workspace) and ([.windows[] | select(.id != $mt_gamma)] | all(.workspace == \$s.workspaces[0]))" "shrunk to two" ||
         fail G-WS-FIXED "shrinking num-workspaces did not move Gamma to the new last workspace"
-    cp "$CSTATE" "$ARTIFACTS/workspaces-fixed-2.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/workspaces-fixed-2.json"
     gsettings set org.gnome.mutter dynamic-workspaces true
     gsettings reset org.gnome.desktop.wm.preferences num-workspaces
     cstate ". as \$s | .multitasking.dynamic_workspaces and (.workspaces | length) == 3 and any(.windows[]; .id == $mt_gamma and .workspace == \$s.workspaces[1])" "dynamic again" ||
         fail G-WS-FIXED "dynamic-workspaces on did not compact to two occupied workspaces and one empty"
-    cp "$CSTATE" "$ARTIFACTS/workspaces-dynamic-again.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/workspaces-dynamic-again.json"
     [ "$(jq .focused "$CSTATE")" = "$mt_gamma" ] || xdotool key super+Page_Down
     cstate ".focused == $mt_gamma" "gamma focused before home" ||
         fail G-WS-FIXED "could not focus Gamma on its workspace"
@@ -2786,7 +2899,7 @@ EOF2
         else
             want_x=$(((WIDTH % (dw + 1)) / 2)); want_y=$((32 + (work_h % (dh + 1)) / 3))
         fi
-        cp "$CSTATE" "$ARTIFACTS/center-new-windows-$mt_center.json"
+        snapshot_state "$CSTATE" "$ARTIFACTS/center-new-windows-$mt_center.json"
         scrot "$ARTIFACTS/08f-center-new-windows-$mt_center.png" >/dev/null
         if [ "$dx" != "$want_x" ] || [ "$dy" != "$want_y" ]; then
             fail G-CENTER-NEW-WINDOWS "center-new-windows=$mt_center placed ${dw}x$dh at $dx,$dy, not mutter's $want_x,$want_y"
@@ -2866,7 +2979,7 @@ else
     anim_clock 50
     cstate "$(thumb_alphas '((. - 191 / 255) | fabs) < 1e-6')" "thumbnails 50 ms in" ||
         { xdotool keyup Alt_L; real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were not three quarters opaque 50 ms in"; }
-    cp "$CSTATE" "$ARTIFACTS/switcher-thumbnails-50ms.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/switcher-thumbnails-50ms.json"
     anim_clock 100
     cstate "$(thumb_alphas '. == 1')" "thumbnails 100 ms in" ||
         { xdotool keyup Alt_L; real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were not opaque 100 ms in"; }
@@ -2883,7 +2996,7 @@ else
     anim_clock 150
     cstate "$(thumb_alphas '((. - 64 / 255) | fabs) < 1e-6')" "thumbnails 50 ms into the fade-out" ||
         { real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were not a quarter opaque 50 ms into the fade-out"; }
-    cp "$CSTATE" "$ARTIFACTS/switcher-thumbnails-out-50ms.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/switcher-thumbnails-out-50ms.json"
     anim_clock 200
     cstate ".switcher_thumbnails == 0 and .focused == $fade_focus" "thumbnails faded out" ||
         { real_clock; fail G-SWITCHER-FADE "the thumbnails' windows were still drawn after the fade-out, or focus moved"; }
@@ -3329,7 +3442,7 @@ fi
 grid_cancel_dump "$ARTIFACTS/a11y-folder-page-peek.json" ||
     fail G-GRID-DRAG-CANCEL "active neutral dump failed"
 scrot "$ARTIFACTS/11h-folder-page-peek.png" >/dev/null
-cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-escape.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/grid-cancel-before-escape.json"
 "$PY" "$ROOT/scripts/lib/tuna_grid_cancel_proof.py" neutral-check \
     "$grid_cancel_pid" "$grid_cancel_start" "$ARTIFACTS/a11y-folder-page-peek.json" \
     "$ARTIFACTS/grid-cancel-before-escape.json" "$grid_neutral_x" "$grid_neutral_y" \
@@ -3342,7 +3455,7 @@ if [ "$GRID_CANCEL_OLD_NEGATIVE" = 1 ]; then
     # Test-only old-source discriminator. The default/full gate NEVER accepts
     # overview close, and this branch requires the exact live old tuple above.
     cstate ".client_dnd_active == true and .overview_open == false and (.locked == false) and (.rendered_frames > $grid_cancel_before_frame)" "old drag retained before release" || fail G-GRID-DRAG-OLD-NEG "reviewed old source did not reproduce Escape routing failure"
-    cp "$CSTATE" "$ARTIFACTS/grid-cancel-old-before-release.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/grid-cancel-old-before-release.json"
     scrot "$ARTIFACTS/grid-cancel-old-before-release.png" >/dev/null
     gsettings get org.gnome.shell app-picker-layout > "$ARTIFACTS/grid-cancel-old-layout-before-release.txt"
     "$PY" - "$ROOT" "$ARTIFACTS/grid-cancel-before-escape.json" "$ARTIFACTS/grid-cancel-old-before-release.json" <<'PY_GRID_OLD'
@@ -3362,7 +3475,7 @@ fi
 # xdotool's Escape release reaches the seat after its press cancels the drag,
 # so wait for the held-key count to return to its baseline too.
 cstate ".client_dnd_active == false and .overview_open and .overview_app_grid and (.locked == false) and (.rendered_frames > $grid_cancel_before_frame) and (.seat_pressed_key_count == $grid_cancel_before_keys)" "folder cancellation before release" || fail G-GRID-DRAG-CANCEL "Escape failed to cancel native drag while keeping grid open"
-cp "$CSTATE" "$ARTIFACTS/grid-cancel-before-release.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/grid-cancel-before-release.json"
 scrot "$ARTIFACTS/grid-cancel-before-release.png" >/dev/null
 # GTK hears cancel asynchronously and removes preview widgets during traversal.
 # Reject an inconsistent tree, then wait for a fresh complete owner-bound tree
@@ -5457,7 +5570,7 @@ if command -v Xwayland >/dev/null 2>&1 && command -v xeyes >/dev/null 2>&1; then
         cstate ".windows[] | select(.id == $x11_model_id) | .introspect_eligible == $x11_pickable" \
             "X11 $x11_kind picker eligibility" ||
             fail G-INTROSPECT-TYPES "actual X11 $x11_kind role did not yield $x11_pickable"
-        cp "$CSTATE" "$ARTIFACTS/introspect-type-$x11_kind.json"
+        snapshot_state "$CSTATE" "$ARTIFACTS/introspect-type-$x11_kind.json"
     done <<EOF
 NORMAL true
 DIALOG true
@@ -5477,7 +5590,7 @@ EOF
     DISPLAY="$x11_display" xprop -id "$x11_window" -remove _NET_WM_WINDOW_TYPE
     cstate ".windows[] | select(.id == $x11_model_id) | .introspect_eligible" \
         "X11 absent type is normal" || fail G-INTROSPECT-TYPES "absent type did not restore eligibility"
-    cp "$CSTATE" "$ARTIFACTS/introspect-type-absent.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/introspect-type-absent.json"
     pass G-INTROSPECT-TYPES "actual mapped X11 role changes follow all fourteen EWMH types and restore the absent-type default"
     DISPLAY="$x11_display" "$COMPANIONS/icon-probe" --x11-hints >"$ARTIFACTS/hints-probe.log" 2>&1 &
     HINTS_PID=$!
@@ -5507,6 +5620,7 @@ EOF
     fi
     kill "$XEV_PID" 2>/dev/null || true
     pass G-X11-INPUT-FOCUS "X input focus is the focused X11 window $xev_window"
+    x11_iconic_gate
     tray_x11_gate
 else
     echo "tuna-gtk-shell-proof: G-X11-APP skipped (no Xwayland or xeyes)"
@@ -5523,7 +5637,7 @@ xdotool key Super_L
 cstate '.overview_open' "icon overview" || fail G-WINDOW-ICONS "overview did not open"
 sleep 1
 scrot "$ARTIFACTS/20a-window-icons-overview.png" >/dev/null
-cp "$CSTATE" "$ARTIFACTS/window-icons-state.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/window-icons-state.json"
 xdotool key Escape
 cstate '.overview_open == false' "icon overview closed" || fail G-WINDOW-ICONS "overview did not close"
 xdotool keydown Alt_L key Tab
@@ -5723,7 +5837,7 @@ while :; do
 done
 sleep 1
 scrot -o "$ARTIFACTS/set-wallpaper-shot-reverted.png" >/dev/null
-cp "$CSTATE" "$ARTIFACTS/set-wallpaper-reverted-state.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/set-wallpaper-reverted-state.json"
 pass G-SET-WALLPAPER "picture-uri writes publish, identify, decode and visibly repaint; replacement refreshes, an invalid URI is ignored, and revert restores"
 
 # P-ST-01 (#594): clock-format and clock-show-date reach the panel clock
@@ -6052,7 +6166,7 @@ cstate '.animation_clock_manual' "frozen corner clock" ||
 xdotool mousemove --window "$WID" 1 1
 cstate '.overview_open' "hot corner enabled" ||
     fail G-HOT-CORNER "enabling GNOME hot corners did not open the actual overview"
-cp "$CSTATE" "$ARTIFACTS/hot-corner-enabled.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/hot-corner-enabled.json"
 # The first ring starts at full opacity and is a quarter gone half way.
 tvalue hot_corner_ripples 1 || fail G-HOT-CORNER-RIPPLES "the corner did not start GNOME's ripples"
 anim_clock 415
@@ -6130,13 +6244,13 @@ gsettings set org.gnome.desktop.interface cursor-theme 'TunaProof'
 gsettings set org.gnome.desktop.interface cursor-size 24
 cstate '.cursor.theme == "TunaProof" and .cursor.size == 24 and .cursor.kind == "named" and .cursor.name == "default" and .cursor.source == "client" and .cursor.image_theme == "TunaProofBase" and .cursor.image == [24, 24] and .cursor.logical == [24, 24]' "theme cursor at 24px" ||
     fail G-CURSOR-SIZE "cursor-theme TunaProof at size 24 did not draw the inherited 24px image"
-cp "$CSTATE" "$ARTIFACTS/cursor-size-24.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/cursor-size-24.json"
 "$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-size-24.png" 24 1 1 181,29,91 ||
     fail G-CURSOR-SIZE "the actual 24px legacy cursor pixels or hotspot differ"
 gsettings set org.gnome.desktop.interface cursor-size 48
 cstate '.cursor.size == 48 and .cursor.image_theme == "TunaProofBase" and .cursor.image == [48, 48] and .cursor.logical == [48, 48]' "theme cursor at 48px" ||
     fail G-CURSOR-SIZE "cursor-size 48 did not redraw the cursor from the 48px image live"
-cp "$CSTATE" "$ARTIFACTS/cursor-size-48.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/cursor-size-48.json"
 "$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-size-48.png" 48 1 1 25,173,125 ||
     fail G-CURSOR-SIZE "the actual 48px legacy cursor pixels or hotspot differ"
 # A live theme change must replace the buffer with GNOME51 SVG data,
@@ -6158,7 +6272,7 @@ gsettings set org.gnome.desktop.interface cursor-size 24
 cursor_probe shape crosshair G-CURSOR-SHAPE
 cstate '.cursor.kind == "named" and .cursor.name == "crosshair" and .cursor.source == "client" and .cursor.file == "crosshair" and .cursor.image_theme == "TunaProofBase" and .cursor.image == [24, 24]' "crosshair shape" ||
     fail G-CURSOR-SHAPE "a wp_cursor_shape_v1 crosshair request did not draw the theme's crosshair"
-cp "$CSTATE" "$ARTIFACTS/cursor-shape-crosshair.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/cursor-shape-crosshair.json"
 "$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-shape-crosshair.png" 24 1 1 181,29,91 ||
     fail G-CURSOR-SHAPE "the requested shape has incorrect actual legacy pixels"
 # A shape the theme chain lacks still shows: from libXcursor's default
@@ -6185,7 +6299,7 @@ cstate '.cursor.image_theme == "TunaProofSvg" and .cursor.animation_frames == 2 
 cursor_probe surface 32 G-CURSOR-SHAPE
 cstate '.cursor.kind == "surface" and .cursor.image == [32, 32] and .cursor.logical == [32, 32]' "client cursor surface" ||
     fail G-CURSOR-SHAPE "a client's 32px cursor surface was not drawn at its size"
-cp "$CSTATE" "$ARTIFACTS/cursor-surface.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/cursor-surface.json"
 "$PY" "$ROOT/scripts/lib/cursor-pixels.py" "$ARTIFACTS/cursor-surface.png" 32 0 0 224,27,36 ||
     fail G-CURSOR-SHAPE "the client surface has incorrect actual pixels"
 kill "$CURSOR_PID" 2>/dev/null || true
@@ -6243,7 +6357,7 @@ cstate '.cursor.locate_pointer.enabled' "locate-pointer on" ||
 xdotool key Control_L
 cstate ".cursor.locate_pointer.count == $((locate_before + 1)) and .cursor.locate_pointer.active and .cursor.locate_pointer.frames > $locate_frames" "ripples" 3 ||
     fail G-LOCATE-POINTER "a Ctrl tap with locate-pointer on drew no ripples"
-cp "$CSTATE" "$ARTIFACTS/locate-pointer.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/locate-pointer.json"
 jq -e ".cursor.locate_pointer.at == [$((WIDTH / 2)), $((HEIGHT / 2))]" "$CSTATE" >/dev/null ||
     fail G-LOCATE-POINTER "the ripples did not center on the pointer: $(jq -c '.cursor.locate_pointer' "$CSTATE")"
 cstate '.cursor.locate_pointer.active | not' "ripples finished" 5 ||
@@ -6280,7 +6394,7 @@ done
 if [ -z "$corner_restored_rect" ] || [ "$corner_restored_rect" = null ]; then
     fail G-HOT-CORNER-FULLSCREEN "genuine GTK proof window never settled in place"
 fi
-cp "$CSTATE" "$ARTIFACTS/hot-corner-client-before-fullscreen.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/hot-corner-client-before-fullscreen.json"
 printf '{"generation":1,"request":"fullscreen"}\n' >"$corner_requests"
 cstate ".focused_rect == [0, 0, $WIDTH, $HEIGHT]" "corner proof fullscreen" ||
     fail G-HOT-CORNER-FULLSCREEN "actual GTK fullscreen request did not cover the output"
@@ -6294,7 +6408,7 @@ cstate '.pointer_position == [1, 1] and .pointer_fullscreen_blocked' "fullscreen
     fail G-HOT-CORNER-FULLSCREEN "actual corner coordinates or fullscreen guard were not observed"
 cstate '.overview_open | not' "fullscreen corner blocked" ||
     fail G-HOT-CORNER-FULLSCREEN "the corner opened over the fullscreen window"
-cp "$CSTATE" "$ARTIFACTS/hot-corner-fullscreen-blocked.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/hot-corner-fullscreen-blocked.json"
 scrot "$ARTIFACTS/hot-corner-fullscreen-blocked.png" >/dev/null
 xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
 xdotool key super
@@ -6310,19 +6424,19 @@ cstate '.overview_open | not' "fullscreen deliberate overview dismissed" ||
 xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
 cstate ".pointer_position == [$((WIDTH / 2)), $((HEIGHT / 2))]" "fullscreen corner exit delivered" ||
     fail G-HOT-CORNER-FULLSCREEN "backend did not deliver the requested corner exit"
-cp "$CSTATE" "$ARTIFACTS/hot-corner-fullscreen-before-unfullscreen.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/hot-corner-fullscreen-before-unfullscreen.json"
 printf '{"generation":2,"request":"unfullscreen"}\n' >"$corner_requests"
 # A null focus during overview teardown is not an unfullscreen completion.
 # Observe the original mapped client and its exact saved rectangle with the
 # real pointer still at the center, before the one genuine corner entry.
 cstate ".focused == $corner_window_id and .focused_rect == $corner_restored_rect and (.windows | any(.id == $corner_window_id and .rect == $corner_restored_rect)) and .pointer_position == [$((WIDTH / 2)), $((HEIGHT / 2))] and (.pointer_fullscreen_blocked | not)" "original corner proof restored at center" ||
     fail G-HOT-CORNER-FULLSCREEN "actual GTK unfullscreen request did not restore geometry"
-cp "$CSTATE" "$ARTIFACTS/hot-corner-unfullscreen-before-entry.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/hot-corner-unfullscreen-before-entry.json"
 xdotool mousemove --window "$WID" 1 1
 xdotool getmouselocation --shell >"$ARTIFACTS/hot-corner-unfullscreen-host-pointer.txt"
 cstate '.pointer_position == [1, 1]' "unfullscreen corner entry delivered" ||
     fail G-HOT-CORNER-FULLSCREEN "backend did not deliver the requested corner entry"
-cp "$CSTATE" "$ARTIFACTS/hot-corner-unfullscreen-entry.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/hot-corner-unfullscreen-entry.json"
 cstate '.pointer_fullscreen_blocked | not' "unfullscreen corner guard removed" ||
     fail G-HOT-CORNER-FULLSCREEN "actual fullscreen guard remained after restoring geometry"
 cstate '.overview_open' "corner restored after fullscreen" ||
@@ -6365,7 +6479,7 @@ cstate "([.frame_cost[] | .culled_windows[]] | index($below_id) != null) and ([.
     fail G-OCCLUSION-CULL "the window under an opaque fullscreen window was still drawn"
 cstate ".throttled_windows | index($below_id) != null and index($above_id) == null" "lower window frame callbacks throttled" ||
     fail G-OCCLUSION-CULL "the hidden window kept full-rate frame callbacks"
-cp "$CSTATE" "$ARTIFACTS/occlusion-fullscreen.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/occlusion-fullscreen.json"
 scrot "$ARTIFACTS/occlusion-fullscreen.png" >/dev/null
 printf '{"generation":2,"request":"unfullscreen"}\n' >"$occlusion_requests"
 cstate ".focused == $above_id and .focused_rect != [0, 0, $WIDTH, $HEIGHT]" "occlusion upper restored" ||
@@ -6374,7 +6488,7 @@ cstate "([.frame_cost[] | .drawn_windows[]] | index($below_id) != null) and ([.f
     fail G-OCCLUSION-CULL "the lower window stayed culled under a translucent-edged window"
 cstate ".throttled_windows | index($below_id) == null" "lower window frame callbacks restored" ||
     fail G-OCCLUSION-CULL "the shown window stayed throttled"
-cp "$CSTATE" "$ARTIFACTS/occlusion-restored.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/occlusion-restored.json"
 # shellcheck disable=SC2086
 kill $OCCLUSION_PIDS 2>/dev/null || true
 OCCLUSION_PIDS=""
@@ -6453,7 +6567,7 @@ cstate ".pointer_device_settings == {
     \"pointing_stick\": {\"speed_milli\": -500, \"accel_profile\": \"Flat\", \"scroll_method\": \"None\"}}" \
     "pointer device keys applied" ||
     fail G-SETTINGS-POINTER "GNOME's touchpad, mouse, trackball and pointing-stick keys did not reach the compositor"
-cp "$CSTATE" "$ARTIFACTS/pointer-device-settings.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/pointer-device-settings.json"
 reset_pointer_keys
 cstate '.pointer_device_settings == {
     "mouse_accel_profile": "Default",
@@ -6570,7 +6684,7 @@ a11y_right_alt_tap() {
 }
 "$PY" "$ROOT/scripts/lib/xkeysym-levels.py" "$DISPLAY" ffea fe03 >"$ARTIFACTS/a11y-host-rightalt-levels.log" 2>&1 ||
     fail G-A11Y-KEYMAP "could not record the host RightAlt/Level3 keymap"
-cp "$CSTATE" "$ARTIFACTS/a11y-keymap-before-rightalt.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/a11y-keymap-before-rightalt.json"
 mark="$(a11y_mark)"
 a11y_right_alt_tap
 cstate '.input_aids.latched == ["alt"]' "US physical RightAlt is Alt" ||
@@ -6588,7 +6702,7 @@ cstate '.keyboard.layouts == ["German"] and .input_aids.latched == [] and .seat_
     fail G-A11Y-KEYMAP "German layout replacement did not clear held modifiers"
 gsettings set "$A11Y_KBD" stickykeys-enable false
 cstate '(.input_aids.sticky | not)' "German sticky off" || fail G-A11Y-KEYMAP "Sticky Keys off did not apply"
-cp "$CSTATE" "$ARTIFACTS/a11y-keymap-german-sticky-off.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/a11y-keymap-german-sticky-off.json"
 mark="$(a11y_mark)"
 a11y_right_alt_tap
 xdotool key q
@@ -6601,7 +6715,7 @@ mark="$(a11y_mark)"
 a11y_right_alt_tap
 cstate '.input_aids.latched == ["level3"]' "German Level3 latched" ||
     fail G-A11Y-KEYMAP "the configured German AltGr selector did not latch Level3"
-cp "$CSTATE" "$ARTIFACTS/a11y-keymap-german-level3-latched.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/a11y-keymap-german-level3-latched.json"
 xdotool key q q
 a11y_wait "[.presses[$mark:][] | select(.printable) | {keyval,alt}] == [{\"keyval\":64,\"alt\":false},{\"keyval\":113,\"alt\":false}]" "German Level3 spent once" ||
     fail G-A11Y-KEYMAP "the real German client did not receive @ then plain q"
@@ -6898,7 +7012,7 @@ cstate '(.animations_enabled | not)' "animations disabled" ||
 xdotool key Super_L
 cstate '.overview_open and .overview_progress == 1' "instant overview" ||
     fail G-ANIMATIONS-OFF "the disabled overview did not jump to its open state"
-cp "$CSTATE" "$ARTIFACTS/animations-disabled-open.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/animations-disabled-open.json"
 xdotool key Escape
 cstate '(.overview_open | not) and .overview_progress == 0' "instant desktop" ||
     fail G-ANIMATIONS-OFF "the disabled overview did not jump to its closed state"
@@ -6934,7 +7048,7 @@ cstate '.animations_enabled and .motion_policy == "fade-only"' "reduced motion" 
 xdotool key Super_L
 cstate '.overview_open and .overview_progress == 1' "reduced overview" ||
     fail G-ANIMATIONS-OFF "Reduced Motion overview did not jump to its open state"
-cp "$CSTATE" "$ARTIFACTS/reduced-motion-open.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/reduced-motion-open.json"
 xdotool key Escape
 cstate '(.overview_open | not) and .overview_progress == 0' "reduced desktop" ||
     fail G-ANIMATIONS-OFF "Reduced Motion overview did not jump to its closed state"
@@ -6987,7 +7101,7 @@ anim_clock 125
 # Opening eases out-sine (#499): sin(pi/4) of the way at half time.
 cstate '(.overview_progress - 0.7071067811865476 | if . < 0 then -. else . end) < 1e-9' "overview at 125 ms" ||
     fail G-ANIMATION-CLOCK "the overview was not sin(pi/4) open 125 ms in (EASE_OUT_SINE)"
-cp "$CSTATE" "$ARTIFACTS/animation-clock-125ms.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/animation-clock-125ms.json"
 anim_clock 250
 cstate '.overview_progress == 1' "overview at 250 ms" ||
     fail G-ANIMATION-CLOCK "the overview had not settled 250 ms in"
@@ -7032,7 +7146,7 @@ anim_clock 75
 # Ease-out quad: three quarters of the way at half time.
 cstate "$(menu_ghost '.elapsed_ms == 75 and ((.frame.alpha - 0.25) | fabs) < 1e-9 and ((.frame.dy + 4.5) | fabs) < 1e-9 and ((.frame.scale - 0.97) | fabs) < 1e-9')" "menu close at 75 ms" ||
     fail G-TRANSIENT-CLOSE-CLOCK "the menu was not a quarter opaque, 4.5px up and 97% 75 ms in"
-cp "$CSTATE" "$ARTIFACTS/menu-close-75ms.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/menu-close-75ms.json"
 anim_clock 150
 cstate '(.menu_close.closing | length) == 0 and .menu_close.history[-1].outcome == "started"' "menu close at 150 ms" ||
     fail G-TRANSIENT-CLOSE-CLOCK "the menu close had not finished 150 ms in"
@@ -7433,7 +7547,7 @@ wb_probe_ensure() {
         fi
         cstate 'all(.windows[]; .app_id != "tuna-cursor-probe")' "stale probe gone" 5 ||
             fail "$WB_GATE" "a stale probe map outlived its client"
-        cp "$CSTATE" "$ARTIFACTS/wb-probe-before.json" ||
+        snapshot_state "$CSTATE" "$ARTIFACTS/wb-probe-before.json" ||
             fail "$WB_GATE" "compositor state missing before probe map"
         rm -f "$ARTIFACTS/wb-cursor-probe.log"
         WAYLAND_DISPLAY="$SOCKET_NAME" "$ARTIFACTS/cursor-client/tuna-cursor-client" surface 32 \
@@ -7459,7 +7573,7 @@ wb_probe_ensure() {
             fi
             sleep 0.3
         done
-        cp "$CSTATE" "$ARTIFACTS/wb-probe-after.json" ||
+        snapshot_state "$CSTATE" "$ARTIFACTS/wb-probe-after.json" ||
             fail "$WB_GATE" "compositor state missing after probe map"
         "$PY" "$ROOT/scripts/lib/tuna-wellbeing-probe-bind.py" bind \
             --before "$ARTIFACTS/wb-probe-before.json" \
@@ -7617,7 +7731,7 @@ wb_capture() {
     cstate_after="$ARTIFACTS/wb-$label-cstate-after.json"
     proc_before_file="$ARTIFACTS/wb-$label-proc-before.json"
     proc_after_file="$ARTIFACTS/wb-$label-proc-after.json"
-    cp "$CSTATE" "$cstate_before" || fail "$WB_GATE" "compositor state missing before $label"
+    snapshot_state "$CSTATE" "$cstate_before" || fail "$WB_GATE" "compositor state missing before $label"
     "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-snapshot \
         --probe "$WB_PROBE_PID" --compositor "$COMPOSITOR_PID" --shell "$WB_SHELL_PID" \
         >"$proc_before_file" ||
@@ -7627,7 +7741,7 @@ wb_capture() {
         --probe "$WB_PROBE_PID" --compositor "$COMPOSITOR_PID" --shell "$WB_SHELL_PID" \
         >"$proc_after_file" ||
         fail "$WB_GATE" "capture-time process snapshot failed after $label"
-    cp "$CSTATE" "$cstate_after" || fail "$WB_GATE" "compositor state missing after $label"
+    snapshot_state "$CSTATE" "$cstate_after" || fail "$WB_GATE" "compositor state missing after $label"
     "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-sandwich \
         --before "$proc_before_file" --after "$proc_after_file" --label "$label" ||
         fail "$WB_GATE" "a capture-time process was replaced across $label"
@@ -7665,12 +7779,12 @@ wb_state_capture() {
     cstate_after="$ARTIFACTS/wb-$label-cstate-after.json"
     proc_before_file="$ARTIFACTS/wb-$label-proc-before.json"
     proc_after_file="$ARTIFACTS/wb-$label-proc-after.json"
-    cp "$CSTATE" "$cstate_before" || fail "$WB_GATE" "compositor state missing before $label"
+    snapshot_state "$CSTATE" "$cstate_before" || fail "$WB_GATE" "compositor state missing before $label"
     "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-snapshot \
         --probe "$WB_PROBE_PID" --compositor "$COMPOSITOR_PID" --shell "$WB_SHELL_PID" \
         >"$proc_before_file" ||
         fail "$WB_GATE" "capture-time process snapshot failed before $label"
-    cp "$CSTATE" "$cstate_after" || fail "$WB_GATE" "compositor state missing after $label"
+    snapshot_state "$CSTATE" "$cstate_after" || fail "$WB_GATE" "compositor state missing after $label"
     "$PY" "$ROOT/scripts/lib/tuna-wellbeing-frame-proof.py" proc-snapshot \
         --probe "$WB_PROBE_PID" --compositor "$COMPOSITOR_PID" --shell "$WB_SHELL_PID" \
         >"$proc_after_file" ||
@@ -8148,10 +8262,10 @@ else
         --proc-after "$ARTIFACTS/wb-take-lock-locked-proc-after.json" \
         --label take-lock-locked ||
         fail G-WELLBEING-ACTION-TAKE-LOCK "lock not observed in state (full typed presence, redaction, sandwich)"
-    cp "$CSTATE" "$ARTIFACTS/wb-take-lock-stale-before.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/wb-take-lock-stale-before.json"
     stale_code=0
     wb_a11y_dump "$ARTIFACTS/a11y-wb-take-lock-stale.json" 20 --press "Take" >/dev/null 2>&1 || stale_code=$?
-    cp "$CSTATE" "$ARTIFACTS/wb-take-lock-stale-after.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/wb-take-lock-stale-after.json"
     wb_a11y_dump "$ARTIFACTS/a11y-wb-take-lock-retired.json" 20 ||
         fail G-WELLBEING-ACTION-TAKE-LOCK "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
     take_lock_retired_seq="$WB_DUMP_SEQ"
@@ -8266,10 +8380,10 @@ wb_capture take-fade-settled
 rm -f "$TUNA_ANIMATION_CLOCK"
 cstate '.animation_clock_manual | not' "real clock" ||
     fail G-WELLBEING-ACTION-TAKE-FADE "real time did not resume after the settled capture"
-cp "$CSTATE" "$ARTIFACTS/wb-take-fade-stale-before.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/wb-take-fade-stale-before.json"
 stale_code=0
 wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-stale.json" 20 --press "Take" >/dev/null 2>&1 || stale_code=$?
-cp "$CSTATE" "$ARTIFACTS/wb-take-fade-stale-after.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/wb-take-fade-stale-after.json"
 wb_a11y_dump "$ARTIFACTS/a11y-wb-take-fade-retired.json" 20 ||
     fail G-WELLBEING-ACTION-TAKE-FADE "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
 take_fade_retired_seq="$WB_DUMP_SEQ"
@@ -8322,10 +8436,10 @@ wb_press_banner G-WELLBEING-ACTION-DELAY "$ARTIFACTS/a11y-wb-delay-due.json" \
     "Time for an Eyesight Break" Delay 25 ||
     fail G-WELLBEING-ACTION-DELAY "no due banner to delay"
 delay_due_epoch="$WB_PRESS_EPOCH"
-cp "$CSTATE" "$ARTIFACTS/wb-delay-stale-before.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/wb-delay-stale-before.json"
 stale_code=0
 wb_a11y_dump "$ARTIFACTS/a11y-wb-delay-stale.json" 20 --press "Delay" >/dev/null 2>&1 || stale_code=$?
-cp "$CSTATE" "$ARTIFACTS/wb-delay-stale-after.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/wb-delay-stale-after.json"
 # The retired dump is taken now (the redue banner is not showing yet);
 # the stale verdict waits for the redue so the due schedule the live
 # press set is proven undisturbed by the stale press.
@@ -8416,10 +8530,10 @@ wb_press_banner G-WELLBEING-ACTION-SKIP "$ARTIFACTS/a11y-wb-skip-upcoming.json" 
     "$ARTIFACTS/a11y-wb-skip-upcoming.json" --title "Eyesight Break Soon" \
     --expect Delay,Skip --reject Take ||
     fail G-WELLBEING-ACTION-SKIP "the upcoming banner does not offer Delay+Skip without Take"
-cp "$CSTATE" "$ARTIFACTS/wb-skip-stale-before.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/wb-skip-stale-before.json"
 stale_code=0
 wb_a11y_dump "$ARTIFACTS/a11y-wb-skip-stale.json" 20 --press "Skip" >/dev/null 2>&1 || stale_code=$?
-cp "$CSTATE" "$ARTIFACTS/wb-skip-stale-after.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/wb-skip-stale-after.json"
 # The retired dump is taken now (the due banner is not showing yet);
 # the stale verdict waits for the due so the original schedule the
 # live press left undisturbed is proven intact after the stale press.
@@ -8533,10 +8647,10 @@ done
     --desaturation 0 --brightness 0.7 \
     --receipt "$ARTIFACTS/wb-negative-fade-mid-check.json" ||
     fail G-WELLBEING-NEGATIVE "the fade 1500ms intermediate diverged from 0.7"
-cp "$CSTATE" "$ARTIFACTS/wb-negative-stale-before.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/wb-negative-stale-before.json"
 stale_code=0
 wb_a11y_dump "$ARTIFACTS/a11y-wb-negative-stale.json" 20 --press "Take" >/dev/null 2>&1 || stale_code=$?
-cp "$CSTATE" "$ARTIFACTS/wb-negative-stale-after.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/wb-negative-stale-after.json"
 wb_a11y_dump "$ARTIFACTS/a11y-wb-negative-retired.json" 20 ||
     fail G-WELLBEING-NEGATIVE "a11y bus dead or owned shell tree gone; retired UI cannot be qualified"
 negative_retired_seq="$WB_DUMP_SEQ"
@@ -8722,12 +8836,12 @@ gsettings set "$MEDIA_SCHEMA" volume-up-static '[]'
 media_mark static-disable-after
 sleep 0.7
 media_mark disabled-key-before
-cp "$CSTATE" "$ARTIFACTS/media-before-disabled-key.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/media-before-disabled-key.json"
 xdotool key XF86AudioRaiseVolume
 media_mark disabled-key-after
 sleep 0.7
 media_mark disabled-check
-cp "$CSTATE" "$ARTIFACTS/media-after-disabled-key.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/media-after-disabled-key.json"
 [ "$(cat "$VOLUME_FILE")" = 0.4200 ] || fail G-MEDIA-VOLUME "an explicitly disabled hardware key still changed volume"
 gsettings set "$MEDIA_SCHEMA" volume-up "['F8']"
 gsettings set "$MEDIA_SCHEMA" volume-step 10
@@ -9296,7 +9410,7 @@ cstate ".size_changes.in_flight | any(.seq > $seq_mid and .phase == \"animating\
     fail G-SIZE-CHANGE-ANIM "untiling did not start on the frozen clock"
 sleep 0.3
 scrot "$ARTIFACTS/size-change-0ms.png" >/dev/null
-cp "$CSTATE" "$ARTIFACTS/size-change-0ms.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/size-change-0ms.json"
 "$PY" - "$ARTIFACTS/size-change-before.png" "$ARTIFACTS/size-change-0ms.png" "$((WIDTH / 2))" "$HEIGHT" <<'PYSNAP' ||
 from PIL import Image, ImageChops
 import sys
@@ -9315,7 +9429,7 @@ cstate ".size_changes.in_flight | any(.seq > $seq_mid and .snapshot_alpha == 0.2
     fail G-SIZE-CHANGE-ANIM "the transition was not exactly half way 125 ms in"
 sleep 0.3
 scrot "$ARTIFACTS/size-change-mid-flight.png" >/dev/null
-cp "$CSTATE" "$ARTIFACTS/size-change-125ms.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/size-change-125ms.json"
 anim_clock 250
 cstate "(.size_changes.in_flight | length) == 0 and any(.size_changes.history[]; .seq > $seq_mid and .outcome == \"completed\" and .settle_ms == 250)" "250 ms" ||
     fail G-SIZE-CHANGE-ANIM "the transition had not settled exactly 250 ms in"
@@ -9356,7 +9470,7 @@ jq -e '.outcome == "skipped" and .reason == "animations-off"' \
 gsettings set org.gnome.desktop.interface enable-animations true
 cstate '.animations_enabled' "size change animations on" ||
     fail G-SIZE-CHANGE-ANIM "enable-animations true did not reach the compositor"
-cp "$CSTATE" "$ARTIFACTS/size-change.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/size-change.json"
 pass G-SIZE-CHANGE-ANIM "maximize, unmaximize and half-tiling ease 250 ms from the old frame (exact on the proof clock), never stretch new content, only fade under Reduced Motion, and are instant with animations off"
 
 # The switcher's keys rebind too: switch-applications on Ctrl+J steps
@@ -10212,7 +10326,7 @@ anim_clock 10125
 # Ease-out-cubic is 87.5% of the way at half time.
 cstate '.workspace_slide.in_flight | ((.position - .from_slot) - 0.875 | . < 0.001 and . > -0.001)' "slide half way" ||
     fail G-WORKSPACE-SLIDE "the slide was not 87.5% across at 125 ms"
-cp "$CSTATE" "$ARTIFACTS/workspace-slide-in-flight.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/workspace-slide-in-flight.json"
 scrot "$ARTIFACTS/24g-workspace-slide-mid.png" >/dev/null 2>&1 || true
 anim_clock 10250
 slide_settled $((slide_home + 1)) "slide settled" || fail G-WORKSPACE-SLIDE "the slide had not settled at 250 ms"
@@ -10248,7 +10362,7 @@ slide_began $((slide_home + 2)) "retargeted" ||
     fail G-WORKSPACE-SLIDE "the second press did not start a slide toward the next workspace"
 cstate ".active_workspace == $slide_home + 2 and (.workspace_slide.in_flight | .record.retargets == 1 and ((.position - $first_position) | . < 0.001 and . > -0.001))" "retargeted" ||
     fail G-WORKSPACE-SLIDE "the second press jumped instead of retargeting from the drawn offset"
-cp "$CSTATE" "$ARTIFACTS/workspace-slide-retarget-in-flight.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/workspace-slide-retarget-in-flight.json"
 anim_clock 11310
 slide_settled $((slide_home + 2)) "double press settled" ||
     fail G-WORKSPACE-SLIDE "two rapid Super+Page_Down did not end two workspaces over"
@@ -10340,13 +10454,13 @@ swipe_phase update -240 0
 swipe_phase end 0 0
 cstate ".active_workspace == $gesture_home + 1 and (.overview_open | not)" "left swipe" ||
     fail G-SWIPE-DIRECTIONS "three-finger left did not select the next workspace"
-cp "$CSTATE" "$ARTIFACTS/swipe-next-workspace.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/swipe-next-workspace.json"
 swipe_phase begin 0 0
 swipe_phase update 240 0
 swipe_phase end 0 0
 cstate ".active_workspace == $gesture_home and (.overview_open | not)" "right swipe" ||
     fail G-SWIPE-DIRECTIONS "three-finger right did not restore the previous workspace"
-cp "$CSTATE" "$ARTIFACTS/swipe-previous-workspace.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/swipe-previous-workspace.json"
 pass G-SWIPE-DIRECTIONS "nested three-finger left/right switch and restore the exact workspace"
 
 # The strip follows the fingers while they are down (1 workspace per
@@ -10368,7 +10482,7 @@ held_at() {
 swipe_at begin 0 30000
 swipe_at update -100 30010
 held_at 0.25 "a quarter over" || fail G-SWIPE-FOLLOW "100px of travel did not hold the strip a quarter over"
-cp "$CSTATE" "$ARTIFACTS/swipe-follow-quarter.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/swipe-follow-quarter.json"
 swipe_at update -60 30020
 held_at 0.4 "0.4 over" || fail G-SWIPE-FOLLOW "the strip did not keep following the fingers"
 # Lifted 400 ms after the last movement: no velocity, so it snaps back.
@@ -10508,7 +10622,7 @@ swipe_phase begin 0 0
 swipe_phase update 0 -180
 cstate '.overview_progress > 0.55 and .overview_progress < 0.65 and (.overview_open | not)' "animations-off held up" ||
     fail G-SWIPE-REDUCED-MOTION "held upward swipe did not follow the fingers"
-cp "$CSTATE" "$ARTIFACTS/swipe-reduced-motion-held-up.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/swipe-reduced-motion-held-up.json"
 swipe_phase end 0 0
 cstate '.overview_open and .overview_progress == 1 and .overview_motion.release.duration_ms == 0' "animations-off up released" ||
     fail G-SWIPE-REDUCED-MOTION "upward release did not open the overview at once"
@@ -10516,7 +10630,7 @@ swipe_phase begin 0 0
 swipe_phase update 0 180
 cstate '.overview_progress > 0.35 and .overview_progress < 0.45 and .overview_open' "animations-off held down" ||
     fail G-SWIPE-REDUCED-MOTION "held downward swipe did not follow the fingers"
-cp "$CSTATE" "$ARTIFACTS/swipe-reduced-motion-held-down.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/swipe-reduced-motion-held-down.json"
 swipe_phase end 0 0
 cstate '(.overview_open | not) and .overview_progress == 0 and .overview_motion.release.duration_ms == 0' "animations-off down released" ||
     fail G-SWIPE-REDUCED-MOTION "downward release did not close the overview at once"
@@ -10539,7 +10653,7 @@ sleep 1
 xdotool key Escape
 cstate '(.overview_open | not) and .overview_progress == 0' "eased close" ||
     fail G-OVERVIEW-EASING "the overview did not close"
-cp "$CSTATE" "$ARTIFACTS/overview-easing.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/overview-easing.json"
 jq -e '
     def abs: if . < 0 then -. else . end;
     def frac: (.[0] / 250) | if . > 1 then 1 else . end;
@@ -10578,7 +10692,7 @@ cstate '.overview_open and .overview_motion.release.target == 1 and .overview_mo
     fail G-SWIPE-MOMENTUM "a quarter-way flick did not carry its velocity into the finish"
 cstate '.overview_progress == 1' "flick settled" ||
     fail G-SWIPE-MOMENTUM "the flick did not settle open"
-cp "$CSTATE" "$ARTIFACTS/swipe-momentum.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/swipe-momentum.json"
 xdotool key Escape
 cstate '(.overview_open | not) and .overview_progress == 0' "flick closed" ||
     fail G-SWIPE-MOMENTUM "the overview did not close after the flick"
@@ -10603,7 +10717,7 @@ swipe_timed begin 0 40000
 swipe_timed update -90 40010
 cstate '.touchpad_swipe.active and .overview_open and .overview_progress == 1 and .overview_state > 1.299 and .overview_state < 1.301 and (.layers | any(.namespace == "tuna-shell-appgrid"))' "app grid held part way" ||
     fail G-SWIPE-APPGRID "a held swipe up from the window picker did not draw the app grid part way"
-cp "$CSTATE" "$ARTIFACTS/swipe-appgrid-held.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/swipe-appgrid-held.json"
 swipe_timed update -60 40020
 cstate '.touchpad_swipe.active and .overview_state > 1.499 and .overview_state < 1.501' "app grid follows" ||
     fail G-SWIPE-APPGRID "the app grid stopped following the fingers"
@@ -10615,7 +10729,7 @@ cstate '.overview_open and .overview_state == 2 and .overview_app_grid and (.lay
     fail G-SWIPE-APPGRID "the swipe did not settle on the app grid"
 log_wait "$grid_swipe_mark" "grid-anim grid-swipe-in settle" ||
     fail G-SWIPE-APPGRID "the shell's grid did not ease in on the swipe's release"
-cp "$CSTATE" "$ARTIFACTS/swipe-appgrid-settled.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/swipe-appgrid-settled.json"
 grid_swipe_mark="$(log_mark)"
 swipe_timed begin 0 41000
 swipe_timed update 90 41010
@@ -10642,7 +10756,7 @@ pass G-SWIPE-APPGRID "the overview swipe stops at the picker from the desktop, f
 # Swipes restore the previous focus, which can legitimately be XEyes.
 # Select the owned native header fixture before the single menu attempt.
 pick_alpha || fail G-WS-THUMBS "could not focus the original native Alpha fixture"
-cp "$CSTATE" "$ARTIFACTS/ws-thumbs-native-before.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/ws-thumbs-native-before.json"
 menu_target="$("$PY" "$ROOT/scripts/lib/tuna_window_menu_fixture.py" target "$ARTIFACTS/ws-thumbs-native-before.json" "$ARTIFACTS/alpha-window-owner.json")" ||
     fail G-WS-THUMBS "original native Alpha identity/focus/geometry is not ready"
 read -r moved home_ws menu_x menu_y <<EOF
@@ -10654,7 +10768,7 @@ sleep 1.5
     --press "Move to Workspace Right" || fail G-WS-THUMBS "the window menu has no Move to Workspace Right"
 cstate ".active_workspace == $home_ws and any(.windows[]; .id == $moved and .workspace == $home_ws + 1)" \
     "moved" || fail G-WS-THUMBS "the original native Alpha did not move one workspace right"
-cp "$CSTATE" "$ARTIFACTS/ws-thumbs-native-after.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/ws-thumbs-native-after.json"
 sleep 1
 # Hold a synthetic three-finger swipe at half progress. The event enters the
 # compositor's normal gesture handler; the held frame lets CI sample it.
@@ -10669,7 +10783,7 @@ cstate '.overview_progress == 0.5 and (.thumbnails | length) == 3 and any(.works
     fail G-SWIPE-PROGRESS "neighbour cards or thumbnails are missing mid-gesture"
 sleep 0.2
 scrot "$ARTIFACTS/24f-mid-swipe-workspaces.png" >/dev/null
-cp "$CSTATE" "$ARTIFACTS/mid-swipe-state.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/mid-swipe-state.json"
 pass G-SWIPE-PROGRESS "neighbour workspaces and thumbnails slide and fade during a held three-finger swipe"
 printf '{"phase":"end","sequence":3}\n' >"$TUNA_PROOF_SWIPE_INPUT.tmp"
 mv "$TUNA_PROOF_SWIPE_INPUT.tmp" "$TUNA_PROOF_SWIPE_INPUT"
@@ -10700,7 +10814,7 @@ swipe_at begin 0 50000
 swipe_at update -200 50010
 cstate ".overview_open and .overview_motion.scroll.held and ($(ov_scrolled) | . > 0.499 and . < 0.501) and .active_workspace == $home_ws" "overview strip held" ||
     fail G-SWIPE-OVERVIEW-SCROLL "a held sideways swipe did not hold the overview's workspaces half way"
-cp "$CSTATE" "$ARTIFACTS/swipe-overview-scroll-held.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/swipe-overview-scroll-held.json"
 swipe_at update -500 50020
 cstate ".overview_motion.scroll.held and ($(ov_scrolled) | . > 1.749 and . < 1.751) and .active_workspace == $home_ws" "overview strip follows" ||
     fail G-SWIPE-OVERVIEW-SCROLL "the overview's workspaces stopped following past the next one"
@@ -10710,7 +10824,7 @@ cstate '.overview_motion.scroll_release | .target - .from > 0 and .curve == "eas
     fail G-SWIPE-OVERVIEW-SCROLL "the release did not ease on toward the last workspace"
 cstate ".overview_open and .active_workspace == $home_ws + 2 and .overview_motion.scroll == null" "two workspaces on" ||
     fail G-SWIPE-OVERVIEW-SCROLL "the release did not settle two workspaces on"
-cp "$CSTATE" "$ARTIFACTS/swipe-overview-scroll-settled.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/swipe-overview-scroll-settled.json"
 swipe_at begin 0 51000
 swipe_at update 500 51010
 swipe_at update 300 51020
@@ -12252,6 +12366,11 @@ if [ -n "$PAM_ON" ]; then
     anim_clock 125
     tvalue lock_curtain 0.25 || fail G-LOCK-SLIDE "the curtain was not at ease-out-quad 75% down 125 ms in"
     scrot "$ARTIFACTS/25a-lock-curtain-125ms.png" >/dev/null
+    # gnome-shell sets the screen saver active only once the curtain has
+    # landed (`_lockScreenShown`): gnome-settings-daemon blanks the
+    # screen on ActiveChanged(true), which mid-slide froze the curtain.
+    screen_active | grep -q false ||
+        fail G-LOCK-SLIDE "the screen saver went active before the curtain landed"
     anim_clock 250
     tsettled lock_curtain "$curtain_started" "$curtain_frames" ||
         fail G-LOCK-SLIDE "the lock curtain did not lower and settle"
@@ -12282,7 +12401,16 @@ if [ -n "$PAM_ON" ]; then
     sleep 0.5
     grep -q 'ActiveChanged.*true' "$ARTIFACTS/screensaver-signals.log" || fail G-LOCK-KEY "no active signal"
     grep -q 'ActiveChanged.*false' "$ARTIFACTS/screensaver-signals.log" || fail G-LOCK-KEY "no inactive signal"
-    pass G-LOCK-KEY "Super+L locks; PAM unlocks; ActiveChanged publishes both transitions"
+    # gnome-settings-daemon unblanks only on input or WakeUpScreen, which
+    # gnome-shell's `_continueDeactivate` emits on every unlock before the
+    # screen saver goes inactive: `loginctl unlock-session` after the blank
+    # otherwise left the unlocked session dark (marlin-vm V-ORCA-ACTIVATION).
+    wake_line=$(grep -n 'WakeUpScreen' "$ARTIFACTS/screensaver-signals.log" | tail -1 | cut -d: -f1)
+    inactive_line=$(grep -n 'ActiveChanged.*false' "$ARTIFACTS/screensaver-signals.log" | tail -1 | cut -d: -f1)
+    if [ -z "$wake_line" ] || [ "$wake_line" -gt "$inactive_line" ]; then
+        fail G-LOCK-KEY "the unlock did not emit WakeUpScreen before ActiveChanged(false)"
+    fi
+    pass G-LOCK-KEY "Super+L locks; PAM unlocks; ActiveChanged publishes both transitions; the unlock wakes the screen first"
     # With animations off the curtain moves at once, both ways.
     gsettings set org.gnome.desktop.interface enable-animations false
     cstate '(.animations_enabled | not)' "still curtain" ||
@@ -12301,7 +12429,7 @@ if [ -n "$PAM_ON" ]; then
     xdotool key Control_L
     cstate ".cursor.locate_pointer.active and .cursor.locate_pointer.at != null and .cursor.locate_pointer.frames > $locate_lock_frames" "rendered ripple before D-Bus lock" ||
         fail G-POINTER-TRACE-PRIVATE "no actual active rendered ripple before locking"
-    cp "$CSTATE" "$ARTIFACTS/locate-before-dbus-lock.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/locate-before-dbus-lock.json"
     gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/ScreenSaver \
         --method org.gnome.ScreenSaver.Lock >/dev/null || fail G-DBUS-LOCK "D-Bus Lock failed"
     cstate '.locked' "D-Bus locked" 5 || fail G-DBUS-LOCK "D-Bus Lock replied without locking"
@@ -12310,7 +12438,7 @@ if [ -n "$PAM_ON" ]; then
     curtain_started=$(tval lock_curtain started)
     cstate '.locked and .animation_clock_manual and has("cursor") and .cursor == null and .pointer_position == null and .pointer_fullscreen_blocked == null' "D-Bus lock redacts active ripple" ||
         fail G-POINTER-TRACE-PRIVATE "D-Bus lock retained cursor activity or pointer coordinates"
-    cp "$CSTATE" "$ARTIFACTS/locate-dbus-locked-private.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/locate-dbus-locked-private.json"
     rm -f "$TUNA_ANIMATION_CLOCK"
     cstate '.locked and (.animation_clock_manual | not)' "locked real clock restored" ||
         fail G-POINTER-TRACE-PRIVATE "animation proof clock remained active"
@@ -12334,7 +12462,7 @@ if [ -n "$PAM_ON" ]; then
     pass G-LOCK-FIRST-PRINTABLE "a printable wake key becomes exactly one password character and PAM unlocks"
     cstate '(.locked | not) and (.cursor.locate_pointer.active | not) and .cursor.locate_pointer.at == null and .cursor.locate_pointer.count == 0 and .cursor.locate_pointer.frames == 0' "unlock retains no prior ripple" ||
         fail G-POINTER-TRACE-PRIVATE "unlock resurrected pre-lock cursor activity/history"
-    cp "$CSTATE" "$ARTIFACTS/locate-after-dbus-unlock.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/locate-after-dbus-unlock.json"
     gsettings set org.gnome.desktop.interface locate-pointer false
     pass G-POINTER-TRACE-PRIVATE "D-Bus lock during an actual rendered frozen-clock ripple redacts cursor diagnostics; unlock retains no activity/history"
     lock_with_menu_gate

@@ -456,7 +456,7 @@ fn session_clipboard_and_keysyms_are_owned_bounded_and_revocable() {
 
     // Locked: every clipboard and input call is refused.
     session(&owner, "EnableClipboard", &(no_options(),)).unwrap();
-    authority.publish(true, None);
+    authority.publish(true, std::iter::empty());
     for result in [
         session(&owner, "SetSelection", &(mime_options(&["text/plain"]),)),
         session(&owner, "SelectionRead", &("text/plain",)),
@@ -466,7 +466,7 @@ fn session_clipboard_and_keysyms_are_owned_bounded_and_revocable() {
     ] {
         assert_error(result, "AccessDenied");
     }
-    authority.publish(false, None);
+    authority.publish(false, std::iter::empty());
 
     // A stopped grant cuts an in-flight transfer: the local reader sees
     // end of file, and the session can do nothing more.
@@ -788,13 +788,13 @@ fn linked_screencast_records_after_remote_start_and_serves_stream_start_stop() {
 
     // Locked: nothing new is recorded or started.
     let pending = object_path(sc(&owner, "RecordMonitor", &("", no_options())));
-    authority.publish(true, None);
+    authority.publish(true, std::iter::empty());
     assert_error(
         sc(&owner, "RecordMonitor", &("", no_options())),
         "AccessDenied",
     );
     assert_error(stream(&owner, &pending, "Start"), "AccessDenied");
-    authority.publish(false, None);
+    authority.publish(false, std::iter::empty());
 
     // Stream.Stop ends that stream alone; the linked session and its
     // grant live on, and the stopped stream's object is gone.

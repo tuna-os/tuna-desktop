@@ -33,6 +33,8 @@ if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ] && command -v dbus-run-session >/dev/nul
 fi
 unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+# shellcheck source=scripts/lib/tuna-state-snapshot.sh
+. "$ROOT/scripts/lib/tuna-state-snapshot.sh"
 DISPLAY_ARG=""
 ARTIFACTS="$ROOT/magnifier-artifacts"
 WIDTH=1280
@@ -476,7 +478,7 @@ focus_gate() {
     fi
     centered_on "$7" "$8" ||
         fail M-ATSPI-FOCUS "focusing the $2 did not center the view on its AT-SPI centre ($7, $8); window centre is ($WCX, $WCY)"
-    cp "$CSTATE" "$ARTIFACTS/atspi-$2-state.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/atspi-$2-state.json"
     FOCUS_SEEN="$FOCUS_SEEN $2 ($7,$8)"
 }
 FOCUS_SEEN=""
@@ -657,7 +659,7 @@ if [ "$greens" -ne 0 ] || [ "$oranges" -ne 0 ]; then
 fi
 pass M-LOCK "the magnified locked frame holds no window pixels"
 
-cp "$CSTATE" "$ARTIFACTS/final-state.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/final-state.json"
 grep -qi panicked "$LOG" && fail M-NOPANIC "panic in nested log"
 echo "M-NOPANIC pass no panic in nested log" >>"$ASSERTIONS"
 echo "tuna-magnifier-proof: OK, artifacts in $ARTIFACTS"

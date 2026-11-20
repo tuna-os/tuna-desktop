@@ -1,8 +1,9 @@
 //! Capture admission is an authenticated desktop-service boundary, not a bus name.
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
-    Arc,
+    atomic::{AtomicBool, Ordering},
+    Arc, RwLock,
 };
 use zbus::{fdo, message::Header, names::UniqueName, Connection};
 
@@ -39,10 +40,17 @@ impl ServiceClient {
     }
 }
 
+/// Capture identity shared by the D-Bus services and the runtime.
+///
+/// The supervised shell is recognised on the session bus by the unique
+/// names it declared over its pidfd-pinned control session
+/// ([`crate::control::ControlHub::shell_bus_names`]), never by a PID. The
+/// bus never reuses a unique name, so neither PID reuse nor the bus's
+/// `ProcessFD` support affects it.
 #[derive(Clone, Default)]
 pub struct Authority {
     locked: Arc<AtomicBool>,
-    shell_pid: Arc<AtomicU32>,
+    shell_names: Arc<RwLock<Vec<String>>>,
 }
 
 pub(crate) struct ConnectionCaller {
@@ -50,17 +58,11 @@ pub(crate) struct ConnectionCaller {
     pub credentials: Arc<fdo::ConnectionCredentials>,
 }
 
-/// Capture the kernel's original peer identity while accepting a native
-/// socket. SO_PEERPIDFD pins the socket peer; opening a pidfd from a numeric
-/// SO_PEERCRED PID later would instead risk pinning a recycled process.
-pub(crate) fn socket_credentials(
-    socket: &std::os::unix::net::UnixStream,
-) -> Option<Arc<fdo::ConnectionCredentials>> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let peer = rustix::net::sockopt::socket_peercred(socket).ok()?;
-    let pid = u32::try_from(peer.pid.as_raw_pid())
-        .ok()
-        .filter(|pid| *pid != 0)?;
+/// The kernel's `SO_PEERPIDFD` of a connected Unix socket: a descriptor
+/// pinned to the process that connected, taken at connect time. `None`
+/// when the kernel lacks it (before 6.5) or the peer is gone.
+pub(crate) fn socket_pidfd(socket: &std::os::unix::net::UnixStream) -> Option<OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd};
     let mut descriptor: libc::c_int = -1;
     let mut length = std::mem::size_of_val(&descriptor) as libc::socklen_t;
     // SAFETY: socket remains borrowed; both output pointers refer to writable
@@ -79,9 +81,21 @@ pub(crate) fn socket_credentials(
     }
     // SAFETY: a successful SO_PEERPIDFD allocated this descriptor for us.
     let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
-    if length as usize != std::mem::size_of::<libc::c_int>() {
-        return None;
-    }
+    (length as usize == std::mem::size_of::<libc::c_int>()).then_some(descriptor)
+}
+
+/// Capture the kernel's original peer identity while accepting a native
+/// socket. SO_PEERPIDFD pins the socket peer; opening a pidfd from a numeric
+/// SO_PEERCRED PID later would instead risk pinning a recycled process.
+/// Without SO_PEERPIDFD there is no identity at all: callers fail closed.
+pub(crate) fn socket_credentials(
+    socket: &std::os::unix::net::UnixStream,
+) -> Option<Arc<fdo::ConnectionCredentials>> {
+    let peer = rustix::net::sockopt::socket_peercred(socket).ok()?;
+    let pid = u32::try_from(peer.pid.as_raw_pid())
+        .ok()
+        .filter(|pid| *pid != 0)?;
+    let descriptor = socket_pidfd(socket)?;
     Some(Arc::new(
         fdo::ConnectionCredentials::default()
             .set_unix_user_id(peer.uid.as_raw())
@@ -90,20 +104,39 @@ pub(crate) fn socket_credentials(
     ))
 }
 
-/// A numeric PID alone can be recycled. Only expose live process identity
-/// when the bus supplied a descriptor pinning the original connection peer.
-pub(crate) fn pinned_process_id(credentials: &fdo::ConnectionCredentials) -> Option<u32> {
-    let pid = credentials.process_id().filter(|pid| *pid != 0)?;
-    let descriptor = credentials.process_fd()?;
+/// Whether the process a pidfd pins has not exited. A pidfd polls readable
+/// once its process exits; until then its PID cannot be recycled.
+pub(crate) fn pidfd_live(descriptor: BorrowedFd<'_>) -> bool {
     let mut poll = [rustix::event::PollFd::new(
-        descriptor,
+        &descriptor,
         rustix::event::PollFlags::IN,
     )];
     let timeout = rustix::event::Timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    (rustix::event::poll(&mut poll, Some(&timeout)).ok()? == 0).then_some(pid)
+    rustix::event::poll(&mut poll, Some(&timeout)).is_ok_and(|ready| ready == 0)
+}
+
+/// The PID the kernel says a pidfd pins (`Pid:` in its
+/// `/proc/self/fdinfo` entry), so a descriptor handed over by a bus is
+/// checked against the PID reported beside it. `None` for a descriptor
+/// that is not a pidfd, or whose process exited (`Pid: -1`).
+pub(crate) fn pidfd_pid(descriptor: BorrowedFd<'_>) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let info =
+        std::fs::read_to_string(format!("/proc/self/fdinfo/{}", descriptor.as_raw_fd())).ok()?;
+    info.lines()
+        .find_map(|line| line.strip_prefix("Pid:"))
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+}
+
+/// A numeric PID alone can be recycled. Only expose live process identity
+/// when the bus supplied a descriptor pinning the original connection peer.
+pub(crate) fn pinned_process_id(credentials: &fdo::ConnectionCredentials) -> Option<u32> {
+    let pid = credentials.process_id().filter(|pid| *pid != 0)?;
+    pidfd_live(credentials.process_fd()?.as_fd()).then_some(pid)
 }
 impl Authority {
     /// The portal opens its native display before acquiring its service name.
@@ -126,8 +159,7 @@ impl Authority {
         role: ServiceClient,
     ) -> fdo::Result<ConnectionCaller> {
         let caller = self.connection_caller(conn, header).await?;
-        let pid = caller.credentials.process_id().unwrap_or(0);
-        if !installed_service(pid, role) {
+        if !installed_service(&caller.credentials, role) {
             return Err(denied(
                 "service connection requires the installed provider for its type",
             ));
@@ -162,10 +194,36 @@ impl Authority {
             credentials: Arc::new(credentials),
         })
     }
-    pub fn publish(&self, locked: bool, shell_pid: Option<u32>) {
+    /// Publish the lock flag and the supervised shell's declared session-bus
+    /// unique names (empty while no live, pinned shell session declared one).
+    pub fn publish<'a, I>(&self, locked: bool, shell_names: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+        I::IntoIter: Clone,
+    {
         self.locked.store(locked, Ordering::SeqCst);
-        self.shell_pid
-            .store(shell_pid.unwrap_or(0), Ordering::SeqCst);
+        let shell_names = shell_names.into_iter();
+        let current = self
+            .shell_names
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.iter().map(String::as_str).eq(shell_names.clone()) {
+            return;
+        }
+        drop(current);
+        *self
+            .shell_names
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            shell_names.map(str::to_owned).collect();
+    }
+    /// Whether `sender` is a unique name the supervised shell declared.
+    fn is_shell(&self, sender: &str) -> bool {
+        self.shell_names
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|name| name == sender)
     }
     pub fn unlocked(&self) -> fdo::Result<()> {
         if self.locked.load(Ordering::SeqCst) {
@@ -173,33 +231,36 @@ impl Authority {
         }
         Ok(())
     }
+    /// Whether a capture session's creator may keep it. The shell is
+    /// tracked by unique name: it stays an owner while the bus still has
+    /// that name and the shell's pinned control session still declares it.
     pub async fn owner_alive(&self, conn: &Connection, owner: &str) -> bool {
         if self.unlocked().is_err() {
             return false;
         }
-        let Ok(name) = zbus::names::BusName::try_from(owner) else {
+        let Ok(name) = UniqueName::try_from(owner) else {
             return false;
         };
         let Ok(dbus) = fdo::DBusProxy::new(conn).await else {
             return false;
         };
-        let Ok(pid) = dbus.get_connection_unix_process_id(name).await else {
+        if self.is_shell(owner) {
+            return dbus.name_has_owner(name.into()).await.unwrap_or(false);
+        }
+        let Ok(credentials) = dbus.get_connection_credentials(name.into()).await else {
             return false;
         };
-        if pid != 0 && pid == self.shell_pid.load(Ordering::SeqCst) {
-            return true;
-        }
-        let name =
+        let portal =
             zbus::names::BusName::try_from("org.freedesktop.impl.portal.desktop.gnome").unwrap();
         if dbus
-            .get_name_owner(name)
+            .get_name_owner(portal)
             .await
             .is_ok_and(|current| current.as_str() == owner)
-            && installed_portal(pid)
+            && installed_portal(&credentials)
         {
             return true;
         }
-        remote_desktop_daemon(&dbus, owner, pid).await
+        remote_desktop_daemon(&dbus, owner, &credentials).await
     }
     pub async fn admit(&self, conn: &Connection, header: &Header<'_>) -> fdo::Result<String> {
         self.unlocked()?;
@@ -250,9 +311,8 @@ impl Authority {
                 let credentials = dbus
                     .get_connection_credentials(sender.clone().into())
                     .await?;
-                let pid = credentials.process_id().unwrap_or(0);
                 if credentials.unix_user_id() != Some(rustix::process::geteuid().as_raw())
-                    || !remote_desktop_daemon(&dbus, sender.as_str(), pid).await
+                    || !remote_desktop_daemon(&dbus, sender.as_str(), &credentials).await
                 {
                     return Err(denial);
                 }
@@ -302,25 +362,33 @@ impl Authority {
         let caller = self.authenticate_sender(conn, sender).await?;
         Ok((sender.to_string(), caller))
     }
+    /// The shell is a unique name it declared over its pinned control
+    /// session; the portal is the current owner of its well-known name
+    /// running the installed executable.
     async fn authenticate_sender(
         &self,
         conn: &Connection,
         sender: &UniqueName<'_>,
     ) -> fdo::Result<CaptureCaller> {
-        let dbus = fdo::DBusProxy::new(conn).await?;
-        let pid = dbus
-            .get_connection_unix_process_id(sender.clone().into())
-            .await?;
-        if pid != 0 && pid == self.shell_pid.load(Ordering::SeqCst) {
+        if self.is_shell(sender.as_str()) {
             return Ok(CaptureCaller::Shell);
         }
+        let dbus = fdo::DBusProxy::new(conn).await?;
         let name =
             zbus::names::BusName::try_from("org.freedesktop.impl.portal.desktop.gnome").unwrap();
         let owner = dbus
             .get_name_owner(name)
             .await
             .map_err(|_| denied("portal not running"))?;
-        if owner.as_str() != sender.as_str() || !installed_portal(pid) {
+        if owner.as_str() != sender.as_str() {
+            return Err(denied(
+                "capture requires the supervised shell or installed portal",
+            ));
+        }
+        let credentials = dbus
+            .get_connection_credentials(sender.clone().into())
+            .await?;
+        if !installed_portal(&credentials) {
             return Err(denied(
                 "capture requires the supervised shell or installed portal",
             ));
@@ -342,8 +410,8 @@ pub fn owns_session(owner: &str, sender: Option<&str>, revoked: bool) -> bool {
 pub fn denied(reason: &str) -> fdo::Error {
     fdo::Error::AccessDenied(reason.into())
 }
-fn installed_portal(pid: u32) -> bool {
-    installed_service(pid, ServiceClient::Portal)
+fn installed_portal(credentials: &fdo::ConnectionCredentials) -> bool {
+    installed_service(credentials, ServiceClient::Portal)
 }
 /// gnome-remote-desktop's session-bus daemons (`grd-private.h`): the
 /// user-mode Desktop Sharing daemon, the remote-login handover daemon and
@@ -360,8 +428,12 @@ const REMOTE_DESKTOP_DAEMON: [&str; 2] = [
 /// The caller is the root-owned installed grd executable and currently
 /// owns one of grd's well-known names, so neither a copied binary nor a
 /// process that merely claims a grd name passes.
-async fn remote_desktop_daemon(dbus: &fdo::DBusProxy<'_>, owner: &str, pid: u32) -> bool {
-    if !installed_executable(pid, &REMOTE_DESKTOP_DAEMON) {
+async fn remote_desktop_daemon(
+    dbus: &fdo::DBusProxy<'_>,
+    owner: &str,
+    credentials: &fdo::ConnectionCredentials,
+) -> bool {
+    if !installed_executable(credentials, &REMOTE_DESKTOP_DAEMON) {
         return false;
     }
     for name in REMOTE_DESKTOP_DAEMON_NAMES {
@@ -376,13 +448,31 @@ async fn remote_desktop_daemon(dbus: &fdo::DBusProxy<'_>, owner: &str, pid: u32)
     }
     false
 }
-fn installed_service(pid: u32, role: ServiceClient) -> bool {
-    installed_executable(pid, role.executables())
+fn installed_service(credentials: &fdo::ConnectionCredentials, role: ServiceClient) -> bool {
+    installed_executable(credentials, role.executables())
 }
-fn installed_executable(pid: u32, executables: &[&str]) -> bool {
-    if pid == 0 {
+/// Whether the caller runs one of `executables`, a root-owned file no group
+/// or other user may write. With a bus `ProcessFD` the PID is read through
+/// the pin: the descriptor must name that PID, and its process must still
+/// be alive after `/proc/<pid>/exe` was read, so the read cannot have
+/// reached a process that took over a recycled PID. A bus without
+/// `ProcessFD` (dbus-daemon before 1.15.8) leaves the numeric PID, as
+/// before; the same-UID boundary of ADR 0010 already admits a caller that
+/// starts the genuine binary itself.
+fn installed_executable(credentials: &fdo::ConnectionCredentials, executables: &[&str]) -> bool {
+    let Some(pid) = credentials.process_id().filter(|pid| *pid != 0) else {
         return false;
-    }
+    };
+    let Some(pin) = credentials.process_fd() else {
+        return runs_executable(pid, executables);
+    };
+    let pin = pin.as_fd();
+    pidfd_pid(pin) == Some(pid)
+        && pidfd_live(pin)
+        && runs_executable(pid, executables)
+        && pidfd_live(pin)
+}
+fn runs_executable(pid: u32, executables: &[&str]) -> bool {
     let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
         return false;
     };
@@ -452,6 +542,63 @@ mod tests {
             Some(std::process::id())
         );
     }
+    /// The Wayland shell flag and the session-lock identity, as the
+    /// runtime's accept path and `take_lock_request` read them. PID reuse:
+    /// a connection made by a process that has since exited, whose PID
+    /// number is now the held shell child's (this process), is not the
+    /// shell. Without `SO_PEERPIDFD` there is no shell at all.
+    #[test]
+    fn only_a_live_pinned_shell_child_is_the_wayland_shell() {
+        use crate::session_lock::{lock_request_verdict, LockVerdict};
+        let me = std::process::id();
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut shell = crate::ClientState::native_connection(&socket);
+        shell.admit_supervised_shell(Some(me));
+        assert!(shell.supervised_shell);
+        assert_eq!(shell.shell_pid(), Some(me));
+        assert_eq!(
+            lock_request_verdict(shell.shell_pid(), Some(me), true),
+            LockVerdict::Approved
+        );
+        shell.admit_supervised_shell(Some(me + 1));
+        assert!(!shell.supervised_shell, "another held child");
+
+        let mut gone = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let gone_pin = rustix::process::pidfd_open(
+            rustix::process::Pid::from_raw(gone.id() as i32).unwrap(),
+            rustix::process::PidfdFlags::empty(),
+        )
+        .unwrap();
+        gone.kill().unwrap();
+        gone.wait().unwrap();
+        let mut recycled = crate::ClientState {
+            original_credentials: Some(Arc::new(numeric(me).set_process_fd(gone_pin.into()))),
+            ..Default::default()
+        };
+        recycled.admit_supervised_shell(Some(me));
+        assert!(!recycled.supervised_shell, "recycled PID at accept");
+        // Flagged while its process lived, the connection outlives it.
+        recycled.supervised_shell = true;
+        assert_eq!(recycled.shell_pid(), None);
+        assert_eq!(
+            lock_request_verdict(recycled.shell_pid(), Some(me), true),
+            LockVerdict::RefusedForeign
+        );
+
+        // A kernel without SO_PEERPIDFD: only a numeric PID, or nothing.
+        let mut numeric_only = crate::ClientState {
+            original_credentials: Some(Arc::new(numeric(me))),
+            ..Default::default()
+        };
+        numeric_only.admit_supervised_shell(Some(me));
+        assert!(!numeric_only.supervised_shell);
+        let mut unknown = crate::ClientState::default();
+        unknown.admit_supervised_shell(Some(me));
+        assert!(!unknown.supervised_shell);
+    }
     #[test]
     fn process_identity_requires_a_pin_and_does_not_survive_peer_exit() {
         let numeric = fdo::ConnectionCredentials::default().set_process_id(std::process::id());
@@ -481,14 +628,28 @@ mod tests {
     #[test]
     fn lock_admission_fails_closed_and_updates() {
         let authority = Authority::default();
-        authority.publish(true, Some(42));
+        authority.publish(true, [":1.42"]);
         assert!(matches!(
             authority.unlocked(),
             Err(fdo::Error::AccessDenied(_))
         ));
-        authority.publish(false, None);
+        authority.publish(false, std::iter::empty());
         assert!(authority.unlocked().is_ok());
-        assert_eq!(authority.shell_pid.load(Ordering::SeqCst), 0);
+        assert!(
+            !authority.is_shell(":1.42"),
+            "a dropped declaration is gone"
+        );
+    }
+    #[test]
+    fn the_shell_is_only_the_unique_names_it_declared() {
+        let authority = Authority::default();
+        assert!(!authority.is_shell(":1.7"), "nothing declared, nobody");
+        authority.publish(false, [":1.7", ":1.9"]);
+        assert!(authority.is_shell(":1.7"));
+        assert!(authority.is_shell(":1.9"));
+        assert!(!authority.is_shell(":1.8"), "another connection");
+        assert!(!authority.is_shell("org.gnome.Shell"), "a well-known name");
+        assert!(!authority.is_shell(""));
     }
     #[test]
     fn sessions_are_owned_by_the_unique_creator_and_revoke_permanently() {
@@ -497,23 +658,53 @@ mod tests {
         assert!(!owns_session(":1.1", None, false));
         assert!(!owns_session(":1.1", Some(":1.1"), true));
     }
+    /// Credentials as a bus without `ProcessFD` reports them.
+    fn numeric(pid: u32) -> fdo::ConnectionCredentials {
+        fdo::ConnectionCredentials::default().set_process_id(pid)
+    }
+    /// Credentials as a bus with `ProcessFD` reports them: `pid` beside a
+    /// pidfd of the process `pinned` (normally the same process).
+    fn pinned(pid: u32, pinned: u32) -> fdo::ConnectionCredentials {
+        let descriptor = rustix::process::pidfd_open(
+            rustix::process::Pid::from_raw(pinned as i32).unwrap(),
+            rustix::process::PidfdFlags::empty(),
+        )
+        .unwrap();
+        numeric(pid).set_process_fd(descriptor.into())
+    }
     #[test]
     fn remote_desktop_daemon_identity_is_the_root_owned_installed_binary() {
         // This test process, a missing pid and pid 0 are not grd.
+        let me = std::process::id();
+        assert!(!installed_executable(&numeric(me), &REMOTE_DESKTOP_DAEMON));
         assert!(!installed_executable(
-            std::process::id(),
+            &pinned(me, me),
             &REMOTE_DESKTOP_DAEMON
         ));
-        assert!(!installed_executable(u32::MAX, &REMOTE_DESKTOP_DAEMON));
-        assert!(!installed_executable(0, &["/proc/self/exe"]));
+        assert!(!installed_executable(
+            &numeric(u32::MAX),
+            &REMOTE_DESKTOP_DAEMON
+        ));
+        assert!(!installed_executable(&numeric(0), &["/proc/self/exe"]));
+        assert!(!installed_executable(
+            &fdo::ConnectionCredentials::default(),
+            &["/proc/self/exe"]
+        ));
         // The identity check accepts a root-owned, non-writable binary
         // the process really runs (here coreutils' sleep stands in)...
         let mut sleep = std::process::Command::new("/bin/sleep")
             .arg("60")
             .spawn()
             .unwrap();
-        assert!(installed_executable(sleep.id(), &["/bin/sleep"]));
-        assert!(!installed_executable(sleep.id(), &REMOTE_DESKTOP_DAEMON));
+        assert!(installed_executable(&numeric(sleep.id()), &["/bin/sleep"]));
+        assert!(installed_executable(
+            &pinned(sleep.id(), sleep.id()),
+            &["/bin/sleep"]
+        ));
+        assert!(!installed_executable(
+            &pinned(sleep.id(), sleep.id()),
+            &REMOTE_DESKTOP_DAEMON
+        ));
         sleep.kill().unwrap();
         sleep.wait().unwrap();
         // ...but not a user-owned copy named like the daemon.
@@ -530,22 +721,57 @@ mod tests {
             .success());
         let mut spoof = std::process::Command::new(&copy).arg("60").spawn().unwrap();
         let copy_path = copy.to_str().unwrap();
-        assert!(!installed_executable(spoof.id(), &[copy_path]));
-        assert!(!installed_executable(spoof.id(), &REMOTE_DESKTOP_DAEMON));
+        let spoofed = pinned(spoof.id(), spoof.id());
+        assert!(!installed_executable(&spoofed, &[copy_path]));
+        assert!(!installed_executable(&spoofed, &REMOTE_DESKTOP_DAEMON));
         spoof.kill().unwrap();
         spoof.wait().unwrap();
     }
+    /// PID reuse: the bus reports a PID number that now belongs to a
+    /// genuine root-owned binary, beside the pin of the process that really
+    /// connected. The pin refuses it; the numeric PID alone (the check
+    /// before this one) admitted it. An exited pin is no identity either.
+    #[test]
+    fn a_recycled_pid_does_not_inherit_the_installed_executable() {
+        let mut caller = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let mut genuine = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let recycled = pinned(genuine.id(), caller.id());
+        assert!(
+            !installed_executable(&recycled, &["/bin/sleep"]),
+            "the pin names another process than the reported PID"
+        );
+        let own = pinned(genuine.id(), genuine.id());
+        assert!(installed_executable(&own, &["/bin/sleep"]));
+        caller.kill().unwrap();
+        caller.wait().unwrap();
+        genuine.kill().unwrap();
+        genuine.wait().unwrap();
+        assert!(
+            !installed_executable(&own, &["/bin/sleep"]),
+            "an exited pin is no identity, whoever holds its PID now"
+        );
+    }
     #[test]
     fn arbitrary_process_cannot_be_the_installed_portal() {
-        assert!(!installed_portal(std::process::id()));
-        assert!(!installed_portal(u32::MAX));
+        let me = std::process::id();
+        assert!(!installed_portal(&numeric(me)));
+        assert!(!installed_portal(&pinned(me, me)));
+        assert!(!installed_portal(&numeric(u32::MAX)));
     }
     #[test]
     fn typed_service_roles_do_not_accept_an_arbitrary_process() {
         for value in 1..=3 {
             let role = ServiceClient::from_wire(value).unwrap();
-            assert!(!installed_service(std::process::id(), role));
-            assert!(!installed_service(u32::MAX, role));
+            let me = std::process::id();
+            assert!(!installed_service(&numeric(me), role));
+            assert!(!installed_service(&pinned(me, me), role));
+            assert!(!installed_service(&numeric(u32::MAX), role));
         }
         for value in [0, 4, u32::MAX] {
             assert!(matches!(

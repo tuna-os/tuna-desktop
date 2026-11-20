@@ -57,6 +57,8 @@ unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 # shellcheck source=scripts/lib/colord-startup.sh
 . "$ROOT/scripts/lib/colord-startup.sh"
+# shellcheck source=scripts/lib/tuna-state-snapshot.sh
+. "$ROOT/scripts/lib/tuna-state-snapshot.sh"
 ARTIFACTS="$ROOT/drm-smoke-artifacts"
 SECONDS_UP=20
 while [ $# -gt 0 ]; do
@@ -225,10 +227,10 @@ pass D-SHELL "shell connected (revision $(jq .revision "$STATE"))"
 sleep 2
 [ -s "$CSTATE" ] || fail D-IDLE "missing compositor frame counter"
 idle_before=$(jq -er '.rendered_frames' "$CSTATE")
-cp "$CSTATE" "$ARTIFACTS/idle-before.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/idle-before.json"
 sleep 3
 idle_after=$(jq -er '.rendered_frames' "$CSTATE")
-cp "$CSTATE" "$ARTIFACTS/idle-after.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/idle-after.json"
 if [ "$idle_after" -lt "$idle_before" ] || [ "$((idle_after - idle_before))" -gt 1 ]; then
     fail D-IDLE "stationary scene redrew $((idle_after - idle_before)) times in 3 seconds"
 fi
@@ -434,7 +436,7 @@ until [ "$(jq -er '.rendered_frames' "$CSTATE")" -gt "$frames_before" ]; do
     [ "$(date +%s)" -le "$end" ] || fail D-MODES "no frame flipped in $TARGET_MODE"
     sleep 0.2
 done
-cp "$CSTATE" "$ARTIFACTS/modes-switched.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/modes-switched.json"
 # Persistent and unanswered (no GNOME Shell dialog here): the CRTC
 # returns to the original mode, then Mutter's timeout reverts to the
 # configuration before it.
@@ -558,7 +560,7 @@ until [ -s "$CSTATE" ] && jq -e '.color.devices[0].ready and .color.devices[0].a
     [ "$(date +%s)" -le "$end" ] || fail D-COLORD "no colord device was set up: $(jq -c .color "$CSTATE" 2>/dev/null)"
     sleep 0.2
 done
-cp "$CSTATE" "$ARTIFACTS/color-registered.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/color-registered.json"
 device_path="$(cd_call --object-path /org/freedesktop/ColorManager \
     --method org.freedesktop.ColorManager.FindDeviceById "$DEVICE_ID" | sed -n "s/^(objectpath '\(.*\)',)$/\1/p")"
 [ -n "$device_path" ] || fail D-COLORD "colord has no device $DEVICE_ID"

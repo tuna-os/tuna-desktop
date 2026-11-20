@@ -13,6 +13,8 @@ BLOCKS = [part.split('\nPY\n', 1)[0] for part in SCRIPT.split("<<'PY'\n")[1:]]
 
 
 CONVERSATION_KEYS = ['fingerprint_unavailable_denied', 'second_password_conversation_denied', 'stale_sequence_dropped', 'distinct_answers_per_question', 'info_and_error_relayed', 'wrong_pin_denied_with_problem', 'cancel_denied_silently', 'fresh_answers_unlock']
+FINGERPRINT_KEYS = ['expired_account_match_denied', 'max_tries_unavailable', 'timed_out_unavailable', 'lock_budget_refuses_before_pam', 'password_unaffected', 'retry_then_match_unlocks']
+SETTING_KEYS = ['setting_off_refused_before_pam']
 
 class Admission(unittest.TestCase):
     def setUp(self):
@@ -67,6 +69,10 @@ class Admission(unittest.TestCase):
         (self.out/'runtime-conversation').mkdir(exist_ok=True)
         (self.out/'runtime-conversation/success.json').write_text(json.dumps({
             **{k: True for k in CONVERSATION_KEYS}, 'compositor_sha256': r['executables'][str(self.bin)]}))
+        for name, keys in [('runtime-fingerprint', FINGERPRINT_KEYS), ('runtime-fingerprint-setting', SETTING_KEYS)]:
+            (self.out/name).mkdir(exist_ok=True)
+            (self.out/name/'success.json').write_text(json.dumps({
+                **{k: True for k in keys}, 'compositor_sha256': r['executables'][str(self.bin)]}))
         return r
 
     def test_exact_roles_and_unchanged_files_admitted(self):
@@ -170,6 +176,18 @@ class Admission(unittest.TestCase):
         self.admit()
         (self.out/'runtime-conversation/success.json').unlink()
         with self.assertRaises(FileNotFoundError): self.execute(BLOCKS[1])
+
+    def test_fingerprint_receipts_false_missing_or_wrong_image_refused(self):
+        for name, keys in [('runtime-fingerprint', FINGERPRINT_KEYS), ('runtime-fingerprint-setting', SETTING_KEYS)]:
+            for field, wrong in [*((key, False) for key in keys), ('compositor_sha256', '0'*64)]:
+                self.admit()
+                path = self.out/name/'success.json'
+                receipt = json.loads(path.read_text()); receipt[field] = wrong
+                path.write_text(json.dumps(receipt))
+                with self.subTest(receipt=name, field=field), self.assertRaises(AssertionError): self.execute(BLOCKS[1])
+            self.admit()
+            (self.out/name/'success.json').unlink()
+            with self.subTest(receipt=name), self.assertRaises(FileNotFoundError): self.execute(BLOCKS[1])
 
     def test_actual_pam_receipt_missing_or_duplicate_source_refused(self):
         self.admit()

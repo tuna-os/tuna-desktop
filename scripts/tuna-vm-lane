@@ -694,6 +694,29 @@ def read_ppm(path):
     return w, h, data[pos + 1:pos + 1 + w * h * 3]
 
 
+def difference(left, right):
+    """Fraction of body pixels (below the 64 px panel) changed by more than 24 in any channel."""
+    if left[:2] != right[:2]:
+        raise RuntimeError("lifecycle frame dimensions changed")
+    width, height = left[:2]
+    first = width * 64 * 3  # Clock/panel changes are outside the repaint comparison.
+    changed = sum(max(abs(a - b) for a, b in zip(left[2][i:i+3], right[2][i:i+3])) > 24
+                  for i in range(first, width * height * 3, 3))
+    return changed / (width * (height - 64))
+
+
+def greeter_colors(image):
+    """Quantized colors on an 8 px grid; a black scanout or uniform fill has one."""
+    width, height, pixels = image
+    return len({tuple(value >> 4 for value in pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+                for y in range(0, height, 8) for x in range(0, width, 8)})
+
+
+# The repainted greeter after logout must match the pre-login greeter frame
+# within this body fraction; the pre-login frame is settled within it too.
+GREETER_REPAINT_TOLERANCE = 0.05
+
+
 def check_panel(path):
     """Black panel strip at y=5 over a non-uniform desktop."""
     w, h, px = read_ppm(path)
@@ -1004,15 +1027,6 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         ppm = os.path.join(evidence, f"{label}.ppm")
         qmp.cmd("screendump", filename=ppm, format="ppm")
         return read_ppm(ppm)
-
-    def difference(left, right):
-        if left[:2] != right[:2]:
-            raise RuntimeError("lifecycle frame dimensions changed")
-        width, height = left[:2]
-        first = width * 64 * 3  # Clock/panel changes are outside the repaint comparison.
-        changed = sum(max(abs(a - b) for a, b in zip(left[2][i:i+3], right[2][i:i+3])) > 24
-                      for i in range(first, width * height * 3, 3))
-        return changed / (width * (height - 64))
 
     def varied_mask(image):
         # The inactive QEMU placeholder has only two quantized colors.
@@ -2957,12 +2971,10 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         greeter = agent.run("greeter")
         if greeter_ready(greeter):
             image = frame("logout-greeter")
-            width, height, pixels = image
-            colors = {tuple(value >> 4 for value in pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
-                      for y in range(0, height, 8) for x in range(0, width, 8)}
+            colors = greeter_colors(image)
             changed = difference(reference, image)
-            greeter["paint"] = {"changed_from_pre_login_greeter": changed, "colors": len(colors)}
-            greeter_visible = changed < 0.05 and len(colors) >= 8
+            greeter["paint"] = {"changed_from_pre_login_greeter": changed, "colors": colors}
+            greeter_visible = changed < GREETER_REPAINT_TOLERANCE and colors >= 8
             if greeter_visible:
                 break
         time.sleep(0.5)
@@ -3153,10 +3165,30 @@ def gdm_login(qmp, agent_path, out, record, *, reference_profile=None):
             json.dump(provenance, stream, indent=2)
         with open(os.path.join(out, "greeter-before-login.json"), "w") as stream:
             json.dump(greeter, stream, indent=2)
-        time.sleep(5)
-        qmp.frame(os.path.join(out, "V-GDM-GREETER.png"))
         # The logout check compares the repainted greeter with this frame.
-        qmp.cmd("screendump", filename=os.path.join(out, "greeter-before-login.ppm"), format="ppm")
+        # greeter_ready sees GDM's gnome-shell process and active greeter
+        # session before that shell registers its display and paints; a slow
+        # start outlasted the fixed settle and left the scanout black (run
+        # 44611328331: display registered 6.5-7 s after readiness on all five
+        # boots), so logout later waited out its deadline against black. Keep
+        # the first painted frame that the next frame confirms settled, within
+        # the unchanged greeter deadline.
+        time.sleep(5)
+        reference = os.path.join(out, "greeter-before-login.ppm")
+        previous = None
+        while True:
+            qmp.cmd("screendump", filename=reference, format="ppm")
+            image = read_ppm(reference)
+            painted = greeter_colors(image) >= 8
+            settled = (painted and previous is not None
+                       and difference(previous, image) < GREETER_REPAINT_TOLERANCE)
+            if settled or time.monotonic() >= deadline:
+                break
+            previous = image if painted else None
+            time.sleep(1)
+        qmp.frame(os.path.join(out, "V-GDM-GREETER.png"))
+        if not settled:
+            raise RuntimeError("shipped GDM greeter did not paint a settled frame before its deadline")
         if reference_profile is not None:
             record("V-REFERENCE-STOCK-GDM", greeter["gdm"]["ready"],
                    "original packaged stock GDM greeter admitted by the independent reference observer")

@@ -572,6 +572,74 @@ class NotificationPreparation(unittest.TestCase):
         self.assertEqual(self.keys, [('meta_l', 'n'), ('tab',), ('ret',)])
         self.assertFalse(self.evidence['confirmed_absent'])
 
+    def queue(self, paths, *, closes=True, focused_path=None, deadline=10.0):
+        """The shell's tray: one banner on screen, critical ones never expire,
+        the next queued one drops in when Return reaches the focused Close.
+        Guest calls cost what run 44442598008 recorded: a state read about
+        0.25 s, a Close observation about 0.5 s, a key chord about 0.1 s."""
+        from unittest.mock import patch
+        queue = list(paths)
+        keys, evidence, clock = [], {}, [0.0]
+        def banner(focused):
+            value = copy.deepcopy(self.focused if focused else self.value)
+            close = value['notification_ui']['control']['notification_banner']['close_controls'][0]
+            close['path'] = (focused_path or queue[0]) if focused else queue[0]
+            return value
+        def read(_deadline):
+            clock[0] += .25
+            return banner(False) if queue else self.after
+        def observe(_deadline):
+            clock[0] += .5
+            return banner(bool(keys) and keys[-1] == ('tab',)) if queue else self.after
+        def send(*key):
+            clock[0] += .1
+            keys.append(key)
+            if key == ('ret',) and closes:
+                queue.pop(0)
+        with patch.object(proof.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(proof.time, 'sleep', side_effect=lambda d: clock.__setitem__(0, clock[0] + d)):
+            try:
+                return proof.dismiss_notification_banner(
+                    read, observe, send, banner(False), self.original, self.sha, deadline=deadline,
+                    input_idle=True, evidence=evidence), keys, evidence, clock[0]
+            except BaseException as error:
+                error.keys, error.evidence = keys, evidence
+                raise
+
+    def test_queued_banners_each_receive_one_focused_close_within_the_capture_deadline(self):
+        # Run 44442598008: three critical updater banners queued; one Close
+        # only revealed the next. Each distinct Close instance gets its own
+        # focused Return, and all three leave time for both frames.
+        paths = ['/org/gtk/a11y/close%d' % index for index in range(3)]
+        after, keys, evidence, elapsed = self.queue(paths)
+        self.assertIs(after, self.after)
+        self.assertEqual(keys, [('meta_l', 'n'), ('tab',), ('ret',)] * 3)
+        self.assertEqual(evidence['activations'], 3)
+        self.assertTrue(evidence['confirmed_absent'])
+        self.assertLess(elapsed, 8.5)
+        self.assertLess(len(json.dumps(evidence)), 2048)
+
+    def test_a_named_banner_its_close_does_not_remove_is_never_activated_twice(self):
+        with self.assertRaises(TimeoutError) as caught:
+            self.queue(['/org/gtk/a11y/close0'], closes=False)
+        self.assertEqual(caught.exception.keys, [('meta_l', 'n'), ('tab',), ('ret',)])
+        self.assertEqual(caught.exception.evidence['activations'], 1)
+        self.assertFalse(caught.exception.evidence['confirmed_absent'])
+
+    def test_a_close_instance_change_before_return_never_receives_it(self):
+        with self.assertRaisesRegex(RuntimeError, 'changed before focused activation') as caught:
+            self.queue(['/org/gtk/a11y/close0'], focused_path='/org/gtk/a11y/other')
+        self.assertEqual(caught.exception.keys, [('meta_l', 'n'), ('tab',)])
+        self.assertFalse(caught.exception.evidence['activated'])
+
+    def test_malformed_close_path_never_receives_input(self):
+        for path in ('relative/path', '/a//b', '/' + 'a' * 255, '/private notification title', 7):
+            value = copy.deepcopy(self.value)
+            value['notification_ui']['control']['notification_banner']['close_controls'][0]['path'] = path
+            with self.subTest(path=path), self.assertRaisesRegex(RuntimeError, 'path is malformed'):
+                self.dismiss(observed=value)
+            self.assertEqual(self.keys, [])
+
     def test_wrong_button_or_unfocused_close_never_receives_return(self):
         with self.assertRaisesRegex(RuntimeError, 'Close focused'):
             self.dismiss(observed=self.value)

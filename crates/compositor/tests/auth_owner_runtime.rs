@@ -579,6 +579,301 @@ fn actual_main_runtime_private_pam_retirement_and_held_self() {
     run_parent(Path::new(env!("CARGO_BIN_EXE_tuna-compositor")), "3", "pam");
 }
 
+const NO_MATCH: &str = "Failed to match fingerprint";
+const RETRY: &str = "Place your finger on the reader again";
+const ACCOUNT_EXPIRED: &str = "Your account was given a time limit that’s now passed.";
+const MAX_TRIES: &str =
+    "You reached the maximum fingerprint authentication attempts, please try another method";
+
+/// Script the next fingerprint conversation of the controlled module:
+/// one letter per scan, `m` match, `n` no-match, `t` timed out, each
+/// optionally after `r` retry statuses within that scan.
+fn plan_scans(root: &Path, plan: &str) {
+    std::fs::write(root.join("fprint-plan"), plan).unwrap();
+}
+
+fn fingerprint_events(conn: &mut ControlConn, request: u64, expected: &[&str]) {
+    use tuna_shell_control::AuthEvent;
+    for step in expected {
+        let wanted = match *step {
+            "scan" => AuthEvent::FingerprintScan { swipe: true },
+            "unavailable" => AuthEvent::Unavailable,
+            text => AuthEvent::Problem { text: text.into() },
+        };
+        assert_eq!(auth_event(conn, request), wanted, "request {request}");
+    }
+}
+
+/// Fingerprint unlock through PAM (#1162 F5) against the actual runtime,
+/// private helper and a pam_fprintd-like module behind `tuna-lock-fingerprint`:
+/// the account stack refuses an expired account after a match; PAM's
+/// max-tries and a timed-out scan end the service as GDM reports them;
+/// a lock admits three failed conversations, then refuses before PAM
+/// runs; the password still unlocks; on a new lock a retry status and a
+/// no-match, then a match, unlock.
+fn fingerprint_client() {
+    use tuna_shell_control::AuthService;
+    let root = PathBuf::from(std::env::var_os("TUNA_AUTH_OWNER_ROOT").unwrap());
+    let failures = || state(&root)["auth_owner"]["conversations"]["fingerprint_failures"].clone();
+    wait(|| state(&root)["auth_owner"].is_object());
+    let mut a = connect();
+    send(&mut a, 10, CommandKind::Lock);
+    result(&mut a, 10, true);
+    wait(|| state(&root)["locked"] == true);
+    // A match on an expired account: pam_acct_mgmt refuses it.
+    std::fs::write(root.join("fprint-expired"), "").unwrap();
+    plan_scans(&root, "nm");
+    begin(&mut a, 11, AuthService::Fingerprint);
+    fingerprint_events(&mut a, 11, &["scan", NO_MATCH, "scan", ACCOUNT_EXPIRED]);
+    result(&mut a, 11, false);
+    assert_eq!(
+        state(&root)["locked"],
+        true,
+        "an expired account never unlocks by fingerprint"
+    );
+    std::fs::remove_file(root.join("fprint-expired")).unwrap();
+    // Three no-matches: PAM_MAXTRIES, GDM's message, the service stops.
+    plan_scans(&root, "nnn");
+    begin(&mut a, 12, AuthService::Fingerprint);
+    fingerprint_events(
+        &mut a,
+        12,
+        &[
+            "scan",
+            NO_MATCH,
+            "scan",
+            NO_MATCH,
+            "scan",
+            NO_MATCH,
+            MAX_TRIES,
+            "unavailable",
+        ],
+    );
+    result(&mut a, 12, false);
+    // A no-match, then a timed-out scan (PAM_AUTHINFO_UNAVAIL; its info
+    // message is only GNOME's hint cue).
+    plan_scans(&root, "nt");
+    begin(&mut a, 13, AuthService::Fingerprint);
+    fingerprint_events(
+        &mut a,
+        13,
+        &["scan", NO_MATCH, "scan", "scan", "unavailable"],
+    );
+    result(&mut a, 13, false);
+    wait(|| failures() == 3);
+    // The lock's failed conversations are used up: a matching finger is
+    // never even asked for.
+    plan_scans(&root, "m");
+    begin(&mut a, 14, AuthService::Fingerprint);
+    fingerprint_events(&mut a, 14, &["unavailable"]);
+    result(&mut a, 14, false);
+    assert!(
+        root.join("fprint-plan").exists(),
+        "PAM ran after the lock's fingerprint budget"
+    );
+    assert_eq!(state(&root)["locked"], true);
+    // The password conversation is unaffected.
+    begin(&mut a, 20, AuthService::Password);
+    query(&mut a, 20, 1, "Visible account challenge", false);
+    answer(&mut a, 21, 1, "visible-answer");
+    query(&mut a, 20, 2, "First secret challenge", true);
+    answer(&mut a, 22, 2, "first-secret");
+    let _info = auth_event(&mut a, 20);
+    let _error = auth_event(&mut a, 20);
+    query(&mut a, 20, 3, "Separate PIN challenge", true);
+    answer(&mut a, 23, 3, "pin-secret");
+    result(&mut a, 20, true);
+    wait(|| state(&root)["locked"] == false);
+    // A new lock starts afresh: a retry status and a no-match are shown,
+    // then a match on a valid account unlocks.
+    send(&mut a, 30, CommandKind::Lock);
+    result(&mut a, 30, true);
+    wait(|| state(&root)["locked"] == true);
+    plan_scans(&root, "rnm");
+    begin(&mut a, 31, AuthService::Fingerprint);
+    fingerprint_events(&mut a, 31, &["scan", RETRY, NO_MATCH, "scan"]);
+    result(&mut a, 31, true);
+    wait(|| {
+        state(&root)["locked"] == false
+            && state(&root)["auth_owner"]["conversations"]["fingerprint"] == false
+    });
+    publish_json(
+        &root.join("success.json"),
+        &serde_json::json!({
+            "supervised_client_pid": std::process::id(),
+            "expired_account_match_denied": true,
+            "max_tries_unavailable": true,
+            "timed_out_unavailable": true,
+            "lock_budget_refuses_before_pam": true,
+            "password_unaffected": true,
+            "retry_then_match_unlocks": true,
+            "scope": "actual nested Runtime + private PAM helper on the fingerprint service + pam_fprintd-like controlled module + private-bus fprintd probe; no GTK, reader or installed stack"
+        }),
+    );
+    std::thread::sleep(Duration::from_secs(2));
+}
+
+/// `enable-fingerprint-authentication` off: the compositor refuses the
+/// service itself, whatever the shell asks; PAM never runs.
+fn fingerprint_setting_client() {
+    use tuna_shell_control::AuthService;
+    let root = PathBuf::from(std::env::var_os("TUNA_AUTH_OWNER_ROOT").unwrap());
+    wait(|| state(&root)["auth_owner"].is_object());
+    let mut a = connect();
+    send(&mut a, 10, CommandKind::Lock);
+    result(&mut a, 10, true);
+    wait(|| state(&root)["locked"] == true);
+    plan_scans(&root, "m");
+    begin(&mut a, 11, AuthService::Fingerprint);
+    fingerprint_events(&mut a, 11, &["unavailable"]);
+    result(&mut a, 11, false);
+    assert!(
+        root.join("fprint-plan").exists(),
+        "PAM ran with fingerprint disabled"
+    );
+    assert_eq!(state(&root)["locked"], true);
+    publish_json(
+        &root.join("success.json"),
+        &serde_json::json!({
+            "supervised_client_pid": std::process::id(),
+            "setting_off_refused_before_pam": true,
+            "scope": "actual nested Runtime; org.gnome.login-screen from a private schema and keyfile backend"
+        }),
+    );
+    std::thread::sleep(Duration::from_secs(2));
+}
+
+#[test]
+fn actual_main_runtime_fingerprint_through_pam() {
+    match std::env::var(ROLE).ok().as_deref() {
+        Some("5") => return fingerprint_client(),
+        Some(_) => return,
+        None => {}
+    }
+    run_parent(
+        Path::new(env!("CARGO_BIN_EXE_tuna-compositor")),
+        "5",
+        "fingerprint",
+    );
+}
+
+#[test]
+fn actual_main_runtime_fingerprint_setting_enforced() {
+    match std::env::var(ROLE).ok().as_deref() {
+        Some("6") => return fingerprint_setting_client(),
+        Some(_) => return,
+        None => {}
+    }
+    run_parent(
+        Path::new(env!("CARGO_BIN_EXE_tuna-compositor")),
+        "6",
+        "fingerprint-setting",
+    );
+}
+
+struct StubManager;
+
+#[zbus::interface(name = "net.reactivated.Fprint.Manager")]
+impl StubManager {
+    fn get_default_device(&self) -> zbus::OwnedObjectPath {
+        zbus::OwnedObjectPath::try_from(STUB_DEVICE).unwrap()
+    }
+}
+
+struct StubDevice;
+
+#[zbus::interface(name = "net.reactivated.Fprint.Device")]
+impl StubDevice {
+    fn list_enrolled_fingers(&self, _username: String) -> Vec<String> {
+        vec!["right-index-finger".into()]
+    }
+
+    #[zbus(property, name = "scan-type")]
+    fn scan_type(&self) -> String {
+        "swipe".into()
+    }
+}
+
+const STUB_DEVICE: &str = "/net/reactivated/Fprint/Device/0";
+
+/// fprintd's probe surface (a swipe reader with one enrolled print) on a
+/// private bus handed to the compositor as its system bus. Verification
+/// itself is the PAM module's: the stub has no Claim or VerifyStart.
+struct FprintdStub {
+    daemon: Child,
+    address: String,
+    _service: zbus::Connection,
+}
+
+impl FprintdStub {
+    fn spawn() -> Self {
+        use std::io::BufRead;
+        let mut daemon = Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("private fprintd bus starts");
+        let mut address = String::new();
+        std::io::BufReader::new(daemon.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+        let address = address.trim().to_owned();
+        let service = zbus::block_on(
+            zbus::connection::Builder::address(address.as_str())
+                .method_timeout(Duration::from_secs(10))
+                .build(),
+        )
+        .unwrap();
+        zbus::block_on(service.request_name("net.reactivated.Fprint")).unwrap();
+        zbus::block_on(
+            service
+                .object_server()
+                .at("/net/reactivated/Fprint/Manager", StubManager),
+        )
+        .unwrap();
+        zbus::block_on(service.object_server().at(STUB_DEVICE, StubDevice)).unwrap();
+        Self {
+            daemon,
+            address,
+            _service: service,
+        }
+    }
+}
+
+impl Drop for FprintdStub {
+    fn drop(&mut self) {
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
+    }
+}
+
+/// GNOME's `org.gnome.login-screen` schema (shipped by GDM, absent on CI)
+/// compiled under `root/schemas`, with `enable-fingerprint-authentication`
+/// set in the keyfile backend's file under `root/config`.
+fn login_screen_setting(root: &Path, enabled: bool) {
+    let schemas = root.join("schemas");
+    std::fs::create_dir(&schemas).unwrap();
+    std::fs::write(
+        schemas.join("org.gnome.login-screen.gschema.xml"),
+        "<schemalist><schema id='org.gnome.login-screen' path='/org/gnome/login-screen/'>\
+         <key name='enable-fingerprint-authentication' type='b'><default>true</default></key>\
+         </schema></schemalist>",
+    )
+    .unwrap();
+    assert!(Command::new("glib-compile-schemas")
+        .arg(&schemas)
+        .status()
+        .unwrap()
+        .success());
+    let keyfile = root.join("config/glib-2.0/settings");
+    std::fs::create_dir_all(&keyfile).unwrap();
+    std::fs::write(
+        keyfile.join("keyfile"),
+        format!("[org/gnome/login-screen]\nenable-fingerprint-authentication={enabled}\n"),
+    )
+    .unwrap();
+}
+
 fn run_parent(bin: &Path, role: &str, kind: &str) {
     if std::env::var_os("DISPLAY").is_none() {
         assert!(
@@ -606,8 +901,10 @@ fn run_parent(bin: &Path, role: &str, kind: &str) {
     };
     let end = Instant::now() + Duration::from_secs(30);
     // Role 4 is the interactive relay: the module's multi-prompt mode;
-    // every other role delays a single controlled password.
-    let (service, mode) = if role == "4" {
+    // roles 5 and 6 add the fingerprint service; every other role delays
+    // a single controlled password.
+    let fingerprint = matches!(role, "5" | "6");
+    let (service, mode) = if role == "4" || fingerprint {
         ("runtime-conversation", "multi")
     } else {
         ("runtime-delay", "runtime-delay")
@@ -637,6 +934,23 @@ fn run_parent(bin: &Path, role: &str, kind: &str) {
         ),
     )
     .unwrap();
+    // The fingerprint service: a pam_fprintd-like module scripted by the
+    // client, then an account stack the client can expire.
+    std::fs::write(
+        root.path().join("services").join("runtime-fingerprint"),
+        format!(
+            "auth required {} fprint-plan\naccount required {} fprint-plan\n",
+            module.display(),
+            module.display()
+        ),
+    )
+    .unwrap();
+    // A reader with an enrolled print, and GNOME's login-screen setting:
+    // on for role 5, off for role 6.
+    let fprintd = fingerprint.then(FprintdStub::spawn);
+    if fingerprint {
+        login_screen_setting(root.path(), role == "5");
+    }
     let owned_bin = root.path().join("compositor-copy");
     if role == "3" {
         std::fs::copy(bin, &owned_bin).unwrap();
@@ -656,44 +970,54 @@ fn run_parent(bin: &Path, role: &str, kind: &str) {
             .unwrap()
     );
     let log = std::fs::File::create(root.path().join("compositor.log")).unwrap();
-    let mut child = OwnedChild(
-        Command::new(executable)
-            .env("TUNA_PAM_SERVICE", service)
-            .env("LD_PRELOAD", "/usr/lib/x86_64-linux-gnu/libpam_wrapper.so")
-            .env("PAM_WRAPPER", "1")
-            .env("PAM_WRAPPER_SERVICE_DIR", root.path().join("services"))
-            // No reader here: the fingerprint service must say unavailable.
-            .env("TUNA_FPRINTD_OFF", "1")
-            .args([
-                "--socket",
-                "auth-owner-proof",
-                "--width",
-                "800",
-                "--height",
-                "600",
-                "--shell-bin",
-            ])
-            .arg(std::env::current_exe().unwrap())
-            .env(ROLE, role)
-            // The supervised peer is libtest too; retain its panic in compositor.log.
-            .env("RUST_TEST_NOCAPTURE", "1")
-            .env("TUNA_AUTH_OWNER_TEST_BIN", std::env::current_exe().unwrap())
-            .env("TUNA_AUTH_OWNER_ROOT", root.path())
-            .env("XDG_RUNTIME_DIR", root.path())
-            .env("HOME", root.path().join("home"))
-            .env("XDG_CONFIG_HOME", root.path().join("config"))
-            .env("XDG_CACHE_HOME", root.path().join("cache"))
-            .env("XDG_DATA_HOME", root.path().join("data"))
-            .env("XDG_STATE_HOME", root.path().join("state"))
-            .env("TUNA_COMPOSITOR_STATE", root.path().join("state.json"))
-            .env("TUNA_LOCK_TRACE", "1")
-            .env("TUNA_XWAYLAND", "0")
-            .env_remove("WAYLAND_DISPLAY")
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap(),
-    );
+    let mut command = Command::new(executable);
+    command
+        .env("TUNA_PAM_SERVICE", service)
+        .env("TUNA_PAM_FINGERPRINT_SERVICE", "runtime-fingerprint")
+        .env("LD_PRELOAD", "/usr/lib/x86_64-linux-gnu/libpam_wrapper.so")
+        .env("PAM_WRAPPER", "1")
+        .env("PAM_WRAPPER_SERVICE_DIR", root.path().join("services"))
+        .args([
+            "--socket",
+            "auth-owner-proof",
+            "--width",
+            "800",
+            "--height",
+            "600",
+            "--shell-bin",
+        ])
+        .arg(std::env::current_exe().unwrap())
+        .env(ROLE, role)
+        // The supervised peer is libtest too; retain its panic in compositor.log.
+        .env("RUST_TEST_NOCAPTURE", "1")
+        .env("TUNA_AUTH_OWNER_TEST_BIN", std::env::current_exe().unwrap())
+        .env("TUNA_AUTH_OWNER_ROOT", root.path())
+        .env("XDG_RUNTIME_DIR", root.path())
+        .env("HOME", root.path().join("home"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_CACHE_HOME", root.path().join("cache"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .env("TUNA_COMPOSITOR_STATE", root.path().join("state.json"))
+        .env("TUNA_LOCK_TRACE", "1")
+        .env("TUNA_XWAYLAND", "0")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DBUS_SYSTEM_BUS_ADDRESS")
+        .stdout(Stdio::null())
+        .stderr(log);
+    match &fprintd {
+        Some(stub) => {
+            command
+                .env("DBUS_SYSTEM_BUS_ADDRESS", &stub.address)
+                .env("GSETTINGS_BACKEND", "keyfile")
+                .env("GSETTINGS_SCHEMA_DIR", root.path().join("schemas"));
+        }
+        // No reader here: the fingerprint service must say unavailable.
+        None => {
+            command.env("TUNA_FPRINTD_OFF", "1");
+        }
+    }
+    let mut child = OwnedChild(command.spawn().unwrap());
     publish_json(
         &root.path().join("compositor-pid"),
         &serde_json::json!(child.0.id()),

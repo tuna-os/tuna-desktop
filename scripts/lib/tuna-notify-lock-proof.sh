@@ -30,6 +30,10 @@
 #                        (MediaMessage); Play reaches it while locked and
 #                        turns to Pause; its app's show-in-lock-screen
 #                        and leaving the bus take it away
+#   G-NOTIFY-CALENDAR-MEDIA the same player lists in the date menu above
+#                        the notifications (MessageView._setupMpris,
+#                        #1037); Play reaches it and turns to Pause; its
+#                        app's enable and leaving the bus take it away
 #   G-NOTIFY-SOUND       a banner plays its sound-name (else sound-file)
 #                        through the event-sound player as it shows,
 #                        unless enable-sound-alerts or event-sounds is off
@@ -379,6 +383,55 @@ notify_lock_proof() {
     nl_close "$nl_listed"
     nl_close "$nl_off_again"
     pass G-NOTIFY-RESTORE "a disabled app's notification stays out of the list; enabling the app brings it back at once, with no banner"
+
+    # The date menu's media section (messageList.js MessageView
+    # _setupMpris, #1037): the player above the notifications, live.
+    printf '[Desktop Entry]\nName=Tuna Proof Music\nExec=true\nType=Application\n' \
+        >"$nl_desktop_dir/tuna-proof-player.desktop"
+    : >"$ARTIFACTS/calendar-mpris-calls"
+    "$PY" "$ROOT/scripts/lib/tuna-mpris-player-stub.py" "$ARTIFACTS/calendar-mpris-calls" 120 tunacalendar \
+        >"$ARTIFACTS/calendar-mpris.log" 2>&1 &
+    nl_player=$!
+    nl_below=$(nl_notify tuna-lock-private "Below The Player" "calendar body" 1) ||
+        fail G-NOTIFY-CALENDAR-MEDIA "Notify failed"
+    sleep 1
+    xdotool key super+v
+    sleep 2
+    nl_until calendar-media '[.[] | select(.showing)] | (any(.name == "Tuna Proof Track") and any(.name == "Tuna Proof Artist") and any(.name == "Tuna Proof Music") and any(.name == "Below The Player"))' G-NOTIFY-CALENDAR-MEDIA ||
+        fail G-NOTIFY-CALENDAR-MEDIA "the date menu does not list the player's track, artist and app beside the notification"
+    jq -e '([.[] | select(.showing and .name == "Tuna Proof Track" and .bounds != null) | .bounds[1]] | min) < ([.[] | select(.showing and .name == "Below The Player" and .bounds != null) | .bounds[1]] | min)' "$nl_tree" >/dev/null ||
+        fail G-NOTIFY-CALENDAR-MEDIA "the player's message is not above the notifications"
+    button_showing "$nl_tree" "Play" || fail G-NOTIFY-CALENDAR-MEDIA "the paused player shows no Play control"
+    button_showing "$nl_tree" "Previous" || fail G-NOTIFY-CALENDAR-MEDIA "the player shows no Previous control"
+    button_showing "$nl_tree" "Next" || fail G-NOTIFY-CALENDAR-MEDIA "the player shows no Next control"
+    nl_shot calendar-media
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-notify-calendar-media-press.json" 20 \
+        --press "Play" || fail G-NOTIFY-CALENDAR-MEDIA "could not press Play"
+    nl_end=$(($(date +%s) + 5))
+    until grep -q '^call PlayPause ' "$ARTIFACTS/calendar-mpris-calls"; do
+        [ "$(date +%s)" -lt "$nl_end" ] || fail G-NOTIFY-CALENDAR-MEDIA "Play in the date menu did not reach the player"
+        sleep 0.3
+    done
+    nl_until calendar-media-playing 'any(.[]; .showing and .name == "Pause" and (.role == "push button" or .role == "button"))' G-NOTIFY-CALENDAR-MEDIA ||
+        fail G-NOTIFY-CALENDAR-MEDIA "the control did not turn to Pause once the player played"
+    gsettings set "$(nl_app tuna-proof-player)" enable false
+    nl_until calendar-media-off '(any(.[]; .showing and .name == "Tuna Proof Track")) | not' G-NOTIFY-CALENDAR-MEDIA ||
+        fail G-NOTIFY-CALENDAR-MEDIA "the app's enable off left the player in the date menu"
+    gsettings set "$(nl_app tuna-proof-player)" enable true
+    nl_until calendar-media-on 'any(.[]; .showing and .name == "Tuna Proof Track")' G-NOTIFY-CALENDAR-MEDIA ||
+        fail G-NOTIFY-CALENDAR-MEDIA "the app's enable on did not bring the player back"
+    kill "$nl_player" 2>/dev/null || true
+    wait "$nl_player" 2>/dev/null || true
+    nl_until calendar-media-gone '(any(.[]; .showing and .name == "Tuna Proof Track")) | not' G-NOTIFY-CALENDAR-MEDIA ||
+        fail G-NOTIFY-CALENDAR-MEDIA "the player stayed in the date menu after leaving the bus"
+    xdotool key Escape
+    sleep 1
+    nl_close "$nl_below"
+    for nl_key in enable application-id; do
+        gsettings reset "$(nl_app tuna-proof-player)" "$nl_key"
+    done
+    rm -f "$nl_desktop_dir/tuna-proof-player.desktop"
+    pass G-NOTIFY-CALENDAR-MEDIA "a player that can play lists in the date menu above the notifications with its app, track and artist; its controls drive it; its app's enable and leaving the bus take it away"
 
     # As found for the gates after.
     for nl_id in $NL_APPS; do

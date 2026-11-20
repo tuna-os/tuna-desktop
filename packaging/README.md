@@ -19,7 +19,8 @@ parity baseline. The preview image layers the Tuna Desktop package on
 
 The preview image offers "Tuna Desktop (preview)" on the GDM login screen
 beside GNOME: the DRM/KMS backend runs the hardware session (#52), the
-lock screen unlocks through PAM (`/etc/pam.d/tuna-lock`, #62), and the
+lock screen unlocks through PAM (`/etc/pam.d/tuna-lock`, #62; fingerprint
+through `/etc/pam.d/tuna-lock-fingerprint`), and the
 power menu logs out back to GDM. A "Tuna Desktop (nested preview)" launcher
 also opens Tuna Desktop in a window inside GNOME. Upstreaming a `marlin:tuna`
 flavor to `tuna-os/tunaOS` (#69) follows once hardware runs in the VM

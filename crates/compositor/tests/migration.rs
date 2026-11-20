@@ -760,6 +760,11 @@ fn real_output_global_removal_reaches_clients() {
 /// A real hotplugged output: a protocol `Output` with its registry
 /// global, registered in the inventory as `Runtime` does.
 fn plug_real_output(comp: &mut TestCompositor, name: &str) {
+    plug_real_output_sized(comp, name, 1280, 800);
+}
+
+/// [`plug_real_output`] at `width`x`height`, right of the row.
+fn plug_real_output_sized(comp: &mut TestCompositor, name: &str, width: i32, height: i32) {
     let output = Output::new(
         name.to_owned(),
         PhysicalProperties {
@@ -770,14 +775,125 @@ fn plug_real_output(comp: &mut TestCompositor, name: &str) {
         },
     );
     let mode = Mode {
-        size: (1280, 800).into(),
+        size: (width, height).into(),
         refresh: 60_000,
     };
     output.change_current_state(Some(mode), None, Some(Scale::Integer(1)), None);
     output.set_preferred(mode);
     let global = output.create_global::<State>(&comp.display.handle());
-    comp.state.add_output(name, Some(output), 1280, 800);
+    comp.state.add_output(name, Some(output), width, height);
     comp.state.note_output_global(name, global);
+}
+
+/// The runtime's reaction to an output change (`sync_drm_outputs`): re-home
+/// the floating windows against the layout before it, then re-resolve
+/// the derived layouts.
+fn outputs_changed(
+    manager: &mut WindowManager,
+    state: &mut State,
+    before: &[(
+        String,
+        smithay::utils::Rectangle<i32, smithay::utils::Logical>,
+    )],
+) {
+    manager.relocate_for_monitors_changed(state, before);
+    manager.reapply_derived_layouts(state);
+}
+
+/// Two real outputs, the VM lane's: "Virtual-1" 1280x800 (primary) and
+/// "Virtual-2" 1024x768 right of it; one client bound to both with one
+/// mapped toplevel.
+fn real_dual_with_window() -> (
+    TestCompositor,
+    WindowManager,
+    Connection,
+    EventQueue<Client>,
+    Client,
+    u64,
+) {
+    let mut comp = TestCompositor::new();
+    plug_real_output_sized(&mut comp, "Virtual-1", 1280, 800);
+    plug_real_output_sized(&mut comp, "Virtual-2", 1024, 768);
+    let mut manager = comp.window_manager();
+    let (conn, mut queue, mut client) = connect(&mut comp);
+    assert_eq!(client.outputs.len(), 2, "the client binds both outputs");
+    map_toplevel(&mut comp, &conn, &mut queue, &mut client, "placed");
+    manager.reconcile(&mut comp.state);
+    sync_client(&mut comp, &conn, &mut queue, &mut client);
+    let id = manager.model().windows().next().unwrap().id;
+    (comp, manager, conn, queue, client, id)
+}
+
+/// GTK's `fullscreen_on_monitor` (`xdg_toplevel.set_fullscreen` with a
+/// wl_output) covers that output, not the primary, as Mutter moves the
+/// window to the monitor first; the window keeps it across an unplug
+/// (the remaining output) and a replug (back on the one it asked for).
+#[test]
+fn fullscreen_request_covers_the_named_output() {
+    let (mut comp, mut manager, conn, mut queue, mut client, id) = real_dual_with_window();
+    let second = smithay::utils::Rectangle::new((1280, 0).into(), (1024, 768).into());
+    let primary = smithay::utils::Rectangle::new((0, 0).into(), (1280, 800).into());
+    assert!(
+        primary.contains_rect(manager.geometry(id).unwrap()),
+        "the window maps on the primary output"
+    );
+
+    let named = client.outputs[1].clone();
+    client
+        .toplevel
+        .as_ref()
+        .unwrap()
+        .set_fullscreen(Some(&named));
+    sync_client(&mut comp, &conn, &mut queue, &mut client);
+    manager.reconcile(&mut comp.state);
+    assert_eq!(manager.window_layout(id), Some(WindowLayout::Fullscreen));
+    assert_eq!(manager.geometry(id).unwrap(), second);
+    assert_eq!(manager.preferred_output(id), Some("Virtual-2"));
+
+    // Unplugged: the fullscreen window survives on the remaining output.
+    let before = comp.state.output_slices();
+    assert!(comp.state.remove_output("Virtual-2"));
+    outputs_changed(&mut manager, &mut comp.state, &before);
+    assert_eq!(manager.window_layout(id), Some(WindowLayout::Fullscreen));
+    assert_eq!(manager.geometry(id).unwrap(), primary);
+
+    // Plugged back: it returns to the output it asked for.
+    let before = comp.state.output_slices();
+    plug_real_output_sized(&mut comp, "Virtual-2", 1024, 768);
+    outputs_changed(&mut manager, &mut comp.state, &before);
+    assert_eq!(manager.window_layout(id), Some(WindowLayout::Fullscreen));
+    assert_eq!(manager.geometry(id).unwrap(), second);
+
+    // Leaving fullscreen floats it on that output.
+    client.toplevel.as_ref().unwrap().unset_fullscreen();
+    sync_client(&mut comp, &conn, &mut queue, &mut client);
+    manager.reconcile(&mut comp.state);
+    assert_eq!(manager.window_layout(id), Some(WindowLayout::Floating));
+    assert!(
+        second.contains_rect(manager.geometry(id).unwrap()),
+        "unfullscreened at {:?}, off {second:?}",
+        manager.geometry(id)
+    );
+}
+
+/// `xdg_toplevel.set_fullscreen` without an output covers the output the
+/// window is on (Mutter's `window->monitor`), not always the primary.
+#[test]
+fn fullscreen_request_without_output_covers_the_window_s_output() {
+    let (mut comp, mut manager, conn, mut queue, mut client, id) = real_dual_with_window();
+    assert!(manager.move_window(id, 1280, 0));
+    client
+        .toplevel
+        .as_ref()
+        .unwrap()
+        .set_fullscreen(None::<&WlOutput>);
+    sync_client(&mut comp, &conn, &mut queue, &mut client);
+    manager.reconcile(&mut comp.state);
+    assert_eq!(manager.window_layout(id), Some(WindowLayout::Fullscreen));
+    assert_eq!(
+        manager.geometry(id).unwrap(),
+        smithay::utils::Rectangle::new((1280, 0).into(), (1024, 768).into())
+    );
 }
 
 /// A monitor unplugged right after it was plugged in: GTK binds every

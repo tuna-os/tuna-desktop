@@ -48,7 +48,7 @@ while IFS='|' read -r shot_keys shot_dims shot_position shot_label shot_pointer;
     # far below a pixel; the visible host cursor is checked separately.
     cstate "((.pointer_position[0] - ${shot_pointer%,*}) | fabs) < 0.000001 and ((.pointer_position[1] - ${shot_pointer#*,}) | fabs) < 0.000001" "screenshot keyboard pointer feedback" ||
         fail G-SCREENSHOT-KEYS "$shot_label cursor did not follow the selected edge or area centre"
-    cp "$CSTATE" "$ARTIFACTS/shot-keys-$shot_label-compositor.json"
+    snapshot_state "$CSTATE" "$ARTIFACTS/shot-keys-$shot_label-compositor.json"
     # Observe the visible nested host cursor too. Seat state alone can
     # change without moving Winit's actual pointer on the screen.
     "$PY" - "$WID" "$shot_pointer" "$WIDTH" "$HEIGHT" "$ARTIFACTS/shot-keys-$shot_label-host-cursor.json" <<'HOST_CURSOR' ||
@@ -123,7 +123,7 @@ done
 sleep 0.3 # Let the compositor publish the processed keyboard sequence.
 cstate ".pointer_position == $pointer_before and .active_workspace == $workspace_before and (.overview_open | not)" "screen-mode navigation negative control" ||
     fail G-SCREENSHOT-KEYS "modified Screen-mode keys moved the pointer or leaked desktop shortcuts"
-cp "$CSTATE" "$ARTIFACTS/shot-screen-negative-control.json"
+snapshot_state "$CSTATE" "$ARTIFACTS/shot-screen-negative-control.json"
 pass G-SCREENSHOT-KEYS-SCREEN "modified Screen navigation leaves pointer and workspace unchanged; Escape dismisses"
 
 # GNOME's binding pool matches modifiers exactly: Ctrl+C captures (C

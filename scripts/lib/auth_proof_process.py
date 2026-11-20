@@ -1,4 +1,4 @@
-"""Owned Linux proof process retirement; copied from reviewed fingerprint wrapper."""
+"""Owned Linux proof process retirement."""
 import ctypes
 import os
 from pathlib import Path

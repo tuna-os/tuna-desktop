@@ -39,7 +39,8 @@ for path in \
     usr/share/wayland-sessions/tuna.desktop \
     usr/lib/systemd/user/tuna-session.target \
     usr/libexec/tuna-geoclue-agent-policy \
-    etc/pam.d/tuna-lock; do
+    etc/pam.d/tuna-lock \
+    etc/pam.d/tuna-lock-fingerprint; do
     printf '%s' "$CONTENTS" | grep -q "$path" || fail "missing $path"
 done
 
@@ -56,7 +57,7 @@ trap 'rm -rf "$DIR"' EXIT INT TERM
 dpkg-deb -x "$PKG" "$DIR"
 python3 "$ROOT/scripts/tuna-cursor-assets-check" "$DIR/usr/share/tuna-desktop/icons/Adwaita" \
     || fail "bundled cursor assets rejected"
-for path in usr/share/wayland-sessions/tuna.desktop usr/lib/systemd/user/tuna-session.target etc/pam.d/tuna-lock; do
+for path in usr/share/wayland-sessions/tuna.desktop usr/lib/systemd/user/tuna-session.target etc/pam.d/tuna-lock etc/pam.d/tuna-lock-fingerprint; do
     [ -f "$DIR/$path" ] && [ ! -L "$DIR/$path" ] || fail "invalid required file $path"
 done
 for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus-bridge tuna-wallpaper-svg; do
@@ -79,7 +80,7 @@ done
 # it), so it is recommended rather than required.
 RECOMMENDS="$(dpkg-deb -f "$PKG" Recommends)"
 printf '%s\n' "$RECOMMENDS" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -Fxq 'geoclue-2.0' || fail "missing recommendation geoclue-2.0"
-# Both PAM conffiles and exact bridge contents/modes were checked in the
+# Every PAM conffile and exact bridge contents/modes were checked in the
 # original archives before extraction; no lifecycle hooks are permitted.
 
 # Former-package relations remain alongside the two retained regular files.

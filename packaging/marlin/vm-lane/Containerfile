@@ -96,8 +96,9 @@ COPY --chown=0:0 --chmod=0755 packaging/marlin/vm-lane/tuna-vm-admin-policy /tmp
 # status, the derived policy, pacman versions/ownership and only allowlisted
 # [User] keys of the global templates. It is a diagnostic, never a gate.
 # The payload hashes cover the same login-path files Containerfile.published
-# pins, taken after the tunaOS steps; the booted lane re-checks them before
-# it types into GDM.
+# pins, plus the fingerprint lock PAM service (/etc/pam.d/tuna-lock-fingerprint)
+# that published images predate, taken after the tunaOS steps; the booted
+# lane re-checks them before it types into GDM.
 RUN mkdir -p /usr/share/tuna-vm \
     && pacman -Q tuna-desktop > /usr/share/tuna-vm/shipped-package.txt \
     && pacman -Q > /usr/share/tuna-vm/shipped-packages.txt \
@@ -113,7 +114,7 @@ RUN mkdir -p /usr/share/tuna-vm \
     && sha256sum /usr/bin/tuna-session /usr/bin/tuna-compositor \
          /usr/bin/tuna-shell-host /usr/bin/tuna-shell-gtk \
          /usr/bin/tuna-ibus-bridge \
-         /usr/share/wayland-sessions/*.desktop /etc/pam.d/tuna-lock \
+         /usr/share/wayland-sessions/*.desktop /etc/pam.d/tuna-lock /etc/pam.d/tuna-lock-fingerprint \
          /usr/lib/pam.d/gdm-password /usr/lib/pam.d/gdm-launch-environment \
          /etc/gdm/custom.conf /usr/lib/systemd/system/gdm.service \
          /etc/systemd/user/org.gnome.Shell@gdm.service.d/tunaos-gdm-theme.conf \

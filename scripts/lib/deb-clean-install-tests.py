@@ -28,12 +28,14 @@ class CleanInstallTests(unittest.TestCase):
                 ('usr/share/wayland-sessions/tuna.desktop', 'share/wayland-sessions/tuna.desktop'),
                 ('usr/share/wayland-sessions/roost.desktop', 'share/compat/wayland-sessions/roost.desktop'),
                 ('etc/pam.d/tuna-lock', 'share/pam.d/tuna-lock'),
+                ('etc/pam.d/tuna-lock-fingerprint', 'share/pam.d/tuna-lock-fingerprint'),
                 ('etc/pam.d/roost-lock', 'share/compat/pam.d/roost-lock')):
             path = self.stage / installed
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(SCRIPT.parents[1] / source, path)
             path.chmod(0o644)
-        (self.stage / 'conffiles').write_text('/etc/pam.d/tuna-lock\n/etc/pam.d/roost-lock\n')
+        (self.stage / 'conffiles').write_text(
+            '/etc/pam.d/tuna-lock\n/etc/pam.d/tuna-lock-fingerprint\n/etc/pam.d/roost-lock\n')
         (self.stage / 'conffiles').chmod(0o644)
         # tuna-rename: keep-end
         for directory in self.stage.rglob('*'):
@@ -129,17 +131,24 @@ sys.exit(int(os.environ['ENGINE_FAILURE']))
         self.assertEqual(result.returncode, 0, result.stderr)
         body = json.loads(self.log.read_text())[-1]
         # tuna-rename: keep-begin
-        self.assertIn('/usr/share/wayland-sessions/roost.desktop /etc/pam.d/roost-lock /etc/pam.d/tuna-lock', body)
+        self.assertIn('/usr/share/wayland-sessions/roost.desktop /etc/pam.d/roost-lock /etc/pam.d/tuna-lock '
+                      '/etc/pam.d/tuna-lock-fingerprint', body)
         self.assertIn('[ ! -L "$path" ]', body)
         self.assertIn('NoDisplay=true', body)
         self.assertIn('unexpected legacy paths', body)
         self.assertIn('for service in tuna-lock roost-lock', body)
-        self.log.unlink()
-        (self.stage / 'etc/pam.d/roost-lock').unlink()
-        result = self.run_check()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('transition-file-missing', result.stderr)
-        self.assertFalse(self.log.exists())
+        self.assertIn('auth required pam_fprintd.so\\naccount include login', body)
+        for missing in ('etc/pam.d/roost-lock', 'etc/pam.d/tuna-lock-fingerprint'):
+            with self.subTest(missing=missing):
+                self.log.unlink(missing_ok=True)
+                saved = (self.stage / missing).read_bytes()
+                (self.stage / missing).unlink()
+                result = self.run_check()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('transition-file-missing', result.stderr)
+                self.assertFalse(self.log.exists())
+                (self.stage / missing).write_bytes(saved)
+                (self.stage / missing).chmod(0o644)
         # tuna-rename: keep-end
 
     def test_container_failure_is_not_a_pass(self):

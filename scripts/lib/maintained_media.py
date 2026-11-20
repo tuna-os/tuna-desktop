@@ -191,8 +191,15 @@ def media(path):
     streams = json_blob(probe.stdout).get("streams", [])
     require(any(s.get("codec_type") == "video" and s.get("width", 0) > 0 and
                 s.get("height", 0) > 0 for s in streams), "no decoded visual stream: " + str(path))
+    # Keep the demuxed time base through the null output. FFmpeg otherwise
+    # re-times frames onto a 1/frame-rate grid, so two variable-rate
+    # capture frames inside one tick (x11grab catching up after a stall)
+    # are reported as non-monotonic DTS: a muxing artefact of this check,
+    # not a decode failure. At the input's own time base, genuinely
+    # repeated timestamps still fail.
     decoded = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", str(path),
-                              "-map", "0:v:0", "-f", "null", "-"], capture_output=True)
+                              "-map", "0:v:0", "-enc_time_base", "demux", "-f", "null", "-"],
+                             capture_output=True)
     require(decoded.returncode == 0 and not decoded.stderr.strip(),
             "media decode failed: " + str(path))
     visual = next(s for s in streams if s.get("codec_type") == "video")

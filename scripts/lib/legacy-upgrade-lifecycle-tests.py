@@ -41,6 +41,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 OLD_PAM = 'etc/pam.d/roost-lock'
 NEW_PAM = 'etc/pam.d/tuna-lock'
+# Fingerprint unlock's own service (#1162 F5); new in the candidate, no bridge.
+FINGERPRINT_PAM = 'etc/pam.d/tuna-lock-fingerprint'
+FINGERPRINT_PAM_RULES = [['auth', 'required', 'pam_fprintd.so'], ['account', 'include', 'login']]
 OLD_SESSION = 'usr/share/wayland-sessions/roost.desktop'
 NEW_SESSION = 'usr/share/wayland-sessions/tuna.desktop'
 OLD_BINS = ('roost-compositor', 'roost-greeter', 'roost-ibus-bridge',
@@ -318,8 +321,10 @@ Description: synthetic disposable lifecycle fixture, never release qualification
         for installed, source in ((NEW_SESSION, 'share/wayland-sessions/tuna.desktop'),
                                   (OLD_SESSION, 'share/compat/wayland-sessions/roost.desktop'),
                                   (NEW_PAM, 'share/pam.d/tuna-lock'),
+                                  (FINGERPRINT_PAM, 'share/pam.d/tuna-lock-fingerprint'),
                                   (OLD_PAM, 'share/compat/pam.d/roost-lock')):
             files[installed] = (ROOT / source).read_bytes()
+        conffiles = '/' + NEW_PAM + '\n/' + FINGERPRINT_PAM + '\n/' + OLD_PAM + '\n'
     if flavor == 'changed-policy':
         files[OLD_PAM] += b'# Deliberately changed shipped bytes: prompt/control fixture only.\n'
     if flavor == 'removed':
@@ -476,6 +481,7 @@ class DisposableLifecycle(unittest.TestCase):
         self.assert_regular(NEW_SESSION, DESKTOP)
         self.assert_regular(OLD_PAM, self.candidate['data'][OLD_PAM]['body'] if pam is None else pam)
         self.assert_regular(NEW_PAM, self.candidate['data'][NEW_PAM]['body'] if new_pam is None else new_pam)
+        self.assert_regular(FINGERPRINT_PAM, self.candidate['data'][FINGERPRINT_PAM]['body'])
         self.assertEqual({str(path.relative_to(self.root)) for path in self.root.rglob('*')
                           if 'roost' in str(path.relative_to(self.root)).lower()
                           and not str(path.relative_to(self.root)).startswith('var/lib/dpkg/')
@@ -484,7 +490,7 @@ class DisposableLifecycle(unittest.TestCase):
         for old in OLD_BINS:
             self.assertFalse(os.path.lexists(self.root / 'usr/bin' / old))
         status_text = package_status(self.root, 'tuna-desktop')
-        for name in (OLD_PAM, NEW_PAM):
+        for name in (OLD_PAM, NEW_PAM, FINGERPRINT_PAM):
             line = next(line for line in status_text.splitlines() if line.startswith(' /' + name + ' '))
             self.assertNotIn('obsolete', line)
 
@@ -497,8 +503,13 @@ class DisposableLifecycle(unittest.TestCase):
             rules = [line.split() for line in data['body'].decode().splitlines()
                      if line.strip() and not line.lstrip().startswith('#')]
             self.assertEqual(rules, PAM_RULES)
+        data = self.candidate['data'][FINGERPRINT_PAM]
+        self.assertEqual((data['kind'], data['mode']), ('file', 0o644))
+        self.assertEqual([line.split() for line in data['body'].decode().splitlines()
+                          if line.strip() and not line.lstrip().startswith('#')], FINGERPRINT_PAM_RULES)
+        self.assertEqual(data['body'], (ROOT / 'share/pam.d/tuna-lock-fingerprint').read_bytes())
         self.assertEqual(set(self.candidate['control']['conffiles']['body'].decode().splitlines()),
-                         {'/' + NEW_PAM, '/' + OLD_PAM})
+                         {'/' + NEW_PAM, '/' + FINGERPRINT_PAM, '/' + OLD_PAM})
         self.assertEqual(self.candidate['data'][OLD_PAM]['body'], ORIGINAL_BETA_OLD_PAM)
         self.assertEqual(self.candidate['data'][NEW_PAM]['body'], ORIGINAL_BETA_NEW_PAM)
         self.install(self.candidate)

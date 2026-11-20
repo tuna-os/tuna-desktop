@@ -51,6 +51,16 @@ before decoding.
   lock). The shell answers `CommandKind::RespondCloseDialog { window,
   response }` with `CloseDialogResponse::ForceClose` or `Wait`. Texts are
   bounded by `MAX_TITLE_LEN`, sides by `MAX_CLOSE_DIALOG_SIDE`.
+- Lock screen shown (0.51): `Message::LockScreenShown { shown }` (peers
+  >=51 only) says the session is locked and the lock curtain has landed
+  (screenShield.js `_lockScreenShown`); `false` once it unlocks. The shell
+  reports `org.gnome.ScreenSaver` active only while it is shown, because
+  gnome-settings-daemon blanks the screen on `ActiveChanged(true)`.
+- Shell bus identity (0.52): `CommandKind::DeclareBusName { unique_name }`
+  (peers >=52 only) names the shell's session-bus connection. The
+  compositor admits D-Bus capture and Introspect calls as the shell only
+  from names the supervised shell's pidfd-pinned control session declared,
+  and denies the command from any other session (ADR 0010).
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
   `ErrorKind`.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,

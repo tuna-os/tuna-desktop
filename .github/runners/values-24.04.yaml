@@ -6,7 +6,7 @@ githubConfigSecret: tuna-ci-github
 runnerGroup: tuna-desktop-karnataka
 runnerScaleSetName: tuna-ci-24.04
 minRunners: 1
-maxRunners: 10
+maxRunners: 6
 
 controllerServiceAccount:
   namespace: arc-systems
@@ -32,7 +32,7 @@ template:
     enableServiceLinks: false
     containers:
       - name: runner
-        image: localhost/tuna-ci-runner:24.04-2.338.2-202610310435
+        image: localhost/tuna-ci-runner:24.04-2.338.2-202611070451
         imagePullPolicy: Never
         command: ["/home/runner/run.sh"]
         # ARC uses this as the runner's work folder: /home/runner/work, as on
@@ -48,8 +48,11 @@ template:
         resources:
           requests: {cpu: "1500m", memory: 5Gi, ephemeral-storage: 20Gi}
           # /dev/net/tun (KubeVirt's device plugin) for podman's pasta
-          # networking; no host paths are mounted.
-          limits: {cpu: "4", memory: 14Gi, ephemeral-storage: 45Gi, devices.kubevirt.io/tun: "1"}
+          # networking; no host paths are mounted. 24Gi: shellcheck on
+          # scripts/tuna-gtk-shell-proof alone peaks near 12 GB, and the
+          # gtk-shell job's single shellcheck call over five scripts was
+          # OOM-killed at 14Gi, taking the runner with it.
+          limits: {cpu: "4", memory: 24Gi, ephemeral-storage: 45Gi, devices.kubevirt.io/tun: "1"}
         volumeMounts:
           - name: dshm
             mountPath: /dev/shm

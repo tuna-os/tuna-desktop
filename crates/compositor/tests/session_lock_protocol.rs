@@ -1,4 +1,8 @@
 //! Real ext-session-lock clients; runtime PID/PAM policy is tested separately.
+//!
+//! `connect` attaches the supervised shell's pinned connection, the only
+//! client whose lock request is considered; `connect_foreign` attaches an
+//! ordinary client of this same process, so with the shell's very PID.
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::wayland_server::Resource;
 use std::collections::HashMap;
@@ -143,9 +147,20 @@ fn pump(comp: &mut TestCompositor, peer: &mut Peer) {
         peer.queue.dispatch_pending(&mut peer.client).unwrap();
     }
 }
+/// The supervised shell's connection, pinned to this process.
 fn connect(comp: &mut TestCompositor) -> Peer {
     let (server, stream) = UnixStream::pair().unwrap();
+    comp.add_shell_client(server);
+    peer(comp, stream)
+}
+/// An ordinary client. It runs in this process, so its `SO_PEERCRED` PID
+/// is the shell's: the PID number alone must not make it the shell.
+fn connect_foreign(comp: &mut TestCompositor) -> Peer {
+    let (server, stream) = UnixStream::pair().unwrap();
     comp.add_client(server);
+    peer(comp, stream)
+}
+fn peer(comp: &mut TestCompositor, stream: UnixStream) -> Peer {
     let conn = Connection::from_socket(stream).unwrap();
     let queue = conn.new_event_queue();
     let registry = conn.display().get_registry(&queue.handle(), ());
@@ -200,8 +215,8 @@ fn pending_lock_is_not_granted_and_denial_reports_finished() {
         .expect("actual protocol request");
     assert_eq!(
         pid,
-        Some(std::process::id() as i32),
-        "SO_PEERCRED sender PID"
+        Some(std::process::id()),
+        "SO_PEERPIDFD-pinned shell PID"
     );
     assert!(comp.state.take_lock_request().is_none());
     drop(pending);
@@ -210,6 +225,78 @@ fn pending_lock_is_not_granted_and_denial_reports_finished() {
     assert!(!comp.state.has_lock_surfaces());
     assert!(!comp.state.take_client_unlock());
     lock.destroy();
+}
+
+/// PID reuse, as Wayland sees it: an ordinary connection whose
+/// `SO_PEERCRED` PID is the held shell's is refused on arrival. Before,
+/// its request was pending with the shell's PID and the runtime approved
+/// it.
+#[test]
+fn a_foreign_lock_with_the_shells_pid_is_refused_on_arrival() {
+    let mut comp = compositor();
+    let mut peer = connect_foreign(&mut comp);
+    let manager: ExtSessionLockManagerV1 = peer.bind(1);
+    let lock = manager.lock(&peer.queue.handle(), 1);
+    pump(&mut comp, &mut peer);
+    assert!(
+        comp.state.take_lock_request().is_none(),
+        "nothing for the runtime to approve"
+    );
+    assert_eq!(peer.client.events, vec![(1, false)]);
+    assert!(!comp.state.has_lock_surfaces());
+    lock.destroy();
+}
+
+/// A hostile client spamming `lock` around the shell's request can neither
+/// replace nor cancel it, nor drop the shell's early lock surface; the
+/// shell's lock is still granted with its surface. The shell locks because
+/// the compositor's flag is already set, and it asks once: if another
+/// client's request could finish the shell's before the runtime judged
+/// it, the session would stay locked with no curtain and no prompt.
+#[test]
+fn a_hostile_client_spamming_lock_cannot_cancel_the_shells_lock() {
+    use tuna_compositor::session_lock::{lock_request_verdict, LockVerdict};
+    let mut comp = compositor();
+    let mut shell = connect(&mut comp);
+    let mut hostile = connect_foreign(&mut comp);
+    let hostile_manager: ExtSessionLockManagerV1 = hostile.bind(1);
+    let mut spam: Vec<_> = (100..132)
+        .map(|tag| hostile_manager.lock(&hostile.queue.handle(), tag))
+        .collect();
+    hostile.queue.flush().unwrap();
+    let (_shell_lock, _role, _surface) = pending_surface(&mut comp, &mut shell, 1);
+    // More requests after the shell's, before the runtime's next tick.
+    spam.extend((200..232).map(|tag| hostile_manager.lock(&hostile.queue.handle(), tag)));
+    pump(&mut comp, &mut hostile);
+    pump(&mut comp, &mut shell);
+    assert!(
+        shell.client.events.is_empty(),
+        "the shell's request was not finished"
+    );
+    assert_eq!(hostile.client.events.len(), 64);
+    assert!(hostile.client.events.iter().all(|(_, granted)| !granted));
+    let (locker, pid) = comp
+        .state
+        .take_lock_request()
+        .expect("the shell's request is still pending");
+    assert!(
+        comp.state.take_lock_request().is_none(),
+        "nothing else waits for a verdict"
+    );
+    let verdict = lock_request_verdict(pid, Some(std::process::id()), true);
+    assert_eq!(verdict, LockVerdict::Approved);
+    comp.state.resolve_lock_request(locker, true);
+    pump(&mut comp, &mut shell);
+    assert_eq!(shell.client.events, vec![(1, true)]);
+    assert_eq!(
+        comp.state.lock_surfaces().len(),
+        1,
+        "the shell's early surface survived the spam"
+    );
+    for lock in spam {
+        lock.destroy();
+    }
+    hostile.conn.flush().unwrap();
 }
 
 #[test]
@@ -365,72 +452,19 @@ fn rejected_second_client_preserves_the_approved_output_surface() {
     comp.state.resolve_lock_request(pending, true);
     pump(&mut comp, &mut owner);
     let original = comp.state.lock_surface_for("fixture").unwrap();
-    let mut other = connect(&mut comp);
+    let mut other = connect_foreign(&mut comp);
     let (_other_lock, _other_role, _other_surface) = pending_surface(&mut comp, &mut other, 23);
     assert_eq!(comp.state.lock_surface_for("fixture").unwrap(), original);
     assert_eq!(comp.state.lock_surfaces(), vec![original.clone()]);
-    let pending = comp.state.take_lock_request().unwrap().0;
-    comp.state.resolve_lock_request(pending, false);
+    assert!(
+        comp.state.take_lock_request().is_none(),
+        "refused on arrival, never pending"
+    );
     pump(&mut comp, &mut other);
     assert_eq!(other.client.events, vec![(23, false)]);
     assert_eq!(comp.state.lock_surface_for("fixture").unwrap(), original);
     assert_eq!(comp.state.lock_surfaces(), vec![original]);
     assert!(!comp.state.take_client_unlock());
-}
-
-#[test]
-fn another_clients_request_does_not_cancel_a_pending_lock() {
-    // The shell locks because the compositor's flag is already set, and
-    // it asks once. If a request from any other client could finish the
-    // shell's before the runtime judged it, the session would stay
-    // locked with no curtain and no prompt.
-    let mut comp = compositor();
-    let mut shell = connect(&mut comp);
-    let (_lock, _role, _surface) = pending_surface(&mut comp, &mut shell, 26);
-    let mut other = connect(&mut comp);
-    let manager: ExtSessionLockManagerV1 = other.bind(1);
-    let foreign = manager.lock(&other.queue.handle(), 27);
-    pump(&mut comp, &mut other);
-    pump(&mut comp, &mut shell);
-    assert!(
-        shell.client.events.is_empty(),
-        "the earlier request is still undecided"
-    );
-    // The runtime judges each request in turn, oldest first.
-    let (first, _) = comp.state.take_lock_request().expect("the shell's request");
-    comp.state.resolve_lock_request(first, true);
-    let (second, _) = comp.state.take_lock_request().expect("the other's request");
-    comp.state.resolve_lock_request(second, false);
-    assert!(comp.state.take_lock_request().is_none());
-    pump(&mut comp, &mut other);
-    pump(&mut comp, &mut shell);
-    assert_eq!(shell.client.events, vec![(26, true)]);
-    assert_eq!(other.client.events, vec![(27, false)]);
-    assert_eq!(comp.state.lock_surfaces().len(), 1);
-    foreign.destroy();
-}
-
-#[test]
-fn refusing_one_client_keeps_a_waiting_clients_early_surface() {
-    // The other client asked first, so it is judged first, while the
-    // shell's request and its early lock surface still wait.
-    let mut comp = compositor();
-    let mut other = connect(&mut comp);
-    let manager: ExtSessionLockManagerV1 = other.bind(1);
-    let foreign = manager.lock(&other.queue.handle(), 28);
-    pump(&mut comp, &mut other);
-    let mut shell = connect(&mut comp);
-    let (_lock, _role, _surface) = pending_surface(&mut comp, &mut shell, 29);
-    let (first, _) = comp.state.take_lock_request().expect("the other's request");
-    comp.state.resolve_lock_request(first, false);
-    let (second, _) = comp.state.take_lock_request().expect("the shell's request");
-    comp.state.resolve_lock_request(second, true);
-    pump(&mut comp, &mut other);
-    pump(&mut comp, &mut shell);
-    assert_eq!(other.client.events, vec![(28, false)]);
-    assert_eq!(shell.client.events, vec![(29, true)]);
-    assert_eq!(comp.state.lock_surfaces().len(), 1);
-    foreign.destroy();
 }
 
 #[test]
@@ -442,12 +476,11 @@ fn unapproved_release_is_a_protocol_error_without_clearing_the_owner() {
     comp.state.resolve_lock_request(pending, true);
     pump(&mut comp, &mut owner);
     let original = comp.state.lock_surface_for("fixture").unwrap();
-    let mut other = connect(&mut comp);
+    let mut other = connect_foreign(&mut comp);
     let manager: ExtSessionLockManagerV1 = other.bind(1);
     let unapproved = manager.lock(&other.queue.handle(), 25);
     pump(&mut comp, &mut other);
-    let pending = comp.state.take_lock_request().unwrap().0;
-    comp.state.resolve_lock_request(pending, false);
+    assert!(comp.state.take_lock_request().is_none());
     pump(&mut comp, &mut other);
     unapproved.unlock_and_destroy();
     other.queue.flush().unwrap();

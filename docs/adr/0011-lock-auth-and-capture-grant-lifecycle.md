@@ -103,16 +103,20 @@ which includes `login`) for `getpwuid(getuid())`.
   [password result ownership](../security/password-owner-epoch.md),
   [PAM conversation relay](../security/pam-conversation-relay.md).
 
-**Fingerprint through PAM (pending fix, F5).** Today fingerprint unlock
-does not use PAM. The compositor talks to fprintd over D-Bus itself, and a
-`Matched` result goes straight to `Runtime::apply_verified_unlock`
-(`runtime/auth.rs`, `Runtime::begin_fingerprint`; `crates/compositor/src/fprintd.rs`).
-No account stack, `pam_faillock` or `pam_access` runs on this path, and the
-`enable-fingerprint-authentication` key is enforced only by the shell.
-GNOME 51 runs the `gdm-fingerprint` PAM service instead. The fix being
-built runs fingerprint through the private PAM helper on its own PAM
-service, with `pam_fprintd` and the account stack. Until it lands, an
-administrator's PAM account policy does not apply to a fingerprint unlock.
+**Fingerprint through PAM (F5; fixed in #1173).** Fingerprint unlock runs
+`pam_fprintd` in the private PAM helper on its own PAM service,
+`tuna-lock-fingerprint` (`share/pam.d/tuna-lock-fingerprint`: `pam_fprintd`
+plus `login`'s account stack), as GNOME 51 runs `gdm-fingerprint`. The
+helper runs `pam_authenticate` then `pam_acct_mgmt`, so the account stack,
+`pam_faillock` and `pam_access` decide a fingerprint unlock as they decide a
+password one. The compositor asks fprintd only whether a reader and an
+enrolled print exist and which scan type the reader has
+(`crates/compositor/src/fprintd.rs`). It enforces
+`enable-fingerprint-authentication` itself and admits three failed
+fingerprint conversations per lock (`runtime/auth.rs`,
+`Runtime::begin_fingerprint`). Before #1173 a fprintd `Matched` result went
+straight to `Runtime::apply_verified_unlock` and no account stack ran.
+Detail: [lock conversations](../security/lock-conversations.md#fingerprint-conversation).
 
 **Unlock.** A verified credential reaches `Runtime::apply_verified_unlock`,
 which unlocks only if the session is still locked and `Slot::grant` wins a
@@ -359,7 +363,7 @@ that closes a risk below; "in progress" means a fix is still being built.
   consented share, a restored share or a gnome-remote-desktop session runs
   with nothing on screen until it ends or the session locks. GNOME 51 shows
   a remote-access indicator with Stop.
-- **L14. Fingerprint bypasses PAM (F5; in progress).** See
+- **L14. Fingerprint bypasses PAM (F5; fixed in #1173).** See
   [Fingerprint through PAM](#lock-lifecycle) above.
 
 ## Evidence

@@ -140,6 +140,18 @@ nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
 
+Issue #1078 changes src/xwayland/xwm/surface.rs. Upstream writes WM_STATE
+only from set_mapped, which also unmaps the frame, and set_suspended adds
+_NET_WM_STATE_HIDDEN alone, so a minimized window that stays mapped (its
+contents drawn by the minimize animation, as Mutter keeps them) was never
+told it is iconic. The additive X11Surface::set_iconic writes WM_STATE
+IconicState and adds _NET_WM_STATE_HIDDEN, or NormalState and removes it,
+without touching the frame, as Mutter's meta_window_x11_set_wm_state and
+set_net_wm_state do on minimize and restore. The nested proof G-X11-ICONIC
+(scripts/tuna-gtk-shell-proof --x11-iconic-only) covers it. The isolated
+diff is retained in X11-ICONIC-STATE-API-PATCH.diff; the pinned version
+stays 0.7.0.
+
 Issue #729 changes src/wayland/session_lock/lock.rs and mod.rs: the
 ext_session_lock_v1 duplicate_output check now tracks outputs per lock
 object (SessionLockState) instead of in a manager-wide list that only

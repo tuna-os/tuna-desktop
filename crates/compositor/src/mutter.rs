@@ -1907,25 +1907,26 @@ mod tests {
         creator.join().unwrap();
     }
 
-    /// The bus daemon's half of the owner check, answering every PID
-    /// query with one process.
-    struct AnsweringBus(u32);
+    /// The bus daemon's half of the owner check: these unique names are
+    /// still connected.
+    struct AnsweringBus(Vec<&'static str>);
 
     #[zbus::interface(name = "org.freedesktop.DBus")]
     impl AnsweringBus {
-        #[zbus(name = "GetConnectionUnixProcessID")]
-        fn get_connection_unix_process_id(&self, _name: String) -> u32 {
-            self.0
+        #[zbus(name = "NameHasOwner")]
+        fn name_has_owner(&self, name: String) -> bool {
+            self.0.contains(&name.as_str())
         }
     }
 
     /// #657: a bus that stops answering revokes every capture owner
     /// within one bound, checked concurrently rather than one blocked
-    /// call after another; an answering bus still vouches for the shell.
+    /// call after another; an answering bus still vouches for the shell,
+    /// which is tracked by the unique names it declared, not by a PID.
     #[test]
     fn owner_checks_are_bounded_and_fail_closed_on_a_wedged_bus() {
         let authority = crate::capture_security::Authority::default();
-        authority.publish(false, Some(4242));
+        authority.publish(false, [":1.7", ":1.8", ":1.9"]);
         let owners: Vec<String> = [":1.7", ":1.8", ":1.9"].map(String::from).to_vec();
         let timeout = std::time::Duration::from_millis(400);
 
@@ -1953,7 +1954,7 @@ mod tests {
                 zbus::connection::Builder::unix_stream(server_end)
                     .server(zbus::Guid::generate())
                     .p2p()
-                    .serve_at("/org/freedesktop/DBus", AnsweringBus(4242))
+                    .serve_at("/org/freedesktop/DBus", AnsweringBus(vec![":1.7", ":1.8"]))
                     .build(),
             )
             .unwrap()
@@ -1973,10 +1974,22 @@ mod tests {
         );
         assert_eq!(
             alive,
-            [true, true, true],
-            "the shell's own sessions survive"
+            [true, true, false],
+            "the shell's own sessions survive while their names are connected"
         );
-        authority.publish(true, Some(4242));
+        authority.publish(false, [":1.7"]);
+        let alive = owners_alive(
+            &authority,
+            &caller,
+            &owners,
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(
+            alive,
+            [true, false, false],
+            "a name the shell no longer declares is revoked"
+        );
+        authority.publish(true, [":1.7"]);
         let alive = owners_alive(
             &authority,
             &caller,
