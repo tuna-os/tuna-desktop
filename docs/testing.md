@@ -232,8 +232,13 @@ carries on. G-BACKGROUND-BLUR: `ext_background_effect_manager_v1` offers
 blur, and a clear window whose surface is a blur region smooths the
 one-pixel stripes of a maximized window behind it (mean step between
 neighbouring pixels below 16) while beside it they stay sharp (above 128),
-from `background-blur.png`. CI runs the slice in the `gtk-shell` job; its
-`protocols/assertions.txt` feeds the ledger.
+from `background-blur.png`. G-XWAYLAND-GRAB: an X11 probe on the session's
+Xwayland takes `XGrabKeyboard`; as WM_CLASS `remote-viewer` (Mutter's
+built-in list) its grab is granted, a real Super tap reaches it and the
+overview stays shut until Super+Escape gives the shortcuts back, while as
+`XTerm` its grab is refused and Super opens the overview. CI runs the
+slice in the `gtk-shell` job; its `protocols/assertions.txt` feeds the
+ledger.
 
 `scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts DIR` runs the same
 held-button hover and persisted reorder assertions as the full GTK proof,
