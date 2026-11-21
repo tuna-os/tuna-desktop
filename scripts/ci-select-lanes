@@ -89,6 +89,10 @@ PACKAGE_CONSUMERS = ["arch-package", "portal-security", "remote-security",
 
 OWNED = [
     ("scripts/tuna-gtk-shell-proof", ["gtk-shell", "journey"]),
+    # Sourced by it (journey's installed run included): the sound-alert
+    # gates (#353) and their bell pixel reader.
+    ("scripts/lib/tuna-sound-alerts-proof.sh", ["gtk-shell", "journey"]),
+    ("scripts/lib/tuna-bell-pixels.py", ["gtk-shell", "journey"]),
     ("scripts/tuna-scale-proof", ["gtk-shell"]),
     ("scripts/tuna-slow-portal-proof", ["gtk-shell"]),
     ("scripts/tuna-session-restore-proof", ["gtk-shell"]),

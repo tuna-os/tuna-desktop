@@ -106,7 +106,7 @@ def preflight():
     manifest_path = fixture_root / 'provenance.json'
     digest(manifest_path)
     companion = bounded_json(manifest_path)
-    if type(companion) is not dict or set(companion) != {'commit', 'files'} or type(companion['commit']) is not str or type(companion['files']) is not dict or companion['commit'] != run(['git', 'rev-parse', 'HEAD']) or set(companion['files']) != {'icon-probe', 'shortcut-inhibit-client'}:
+    if type(companion) is not dict or set(companion) != {'commit', 'files'} or type(companion['commit']) is not str or type(companion['files']) is not dict or companion['commit'] != run(['git', 'rev-parse', 'HEAD']) or set(companion['files']) != {'icon-probe', 'shortcut-inhibit-client', 'tuna-bell-client'}:
         raise ValueError('companion-source-contract')
     for name, expected in companion['files'].items():
         if digest(fixture_root / name)['sha256'] != expected:
