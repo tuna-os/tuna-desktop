@@ -847,13 +847,25 @@ impl WatcherBus {
     /// the role. A taken name (or no bus) reads as no host: the bar
     /// keeps its tiles and nothing else changes.
     pub fn ensure(&mut self) -> bool {
+        self.connect(None)
+    }
+
+    /// Serve over an explicit bus address (`None` means the session
+    /// bus). Tests point this at a private daemon instead of setting
+    /// `DBUS_SESSION_BUS_ADDRESS` for the whole process; production
+    /// passes `None` through [`WatcherBus::ensure`].
+    fn connect(&mut self, address: Option<&str>) -> bool {
         if self.conn.is_some() {
             return true;
         }
         let watcher = Watcher {
             state: self.state.clone(),
         };
-        let builder = zbus::connection::Builder::session()
+        let builder = match address {
+            Some(address) => zbus::connection::Builder::address(address),
+            None => zbus::connection::Builder::session(),
+        };
+        let builder = builder
             .method_timeout(CALL_TIMEOUT)
             .serve_at(WATCHER_PATH, watcher);
         let conn = match zbus::block_on(builder.build()) {
@@ -2069,29 +2081,6 @@ mod tests {
             }
         }
 
-        /// Process-global session-bus address while a live test owns
-        /// the bus; restores the prior value on drop.
-        struct BusAddressGuard {
-            prior: Option<String>,
-        }
-
-        impl BusAddressGuard {
-            fn point_at(address: &str) -> Self {
-                let prior = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
-                std::env::set_var("DBUS_SESSION_BUS_ADDRESS", address);
-                Self { prior }
-            }
-        }
-
-        impl Drop for BusAddressGuard {
-            fn drop(&mut self) {
-                match &self.prior {
-                    Some(value) => std::env::set_var("DBUS_SESSION_BUS_ADDRESS", value),
-                    None => std::env::remove_var("DBUS_SESSION_BUS_ADDRESS"),
-                }
-            }
-        }
-
         /// Private bus daemon plus its address, or `None` when no
         /// daemon is usable (the caller skips the test).
         fn private_bus() -> Option<(String, std::process::Child)> {
@@ -2124,7 +2113,6 @@ mod tests {
                 eprintln!("SKIP live indicator test: no usable dbus-daemon on PATH");
                 return;
             };
-            let _bus_address = BusAddressGuard::point_at(&address);
 
             let activated = Arc::new(AtomicBool::new(false));
             let secondary = Arc::new(AtomicBool::new(false));
@@ -2213,7 +2201,10 @@ mod tests {
             let mut owned = false;
             let start = std::time::Instant::now();
             while start.elapsed() < Duration::from_secs(20) {
-                if bus.ensure() {
+                // The address goes to this edge alone: setting the
+                // process's session bus would also send other tests'
+                // edges (and the children they spawn) to this bus.
+                if bus.connect(Some(&address)) {
                     owned = true;
                     break;
                 }
