@@ -1446,6 +1446,9 @@ impl Runtime {
                         calloop::channel::Event::Msg(Request::Windows { directory, reply }) => {
                             let _ = reply.send(rt.capture_selector_windows(&directory));
                         }
+                        calloop::channel::Event::Msg(Request::Outputs { directory, reply }) => {
+                            let _ = reply.send(rt.capture_outputs(&directory));
+                        }
                         calloop::channel::Event::Msg(Request::Flash { area, reply }) => {
                             let valid = !rt.is_locked()
                                 && rt.state.outputs.iter().any(|out| {
@@ -3976,6 +3979,64 @@ impl Runtime {
                 y: rect.loc.y,
                 width: rect.size.w,
                 height: rect.size.h,
+                path,
+            });
+        }
+        shots
+    }
+
+    /// GNOME's stage screenshot as the screenshot UI freezes it
+    /// (screenshot.js `screenshot_stage_to_content`), one picture per
+    /// output so the shell can lay one `UIMonitorBin` and screen
+    /// selector over each: every output in layout order, rendered at its
+    /// own scale and saved into `directory`, with its global logical
+    /// rectangle and whether it is the primary. Never while locked.
+    pub fn capture_outputs(
+        &mut self,
+        directory: &std::path::Path,
+    ) -> Vec<crate::screenshot::OutputShot> {
+        if self.is_locked() || crate::screenshot::private_directory(directory).is_err() {
+            return Vec::new();
+        }
+        let primary = self.state.primary_output_name();
+        let entries: Vec<_> = self
+            .state
+            .outputs
+            .iter()
+            .map(|e| (e.name.clone(), e.loc, e.size))
+            .collect();
+        let mut shots = Vec::new();
+        for (index, (name, loc, size)) in entries.into_iter().enumerate() {
+            let (connector, scale) = match &self.backend {
+                // The nested window is the one output.
+                Backend::Winit(_) if index > 0 => continue,
+                Backend::Winit(_) => (None, self.scale),
+                #[cfg(feature = "drm")]
+                Backend::Drm(drm) => {
+                    let Some(out) = drm.outputs.iter().find(|o| o.enabled && o.name == name) else {
+                        continue;
+                    };
+                    (Some(name.clone()), out.scale)
+                }
+            };
+            let Some((w, h, rgba)) = self.render_pixels(
+                connector.as_deref(),
+                smithay::backend::allocator::Fourcc::Abgr8888,
+            ) else {
+                continue;
+            };
+            let path = directory.join(format!("output-{index}.png"));
+            if crate::screenshot::save_png(&path, w as u32, h as u32, &rgba).is_err() {
+                continue;
+            }
+            shots.push(crate::screenshot::OutputShot {
+                primary: primary.as_deref() == Some(name.as_str()),
+                name,
+                x: loc.0,
+                y: loc.1,
+                width: size.w,
+                height: size.h,
+                scale,
                 path,
             });
         }

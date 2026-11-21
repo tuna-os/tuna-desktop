@@ -6,6 +6,22 @@ Every key goes through one table that matches `ScreenshotUI`'s Clutter binding p
 
 Keyboard adjustment relocates the pointer to the selected edge, or to the area centre during Alt movement. Coordinates use integer logical pixels, as Mutter 51.0 `ClutterSeat.warp_pointer`. The private authenticated shell control socket carries the feedback; it adds no public D-Bus API. The compositor rechecks the lock, the mapped exclusive screenshot layer and local bounds before applying it. Existing pointer constraints remain authoritative. Winit also updates the visible host cursor.
 
+## Screen mode on several monitors
+
+Screen mode follows `_rebuildMonitorBins` and `_moveFocus` in gnome-shell 51.0's `screenshot.js`. When the UI opens, the shell asks the compositor for every output's current picture (`org.tuna.Screenshot.ScreenshotOutputs`, `(directory) -> a(siiiidbs)`: name, logical rectangle, scale, primary, PNG path). Each picture is rendered at that output's own scale and shown frozen on its own overlay layer. The primary output carries the panel and holds the keyboard. The other outputs get keyboard-less overlays in the same `tuna-screenshot-ui` namespace. In Screen mode each overlay is a screen selector: the selected one has a 2px white frame, and the others are dimmed to 50% black (30% while hovered), as `.screenshot-ui-screen-selector` styles them. A click selects a monitor.
+
+`ScreenshotOutputs` stands in for GNOME's in-process stage screenshot, so only the supervised shell may call it, and only while the session is unlocked. A portal call under `disable-save-to-disk` gets GNOME's "Saving to disk is disabled" error first; any other portal or caller is denied. The shell keeps working under that lockdown, clipboard-only, as GNOME's UI does. The pictures go only to `$XDG_RUNTIME_DIR/tuna-screenshot-outputs`. The path must match exactly by component, so another directory or `..` is refused. The directory is created mode 0700 and refused when it is a symlink, owned by another user, or open to others.
+
+The primary monitor starts selected. The selection then holds across openings until the set or layout of monitors changes, because GNOME rebuilds its monitor bins only on `monitors-changed`. GNOME 51 does not start on the monitor under the pointer. Plain arrows move the selection as `st_widget_navigate_focus` does, with no wrap-around:
+
+- the candidates are the monitors lying wholly past the selected one's edge in that direction (0.1px slack);
+- the one whose integer midpoint is nearest wins;
+- on a tie, the later monitor wins.
+
+Modified arrows do nothing in Screen mode. Return, Space or Ctrl+C saves only the selected output, in its own physical pixels: a scale-2 monitor yields its full mode size, not its logical size. Escape closes every overlay without saving. Recording in Screen mode records the selected monitor. A recording from Selection mode records the area, offset by the primary monitor's position. The area selection and the window selector stay on the primary monitor.
+
+`D-SCREENSHOT-KEYS-MULTI` in `scripts/tuna-drm-dual` (drm-smoke job; see [testing](testing.md)) proves this on two vkms connectors: one at scale 1 and one at scale 2. The nested session has a single output, so the focused proof below covers only the one-monitor path.
+
 ## Focused runtime proof
 
 ```sh

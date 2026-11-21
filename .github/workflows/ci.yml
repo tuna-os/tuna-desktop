@@ -642,9 +642,9 @@ jobs:
       - run: python3 scripts/tests/test_drm_dual.py
       - run: scripts/ci-install-vkms
       - run: scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts
-      # D-MIRROR-DISABLE, D-LAYOUT-KEEP, D-WORKSPACES-PRIMARY, D-SCALE-MIXED:
-      # two connectors of a vkms configfs device; the lines join drm-smoke's
-      # assertions.txt, the parity ledger's input.
+      # D-MIRROR-DISABLE, D-LAYOUT-KEEP, D-WORKSPACES-PRIMARY, D-SCALE-MIXED,
+      # D-SCREENSHOT-KEYS-MULTI: two connectors of a vkms configfs device;
+      # the lines join drm-smoke's assertions.txt, the parity ledger's input.
       - run: scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt
       - uses: actions/upload-artifact@v7.0.2
         if: always()

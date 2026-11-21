@@ -318,5 +318,77 @@ class Windows(unittest.TestCase):
         self.assertIsNotNone(dual.frames_between(beats, 50.5, 51.9))
 
 
+def picture(width, height, channels=4, fill=(30, 60, 90), marker=None):
+    """Pixel bytes as GdkPixbuf hands them over, with an optional marker
+    rectangle (x, y, w, h) in dual.MARKER_RGB; rows padded to 4 bytes."""
+    rowstride = (width * channels + 3) & ~3
+    data = bytearray(rowstride * height)
+    for y in range(height):
+        for x in range(width):
+            inside = marker and marker[0] <= x < marker[0] + marker[2] and marker[1] <= y < marker[1] + marker[3]
+            i = y * rowstride + x * channels
+            data[i:i + 3] = bytes(dual.MARKER_RGB if inside else fill)
+            if channels == 4:
+                data[i + 3] = 255
+    return bytes(data), rowstride
+
+
+class Screenshot(unittest.TestCase):
+    MONITORS = {"Virtual-1": [0, 0, 1024, 768], "Virtual-2": [1024, 0, 800, 600]}
+
+    @staticmethod
+    def layers(*rects, namespace=dual.SCREENSHOT_NAMESPACE):
+        return {"layers": [{"namespace": "tuna-panel", "rect": [0, 0, 1024, 32]}]
+                + [{"namespace": namespace, "rect": list(r)} for r in rects]}
+
+    def test_one_overlay_per_monitor(self):
+        both = self.layers([1024, 0, 800, 600], [0, 0, 1024, 768])
+        self.assertEqual(dual.check_screenshot_layers(both, self.MONITORS), [])
+        # Old behaviour: one overlay, on the primary or on the pointer's
+        # monitor, and nothing over the other.
+        for old, bare in (([0, 0, 1024, 768], "Virtual-2"), ([1024, 0, 800, 600], "Virtual-1")):
+            problems = dual.check_screenshot_layers(self.layers(old), self.MONITORS)
+            self.assertEqual(len(problems), 1)
+            self.assertIn(f"none over {bare}", problems[0])
+        # An overlay the size of the wrong monitor, or one too many.
+        self.assertTrue(dual.check_screenshot_layers(
+            self.layers([0, 0, 1024, 768], [1024, 0, 1024, 768]), self.MONITORS))
+        self.assertTrue(dual.check_screenshot_layers(
+            self.layers([0, 0, 1024, 768], [1024, 0, 800, 600], [0, 0, 1024, 768]), self.MONITORS))
+        self.assertTrue(dual.check_screenshot_layers(self.layers(), self.MONITORS))
+        # Closed: none left.
+        self.assertEqual(dual.check_no_screenshot_layers(self.layers()), [])
+        self.assertTrue(dual.check_no_screenshot_layers(self.layers([0, 0, 1024, 768])))
+
+    def test_marker_share(self):
+        for channels in (3, 4):
+            plain, stride = picture(64, 40, channels)
+            self.assertEqual(dual.color_share(plain, 64, 40, stride, channels, dual.MARKER_RGB), 0.0)
+            half, stride = picture(64, 40, channels, marker=(0, 0, 32, 40))
+            self.assertAlmostEqual(dual.color_share(half, 64, 40, stride, channels, dual.MARKER_RGB), 0.5)
+        # Near misses: a pinkish or purple desktop is not the marker.
+        pink, stride = picture(16, 16, fill=(255, 40, 255))
+        self.assertEqual(dual.color_share(pink, 16, 16, stride, 4, dual.MARKER_RGB, step=1), 0.0)
+        close, stride = picture(16, 16, fill=(250, 5, 252))
+        self.assertEqual(dual.color_share(close, 16, 16, stride, 4, dual.MARKER_RGB, step=1), 1.0)
+
+    def test_capture_is_the_selected_output_alone_at_its_scale(self):
+        a, b = (1024, 768), (1600, 1200)
+        self.assertEqual(dual.check_capture("primary-first", a, 0.0, a, False), [])
+        self.assertEqual(dual.check_capture("right-twice", b, 0.18, b, True), [])
+        # Old behaviour: Screen saves the one frozen canvas, the primary's,
+        # whatever Right selected, so B's capture is A's size with no marker.
+        old = dual.check_capture("right-twice", a, 0.0, b, True)
+        self.assertEqual(len(old), 2)
+        self.assertIn("not the selected output's 1600x1200", old[0])
+        self.assertIn("not the output showing it", old[1])
+        # B in logical rather than physical pixels (its scale lost).
+        self.assertTrue(dual.check_capture("right-twice", (800, 600), 0.18, b, True))
+        # The whole desktop rather than one monitor.
+        self.assertTrue(dual.check_capture("primary-first", (1824, 768), 0.07, a, False))
+        # A's size but B's pixels (the marker shows on A's capture).
+        self.assertTrue(dual.check_capture("left-before-escape", a, 0.1, a, False))
+
+
 if __name__ == "__main__":
     unittest.main()

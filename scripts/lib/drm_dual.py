@@ -2,7 +2,8 @@
 
 Each check takes what the leg reads (the kernel's KMS readback from
 drm_kms_readback.py, the compositor's TUNA_COMPOSITOR_STATE document,
-a GTK client's reports, a saved monitors.xml) and returns a list of
+a GTK client's reports, a saved monitors.xml, a saved screenshot's
+pixels) and returns a list of
 problems; an empty list passes. They hold no I/O so
 scripts/tests/test_drm_dual.py runs them on recorded and on old-behaviour
 inputs without a kernel.
@@ -12,6 +13,14 @@ import xml.etree.ElementTree as ET
 
 # wp_fractional_scale_v1 sends the preferred scale in 120ths.
 FRACTIONAL_DENOMINATOR = 120
+# tuna_shell_control::SCREENSHOT_NAMESPACE, the screenshot UI's layers.
+SCREENSHOT_NAMESPACE = "tuna-screenshot-ui"
+# The marker client's colour (magenta, which the desktop never shows) and
+# how much of a capture it must cover: at least MARKER_MIN_SHARE of the
+# output showing it, at most MARKER_MAX_SHARE of one that does not.
+MARKER_RGB = (255, 0, 255)
+MARKER_MIN_SHARE = 0.05
+MARKER_MAX_SHARE = 0.005
 
 
 def configfs_script(path, pipes):
@@ -323,3 +332,60 @@ def frames_between(beats, start, end):
     if not before or not by_end or by_end[-1]["t"] < end - 0.3:
         return None
     return by_end[-1]["frames"] - before[-1]["frames"]
+
+
+def screenshot_layers(state):
+    return sorted(layer["rect"] for layer in state.get("layers", [])
+                  if layer.get("namespace") == SCREENSHOT_NAMESPACE)
+
+
+def check_screenshot_layers(state, monitors):
+    """GNOME's screenshot UI covers every monitor with its own bin and
+    screen selector: one screenshot layer over each of `monitors`
+    ({name: [x, y, w, h]}, logical) and no other."""
+    have = screenshot_layers(state)
+    want = sorted(monitors.values())
+    if have != want:
+        bare = [name for name, rect in monitors.items() if rect not in have]
+        return [f"screenshot UI layers at {have}, not one per monitor {want}"
+                + (f"; none over {', '.join(bare)}" if bare else "")]
+    return []
+
+
+def check_no_screenshot_layers(state):
+    have = screenshot_layers(state)
+    return [f"screenshot UI layers still mapped at {have}"] if have else []
+
+
+def color_share(pixels, width, height, rowstride, channels, rgb, tolerance=8, step=4):
+    """The share of a picture's pixels (sampled every `step` in both
+    directions) within `tolerance` of `rgb` in every channel."""
+    hits = total = 0
+    r, g, b = rgb
+    for y in range(0, height, step):
+        row = y * rowstride
+        for x in range(0, width, step):
+            i = row + x * channels
+            total += 1
+            if (abs(pixels[i] - r) <= tolerance and abs(pixels[i + 1] - g) <= tolerance
+                    and abs(pixels[i + 2] - b) <= tolerance):
+                hits += 1
+    return hits / total if total else 0.0
+
+
+def check_capture(label, size, marker_share, expected_size, marker_shown):
+    """A Screen-mode capture holds the selected output alone, in its own
+    pixels: exactly `expected_size` (its physical mode), with the marker
+    client covering at least MARKER_MIN_SHARE when that output shows it
+    and at most MARKER_MAX_SHARE when it does not."""
+    problems = []
+    if tuple(size) != tuple(expected_size):
+        problems.append(f"{label}: saved {size[0]}x{size[1]}, not the selected output's "
+                        f"{expected_size[0]}x{expected_size[1]}")
+    if marker_shown and marker_share < MARKER_MIN_SHARE:
+        problems.append(f"{label}: the marker client covers {marker_share:.1%}, under {MARKER_MIN_SHARE:.0%}: "
+                        "not the output showing it")
+    if not marker_shown and marker_share > MARKER_MAX_SHARE:
+        problems.append(f"{label}: the marker client covers {marker_share:.1%}, over {MARKER_MAX_SHARE:.1%}: "
+                        "the other output's pixels")
+    return problems

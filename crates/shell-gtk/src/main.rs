@@ -166,6 +166,7 @@ mod rfkill;
 mod run_dialog;
 mod screencast;
 mod screensaver;
+mod screenshot_screens;
 mod screenshot_selection;
 mod screenshot_ui;
 mod services;
