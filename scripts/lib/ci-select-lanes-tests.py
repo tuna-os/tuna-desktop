@@ -64,10 +64,32 @@ class Selection(unittest.TestCase):
                      "tests/gnome-reference/motion-reference.json"):
             self.assertEqual(pr(path), ["gtk-shell"], path)
         self.assertEqual(pr("docs/parity-ledger.md"),
-                         ["journey", "drm-smoke", "gtk-shell", "orca-speech",
+                         ["journey", "drm-smoke", "hotplug", "gtk-shell", "orca-speech",
                           "arch-package", "marlin-vm", "parity-ledger"])
         self.assertEqual(pr("scripts/tuna-orca-speech-proof"), ["orca-speech"])
         self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
+        # The hotplug storm left NO_LANE when ci.yml began running it (#203).
+        self.assertEqual(pr("scripts/tuna-hotplug-stress"), ["hotplug"])
+        self.assertEqual(pr("scripts/lib/tuna_process_metrics.py"), ["hotplug"])
+
+    def test_hotplug_code_always_runs_the_hotplug_lane_beside_the_code_lanes(self):
+        # #203: window re-homing, lock surfaces on new outputs, colord
+        # devices and casts across connector hotplug have no nested proof;
+        # a change to them must not wait for the rotation to reach hotplug.
+        for path in ("crates/compositor/src/drm.rs", "crates/compositor/src/drm/libinput.rs",
+                     "crates/compositor/src/windows.rs", "crates/compositor/src/color_manager.rs",
+                     "crates/compositor/src/color_manager/tests.rs",
+                     "crates/compositor/src/session_lock.rs", "crates/compositor/src/screencast.rs",
+                     "crates/compositor/src/mutter.rs", "crates/compositor/src/mutter/remote_bus_tests.rs",
+                     "crates/compositor/src/runtime/display.rs", "crates/shell-gtk/src/lock.rs"):
+            for run in range(len(m.ROTATION)):
+                with self.subTest(path=path, run=run):
+                    lanes = pr(path, run=run)
+                    self.assertIn("hotplug", lanes)
+                    self.assertTrue(set(m.CORE + m.rotation(run, 2)) <= set(lanes))
+        # Control: other compositor code reaches hotplug only by rotation.
+        self.assertNotIn("hotplug", pr("crates/compositor/src/lib.rs", run=0))
+        self.assertIn("hotplug", m.ROTATION)
 
 
     def test_transition_policy_and_suite_always_run_journey(self):
