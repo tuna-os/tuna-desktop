@@ -318,5 +318,100 @@ class Windows(unittest.TestCase):
         self.assertIsNotNone(dual.frames_between(beats, 50.5, 51.9))
 
 
+def timeline(seconds, rates, start=100.0, step=0.004):
+    """drm_kms_readback.py --sample output: each connector flipping at
+    rates[name](t) per second (0 for a still output), sampled every 4 ms."""
+    samples, fbs, next_flip = [], {n: 1 for n in rates}, {n: start for n in rates}
+    t = start
+    while t < start + seconds:
+        for name, rate in rates.items():
+            r = rate(t)
+            if r and t >= next_flip[name]:
+                fbs[name] = 3 - fbs[name]
+                next_flip[name] += 1.0 / r
+            elif not r:
+                next_flip[name] = t
+        samples.append([t, dict(fbs)])
+        t += step
+    return {"crtcs": {n: 40 + i for i, n in enumerate(rates)}, "samples": samples}
+
+
+def sliding(press, rate=60, length=0.25):
+    return lambda t: rate if press <= t < press + length else 0
+
+
+class Slide(unittest.TestCase):
+    PRESS = 100.5
+
+    def test_flips_count_framebuffer_changes(self):
+        sampled = timeline(1.0, {"A": lambda t: 60, "B": lambda t: 0})
+        self.assertIn(dual.flips(sampled, "A"), range(56, 63))
+        self.assertEqual(dual.flips(sampled, "B"), 0)
+        self.assertIn(dual.flips(sampled, "A", 100.0, 100.5), range(26, 33))
+
+    def test_only_the_primary_slides(self):
+        good = timeline(2.0, {"A": sliding(self.PRESS), "B": lambda t: 0})
+        self.assertEqual(dual.check_slide_only_on(good, "A", "B", self.PRESS, 5), [])
+        # Old behaviour / regression: the still output repaints too.
+        both = timeline(2.0, {"A": sliding(self.PRESS), "B": sliding(self.PRESS)})
+        self.assertTrue(dual.check_slide_only_on(both, "A", "B", self.PRESS, 5))
+        # Or the switch never slid the primary.
+        none = timeline(2.0, {"A": lambda t: 0, "B": lambda t: 0})
+        self.assertTrue(dual.check_slide_only_on(none, "A", "B", self.PRESS, 5))
+        # A connector the sampler never saw cannot pass as still.
+        self.assertTrue(dual.check_slide_only_on(good, "A", "Virtual-9", self.PRESS, 5))
+
+    def test_a_busy_secondary_keeps_its_frame_clock(self):
+        press = 100.0 + 1.3
+        steady = timeline(2.6, {"A": sliding(press), "B": lambda t: 60})
+        problems, before, during = dual.check_no_stall(steady, "B", press, (press - 1.15, press - 0.05))
+        self.assertEqual(problems, [])
+        self.assertGreater(before, 50)
+        # Old behaviour / regression: B stalls while A slides.
+        stalled = timeline(2.6, {"A": sliding(press), "B": lambda t: 10 if press <= t < press + 1 else 60})
+        self.assertTrue(dual.check_no_stall(stalled, "B", press, (press - 1.15, press - 0.05))[0])
+        # No busy baseline is no proof.
+        idle = timeline(2.6, {"A": sliding(press), "B": lambda t: 0})
+        self.assertTrue(dual.check_no_stall(idle, "B", press, (press - 1.15, press - 0.05))[0])
+        # A sample that ends before the window would undercount: refused.
+        short = timeline(1.8, {"A": sliding(press), "B": lambda t: 60})
+        self.assertTrue(dual.check_no_stall(short, "B", press, (press - 1.15, press - 0.05))[0])
+        self.assertTrue(dual.check_slide_only_on(timeline(1.8, {"A": sliding(press), "B": lambda t: 0}),
+                                                 "A", "B", press, 5))
+
+    def test_slide_distance_is_the_primarys(self):
+        width = 1024
+        distance = width + dual.SLIDE_SPACING
+        flight = [{"position": 0.2, "to_slot": 1.0, "target_dx": round(0.8 * distance)},
+                  {"position": 0.7, "to_slot": 1.0, "target_dx": round(0.3 * distance)},
+                  {"position": 1.0, "to_slot": 1.0, "target_dx": 0}]
+        self.assertEqual(dual.check_slide_distance(flight, width, 2048), [])
+        # Old behaviour / regression: the strip spans the whole desktop.
+        union = [{"position": 0.2, "to_slot": 1.0, "target_dx": round(0.8 * (2048 + dual.SLIDE_SPACING))}]
+        self.assertTrue(dual.check_slide_distance(union, width, 2048))
+        self.assertTrue(dual.check_slide_distance([], width, 2048))
+        self.assertTrue(dual.check_slide_distance([{"position": 1.0, "to_slot": 1.0, "target_dx": 0}], width, 2048))
+
+    def test_popup_on_the_primary(self):
+        on_a = state()
+        on_a["layers"] = [{"namespace": "tuna-workspace-popup", "rect": [462, 650, 100, 50]}]
+        self.assertEqual(dual.check_popup_on(on_a, "Virtual-2"), [])
+        # Old behaviour / regression: the popup follows the pointer to B.
+        on_b = state()
+        on_b["layers"] = [{"namespace": "tuna-workspace-popup", "rect": [1486, 650, 100, 50]}]
+        self.assertTrue(dual.check_popup_on(on_b, "Virtual-2"))
+        straddling = state()
+        straddling["layers"] = [{"namespace": "tuna-workspace-popup", "rect": [1000, 650, 100, 50]}]
+        self.assertTrue(dual.check_popup_on(straddling, "Virtual-2"))
+        self.assertTrue(dual.check_popup_on(state(), "Virtual-2"))
+
+
+class Sampler(unittest.TestCase):
+    def test_sample_is_refused_without_a_card(self):
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/lib/drm_kms_readback.py"),
+                                 "--sample", "0.1", "4", "/nonexistent/card"], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
