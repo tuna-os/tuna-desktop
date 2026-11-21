@@ -591,7 +591,9 @@ jobs:
     # libseat (seatd), GBM/EGL scanout, page-flip pacing, shell attach.
     # Needs headroom: the DRM/apt install (including any missing vkms
     # modules for the running kernel) can take ~20 min on a cold cache.
-    runs-on: ubuntu-latest
+    # Pinned to the 26.04 image: its 7.0 kernel has vkms configfs (Linux
+    # 6.19+), which the two-output leg (scripts/tuna-drm-dual) needs.
+    runs-on: ubuntu-26.04
     needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'drm-smoke')
     timeout-minutes: 40
@@ -636,8 +638,14 @@ jobs:
       - run: shellcheck -x scripts/ci-install-vkms scripts/tuna-drm-smoke scripts/lib/colord-startup.sh scripts/tuna-frame-pacer-build
       - run: bash -n scripts/tuna-drm-smoke scripts/lib/colord-startup.sh
       - run: python3 scripts/tests/test_colord_startup.py
+      - run: python3 -m py_compile scripts/tuna-drm-dual scripts/lib/drm_dual.py scripts/lib/drm_kms_readback.py
+      - run: python3 scripts/tests/test_drm_dual.py
       - run: scripts/ci-install-vkms
       - run: scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts
+      # D-MIRROR-DISABLE, D-LAYOUT-KEEP, D-WORKSPACES-PRIMARY, D-SCALE-MIXED:
+      # two connectors of a vkms configfs device; the lines join drm-smoke's
+      # assertions.txt, the parity ledger's input.
+      - run: scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:

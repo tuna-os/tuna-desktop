@@ -557,6 +557,7 @@ cannot satisfy the gate.
 | `gtk-shell` | `scripts/tuna-scale-proof --artifacts gtk-shell-artifacts/scale` | as above | The same session at 150 percent scale; writes `assertions.txt` |
 | `gtk-shell` | `scripts/tuna-slow-portal-proof --artifacts gtk-shell-artifacts/slow-portal` | as above | On a dbus-daemon bus whose portal activation hangs, the shell owns `org.gnome.Shell` within 15 s (40 s on GTK before 4.17, whose GtkApplication always waits on the inhibit portal) and makes no GDK portal call; writes `assertions.txt` |
 | `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg kmod python3-evdev python3-gi gir1.2-gtk-4.0 gsettings-desktop-schemas`; run `scripts/ci-install-vkms` after `apt-get update` to ensure vkms for the running kernel | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe`, seatd and uinput |
+| `drm-smoke` | `scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt` | as above; Linux 6.19 or newer for vkms configfs (the job pins `ubuntu-26.04`) | Two connectors of a vkms configfs device: mirroring, disabling and kept layouts, workspaces on the primary only, mixed fractional/integer scale; appends to drm-smoke's `assertions.txt` |
 
 `app-content` and `scroll-proof` download Playwright and Chromium into a
 temporary venv on every run, so they need network access.
@@ -634,6 +635,44 @@ also runs on its own and reads
 commands (`down N`, `move DX DY MS`, `hold MS`, `up`, `swipe N DX DY MS
 [PAUSE]`, `scroll`, `tap`, `click`) on stdin, in millimetres and
 milliseconds. Other phases can import `create_touchpad()` from it.
+
+`scripts/tuna-drm-dual` is the two-output leg the `drm-smoke` job runs
+after the smoke test. It creates a vkms configfs device (`tuna-dual`,
+Linux 6.19 or newer) with two connected CRTC/connector pipes, A and B,
+and runs `tuna-compositor --backend drm` on it with the GTK shell, a
+uinput keyboard and mouse and undecorated GTK 4 clients that report
+their frames, surface scale and pointer motion. The kernel side is read
+with KMS GET ioctls by `scripts/lib/drm_kms_readback.py` (each
+connector's CRTC, mode, `ACTIVE` and framebuffer), never from the
+compositor. Its checks live in `scripts/lib/drm_dual.py`, whose unit
+tests (`scripts/tests/test_drm_dual.py`) also feed each check what the
+old behaviour produces:
+
+- `D-MIRROR-DISABLE` (P-DS-02): A and B enumerate side by side on their
+  own CRTCs; `ApplyMonitorsConfig` mirroring them lights both CRTCs in
+  one mode, disabling B leaves it connected but on no enabled CRTC while
+  A scans out, and extending again relights B;
+- `D-LAYOUT-KEEP` (P-DS-02): a persistent mirror, then a persistent
+  disable, each kept with Enter on the shell's "Keep these display
+  settings?" dialog, land in `tuna/monitors.xml`, and the next session
+  starts mirrored, then with B off, in the kernel;
+- `D-WORKSPACES-PRIMARY` (P-WM-08): with `workspaces-only-on-primary`,
+  Super+Page_Down hides A's window (throttled frame callbacks) while B's
+  stays on the active workspace and keeps drawing; with the key false
+  both hide; a window Alt-dragged from B onto A stays on the workspace
+  it was carried on. Client frame rates (a shown window at least 10/s,
+  a hidden one at most 3/s against the compositor's 995 ms hidden-frame
+  interval) are counted from the clients' heartbeats over 3 s starting
+  1.5 s after each switch ends, past the callbacks owed from the slide;
+- `D-SCALE-MIXED` (P-SY-03): a GNOME `monitors.xml` gives A a fractional
+  scale and B scale 2 in the smallest mode Mutter allows both in; a GTK
+  window Alt-dragged to span them gets B's scale over
+  `wp_fractional_scale` when it overlaps B most and A's when it overlaps
+  A most, and its pointer events carry the compositor's logical pointer
+  position each time.
+
+On a kernel without vkms configfs the leg fails with the running kernel
+named; `scripts/tuna-drm-smoke` alone still runs there.
 
 Private colord startup failures in `D-COLORD` retain `colord-startup.txt`:
 the intended user/group, private bus and binary identity, boundary markers
