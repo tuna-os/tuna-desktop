@@ -1504,6 +1504,59 @@ window.tuna-window-menu .popup-separator-menu-item-separator {
   background-color: rgba(255, 255, 255, 0.1);
 }
 
+/* GNOME 51's app menu (.app-menu, appMenu.js) in the shell's popup-menu
+   style, as the window menu above: 37px items with 12px corners,
+   focused or hovered at #535359, a heading as a labelled separator. */
+popover.tuna-app-menu .popup-menu-content {
+  min-width: 220px;
+}
+popover.tuna-app-menu button.popup-menu-item {
+  min-height: 19px;
+  padding: 9px 12px 9px 12px;
+  border-radius: 12px;
+  background: none;
+  box-shadow: none;
+  color: #ffffff;
+  font-weight: normal;
+  outline: none;
+}
+popover.tuna-app-menu button.popup-menu-item:hover,
+popover.tuna-app-menu button.popup-menu-item:focus {
+  background-color: #535359;
+}
+popover.tuna-app-menu button.popup-menu-item:active {
+  background-color: #58585e;
+}
+popover.tuna-app-menu .popup-separator-menu-item {
+  min-height: 19px;
+  padding: 0 12px;
+}
+popover.tuna-app-menu .popup-heading-menu-item label {
+  margin-right: 12px;
+  color: rgba(255, 255, 255, 0.5);
+  font-weight: bold;
+}
+popover.tuna-app-menu .popup-separator-menu-item-separator {
+  min-height: 1px;
+  background-color: rgba(255, 255, 255, 0.1);
+}
+
+/* AppIcon.setForcedHighlight: the icon keeps its hover look while its
+   menu is open. */
+.tuna-overview-grid .grid-tile.menu-open {
+  background-color: rgba(255, 255, 255, 0.1);
+}
+.overview-dash .dash-tile.menu-open .overview-icon {
+  background-color: #444447;
+}
+
+/* The dash's drag placeholder (_dash.scss `.placeholder`): a faint,
+   rounded slot where the dragged app would pin. */
+.overview-dash .dash-placeholder {
+  border-radius: 8px;
+  background-color: rgba(250, 250, 251, 0.12);
+}
+
 /* GNOME 51's screenshot UI: the panel (#2e2e33, 32px corners, 18px of
    padding, 12px at the bottom), mode buttons (89x76, 14px corners,
    #414148 when chosen), the photo/video switch, the 48px capture ring,

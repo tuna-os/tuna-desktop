@@ -193,6 +193,17 @@ This matches Mutter 51's initial-focus path:
 [attaching the drag handler immediately invalidates focus](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-input.c#L288-L325),
 and [drag focus sends the destination its offer while restricting source-less drags to the origin client](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-data-device.c#L337-L397).
 
+`scripts/tuna-gtk-shell-proof --app-menu-only --artifacts DIR` runs
+G-FAVORITES-IMPORT, G-APP-MENU, G-DASH-PIN-DND and G-FAVORITES-LIVE (#1182,
+#1183): the old `tuna-shell/favorites.json` pins, seeded before the shell
+starts with `favorite-apps` unset, imported once into the key and shown in the
+dash; the app-icon
+menu from a right click, a long press and Shift+F10 or Menu (rows pressed
+through AT-SPI, GPU rows from a switcheroo-control stub on the private system
+bus, App Details from a GNOME Software stub), pinning by dragging from the
+grid, reordering and unpinning on Show Apps with real pointer drags, and
+`gsettings set favorite-apps` reaching the dash without a restart.
+
 The GTK proof's focused slices (`--*-only`) run one at a time. A new slice
 adds its usage line above `# end of --help` in the script's header (`--help`
 prints up to that line) and one case arm that calls `only_mode` with its flag

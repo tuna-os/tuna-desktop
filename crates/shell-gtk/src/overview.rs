@@ -18,7 +18,10 @@ use gtk4::subclass::prelude::ObjectSubclassIsExt;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tuna_shell_host::apps::AppEntry;
 
+use crate::app_favorites::AppFavorites;
+use crate::app_menu::{AppMenus, Subject};
 use crate::live_apps::LiveApps;
+use crate::switcheroo::Switcheroo;
 
 use crate::providers;
 
@@ -55,6 +58,10 @@ pub trait OverviewActions {
     fn set_app_grid(&self, active: bool);
     /// Open the overview (org.gnome.Shell FocusSearch, ShowApplications).
     fn open_overview(&self);
+    /// A window's title.
+    fn window_title(&self, id: u64) -> String;
+    /// Ask a window to close (the app menu's Quit closes each).
+    fn close_window(&self, id: u64);
 }
 
 /// What activating an app does: gnome-shell 51's `AppIcon.activate`
@@ -281,6 +288,358 @@ struct DashWant {
     windows: Vec<u64>,
 }
 
+/// The dash's drag and drop, traced for the proof (`TUNA_DASH_TRACE`).
+fn dnd_trace(what: std::fmt::Arguments) {
+    if std::env::var_os("TUNA_DASH_TRACE").is_some() {
+        eprintln!("tuna-shell-gtk: dash dnd {what}");
+    }
+}
+
+/// GNOME's dash drag and drop (dash.js `handleDragOver` and `acceptDrop`,
+/// with the Show Apps item as the unpin target, `ShowAppsIcon`): an app
+/// dragged from the grid or the dash makes a placeholder where it would
+/// pin, a drop there pins it (or moves it among the favorites), and a
+/// favorite dropped on Show Apps, which then reads "Unpin", is unpinned.
+/// Each change is written to `favorite-apps` through [`AppFavorites`].
+struct DashDnd {
+    favorites: Rc<AppFavorites>,
+    row: gtk::Box,
+    items: Rc<RefCell<Vec<DashSlot>>>,
+    separator: gtk::Separator,
+    /// The app being dragged, as a desktop id.
+    dragged: RefCell<Option<String>>,
+    /// The placeholder item and the slot it holds.
+    placeholder: RefCell<Option<(crate::dash_motion::DashItem, usize)>>,
+    /// Placeholders still fading out: none is made meanwhile.
+    animating: Rc<Cell<usize>>,
+    show_apps: RefCell<Option<(crate::dash_motion::DashItem, gtk::ToggleButton)>>,
+    /// Runs once the drag has ended (rebuilds that would pull the
+    /// dragged tile from under it).
+    after_drag: RefCell<Vec<Box<dyn FnOnce()>>>,
+}
+
+/// What a drag over the dash would do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Aim {
+    /// Not a drop target (nothing dragged, the key is read-only, or the
+    /// pointer is over Show Apps).
+    Refuse,
+    /// Over the dragged favorite's own place: a drop changes nothing.
+    InPlace,
+    /// The placeholder's slot among the dash's items.
+    Slot(usize),
+}
+
+impl DashDnd {
+    fn new(
+        favorites: Rc<AppFavorites>,
+        row: gtk::Box,
+        items: Rc<RefCell<Vec<DashSlot>>>,
+        separator: gtk::Separator,
+    ) -> Rc<Self> {
+        Rc::new(Self {
+            favorites,
+            row,
+            items,
+            separator,
+            dragged: RefCell::new(None),
+            placeholder: RefCell::new(None),
+            animating: Rc::default(),
+            show_apps: RefCell::new(None),
+            after_drag: RefCell::new(Vec::new()),
+        })
+    }
+
+    fn dragging(&self) -> bool {
+        self.dragged.borrow().is_some()
+    }
+
+    /// An app tile starts a drag (`item-drag-begin`).
+    fn begin(&self, desktop_id: String) {
+        *self.dragged.borrow_mut() = Some(desktop_id);
+    }
+
+    /// The drag is over, dropped or not (`item-drag-end`,
+    /// `item-drag-cancelled`): the placeholder and the Unpin label go.
+    fn end(self: &Rc<Self>) {
+        *self.dragged.borrow_mut() = None;
+        self.clear_placeholder();
+        self.show_unpin(false);
+        let pending: Vec<_> = self.after_drag.borrow_mut().drain(..).collect();
+        for run in pending {
+            gtk::glib::idle_add_local_once(run);
+        }
+    }
+
+    /// Run `f` now, or when the drag in progress has ended.
+    fn after_drag(&self, f: impl FnOnce() + 'static) {
+        if self.dragging() {
+            self.after_drag.borrow_mut().push(Box::new(f));
+        } else {
+            gtk::glib::idle_add_local_once(f);
+        }
+    }
+
+    /// The dash's items that are shown, in order, with the desktop id of
+    /// the app each is (none for a window-backed one).
+    fn shown_items(&self) -> Vec<(crate::dash_motion::DashItem, Option<String>)> {
+        self.items
+            .borrow()
+            .iter()
+            .filter(|slot| slot.item.shown())
+            .map(|slot| {
+                let id = slot
+                    .entry
+                    .as_ref()
+                    .map(|entry| crate::app_favorites::desktop_id(&entry.borrow().app_id));
+                (slot.item.clone(), id)
+            })
+            .collect()
+    }
+
+    /// What a drag at (`x`, `y`) of the row would do.
+    fn aim(&self, x: f64, y: f64) -> Aim {
+        let Some(dragged) = self.dragged.borrow().clone() else {
+            return Aim::Refuse;
+        };
+        if !self.favorites.writable() {
+            return Aim::Refuse;
+        }
+        // Show Apps is not in the dash's box: over it nothing pins.
+        let show_apps = self.show_apps.borrow().clone();
+        if show_apps.as_ref().is_some_and(|(item, _)| {
+            item.compute_bounds(&self.row)
+                .is_some_and(|b| b.contains_point(&gtk::graphene::Point::new(x as f32, y as f32)))
+        }) {
+            return Aim::Refuse;
+        }
+        let favorites = self.favorites.ids();
+        let items = self.shown_items();
+        // The box's width without Show Apps, the placeholder and the
+        // separator, which are not items.
+        let mut width = f64::from(self.row.width());
+        if let Some((item, _)) = &show_apps {
+            width -= f64::from(item.width());
+        }
+        if let Some((item, _)) = self.placeholder.borrow().as_ref() {
+            width -= f64::from(item.width());
+        }
+        if self.separator.parent().is_some() {
+            width -= f64::from(self.separator.width());
+        }
+        let slot = crate::app_favorites::placeholder_slot(
+            x,
+            width,
+            items.len(),
+            favorites.len(),
+            items.is_empty(),
+        );
+        let at = favorites.iter().position(|id| *id == dragged);
+        if crate::app_favorites::beside_itself(slot, at) {
+            Aim::InPlace
+        } else {
+            Aim::Slot(slot)
+        }
+    }
+
+    /// `handleDragOver`: show the placeholder for `aim`; whether the
+    /// drop is accepted.
+    fn over(self: &Rc<Self>, x: f64, y: f64) -> bool {
+        match self.aim(x, y) {
+            Aim::Refuse | Aim::InPlace => {
+                self.clear_placeholder();
+                false
+            }
+            Aim::Slot(slot) => {
+                let current = self.placeholder.borrow().as_ref().map(|(_, at)| *at);
+                if current != Some(slot) && self.animating.get() == 0 {
+                    self.place(slot);
+                }
+                self.placeholder.borrow().is_some()
+            }
+        }
+    }
+
+    /// A placeholder at `slot`: moved if one shows, else faded in.
+    fn place(&self, slot: usize) {
+        dnd_trace(format_args!("placeholder slot={slot}"));
+        let moved = self.placeholder.borrow_mut().take();
+        let fade_in = moved.is_none();
+        if let Some((old, _)) = moved {
+            old.unparent();
+        }
+        let space = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        space.add_css_class("dash-placeholder");
+        space.set_size_request(64, 32);
+        let item = crate::dash_motion::DashItem::new("placeholder", &space, "");
+        let before = self
+            .shown_items()
+            .get(slot.wrapping_sub(1))
+            .map(|(item, _)| item.clone());
+        self.row.insert_child_after(&item, before.as_ref());
+        item.ease(true, fade_in, |_| {});
+        *self.placeholder.borrow_mut() = Some((item, slot));
+    }
+
+    /// `_clearDragPlaceholder`: the placeholder fades out.
+    fn clear_placeholder(&self) {
+        let Some((item, _)) = self.placeholder.borrow_mut().take() else {
+            return;
+        };
+        let animating = self.animating.clone();
+        animating.set(animating.get() + 1);
+        item.ease(false, true, move |item| {
+            animating.set(animating.get().saturating_sub(1));
+            item.unparent();
+        });
+    }
+
+    /// `acceptDrop`: pin the dragged app at the placeholder's position
+    /// among the favorites, or move it there. A drop on its own place
+    /// is accepted and changes nothing.
+    fn accept(self: &Rc<Self>, x: f64, y: f64) -> bool {
+        let slot = match self.aim(x, y) {
+            Aim::Refuse => return false,
+            Aim::InPlace => return true,
+            Aim::Slot(slot) => slot,
+        };
+        let Some(dragged) = self.dragged.borrow().clone() else {
+            return false;
+        };
+        let favorites = self.favorites.ids();
+        let ids: Vec<Option<String>> = self.shown_items().into_iter().map(|(_, id)| id).collect();
+        let pos = crate::app_favorites::drop_position(&ids, slot, &favorites, &dragged);
+        let is_favorite = favorites.contains(&dragged);
+        dnd_trace(format_args!("drop {dragged} slot={slot} position={pos}"));
+        let store = self.favorites.clone();
+        // Laters.BEFORE_REDRAW: after the drop returns.
+        gtk::glib::idle_add_local_once(move || {
+            if is_favorite {
+                store.move_to(&dragged, pos);
+            } else {
+                store.add_at(&dragged, Some(pos));
+            }
+        });
+        true
+    }
+
+    /// Whether Show Apps would take the app being dragged
+    /// (`_canRemoveApp`): a favorite, with the key writable.
+    fn can_unpin(&self) -> bool {
+        self.favorites.writable()
+            && self
+                .dragged
+                .borrow()
+                .as_ref()
+                .is_some_and(|id| self.favorites.is_favorite(id))
+    }
+
+    /// `setDragApp`: Show Apps reads "Unpin" and takes the hover while a
+    /// favorite is over it.
+    fn show_unpin(&self, on: bool) {
+        let Some((item, button)) = self.show_apps.borrow().clone() else {
+            return;
+        };
+        let text = if on { "Unpin" } else { "Show Apps" };
+        item.set_label_text(text);
+        button.update_property(&[gtk::accessible::Property::Label(text)]);
+        if on {
+            button.set_state_flags(gtk::StateFlags::PRELIGHT, false);
+        } else {
+            button.unset_state_flags(gtk::StateFlags::PRELIGHT);
+        }
+    }
+
+    /// `ShowAppsIcon.acceptDrop`: unpin the dragged favorite.
+    fn unpin_drop(self: &Rc<Self>) -> bool {
+        if !self.can_unpin() {
+            return false;
+        }
+        let Some(dragged) = self.dragged.borrow().clone() else {
+            return false;
+        };
+        let store = self.favorites.clone();
+        dnd_trace(format_args!("unpin {dragged}"));
+        gtk::glib::idle_add_local_once(move || store.remove(&dragged));
+        true
+    }
+
+    /// The row takes drops of apps dragged over it.
+    fn accept_drops_on_row(self: &Rc<Self>) {
+        let target = gtk::DropTarget::new(gtk::glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+        {
+            let dnd = self.clone();
+            target.connect_motion(move |_, x, y| {
+                if dnd.over(x, y) {
+                    gtk::gdk::DragAction::MOVE
+                } else {
+                    gtk::gdk::DragAction::empty()
+                }
+            });
+        }
+        {
+            let dnd = self.clone();
+            target.connect_leave(move |_| dnd.clear_placeholder());
+        }
+        {
+            let dnd = self.clone();
+            target.connect_drop(move |_, _, x, y| dnd.accept(x, y));
+        }
+        self.row.add_controller(target);
+    }
+
+    /// Show Apps takes a dragged favorite to unpin it.
+    fn accept_unpin_on(self: &Rc<Self>, toggle: &gtk::ToggleButton) {
+        let target = gtk::DropTarget::new(gtk::glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+        {
+            let dnd = self.clone();
+            target.connect_motion(move |_, _, _| {
+                if dnd.can_unpin() {
+                    dnd.show_unpin(true);
+                    gtk::gdk::DragAction::MOVE
+                } else {
+                    gtk::gdk::DragAction::empty()
+                }
+            });
+        }
+        {
+            let dnd = self.clone();
+            target.connect_leave(move |_| dnd.show_unpin(false));
+        }
+        {
+            let dnd = self.clone();
+            target.connect_drop(move |_, _, _, _| dnd.unpin_drop());
+        }
+        toggle.add_controller(target);
+    }
+}
+
+/// A dash item is dragged as GNOME's `DashIcon` is (its scale-and-fade
+/// is disabled, dash.js:31-36): the icon follows the pointer.
+fn dash_drag_source(button: &gtk::Button, image: &gtk::Image, app_id: String, dnd: &Rc<DashDnd>) {
+    let source = gtk::DragSource::new();
+    source.set_actions(gtk::gdk::DragAction::MOVE);
+    source.set_content(Some(&gtk::gdk::ContentProvider::for_value(
+        &format!("dash-app:{app_id}").to_value(),
+    )));
+    let desktop_id = crate::app_favorites::desktop_id(&app_id);
+    {
+        let (dnd, image) = (dnd.clone(), image.downgrade());
+        source.connect_drag_begin(move |source, _| {
+            if let Some(image) = image.upgrade() {
+                let paintable = gtk::WidgetPaintable::new(Some(&image)).current_image();
+                source.set_icon(Some(&paintable), image.width() / 2, image.height() / 2);
+            }
+            dnd.begin(desktop_id.clone());
+        });
+    }
+    {
+        let dnd = dnd.clone();
+        source.connect_drag_end(move |_, _, _| dnd.end());
+    }
+    button.add_controller(source);
+}
+
 fn app_button(entry: &AppEntry, icon_size: i32, with_label: bool) -> gtk::Button {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
     column.append(&app_icon(entry, icon_size));
@@ -375,11 +734,15 @@ pub struct OverviewUi {
     published_icons: Vec<tuna_shell_control::WindowIconGeometry>,
     grid: gtk::ApplicationWindow,
     apps: Rc<LiveApps>,
-    favorites: Vec<String>,
+    favorites: Rc<AppFavorites>,
     folder_watch: crate::folders::FolderWatch,
     grid_dragging: Rc<Cell<bool>>,
     grid_external_dragging: Rc<Cell<bool>>,
     actions: Rc<dyn OverviewActions>,
+    /// The app-icon menus of the dash, the grid and the search results.
+    menus: Rc<AppMenus>,
+    /// Dragging apps onto, within and off the dash.
+    dash_dnd: Rc<DashDnd>,
     open: bool,
     /// Open on the app grid once the overview opens (ShowApplications).
     want_apps: std::cell::Cell<bool>,
@@ -410,6 +773,8 @@ enum Keynav {
     Grid,
     /// A window preview has the focus; the chrome holds the keyboard.
     Previews,
+    /// A dash item has the focus; the dash holds the keyboard.
+    Dash,
 }
 
 /// One step of keyboard navigation in the paged app grid.
@@ -494,7 +859,8 @@ impl OverviewUi {
     pub fn new(
         app: &gtk::Application,
         apps: Rc<LiveApps>,
-        favorites: Vec<String>,
+        favorites: Rc<AppFavorites>,
+        switcheroo: Rc<Switcheroo>,
         actions: Rc<dyn OverviewActions>,
     ) -> Rc<RefCell<Self>> {
         // Search: top center, below the panel.
@@ -599,6 +965,21 @@ impl OverviewUi {
         grid.set_keyboard_mode(KeyboardMode::None);
         grid.set_title(Some("App Grid"));
 
+        let dash_items: Rc<RefCell<Vec<DashSlot>>> = Rc::default();
+        let dash_separator = {
+            let separator = gtk::Separator::new(gtk::Orientation::Vertical);
+            separator.add_css_class("dash-separator");
+            separator.set_valign(gtk::Align::Center);
+            separator
+        };
+        let dash_dnd = DashDnd::new(
+            favorites.clone(),
+            dash_row.clone(),
+            dash_items.clone(),
+            dash_separator.clone(),
+        );
+        dash_dnd.accept_drops_on_row();
+        let menus = AppMenus::new(actions.clone(), favorites.clone(), switcheroo);
         let ui = Rc::new(RefCell::new(Self {
             search,
             entry,
@@ -612,13 +993,8 @@ impl OverviewUi {
             dash,
             dash_row,
             dash_signature: Vec::new(),
-            dash_items: Rc::default(),
-            dash_separator: {
-                let separator = gtk::Separator::new(gtk::Orientation::Vertical);
-                separator.add_css_class("dash-separator");
-                separator.set_valign(gtk::Align::Center);
-                separator
-            },
+            dash_items,
+            dash_separator,
             show_apps: None,
             dash_labels: Rc::default(),
             dash_icons: Vec::new(),
@@ -632,6 +1008,8 @@ impl OverviewUi {
             grid_dragging: Rc::new(Cell::new(false)),
             grid_external_dragging: Rc::new(Cell::new(false)),
             actions,
+            menus,
+            dash_dnd,
             open: false,
             want_apps: std::cell::Cell::new(false),
             folder_dialog: crate::folder_dialog::FolderDialog::new(
@@ -698,6 +1076,28 @@ impl OverviewUi {
                         }
                     });
                 }));
+        }
+        // `AppFavorites` `changed`: the dash and the grid (which leaves the
+        // favorites out) show the new favorites once any drag that could
+        // be pulling its tile from under it is over.
+        {
+            let weak = Rc::downgrade(&ui);
+            let (favorites, dnd) = {
+                let me = ui.borrow();
+                (me.favorites.clone(), me.dash_dnd.clone())
+            };
+            favorites.connect_changed(move || {
+                let weak = weak.clone();
+                dnd.after_drag(move || {
+                    let Some(ui) = weak.upgrade() else { return };
+                    if !ui.borrow().open {
+                        // The dash is filled afresh when the overview opens.
+                        return;
+                    }
+                    Self::rebuild_dash(&ui, true);
+                    Self::refresh_grid(&ui);
+                });
+            });
         }
         Self::wire(&ui);
         ui
@@ -794,11 +1194,50 @@ impl OverviewUi {
                         Self::leave_keynav(&ui, None);
                         glib::Propagation::Stop
                     }
-                    Some(GridStep::Stay) => glib::Propagation::Stop,
+                    Some(GridStep::Stay) => {
+                        // Past the last row or tile: on to the dash.
+                        if matches!(
+                            key,
+                            gtk::gdk::Key::Down
+                                | gtk::gdk::Key::KP_Down
+                                | gtk::gdk::Key::Tab
+                                | gtk::gdk::Key::KP_Tab
+                        ) {
+                            Self::enter_dash(&ui);
+                        }
+                        glib::Propagation::Stop
+                    }
                     None => glib::Propagation::Proceed,
                 }
             });
             me.grid.add_controller(keys);
+        }
+        // Typing in the dash goes back to search; Up leaves it, as Up
+        // from the grid's first row does. The arrows and Tab walk its
+        // items as GTK's focus does.
+        {
+            let keys = gtk::EventControllerKey::new();
+            keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let weak = Rc::downgrade(ui);
+            keys.connect_key_pressed(move |_, key, _, state| {
+                use gtk::gdk::Key;
+                let Some(ui) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                if ui.borrow().keynav.get() != Keynav::Dash {
+                    return glib::Propagation::Proceed;
+                }
+                if let Some(c) = typed_text(key, state) {
+                    Self::leave_keynav(&ui, Some(c));
+                    return glib::Propagation::Stop;
+                }
+                if matches!(key, Key::Up | Key::KP_Up) {
+                    Self::leave_keynav(&ui, None);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+            me.dash.add_controller(keys);
         }
     }
 
@@ -866,12 +1305,41 @@ impl OverviewUi {
         match self.keynav.replace(Keynav::Search) {
             Keynav::Search => {}
             Keynav::Grid => self.grid.set_keyboard_mode(KeyboardMode::None),
+            Keynav::Dash => self.dash.set_keyboard_mode(KeyboardMode::None),
             Keynav::Previews => {
                 if let Some(chrome) = self.previews.borrow().as_ref() {
                     chrome.leave_keynav();
                 }
             }
         }
+    }
+
+    /// Down off the grid's last row, or Tab past its last tile, goes on
+    /// to the dash (GNOME's focus chain runs on from the app grid to the
+    /// dash): its first item takes the keys, which the dash holds until
+    /// they come back to search.
+    fn enter_dash(ui: &Rc<RefCell<Self>>) -> bool {
+        let me = ui.borrow();
+        let first = me
+            .dash_items
+            .borrow()
+            .iter()
+            .find(|slot| slot.item.shown())
+            .map(|slot| slot.button.clone().upcast::<gtk::Widget>())
+            .or_else(|| {
+                me.show_apps
+                    .as_ref()
+                    .map(|(toggle, _)| toggle.clone().upcast::<gtk::Widget>())
+            });
+        let Some(first) = first else {
+            return false;
+        };
+        me.reset_keynav();
+        me.keynav.set(Keynav::Dash);
+        me.dash.set_keyboard_mode(KeyboardMode::Exclusive);
+        me.dash.set_focus_visible(true);
+        first.grab_focus();
+        true
     }
 
     /// The app grid's pager, if the grid is built.
@@ -993,6 +1461,12 @@ impl OverviewUi {
             // Enter finds its tile by the app it shows.
             button.set_widget_name(&hit.app_id);
             connect_app_activation(&button, self.actions.clone(), (*hit).clone(), || {});
+            let entry = (*hit).clone();
+            self.menus
+                .attach(&button, gtk::PositionType::Right, move || Subject {
+                    entry: Some(entry.clone()),
+                    window: None,
+                });
             self.results.append(&button);
         }
         self.results.set_visible(!hits.is_empty());
@@ -1145,7 +1619,7 @@ impl OverviewUi {
                 .collect()
         };
         let mut shown: Vec<AppEntry> = Vec::new();
-        for id in &me.favorites {
+        for id in &me.favorites.ids() {
             if let Some(entry) = providers::provider_app(&apps, id) {
                 if !shown.iter().any(|e| e.app_id == entry.app_id) {
                     shown.push(entry.clone());
@@ -1349,6 +1823,24 @@ impl OverviewUi {
             }
             (None, None) => {}
         }
+        // DashIcon is an AppIcon, so it has the app menu (dash.js:22,
+        // `popupMenuSide: BOTTOM`: the menu opens above the dash), and a
+        // desktop app can be dragged to reorder or unpin it. A
+        // window-backed app is neither pinned nor dragged.
+        let window = if entry.is_none() {
+            want.windows.first().copied()
+        } else {
+            None
+        };
+        let subject = entry.clone();
+        me.menus
+            .attach(&button, gtk::PositionType::Top, move || Subject {
+                entry: subject.as_ref().map(|entry| entry.borrow().clone()),
+                window,
+            });
+        if let Some(entry) = &entry {
+            dash_drag_source(&button, &image, entry.borrow().app_id.clone(), &me.dash_dnd);
+        }
         DashSlot {
             item,
             button,
@@ -1406,6 +1898,8 @@ impl OverviewUi {
         let item = crate::dash_motion::DashItem::new("show-apps", &show_apps, "Show Apps");
         me.dash_labels.hook(&item, &show_apps);
         item.ease(true, false, |_| {});
+        me.dash_dnd.accept_unpin_on(&show_apps);
+        *me.dash_dnd.show_apps.borrow_mut() = Some((item.clone(), show_apps.clone()));
         me.show_apps = Some((show_apps, toggled));
         item
     }
@@ -1421,6 +1915,8 @@ impl OverviewUi {
 
     fn rebuild_grid(ui: &Rc<RefCell<Self>>) {
         let me = ui.borrow();
+        // The icons the menu hangs from are rebuilt.
+        me.menus.close();
         // GNOME's paged icon grid: its mode (columns x rows) from the
         // area's shape, 113px tiles 12px apart, 24px below the top.
         let (mon_w, mon_h) = gtk::gdk::Display::default()
@@ -1456,7 +1952,7 @@ impl OverviewUi {
         crate::folders::ensure_defaults(apps.apps());
         me.folder_watch.take_dirty();
         let folders = me.folder_watch.load();
-        let (filled, loose) = crate::folders::arrange(&folders, apps.apps(), &me.favorites);
+        let (filled, loose) = crate::folders::arrange(&folders, apps.apps(), &me.favorites.ids());
         enum Item<'a> {
             Folder(crate::folders::Folder, Vec<&'a AppEntry>),
             App(&'a AppEntry),
@@ -1531,6 +2027,7 @@ impl OverviewUi {
             )
         };
         let live_apps = me.apps.clone();
+        let (dnd, menus) = (me.dash_dnd.clone(), me.menus.clone());
         let launch_button = |entry: &AppEntry, size: i32, actions: Rc<dyn OverviewActions>| {
             let key = format!("{}.desktop", entry.app_id);
             let button = app_button(entry, size, true);
@@ -1543,6 +2040,24 @@ impl OverviewUi {
             {
                 let reflow = reflow.clone();
                 drag.connect_drag_end(move |_, _, _| reflow.cancel());
+            }
+            // The dash takes the dragged app to pin it.
+            {
+                let (dnd, id) = (dnd.clone(), key.clone());
+                drag.connect_drag_begin(move |_, _| dnd.begin(id.clone()));
+            }
+            {
+                let dnd = dnd.clone();
+                drag.connect_drag_end(move |_, _, _| dnd.end());
+            }
+            // AppIcon's menu: the grid's opens to the icon's right
+            // (`popupMenuSide` LEFT is where its arrow points).
+            {
+                let entry = entry.clone();
+                menus.attach(&button, gtk::PositionType::Right, move || Subject {
+                    entry: Some(entry.clone()),
+                    window: None,
+                });
             }
             {
                 let (target, weak_ui, live_apps, reorder) = (
@@ -1891,6 +2406,7 @@ impl OverviewUi {
         } else {
             let me = ui.borrow();
             me.folder_dialog.close_now();
+            me.menus.close();
             me.reset_keynav();
             // The overview's `hiding`: no label waits or stays.
             let show_apps = me
@@ -3261,6 +3777,12 @@ mod app_activation_tests {
         fn set_search(&self, _: bool) {}
         fn set_app_grid(&self, _: bool) {}
         fn open_overview(&self) {}
+        fn window_title(&self, _: u64) -> String {
+            String::new()
+        }
+        fn close_window(&self, id: u64) {
+            self.events.borrow_mut().push(format!("close-window:{id}"));
+        }
     }
     impl Actions {
         fn push(&self, event: &str) {

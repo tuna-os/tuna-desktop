@@ -82,6 +82,9 @@ fn seed(directory: &Path, index: usize) {
     mkdir(&directory.join("nested"));
     for (name, bytes) in [
         ("monitor-layout.json", b"{\"scale\":1.5}\n".as_slice()),
+        // The legacy dash pins: the GTK shell imports them once into
+        // favorite-apps through the new reader path, and the legacy
+        // shell host still reads them there.
         ("favorites.json", b"[\"org.example.Editor\"]\n".as_slice()),
         ("notification-history.json", b"[1,2,3]\n".as_slice()),
         ("nested/binary", &[0, 255, index as u8]),

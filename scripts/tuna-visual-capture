@@ -464,8 +464,9 @@ XML
         GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
         export GSETTINGS_SCHEMA_DIR
     fi
-    mkdir -p "$XDG_DATA_HOME/applications" "$XDG_DATA_HOME/tuna-shell"
-    echo '["org.tuna.ProofNoFavorite.desktop"]' >"$XDG_DATA_HOME/tuna-shell/favorites.json"
+    mkdir -p "$XDG_DATA_HOME/applications"
+    # The dash shows only the proof's own windows (see tuna-gtk-shell-proof).
+    gsettings set org.gnome.shell favorite-apps "['org.tuna.ProofNoFavorite.desktop']"
     for t in alpha beta gamma delta; do
         printf '[Desktop Entry]\nName=Tuna Desktop Test %s\nExec=true\nType=Application\nNoDisplay=true\n' "$t" \
             >"$XDG_DATA_HOME/applications/tuna-test-$t.desktop"
