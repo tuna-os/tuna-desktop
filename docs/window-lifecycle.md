@@ -64,7 +64,7 @@ flock /tmp/tuna-v1-build-and-freeze.lock bash -c '
   cp "${CARGO_TARGET_DIR:-target}/debug/tuna-compositor" \
      "${CARGO_TARGET_DIR:-target}/debug/tuna-shell-gtk" /tmp/tuna-window-binaries/
 '
-dbus-run-session -- scripts/tuna-window-lifecycle-proof \
+scripts/tuna-window-lifecycle-proof \
   --bin-dir /tmp/tuna-window-binaries --artifacts /tmp/tuna-window-lifecycle
 ```
 

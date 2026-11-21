@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""tuna-proof-session — run a nested proof as one owned session and end
+every process it started, however it exits (#1082).
+
+Usage: scripts/lib/tuna-proof-session [--bus] [--label NAME] [--] COMMAND [ARGS...]
+       scripts/lib/tuna-proof-session --stop NAME...   (inside a session)
+       scripts/lib/tuna-proof-session --check          (inside a session)
+
+  --bus         start a private session bus for COMMAND (as dbus-run-session
+                did) and stop it last
+  --label NAME  name in messages and in the run marker (default: COMMAND's
+                basename, or its first argument's when that is a tuna-* script)
+
+Before starting anything it runs scripts/lib/tuna-proof-preflight (leftover
+session daemons of earlier runs, inotify headroom) and exits 75 when that
+refuses the host; a session started inside another one skips the check.
+
+COMMAND runs as the leader of its own session and process group, with
+TUNA_PROOF_SESSION=<label>.<pid>.<start> in its environment: the run
+marker every process it starts inherits (and TUNA_PROOF_SESSION_BUS_PID,
+the private bus, with --bus). This process is the subreaper of everything
+below it, so a daemon that detaches (`ibus-daemon --daemonize`,
+`dbus-daemon --fork`, a double fork) stays a descendant instead of moving
+to PID 1.
+
+INT, TERM and HUP go to COMMAND's process group, which then has
+TUNA_PROOF_SESSION_GRACE seconds (default 10) for its own cleanup. Should
+this process be killed outright (KILL leaves it no teardown), COMMAND and
+the private bus get TERM; what then remains carries the run marker, which
+scripts/lib/tuna-proof-preflight reports on the next run.
+
+When COMMAND has exited (or that time is up), whatever is left is stopped
+by PID, without asking any bus: every descendant, and every process of the
+user whose /proc/PID/environ carries the run marker or the private bus
+address. Order: everything but message buses, then the remaining buses
+(AT-SPI, a stub system bus), then the session bus of --bus. Each step is
+TERM, a wait (all steps together at most TUNA_PROOF_SESSION_GRACE
+seconds), KILL, and a wait of up to 5 s. A process that is already gone is
+not an error.
+
+Exit status: COMMAND's (128+N when it died of signal N), or 128+N when
+this process was told to stop by signal N. If any process of the run is
+still alive after KILL, that is reported and the status is never 0.
+
+Inside a session (TUNA_PROOF_SESSION set), for a proof's own cleanup:
+  --stop NAME...  stops the run's processes named NAME (/proc/PID/comm, or
+                  the basename of argv[0]): TERM, wait, KILL, found by
+                  PID, so a daemon is stopped even when its bus no longer
+                  answers (`ibus exit` needs IBus's bus). Exit 1 if one
+                  survives.
+  --check         waits up to TUNA_PROOF_SESSION_GRACE seconds for every
+                  process of the run to end, except the caller and its
+                  ancestors, and the private session bus with the services
+                  it activated (the session stops those last). Exit 1,
+                  naming them, if any is still alive: something the proof
+                  started escaped its cleanup.
+"""
+import ctypes
+import os
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+NAME = "tuna-proof-session"
+MARKER_VAR = "TUNA_PROOF_SESSION"
+BUS_VAR = "TUNA_PROOF_SESSION_BUS_PID"
+PREFLIGHT_REFUSED = 75
+KILL_WAIT = 5.0
+POLL = 0.1
+PR_SET_PDEATHSIG = 1
+PR_SET_CHILD_SUBREAPER = 36
+
+
+def say(label, text):
+    print(f"{NAME}: {label}: {text}", file=sys.stderr, flush=True)
+
+
+def stat_fields(pid):
+    """(ppid, state, comm, start ticks, uid) of PID, or None once it is gone."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            raw = handle.read().decode(errors="replace")
+        uid = os.stat(f"/proc/{pid}").st_uid
+    except OSError:
+        return None
+    comm = raw[raw.index("(") + 1:raw.rindex(")")]
+    rest = raw[raw.rindex(")") + 2:].split()
+    return int(rest[1]), rest[0], comm, int(rest[19]), uid
+
+
+def environ_has(pid, needles):
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as handle:
+            env = b"\0" + handle.read()
+    except OSError:
+        return False
+    return any(needle in env for needle in needles)
+
+
+def cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            return handle.read().replace(b"\0", b" ").decode(errors="replace").strip()[:200]
+    except OSError:
+        return ""
+
+
+def os_kill(pid, signum):
+    os.kill(pid, signum)
+
+
+def process_table():
+    table = {}
+    for name in os.listdir("/proc"):
+        if name.isdigit():
+            fields = stat_fields(int(name))
+            if fields is not None:
+                table[int(name)] = fields
+    return table
+
+
+def descendants(table, roots):
+    children = {}
+    for pid, fields in table.items():
+        children.setdefault(fields[0], []).append(pid)
+    found, todo = set(), list(roots)
+    while todo:
+        for child in children.get(todo.pop(), ()):
+            if child not in found:
+                found.add(child)
+                todo.append(child)
+    return found
+
+
+class Run:
+    """The processes of one run: below its session process, or marked."""
+
+    def __init__(self, label, grace, owner, marker, needles):
+        self.label = label
+        self.grace = grace
+        self.owner = owner
+        self.marker = marker
+        self.needles = needles
+        self.swept = {}
+        self.denied = {}
+
+    def members(self, keep=lambda table, pid: False):
+        """Live processes of this run but its owner: pid -> (comm, start)."""
+        table = process_table()
+        found = descendants(table, [self.owner]) if self.owner in table else set()
+        uid = os.getuid()
+        for pid, fields in table.items():
+            if pid not in found and fields[4] == uid and environ_has(pid, self.needles):
+                found.add(pid)
+        found.discard(self.owner)
+        return {pid: (table[pid][2], table[pid][3]) for pid in found
+                if table[pid][1] != "Z" and not keep(table, pid)}
+
+    def reap(self):
+        """Collect exited children (as a subreaper: orphans of the run too)."""
+
+    def pause(self, seconds):
+        """Sleep; True when told (again) to stop."""
+        time.sleep(seconds)
+        return False
+
+    def signal_all(self, targets, signum):
+        for pid, (comm, start) in targets.items():
+            fields = stat_fields(pid)
+            if fields is None or fields[3] != start:
+                continue                      # gone, or the PID was reused
+            try:
+                os_kill(pid, signum)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                self.denied[pid] = comm
+
+    def stop(self, select_targets, term_deadline, hurry=False):
+        """TERM, wait until TERM_DEADLINE, KILL, wait: every selected member.
+
+        True if told to hurry (a second stop signal)."""
+        for signum in (signal.SIGTERM, signal.SIGKILL):
+            targets = select_targets()
+            if not targets:
+                return hurry
+            self.swept.update({pid: comm for pid, (comm, _) in targets.items()})
+            self.signal_all(targets, signum)
+            deadline = time.monotonic() + KILL_WAIT if signum == signal.SIGKILL else term_deadline
+            while True:
+                self.reap()
+                targets = select_targets()
+                if not targets:
+                    return hurry
+                if time.monotonic() >= deadline or (hurry and signum == signal.SIGTERM):
+                    break
+                if signum == signal.SIGKILL:
+                    self.signal_all(targets, signum)    # late forks of the dying
+                if self.pause(min(POLL, max(0.0, deadline - time.monotonic()))):
+                    hurry = True
+        return hurry
+
+    def listing(self, pids, details=False):
+        return " ".join(
+            f"{comm}({pid}{', not ours to signal' if pid in self.denied else ''})"
+            + (f" [{cmdline(pid)}]" if details else "")
+            for pid, comm in sorted(pids.items()))
+
+
+class Session(Run):
+    def __init__(self, label, grace):
+        me = os.getpid()
+        marker = f"{label}.{me}.{stat_fields(me)[3]}"
+        super().__init__(label, grace, me, marker, [f"\0{MARKER_VAR}={marker}\0".encode()])
+        self.bus = None
+        self.leader = None
+        self.leader_status = None
+        self.watch = set()
+
+    def reap(self):
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if pid == 0:
+                return
+            if pid == self.leader:
+                self.leader_status = status
+
+    def pause(self, seconds):
+        """Sleep until a child changes state; True when told (again) to stop."""
+        info = signal.sigtimedwait(self.watch, seconds)
+        return info is not None and info.si_signo != signal.SIGCHLD
+
+    def spawn(self, argv, env, **options):
+        libc = ctypes.CDLL(None, use_errno=True)
+        me = self.owner
+
+        def child():
+            signal.pthread_sigmask(signal.SIG_SETMASK, set())
+            # Should this session process itself be killed (KILL leaves it no
+            # teardown), the proof still hears TERM and runs its own cleanup.
+            if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0 or os.getppid() != me:
+                os._exit(143)
+
+        return subprocess.Popen(argv, env=env, start_new_session=True, preexec_fn=child, **options)
+
+    def start_bus(self, env):
+        daemon = shutil.which("dbus-daemon")
+        if daemon is None:
+            raise RuntimeError("--bus needs dbus-daemon on PATH")
+        read_end, write_end = os.pipe()
+        try:
+            # Its own session and group: nothing aimed at the proof's group
+            # (a terminal's Ctrl-C, the forwarded signal) can end it early.
+            bus = self.spawn([daemon, "--session", "--nofork", f"--print-address={write_end}"],
+                             env, pass_fds=[write_end], stdin=subprocess.DEVNULL)
+        finally:
+            os.close(write_end)
+        self.bus = bus.pid
+        address = b""
+        deadline = time.monotonic() + 30
+        while not address.endswith(b"\n"):
+            if not select.select([read_end], [], [], max(0, deadline - time.monotonic()))[0]:
+                break
+            chunk = os.read(read_end, 4096)
+            if not chunk:
+                break
+            address += chunk
+        os.close(read_end)
+        address = address.decode().strip()
+        if not address:
+            raise RuntimeError("the private session bus printed no address")
+        env["DBUS_SESSION_BUS_ADDRESS"] = address
+        env[BUS_VAR] = str(self.bus)
+        for stale in ("DBUS_SESSION_BUS_PID", "DBUS_SESSION_BUS_WINDOWID",
+                      "DBUS_STARTER_ADDRESS", "DBUS_STARTER_BUS_TYPE"):
+            env.pop(stale, None)
+        self.needles.append(f"\0DBUS_SESSION_BUS_ADDRESS={address}\0".encode())
+
+    def teardown(self, hurry):
+        term_deadline = time.monotonic() + (0 if hurry else self.grace)
+
+        def session_bus(table, pid):
+            return pid == self.bus
+
+        def any_bus(table, pid):
+            return pid == self.bus or table[pid][2] == "dbus-daemon"
+
+        # members(keep) leaves out what KEEP holds: buses until the last steps.
+        hurry = self.stop(lambda: self.members(any_bus), term_deadline, hurry)
+        hurry = self.stop(lambda: self.members(session_bus), term_deadline, hurry)
+        # The proof's own cleanup already ran: only what needed stopping is
+        # reported, not the private bus, which is this session's to stop.
+        left_by_proof = dict(self.swept)
+        self.stop(lambda: self.members(lambda table, pid: pid != self.bus), term_deadline, hurry)
+        self.reap()
+        if left_by_proof:
+            say(self.label, f"stopped {len(left_by_proof)} process(es) the run left behind: "
+                + self.listing(left_by_proof))
+        return self.members()
+
+
+def inside(label_hint):
+    """The Run of the session around this process, from its environment."""
+    marker = os.environ.get(MARKER_VAR, "")
+    try:
+        owner, start = (int(part) for part in marker.rsplit(".", 2)[1:])
+    except ValueError:
+        print(f"{NAME}: {label_hint} only works inside tuna-proof-session ({MARKER_VAR} is not set)",
+              file=sys.stderr)
+        return None
+    fields = stat_fields(owner)
+    if fields is None or fields[3] != start:
+        owner = -1                              # the session is gone: marker only
+    try:
+        grace = float(os.environ.get("TUNA_PROOF_SESSION_GRACE", "10"))
+    except ValueError:
+        grace = 10.0
+    return Run(marker.rsplit(".", 2)[0], grace, owner, marker, [f"\0{MARKER_VAR}={marker}\0".encode()])
+
+
+def own_line():
+    """This process and its ancestors."""
+    line, pid = set(), os.getpid()
+    while pid > 1 and pid not in line:
+        line.add(pid)
+        fields = stat_fields(pid)
+        if fields is None:
+            break
+        pid = fields[0]
+    return line
+
+
+def stop_named(names):
+    run = inside("--stop")
+    if run is None:
+        return 2
+    line = own_line()
+    wanted = set(names)
+
+    def named(table, pid):
+        if pid in line:
+            return True
+        return table[pid][2] not in wanted and os.path.basename(cmdline(pid).split(" ")[0]) not in wanted
+
+    run.stop(lambda: run.members(named), time.monotonic() + run.grace)
+    alive = run.members(named)
+    if alive:
+        say(run.label, f"FAIL: still alive after KILL: {run.listing({p: c for p, (c, _) in alive.items()}, True)}")
+        return 1
+    if run.swept:
+        say(run.label, f"stopped {run.listing(run.swept)}")
+    return 0
+
+
+def check():
+    run = inside("--check")
+    if run is None:
+        return 2
+    line = own_line()
+    try:
+        bus = int(os.environ.get(BUS_VAR, ""))
+    except ValueError:
+        bus = None
+
+    # Services the private session bus activated carry its address as
+    # DBUS_STARTER_ADDRESS (dbus-daemon's activation helper forks them and
+    # may exit, so they need not stay below the bus); they end with the bus,
+    # which the session stops last.
+    address = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+    started = f"\0DBUS_STARTER_ADDRESS={address}\0".encode()
+    below_bus = {}
+
+    def exempt(table, pid):
+        if pid in line:
+            return True
+        if bus is None or bus not in table:
+            return False
+        if below_bus.get("table") is not table:
+            below_bus.update(table=table, pids=descendants(table, [bus]) | {bus})
+        return pid in below_bus["pids"] or (bool(address) and environ_has(pid, [started]))
+
+    deadline = time.monotonic() + run.grace
+    alive = run.members(exempt)
+    while alive and time.monotonic() < deadline:
+        time.sleep(POLL)
+        alive = run.members(exempt)
+    if alive:
+        say(run.label, f"FAIL: {len(alive)} process(es) escaped the proof's cleanup (still alive "
+            f"{run.grace:g} s after it; the session stops them now): "
+            + run.listing({p: c for p, (c, _) in alive.items()}, True))
+        return 1
+    return 0
+
+
+def exit_code(status):
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return os.WEXITSTATUS(status)
+
+
+def main(argv):
+    bus = False
+    label = None
+    args = list(argv)
+    if args[:1] == ["--stop"]:
+        return stop_named(args[1:]) if args[1:] else 2
+    if args == ["--check"]:
+        return check()
+    while args and args[0].startswith("-"):
+        option = args.pop(0)
+        if option == "--":
+            break
+        if option == "--bus":
+            bus = True
+        elif option == "--label" and args:
+            label = args.pop(0)
+        elif option in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        else:
+            print(f"{NAME}: unknown option {option}", file=sys.stderr)
+            return 2
+    if not args:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    if label is None:
+        names = [os.path.basename(word) for word in args[:2]]    # a script, or interpreter and script
+        label = next((name for name in names if name.startswith("tuna-")), names[0])
+    label = "".join(c if c.isalnum() or c in "_-" else "-" for c in label)
+    try:
+        grace = float(os.environ.get("TUNA_PROOF_SESSION_GRACE", "10"))
+    except ValueError:
+        print(f"{NAME}: bad TUNA_PROOF_SESSION_GRACE", file=sys.stderr)
+        return 2
+
+    if not os.environ.get(MARKER_VAR):
+        preflight = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tuna-proof-preflight")
+        if subprocess.run([preflight, "--label", label], stdin=subprocess.DEVNULL, check=False).returncode != 0:
+            return PREFLIGHT_REFUSED
+
+    session = Session(label, grace)
+    if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        say(label, "cannot become a subreaper: detached processes are found by the run marker only")
+    # A disposition the caller ignored (nohup's HUP, a background job's INT)
+    # stays ignored, here and in the session.
+    stops = {s for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP) if signal.getsignal(s) != signal.SIG_IGN}
+    signal.signal(signal.SIGCHLD, lambda *_: None)
+    session.watch = stops | {signal.SIGCHLD}
+    signal.pthread_sigmask(signal.SIG_BLOCK, session.watch)
+
+    env = dict(os.environ)
+    env[MARKER_VAR] = session.marker
+    env.pop(BUS_VAR, None)
+    stop_signal = None
+    status = None
+    try:
+        if bus:
+            session.start_bus(env)
+        try:
+            session.leader = session.spawn(args, env).pid
+        except OSError as error:
+            say(label, f"cannot run {args[0]}: {error.strerror}")
+            status = 126 if isinstance(error, PermissionError) else 127
+        while session.leader is not None:
+            session.reap()
+            if session.leader_status is not None:
+                break
+            signum = signal.sigwaitinfo(session.watch).si_signo
+            if signum != signal.SIGCHLD:
+                stop_signal = signum
+                break
+    except RuntimeError as error:
+        say(label, str(error))
+        status = 127
+    hurry = False
+    if stop_signal is not None:
+        say(label, f"{signal.Signals(stop_signal).name}: stopping the session")
+        try:
+            os.killpg(session.leader, stop_signal)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + grace
+        while session.leader_status is None and time.monotonic() < deadline and not hurry:
+            hurry = session.pause(min(POLL, max(0.0, deadline - time.monotonic())))
+            session.reap()
+    alive = session.teardown(hurry)
+    if stop_signal is not None:
+        status = 128 + stop_signal
+    elif status is None:
+        status = exit_code(session.leader_status)
+    if alive:
+        say(label, f"FAIL: {len(alive)} process(es) of run {session.marker} are still alive after KILL: "
+            + session.listing({p: c for p, (c, _) in alive.items()}, True))
+        return status or 1
+    say(label, f"no process of run {session.marker} remains")
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
