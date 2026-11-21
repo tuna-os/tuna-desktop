@@ -21,6 +21,12 @@ pub const MANAGER_INTERFACE: &str = "org.gnome.DisplayManager.Manager";
 pub const SESSION_PATH: &str = "/org/gnome/DisplayManager/Session";
 pub const USER_VERIFIER: &str = "org.gnome.DisplayManager.UserVerifier";
 pub const GREETER: &str = "org.gnome.DisplayManager.Greeter";
+/// The UserVerifier extensions gnome-shell 51 enables (loginDialog.js
+/// `set_enabled_extensions`); GDM exports them on the channel once asked.
+pub const CHOICE_LIST: &str = "org.gnome.DisplayManager.UserVerifier.ChoiceList";
+pub const CUSTOM_JSON: &str = "org.gnome.DisplayManager.UserVerifier.CustomJSON";
+/// The extensions, in gnome-shell's order.
+pub const EXTENSIONS: [&str; 2] = [CHOICE_LIST, CUSTOM_JSON];
 
 /// One signal of the session object, parsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,6 +73,26 @@ pub enum Signal {
         service: String,
         session_id: String,
     },
+    /// `ChoiceList.ChoiceQuery`: a PAM module offers choices (GDM's
+    /// `GDM_PAM_EXTENSION_CHOICE_LIST`), in the module's order.
+    ChoiceQuery {
+        service: String,
+        prompt: String,
+        choices: Vec<(String, String)>,
+    },
+    /// `CustomJSON.Request`: a JSON query (SSSD's `auth-mechanisms`).
+    JsonRequest {
+        service: String,
+        protocol: String,
+        version: u32,
+        json: String,
+    },
+    /// `Greeter.TimedLoginRequested`, the answer to
+    /// `GetTimedLoginDetails` when timed login is configured.
+    TimedLoginRequested {
+        user: String,
+        delay: i32,
+    },
 }
 
 /// Parse a signal of [`USER_VERIFIER`] or [`GREETER`]; `None` for
@@ -108,6 +134,38 @@ pub fn parse_signal(interface: &str, member: &str, params: &glib::Variant) -> Op
             service,
             session_id,
         }),
+        (GREETER, "TimedLoginRequested") => params
+            .get::<(String, i32)>()
+            .map(|(user, delay)| Signal::TimedLoginRequested { user, delay }),
+        (CHOICE_LIST, "ChoiceQuery") => {
+            if params.type_().as_str() != "(ssa{ss})" {
+                return None;
+            }
+            let text = |i: usize| params.child_value(i).str().map(str::to_owned);
+            let choices = params
+                .child_value(2)
+                .iter()
+                .filter_map(|entry| {
+                    Some((
+                        entry.child_value(0).str()?.to_owned(),
+                        entry.child_value(1).str()?.to_owned(),
+                    ))
+                })
+                .collect();
+            Some(Signal::ChoiceQuery {
+                service: text(0)?,
+                prompt: text(1)?,
+                choices,
+            })
+        }
+        (CUSTOM_JSON, "Request") => params.get::<(String, String, u32, String)>().map(
+            |(service, protocol, version, json)| Signal::JsonRequest {
+                service,
+                protocol,
+                version,
+                json,
+            },
+        ),
         _ => None,
     }
 }
@@ -115,25 +173,77 @@ pub fn parse_signal(interface: &str, member: &str, params: &glib::Variant) -> Op
 /// A call on the session object. Answers are never in `Debug` output.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Call {
-    BeginVerificationForUser { service: String, user: String },
-    AnswerQuery { service: String, answer: String },
+    /// `UserVerifier.EnableExtensions`, once per channel (libgdm does it
+    /// when it makes the channel's UserVerifier proxy).
+    EnableExtensions,
+    BeginVerificationForUser {
+        service: String,
+        user: String,
+    },
+    /// A conversation that finds its user itself (a smartcard's
+    /// certificate names it).
+    BeginVerification {
+        service: String,
+    },
+    AnswerQuery {
+        service: String,
+        answer: String,
+    },
+    /// `ChoiceList.SelectChoice`.
+    SelectChoice {
+        service: String,
+        choice: String,
+    },
+    /// `CustomJSON.Reply`; the JSON may carry a password or PIN.
+    JsonReply {
+        service: String,
+        json: String,
+    },
     Cancel,
-    SelectSession { session: String },
-    StartSessionWhenReady { service: String },
+    SelectSession {
+        session: String,
+    },
+    StartSessionWhenReady {
+        service: String,
+    },
+    /// libgdm asks for the timed login details whenever it makes the
+    /// Greeter proxy; GDM answers with `TimedLoginRequested`.
+    GetTimedLoginDetails,
+    BeginAutoLogin {
+        user: String,
+    },
+    StopConflictingSession,
+}
+
+impl Call {
+    /// Whether the call belongs to the conversation's channel (GDM's
+    /// UserVerifier and its extensions) rather than the greeter's.
+    pub fn is_verifier(&self) -> bool {
+        self.wire().0 != GREETER
+    }
 }
 
 impl std::fmt::Debug for Call {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::EnableExtensions => write!(f, "EnableExtensions({})", EXTENSIONS.join(", ")),
             Self::BeginVerificationForUser { service, user } => {
                 write!(f, "BeginVerificationForUser({service}, {user})")
             }
+            Self::BeginVerification { service } => write!(f, "BeginVerification({service})"),
             Self::AnswerQuery { service, .. } => write!(f, "AnswerQuery({service}, <redacted>)"),
+            Self::SelectChoice { service, choice } => {
+                write!(f, "SelectChoice({service}, {choice})")
+            }
+            Self::JsonReply { service, .. } => write!(f, "Reply({service}, <redacted>)"),
             Self::Cancel => write!(f, "Cancel"),
             Self::SelectSession { session } => write!(f, "SelectSession({session})"),
             Self::StartSessionWhenReady { service } => {
                 write!(f, "StartSessionWhenReady({service}, true)")
             }
+            Self::GetTimedLoginDetails => write!(f, "GetTimedLoginDetails"),
+            Self::BeginAutoLogin { user } => write!(f, "BeginAutoLogin({user})"),
+            Self::StopConflictingSession => write!(f, "StopConflictingSession"),
         }
     }
 }
@@ -142,15 +252,35 @@ impl Call {
     /// Interface, method and arguments on the wire.
     pub fn wire(&self) -> (&'static str, &'static str, glib::Variant) {
         match self {
+            Self::EnableExtensions => (
+                USER_VERIFIER,
+                "EnableExtensions",
+                (EXTENSIONS.to_vec(),).to_variant(),
+            ),
             Self::BeginVerificationForUser { service, user } => (
                 USER_VERIFIER,
                 "BeginVerificationForUser",
                 (service.as_str(), user.as_str()).to_variant(),
             ),
+            Self::BeginVerification { service } => (
+                USER_VERIFIER,
+                "BeginVerification",
+                (service.as_str(),).to_variant(),
+            ),
             Self::AnswerQuery { service, answer } => (
                 USER_VERIFIER,
                 "AnswerQuery",
                 (service.as_str(), answer.as_str()).to_variant(),
+            ),
+            Self::SelectChoice { service, choice } => (
+                CHOICE_LIST,
+                "SelectChoice",
+                (service.as_str(), choice.as_str()).to_variant(),
+            ),
+            Self::JsonReply { service, json } => (
+                CUSTOM_JSON,
+                "Reply",
+                (service.as_str(), json.as_str()).to_variant(),
             ),
             Self::Cancel => (USER_VERIFIER, "Cancel", ().to_variant()),
             Self::SelectSession { session } => {
@@ -161,8 +291,46 @@ impl Call {
                 "StartSessionWhenReady",
                 (service.as_str(), true).to_variant(),
             ),
+            Self::GetTimedLoginDetails => (GREETER, "GetTimedLoginDetails", ().to_variant()),
+            Self::BeginAutoLogin { user } => {
+                (GREETER, "BeginAutoLogin", (user.as_str(),).to_variant())
+            }
+            Self::StopConflictingSession => (GREETER, "StopConflictingSession", ().to_variant()),
         }
     }
+}
+
+/// `Manager.OpenReauthenticationChannel` (libgdm
+/// `gdm_client_open_reauthentication_channel`): on the login screen GDM
+/// answers only for a user whose session runs, with the address of that
+/// session's reauthentication channel; otherwise `AccessDenied`
+/// (`gdm-manager.c`: "Login screen only allowed to open
+/// reauthentication channels for running sessions").
+pub async fn open_reauthentication_channel(
+    system: &gio::DBusConnection,
+    user: &str,
+) -> Result<String, glib::Error> {
+    let reply = system
+        .call_future(
+            Some(MANAGER_NAME),
+            MANAGER_PATH,
+            MANAGER_INTERFACE,
+            "OpenReauthenticationChannel",
+            Some(&(user,).to_variant()),
+            Some(glib::VariantTy::new("(s)").unwrap()),
+            gio::DBusCallFlags::NONE,
+            -1,
+        )
+        .await?;
+    Ok(reply.get::<(String,)>().map(|(a,)| a).unwrap_or_default())
+}
+
+/// Whether a D-Bus error is GDM's refusal (`AccessDenied`), after which
+/// userVerifier.js verifies on the login screen's own channel.
+pub fn access_denied(error: &glib::Error) -> bool {
+    gio::DBusError::remote_error(error).as_deref()
+        == Some("org.freedesktop.DBus.Error.AccessDenied")
+        || error.matches(gio::DBusError::AccessDenied)
 }
 
 /// `Manager.OpenSession` on the system bus: the private channel's address.
@@ -443,9 +611,9 @@ mod tests {
             parse(USER_VERIFIER, "VerificationFailed", (1u32,).to_variant()),
             None
         );
-        // Signals the greeter does not act on yet.
+        // Signals the greeter does not act on.
         assert_eq!(
-            parse(GREETER, "TimedLoginRequested", ("a", 5i32).to_variant()),
+            parse(GREETER, "TimedLoginRequested", ("a", 5u32).to_variant()),
             None
         );
         assert_eq!(
@@ -485,6 +653,111 @@ mod tests {
         assert_eq!(start.wire().1, "StartSessionWhenReady");
         assert_eq!(start.wire().2.type_().as_str(), "(sb)");
         assert!(start.wire().2.get::<(String, bool)>().unwrap().1);
+    }
+
+    #[test]
+    fn extension_and_timed_login_signals_parse() {
+        assert_eq!(
+            parse(GREETER, "TimedLoginRequested", ("ada", 30i32).to_variant()),
+            Some(Signal::TimedLoginRequested {
+                user: "ada".into(),
+                delay: 30
+            })
+        );
+        let list = glib::Variant::array_from_iter_with_type(
+            glib::VariantTy::new("{ss}").unwrap(),
+            [("k1", "Card one"), ("k2", "Card two")]
+                .into_iter()
+                .map(|(k, v)| glib::Variant::from_dict_entry(&k.to_variant(), &v.to_variant())),
+        );
+        let params = glib::Variant::tuple_from_iter([
+            "gdm-smartcard".to_variant(),
+            "Select a card".to_variant(),
+            list,
+        ]);
+        assert_eq!(
+            parse(CHOICE_LIST, "ChoiceQuery", params),
+            Some(Signal::ChoiceQuery {
+                service: "gdm-smartcard".into(),
+                prompt: "Select a card".into(),
+                choices: vec![
+                    ("k1".into(), "Card one".into()),
+                    ("k2".into(), "Card two".into())
+                ]
+            })
+        );
+        assert_eq!(
+            parse(CHOICE_LIST, "ChoiceQuery", ("a", "b", "c").to_variant()),
+            None
+        );
+        assert_eq!(
+            parse(
+                CUSTOM_JSON,
+                "Request",
+                ("gdm-switchable-auth", "auth-mechanisms", 1u32, "{}").to_variant()
+            ),
+            Some(Signal::JsonRequest {
+                service: "gdm-switchable-auth".into(),
+                protocol: "auth-mechanisms".into(),
+                version: 1,
+                json: "{}".into()
+            })
+        );
+        // The extensions' signals on the base interface are not theirs.
+        assert_eq!(
+            parse(
+                USER_VERIFIER,
+                "Request",
+                ("s", "p", 1u32, "{}").to_variant()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn extension_calls_go_to_their_interfaces_and_redact_json() {
+        let reply = Call::JsonReply {
+            service: "gdm-switchable-auth".into(),
+            json: r#"{"password":"hunter2"}"#.into(),
+        };
+        assert_eq!(reply.wire().0, CUSTOM_JSON);
+        assert_eq!(reply.wire().2.type_().as_str(), "(ss)");
+        assert!(!format!("{reply:?}").contains("hunter2"));
+        let choice = Call::SelectChoice {
+            service: "gdm-smartcard".into(),
+            choice: "k1".into(),
+        };
+        assert_eq!(
+            (choice.wire().0, choice.wire().1),
+            (CHOICE_LIST, "SelectChoice")
+        );
+        assert_eq!(Call::EnableExtensions.wire().2.type_().as_str(), "(as)");
+        assert_eq!(
+            Call::EnableExtensions
+                .wire()
+                .2
+                .get::<(Vec<String>,)>()
+                .unwrap()
+                .0,
+            vec![CHOICE_LIST.to_owned(), CUSTOM_JSON.to_owned()]
+        );
+        assert!(choice.is_verifier() && reply.is_verifier() && Call::Cancel.is_verifier());
+        assert!(!Call::GetTimedLoginDetails.is_verifier());
+        assert_eq!(
+            Call::BeginAutoLogin { user: "ada".into() }.wire(),
+            (GREETER, "BeginAutoLogin", ("ada",).to_variant())
+        );
+        assert_eq!(Call::StopConflictingSession.wire().2.type_().as_str(), "()");
+        assert_eq!(
+            Call::BeginVerification {
+                service: "gdm-smartcard".into()
+            }
+            .wire()
+            .2
+            .type_()
+            .as_str(),
+            "(s)"
+        );
     }
 
     /// GDM's channel is peer to peer: its signals carry no sender. They
@@ -556,5 +829,110 @@ mod tests {
                 server.stop();
             })
             .unwrap();
+    }
+
+    #[test]
+    fn access_denied_is_gdms_refusal_only() {
+        assert!(access_denied(&gio::DBusError::new_for_dbus_error(
+            "org.freedesktop.DBus.Error.AccessDenied",
+            "Login screen only allowed to open reauthentication channels for running sessions",
+        )));
+        assert!(access_denied(&glib::Error::new(
+            gio::DBusError::AccessDenied,
+            "denied"
+        )));
+        assert!(!access_denied(&gio::DBusError::new_for_dbus_error(
+            "org.gnome.DisplayManager.Manager.Error.NotSupported",
+            "no"
+        )));
+        assert!(!access_denied(&gio::DBusError::new_for_dbus_error(
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            "GDM is not running"
+        )));
+        assert!(!access_denied(&glib::Error::new(
+            gio::IOErrorEnum::NotConnected,
+            "closed"
+        )));
+    }
+
+    /// GDM's Manager on a private message bus: `OpenReauthenticationChannel`
+    /// answers mary (a running session) with her channel's address and
+    /// refuses ada as gdm-manager.c does.
+    #[test]
+    fn reauthentication_channels_are_opened_for_running_sessions_only() {
+        use std::io::BufRead;
+        let mut daemon = std::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("dbus-daemon starts");
+        let mut address = String::new();
+        std::io::BufReader::new(daemon.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+        let address = address.trim().to_owned();
+        let context = glib::MainContext::new();
+        let answers = context
+            .with_thread_default(|| {
+                context.block_on(async {
+                    let flags = gio::DBusConnectionFlags::AUTHENTICATION_CLIENT
+                        | gio::DBusConnectionFlags::MESSAGE_BUS_CONNECTION;
+                    let gdm = gio::DBusConnection::for_address_future(&address, flags, None)
+                        .await
+                        .unwrap();
+                    let node = gio::DBusNodeInfo::for_xml(&format!(
+                        r#"<node><interface name="{MANAGER_INTERFACE}">
+                        <method name="OpenReauthenticationChannel">
+                          <arg name="username" direction="in" type="s"/>
+                          <arg name="address" direction="out" type="s"/>
+                        </method></interface></node>"#
+                    ))
+                    .unwrap();
+                    let _object = gdm
+                        .register_object(
+                            MANAGER_PATH,
+                            &node.lookup_interface(MANAGER_INTERFACE).unwrap(),
+                        )
+                        .method_call(|_, _, _, _, _, params, invocation| {
+                            match params.get::<(String,)>().map(|(user,)| user).as_deref() {
+                                Some("mary") => invocation.return_value(Some(
+                                    &("unix:path=/run/gdm/dbus/dbus-mary",).to_variant(),
+                                )),
+                                _ => invocation.return_dbus_error(
+                                    "org.freedesktop.DBus.Error.AccessDenied",
+                                    "Login screen only allowed to open reauthentication \
+                                     channels for running sessions",
+                                ),
+                            }
+                        })
+                        .build()
+                        .unwrap();
+                    gdm.call_future(
+                        Some("org.freedesktop.DBus"),
+                        "/org/freedesktop/DBus",
+                        "org.freedesktop.DBus",
+                        "RequestName",
+                        Some(&(MANAGER_NAME, 4u32).to_variant()),
+                        None,
+                        gio::DBusCallFlags::NONE,
+                        -1,
+                    )
+                    .await
+                    .unwrap();
+                    let greeter = gio::DBusConnection::for_address_future(&address, flags, None)
+                        .await
+                        .unwrap();
+                    (
+                        open_reauthentication_channel(&greeter, "mary").await,
+                        open_reauthentication_channel(&greeter, "ada").await,
+                    )
+                })
+            })
+            .unwrap();
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        assert_eq!(answers.0.unwrap(), "unix:path=/run/gdm/dbus/dbus-mary");
+        let refused = answers.1.unwrap_err();
+        assert!(access_denied(&refused), "{refused:?}");
     }
 }

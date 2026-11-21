@@ -136,6 +136,57 @@ pub trait Host {
     fn can_retry(&self) -> bool {
         true
     }
+    /// authServices.js `cancelRequested`: Back or Escape is handled by
+    /// the conversation itself (a step back inside a mechanism, such as
+    /// web login's dialog back to its button); the prompt then only steps
+    /// back. The lock screen's conversations never do.
+    fn cancel_requested(&self) -> bool {
+        false
+    }
+}
+
+/// One item of an [`Ask::Choices`] list (authList.js `addItem`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Choice {
+    /// What choosing it answers.
+    pub key: String,
+    pub title: String,
+    pub subtitle: Option<String>,
+}
+
+/// A step the prompt shows instead of its entry (authPrompt.js
+/// `_onShowChoiceList`, `_onShowButton`, `_onWebLogin`). Each is a query
+/// of the conversation: what is chosen answers it, through the same
+/// sequence as a typed answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ask {
+    /// A titled list (`_authList`); choosing an item answers its key. A
+    /// list without items is an instruction alone (insert the key, touch
+    /// it) that nothing answers.
+    Choices {
+        prompt: String,
+        choices: Vec<Choice>,
+    },
+    /// One button (`_authButton`); pressing it answers "".
+    Button { label: String },
+    /// webLogin.js `WebLoginDialog`: the message, the URL (as text and QR
+    /// code), the login code, Cancel and Done; Done answers "" and the
+    /// dialog waits (`_startLoading`) for the outcome.
+    WebLogin {
+        message: String,
+        url: String,
+        code: Option<String>,
+    },
+}
+
+impl Ask {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Choices { .. } => "choices",
+            Self::Button { .. } => "button",
+            Self::WebLogin { .. } => "web-login",
+        }
+    }
 }
 
 /// What the prompt widgets show.
@@ -150,6 +201,16 @@ pub struct View {
     /// Back shown and targetable (`promptStep > 1`).
     pub back: bool,
     pub message: Option<(String, MessageKind)>,
+    /// The step shown instead of the entry, if any.
+    pub ask: Option<Ask>,
+    /// Web login's Done was pressed: the dialog waits, only Cancel works.
+    pub loading: bool,
+    /// authPrompt.js `_entryArea.visible`: hidden by `clear()` until a
+    /// question (`setQuestion`) or a non-error message shows it. The lock
+    /// screen keeps its entry and ignores this.
+    pub entry: bool,
+    /// The entry's hint is a question's (`clear()` blanks it otherwise).
+    pub hinted: bool,
 }
 
 /// One-shot work for the widgets.
@@ -260,6 +321,10 @@ pub struct AuthMachine {
     sensitive: bool,
     message: Option<(String, MessageKind)>,
     effects: Vec<Effect>,
+    ask: Option<Ask>,
+    loading: bool,
+    entry: bool,
+    hinted: bool,
 }
 
 impl AuthMachine {
@@ -297,6 +362,10 @@ impl AuthMachine {
             hint: DEFAULT_QUESTION.to_owned(),
             sensitive: true,
             message: None,
+            ask: None,
+            loading: false,
+            entry: false,
+            hinted: false,
             effects: Vec::new(),
         }
     }
@@ -308,6 +377,10 @@ impl AuthMachine {
             sensitive: self.sensitive,
             back: self.step > 1,
             message: self.message.clone(),
+            ask: self.ask.clone(),
+            loading: self.loading,
+            entry: self.entry,
+            hinted: self.hinted,
         }
     }
 
@@ -352,7 +425,7 @@ impl AuthMachine {
 
     /// Enter or Submit (authPrompt.js `_activateNext`).
     pub fn submit(&mut self, host: &dyn Host, text: String) {
-        if !self.sensitive || self.status == Status::Succeeded {
+        if !self.sensitive || self.status == Status::Succeeded || self.ask.is_some() {
             return;
         }
         if self.legacy {
@@ -379,6 +452,13 @@ impl AuthMachine {
     /// Back or Escape (authPrompt.js `cancel`): from a later step, back to
     /// the first; otherwise stop. Returns whether the clock comes back.
     pub fn cancel(&mut self, host: &dyn Host) -> bool {
+        // `_handleCancel`: the conversation may take the step back itself
+        // (two steps off: its next prompt counts one again).
+        if self.status != Status::Succeeded && host.cancel_requested() {
+            self.step = self.step.saturating_sub(2);
+            self.flush(host);
+            return false;
+        }
         let clock = match self.status {
             Status::Succeeded => false,
             _ if self.step > 1 => {
@@ -392,6 +472,92 @@ impl AuthMachine {
         };
         self.flush(host);
         clock
+    }
+
+    /// The conversation asked for a soft reset (authServices `reset`
+    /// with `softReset`: a mechanism was chosen, a smartcard came or
+    /// went, web login timed out): verification begins again for the
+    /// same user, unless it already succeeded.
+    pub fn restart(&mut self, host: &dyn Host) {
+        if self.status != Status::Succeeded {
+            self.soft_restart(host);
+        }
+        self.flush(host);
+    }
+
+    /// authPrompt.js `selectMechanism`: a mechanism may be chosen unless
+    /// verification succeeded or an answer is being checked.
+    pub fn can_select(&self) -> bool {
+        !matches!(self.status, Status::Succeeded | Status::InProgress)
+    }
+
+    /// Set the prompt step (`selectMechanism` starts the chosen
+    /// mechanism at 0, and puts the old step back when nothing changed).
+    pub fn set_prompt_step(&mut self, step: u32) {
+        self.step = step;
+    }
+
+    /// Whether verification succeeded.
+    pub fn succeeded(&self) -> bool {
+        self.status == Status::Succeeded
+    }
+
+    /// Whether verification runs or ended (authPrompt.js status other
+    /// than `NOT_VERIFYING`).
+    pub fn verifying(&self) -> bool {
+        self.status != Status::NotVerifying
+    }
+
+    /// The conversation shows a step other than the entry (authPrompt.js
+    /// `_onShowChoiceList`, `_onShowButton`, `_onWebLogin`).
+    pub fn ask(&mut self, host: &dyn Host, request: u64, sequence: u32, ask: Ask) {
+        if self.password != Some(request) || self.status == Status::Succeeded {
+            return;
+        }
+        if self.queried {
+            self.clear_entry();
+        }
+        self.queried = true;
+        self.step += 1;
+        self.query = Some(sequence);
+        self.preemptive_answer = None;
+        self.preemptive_input = false;
+        self.effects.push(Effect::Trace(format!(
+            "lock auth ask service=password step={} kind={}",
+            self.step,
+            ask.kind()
+        )));
+        self.ask = Some(ask);
+        self.entry = false;
+        self.loading = false;
+        self.set_sensitive(true);
+        self.flush(host);
+    }
+
+    /// An item of the list, the button or web login's Done was activated
+    /// (`_completePendingCallback(key)`): it answers the step once the
+    /// queued messages are read.
+    pub fn choose(&mut self, host: &dyn Host, answer: String) {
+        if !self.sensitive || self.status == Status::Succeeded || self.loading {
+            return;
+        }
+        let Some(ask) = self.ask.as_ref() else {
+            return;
+        };
+        if matches!(ask, Ask::Choices { choices, .. } if choices.is_empty()) {
+            return;
+        }
+        let Some(sequence) = self.query.take() else {
+            return;
+        };
+        if matches!(ask, Ask::WebLogin { .. }) {
+            self.loading = true;
+        } else {
+            self.ask = None;
+            self.sensitive = false;
+        }
+        self.complete_pending(host, sequence, answer);
+        self.flush(host);
     }
 
     /// The clock is back (unlockDialog.js `_maybeDestroyAuthPrompt`): the
@@ -411,6 +577,10 @@ impl AuthMachine {
         self.clear_entry();
         self.secret = true;
         self.hint = DEFAULT_QUESTION.to_owned();
+        self.ask = None;
+        self.loading = false;
+        self.entry = false;
+        self.hinted = false;
         self.sensitive = true;
         self.flush(host);
     }
@@ -708,9 +878,13 @@ impl AuthMachine {
         self.fingerprint_unavailable = false;
         if !reuse {
             self.clear_entry();
+            self.entry = false;
+            self.hinted = false;
         }
         self.secret = true;
         self.hint = DEFAULT_QUESTION.to_owned();
+        self.ask = None;
+        self.loading = false;
     }
 
     fn soft_restart(&mut self, host: &dyn Host) {
@@ -816,7 +990,12 @@ impl AuthMachine {
             return;
         }
         self.secret = secret;
+        // `setQuestion` hides the list, the button and web login.
+        self.ask = None;
+        self.loading = false;
         self.hint = label;
+        self.entry = true;
+        self.hinted = true;
         self.set_sensitive(true);
     }
 
@@ -925,6 +1104,7 @@ impl AuthMachine {
         let retry = host.can_retry();
         self.done_trying = !retry;
         self.status = Status::Verifying;
+        self.loading = false;
         self.clear_entry();
         self.preemptive_input = retry;
         if retry {
@@ -1016,6 +1196,11 @@ impl AuthMachine {
         match message.text.as_deref().filter(|t| !t.is_empty()) {
             Some(text) => {
                 self.message = Some((text.to_owned(), message.kind));
+                // `_onShowMessage`: a hint or info with nothing else to
+                // answer brings the entry for a preemptive answer.
+                if message.kind < MessageKind::Error && self.ask.is_none() {
+                    self.entry = true;
+                }
                 self.shown = Some((message.service, message.kind));
                 self.effects.push(Effect::Announce(text.to_owned()));
                 self.effects.push(Effect::Trace(format!(
@@ -1966,5 +2151,168 @@ mod tests {
         assert_eq!(host.begins().len(), 2);
         m.resume(&host);
         assert_eq!(host.begins().len(), 2, "resumes once");
+    }
+}
+
+#[cfg(test)]
+mod ask_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[derive(Default)]
+    struct Host1 {
+        answers: RefCell<Vec<(u32, String)>>,
+        begins: Cell<u64>,
+        cancels: Cell<u32>,
+        step_back: Cell<bool>,
+    }
+
+    impl Host for Host1 {
+        fn begin(&self, service: AuthService) -> Option<u64> {
+            (service == AuthService::Password).then(|| {
+                self.begins.set(self.begins.get() + 1);
+                self.begins.get()
+            })
+        }
+        fn answer(&self, _: AuthService, sequence: u32, answer: String) -> Option<u64> {
+            self.answers.borrow_mut().push((sequence, answer));
+            Some(self.begins.get())
+        }
+        fn cancel(&self) -> Option<u64> {
+            self.cancels.set(self.cancels.get() + 1);
+            Some(0)
+        }
+        fn unlock(&self, _: String) -> Option<u64> {
+            None
+        }
+        fn fingerprint_enabled(&self) -> bool {
+            false
+        }
+        fn wiggle_ms(&self) -> u64 {
+            0
+        }
+        fn cancel_requested(&self) -> bool {
+            self.step_back.get()
+        }
+    }
+
+    fn list() -> Ask {
+        Ask::Choices {
+            prompt: "Select Identity".into(),
+            choices: vec![
+                Choice {
+                    key: "a".into(),
+                    title: "Ada".into(),
+                    subtitle: None,
+                },
+                Choice {
+                    key: "b".into(),
+                    title: "Bob".into(),
+                    subtitle: Some("work".into()),
+                },
+            ],
+        }
+    }
+
+    fn started() -> (Host1, AuthMachine) {
+        let host = Host1::default();
+        let mut m = AuthMachine::new(1.0);
+        m.show_prompt(&host, false);
+        (host, m)
+    }
+
+    #[test]
+    fn a_choice_answers_its_query_once_and_counts_a_step() {
+        let (host, mut m) = started();
+        m.ask(&host, 1, 7, list());
+        let v = m.view();
+        assert_eq!(v.ask, Some(list()));
+        assert!(v.sensitive);
+        assert_eq!(m.prompt_step(), 1);
+        // The entry does not answer a list.
+        m.submit(&host, "typed".into());
+        assert!(host.answers.borrow().is_empty());
+        m.choose(&host, "b".into());
+        assert_eq!(*host.answers.borrow(), vec![(7, "b".to_owned())]);
+        assert_eq!(m.view().ask, None, "the list goes once chosen");
+        m.choose(&host, "a".into());
+        assert_eq!(host.answers.borrow().len(), 1, "answered once");
+        // The next question is the PIN: entry back, step 2, Back shows.
+        m.event(
+            &host,
+            1,
+            AuthService::Password,
+            &AuthEvent::Query {
+                sequence: 8,
+                question: "PIN:".into(),
+                secret: true,
+            },
+        );
+        let v = m.view();
+        assert_eq!((v.ask, v.hint.as_str(), v.back), (None, "PIN", true));
+    }
+
+    #[test]
+    fn web_login_done_waits_and_an_instruction_list_takes_no_answer() {
+        let (host, mut m) = started();
+        m.ask(
+            &host,
+            1,
+            3,
+            Ask::Choices {
+                prompt: "Insert security key".into(),
+                choices: Vec::new(),
+            },
+        );
+        m.choose(&host, String::new());
+        assert!(host.answers.borrow().is_empty());
+        let web = Ask::WebLogin {
+            message: "Log in online".into(),
+            url: "https://idp.example/device".into(),
+            code: Some("1234".into()),
+        };
+        m.ask(&host, 1, 4, web.clone());
+        m.choose(&host, String::new());
+        assert_eq!(*host.answers.borrow(), vec![(4, String::new())]);
+        let v = m.view();
+        assert_eq!((v.ask, v.loading), (Some(web), true));
+        // A soft reset drops the dialog and begins again.
+        m.restart(&host);
+        let v = m.view();
+        assert_eq!((v.ask, v.loading), (None, false));
+        assert_eq!(host.cancels.get(), 1);
+    }
+
+    #[test]
+    fn a_conversation_that_steps_back_itself_keeps_the_prompt() {
+        let (host, mut m) = started();
+        m.ask(
+            &host,
+            1,
+            1,
+            Ask::Button {
+                label: "Log In".into(),
+            },
+        );
+        m.choose(&host, String::new());
+        m.ask(
+            &host,
+            1,
+            2,
+            Ask::WebLogin {
+                message: "m".into(),
+                url: "u".into(),
+                code: None,
+            },
+        );
+        assert_eq!(m.prompt_step(), 2);
+        host.step_back.set(true);
+        assert!(!m.cancel(&host), "the user list does not come back");
+        assert_eq!(m.prompt_step(), 0);
+        assert_eq!(host.cancels.get(), 0, "nothing cancelled at GDM");
+        host.step_back.set(false);
+        assert!(m.can_select());
+        m.set_prompt_step(0);
+        assert!(m.cancel(&host), "first step: back to the list");
     }
 }

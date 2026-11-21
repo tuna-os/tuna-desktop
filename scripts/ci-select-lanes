@@ -97,6 +97,7 @@ OWNED = [
     # org.gnome.login-screen schema.
     ("scripts/tuna-greeter-proof", ["gtk-shell"]),
     ("scripts/lib/tuna-gdm-mock.py", ["gtk-shell"]),
+
     ("scripts/lib/org.gnome.login-screen.gschema.xml", ["gtk-shell"]),
     ("scripts/tuna-walkthrough", ["gtk-shell"]),
     # Example clients only a lane's proof runs (the check job builds every

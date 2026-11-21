@@ -16,8 +16,14 @@
 # DBUS_SYSTEM_BUS_ADDRESS: Manager.OpenSession returns the address of a
 # GDBusServer on unix:dir= (GDM's /run/gdm/dbus), whose
 # /org/gnome/DisplayManager/Session serves UserVerifier and Greeter as GDM
-# 51.1.1 does for the gdm-password conversation. Users ada, grace and
-# katherine are listed; gdm-greeter (system) and mallory (locked) are not.
+# 51.1.1 does, with logind and gsd-smartcard alongside, and a control
+# interface the proof uses to insert the card or the passkey, install
+# gdm-switchable-auth, configure timed login and restart the greeter's
+# channel. Users ada, grace, katherine, dorothy (a second factor), mary (a
+# running session), annie (a remote session GDM does not manage), hedy (the
+# smartcard's), joan (SSSD web login), radia (an SSSD passkey), frances
+# (SSSD smartcard certificates) and evelyn (an expired SSSD password) are
+# listed; gdm-greeter (system) and mallory (locked) are not.
 # The sessions are fixture wayland-sessions Tuna (tuna, GDM's fallback, as
 # TunaOS sets FallbackSession=tuna) and GNOME (gnome). NOTIFY_SOCKET is a
 # datagram socket of this proof. Gates (assertions.txt carries the ID):
@@ -47,7 +53,61 @@
 #   G-GREETER-SUPERVISION killing tuna-greeter restarts it (new channel,
 #                        user list back); with the restart budget spent the
 #                        compositor exits non-zero
-#   G-GREETER-HYGIENE    no password in any artifact; no panic
+#   G-GREETER-MULTISTEP  after dorothy's password GDM asks 'Verification code: '
+#                        (InfoQuery): a visible entry at step 2; Back there
+#                        resets softly (Cancel, gdm-password begins again for
+#                        her, 'Password' at step 1); then the code reaches
+#                        AnswerQuery and she logs in
+#   G-GREETER-SWITCH-RETURN mary (a running GDM session) is ringed as
+#                        logged in; choosing her opens her re-authentication
+#                        channel (OpenReauthenticationChannel), gdm-password
+#                        runs there, GDM switches to her session with no
+#                        new session; users without one get AccessDenied
+#                        and verify on the greeter's channel
+#   G-GREETER-CONFLICT   annie's remote session conflicts: "Session Already
+#                        Running"; Cancel resets at GDM, Force Stop sends
+#                        StopConflictingSession and starts once logind
+#                        removed the old session
+#   G-GREETER-CONFLICT-TIMEOUT the dialog unanswered for 60 s closes with
+#                        "Login Attempt Timed Out", resets at GDM (the opened
+#                        session closes) and returns to the user list
+#   G-GREETER-SMARTCARD  Login Options offers Smartcard; gdm-smartcard says
+#                        'Please insert smart card'; gsd-smartcard's token
+#                        insertion restarts it; the PIN logs hedy in
+#   G-GREETER-CHOICE-LIST GDM's ChoiceList query (two certificates) shows as
+#                        a list; the chosen key reaches SelectChoice
+#   G-GREETER-WEB-LOGIN  SSSD's CustomJSON auth-mechanisms (eidp first):
+#                        "Log In", then the dialog (message, QR code of the
+#                        URL, URL, login code, Cancel back to "Log In",
+#                        Done); Done replies {"eidp": {}} and joan logs in
+#   G-GREETER-PASSKEY    SSSD's passkey without the key: its insert
+#                        instruction (Back resets to the list); with the key:
+#                        the PIN (hidden) with the attempts warning, then the
+#                        touch instruction; the reply carries the PIN,
+#                        kerberos and cryptoChallenge; the touch logs radia in
+#   G-GREETER-SSSD-SMARTCARD SSSD's smartcard with two certificates: "Select
+#                        Identity" lists them by CN; Back at the PIN returns
+#                        to the list (no Cancel); the reply names the chosen
+#                        certificate with the card's PIN and frances logs in
+#   G-GREETER-PASSWORD-EXPIRED SSSD's password is right but expired: pam_sss's
+#                        'Password expired. Change your password now.' shows
+#                        with 'New Password', then 'Reenter new Password'
+#                        (hidden entries, AnswerQuery on gdm-switchable-auth)
+#                        and evelyn logs in
+#   G-GREETER-POLICY-AUTH enable-password-authentication=false: no Password
+#                        mechanism or entry, gdm-smartcard runs instead;
+#                        with switchable auth also off no username is
+#                        asked (BeginVerification(gdm-smartcard));
+#                        enable-smartcard-authentication=false: Login Options
+#                        offers Password only and gdm-password runs
+#   G-GREETER-TIMED-LOGIN TimedLoginRequested(katherine, 8): after 5 idle
+#                        seconds her row counts down 3 s; a key and a click
+#                        each start it over; then BeginAutoLogin and
+#                        gdm-autologin starts
+#   G-GREETER-TIMED-LOGIN-PROMPT with disable-user-list (a restarted
+#                        greeter) the countdown runs on the username prompt
+#                        and BeginAutoLogin follows
+#   G-GREETER-HYGIENE    no password, code or PIN in any artifact; no panic
 # Then a second login screen on the same GDM, with GDM 51.1.1's
 # org.gnome.login-screen schema (scripts/lib) on the keyfile backend and
 # TUNA_SESSION_KIND=hardware (the mock also serves logind's power calls):
@@ -85,7 +145,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
-        --help|-h) sed -n '2,72p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,132p' "$0"; exit 0 ;;
         *) echo "tuna-greeter-proof: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -133,7 +193,7 @@ export HOME XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STA
 GSETTINGS_SCHEMA_DIR="$FIXTURE/schemas"
 export GSETTINGS_SCHEMA_DIR
 unset WAYLAND_DISPLAY WAYLAND_SOCKET DBUS_SYSTEM_BUS_ADDRESS AT_SPI_BUS_ADDRESS NOTIFY_SOCKET \
-    GDM_MESSAGE_TIME_MULTIPLIER TUNA_GREETER_BIN TUNA_SHELL_BIN TUNA_SESSION_KIND
+    GDM_MESSAGE_TIME_MULTIPLIER TUNA_GREETER_BIN TUNA_SHELL_BIN XDG_SESSION_ID TUNA_SESSION_KIND
 
 # Secrets of this run only: never written below $ARTIFACTS.
 secret() { echo "$1-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"; }
@@ -141,6 +201,16 @@ ADA_PASSWORD="$(secret ada)"
 GRACE_PASSWORD="$(secret grace)"
 KATHERINE_PASSWORD="$(secret katherine)"
 WRONG_PASSWORD="$(secret nope)"
+DOROTHY_PASSWORD="$(secret dorothy)"
+DOROTHY_CODE="$(secret code)"
+MARY_PASSWORD="$(secret mary)"
+ANNIE_PASSWORD="$(secret annie)"
+HEDY_PASSWORD="$(secret hedy)"
+JOAN_PASSWORD="$(secret joan)"
+CARD_PIN="$(secret pin)"
+PASSKEY_PIN="$(secret passkey)"
+EVELYN_PASSWORD="$(secret evelyn)"
+EVELYN_NEW_PASSWORD="$(secret evelyn-new)"
 
 XVFB_PID=""
 ATSPI_PID=""
@@ -254,6 +324,10 @@ receipt = {
     'bin_dir': str(bins), 'gates': gates,
     'compositor_exit_status': int(status) if status.isdigit() else None,
     'review_screenshots': ['A-1-user-list.png', 'C-1-prompt.png', 'C-2-wrong-password.png',
+                           'F-2-code.png', 'G-2-conflict.png', 'H-1-insert.png',
+                           'H-2-choice.png', 'I-2-web-login.png', 'J-1-policy.png',
+                           'K-1-timed.png', 'P-2-pin.png', 'P-3-touch.png', 'S-1-identity.png',
+                           'X-2-new.png', 'G-3-timeout.png', 'L-1-prompt-timed.png',
                            'P-1-policy.png'],
     'cleanup': {'swept_pids': swept,
                 'leftover_pids': (out / 'leftover-pids.txt').read_text().split()},
@@ -263,7 +337,11 @@ receipt = {
     'not_covered': ['GDM itself: PAM, the session worker, VT handoff and session start',
                     'gnome-session --session gnome-login and tuna-greeter.service (V-GDM-LOGIN)',
                     'DRM hardware, the dynamic greeter user and GDM\'s uid checks',
-                    'fingerprint, smartcard, ChoiceList and CustomJSON web login'],
+                    'fingerprint: GDM 51 offers it only for re-authentication and the '
+                    'login dialog never starts it (not applicable)',
+                    'real SSSD, pam_sss, a smartcard reader, a passkey and an identity provider',
+                    'a FIDO2 token plugged in (fido2TokenManager.js watches udev hidraw): '
+                    'the greeter does not restart the passkey prompt on its own (not implemented)'],
 }
 (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
 RECEIPT
@@ -384,12 +462,26 @@ answer() {
     xdotool key Return
 }
 
-# The mock's controls (the proof's hand on GDM and AccountsService).
+# The mock's controls (the proof's hand on GDM, the card and SSSD).
 control() {
     gdbus call --address "$SYS_ADDR" --dest org.gnome.DisplayManager \
         --object-path /org/tuna/Proof/GdmMock --method "org.tuna.Proof.GdmMock.$1" "${@:2}" \
         >/dev/null 2>>"$ARTIFACTS/control.err" || fail "$CURRENT_GATE" "the GDM mock refused $1"
 }
+# GDM restarts the greeter's channel (the login before it is done); the
+# greeter connects again and shows its user list.
+new_channel() {
+    nc="$(mark)"
+    control CloseGreeterChannels
+    twait "$nc" "greeter gdm-connected" 20 >/dev/null || fail "$CURRENT_GATE" "the greeter did not reconnect to GDM"
+    sleep 1
+}
+description() {
+    jq -r --arg n "$2" 'first(.[] | select(.name == $n and .role == "list item")) | .description' \
+        "$ARTIFACTS/a11y-$1.json"
+}
+# The wall time of the first entry after MARK matching JQ.
+wall_of() { gsel "$1" "$2" | head -1 | jq -r .wall; }
 # Pixels of screenshot $1 within 24 of the colour R G B ($2 $3 $4).
 colour_pixels() {
     "$PY" - "$ARTIFACTS/$1.png" "$2" "$3" "$4" <<'COLOUR'
@@ -493,11 +585,50 @@ cat >"$FIXTURE/users.json" <<'USERS'
   {"name": "ada", "real_name": "Ada Lovelace", "uid": 1001, "icon": "ada.png"},
   {"name": "grace", "real_name": "Grace Hopper", "uid": 1002},
   {"name": "katherine", "real_name": "Katherine Johnson", "uid": 1003},
+  {"name": "dorothy", "real_name": "Dorothy Vaughan", "uid": 1005, "second_factor": true},
+  {"name": "mary", "real_name": "Mary Jackson", "uid": 1006,
+   "logged_in": {"id": "7", "managed": true}},
+  {"name": "annie", "real_name": "Annie Easley", "uid": 1007,
+   "logged_in": {"id": "9", "managed": false, "remote": true}},
+  {"name": "hedy", "real_name": "Hedy Lamarr", "uid": 1008},
+  {"name": "joan", "real_name": "Joan Clarke", "uid": 1009,
+   "switchable": {"authSelection": {"mechanisms": {
+     "password": {"name": "Password", "role": "password", "selectable": true, "prompt": "Password"},
+     "eidp": {"name": "Web Login", "role": "eidp", "selectable": true, "initPrompt": "Log In",
+              "linkPrompt": "Log in online with another device",
+              "uri": "https://idp.example.org/device/", "code": "4219-7730", "timeout": 300}},
+     "priority": ["eidp", "password"]}}},
+  {"name": "radia", "real_name": "Radia Perlman", "uid": 1010,
+   "switchable": {"authSelection": {"mechanisms": {
+     "passkey": {"name": "Passkey", "role": "passkey", "selectable": true,
+                 "initInstruction": "Insert your passkey device, then press ENTER.",
+                 "keyConnected": false, "pinRequest": true, "pinAttempts": 2,
+                 "pinPrompt": "Security key PIN", "touchInstruction": "Touch security key",
+                 "kerberos": true, "cryptoChallenge": "6uDMvRKj3W5xJV3HaQjZrtXMNmUUAjRGklFG2MIhN5s="}},
+     "priority": ["passkey"]}}},
+  {"name": "frances", "real_name": "Frances Allen", "uid": 1011,
+   "switchable": {"authSelection": {"mechanisms": {
+     "smartcard:1": {"name": "Smartcard", "role": "smartcard", "selectable": true,
+       "certificates": [
+         {"tokenName": "PIV_II", "moduleName": "/usr/lib64/pkcs11/opensc-pkcs11.so", "keyId": "01",
+          "label": "Certificate for PIV Authentication", "pinPrompt": "PIN for PIV_II",
+          "certInstruction": "Certificate for PIV Authentication\nCN=Frances Allen (Authentication),O=IBM"},
+         {"tokenName": "PIV_II", "moduleName": "/usr/lib64/pkcs11/opensc-pkcs11.so", "keyId": "02",
+          "label": "Certificate for Digital Signature", "pinPrompt": "PIN for PIV_II",
+          "certInstruction": "Certificate for Digital Signature\nCN=Frances Allen (Signature)"}]}},
+     "priority": ["smartcard:1"]}}},
+  {"name": "evelyn", "real_name": "Evelyn Granville", "uid": 1012, "password_expired": true,
+   "switchable": {"authSelection": {"mechanisms": {
+     "password": {"name": "Password", "role": "password", "selectable": true, "prompt": "Password"}},
+     "priority": ["password"]}}},
   {"name": "gdm-greeter", "real_name": "GDM Greeter", "uid": 60578, "system": true},
   {"name": "mallory", "real_name": "Locked Account", "uid": 1004, "locked": true}
 ]
 USERS
-printf 'ada:%s\ngrace:%s\nkatherine:%s\n' "$ADA_PASSWORD" "$GRACE_PASSWORD" "$KATHERINE_PASSWORD" \
+printf 'ada:%s\ngrace:%s\nkatherine:%s\ndorothy:%s\ndorothy@code:%s\nmary:%s\nannie:%s\nhedy:%s\njoan:%s\nsmartcard@pin:%s\npasskey@pin:%s\nevelyn:%s\n' \
+    "$ADA_PASSWORD" "$GRACE_PASSWORD" "$KATHERINE_PASSWORD" "$DOROTHY_PASSWORD" "$DOROTHY_CODE" \
+    "$MARY_PASSWORD" "$ANNIE_PASSWORD" "$HEDY_PASSWORD" "$JOAN_PASSWORD" "$CARD_PIN" \
+    "$PASSKEY_PIN" "$EVELYN_PASSWORD" \
     >"$RUN_PRIV/secrets"
 chmod 600 "$RUN_PRIV/secrets"
 mkdir -p "$GSETTINGS_SCHEMA_DIR"
@@ -546,7 +677,7 @@ case "$SYS_ADDR" in unix:path=*) ;; *) fail SETUP "the private system bus did no
 mkdir -m 711 "$RUN_PRIV/gdm-dbus"
 "$PY" "$ROOT/scripts/lib/tuna-gdm-mock.py" --address "$SYS_ADDR" --server-dir "$RUN_PRIV/gdm-dbus" \
     --log "$GDM_LOG" --users "$FIXTURE/users.json" --secrets "$RUN_PRIV/secrets" \
-    --sessions tuna,gnome --fallback-session tuna \
+    --sessions tuna,gnome --fallback-session tuna --smartcard-user hedy --smartcard-certs 2 \
     >"$ARTIFACTS/gdm-mock.out" 2>"$ARTIFACTS/gdm-mock.err" &
 MOCK_PID=$!
 for _ in $(seq 1 50); do grep -q '^tuna-gdm-mock: ready ' "$ARTIFACTS/gdm-mock.out" && break; sleep 0.1; done
@@ -601,8 +732,10 @@ pass G-GREETER-READY "the tuna-greeter layer mapped and READY=1 reached NOTIFY_S
 
 CURRENT_GATE=G-GREETER-USER-LIST
 m="$(mark)"
-twait 0 "greeter users names=ada,grace,katherine" 20 >/dev/null ||
-    fail G-GREETER-USER-LIST "the greeter did not list exactly ada, grace and katherine"
+twait 0 "greeter users names=ada,grace,katherine,dorothy,mary,annie,hedy,joan,radia,frances,evelyn" 20 >/dev/null ||
+    fail G-GREETER-USER-LIST "the greeter did not list exactly the eleven fixture users"
+twait 0 "greeter logged-in names=mary,annie" 20 >/dev/null ||
+    fail G-GREETER-USER-LIST "logind's logged-in users (mary, annie) were not read"
 gwait 0 "$(call ListCachedUsers)" 5 || fail G-GREETER-USER-LIST "AccountsService was not asked for its users"
 sleep 1.5
 dump A-1-user-list
@@ -615,12 +748,18 @@ for name in "GDM Greeter" "Locked Account" "Password"; do
 done
 rows="$(jq '[.[] | select(.showing and (.role == "list item") and (.name | IN("Ada Lovelace", "Grace Hopper", "Katherine Johnson")))] | length' "$ARTIFACTS/a11y-A-1-user-list.json")"
 [ "$rows" = 3 ] || fail G-GREETER-USER-LIST "$rows user rows instead of 3"
+[ "$(description A-1-user-list "Mary Jackson")" = "Logged in" ] ||
+    fail G-GREETER-USER-LIST "Mary Jackson's row is not marked logged in"
+[ "$(description A-1-user-list "Annie Easley")" = "Logged in" ] ||
+    fail G-GREETER-USER-LIST "Annie Easley's row is not marked logged in"
+[ "$(description A-1-user-list "Ada Lovelace")" = "" ] ||
+    fail G-GREETER-USER-LIST "Ada Lovelace's row is marked logged in"
 # Ada's IconFile is her avatar; the others' are the default.
 avatar_px="$(colour_pixels A-1-user-list 255 255 0)"
 if ! { [ "$avatar_px" -ge 2500 ] && [ "$avatar_px" -le 4500 ]; }; then
     fail G-GREETER-USER-LIST "ada's 64 px avatar image is not on her row alone ($avatar_px avatar pixels)"
 fi
-pass G-GREETER-USER-LIST "Ada Lovelace, Grace Hopper and Katherine Johnson listed as rows with Not listed?, Ada's row with her IconFile avatar ($avatar_px px); the system and locked accounts are not (A-1-user-list.png)"
+pass G-GREETER-USER-LIST "Ada Lovelace, Grace Hopper and Katherine Johnson listed first as rows with Not listed?, eleven users in all, Ada's row with her IconFile avatar ($avatar_px px), Mary Jackson and Annie Easley marked logged in (logind); the system and locked accounts are not (A-1-user-list.png)"
 
 CURRENT_GATE=G-GREETER-NO-SHELL
 namespaces="$(jq -c '[.layers[].namespace] | unique' "$CSTATE")"
@@ -697,7 +836,7 @@ showing D-4-list "Katherine Johnson" || fail G-GREETER-GIVE-UP "the user list is
 hidden D-4-list "Password" || fail G-GREETER-GIVE-UP "the prompt still shows after giving up"
 begins="$(gcount "$g" "$(call BeginVerificationForUser '.args == ["gdm-password", "katherine"]')")"
 [ "$begins" = 3 ] || fail G-GREETER-GIVE-UP "$begins begins for katherine instead of 3"
-[ "$(gcount "$g" "$(sig VerificationFailed)")" = 3 ] || fail G-GREETER-GIVE-UP "not three VerificationFailed"
+[ "$(gcount "$g" "$(sig VerificationFailed '.args == ["gdm-password"]')")" = 3 ] || fail G-GREETER-GIVE-UP "not three VerificationFailed"
 pass G-GREETER-GIVE-UP "three wrong answers each showed '$GDM_FAILED'; after the third (allowed-failures 3) the greeter gave up to the user list with 3 begins in all"
 
 # --- C: wrong password, session choice, retry, start ---------------------
@@ -786,6 +925,593 @@ CURRENT_GATE=G-GREETER-SESSION
 [ "$selected" = gnome ] || fail G-GREETER-SESSION "GDM would start $selected, not the chosen gnome"
 pass G-GREETER-START "VerificationComplete, SessionOpened, then one StartSessionWhenReady(gdm-password, true) (GDM log lines $complete, $opened, $started)"
 
+# --- F: a second factor -------------------------------------------------
+CURRENT_GATE=G-GREETER-MULTISTEP
+new_channel
+m="$(mark)"; g="$(gmark)"
+pick_user 3
+twait "$m" "greeter page prompt user=dorothy" 10 >/dev/null || fail G-GREETER-MULTISTEP "the prompt did not open for dorothy"
+await_password_prompt "$g" F-1-password
+gq="$(gmark)"
+type_password F-1-password "$DOROTHY_PASSWORD"
+gwait "$gq" "$(call AnswerQuery '.detail.matches_password == true and .detail.user == "dorothy"')" 10 ||
+    fail G-GREETER-MULTISTEP "dorothy's password did not reach AnswerQuery"
+gwait "$gq" "$(sig InfoQuery '.args == ["gdm-password", "Verification code: "]')" 10 ||
+    fail G-GREETER-MULTISTEP "GDM's second question never came"
+twait "$m" "auth query service=password step=2 secret=false question=Verification code" 10 >/dev/null ||
+    fail G-GREETER-MULTISTEP "the prompt did not take the code as its second step"
+sleep 0.5
+dump F-2-code
+shot F-2-code
+showing F-2-code "Verification code" || fail G-GREETER-MULTISTEP "no showing Verification code entry"
+[ "$(role_of F-2-code "Verification code")" != "password text" ] ||
+    fail G-GREETER-MULTISTEP "the code entry hides its text (InfoQuery echoes)"
+focused F-2-code "Verification code" || fail G-GREETER-MULTISTEP "the code entry does not have the keyboard focus"
+hidden F-2-code "Password" || fail G-GREETER-MULTISTEP "the password entry still shows"
+# Back at step 2 resets softly (authPrompt.js `cancel` past the first
+# step): GDM cancels, gdm-password begins again for dorothy and her prompt
+# asks for the password at step 1; the user list does not come back.
+gb="$(gmark)"; mb="$(mark)"
+xdotool key Escape
+gwait "$gb" "$(call Cancel)" 10 || fail G-GREETER-MULTISTEP "Back at step 2 did not cancel at GDM"
+gwait "$gb" "$(call BeginVerificationForUser '.args == ["gdm-password", "dorothy"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-MULTISTEP "Back at step 2 did not begin gdm-password again for dorothy"
+twait "$mb" "auth query service=password step=1 secret=true question=Password" 10 >/dev/null ||
+    fail G-GREETER-MULTISTEP "Back at step 2 did not return to the password at step 1"
+await_password_prompt "$gb" F-3-back
+shot F-3-back
+showing F-3-back "Dorothy Vaughan" || fail G-GREETER-MULTISTEP "after Back the prompt no longer names Dorothy Vaughan"
+hidden F-3-back "Verification code" || fail G-GREETER-MULTISTEP "after Back the code entry still shows"
+[ "$(tail -n "+$((mb + 1))" "$LOG" | grep -cFx "tuna-greeter: greeter page users")" = 0 ] ||
+    fail G-GREETER-MULTISTEP "Back at step 2 returned to the user list (a hard reset)"
+gq="$(gmark)"; m="$(mark)"
+type_password F-3-back "$DOROTHY_PASSWORD"
+gwait "$gq" "$(sig InfoQuery '.args == ["gdm-password", "Verification code: "]')" 10 ||
+    fail G-GREETER-MULTISTEP "GDM's second question did not come again"
+twait "$m" "auth query service=password step=2 secret=false question=Verification code" 10 >/dev/null ||
+    fail G-GREETER-MULTISTEP "the prompt did not take the code as its second step again"
+sleep 0.5
+dump F-4-code
+focused F-4-code "Verification code" || fail G-GREETER-MULTISTEP "the code entry does not have the keyboard focus again"
+gc="$(gmark)"
+answer "$DOROTHY_CODE"
+gwait "$gc" "$(call AnswerQuery ".detail.step == \"code\" and .detail.matches == true and .detail.answer_sha256 == \"$(sha "$DOROTHY_CODE")\"")" 10 ||
+    fail G-GREETER-MULTISTEP "the code did not reach AnswerQuery"
+gwait "$gc" "$(call StartSessionWhenReady '.args == ["gdm-password", true]')" 15 ||
+    fail G-GREETER-MULTISTEP "dorothy's session did not start"
+pass G-GREETER-MULTISTEP "after the password GDM's InfoQuery 'Verification code: ' became step 2 (visible entry, focused, F-2-code.png); Back there reset softly: Cancel, gdm-password began again for dorothy and her prompt asked for the password at step 1 (F-3-back.png); then the code reached AnswerQuery (SHA-256 matches) and dorothy's session started"
+
+# --- F: back to a running session (user switching) ------------------------
+CURRENT_GATE=G-GREETER-SWITCH-RETURN
+new_channel
+denied="$(gcount 0 "$(call OpenReauthenticationChannel '.args == ["ada"] and .outcome == "org.freedesktop.DBus.Error.AccessDenied"')")"
+[ "$denied" -ge 1 ] || fail G-GREETER-SWITCH-RETURN "ada's begins did not ask GDM for a re-authentication channel first"
+m="$(mark)"; g="$(gmark)"
+pick_user 4
+twait "$m" "greeter page prompt user=mary" 10 >/dev/null || fail G-GREETER-SWITCH-RETURN "the prompt did not open for mary"
+gwait "$g" "$(call OpenReauthenticationChannel '.args == ["mary"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-SWITCH-RETURN "GDM was not asked for mary's re-authentication channel"
+# Each begin asks for the channel again (the switchable service's, then,
+# after the cascade, gdm-password's): follow the one gdm-password ran on.
+gwait "$g" "$(call BeginVerificationForUser '.args == ["gdm-password", "mary"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-SWITCH-RETURN "gdm-password did not begin for mary"
+rc="$(gsel "$g" "$(call BeginVerificationForUser '.args == ["gdm-password", "mary"]')" | head -1 | jq -r .conn)"
+[ "$(gcount "$g" ".kind == \"connect\" and .args == [\"mary\"] and .conn == $rc")" = 1 ] ||
+    fail G-GREETER-SWITCH-RETURN "gdm-password did not begin on mary's re-authentication channel"
+gwait "$g" "$(call EnableExtensions ".conn == $rc")" 10 || fail G-GREETER-SWITCH-RETURN "the extensions were not enabled on mary's channel"
+await_password_prompt "$g" F-3-mary
+dump F-4-options --press "Login Options"
+hidden F-4-options "Session Type" || fail G-GREETER-SWITCH-RETURN "a logged-in user is offered a session type"
+dump F-5-closed --press "Login Options"
+gp="$(gmark)"
+type_password F-5-closed "$MARY_PASSWORD"
+gwait "$gp" "$(sig VerificationComplete ".args == [\"gdm-password\"] and .conn == $rc")" 10 ||
+    fail G-GREETER-SWITCH-RETURN "mary's re-authentication did not verify"
+gwait "$gp" '.kind == "switch" and .args[0] == "mary" and .args[1] == "7"' 10 ||
+    fail G-GREETER-SWITCH-RETURN "GDM did not switch to mary's session"
+twait "$m" "greeter reauthenticated user=mary" 10 >/dev/null || fail G-GREETER-SWITCH-RETURN "the greeter did not see the re-authentication succeed"
+sleep 1
+[ "$(gcount "$gp" "$(sig SessionOpened)")" = 0 ] || fail G-GREETER-SWITCH-RETURN "a new session was opened for mary"
+[ "$(gcount "$gp" "$(call StartSessionWhenReady)")" = 0 ] || fail G-GREETER-SWITCH-RETURN "a session was started for mary"
+m2="$(mark)"
+control ActivateGreeterSession
+twait "$m2" "greeter login-screen-activated" 10 >/dev/null || fail G-GREETER-SWITCH-RETURN "the login screen's activation went unseen"
+twait "$m2" "greeter page users" 10 >/dev/null || fail G-GREETER-SWITCH-RETURN "back on the login screen, the prompt did not reset"
+pass G-GREETER-SWITCH-RETURN "Mary Jackson ringed as logged in; choosing her opened her re-authentication channel (conn $rc), gdm-password verified there, GDM switched to her session 7 with no SessionOpened or StartSessionWhenReady; ada's begins got AccessDenied first ($denied); the login screen reset when active again"
+
+# --- G: a conflicting session -------------------------------------------
+CURRENT_GATE=G-GREETER-CONFLICT
+CONFLICT_TEXT="Login is not possible because a remote session is already running for annie. To login, you must log out from the remote session or force stop it."
+# Cancel, then (G-GREETER-CONFLICT-TIMEOUT) no answer for a minute, then
+# Force Stop: annie's session 9 stays until the last.
+for try in cancel timeout force; do
+    m="$(mark)"; g="$(gmark)"
+    pick_user 5
+    twait "$m" "greeter page prompt user=annie" 10 >/dev/null || fail G-GREETER-CONFLICT "the prompt did not open for annie"
+    await_password_prompt "$g" "G-1-$try"
+    gwait "$g" "$(call OpenReauthenticationChannel '.args == ["annie"] and .outcome == "org.freedesktop.DBus.Error.AccessDenied"')" 5 ||
+        fail G-GREETER-CONFLICT "annie's unmanaged session got a re-authentication channel"
+    type_password "G-1-$try" "$ANNIE_PASSWORD"
+    gwait "$g" "$(sig SessionOpened '.args[0] == "gdm-password"')" 10 || fail G-GREETER-CONFLICT "annie's session did not open"
+    twait "$m" "greeter conflict user=annie session=9 remote=true" 15 >/dev/null ||
+        fail G-GREETER-CONFLICT "the conflicting session was not found"
+    gwait "$g" "$(call ListSessions)" 5 || fail G-GREETER-CONFLICT "logind was not asked for the sessions"
+    sleep 0.5
+    dump "G-2-$try"
+    [ "$try" = cancel ] && shot G-2-conflict
+    for text in "Session Already Running" "$CONFLICT_TEXT" "Force stopping will quit any running apps and processes, and could result in data loss" "Cancel" "Force Stop"; do
+        showing "G-2-$try" "$text" || fail G-GREETER-CONFLICT "'$text' is not showing"
+    done
+    [ "$(gcount "$g" "$(call StartSessionWhenReady)")" = 0 ] || fail G-GREETER-CONFLICT "the session started over a running one"
+    ms="$m"; gd="$(gmark)"; m="$(mark)"
+    if [ "$try" = cancel ]; then
+        dump G-3-cancel --press "Cancel"
+        gwait "$gd" "$(call Cancel)" 10 || fail G-GREETER-CONFLICT "Cancel did not reset at GDM"
+        gwait "$gd" '.kind == "logind" and .member == "SessionRemoved" and .args != ["9"]' 10 ||
+            fail G-GREETER-CONFLICT "the opened session was not closed"
+        twait "$m" "greeter page users" 10 >/dev/null || fail G-GREETER-CONFLICT "Cancel did not return to the user list"
+        sleep 1
+        [ "$(gcount "$g" "$(call StartSessionWhenReady)")" = 0 ] || fail G-GREETER-CONFLICT "a cancelled login started"
+    elif [ "$try" = timeout ]; then
+        CURRENT_GATE=G-GREETER-CONFLICT-TIMEOUT
+        # From the iteration's start: under load the dumps above may
+        # outlast the minute.
+        twait "$ms" "greeter conflict timed-out" 75 >/dev/null ||
+            fail G-GREETER-CONFLICT-TIMEOUT "the unanswered dialog did not time out"
+        dump G-3-timeout
+        shot G-3-timeout
+        showing G-3-timeout "Login Attempt Timed Out: login took too long, please try again" ||
+            fail G-GREETER-CONFLICT-TIMEOUT "'Login Attempt Timed Out' is not showing"
+        hidden G-3-timeout "Session Already Running" || fail G-GREETER-CONFLICT-TIMEOUT "the dialog still shows"
+        # The timeout's Cancel is the first after the session opened.
+        go="$(gline "$g" "$(sig SessionOpened '.args[0] == "gdm-password"')")"
+        gwait "$go" "$(call Cancel)" 10 || fail G-GREETER-CONFLICT-TIMEOUT "the timeout did not reset at GDM"
+        waited="$("$PY" -c "print(round($(wall_of "$go" "$(call Cancel)") - $(wall_of "$g" "$(sig SessionOpened)"), 1))")"
+        "$PY" -c "import sys; sys.exit(0 if $waited >= 59.5 else 1)" ||
+            fail G-GREETER-CONFLICT-TIMEOUT "the dialog timed out ${waited}s after the session opened, not 60 s"
+        gwait "$go" '.kind == "logind" and .member == "SessionRemoved" and .args != ["9"]' 10 ||
+            fail G-GREETER-CONFLICT-TIMEOUT "the opened session was not closed"
+        twait "$ms" "greeter page users" 10 >/dev/null ||
+            fail G-GREETER-CONFLICT-TIMEOUT "the timeout did not return to the user list"
+        [ "$(gcount "$g" "$(call StartSessionWhenReady)")" = 0 ] ||
+            fail G-GREETER-CONFLICT-TIMEOUT "a timed-out login started"
+        [ "$(gcount "$g" "$(call StopConflictingSession)")" = 0 ] ||
+            fail G-GREETER-CONFLICT-TIMEOUT "the timeout stopped the other session"
+        pass G-GREETER-CONFLICT-TIMEOUT "unanswered, the dialog closed with 'Login Attempt Timed Out: login took too long, please try again' (kept up as GNOME's critical banner, G-3-timeout.png) and GDM got Cancel ${waited}s after the session opened; the opened session closed, session 9 stayed and the user list returned"
+        CURRENT_GATE=G-GREETER-CONFLICT
+        sleep 1
+    else
+        dump G-3-force --press "Force Stop"
+        gwait "$gd" "$(call StopConflictingSession '.outcome == "ok"')" 10 || fail G-GREETER-CONFLICT "Force Stop did not reach GDM"
+        gwait "$gd" '.kind == "logind" and .member == "SessionRemoved" and .args == ["9"]' 10 ||
+            fail G-GREETER-CONFLICT "the old session was not stopped"
+        gwait "$gd" "$(call StartSessionWhenReady '.args == ["gdm-password", true]')" 10 ||
+            fail G-GREETER-CONFLICT "the session did not start once the old one stopped"
+        removed="$(gline "$gd" '.kind == "logind" and .member == "SessionRemoved"')"
+        started="$(gline "$gd" "$(call StartSessionWhenReady)")"
+        [ "$removed" -lt "$started" ] || fail G-GREETER-CONFLICT "the session started before the old one stopped"
+        twait "$m" "greeter conflict stopped session=9" 5 >/dev/null || fail G-GREETER-CONFLICT "the greeter did not see the old session go"
+    fi
+done
+pass G-GREETER-CONFLICT "annie's remote session 9 (no re-authentication channel) conflicted: 'Session Already Running' with GNOME's remote text, Cancel and Force Stop (G-2-conflict.png); Cancel reset at GDM and closed the opened session; Force Stop sent StopConflictingSession and the session started after logind removed session 9"
+
+# --- H: smartcard ----------------------------------------------------------
+CURRENT_GATE=G-GREETER-SMARTCARD
+new_channel
+m="$(mark)"; g="$(gmark)"
+pick_user 6
+twait "$m" "greeter page prompt user=hedy" 10 >/dev/null || fail G-GREETER-SMARTCARD "the prompt did not open for hedy"
+await_password_prompt "$g" H-0-password
+dump H-0-options --press "Login Options"
+showing H-0-options "Smartcard" || fail G-GREETER-SMARTCARD "Login Options does not offer Smartcard"
+checked H-0-options "Password" || fail G-GREETER-SMARTCARD "Password is not the selected mechanism"
+gs="$(gmark)"; m="$(mark)"
+dump H-0-select --press "Smartcard"
+gwait "$gs" "$(call BeginVerificationForUser '.args == ["gdm-smartcard", "hedy"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-SMARTCARD "choosing Smartcard did not begin gdm-smartcard"
+[ -n "$(gline "$gs" "$(call Cancel)")" ] || fail G-GREETER-SMARTCARD "the password conversation was not cancelled first"
+gwait "$gs" "$(sig Info '.args == ["gdm-smartcard", "Please insert smart card"]')" 10 ||
+    fail G-GREETER-SMARTCARD "gdm-smartcard did not ask for the card"
+sleep 1
+dump H-1-insert
+shot H-1-insert
+showing H-1-insert "Please insert smart card" || fail G-GREETER-SMARTCARD "'Please insert smart card' is not showing"
+hidden H-1-insert "Password" || fail G-GREETER-SMARTCARD "a Password entry shows for the smartcard"
+gi="$(gmark)"; m="$(mark)"
+control SetSmartcard true
+twait "$m" "greeter smartcard inserted=true" 10 >/dev/null || fail G-GREETER-SMARTCARD "gsd-smartcard's insertion went unseen"
+gwait "$gi" "$(call BeginVerificationForUser '.args == ["gdm-smartcard", "hedy"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-SMARTCARD "the insertion did not restart gdm-smartcard"
+CURRENT_GATE=G-GREETER-CHOICE-LIST
+gwait "$gi" "$(sig ChoiceQuery '.args[0] == "gdm-smartcard" and .args[1] == "Select a certificate"')" 10 ||
+    fail G-GREETER-CHOICE-LIST "GDM's ChoiceQuery never came"
+sleep 0.5
+dump H-2-choice
+shot H-2-choice
+for text in "Select a certificate" "Hedy Lamarr (Authentication)" "Hedy Lamarr (Signing)"; do
+    showing H-2-choice "$text" || fail G-GREETER-CHOICE-LIST "'$text' is not showing"
+done
+focused H-2-choice "Hedy Lamarr (Authentication)" || fail G-GREETER-CHOICE-LIST "the list does not have the keyboard focus"
+xdotool key Down
+sleep 0.2
+xdotool key Return
+gwait "$gi" "$(call SelectChoice '.args == ["gdm-smartcard", "cert-2"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-CHOICE-LIST "the second certificate did not reach SelectChoice"
+pass G-GREETER-CHOICE-LIST "GDM's ChoiceQuery 'Select a certificate' showed as a list of its two choices (H-2-choice.png); Down, Return sent SelectChoice(gdm-smartcard, cert-2)"
+CURRENT_GATE=G-GREETER-SMARTCARD
+gwait "$gi" "$(sig SecretInfoQuery '.args == ["gdm-smartcard", "PIN for PIV_II: "]')" 10 ||
+    fail G-GREETER-SMARTCARD "gdm-smartcard did not ask for the PIN"
+sleep 0.5
+dump H-3-pin
+showing H-3-pin "PIN for PIV_II" || fail G-GREETER-SMARTCARD "no showing PIN entry"
+[ "$(role_of H-3-pin "PIN for PIV_II")" = "password text" ] || fail G-GREETER-SMARTCARD "the PIN entry shows its text"
+focused H-3-pin "PIN for PIV_II" || fail G-GREETER-SMARTCARD "the PIN entry does not have the keyboard focus"
+gp="$(gmark)"
+answer "$CARD_PIN"
+gwait "$gp" "$(call AnswerQuery ".detail.step == \"pin\" and .detail.matches == true and .detail.answer_sha256 == \"$(sha "$CARD_PIN")\"")" 10 ||
+    fail G-GREETER-SMARTCARD "the PIN did not reach AnswerQuery"
+gwait "$gp" "$(call StartSessionWhenReady '.args == ["gdm-smartcard", true]')" 15 ||
+    fail G-GREETER-SMARTCARD "hedy's smartcard session did not start"
+control SetSmartcard false
+pass G-GREETER-SMARTCARD "Login Options offered Smartcard; choosing it cancelled gdm-password and began gdm-smartcard, whose 'Please insert smart card' showed without a Password entry (H-1-insert.png); gsd-smartcard's insertion restarted it; the PIN (hidden entry) reached AnswerQuery and gdm-smartcard's session started"
+
+# --- I: web login (SSSD's switchable authentication) -------------------------
+CURRENT_GATE=G-GREETER-WEB-LOGIN
+control SetSwitchable true
+new_channel
+m="$(mark)"; g="$(gmark)"
+pick_user 7
+twait "$m" "greeter page prompt user=joan" 10 >/dev/null || fail G-GREETER-WEB-LOGIN "the prompt did not open for joan"
+gwait "$g" "$(call BeginVerificationForUser '.args == ["gdm-switchable-auth", "joan"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-WEB-LOGIN "gdm-switchable-auth did not begin"
+gwait "$g" "$(sig Request '.args[0] == "gdm-switchable-auth" and .args[1] == "auth-mechanisms"')" 10 ||
+    fail G-GREETER-WEB-LOGIN "SSSD's mechanisms were not requested"
+twait "$m" "greeter mechanisms list=gdm-switchable-auth:password,gdm-switchable-auth:eidp selected=gdm-switchable-auth:eidp" 10 >/dev/null ||
+    fail G-GREETER-WEB-LOGIN "Login Options did not take SSSD's mechanisms with web login first"
+twait "$m" "auth ask service=password step=1 kind=button" 10 >/dev/null || fail G-GREETER-WEB-LOGIN "no Log In button"
+sleep 0.5
+dump I-1-button
+shot I-1-button
+showing I-1-button "Log In" || fail G-GREETER-WEB-LOGIN "'Log In' is not showing"
+m="$(mark)"
+dump I-1-press --press "Log In"
+twait "$m" "auth ask service=password step=2 kind=web-login" 10 >/dev/null || fail G-GREETER-WEB-LOGIN "the web login dialog did not open"
+sleep 0.5
+dump I-2-web-login
+shot I-2-web-login
+for text in "Log in online with another device" "https://idp.example.org/device/" "idp.example.org/device" "4219-7730" "Done" "Cancel"; do
+    showing I-2-web-login "$text" || fail G-GREETER-WEB-LOGIN "'$text' is not showing"
+done
+hidden I-2-web-login "Password" || fail G-GREETER-WEB-LOGIN "a Password entry shows with web login"
+m="$(mark)"
+dump I-3-cancel --press "Cancel"
+twait "$m" "auth ask service=password step=1 kind=button" 10 >/dev/null ||
+    fail G-GREETER-WEB-LOGIN "the dialog's Cancel did not step back to Log In"
+[ "$(gcount "$g" "$(call Reply)")" = 0 ] || fail G-GREETER-WEB-LOGIN "a reply went out before Done"
+control ApproveWebLogin true
+m="$(mark)"
+dump I-4-again --press "Log In"
+twait "$m" "auth ask service=password step=2 kind=web-login" 10 >/dev/null || fail G-GREETER-WEB-LOGIN "the dialog did not open again"
+sleep 0.5
+gr="$(gmark)"
+dump I-5-done --press "Done"
+gwait "$gr" "$(call Reply '.args[0] == "gdm-switchable-auth" and .detail.mechanism == "eidp" and .detail.status == "Ok" and .detail.matches == true')" 10 ||
+    fail G-GREETER-WEB-LOGIN "Done did not reply {\"eidp\": {}} to SSSD"
+gwait "$gr" "$(call StartSessionWhenReady '.args == ["gdm-switchable-auth", true]')" 15 ||
+    fail G-GREETER-WEB-LOGIN "joan's web login did not start her session"
+control SetSwitchable false
+control ApproveWebLogin false
+pass G-GREETER-WEB-LOGIN "SSSD's CustomJSON auth-mechanisms put web login first: 'Log In', then the dialog with GNOME's message, the QR code of https://idp.example.org/device/, the URL as idp.example.org/device and code 4219-7730 (I-2-web-login.png); Cancel stepped back to 'Log In'; Done replied authSelection {status Ok, eidp {}} and gdm-switchable-auth's session started"
+
+# --- I: SSSD's passkey ------------------------------------------------------
+CURRENT_GATE=G-GREETER-PASSKEY
+control SetSwitchable true
+control SetPasskey false
+new_channel
+m="$(mark)"; g="$(gmark)"
+pick_user 8
+twait "$m" "greeter page prompt user=radia" 10 >/dev/null || fail G-GREETER-PASSKEY "the prompt did not open for radia"
+gwait "$g" "$(call BeginVerificationForUser '.args == ["gdm-switchable-auth", "radia"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-PASSKEY "gdm-switchable-auth did not begin"
+gwait "$g" "$(sig Request '.args[1] == "auth-mechanisms" and .args[3].authSelection.mechanisms.passkey.keyConnected == false')" 10 ||
+    fail G-GREETER-PASSKEY "SSSD's passkey mechanism (no key) was not requested"
+twait "$m" "greeter mechanisms list=gdm-switchable-auth:passkey selected=gdm-switchable-auth:passkey" 10 >/dev/null ||
+    fail G-GREETER-PASSKEY "Login Options did not take SSSD's passkey mechanism"
+twait "$m" "auth ask service=password step=1 kind=choices" 10 >/dev/null || fail G-GREETER-PASSKEY "no insert-key instruction"
+sleep 0.5
+dump P-1-insert
+shot P-1-insert
+showing P-1-insert "Insert your passkey device, then press ENTER." || fail G-GREETER-PASSKEY "the insert-key instruction is not showing"
+hidden P-1-insert "Password" || fail G-GREETER-PASSKEY "a Password entry shows for the passkey"
+hidden P-1-insert "Security key PIN" || fail G-GREETER-PASSKEY "the PIN is asked without the key"
+# Back at the key prompt resets hard (cancelRequested: false).
+m="$(mark)"; g="$(gmark)"
+xdotool key Escape
+gwait "$g" "$(call Cancel)" 10 || fail G-GREETER-PASSKEY "Back did not cancel at GDM"
+twait "$m" "greeter page users" 10 >/dev/null || fail G-GREETER-PASSKEY "Back at the key prompt did not return to the list"
+control SetPasskey true
+sleep 0.5
+m="$(mark)"; g="$(gmark)"
+pick_user 8
+twait "$m" "greeter page prompt user=radia" 10 >/dev/null || fail G-GREETER-PASSKEY "the prompt did not open for radia again"
+gwait "$g" "$(sig Request '.args[1] == "auth-mechanisms" and .args[3].authSelection.mechanisms.passkey.keyConnected == true')" 10 ||
+    fail G-GREETER-PASSKEY "SSSD's passkey mechanism (key in) was not requested"
+twait "$m" "auth query service=password step=1 secret=true question=Security key PIN" 10 >/dev/null ||
+    fail G-GREETER-PASSKEY "the passkey's PIN was not asked"
+PASSKEY_WARNING="You have 2 attempts left. If the passkey gets locked, you may not able to access your account."
+twait "$m" "auth message type=info text=$PASSKEY_WARNING" 10 >/dev/null ||
+    fail G-GREETER-PASSKEY "the attempts warning was not queued"
+sleep 0.5
+dump P-2-pin
+shot P-2-pin
+showing P-2-pin "Security key PIN" || fail G-GREETER-PASSKEY "no showing PIN entry"
+[ "$(role_of P-2-pin "Security key PIN")" = "password text" ] || fail G-GREETER-PASSKEY "the PIN entry shows its text"
+focused P-2-pin "Security key PIN" || fail G-GREETER-PASSKEY "the PIN entry does not have the keyboard focus"
+showing P-2-pin "$PASSKEY_WARNING" || fail G-GREETER-PASSKEY "the attempts warning is not showing"
+gr="$(gmark)"; m="$(mark)"
+answer "$PASSKEY_PIN"
+gwait "$gr" "$(call Reply '.args[0] == "gdm-switchable-auth" and .detail.mechanism == "passkey" and .detail.status == "Ok" and .detail.matches == true')" 10 ||
+    fail G-GREETER-PASSKEY "the reply did not carry the PIN, kerberos and cryptoChallenge"
+twait "$m" "auth ask service=password step=2 kind=choices" 10 >/dev/null || fail G-GREETER-PASSKEY "no touch instruction"
+sleep 0.5
+dump P-3-touch
+shot P-3-touch
+showing P-3-touch "Touch security key" || fail G-GREETER-PASSKEY "the touch instruction is not showing"
+hidden P-3-touch "Security key PIN" || fail G-GREETER-PASSKEY "the PIN entry still shows"
+[ "$(gcount "$gr" "$(call StartSessionWhenReady)")" = 0 ] || fail G-GREETER-PASSKEY "the session started before the touch"
+control TouchPasskey
+gwait "$gr" "$(call StartSessionWhenReady '.args == ["gdm-switchable-auth", true]')" 15 ||
+    fail G-GREETER-PASSKEY "radia's passkey login did not start her session"
+control SetPasskey false
+control SetSwitchable false
+pass G-GREETER-PASSKEY "SSSD's passkey without the key showed 'Insert your passkey device, then press ENTER.' (P-1-insert.png) and Back reset to the list; with the key the PIN (hidden, P-2-pin.png) came with '$PASSKEY_WARNING'; the reply carried the PIN, kerberos and cryptoChallenge, 'Touch security key' showed (P-3-touch.png) and the touch started radia's session"
+
+# --- I: SSSD's smartcard certificates ---------------------------------------
+CURRENT_GATE=G-GREETER-SSSD-SMARTCARD
+control SetSwitchable true
+new_channel
+m="$(mark)"; g="$(gmark)"
+pick_user 9
+twait "$m" "greeter page prompt user=frances" 10 >/dev/null || fail G-GREETER-SSSD-SMARTCARD "the prompt did not open for frances"
+gwait "$g" "$(call BeginVerificationForUser '.args == ["gdm-switchable-auth", "frances"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-SSSD-SMARTCARD "gdm-switchable-auth did not begin"
+twait "$m" "greeter mechanisms list=gdm-switchable-auth:smartcard selected=gdm-switchable-auth:smartcard" 10 >/dev/null ||
+    fail G-GREETER-SSSD-SMARTCARD "Login Options did not take SSSD's smartcard mechanism"
+twait "$m" "auth ask service=password step=1 kind=choices" 10 >/dev/null || fail G-GREETER-SSSD-SMARTCARD "no certificate list"
+sleep 0.5
+dump S-1-identity
+shot S-1-identity
+for text in "Select Identity" "Frances Allen (Authentication)" "Frances Allen (Signature)" \
+    "Certificate for PIV Authentication — IBM" "Certificate for Digital Signature"; do
+    showing S-1-identity "$text" || fail G-GREETER-SSSD-SMARTCARD "'$text' is not showing"
+done
+hidden S-1-identity "Password" || fail G-GREETER-SSSD-SMARTCARD "a Password entry shows for the smartcard"
+focused S-1-identity "Frances Allen (Authentication)" || fail G-GREETER-SSSD-SMARTCARD "the list does not have the keyboard focus"
+for round in back pin; do
+    m="$(mark)"
+    xdotool key Down
+    sleep 0.2
+    xdotool key Return
+    twait "$m" "auth query service=password step=2 secret=true question=PIN for PIV_II" 10 >/dev/null ||
+        fail G-GREETER-SSSD-SMARTCARD "the chosen certificate's PIN was not asked"
+    sleep 0.5
+    dump "S-2-$round"
+    showing "S-2-$round" "PIN for PIV_II" || fail G-GREETER-SSSD-SMARTCARD "no showing PIN entry"
+    [ "$(role_of "S-2-$round" "PIN for PIV_II")" = "password text" ] || fail G-GREETER-SSSD-SMARTCARD "the PIN entry shows its text"
+    focused "S-2-$round" "PIN for PIV_II" || fail G-GREETER-SSSD-SMARTCARD "the PIN entry does not have the keyboard focus"
+    [ "$round" = pin ] && break
+    # Back at the PIN of one of several certificates: the list again,
+    # nothing at GDM (cancelRequested steps back).
+    gb="$(gmark)"; m="$(mark)"
+    xdotool key Escape
+    twait "$m" "auth ask service=password step=1 kind=choices" 10 >/dev/null ||
+        fail G-GREETER-SSSD-SMARTCARD "Back at the PIN did not return to the certificate list"
+    sleep 0.5
+    dump S-3-back
+    showing S-3-back "Frances Allen (Signature)" || fail G-GREETER-SSSD-SMARTCARD "the certificates are not showing after Back"
+    focused S-3-back "Frances Allen (Authentication)" || fail G-GREETER-SSSD-SMARTCARD "the list does not have the focus after Back"
+    [ "$(gcount "$gb" "$(call Cancel)")" = 0 ] || fail G-GREETER-SSSD-SMARTCARD "Back at the PIN cancelled at GDM"
+done
+gr="$(gmark)"
+answer "$CARD_PIN"
+gwait "$gr" "$(call Reply '.args[0] == "gdm-switchable-auth" and .detail.mechanism == "smartcard:1" and .detail.key_id == "02" and .detail.matches == true')" 10 ||
+    fail G-GREETER-SSSD-SMARTCARD "the reply did not name the second certificate with the card's PIN"
+gwait "$gr" "$(call StartSessionWhenReady '.args == ["gdm-switchable-auth", true]')" 15 ||
+    fail G-GREETER-SSSD-SMARTCARD "frances's smartcard login did not start her session"
+control SetSwitchable false
+pass G-GREETER-SSSD-SMARTCARD "SSSD's smartcard with two certificates: 'Select Identity' listed them by CN with their descriptions (S-1-identity.png); Back at the PIN returned to the list with no Cancel at GDM; the second certificate's PIN (hidden) went out in a reply naming keyId 02 and frances's session started"
+
+# --- I: an expired SSSD password ---------------------------------------------
+CURRENT_GATE=G-GREETER-PASSWORD-EXPIRED
+control SetSwitchable true
+new_channel
+m="$(mark)"; g="$(gmark)"
+pick_user 10
+twait "$m" "greeter page prompt user=evelyn" 10 >/dev/null || fail G-GREETER-PASSWORD-EXPIRED "the prompt did not open for evelyn"
+gwait "$g" "$(call BeginVerificationForUser '.args == ["gdm-switchable-auth", "evelyn"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-PASSWORD-EXPIRED "gdm-switchable-auth did not begin"
+twait "$m" "auth query service=password step=1 secret=true question=Password" 10 >/dev/null ||
+    fail G-GREETER-PASSWORD-EXPIRED "SSSD's password was not asked"
+sleep 0.5
+dump X-1-password
+gq="$(gmark)"; m="$(mark)"
+type_password X-1-password "$EVELYN_PASSWORD"
+gwait "$gq" "$(call Reply '.args[0] == "gdm-switchable-auth" and .detail.mechanism == "password" and .detail.matches == true')" 10 ||
+    fail G-GREETER-PASSWORD-EXPIRED "evelyn's password did not reach SSSD"
+gwait "$gq" "$(sig Info '.args == ["gdm-switchable-auth", "Password expired. Change your password now."]')" 10 ||
+    fail G-GREETER-PASSWORD-EXPIRED "pam_sss's expiry notice was not sent"
+twait "$m" "auth query service=password step=2 secret=true question=New Password" 10 >/dev/null ||
+    fail G-GREETER-PASSWORD-EXPIRED "the new password was not asked"
+sleep 0.5
+dump X-2-new
+shot X-2-new
+showing X-2-new "Password expired. Change your password now." || fail G-GREETER-PASSWORD-EXPIRED "the expiry notice is not showing"
+showing X-2-new "New Password" || fail G-GREETER-PASSWORD-EXPIRED "no showing New Password entry"
+[ "$(role_of X-2-new "New Password")" = "password text" ] || fail G-GREETER-PASSWORD-EXPIRED "the new password shows its text"
+focused X-2-new "New Password" || fail G-GREETER-PASSWORD-EXPIRED "the New Password entry does not have the keyboard focus"
+for step in new retype; do
+    question="New Password"
+    [ "$step" = retype ] && question="Reenter new Password"
+    if [ "$step" = retype ]; then
+        twait "$m" "auth query service=password step=3 secret=true question=$question" 10 >/dev/null ||
+            fail G-GREETER-PASSWORD-EXPIRED "the new password was not asked again"
+        sleep 0.5
+        dump X-3-retype
+        [ "$(role_of X-3-retype "$question")" = "password text" ] || fail G-GREETER-PASSWORD-EXPIRED "the retyped password shows its text"
+        focused X-3-retype "$question" || fail G-GREETER-PASSWORD-EXPIRED "the $question entry does not have the keyboard focus"
+    fi
+    ga="$(gmark)"; m="$(mark)"
+    answer "$EVELYN_NEW_PASSWORD"
+    gwait "$ga" "$(call AnswerQuery ".args[0] == \"gdm-switchable-auth\" and .detail.step == \"$step\" and .detail.matches == true and .detail.answer_sha256 == \"$(sha "$EVELYN_NEW_PASSWORD")\"")" 10 ||
+        fail G-GREETER-PASSWORD-EXPIRED "the $step password did not reach AnswerQuery on gdm-switchable-auth"
+done
+gwait "$gq" "$(call StartSessionWhenReady '.args == ["gdm-switchable-auth", true]')" 15 ||
+    fail G-GREETER-PASSWORD-EXPIRED "evelyn's session did not start after the change"
+[ "$(gcount "$gq" "$(call Reply)")" = 1 ] || fail G-GREETER-PASSWORD-EXPIRED "the new password went out as JSON"
+control SetSwitchable false
+pass G-GREETER-PASSWORD-EXPIRED "SSSD's right but expired password: 'Password expired. Change your password now.' showed with a hidden 'New Password' entry at step 2 (X-2-new.png), then 'Reenter new Password' at step 3; both answers went to AnswerQuery(gdm-switchable-auth), not JSON, and evelyn's session started"
+
+# --- J: authentication policy ---------------------------------------------
+CURRENT_GATE=G-GREETER-POLICY-AUTH
+new_channel
+gsettings set org.gnome.login-screen enable-password-authentication false
+sleep 1
+m="$(mark)"; g="$(gmark)"
+pick_user 6
+twait "$m" "greeter page prompt user=hedy" 10 >/dev/null || fail G-GREETER-POLICY-AUTH "the prompt did not open for hedy"
+gwait "$g" "$(call BeginVerificationForUser '.args == ["gdm-smartcard", "hedy"] and .outcome == "ok"')" 15 ||
+    fail G-GREETER-POLICY-AUTH "gdm-smartcard did not begin with passwords disabled"
+gwait "$g" "$(sig Info '.args == ["gdm-smartcard", "Please insert smart card"]')" 10 ||
+    fail G-GREETER-POLICY-AUTH "gdm-smartcard did not ask for the card"
+sleep 1
+dump J-1-policy
+shot J-1-policy
+hidden J-1-policy "Password" || fail G-GREETER-POLICY-AUTH "a Password entry or mechanism shows with passwords disabled"
+showing J-1-policy "Please insert smart card" || fail G-GREETER-POLICY-AUTH "the smartcard prompt is not showing"
+[ "$(gcount "$g" "$(call BeginVerificationForUser '.args[0] == "gdm-password"')")" = 0 ] ||
+    fail G-GREETER-POLICY-AUTH "gdm-password began with passwords disabled"
+dump J-2-options --press "Login Options"
+showing J-2-options "Smartcard" || fail G-GREETER-POLICY-AUTH "Login Options does not offer Smartcard"
+hidden J-2-options "Password" || fail G-GREETER-POLICY-AUTH "Login Options offers Password"
+dump J-3-closed --press "Login Options"
+gsettings set org.gnome.login-screen enable-switchable-authentication false
+sleep 1
+m="$(mark)"; g="$(gmark)"
+xdotool key Escape
+gwait "$g" "$(call BeginVerification '.args == ["gdm-smartcard"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-POLICY-AUTH "smartcard alone did not begin without a username"
+twait "$m" "greeter page prompt user=" 10 >/dev/null || fail G-GREETER-POLICY-AUTH "the prompt did not open without a user"
+sleep 0.5
+dump J-4-no-user
+shot J-4-no-user
+hidden J-4-no-user "Not listed?" || fail G-GREETER-POLICY-AUTH "the user list shows"
+hidden J-4-no-user "Hedy Lamarr" || fail G-GREETER-POLICY-AUTH "the prompt still names hedy"
+gsettings reset org.gnome.login-screen enable-password-authentication
+gsettings reset org.gnome.login-screen enable-switchable-authentication
+sleep 1
+m="$(mark)"
+xdotool key Escape
+twait "$m" "greeter page users" 10 >/dev/null || fail G-GREETER-POLICY-AUTH "with passwords back the user list did not return"
+# Smartcard off (password on): Login Options offers Password alone.
+gsettings set org.gnome.login-screen enable-smartcard-authentication false
+sleep 1
+m="$(mark)"; g="$(gmark)"
+pick_user 6
+twait "$m" "greeter page prompt user=hedy" 10 >/dev/null || fail G-GREETER-POLICY-AUTH "the prompt did not open for hedy with smartcards off"
+gwait "$g" "$(call BeginVerificationForUser '.args == ["gdm-password", "hedy"] and .outcome == "ok"')" 15 ||
+    fail G-GREETER-POLICY-AUTH "gdm-password did not begin with smartcards disabled"
+twait "$m" "greeter mechanisms list=gdm-password:password selected=gdm-password:password" 10 >/dev/null ||
+    fail G-GREETER-POLICY-AUTH "the mechanisms are not Password alone"
+await_password_prompt "$g" J-5-password
+dump J-6-options --press "Login Options"
+shot J-6-options
+checked J-6-options "Password" || fail G-GREETER-POLICY-AUTH "Password is not the selected mechanism"
+hidden J-6-options "Smartcard" || fail G-GREETER-POLICY-AUTH "Login Options offers Smartcard with smartcards disabled"
+dump J-7-closed --press "Login Options"
+[ "$(gcount "$g" "$(call BeginVerificationForUser '.args[0] == "gdm-smartcard"')")" = 0 ] ||
+    fail G-GREETER-POLICY-AUTH "gdm-smartcard began with smartcards disabled"
+gsettings reset org.gnome.login-screen enable-smartcard-authentication
+sleep 1
+m="$(mark)"
+xdotool key Escape
+twait "$m" "greeter page users" 10 >/dev/null || fail G-GREETER-POLICY-AUTH "Back did not return to the user list"
+pass G-GREETER-POLICY-AUTH "with enable-password-authentication false Login Options offered Smartcard only, no Password entry showed and gdm-smartcard began for hedy (J-1-policy.png); with enable-switchable-authentication false as well no username was asked: BeginVerification(gdm-smartcard) (J-4-no-user.png); with enable-smartcard-authentication false Login Options offered Password only and gdm-password ran (J-6-options.png)"
+
+# --- K: timed login ---------------------------------------------------------
+CURRENT_GATE=G-GREETER-TIMED-LOGIN
+control SetTimedLogin "'katherine'" 8
+m="$(mark)"; g="$(gmark)"
+new_channel
+gwait "$g" "$(call GetTimedLoginDetails '.outcome == "ok"')" 10 || fail G-GREETER-TIMED-LOGIN "the greeter did not ask for the timed login details"
+twait "$m" "greeter timed-login requested user=katherine delay=8" 10 >/dev/null ||
+    fail G-GREETER-TIMED-LOGIN "TimedLoginRequested was not taken"
+twait "$m" "greeter timed-login indicator user=katherine secs=3" 15 >/dev/null ||
+    fail G-GREETER-TIMED-LOGIN "the countdown did not start after 5 idle seconds"
+sleep 1
+dump K-1-timed
+shot K-1-timed
+showing K-1-timed "Automatic login" || fail G-GREETER-TIMED-LOGIN "the countdown is not showing"
+[ "$(gcount "$g" "$(call BeginAutoLogin)")" = 0 ] || fail G-GREETER-TIMED-LOGIN "auto login began early"
+m="$(mark)"
+xdotool key Shift_L
+twait "$m" "greeter timed-login restart" 5 >/dev/null || fail G-GREETER-TIMED-LOGIN "a key did not start the countdown over"
+sleep 0.5
+dump K-2-restarted
+hidden K-2-restarted "Automatic login" || fail G-GREETER-TIMED-LOGIN "the countdown kept running after a key"
+twait "$m" "greeter timed-login indicator user=katherine secs=3" 10 >/dev/null ||
+    fail G-GREETER-TIMED-LOGIN "the countdown did not come back after 5 more idle seconds"
+# A click on the background starts it over too (the stage's button
+# capture).
+m="$(mark)"
+clicked="$(date +%s.%N)"
+xdotool mousemove --window "$WID" 40 $((HEIGHT - 40)) click 1
+twait "$m" "greeter timed-login restart" 5 >/dev/null || fail G-GREETER-TIMED-LOGIN "a click did not start the countdown over"
+sleep 0.5
+dump K-3-clicked
+hidden K-3-clicked "Automatic login" || fail G-GREETER-TIMED-LOGIN "the countdown kept running after a click"
+gwait "$g" "$(call BeginAutoLogin '.args == ["katherine"] and .outcome == "ok"')" 20 ||
+    fail G-GREETER-TIMED-LOGIN "BeginAutoLogin(katherine) never came"
+began="$(wall_of "$g" "$(call BeginAutoLogin)")"
+waited="$("$PY" -c "print(round($began - $clicked, 2))")"
+"$PY" -c "import sys; sys.exit(0 if $waited >= 7.5 else 1)" ||
+    fail G-GREETER-TIMED-LOGIN "auto login began ${waited}s after the click, not after the full 8 s"
+[ "$(gcount "$g" "$(call BeginAutoLogin)")" = 1 ] || fail G-GREETER-TIMED-LOGIN "auto login began more than once"
+gwait "$g" "$(call StartSessionWhenReady '.args == ["gdm-autologin", true]')" 15 ||
+    fail G-GREETER-TIMED-LOGIN "gdm-autologin's session did not start"
+control SetTimedLogin "''" 0
+pass G-GREETER-TIMED-LOGIN "GetTimedLoginDetails answered TimedLoginRequested(katherine, 8); after 5 idle seconds Katherine's row counted down 3 s (K-1-timed.png); a key hid it and started over, and so did a click once it was back; BeginAutoLogin(katherine) came ${waited}s after the click and gdm-autologin's session started"
+
+# --- K: timed login on the prompt (disable-user-list) ------------------------
+CURRENT_GATE=G-GREETER-TIMED-LOGIN-PROMPT
+# disable-user-list is read when the greeter starts: a restarted one.
+gsettings set org.gnome.login-screen disable-user-list true
+# Katherine logged out of the session timed login gave her (else it would
+# conflict with the next one).
+control EndSessions "'katherine'"
+control SetTimedLogin "'katherine'" 3
+previous="$GREETER_PID"
+m="$(mark)"; g="$(gmark)"
+kill -KILL "$previous"
+await_greeter "$previous" 30 || fail G-GREETER-TIMED-LOGIN-PROMPT "the compositor did not restart the greeter"
+twait "$m" "greeter page username" 30 >/dev/null || fail G-GREETER-TIMED-LOGIN-PROMPT "without the user list the username was not asked"
+twait "$m" "greeter timed-login indicator user=katherine secs=3" 15 >/dev/null ||
+    fail G-GREETER-TIMED-LOGIN-PROMPT "the countdown did not start on the prompt"
+# The page's 250 ms crossfade; the bar stays up once the 3 s ran out.
+sleep 0.5
+dump L-1-prompt-timed
+shot L-1-prompt-timed
+showing L-1-prompt-timed "Automatic login" || fail G-GREETER-TIMED-LOGIN-PROMPT "the prompt's countdown is not showing"
+showing L-1-prompt-timed "Username" || fail G-GREETER-TIMED-LOGIN-PROMPT "the username entry is not showing"
+hidden L-1-prompt-timed "Not listed?" || fail G-GREETER-TIMED-LOGIN-PROMPT "the user list shows"
+hidden L-1-prompt-timed "Katherine Johnson" || fail G-GREETER-TIMED-LOGIN-PROMPT "a user row shows"
+gwait "$g" "$(call BeginAutoLogin '.args == ["katherine"] and .outcome == "ok"')" 15 ||
+    fail G-GREETER-TIMED-LOGIN-PROMPT "BeginAutoLogin(katherine) never came"
+gwait "$g" "$(call StartSessionWhenReady '.args == ["gdm-autologin", true]')" 15 ||
+    fail G-GREETER-TIMED-LOGIN-PROMPT "gdm-autologin's session did not start"
+control SetTimedLogin "''" 0
+gsettings reset org.gnome.login-screen disable-user-list
+pass G-GREETER-TIMED-LOGIN-PROMPT "with disable-user-list the restarted greeter asked for a username and ran TimedLoginRequested(katherine, 3)'s countdown on the prompt (L-1-prompt-timed.png); BeginAutoLogin(katherine) followed and gdm-autologin's session started"
+
 # --- E: supervision, and a login with GDM's default session -------------
 CURRENT_GATE=G-GREETER-SUPERVISION
 first="$GREETER_PID"
@@ -868,7 +1594,8 @@ done
 xdotool windowfocus --sync "$WID"
 cstate '.layers | any(.namespace == "tuna-greeter")' 120 || fail G-GREETER-POLICY "the greeter's layer never mapped"
 await_greeter "" 10 || fail G-GREETER-POLICY "no tuna-greeter child of the second compositor"
-twait "$m" "greeter users names=ada,grace,katherine" 30 >/dev/null || fail G-GREETER-POLICY "the greeter did not load its users"
+USERS_LISTED="ada,grace,katherine,dorothy,mary,annie,hedy,joan,radia,frances,evelyn"
+twait "$m" "greeter users names=$USERS_LISTED" 30 >/dev/null || fail G-GREETER-POLICY "the greeter did not load its users"
 twait "$m" "greeter page username" 10 >/dev/null || fail G-GREETER-POLICY "disable-user-list did not ask for a username"
 tail -n "+$((m + 1))" "$LOG" | grep -qFx "tuna-greeter: greeter page users" &&
     fail G-GREETER-POLICY "the user list showed under disable-user-list"
@@ -956,23 +1683,23 @@ pass G-GREETER-POWER-MENU "on hardware 'Power Off / Log Out' offered Suspend, Re
 
 CURRENT_GATE=G-GREETER-LIVE-USERS
 m="$(mark)"; g="$(gmark)"
-control AddUser "'radia'" "'Radia Perlman'" 1020
+control AddUser "'lynn'" "'Lynn Conway'" 1020
 gwait "$g" "$(sig UserAdded)" 5 || fail G-GREETER-LIVE-USERS "AccountsService did not announce the new user"
-twait "$m" "greeter users names=ada,grace,katherine,radia" 15 >/dev/null ||
-    fail G-GREETER-LIVE-USERS "UserAdded did not add radia to the list"
+twait "$m" "greeter users names=$USERS_LISTED,lynn" 15 >/dev/null ||
+    fail G-GREETER-LIVE-USERS "UserAdded did not add lynn to the list"
 sleep 1
 dump P-11-added
-[ "$(role_of P-11-added "Radia Perlman")" = "list item" ] || fail G-GREETER-LIVE-USERS "Radia Perlman has no row"
+[ "$(role_of P-11-added "Lynn Conway")" = "list item" ] || fail G-GREETER-LIVE-USERS "Lynn Conway has no row"
 m="$(mark)"; g="$(gmark)"
-control DeleteUser "'radia'"
+control DeleteUser "'lynn'"
 gwait "$g" "$(sig UserDeleted)" 5 || fail G-GREETER-LIVE-USERS "AccountsService did not announce the deleted user"
-twait "$m" "greeter users names=ada,grace,katherine" 15 >/dev/null ||
-    fail G-GREETER-LIVE-USERS "UserDeleted did not remove radia from the list"
+twait "$m" "greeter users names=$USERS_LISTED" 15 >/dev/null ||
+    fail G-GREETER-LIVE-USERS "UserDeleted did not remove lynn from the list"
 sleep 1
 dump P-12-deleted
-hidden P-12-deleted "Radia Perlman" || fail G-GREETER-LIVE-USERS "Radia Perlman's row stayed"
+hidden P-12-deleted "Lynn Conway" || fail G-GREETER-LIVE-USERS "Lynn Conway's row stayed"
 showing P-12-deleted "Ada Lovelace" || fail G-GREETER-LIVE-USERS "the list is not showing"
-pass G-GREETER-LIVE-USERS "UserAdded put a Radia Perlman row on the showing list and UserDeleted took it away"
+pass G-GREETER-LIVE-USERS "UserAdded put a Lynn Conway row on the showing list and UserDeleted took it away"
 
 CURRENT_GATE=G-GREETER-RECONNECT
 m="$(mark)"; g="$(gmark)"
@@ -985,6 +1712,8 @@ twait "$m" "greeter gdm-connected" 10 >/dev/null || fail G-GREETER-RECONNECT "th
 sleep 1
 dump P-13-reconnected
 showing P-13-reconnected "Grace Hopper" || fail G-GREETER-RECONNECT "the user list is not showing after the reconnect"
+# Grace logged out of her earlier session (else it would conflict).
+control EndSessions "'grace'"
 m="$(mark)"; g="$(gmark)"
 pick_user 1
 twait "$m" "greeter page prompt user=grace" 10 >/dev/null || fail G-GREETER-RECONNECT "the prompt did not open for grace"
@@ -1015,8 +1744,11 @@ gsettings reset-recursively org.gnome.login-screen
 # --- Z: hygiene ---------------------------------------------------------
 CURRENT_GATE=G-GREETER-HYGIENE
 if grep -rlF -e "$ADA_PASSWORD" -e "$GRACE_PASSWORD" -e "$KATHERINE_PASSWORD" -e "$WRONG_PASSWORD" \
+    -e "$DOROTHY_PASSWORD" -e "$DOROTHY_CODE" -e "$MARY_PASSWORD" -e "$ANNIE_PASSWORD" \
+    -e "$HEDY_PASSWORD" -e "$JOAN_PASSWORD" -e "$CARD_PIN" -e "$PASSKEY_PIN" \
+    -e "$EVELYN_PASSWORD" -e "$EVELYN_NEW_PASSWORD" \
     "$ARTIFACTS" >"$ARTIFACTS/secret-hits.txt" 2>/dev/null; then
-    fail G-GREETER-HYGIENE "a password reached the artifacts: $(tr '\n' ' ' <"$ARTIFACTS/secret-hits.txt")"
+    fail G-GREETER-HYGIENE "a secret reached the artifacts: $(tr '\n' ' ' <"$ARTIFACTS/secret-hits.txt")"
 fi
 grep -qi panicked "$LOG" && fail G-GREETER-HYGIENE "panic in the nested log"
-pass G-GREETER-HYGIENE "no password in any artifact or log; no panic"
+pass G-GREETER-HYGIENE "no password, verification code or PIN in any artifact or log; no panic"
