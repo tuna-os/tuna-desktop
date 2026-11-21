@@ -68,6 +68,9 @@ class Selection(unittest.TestCase):
                           "arch-package", "marlin-vm", "parity-ledger"])
         self.assertEqual(pr("scripts/tuna-orca-speech-proof"), ["orca-speech"])
         self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
+        # The guest's /usr/libexec/tuna-datetime-proof (G-DATETIME-*).
+        self.assertEqual(pr("scripts/lib/tuna-datetime-proof.py"),
+                         ["arch-package", "marlin-image", "marlin-vm"])
 
 
     def test_transition_policy_and_suite_always_run_journey(self):

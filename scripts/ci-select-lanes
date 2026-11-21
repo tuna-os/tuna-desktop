@@ -165,6 +165,9 @@ OWNED = [
     ("scripts/lib/vm_guest_agent.py", ["marlin-vm"]),
     ("scripts/lib/vm_gnome_reference.py", ["marlin-vm"]),
     ("scripts/lib/vm_strip_*", ["marlin-vm"]),
+    # Both marlin images ship it as /usr/libexec/tuna-datetime-proof; the
+    # VM lane's G-DATETIME-* gates run it in the guest.
+    ("scripts/lib/tuna-datetime-proof.py", ["marlin-image", "marlin-vm"]),
     ("scripts/tuna-ledger", ["parity-ledger"]),
     ("docs/parity-ledger.md", ["parity-ledger"]),
     ("scripts/tuna-docs-shots", ["docs-shots"]),
