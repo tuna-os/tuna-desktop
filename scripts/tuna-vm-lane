@@ -2282,29 +2282,39 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
              "devices": mice, "relative_inputs": corner_inputs,
              "primary_error": constraint_primary_error})
 
-    if strip_image is not None:
-        from vm_strip_acceptance import prove_installed_strip
-        if reconnect is None:
-            raise RuntimeError("installed acceptance needs independent cleanup transport")
+    def on_tablet(name, body):
         # QMP routes absolute motion to the HID tablet but buttons to the
         # current mouse handler, here the relative virtio mouse: two guest
         # devices with no mutual ordering. A press sent right after a move
         # reached libinput first and landed at the previous pointer position,
         # so the strip focus click never reached Alpha. Like one physical
-        # mouse, the tablet carries both motion and buttons for this proof.
-        strip_mouse = {"selected": select_corner_mouse(qmp, False)}
+        # mouse, the tablet carries both motion and buttons for these proofs.
+        selection = {"selected": select_corner_mouse(qmp, False)}
         try:
-            prove_installed_strip(qmp, agent, reconnect, out, strip_image, read_ppm, record, edge=strip_edge)
+            body()
         finally:
-            strip_primary = sys.exc_info()[1]
+            primary = sys.exc_info()[1]
             try:
-                strip_mouse["restored"] = restore_corner_mouse(qmp, original_mouse)
+                selection["restored"] = restore_corner_mouse(qmp, original_mouse)
             except Exception as error:
-                if strip_primary is None:
+                if primary is None:
                     raise
-                strip_mouse["restoration_error"] = str(error)
-            with open(os.path.join(evidence, "strip-input-mouse.json"), "w") as stream:
-                json.dump(strip_mouse, stream, indent=2)
+                selection["restoration_error"] = str(error)
+            with open(os.path.join(evidence, f"{name}-input-mouse.json"), "w") as stream:
+                json.dump(selection, stream, indent=2)
+
+    if strip_image is not None:
+        from vm_strip_acceptance import prove_installed_strip
+        if reconnect is None:
+            raise RuntimeError("installed acceptance needs independent cleanup transport")
+        on_tablet("strip", lambda: prove_installed_strip(qmp, agent, reconnect, out, strip_image, read_ppm,
+                                                         record, edge=strip_edge))
+
+    # Installed desktop gates (P-IN-03, P-WM-06, P-WM-05, P-AN-03, P-TR-01):
+    # real GTK clients and a StatusNotifierItem as the session user. Each
+    # gate records its own result; only unconfirmed fixture cleanup raises.
+    from vm_desktop_gates import run as run_desktop_gates
+    on_tablet("desktop-gates", lambda: run_desktop_gates(qmp, agent, out, record, read_ppm))
 
     # Capture the stable desktop after the final key OSD has disappeared.
     time.sleep(2)
@@ -4539,7 +4549,7 @@ def main():
                 try:
                     app_integration.run(qmp, lambda: guest_agent.GuestAgent(agent_path), out, record, display_bus)
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-                    for gate in ("V-PICKER", "V-INTROSPECT-SCREEN", "V-INTROSPECT-SANDBOX"):
+                    for gate in app_integration.GATES:
                         results.setdefault(gate, (False, f"app-integration failed: {error}"))
                         log(f"{gate} FAIL: app-integration failed: {error}")
         # Give activation probes a bounded chance to report before shutdown.
@@ -4561,7 +4571,7 @@ def main():
             shutil.rmtree(display_dir, ignore_errors=True)
 
     if a.app_integration:
-        for gate in ("V-PICKER", "V-INTROSPECT-SCREEN", "V-INTROSPECT-SANDBOX"):
+        for gate in app_integration.GATES:
             results.setdefault(gate, (False, "session never came up; app-integration not run"))
     text = read_text(serial_path)
     drm = drm or DRM_RE.search(text)
@@ -4571,6 +4581,10 @@ def main():
            "tuna-shell-gtk started under supervision" if shell
            else "no tuna-shell-gtk: keybindings line")
     results.setdefault("V-PANEL", (False, "session never came up, no screendump checked"))
+    if a.tour:
+        from vm_desktop_gates import GATES as DESKTOP_GATES
+        for gate in DESKTOP_GATES:
+            results.setdefault(gate, (False, "the lifecycle never reached the installed desktop gates"))
     if a.profile == "autotz":
         results.setdefault("V-AUTOTZ", (False, "native session never admitted; required consumer did not run"))
     if a.soak:

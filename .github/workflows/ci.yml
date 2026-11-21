@@ -199,6 +199,7 @@ jobs:
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
       - run: python3 scripts/tests/test_vm_strip_image.py
       - run: python3 scripts/tests/test_vm_strip_stationary_edge.py
+      - run: python3 scripts/tests/test_vm_desktop_gates.py
       - run: python3 scripts/tests/test_fresh_accounts.py
       - run: python3 scripts/tests/test_try_tuna_signature_gate.py
       - run: python3 scripts/lib/keyring-owner-proof-tests.py
@@ -2038,10 +2039,12 @@ jobs:
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "commit=$PRODUCT_COMMIT"
           --meta "capture_commit=$(git rev-parse HEAD)"
-      # V-PICKER / V-INTROSPECT on their own two-head boot of the same disk:
-      # Nautilus file chooser parenting from real X11 and Wayland GTK callers,
-      # Introspect ScreenSize across virtio-gpu hotplug/rotation/unplug, and
-      # Flatpak sandbox identity through xdg-desktop-portal-gnome.
+      # V-XWAYLAND / V-PICKER / V-INTROSPECT / V-MULTI-OUTPUT on their own
+      # two-head boot of the same disk: Xwayland's on-demand start for a real
+      # X11 GTK client, Nautilus file chooser parenting from real X11 and
+      # Wayland GTK callers, Introspect ScreenSize and the top bar across
+      # virtio-gpu hotplug/rotation/unplug with a window on the unplugged
+      # output, and Flatpak sandbox identity through xdg-desktop-portal-gnome.
       - name: App-integration boot (file chooser, Introspect display size and sandbox identity)
         if: matrix.profile == 'lifecycle' && matrix.orca == 'distribution'
         # Picker (2 roles x 4 cases), Flatpak install (400 s cap) and the

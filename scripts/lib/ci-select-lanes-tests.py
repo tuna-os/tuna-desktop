@@ -68,6 +68,13 @@ class Selection(unittest.TestCase):
                           "arch-package", "marlin-vm", "parity-ledger"])
         self.assertEqual(pr("scripts/tuna-orca-speech-proof"), ["orca-speech"])
         self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
+        # The VM lane's host-side gate modules and V-TRAY's fixture.
+        for path in ("scripts/lib/vm_app_integration.py", "scripts/lib/vm_desktop_gates.py",
+                     "packaging/marlin/vm-lane/tuna-vm-desktop-gates"):
+            self.assertIn("marlin-vm", pr(path, size=0), path)
+        self.assertEqual(pr("scripts/lib/vm_desktop_gates.py"), ["arch-package", "marlin-vm"])
+        self.assertEqual(pr("scripts/lib/tuna-tray-item-stub.py"),
+                         ["journey", "gtk-shell", "arch-package", "marlin-vm"])
 
 
     def test_transition_policy_and_suite_always_run_journey(self):
