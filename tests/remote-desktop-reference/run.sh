@@ -21,6 +21,8 @@ gcc -Wall -Wextra -Werror /repo/scripts/lib/tuna-remote-ei.c -o /out/remote-ei $
 # shellcheck disable=SC2046
 gcc -Wall -Wextra -Werror /repo/tests/remote-desktop-reference/eis-lifetime.c -o /out/eis-lifetime $(pkg-config --cflags --libs libeis-1.0)
 /out/eis-lifetime /out/remote-ei >/out/eis-lifetime.log 2>&1
+# shellcheck disable=SC2046
+gcc -Wall -Wextra -Werror /repo/tests/remote-desktop-reference/eis-revoke.c -o /out/eis-revoke $(pkg-config --cflags --libs libei-1.0)
 pids=""
 cleanup() { for pid in $pids; do kill "$pid" 2>/dev/null || true; done; }
 trap cleanup EXIT
@@ -60,8 +62,22 @@ until [ -s /out/backend-disconnect.active ]; do [ "$SECONDS" -lt "$end" ] || exp
 kill "$portal_backend_pid"
 touch /out/backend-disconnect.revoke
 wait "$client"
-/usr/libexec/xdg-desktop-portal-gnome --replace >/out/backend-restarted.log 2>&1 & pids="$pids $!"
+/usr/libexec/xdg-desktop-portal-gnome --replace >/out/backend-restarted.log 2>&1 & portal_backend_pid=$!; pids="$pids $portal_backend_pid"
 /usr/libexec/xdg-desktop-portal --replace >/out/frontend-restarted.log 2>&1 & pids="$pids $!"
+sleep 2
+# R-EIS-REVOKE (ADR 0011 L7, G9): a libei client the portal delivered keeps
+# its live EIS connection until the compositor revokes the grant (here by
+# losing its trusted backend owner), then hears the disconnect.
+python3 /repo/scripts/lib/tuna-portal-remote-client.py /out/eis-revoke.png eis-revoke >/out/eis-revoke.log 2>&1 & client=$!; pids="$pids $client"
+python3 /repo/scripts/lib/tuna-portal-consent.py /out/a11y-eis-revoke.json grant remote
+end=$((SECONDS + 30))
+until [ -s /out/eis-revoke.active ]; do [ "$SECONDS" -lt "$end" ] || expired 'a live libei client on the eis-revoke grant (30 s)'; sleep .1; done
+kill "$portal_backend_pid"
+touch /out/eis-revoke.revoke
+wait "$client"
+grep -q '^libei client disconnected ' /out/eis-revoke.log
+/usr/libexec/xdg-desktop-portal-gnome --replace >/out/backend-restarted-eis.log 2>&1 & pids="$pids $!"
+/usr/libexec/xdg-desktop-portal --replace >/out/frontend-restarted-eis.log 2>&1 & pids="$pids $!"
 sleep 2
 # Keep a genuine external portal stream active across the lock transition.
 python3 /repo/scripts/lib/tuna-portal-remote-client.py /out/lock-grant.png revoke >/out/lock-grant.log 2>&1 & client=$!; pids="$pids $client"
@@ -81,4 +97,8 @@ wait "$client"
 [ ! -f /out/locked.png ]
 pw-dump > /out/locked-pipewire.json
 jq -e 'all(.[]; .type != "PipeWire:Interface:Node" or (.info.props["node.name"] // "" | contains("tuna-screen-cast") | not))' /out/locked-pipewire.json >/dev/null
-printf '%s\n' 'GNOME51 genuine RemoteDesktop portal: Cancel, keyboard/pointer grant, linked PipeWire frame, foreign input denial, legacy GTK delivery, libei GTK delivery/FD revocation, Close/client/backend disconnect, active lock revocation and locked denial; touch unsupported' > /out/assertions.txt
+# One `<ID> pass <description>` line per gate, as scripts/tuna-ledger reads.
+printf '%s\n' \
+    'R-REMOTE-PORTAL pass GNOME51 genuine RemoteDesktop portal: Cancel, keyboard/pointer grant, linked PipeWire frame, foreign input denial, legacy GTK delivery, libei GTK delivery/FD revocation, Close/client/backend disconnect, active lock revocation and locked denial; touch unsupported' \
+    "R-EIS-REVOKE pass a delivered libei client held its EIS connection while granted and was $(grep -h '^libei client disconnected ' /out/eis-revoke.log | cut -d' ' -f3-) by the compositor" \
+    > /out/assertions.txt

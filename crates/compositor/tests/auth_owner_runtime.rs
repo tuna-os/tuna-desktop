@@ -43,6 +43,11 @@ fn connect() -> ControlConn {
 fn receive(conn: &mut ControlConn, wanted: impl FnMut(&Message) -> bool) -> Message {
     receive_until(conn, wanted, Instant::now() + LIMIT)
 }
+thread_local! {
+    /// Every frame this client read, in order, so a proof can inspect
+    /// traffic a narrower receive skipped past.
+    static SEEN: std::cell::RefCell<Vec<Message>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 fn receive_until(
     conn: &mut ControlConn,
     mut wanted: impl FnMut(&Message) -> bool,
@@ -51,8 +56,12 @@ fn receive_until(
     loop {
         assert!(Instant::now() < end, "control reply deadline");
         match conn.read_frame() {
-            Ok(m) if wanted(&m) => return m,
-            Ok(_) => {}
+            Ok(m) => {
+                SEEN.with(|seen| seen.borrow_mut().push(m.clone()));
+                if wanted(&m) {
+                    return m;
+                }
+            }
             Err(ControlError::WouldBlock) => {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -486,6 +495,7 @@ fn conversation_client() {
         state(&root)["locked"] == false
             && state(&root)["auth_owner"]["conversations"]["password"] == false
     });
+    assert_unlock_restored_session_intact(&mut a);
     // Unlocked: nothing to verify, so a new conversation is denied.
     begin(&mut a, 50, AuthService::Password);
     result(&mut a, 50, false);
@@ -501,10 +511,70 @@ fn conversation_client() {
             "wrong_pin_denied_with_problem": true,
             "cancel_denied_silently": true,
             "fresh_answers_unlock": true,
+            "unlock_restores_session_intact": true,
             "scope": "actual nested Runtime + private PAM helper + controlled multi-prompt module; no GTK, reader or installed stack"
         }),
     );
     std::thread::sleep(Duration::from_secs(2));
+}
+
+/// The production unlock (`Runtime::apply_verified_unlock`) hands the
+/// shell its session back intact: from the lock on, every snapshot was
+/// locked and window-free, until the unlocked one, which carries the
+/// windows and workspaces of the shell's first snapshot.
+fn assert_unlock_restored_session_intact(conn: &mut ControlConn) {
+    let snapshots = || -> Vec<(bool, Message)> {
+        SEEN.with(|seen| {
+            seen.borrow()
+                .iter()
+                .filter_map(|m| match m {
+                    Message::Snapshot { locked, .. } => Some((*locked, m.clone())),
+                    _ => None,
+                })
+                .collect()
+        })
+    };
+    let restored = |list: &[(bool, Message)]| {
+        list.iter()
+            .position(|(locked, _)| *locked)
+            .is_some_and(|at| list[at..].iter().any(|(locked, _)| !locked))
+    };
+    if !restored(&snapshots()) {
+        receive(conn, |m| {
+            matches!(m, Message::Snapshot { locked: false, .. })
+        });
+    }
+    let list = snapshots();
+    let content = |m: &Message| match m {
+        Message::Snapshot {
+            windows,
+            workspaces,
+            ..
+        } => (windows.clone(), workspaces.clone()),
+        _ => unreachable!(),
+    };
+    let (first_locked, first) = &list[0];
+    assert!(!first_locked, "the shell starts unlocked");
+    let lock_at = list
+        .iter()
+        .position(|(locked, _)| *locked)
+        .expect("locking sends a locked snapshot");
+    let unlock_at = lock_at
+        + list[lock_at..]
+            .iter()
+            .position(|(locked, _)| !locked)
+            .expect("unlocking sends an unlocked snapshot");
+    for (_, locked) in &list[lock_at..unlock_at] {
+        assert!(
+            content(locked).0.is_empty(),
+            "locked snapshots carry no windows"
+        );
+    }
+    assert_eq!(
+        content(&list[unlock_at].1),
+        content(first),
+        "unlock restores the session intact"
+    );
 }
 
 #[test]

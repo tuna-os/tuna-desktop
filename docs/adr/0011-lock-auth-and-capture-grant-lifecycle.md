@@ -330,12 +330,18 @@ that closes a risk below; "in progress" means a fix is still being built.
   [INFERENCE.] Mutter's nodes are equally open to unsandboxed clients.
 - **L7. Untested EIS revocation (G9; fixed in #1169).** No test checks that a delivered EIS
   client sees a disconnect after lock or owner loss. The code closes the
-  compositor's end.
+  compositor's end. Fixed: `remote_eis.rs`
+  (`a_delivered_eis_client_is_disconnected_when_its_grant_is_revoked`) and
+  R-EIS-REVOKE in `tests/remote-desktop-reference/run.sh`, where a real
+  libei client the GNOME 51 portal delivered hears the disconnect once the
+  grant's backend owner is lost.
 - **L8. Portal reach beyond need (G6; fixed in #1169).** `org.tuna.Screenshot.ScreenshotWindows`
   uses `Authority::admit` (`screenshot.rs`, `WindowsService::screenshot_windows`),
   so the authenticated portal, not only the shell, can save every window to
   any absolute directory. `disable-save-to-disk` does not cover it.
-  Screenshots written to disk outlive their request by design.
+  Screenshots written to disk outlive their request by design. Fixed: only
+  the shell passes; G-SCREENSHOT-WINDOWS-DENY (`scripts/tuna-gtk-shell-proof`)
+  refuses code inside the genuine portal backend that owns its name.
 - **L9. Shared limits.** Session limits are global, so one trusted caller
   can use up the pool.
 - **L10. Evidence that is not per pull request.** `marlin-vm`,

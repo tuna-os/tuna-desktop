@@ -645,56 +645,6 @@ fn lock_surface_carries_no_titles() {
     assert!(content_visible(false), "unlocked frames show content");
 }
 
-/// Three wrong passwords stay locked with no content leaked: each
-/// denied unlock attempt leaves the flag, the surface, and the hub
-/// mirror exactly as they were.
-#[test]
-fn three_wrong_passwords_stay_locked_without_leak() {
-    use tuna_compositor::unlock::{unlock_session, AuthReply, UnlockClient, Unreachable};
-
-    struct DenyAll;
-    impl UnlockClient for DenyAll {
-        fn begin(&mut self, _user: &str) -> Result<AuthReply, Unreachable> {
-            Ok(AuthReply::Prompt {
-                text: "Password:".to_string(),
-                secret: true,
-            })
-        }
-        fn answer(&mut self, _text: Option<String>) -> Result<AuthReply, Unreachable> {
-            Ok(AuthReply::Refused)
-        }
-        fn cancel(&mut self) {}
-    }
-
-    let dir = private_tempdir();
-    let path = dir.path().join("control.sock");
-    let hub = ControlHub::bind(path.clone(), Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
-    let mut lock = SessionLock::new(60_000);
-    let mut overlay = Overlay::new(3);
-    lock.lock();
-    hub.set_locked(true);
-    overlay.show(Vec::new());
-    let mut client = DenyAll;
-    for _ in 0..3 {
-        assert!(
-            !unlock_session(
-                &mut lock,
-                &hub,
-                &mut overlay,
-                0,
-                "mallory",
-                "wrong",
-                &mut client
-            ),
-            "wrong password denies"
-        );
-        assert!(lock.is_locked(), "flag survives wrong password");
-        assert!(overlay.visible, "surface stays up");
-        assert!(overlay.windows.is_empty(), "no content leaks");
-        assert!(hub.is_locked(), "hub mirror stays locked");
-    }
-}
-
 /// Temp dir with owner-only permissions: the control socket refuses to
 /// bind anywhere less private (#30).
 fn private_tempdir() -> tempfile::TempDir {

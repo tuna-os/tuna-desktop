@@ -2155,7 +2155,7 @@ jobs:
     # tests, and every cited cargo test / journey assertion must have
     # passed in this run.
     runs-on: *runner-24
-    needs: [select-lanes, check, journey, gtk-shell, orca-speech, drm-smoke, marlin-vm]
+    needs: [select-lanes, check, journey, gtk-shell, orca-speech, drm-smoke, marlin-vm, remote-security]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'parity-ledger')
     steps:
       - uses: actions/checkout@v7.0.1
@@ -2189,6 +2189,10 @@ jobs:
         with:
           name: marlin-vm
           path: ledger-in/marlin-vm
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: remote-security
+          path: ledger-in/remote-security
       - run: >-
           scripts/tuna-ledger check --tests ledger-in/test-list.txt
           --assertions ledger-in/journey/assertions.txt
@@ -2210,6 +2214,7 @@ jobs:
           --assertions ledger-in/drm-smoke/assertions.txt
           --assertions ledger-in/marlin-vm/assertions.txt
           --assertions ledger-in/marlin-vm/app-integration/assertions.txt
+          --assertions ledger-in/remote-security/assertions.txt
 
   docs-shots:
     timeout-minutes: 20

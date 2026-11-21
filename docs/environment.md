@@ -192,8 +192,8 @@ uses each one for.
 | `XDG_DATA_DIRS` | Desktop entries and icon themes. | `crates/shell-host/src/apps.rs:101-106`, `crates/shell-host/src/icons.rs:31-40`, `crates/compositor/src/cursor.rs:108` |
 | `XDG_CURRENT_DESKTOP` | `OnlyShowIn`/`NotShowIn` filtering of desktop entries, and the value imported for activated services. | `crates/shell-host/src/apps.rs:138-144`, `crates/compositor/src/session_services.rs:410-413` |
 | `XDG_SESSION_ID` | The logind session the compositor follows for `loginctl lock-session`/`unlock-session` and `LockedHint`, and the polkit agent's subject. Falls back to the session of the process. | `crates/compositor/src/logind_session.rs:10-25`, `crates/shell-gtk/src/polkit.rs:520-526` |
-| `XDG_PICTURES_DIR`, `XDG_VIDEOS_DIR` | Where screenshots and screen recordings are saved. | `crates/compositor/src/screenshot.rs:296-301`, `crates/shell-gtk/src/screencast.rs:106-113` |
-| `LOGNAME`, then `USER` | The user the lock screen authenticates. | `crates/compositor/src/unlock.rs:70-77` |
+| `XDG_PICTURES_DIR`, `XDG_VIDEOS_DIR` | Where screenshots and screen recordings are saved. | `crates/compositor/src/screenshot.rs:369-374`, `crates/shell-gtk/src/screencast.rs:106-113` |
+| `LOGNAME`, then `USER` | The user the lock screen authenticates. | `crates/compositor/src/unlock.rs:67-74` |
 | `PATH` | Finding the shell, `Xwayland`, `ibus-daemon`, `ibus-x11` and the IBus bridge. | `crates/compositor/src/runtime.rs:396-431`, `crates/compositor/src/ime.rs:55-61`, `crates/compositor/src/ime.rs:179` |
 | `DBUS_SESSION_BUS_ADDRESS` | Whether a session bus is there to read lockdown settings from. | `crates/compositor/src/lockdown.rs:445-451` |
 | `XCURSOR_PATH` | Cursor theme search path, as libXcursor reads it. | `crates/compositor/src/cursor.rs:84-108` |
