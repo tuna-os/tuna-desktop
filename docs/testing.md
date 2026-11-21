@@ -217,6 +217,24 @@ subsurface, a grabbing popup and uploaded shm buffers, closed by destroying
 every object or by disconnecting, must drop every surface's server-side
 data, and the window manager must name the window nowhere.
 
+`scripts/tuna-gtk-shell-proof --protocols-only --artifacts DIR` runs
+G-WAYLAND-INFO and the Mutter 51 protocol gates (#364, #588), each driven by
+a real client, `crates/compositor/examples/protocol-probe.rs`, that exits
+with a `FAIL` line when the session answers otherwise than Mutter 51 does.
+G-XDG-WM-BASE-7: a version 7 bind sees a maximized window tiled and
+constrained on every edge, a version 6 bind the tiled states alone.
+G-XDG-FOREIGN-V1: a GTK 3 `zxdg_exporter_v1` handle imported through
+`zxdg_importer_v2` parents the dialog (the compositor state's
+`parent_window_id`), revoking the export destroys the import and unparents,
+a v2 handle imports through v1 and an unknown v1 handle is destroyed.
+G-WL-FIXES: `wl_fixes` 1 destroys a second registry and the connection
+carries on. G-BACKGROUND-BLUR: `ext_background_effect_manager_v1` offers
+blur, and a clear window whose surface is a blur region smooths the
+one-pixel stripes of a maximized window behind it (mean step between
+neighbouring pixels below 16) while beside it they stay sharp (above 128),
+from `background-blur.png`. CI runs the slice in the `gtk-shell` job; its
+`protocols/assertions.txt` feeds the ledger.
+
 `scripts/tuna-gtk-shell-proof --dnd-overview-only --artifacts DIR` runs
 G-DND-OVERVIEW (#1189), the same function the full GTK proof calls after
 G-OV-DND: a client drag through the overview as GNOME 51 handles it
@@ -556,7 +574,7 @@ cannot satisfy the gate.
 | `gtk-shell` | `TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts` | gtk4-layer-shell (`scripts/ci-install-gtk4-layer-shell`), `xwayland pipewire wireplumber at-spi2-core python3-pyatspi fonts-cantarell ffmpeg libpam-wrapper` and the GStreamer PipeWire plugins; see the job for the full list | GTK shell panel, calendar, quick settings, overview, notifications, lock and unlock, AT-SPI trees; writes `assertions.txt` |
 | `gtk-shell` | `scripts/tuna-scale-proof --artifacts gtk-shell-artifacts/scale` | as above | The same session at 150 percent scale; writes `assertions.txt` |
 | `gtk-shell` | `scripts/tuna-slow-portal-proof --artifacts gtk-shell-artifacts/slow-portal` | as above | On a dbus-daemon bus whose portal activation hangs, the shell owns `org.gnome.Shell` within 15 s (40 s on GTK before 4.17, whose GtkApplication always waits on the inhibit portal) and makes no GDK portal call; writes `assertions.txt` |
-| `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg kmod python3-evdev python3-gi gir1.2-gtk-4.0 gsettings-desktop-schemas`; run `scripts/ci-install-vkms` after `apt-get update` to ensure vkms for the running kernel | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe`, seatd and uinput |
+| `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg kmod python3-evdev python3-gi gir1.2-gtk-4.0 gsettings-desktop-schemas acl`; run `scripts/ci-install-vkms` after `apt-get update` to ensure vkms for the running kernel | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe`, seatd, uinput and the card's seat ACL (`setfacl`, which a logind seat session would grant; the DRM lease device opens its own non-master fd) |
 
 `app-content` and `scroll-proof` download Playwright and Chromium into a
 temporary venv on every run, so they need network access.
