@@ -47,10 +47,27 @@ source-only floor is never described as a measured native version.
 **Golden test.** `crates/compositor/tests/protocols.rs` asserts the exact
 list and versions an ordinary client sees (`EXPECTED`), that the
 supervised shell's connection sees exactly that plus `SHELL_ONLY`
-(layer-shell, the foreign toplevel list), and that a client inside a
-`wp_security_context_v1` sees `EXPECTED` less `SANDBOX_HIDDEN` (session
-lock, security context). Adding or dropping a protocol updates the test
-and this page together.
+(layer-shell, the foreign toplevel list), that the compositor's own IBus
+bridge connection sees exactly `EXPECTED` plus `IME_BRIDGE_ONLY`
+(input-method, virtual keyboard, `tuna_osk_input_v1`), and that a client
+inside a `wp_security_context_v1` sees `EXPECTED` less `SANDBOX_HIDDEN`
+(session lock, security context) and none of the shell's or the bridge's
+globals. Adding or dropping a protocol updates the test and this page
+together.
+
+The compositor additionally advertises `tuna_osk_input_v1` version 1 only to
+its supervised IBus bridge, never ordinary clients. This private virtual-text
+transport shares the bridge's input-method-v2 event order and owner-checked
+done epoch; stale fallback replies cannot type into a new field or the locked
+session. It does not extend the public shell control schema or grant virtual
+keyboard access to another client (`crates/compositor/src/osk_ime.rs`,
+`crates/compositor/protocols/tuna-osk-input-v1.xml`). Its filter is the one
+every privileged global shares (`ClientState::privileged` on the bridge
+flag), so a client inside a security context is refused it whatever else it
+is. The ordinary-client global golden therefore remains unchanged and the
+global is listed in `IME_BRIDGE_ONLY`; real socket tests additionally reject
+a guessed private-global bind from an ordinary client and from a client
+inside a security context (`crates/compositor/src/osk_ime_tests.rs`).
 
 ## Advertised by Tuna Desktop
 
@@ -90,7 +107,7 @@ and this page together.
 | xdg_session_manager_v1 | 1 | window session save and restore as in Mutter 51 (P-SY-08): a client that opens a session gets its windows back after logout or reboot (workspace, position and size, maximized, tiled, fullscreen, output; minimized is not restored, as in Mutter); store `$XDG_DATA_HOME/tuna/window-sessions.json`, written 3 s after a change and at exit (`crates/compositor/src/xdg_session.rs`) |
 | zwp_keyboard_shortcuts_inhibit_manager_v1 | 1 | after Allow, the focused window gets every key, the shell's grabs, Super and Alt+Tab included; Super+Escape (Mutter's restore-shortcuts) takes them back until the window is focused again |
 | wp_pointer_warp_v1 | 1 | honoured while the surface has pointer focus from the enter serial it names; nested, the host pointer stays where it is |
-| wp_security_context_manager_v1 | 1 | a sandbox engine (Flatpak) creates a listener; every client accepted on it joins the display tagged with the context (sandbox engine, app id, instance id: `ClientState::security_context`) until the engine closes the context's close fd. Such a client is refused every privileged global whatever else it is (layer-shell, the foreign toplevel list, input-method, virtual keyboard, `mutter_x11_interop`: `ClientState::privileged`), does not see the session lock, and does not see this manager, so it cannot nest. The published `sandboxed-app-id` stays the one read from the live peer, not the engine's claim (#1046) |
+| wp_security_context_manager_v1 | 1 | a sandbox engine (Flatpak) creates a listener; every client accepted on it joins the display tagged with the context (sandbox engine, app id, instance id: `ClientState::security_context`) until the engine closes the context's close fd. Such a client is refused every privileged global whatever else it is (layer-shell, the foreign toplevel list, input-method, virtual keyboard, `tuna_osk_input_v1`, `mutter_x11_interop`: `ClientState::privileged`), does not see the session lock, and does not see this manager, so it cannot nest. The published `sandboxed-app-id` stays the one read from the live peer, not the engine's claim (#1046) |
 | ext_idle_notifier_v1 | 2 | idle and resumed from the clock org.gnome.Mutter.IdleMonitor keeps: every timestamped input event restarts it, and the notifications are checked on the same loop tick and deadline. `get_idle_notification` honours the idle inhibitors the idle lock honours (zwp_idle_inhibitor_v1 and org.gnome.SessionManager's idle flag): it never idles while one is held, an idle one resumes when one appears, and its timeout restarts when the last goes. `get_input_idle_notification` counts input alone (`crates/compositor/src/idle_notify.rs`, #1046) |
 | wp_content_type_manager_v1 | 1 | the hint is kept per surface and applied on commit (`protocols::surface_content_type`); recorded for future VRR and frame scheduling, nothing acts on it yet (#1046) |
 | ext_foreign_toplevel_list_v1 | 1 | the supervised shell's alone, like layer-shell: window titles and app ids are published only to the shell and the portal picker (`docs/security-model.md`), so every other registry omits it and a blind bind is a protocol error. A handle per window in the window model, native and X11 alike, with its title and app id (empty when unknown), updated when either changes and `closed` when the window unmaps (#1046) |

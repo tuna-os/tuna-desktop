@@ -58,6 +58,10 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("docs/walkthrough.tsv"), ["gtk-shell"])
         self.assertEqual(pr("packaging/marlin/vm-lane/Containerfile"),
                          ["arch-package", "marlin-image", "marlin-vm"])
+        # G-OSK-* live in the OSK proof the gtk-shell job runs.
+        for path in ("scripts/tuna-osk-proof", "scripts/lib/tuna-osk-probe.py",
+                     "scripts/lib/tuna-osk-proof.py"):
+            self.assertEqual(pr(path), ["gtk-shell"], path)
         # MP-*, WL-*, X11-* window-motion gates and the capture they pair with.
         for path in ("scripts/tuna-motion-pairing-proof", "scripts/tuna-x11-icon-geometry-proof",
                      "scripts/lib/motion_pairing.py",

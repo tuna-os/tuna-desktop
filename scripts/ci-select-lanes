@@ -92,6 +92,9 @@ OWNED = [
     ("scripts/tuna-scale-proof", ["gtk-shell"]),
     ("scripts/tuna-slow-portal-proof", ["gtk-shell"]),
     ("scripts/tuna-session-restore-proof", ["gtk-shell"]),
+    # G-OSK-* (the IBus source path included, #981) and their helpers.
+    ("scripts/tuna-osk-proof", ["gtk-shell"]),
+    ("scripts/lib/tuna-osk-pro*.py", ["gtk-shell"]),
     # Window motion paired with GNOME 51 (#493-#498): the gtk-shell job runs
     # these proofs on its frozen minimize build, against the distilled
     # capture.
