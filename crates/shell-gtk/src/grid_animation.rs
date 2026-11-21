@@ -18,6 +18,7 @@ use gtk::subclass::prelude::*;
 use gtk4 as gtk;
 use gtk4::glib;
 use std::cell::{Cell, RefCell};
+use std::io::{Read, Seek};
 use std::rc::Rc;
 
 /// The shell's motion policy (#493): `allows_motion` for zooms, slides
@@ -419,7 +420,245 @@ pub fn tracing() -> bool {
 
 pub fn trace(name: &str, what: std::fmt::Arguments) {
     if tracing() {
-        eprintln!("tuna-shell-gtk: grid-anim {name} {what}");
+        // Formatting directly into stderr can split a record around another
+        // process's writes to the same proof pipe. Buffer each short record,
+        // as media diagnostics do, so its text and newline travel together.
+        let line = format!("tuna-shell-gtk: grid-anim {name} {what}\n");
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SchedTimes {
+    run_ns: u64,
+    wait_ns: u64,
+    timeslices: u64,
+}
+
+fn parse_schedstat(bytes: &[u8]) -> Option<SchedTimes> {
+    let mut fields = std::str::from_utf8(bytes).ok()?.split_ascii_whitespace();
+    let run_ns = fields.next()?.parse().ok()?;
+    let wait_ns = fields.next()?.parse().ok()?;
+    let timeslices = fields.next()?.parse().ok()?;
+    // Kernels without active per-task accounting can expose three zeros.
+    // A zero wait is valid, but nonzero runtime and timeslices establish
+    // that these are populated task counters, not an unavailable sentinel.
+    if fields.next().is_some() || run_ns == 0 || timeslices == 0 {
+        return None;
+    }
+    Some(SchedTimes {
+        run_ns,
+        wait_ns,
+        timeslices,
+    })
+}
+
+/// Open only on a traced page tick, once per GTK thread. Reads reuse the
+/// proc handle and a stack buffer; no per-frame path or String allocation.
+struct ThreadSched {
+    file: Option<std::fs::File>,
+    previous: Option<SchedTimes>,
+}
+
+impl ThreadSched {
+    fn open() -> Self {
+        Self {
+            file: std::fs::File::open("/proc/thread-self/schedstat").ok(),
+            previous: None,
+        }
+    }
+
+    fn read(&mut self) -> Result<SchedTimes, &'static str> {
+        let file = self.file.as_mut().ok_or("open")?;
+        file.rewind().map_err(|_| "seek")?;
+        let mut bytes = [0_u8; 128];
+        let count = file.read(&mut bytes).map_err(|_| "read")?;
+        if count == bytes.len() {
+            return Err("truncated");
+        }
+        let current = parse_schedstat(&bytes[..count]).ok_or("unpopulated-or-malformed")?;
+        let previous = self.previous.replace(current);
+        if previous.is_some_and(|before| {
+            current.run_ns < before.run_ns
+                || current.wait_ns < before.wait_ns
+                || current.timeslices < before.timeslices
+        }) {
+            return Err("non-monotonic");
+        }
+        Ok(current)
+    }
+}
+
+thread_local! {
+    static THREAD_SCHED: RefCell<ThreadSched> = RefCell::new(ThreadSched::open());
+}
+
+#[derive(Clone, Copy)]
+struct TickSample {
+    monotonic_us: i64,
+    sched: SchedTimes,
+}
+
+impl TickSample {
+    fn since(self, previous: Self) -> Option<(i64, u64, u64)> {
+        let wall_us = self.monotonic_us.checked_sub(previous.monotonic_us)?;
+        if wall_us < 0 {
+            return None;
+        }
+        self.sched
+            .timeslices
+            .checked_sub(previous.sched.timeslices)?;
+        Some((
+            wall_us,
+            self.sched.run_ns.checked_sub(previous.sched.run_ns)?,
+            self.sched.wait_ns.checked_sub(previous.sched.wait_ns)?,
+        ))
+    }
+}
+
+fn trace_page_tick(clock_us: i64, previous: &Cell<Option<TickSample>>) {
+    let monotonic_us = glib::monotonic_time();
+    THREAD_SCHED.with(|reader| {
+        let mut reader = reader.borrow_mut();
+        match reader.read() {
+            Ok(sched) => {
+                let current = TickSample {
+                    monotonic_us,
+                    sched,
+                };
+                let delta = previous.get().and_then(|before| current.since(before));
+                previous.set(Some(current));
+                let observation_us = glib::monotonic_time() - monotonic_us;
+                if let Some((wall_us, run_ns, wait_ns)) = delta {
+                    trace(
+                        "page-switch",
+                        format_args!(
+                            "tick clock_us={clock_us} monotonic_us={monotonic_us} run_ns={} wait_ns={} timeslices={} schedstat=available wall_delta_us={wall_us} run_delta_ns={run_ns} wait_delta_ns={wait_ns} observation_us={observation_us}",
+                            sched.run_ns, sched.wait_ns, sched.timeslices
+                        ),
+                    );
+                } else {
+                    trace(
+                        "page-switch",
+                        format_args!(
+                            "tick clock_us={clock_us} monotonic_us={monotonic_us} run_ns={} wait_ns={} timeslices={} schedstat=available delta=baseline-or-reset observation_us={observation_us}",
+                            sched.run_ns, sched.wait_ns, sched.timeslices
+                        ),
+                    );
+                }
+            }
+            Err(reason) => {
+                previous.set(None);
+                trace(
+                    "page-switch",
+                    format_args!(
+                        "tick clock_us={clock_us} monotonic_us={monotonic_us} schedstat=unavailable reason={reason} observation_us={}",
+                        glib::monotonic_time() - monotonic_us
+                    ),
+                );
+            }
+        }
+    });
+}
+
+/// GDK phase observations for the grid's own surface, not protocol issue,
+/// flush, callback receipt, or presentation timestamps. The compositor's
+/// matching surface/callback records establish the server-side boundaries.
+pub fn observe_page_clock(window: &impl IsA<gtk::Window>) {
+    if !tracing() {
+        return;
+    }
+    let window: &gtk::Window = window.as_ref();
+    let observation = Rc::new(RefCell::new(None::<PageClockTrace>));
+    let realized = observation.clone();
+    window.connect_realize(move |window| {
+        let Some(clock) = window.frame_clock() else {
+            trace(
+                "page-clock",
+                format_args!("unavailable reason=no-frame-clock"),
+            );
+            return;
+        };
+        let surface_id = window
+            .surface()
+            .and_then(|surface| wayland_surface_id(&surface));
+        trace(
+            "page-clock",
+            format_args!(
+                "attach monotonic_us={} surface_id={surface_id:?}",
+                glib::monotonic_time()
+            ),
+        );
+        let record =
+            move |phase, clock: &gtk::gdk::FrameClock| {
+                trace(
+                    "page-clock",
+                    format_args!(
+                    "phase={phase} monotonic_us={} clock_us={} frame={} surface_id={surface_id:?}",
+                    glib::monotonic_time(), clock.frame_time(), clock.frame_counter()
+                ),
+                );
+            };
+        let handlers = vec![
+            clock.connect_before_paint(move |clock| record("before-paint", clock)),
+            clock.connect_update(move |clock| record("update", clock)),
+            clock.connect_layout(move |clock| record("layout", clock)),
+            clock.connect_paint(move |clock| record("paint", clock)),
+            clock.connect_after_paint(move |clock| record("after-paint", clock)),
+        ];
+        *realized.borrow_mut() = Some(PageClockTrace { clock, handlers });
+    });
+    window.connect_unrealize(move |_| {
+        observation.borrow_mut().take();
+    });
+}
+
+struct PageClockTrace {
+    clock: gtk::gdk::FrameClock,
+    handlers: Vec<glib::SignalHandlerId>,
+}
+
+impl Drop for PageClockTrace {
+    fn drop(&mut self) {
+        for handler in self.handlers.drain(..) {
+            self.clock.disconnect(handler);
+        }
+    }
+}
+
+/// Look up the native identity only on the traced realized grid. GTK keeps
+/// ownership of its surface/proxy; no protocol request or listener is changed.
+fn wayland_surface_id(surface: &gtk::gdk::Surface) -> Option<u32> {
+    type SurfaceType = unsafe extern "C" fn() -> glib::ffi::GType;
+    type NativeSurface = unsafe extern "C" fn(*mut libc::c_void) -> *mut libc::c_void;
+    type ProxyId = unsafe extern "C" fn(*mut libc::c_void) -> u32;
+    // SAFETY: these are the public GTK Wayland and libwayland-client ABI
+    // functions. Check all symbols and the GObject type before asking GTK
+    // for its borrowed wl_surface. The object stays alive throughout.
+    unsafe {
+        let surface_type =
+            libc::dlsym(libc::RTLD_DEFAULT, c"gdk_wayland_surface_get_type".as_ptr());
+        let native = libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"gdk_wayland_surface_get_wl_surface".as_ptr(),
+        );
+        let proxy_id = libc::dlsym(libc::RTLD_DEFAULT, c"wl_proxy_get_id".as_ptr());
+        if surface_type.is_null() || native.is_null() || proxy_id.is_null() {
+            return None;
+        }
+        let surface_type: SurfaceType = std::mem::transmute(surface_type);
+        if glib::gobject_ffi::g_type_check_instance_is_a(surface.as_ptr().cast(), surface_type())
+            == 0
+        {
+            return None;
+        }
+        let native: NativeSurface = std::mem::transmute(native);
+        let proxy = native(surface.as_ptr().cast());
+        if proxy.is_null() {
+            return None;
+        }
+        let proxy_id: ProxyId = std::mem::transmute(proxy_id);
+        Some(proxy_id(proxy))
     }
 }
 
@@ -467,6 +706,8 @@ impl Slot {
             format_args!("start ms={total_ms:.0} motion={}", motion().level.as_str()),
         );
         let started = Cell::new(None::<i64>);
+        let observe_ticks = name == "page-switch" && tracing();
+        let previous_tick = Cell::new(None);
         let done = RefCell::new(Some(done));
         let weak = Rc::downgrade(self);
         let id = widget.add_tick_callback(move |_, clock| {
@@ -474,6 +715,9 @@ impl Slot {
             let start = *started.get().get_or_insert(now);
             started.set(Some(start));
             let elapsed = (now - start) as f64 / 1000.0;
+            if observe_ticks {
+                trace_page_tick(now, &previous_tick);
+            }
             step(elapsed);
             if elapsed < total_ms {
                 return glib::ControlFlow::Continue;
@@ -820,10 +1064,13 @@ impl Zoom {
 
     pub fn set(&self, shift: (f64, f64), scale: (f64, f64), alpha: f64) {
         let imp = self.imp();
-        if imp.shift.replace(shift) != shift
-            || imp.scale.replace(scale) != scale
-            || imp.alpha.replace(alpha) != alpha
-        {
+        // Apply every property before testing for damage: short-circuiting
+        // the replacements can leave the terminal frame at an old scale
+        // or opacity when its translation changes too.
+        let shifted = imp.shift.replace(shift) != shift;
+        let scaled = imp.scale.replace(scale) != scale;
+        let faded = imp.alpha.replace(alpha) != alpha;
+        if shifted || scaled || faded {
             self.queue_draw();
         }
     }
@@ -838,8 +1085,9 @@ impl Zoom {
     /// Only the scale (about the pivot) and opacity, keeping the offset.
     pub fn set_look(&self, scale: f64, alpha: f64) {
         let imp = self.imp();
-        if imp.scale.replace((scale, scale)) != (scale, scale) || imp.alpha.replace(alpha) != alpha
-        {
+        let scaled = imp.scale.replace((scale, scale)) != (scale, scale);
+        let faded = imp.alpha.replace(alpha) != alpha;
+        if scaled || faded {
             self.queue_draw();
         }
     }
@@ -858,6 +1106,122 @@ impl Zoom {
 }
 
 #[cfg(test)]
+mod gtk_zoom_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires owned Xvfb/private D-Bus and explicit grid zoom admission"]
+    fn actual_gtk_zoom_applies_all_properties_including_terminal_frame() {
+        assert_eq!(std::env::var("TUNA_REQUIRE_GRID_ZOOM").as_deref(), Ok("1"));
+        assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
+        gtk::init().expect("actual GTK display required");
+        let zoom = Zoom::new(&gtk::Label::new(Some("Folder apps")));
+        zoom.set_pivot(0.0, 0.0);
+        let source = (158.0, 268.0, 113.0, 113.0);
+        let dialog = (279.0, 56.0, 722.0, 720.0);
+        let full = Motion::from_gnome(true, false, 1.0);
+        let apply = |elapsed| {
+            let (shift, scale) = folder_zoom(source, dialog, FOLDER_ZOOM.at(elapsed, full));
+            let alpha = FOLDER_FADE_IN.at(elapsed, full);
+            zoom.set(shift, scale, alpha);
+            assert_eq!(zoom.shift(), shift, "translation at {elapsed} ms");
+            assert_eq!(zoom.scale(), scale, "scale at {elapsed} ms");
+            assert_eq!(zoom.alpha(), alpha, "opacity at {elapsed} ms");
+        };
+        apply(0.0);
+        apply(50.0);
+        // A delayed frame callback may jump straight past the end. No
+        // subsequent tick repairs it, so all three properties must land.
+        apply(2933.0);
+        assert_eq!(zoom.shift(), (0.0, 0.0));
+        assert_eq!(zoom.scale(), (1.0, 1.0));
+        assert_eq!(zoom.alpha(), 1.0);
+        // Identical values and single-property updates must work too.
+        apply(2933.0);
+        zoom.set((0.0, 0.0), (1.0, 1.0), 0.4);
+        assert_eq!(zoom.alpha(), 0.4);
+        zoom.set_shift((12.0, 8.0));
+        zoom.set_look(0.5, 0.0);
+        assert_eq!(zoom.shift(), (12.0, 8.0), "look preserves reflow");
+        assert_eq!(zoom.scale(), (0.5, 0.5));
+        assert_eq!(zoom.alpha(), 0.0, "drag shrinks and fades in one call");
+        zoom.set_look(1.0, 1.0);
+        assert_eq!(zoom.scale(), (1.0, 1.0));
+        assert_eq!(zoom.alpha(), 1.0, "drag end restores both properties");
+        zoom.set_look(1.0, 0.3);
+        assert_eq!(zoom.alpha(), 0.3, "opacity-only look update");
+        println!("GRID-ZOOM pass simultaneous translation/scale/opacity, delayed terminal frame and drag look updates");
+    }
+
+    #[test]
+    #[ignore = "requires owned Xvfb/private D-Bus and explicit grid zoom admission"]
+    fn actual_gtk_page_tick_trace_records_real_clock_and_thread_scheduler() {
+        assert_eq!(std::env::var("TUNA_REQUIRE_GRID_ZOOM").as_deref(), Ok("1"));
+        assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
+        // This exact test runs alone in its admitted process, before GTK
+        // or the trace's lazy environment reader starts.
+        std::env::set_var("TUNA_GRID_TRACE", "1");
+        assert!(tracing());
+        gtk::init().expect("actual GTK display required");
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let window = gtk::Window::builder()
+            .default_width(128)
+            .default_height(128)
+            .child(&widget)
+            .build();
+        observe_page_clock(&window);
+        window.present();
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !widget.is_mapped() {
+            context.iteration(false);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GTK widget never mapped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let ticks = Rc::new(Cell::new(0));
+        let done = Rc::new(Cell::new(false));
+        let slot = Rc::new(Slot::default());
+        let seen = ticks.clone();
+        let finished = done.clone();
+        slot.start(
+            &widget,
+            "page-switch",
+            PAGE_SWITCH.duration_ms,
+            move |_| seen.set(seen.get() + 1),
+            move || finished.set(true),
+        );
+        while !done.get() {
+            context.iteration(false);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GTK ticks never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(ticks.get() >= 2, "initial and terminal samples required");
+        THREAD_SCHED.with(|reader| {
+            let mut reader = reader.borrow_mut();
+            let observed = reader
+                .read()
+                .expect("real Linux main-thread scheduler observation");
+            assert!(observed.run_ns > 0);
+            assert!(observed.timeslices > 0);
+            println!(
+                "GRID-TICK-TRACE pass actual GTK ticks={} run_ns={} wait_ns={} timeslices={} schedstat=available",
+                ticks.get(),
+                observed.run_ns,
+                observed.wait_ns,
+                observed.timeslices
+            );
+        });
+        window.close();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tuna_shell_control::MotionLevel;
@@ -869,6 +1233,74 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn scheduler_samples_require_all_fields_and_never_invent_zero() {
+        assert_eq!(
+            parse_schedstat(b"123456 789 12\n"),
+            Some(SchedTimes {
+                run_ns: 123456,
+                wait_ns: 789,
+                timeslices: 12,
+            })
+        );
+        for bytes in [
+            &b""[..],
+            &b"0 0 0\n"[..],
+            &b"0 1 2\n"[..],
+            &b"1 2 0\n"[..],
+            &b"1 2"[..],
+            &b"1 nope 3"[..],
+            &b"1 2 3 4"[..],
+            &b"-1 2 3"[..],
+            &b"18446744073709551616 2 3"[..],
+        ] {
+            assert_eq!(parse_schedstat(bytes), None);
+        }
+        let sample = TickSample {
+            monotonic_us: 400,
+            sched: SchedTimes {
+                run_ns: 200,
+                wait_ns: 100,
+                timeslices: 2,
+            },
+        };
+        let next = TickSample {
+            monotonic_us: 700,
+            sched: SchedTimes {
+                run_ns: 450,
+                wait_ns: 120,
+                timeslices: 3,
+            },
+        };
+        assert_eq!(next.since(sample), Some((300, 250, 20)));
+        assert_eq!(sample.since(next), None);
+        for sched in [
+            SchedTimes {
+                run_ns: 199,
+                ..sample.sched
+            },
+            SchedTimes {
+                wait_ns: 99,
+                ..sample.sched
+            },
+            SchedTimes {
+                timeslices: 1,
+                ..sample.sched
+            },
+        ] {
+            assert_eq!(TickSample { sched, ..next }.since(sample), None);
+        }
+        assert_eq!(
+            parse_schedstat(b"123456 0 12\n"),
+            Some(SchedTimes {
+                run_ns: 123456,
+                wait_ns: 0,
+                timeslices: 12
+            }),
+            "a populated thread need not have waited on the runqueue"
+        );
     }
 
     #[test]
