@@ -5,22 +5,29 @@ import json
 from pathlib import Path
 import re
 
+
 def fixture_members(fixture):
     """Fixed immutable installed observer set, never a caller-selected list."""
     if fixture == 'lifecycle':
         return {}
-    if fixture != 'autotz':
-        raise ValueError('unknown native image fixture')
-    directory = 'packaging/marlin/vm-lane/'
-    members = {'/usr/libexec/tuna-native-session/' + name:
-               directory + 'tuna-native-session/' + name
-               for name in ('native_session.py', 'autotz_guest.py')}
-    members.update({'/usr/libexec/tuna-native-session/' + name:
-                    directory + 'core-apps/' + name
-                    for name in ('autotz.py', 'geoclue_fixture.py')})
-    members['/usr/libexec/tuna-geoclue-agent-policy'] = 'packaging/marlin/tuna-geoclue-agent-policy'
-    return members
-
+    if fixture == 'autotz':
+        directory = 'packaging/marlin/vm-lane/'
+        members = {'/usr/libexec/tuna-native-session/' + name:
+                   directory + 'tuna-native-session/' + name
+                   for name in ('native_session.py', 'autotz_guest.py')}
+        members.update({'/usr/libexec/tuna-native-session/' + name:
+                        directory + 'core-apps/' + name
+                        for name in ('autotz.py', 'geoclue_fixture.py')})
+        members['/usr/libexec/tuna-geoclue-agent-policy'] = 'packaging/marlin/tuna-geoclue-agent-policy'
+        return members
+    if fixture == 'colour':
+        members = {'/usr/libexec/tuna-vm-colour': 'packaging/marlin/vm-lane/tuna-vm-colour',
+                   '/usr/share/tuna-colour/source.json': 'native-colour-overlay/usr/share/tuna-colour/source.json'}
+        members.update({'/usr/libexec/tuna-colour/' + name:
+                        'native-colour-overlay/usr/libexec/tuna-colour/' + name
+                        for name in ('unit', 'pixel', 'yuv', 'cast')})
+        return members
+    raise ValueError('unknown native image fixture')
 
 
 def canonical_image_id(observed):
@@ -146,6 +153,13 @@ def admission(package, observed, root, commit, image_id, base_image, *, fixture=
         expected['/usr/libexec/' + name] = hashlib.sha256(path.read_bytes()).hexdigest()
     for installed, source in fixture_members(fixture).items():
         expected[installed] = hashlib.sha256((Path(root) / source).read_bytes()).hexdigest()
+    if fixture == 'colour':
+        receipt = json.loads((Path(root) / fixture_members(fixture)['/usr/share/tuna-colour/source.json']).read_bytes())
+        if receipt.get('revision') != commit or receipt.get('installed_signed_release_qualified') is not False:
+            raise ValueError('native colour build receipt differs from exact source')
+        if receipt.get('elf_sha256') != {name: expected['/usr/libexec/tuna-colour/' + name]
+                                         for name in ('unit', 'pixel', 'yuv', 'cast')}:
+            raise ValueError('native colour original ELF receipt differs from overlay bytes')
     if observed.get('member_sha256') != expected:
         raise ValueError('final image installed executables differ from package/source bytes')
     digest = package['package']['sha256']

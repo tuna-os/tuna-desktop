@@ -7,10 +7,17 @@
 #endif
 
 precision mediump float;
-#if defined(EXTERNAL)
-uniform samplerExternalOES tex;
+#if defined(GL_FRAGMENT_PRECISION_HIGH)
+#define TUNA_SAMPLER_PRECISION highp
 #else
-uniform sampler2D tex;
+// Keep the original SDR sampler precision on GLES2 implementations without
+// fragment highp; native HDR admission rejects these implementations.
+#define TUNA_SAMPLER_PRECISION
+#endif
+#if defined(EXTERNAL)
+uniform TUNA_SAMPLER_PRECISION samplerExternalOES tex;
+#else
+uniform TUNA_SAMPLER_PRECISION sampler2D tex;
 #endif
 
 uniform float alpha;

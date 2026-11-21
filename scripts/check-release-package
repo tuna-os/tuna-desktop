@@ -73,7 +73,7 @@ HELPER="$DIR/usr/libexec/tuna-geoclue-agent-policy"
 [ "$(head -n 1 "$HELPER")" = '#!/usr/bin/python3' ] || fail "tuna-geoclue-agent-policy interpreter is not the declared python3"
 
 DEPENDS="$(dpkg-deb -f "$PKG" Depends)"
-for required in 'libgtk4-layer-shell0 (>= 1.1)' 'libgtk-4-1 (>= 4.14)' 'libadwaita-1-0 (>= 1.0)' 'libgweather-4-0t64 (>= 4.4) | libgweather-4-0 (>= 4.4)' 'libpam0g' 'gsettings-desktop-schemas' 'gnome-settings-daemon-common' 'python3'; do
+for required in 'colord' 'gnome-color-manager' 'libgtk4-layer-shell0 (>= 1.1)' 'libgtk-4-1 (>= 4.14)' 'libadwaita-1-0 (>= 1.0)' 'libgweather-4-0t64 (>= 4.4) | libgweather-4-0 (>= 4.4)' 'libpam0g' 'gsettings-desktop-schemas' 'gnome-settings-daemon-common' 'python3'; do
     printf '%s\n' "$DEPENDS" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -Fxq "$required" || fail "missing runtime floor $required"
 done
 # GeoClue is optional for the session (the location indicator hides without

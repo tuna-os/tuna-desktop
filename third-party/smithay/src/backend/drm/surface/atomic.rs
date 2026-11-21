@@ -34,7 +34,7 @@ use crate::{
 
 use tracing::{debug, info, info_span, instrument, trace, warn};
 
-use super::{PlaneConfig, PlaneState, VrrSupport};
+use super::{ConnectorColorState, PlaneConfig, PlaneState, VrrSupport};
 
 #[derive(Debug, Clone)]
 pub struct State {
@@ -43,6 +43,7 @@ pub struct State {
     pub blob: property::Value<'static>,
     pub vrr: bool,
     pub connectors: HashSet<connector::Handle>,
+    pub connector_colors: Vec<ConnectorColorState>,
 }
 
 impl PartialEq for State {
@@ -52,6 +53,7 @@ impl PartialEq for State {
             && self.mode == other.mode
             && self.vrr == other.vrr
             && self.connectors == other.connectors
+            && self.connector_colors == other.connector_colors
     }
 }
 
@@ -149,6 +151,7 @@ impl State {
             // If we don't know the VRR state, the driver doesn't support the property
             vrr: vrr.unwrap_or(false),
             connectors: current_connectors,
+            connector_colors: Vec::new(),
         })
     }
 
@@ -158,6 +161,7 @@ impl State {
         self.connectors.clear();
         self.active = false;
         self.vrr = false;
+        self.connector_colors.clear();
     }
 }
 
@@ -206,6 +210,7 @@ impl AtomicDrmSurface {
             blob,
             vrr: false,
             connectors: connectors.iter().copied().collect(),
+            connector_colors: Vec::new(),
         };
 
         drop(_guard);
@@ -500,7 +505,11 @@ impl AtomicDrmSurface {
             return Err(Error::DeviceInactive);
         }
 
+        let current = self.state.read().unwrap();
         let mut pending = self.pending.write().unwrap();
+        if pending.mode == mode {
+            return Ok(());
+        }
 
         // check if new config is supported
         let new_blob = self.fd.create_property_blob(&mode).map_err(|source| {
@@ -547,6 +556,11 @@ impl AtomicDrmSurface {
             return Err(err);
         }
 
+        if pending.blob != current.blob {
+            if let Err(error) = self.fd.destroy_property_blob(pending.blob.into()) {
+                warn!("Failed to destroy superseded pending mode blob: {}", error);
+            }
+        }
         // seems to be, lets change the mode
         pending.mode = mode;
         pending.blob = new_blob;
@@ -673,6 +687,20 @@ impl AtomicDrmSurface {
         Ok(())
     }
 
+    pub fn set_connector_color(&self, colors: Vec<ConnectorColorState>) -> Result<(), Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+        let mut pending = self.pending.write().unwrap();
+        for color in &colors {
+            if !pending.connectors.contains(&color.connector) {
+                return Err(Error::SurfaceWithoutConnectors(self.crtc));
+            }
+        }
+        pending.connector_colors = colors;
+        Ok(())
+    }
+
     pub fn commit_pending(&self) -> bool {
         *self.pending.read().unwrap() != *self.state.read().unwrap()
     }
@@ -708,7 +736,7 @@ impl AtomicDrmSurface {
         let removed = current_conns.difference(&pending_conns);
         let prop_mapping = self.prop_mapping.read().unwrap();
 
-        let req = AtomicRequest::build_request(
+        let mut req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
             Some(pending.blob),
@@ -717,6 +745,7 @@ impl AtomicDrmSurface {
             removed,
             &*planes,
         )?;
+        req.set_connector_colors(&pending.connector_colors)?;
 
         let flags = if allow_modeset {
             AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY
@@ -780,7 +809,7 @@ impl AtomicDrmSurface {
         // test the new config and return the request if it would be accepted by the driver.
         let prop_mapping = self.prop_mapping.read().unwrap();
         let req = {
-            let req = AtomicRequest::build_request(
+            let mut req = AtomicRequest::build_request(
                 &prop_mapping,
                 self.crtc,
                 Some(pending.blob),
@@ -789,6 +818,7 @@ impl AtomicDrmSurface {
                 removed,
                 &*planes,
             )?;
+            req.set_connector_colors(&pending.connector_colors)?;
 
             if let Err(err) = self.fd.atomic_commit(
                 AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
@@ -798,12 +828,6 @@ impl AtomicDrmSurface {
 
                 return Err(Error::TestFailed(self.crtc));
             } else {
-                if current.mode != pending.mode {
-                    if let Err(err) = self.fd.destroy_property_blob(current.blob.into()) {
-                        warn!("Failed to destroy old mode property blob: {}", err);
-                    }
-                }
-
                 // new config
                 req
             }
@@ -838,6 +862,11 @@ impl AtomicDrmSurface {
             });
 
         if result.is_ok() {
+            if current.blob != pending.blob {
+                if let Err(error) = self.fd.destroy_property_blob(current.blob.into()) {
+                    warn!("Failed to destroy old mode property blob: {}", error);
+                }
+            }
             *current = pending.clone();
             for plane in planes.iter() {
                 if plane.config.is_some() {
@@ -991,11 +1020,24 @@ impl AtomicDrmSurface {
         &self,
         fd: Option<&B>,
     ) -> Result<(), Error> {
-        *self.state.write().unwrap() = if let Some(fd) = fd {
+        let mut current = self.state.write().unwrap();
+        let refreshed = if let Some(fd) = fd {
             State::current_state(fd, self.crtc, &mut self.prop_mapping.write().unwrap())?
         } else {
             State::current_state(&*self.fd, self.crtc, &mut self.prop_mapping.write().unwrap())?
         };
+        let previous = std::mem::replace(&mut *current, refreshed);
+        // Re-reading current state allocates a new mode blob. Preserve a
+        // previous blob still owned by pending, but release any other replaced
+        // current blob rather than leaking one on every VT activation.
+        if previous.blob != self.pending.read().unwrap().blob {
+            let blob: u64 = previous.blob.into();
+            if blob != 0 {
+                if let Err(error) = self.fd.destroy_property_blob(blob) {
+                    warn!("Failed to destroy refreshed mode property blob: {}", error);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1106,6 +1148,91 @@ mod test {
         let fixed = to_fixed(geometry.size.w) as u64;
         assert_eq!(125835674, fixed);
     }
+    #[test]
+    fn unknown_connector_encoding_requires_commit_even_when_mode_is_unchanged() {
+        use super::{ConnectorColorState, State};
+        use drm::control::{connector, property};
+        use std::{collections::HashSet, num::NonZeroU32};
+        let connector: connector::Handle = NonZeroU32::new(7).unwrap().into();
+        let color = ConnectorColorState {
+            connector,
+            colorspace: Some(29),
+            max_bpc: Some(10),
+            hdr_metadata: Some(73),
+        };
+        let pending = State {
+            active: true,
+            // Same representation used by current_state for an unprogrammed
+            // CRTC; no kernel ioctl is involved in this state comparison.
+            mode: unsafe { std::mem::zeroed() },
+            blob: property::Value::Unknown(0),
+            vrr: false,
+            connectors: HashSet::from([connector]),
+            connector_colors: vec![color],
+        };
+        let mut current = pending.clone();
+        assert_eq!(current, pending);
+        // current_state deliberately marks connector encoding unknown when
+        // rebuilding the cache after external KMS ownership.
+        current.connector_colors.clear();
+        assert_ne!(
+            current, pending,
+            "the next submission must modeset, not page-flip"
+        );
+        assert_eq!(pending.connector_colors[0].hdr_metadata, Some(73));
+        current = pending.clone();
+        assert_eq!(current, pending, "only a successful commit makes states equal");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn restored_hdr_and_sdr_requests_contain_all_connector_encoding_properties() {
+        use super::{AtomicRequest, ConnectorColorState, PropMapping};
+        use drm::control::{connector, property};
+        use std::{collections::HashMap, num::NonZeroU32};
+        let connector: connector::Handle = NonZeroU32::new(7).unwrap().into();
+        let mut mapping = PropMapping::default();
+        mapping.connectors.insert(
+            connector,
+            [
+                ("Colorspace".to_owned(), NonZeroU32::new(11).unwrap().into()),
+                ("max bpc".to_owned(), NonZeroU32::new(12).unwrap().into()),
+                (
+                    "HDR_OUTPUT_METADATA".to_owned(),
+                    NonZeroU32::new(13).unwrap().into(),
+                ),
+            ]
+            .into_iter()
+            .collect::<HashMap<_, property::Handle>>(),
+        );
+        let mut request = AtomicRequest::new(&mapping);
+        request
+            .set_connector_colors(&[ConnectorColorState {
+                connector,
+                colorspace: Some(29),
+                max_bpc: Some(10),
+                hdr_metadata: Some(73),
+            }])
+            .unwrap();
+        let properties = &request.connector_props[&connector];
+        assert_eq!(properties["Colorspace"], property::Value::Unknown(29));
+        assert_eq!(properties["max bpc"], property::Value::Unknown(10));
+        assert_eq!(properties["HDR_OUTPUT_METADATA"], property::Value::Unknown(73));
+        assert!(request.build().is_ok());
+        request
+            .set_connector_colors(&[ConnectorColorState {
+                connector,
+                colorspace: Some(7),
+                max_bpc: Some(8),
+                hdr_metadata: Some(0),
+            }])
+            .unwrap();
+        let properties = &request.connector_props[&connector];
+        assert_eq!(properties["Colorspace"], property::Value::Unknown(7));
+        assert_eq!(properties["max bpc"], property::Value::Unknown(8));
+        assert_eq!(properties["HDR_OUTPUT_METADATA"], property::Value::Unknown(0));
+        assert!(request.build().is_ok());
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -1154,6 +1281,23 @@ impl<'a> AtomicRequest<'a> {
     fn reset_connector(&mut self, conn: connector::Handle) -> Result<(), Error> {
         let connector_props = self.connector_props.entry(conn).or_default();
         connector_props.insert("CRTC_ID", property::Value::CRTC(None));
+        Ok(())
+    }
+
+    fn set_connector_colors(&mut self, colors: &[ConnectorColorState]) -> Result<(), Error> {
+        for color in colors {
+            let props = self.connector_props.entry(color.connector).or_default();
+            for (name, value) in [
+                ("Colorspace", color.colorspace),
+                ("max bpc", color.max_bpc),
+                ("HDR_OUTPUT_METADATA", color.hdr_metadata),
+            ] {
+                if let Some(value) = value {
+                    self.mapping.conn_prop_handle(color.connector, name)?;
+                    props.insert(name, property::Value::Unknown(value));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1356,6 +1500,25 @@ impl<'a> AtomicRequest<'a> {
             self.mapping.conn_prop_handle(conn, "CRTC_ID")?,
             property::Value::CRTC(None),
         );
+        Ok(())
+    }
+
+    fn set_connector_colors(&mut self, colors: &[ConnectorColorState]) -> Result<(), Error> {
+        for color in colors {
+            for (name, value) in [
+                ("Colorspace", color.colorspace),
+                ("max bpc", color.max_bpc),
+                ("HDR_OUTPUT_METADATA", color.hdr_metadata),
+            ] {
+                if let Some(value) = value {
+                    self.request.add_property(
+                        color.connector,
+                        self.mapping.conn_prop_handle(color.connector, name)?,
+                        property::Value::Unknown(value),
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

@@ -2416,6 +2416,15 @@ class BootApi(unittest.TestCase):
         self.assertEqual(wire, {"execute": "trace-event-set-state", "arguments": {
             "name": "virtio_gpu_cmd_set_scanout", "enable": True}})
 
+    def test_qmp_raises_connect_error_when_qemu_never_creates_its_socket(self):
+        # Run 44851956404: QEMU aborted before -qmp existed and the old loop
+        # fell through to a read on an unconnected socket (Errno 22 EINVAL).
+        with tempfile.TemporaryDirectory() as scratch, \
+                patch.object(lane.baseline.time, "sleep") as sleep:
+            with self.assertRaises(FileNotFoundError):
+                lane.baseline.Qmp(os.path.join(scratch, "qmp.sock"))
+        self.assertEqual(sleep.call_count, 99)
+
     def test_existing_four_value_performance_call_keeps_original_devices(self):
         with patch.object(lane.os.path, "exists", return_value=True), patch.object(lane.os, "access", return_value=True), patch.object(lane.subprocess, "Popen") as spawn:
             process, qmp, serial, kvm = lane.boot("disk.raw", "/out", "/scratch", 30)
@@ -4322,11 +4331,17 @@ class FixtureLoginSession(unittest.TestCase):
         # the bounded soak runs only on the published image; the native-session
         # modules (#1003) serve only the current build's `autotz` profile; the
         # app-integration helper serves only the current build's
-        # --app-integration boot (the lane refuses it with --published).
-        unused = {"Containerfile": {"/usr/libexec/tuna-soak/tuna-vm-soak"},
+        # --app-integration boot (the lane refuses it with --published); the
+        # colour consumer serves only the `colour` profile, whose
+        # Containerfile.colour layer installs it from the native colour overlay.
+        colour = "/usr/libexec/tuna-vm-colour"
+        self.assertIn("COPY native-colour-overlay/usr/ /usr/", self.fixture("Containerfile.colour"))
+        overlay = (Path(__file__).resolve().parents[2] / "scripts/tuna-colour-build").read_text()
+        self.assertIn("out / 'usr/libexec/tuna-vm-colour'", overlay)
+        unused = {"Containerfile": {"/usr/libexec/tuna-soak/tuna-vm-soak", colour},
                   "Containerfile.published": {"/usr/libexec/tuna-vm-gdm-trace",
                                               "/usr/libexec/tuna-native-session",
-                                              "/usr/libexec/tuna-vm-app-integration"}}
+                                              "/usr/libexec/tuna-vm-app-integration", colour}}
         # Orca's token-gated test presenter (orca-speech-trigger) reads the
         # runtime token this user environment generator writes.
         generator = "/usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token"

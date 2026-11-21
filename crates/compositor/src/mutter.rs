@@ -473,11 +473,20 @@ fn current_state(
                         .expect("string value"),
                 ),
                 ("is-for-lease".to_owned(), OwnedVariant::from(false)),
-                // SDR only: HDR colour modes are P-DS-03.
-                ("color-mode".to_owned(), OwnedVariant::from(0u32)),
+                (
+                    "color-mode".to_owned(),
+                    OwnedVariant::from(monitor.color_mode as u32),
+                ),
                 (
                     "supported-color-modes".to_owned(),
-                    OwnedVariant::try_from(Variant::from(vec![0u32])).expect("array value"),
+                    OwnedVariant::try_from(Variant::from(
+                        monitor
+                            .supported_color_modes
+                            .iter()
+                            .map(|mode| *mode as u32)
+                            .collect::<Vec<_>>(),
+                    ))
+                    .expect("array value"),
                 ),
             ]);
             // Mutter's `(bb)`: enabled, hardware-locked; absent without
@@ -2120,6 +2129,8 @@ mod tests {
             modes,
             preferred: 0,
             current: Some(0),
+            color_mode: crate::display_config::ColorMode::Default,
+            supported_color_modes: vec![crate::display_config::ColorMode::Default],
             privacy_screen: None,
         };
         DisplayState {
