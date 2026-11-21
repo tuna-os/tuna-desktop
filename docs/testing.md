@@ -547,6 +547,22 @@ is rejected, and the existing five-second polling budget must still obtain
 a valid tree. Persistent transport errors, wrong owners and incomplete trees
 cannot satisfy the gate.
 
+G-TRAY's absence check works the same way. After the probe item is killed,
+an AT-SPI child of that item that is already unexported while the walk
+reaches it (`No such interface`) means the item is still being torn down,
+so the check observes again. The deadline is unchanged: 30 fresh
+owner-bound observations, 0.5 s apart. An error anywhere else, or of another
+kind, is still refused, and an item still showing or still being torn down
+at the deadline fails.
+
+`tuna-gtk-shell-proof` runs the whole session (the script, its private
+buses and the nested session) in a fixed-offset `TZ` where it is about
+15:00 local time when the proof starts (`scripts/lib/proof-session-tz.py`).
+The screen-time day starts at 03:00 local time, as in GNOME. A proof that
+crossed that boundary would reset the day's usage in the middle of a
+wellbeing gate: a reached daily limit would turn Active and grayscale would
+drop mid-bracket. The bracket checks themselves are unchanged.
+
 | CI job | Command | Extra packages | What it asserts |
 |---|---|---|---|
 | `journey` | `scripts/tuna-journey --artifacts journey-artifacts` | `xvfb xdotool x11-apps scrot jq dbus`, Mesa EGL (`libegl1 libgl1-mesa-dri`) | Overview, search, launch from search, Escape, workspace switch, Alt+Tab; writes `assertions.txt` |

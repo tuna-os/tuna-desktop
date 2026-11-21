@@ -553,6 +553,18 @@
 # Frames and accessibility dumps land in the artifacts dir; assertions in
 # assertions.txt for the parity ledger.
 set -eu
+# GNOME's screen-time day starts at 03:00 local time: a proof crossing it
+# resets the day's usage mid-gate, and a reached daily limit turns Active.
+# The proof, its private buses and the session all run in a fixed-offset
+# zone where it is about 15:00, twelve hours from either boundary. Chosen
+# once, before the private bus, so activated services inherit it too.
+if [ -z "${TUNA_PROOF_SESSION_TZ:-}" ]; then
+    TUNA_PROOF_SESSION_TZ="$(python3 "$(dirname -- "$0")/lib/proof-session-tz.py")"
+    export TUNA_PROOF_SESSION_TZ
+    echo "tuna-gtk-shell-proof: session TZ=$TUNA_PROOF_SESSION_TZ, local time $(TZ="$TUNA_PROOF_SESSION_TZ" date +%H:%M)" >&2
+fi
+TZ="$TUNA_PROOF_SESSION_TZ"
+export TZ
 if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
     TUNA_PROOF_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
 fi
@@ -2489,19 +2501,16 @@ end=$(($(date +%s) + 10))
 until [ -s "$TRAY_MARKER" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 grep -q "^clicked 1" "$TRAY_MARKER" 2>/dev/null || fail G-TRAY "the menu row never reached the item"
 kill "$TRAY_PID" 2>/dev/null || true
-tray_absent=0
-for _ in $(seq 1 30); do
-    if "$PY" "$ROOT/scripts/lib/tuna_tray_absence.py" "$ARTIFACTS/privacy-portal/receipt.json" \
-        "$ARTIFACTS/a11y-tray-gone.json" "$ROOT/scripts/lib/tuna-a11y-dump.py"; then
-        tray_absent=1
-        break
-    else
-        tray_observation=$?
-        [ "$tray_observation" = 2 ] || fail G-TRAY "fresh owner-bound tray absence observation failed"
-    fi
-    sleep 0.5
-done
-[ "$tray_absent" = 1 ] || fail G-TRAY "the item stayed in the panel after it exited"
+# Up to 30 fresh owner-bound observations 0.5 s apart; an AT-SPI child
+# vanishing inside the departing item's subtree is a retry, not a refusal.
+if "$PY" "$ROOT/scripts/lib/tuna_tray_absence.py" "$ARTIFACTS/privacy-portal/receipt.json" \
+    "$ARTIFACTS/a11y-tray-gone.json" "$ROOT/scripts/lib/tuna-a11y-dump.py"; then
+    :
+else
+    tray_observation=$?
+    [ "$tray_observation" = 2 ] || fail G-TRAY "fresh owner-bound tray absence observation failed"
+    fail G-TRAY "the item stayed in the panel after it exited"
+fi
 pass G-TRAY "an AppIndicator item shows with its tooltip, fires its menu, and leaves on exit"
 xdotool key Escape
 sleep 1
