@@ -34,6 +34,13 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("README.md", "docs/perf/x.md", ".github/workflows/fuzz.yml",
                             "scripts/lib/ledger-tests.py", "fuzz/Cargo.toml"), [])
 
+    def test_doc_reference_resolver_runs_no_lane(self):
+        # #1219: the check job runs the resolver, its self-test and allowlist;
+        # no proof lane reads them.
+        for run in (0, 4):
+            self.assertEqual(pr("scripts/tuna-doc-refs", "scripts/lib/tuna-doc-refs-tests.py",
+                                "scripts/lib/tuna-doc-refs-allowlist.txt", run=run), [])
+
     def test_code_runs_gtk_shell_and_a_rotating_slice_with_producers(self):
         seen = set()
         for run in range(len(m.ROTATION)):

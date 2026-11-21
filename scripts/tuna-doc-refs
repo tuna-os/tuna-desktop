@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""tuna-doc-refs: relative links and repo paths in changed Markdown must resolve (#1219).
+
+Usage:
+  scripts/tuna-doc-refs [--base REV]      the *.md files changed since REV
+  scripts/tuna-doc-refs FILE.md ...       the named files
+
+With --base, the files are the *.md files whose working-tree copy (tracked
+or added) differs from the merge base of REV and HEAD
+(default REV: origin/main). Unchanged files are not read, so debt in them
+does not fail an unrelated change (the ruling on tuna-os/tromso#467).
+Evidence and history trees are not living docs and are skipped:
+.spektacular/, docs/releases/, docs/research/, third-party/ (upstream
+text) and any path with a dated directory (docs/marlin/2026-10-30-x/).
+
+Outside fenced code blocks, each file must satisfy:
+
+1. Every relative Markdown link, inline `[text](path#anchor)` or reference
+   `[label]: path`, resolves from the directory of the file that holds it
+   (a leading `/` means the repository root). URLs with a scheme
+   (https:, mailto:, ...) and bare `#anchor` links are not checked, and
+   neither are anchors.
+2. Every backticked token that names a tracked top-level entry of this
+   repository (`scripts/foo`, `docs/x.md`, `Cargo.toml`) resolves from the
+   repository root. A location suffix (`:LINE`, `:START-END`, `::item`,
+   `#anchor`) is ignored. Tokens with spaces, globs, placeholders
+   (`<date>`, `$VAR`, `{a,b}`) or `...` are not paths and are skipped.
+
+Intended exceptions (paths that exist only at build or run time, examples)
+go in scripts/lib/tuna-doc-refs-allowlist.txt as `REFERENCE | reason`.
+No network access. Each failure prints `FILE:LINE: link|path 'REF' does
+not resolve`; the exit status is 1 then, 2 for a usage or allowlist error.
+"""
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import unquote
+
+ROOT = Path(__file__).resolve().parent.parent
+ALLOWLIST = ROOT / "scripts/lib/tuna-doc-refs-allowlist.txt"
+
+SKIPPED_TREES = (".spektacular/", "docs/releases/", "docs/research/", "third-party/")
+DATED_DIR = re.compile(r"(^|/)\d{4}-\d{2}-\d{2}[^/]*/")
+FENCE = re.compile(r"\s*(`{3,}|~{3,})")
+CODE_SPAN = re.compile(r"(`+)(.+?)\1")
+INLINE_LINK = re.compile(r"!?\[(?:[^\[\]]|\[[^\]]*\])*\]\(\s*(<[^>]*>|[^)\s]+)(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)")
+REFERENCE_LINK = re.compile(r"^\s{0,3}\[(?!\^)[^\]]+\]:\s*(<[^>]*>|\S+)")
+SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+# `file.rs:12`, `file.rs:12-40`, `file.rs::item`, `file.md#anchor`.
+LOCATION_SUFFIX = re.compile(r"(:\d+(-\d+)?|::.*|#.*)$")
+NOT_A_PATH = set("*?<>{}$|=\\ \t[]()'\"")
+
+
+def load_allowlist(path=ALLOWLIST):
+    """Return {reference: reason}; an entry without a reason is an error."""
+    entries = {}
+    path = Path(path)
+    if not path.exists():
+        return entries
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        reference, separator, reason = line.partition(" | ")
+        if not separator or not reason.strip() or not reference.strip():
+            raise ValueError(f"{path}:{number}: an entry is 'REFERENCE | reason'")
+        entries[reference.strip()] = reason.strip()
+    return entries
+
+
+def living(relative):
+    """False for evidence and history trees, which are not checked."""
+    return not (relative.startswith(SKIPPED_TREES) or DATED_DIR.search(relative))
+
+
+def top_level(root):
+    """The repository's tracked top-level names (every entry outside git)."""
+    listed = subprocess.run(["git", "-C", str(root), "ls-files", "-z"],
+                            capture_output=True, text=True)
+    if listed.returncode == 0 and listed.stdout:
+        return {path.split("/", 1)[0] for path in listed.stdout.split("\0") if path}
+    return {entry.name for entry in Path(root).iterdir() if entry.name != ".git"}
+
+
+def prose_lines(text):
+    """(line number, line) outside fenced code blocks."""
+    fence = None
+    for number, line in enumerate(text.splitlines(), 1):
+        opened = FENCE.match(line)
+        if opened:
+            marker = opened.group(1)
+            if fence is None:
+                fence = marker
+            elif marker[0] == fence[0] and len(marker) >= len(fence):
+                fence = None
+            continue
+        if fence is None:
+            yield number, line
+
+
+def link_targets(line):
+    """Link targets on a line, ignoring anything inside code spans."""
+    text = CODE_SPAN.sub(lambda span: " " * len(span.group(0)), line)
+    targets = [match.group(1) for match in INLINE_LINK.finditer(text)]
+    definition = REFERENCE_LINK.match(text)
+    if definition:
+        targets.append(definition.group(1))
+    return [target[1:-1] if target.startswith("<") else target for target in targets]
+
+
+def path_tokens(line):
+    """Backticked tokens that could be repository paths."""
+    for span in CODE_SPAN.finditer(line):
+        token = span.group(2).strip()
+        if "/" not in token and "." not in token:
+            continue
+        if any(character in NOT_A_PATH for character in token) or "..." in token:
+            continue
+        if token.startswith(("./", "../", "/", "~", "-")) or "://" in token:
+            continue
+        yield token
+
+
+def find_problems(markdown, root, allowlist=None, top=None):
+    """'FILE:LINE: link|path 'REF' does not resolve' for one Markdown file."""
+    root, markdown = Path(root), Path(markdown)
+    allowlist = allowlist or {}
+    top = top_level(root) if top is None else top
+    relative = markdown.relative_to(root).as_posix()
+    problems = []
+    for number, line in prose_lines(markdown.read_text(encoding="utf-8", errors="replace")):
+        for target in link_targets(line):
+            if target.startswith("#") or SCHEME.match(target) or target in allowlist:
+                continue
+            path = unquote(target.split("#", 1)[0].split("?", 1)[0])
+            if not path:
+                continue
+            base = root if path.startswith("/") else markdown.parent
+            if not (base / path.lstrip("/")).exists():
+                problems.append(f"{relative}:{number}: link '{target}' does not resolve")
+        for token in path_tokens(line):
+            if token in allowlist:
+                continue
+            path = LOCATION_SUFFIX.sub("", token).rstrip("/.,;:")
+            if path.split("/", 1)[0] not in top:
+                continue
+            if not (root / path).exists():
+                problems.append(f"{relative}:{number}: path '{token}' does not resolve")
+    return problems
+
+
+def changed_markdown(root, base):
+    """Existing *.md files that differ from the merge base of `base` and HEAD.
+
+    The working tree counts (tracked and added files), so a local run sees
+    uncommitted edits; in CI the working tree is HEAD.
+    """
+    def git(*argv):
+        result = subprocess.run(["git", "-C", str(root), *argv], capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError(f"git {' '.join(argv)} failed: {result.stderr.strip()}")
+        return result.stdout
+    merge_base = git("merge-base", base, "HEAD").strip()
+    changed = git("diff", "--name-only", "-z", "--diff-filter=d", merge_base, "--", "*.md")
+    paths = [path for path in changed.split("\0") if path]
+    return [root / path for path in paths if (root / path).is_file()]
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--base", help="check the *.md files changed since this revision "
+                        "(default origin/main; an empty value means the default)")
+    parser.add_argument("files", nargs="*", type=Path, help="Markdown files to check instead")
+    args = parser.parse_args(argv)
+    if args.files and args.base is not None:
+        parser.error("give --base or files, not both")
+    try:
+        allowlist = load_allowlist()
+        if args.files:
+            files = [path.resolve() for path in args.files]
+            outside = [str(path) for path in files if not path.is_relative_to(ROOT)]
+            if outside:
+                parser.error(f"outside the repository: {', '.join(outside)}")
+        else:
+            files = changed_markdown(ROOT, args.base or "origin/main")
+    except (ValueError, RuntimeError) as error:
+        print(f"tuna-doc-refs: {error}", file=sys.stderr)
+        return 2
+    files = [path for path in files if living(path.relative_to(ROOT).as_posix())]
+    top = top_level(ROOT)
+    problems = []
+    for path in files:
+        problems += find_problems(path, ROOT, allowlist, top)
+    for problem in problems:
+        print(problem)
+    print(f"tuna-doc-refs: {len(files)} Markdown file(s) checked, "
+          f"{len(problems)} unresolved reference(s)", file=sys.stderr)
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -174,6 +174,7 @@ settings local builds need (`just` lists the recipes):
 | `just check` | `fmt-check`, `clippy` and `test`, like the `check` job's core |
 | `just test [cargo args]` | `cargo test --workspace`, or e.g. `just test -p tuna-compositor --lib orca::` |
 | `just clippy` / `just fmt` / `just build [args]` | the matching cargo command |
+| `just doc-refs [base]` | `scripts/tuna-doc-refs --base <base>` (default `origin/main`): relative links and backticked repository paths in the Markdown changed since `base` must resolve, as in the `check` job |
 | `just proof <name> [args]` | `scripts/tuna-<name> --artifacts <tmp>`, e.g. `just proof gtk-shell-proof` |
 | `just ci-artifacts <run> [name]` | downloads a CI run's artifacts and prints the directory |
 | `just clean` / `just gc` | deletes this worktree's target / frees disk (below) |

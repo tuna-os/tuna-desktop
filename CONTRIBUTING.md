@@ -142,7 +142,11 @@ Once a plan is approved and implementation starts:
   `docs/architecture.md` and `docs/roadmap.md`, update them in the same PR.
   Files under `docs/` are plain files and are edited directly; files under
   `.spektacular/specs/` and `.spektacular/plans/` are edited only through the
-  Spektacular CLI (see AGENTS.md).
+  Spektacular CLI (see AGENTS.md). CI's `check` job fails when a Markdown
+  file the PR changes has a relative link or a backticked repository path
+  that does not resolve; `just doc-refs` runs the same check
+  (`scripts/tuna-doc-refs`). Intended exceptions go in
+  `scripts/lib/tuna-doc-refs-allowlist.txt`, each with a reason.
 - **Respect the workspace boundaries.** [ADR 0004](docs/adr/0004-no-split-preserve-seams.md)
   keeps this a monorepo but defines extraction seams between
   `tuna-shell-control` (framing/messages), `supervise.rs` (std-only), and

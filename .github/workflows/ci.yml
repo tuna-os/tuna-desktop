@@ -170,6 +170,12 @@ jobs:
       # a guard that no branch brings the old name back.
       - run: python3 scripts/lib/rename-to-tuna-tests.py
       - run: scripts/rename-to-tuna --check --no-cargo
+      # Relative links and repo paths in the Markdown this change edits
+      # resolve (#1219); a schedule run has no base and checks against main.
+      - run: python3 scripts/lib/tuna-doc-refs-tests.py
+      - env:
+          DOC_REFS_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: scripts/tuna-doc-refs --base "$DOC_REFS_BASE"
       - run: python3 scripts/lib/tuna-soak-tests.py
       - run: python3 scripts/lib/tuna-resource-sample-tests.py
       - run: python3 scripts/lib/vm-boot-tests.py

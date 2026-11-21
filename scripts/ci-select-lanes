@@ -183,6 +183,10 @@ NO_LANE = [
     # ones a lane job runs first.
     "scripts/tests/*",
     "scripts/lib/*-tests.py",
+    # The changed-Markdown resolver and its allowlist: the check job runs
+    # them (#1219).
+    "scripts/tuna-doc-refs",
+    "scripts/lib/tuna-doc-refs-allowlist.txt",
     # Products and workflows of their own, never run by a ci.yml lane
     # (WorkflowSync.test_no_lane_scripts_are_not_run_by_a_lane keeps this
     # true): corral installed-image tooling, variant qualification, hero
