@@ -93,7 +93,18 @@ window.tuna-panel.overview.shaded {
   background-color: shade(#c01c28, 1.1);
 }
 
-/* #panel .privacy-indicator: the microphone while an app records. */
+/* #panel .screen-sharing-indicator: a filled $privacy_indicator_color
+   ($orange_3 on the dark panel) button, white icons 6px apart. */
+.tuna-panel button.panel-button.screen-sharing-indicator {
+  background-color: #ff7800;
+  color: #ffffff;
+}
+.tuna-panel button.panel-button.screen-sharing-indicator:hover {
+  background-color: shade(#ff7800, 1.1);
+}
+
+/* #panel .privacy-indicator: the microphone while an app records, and
+   the remote access applet's record icon. */
 .tuna-panel .privacy-indicator {
   color: #ff7800;
 }

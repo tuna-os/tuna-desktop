@@ -851,6 +851,9 @@ pub struct Runtime {
     remote_held: std::collections::HashMap<u64, RemoteHeld>,
     /// org.gnome.Mutter.InputCapture's input diversion (#1040).
     input_capture: crate::mutter::input_capture::Router,
+    /// The shell's Stop of a remote access grant, for the revocation scan
+    /// (#1162 F2).
+    remote_access_stops: std::sync::Arc<crate::mutter::RemoteAccessStops>,
     /// Keys the tablet action mappers' virtual keyboard holds (evdev).
     tablet_virtual_keys: std::collections::BTreeSet<u32>,
     /// The pad OSD labels the shell last received.
@@ -1381,6 +1384,8 @@ impl Runtime {
         let capture_authority = crate::capture_security::Authority::default();
         let introspect = crate::introspect::start(state.desktop_size(), capture_authority.clone());
         let input_capture = crate::mutter::input_capture::Router::default();
+        let remote_access_stops: std::sync::Arc<crate::mutter::RemoteAccessStops> =
+            Default::default();
         event_loop
             .handle()
             .insert_source(
@@ -1395,6 +1400,7 @@ impl Runtime {
                     display_share.clone(),
                     color_share.clone(),
                     input_capture.sessions(),
+                    remote_access_stops.clone(),
                 ),
                 |event, _, rt: &mut Runtime| {
                     if let calloop::channel::Event::Msg(request) = event {
@@ -1635,6 +1641,7 @@ impl Runtime {
             cast_grants: Default::default(),
             remote_held: Default::default(),
             input_capture,
+            remote_access_stops,
             tablet_virtual_keys: Default::default(),
             pad_osd_labels_sent: None,
             introspect,
@@ -4870,6 +4877,8 @@ impl Runtime {
                 self.set_power_save_mode(mode);
                 let _ = reply.send(());
             }
+            // GNOME 51's remote access indicators follow these (#1162 F2).
+            crate::mutter::ToLoop::RemoteAccess(handles) => self.control.set_remote_access(handles),
         }
     }
 
@@ -5600,6 +5609,10 @@ impl Runtime {
                 .startup
                 .add_launch(app_id, wm_class, Instant::now());
             self.active_at = Instant::now();
+        }
+        // The indicator's Stop: the scan revokes the grant for good.
+        for (kind, id) in outcome.remote_access_stops {
+            self.remote_access_stops.stop(kind, id);
         }
         self.queue_close_dialogs();
         if let Some(request) = self.state.take_shortcut_consent_update() {

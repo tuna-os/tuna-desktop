@@ -35,6 +35,9 @@
 #   cancel and drop, #1189) and G-SHELL-STABLE only.
 #   --lock-menu-only runs panel readiness, G-LOCK-WITH-MENU-OPEN and
 #   G-SHELL-STABLE only (needs pam_wrapper).
+#   --remote-access-only runs panel readiness, G-REMOTE-ACCESS-INDICATOR
+#   (a portal share's Stop Screen Sharing button, #1162 F2) and
+#   G-SHELL-STABLE only (needs pipewire, wireplumber and the portal).
 #   --grid-cancel-only --grid-cancel-admission FILE is an exact CI comparison slice.
 #   --expect-grid-cancel-old-negative is permitted only in that admitted slice.
 #   Run at most one --*-only slice at a time.
@@ -578,6 +581,7 @@ SEARCH_LEAK_ONLY=0
 WINDOW_LEAK_ONLY=0
 DND_OVERVIEW_ONLY=0
 LOCK_MENU_ONLY=0
+REMOTE_ACCESS_ONLY=0
 GRID_CANCEL_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
 GRID_CANCEL_ADMISSION=""
@@ -625,6 +629,7 @@ while [ $# -gt 0 ]; do
         --lock-menu-only) LOCK_MENU_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --dnd-overview-only) DND_OVERVIEW_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --x11-iconic-only) X11_ICONIC_ONLY=1; only_mode "$1"; shift ;;
+        --remote-access-only) REMOTE_ACCESS_ONLY=1; only_mode "$1"; shift ;;
         --subsurface-only) SUBSURFACE_ONLY=1; only_mode "$1" source-build no-media-source no-examples no-camera-policy; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
@@ -2077,6 +2082,78 @@ lock_with_menu_gate() {
     pass G-LOCK-WITH-MENU-OPEN "locking over the open date menu or quick settings closes it; the password typed at once and Return unlock through PAM"
 }
 
+# The installed GNOME portal frontend and backend, with their genuine
+# root-owned executable identities, on this proof's private session bus.
+portal_start() {
+    [ -z "$PORTAL_PIDS" ] || return 0
+    PORTAL_BACKEND=/usr/libexec/xdg-desktop-portal-gnome
+    [ -x "$PORTAL_BACKEND" ] || PORTAL_BACKEND=/usr/lib/xdg-desktop-portal-gnome
+    [ -x "$PORTAL_BACKEND" ] || fail G-PORTAL-CONSENT "installed GNOME backend missing"
+    mkdir -p "$XDG_CONFIG_HOME/xdg-desktop-portal"
+    printf '[preferred]\ndefault=gnome;gtk;\norg.freedesktop.impl.portal.ScreenCast=gnome\n' >"$XDG_CONFIG_HOME/xdg-desktop-portal/portals.conf"
+    XDG_CURRENT_DESKTOP=GNOME WAYLAND_DISPLAY="$SOCKET_NAME" GDK_BACKEND=wayland GTK_A11Y=atspi XDG_SESSION_TYPE=wayland "$PORTAL_BACKEND" --replace >"$ARTIFACTS/portal-gnome.log" 2>&1 &
+    PORTAL_BACKEND_PID=$!
+    PORTAL_PIDS="$PORTAL_BACKEND_PID"
+    "$PY" "$ROOT/scripts/lib/tuna-portal-ready.py" org.freedesktop.impl.portal.desktop.gnome org.freedesktop.impl.portal.ScreenCast "$ARTIFACTS/portal-backend-ready.json" --pid "$PORTAL_BACKEND_PID" ||
+        fail G-PORTAL-CONSENT "installed backend capabilities never became ready"
+    XDG_CURRENT_DESKTOP=GNOME /usr/libexec/xdg-desktop-portal --replace >"$ARTIFACTS/portal-frontend.log" 2>&1 &
+    PORTAL_FRONTEND_PID=$!
+    PORTAL_PIDS="$PORTAL_PIDS $PORTAL_FRONTEND_PID"
+    "$PY" "$ROOT/scripts/lib/tuna-portal-ready.py" org.freedesktop.portal.Desktop org.freedesktop.portal.ScreenCast "$ARTIFACTS/portal-frontend-ready.json" --pid "$PORTAL_FRONTEND_PID" ||
+        fail G-PORTAL-CONSENT "frontend capabilities never became ready"
+}
+
+# G-REMOTE-ACCESS-INDICATOR (#1162 F2): a portal screen share the user
+# granted shows GNOME 51's orange "Stop Screen Sharing" panel button
+# (status/remoteAccess.js ScreenSharingIndicator); pressing it through
+# AT-SPI ends the PipeWire stream within two seconds and closes the app's
+# portal session, and the button hides (after GNOME's five-second minimum).
+remote_access_indicator_gate() {
+    portal_start
+    sharing_dump() {
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/$1" 5 >/dev/null 2>&1
+    }
+    # A share an earlier gate closed keeps the button its five seconds.
+    end=$(($(date +%s) + 12))
+    until sharing_dump a11y-sharing-before.json && hidden "$ARTIFACTS/a11y-sharing-before.json" "Stop Screen Sharing" ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 0.5; done
+    hidden "$ARTIFACTS/a11y-sharing-before.json" "Stop Screen Sharing" ||
+        fail G-REMOTE-ACCESS-INDICATOR "the sharing indicator showed with no share active"
+    rm -f "$ARTIFACTS"/portal-indicator.*
+    "$PY" "$ROOT/scripts/lib/tuna-portal-capture-client.py" "$ARTIFACTS/portal-indicator.png" indicator-stop >"$ARTIFACTS/portal-indicator.log" 2>&1 &
+    PORTAL_CLIENT=$!
+    "$PY" "$ROOT/scripts/lib/tuna-portal-consent.py" "$ARTIFACTS/a11y-portal-indicator.json" grant ||
+        fail G-REMOTE-ACCESS-INDICATOR "actual picker could not grant the share"
+    end=$(($(date +%s) + 30))
+    until [ -f "$ARTIFACTS/portal-indicator.active" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
+    [ -f "$ARTIFACTS/portal-indicator.active" ] ||
+        fail G-REMOTE-ACCESS-INDICATOR "the granted share never streamed: $(tail -3 "$ARTIFACTS/portal-indicator.log")"
+    end=$(($(date +%s) + 10))
+    until sharing_dump a11y-sharing.json && button_showing "$ARTIFACTS/a11y-sharing.json" "Stop Screen Sharing" ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+    button_showing "$ARTIFACTS/a11y-sharing.json" "Stop Screen Sharing" ||
+        fail G-REMOTE-ACCESS-INDICATOR "no Stop Screen Sharing button while the share streams"
+    scrot "$ARTIFACTS/24k-screen-sharing-indicator.png" >/dev/null
+    # GNOME's $privacy_indicator_color ($orange_3, #ff7800) panel button.
+    ffmpeg -loglevel error -i "$ARTIFACTS/24k-screen-sharing-indicator.png" -vf "crop=$WIDTH:1:0:16" \
+        -f rawvideo -pix_fmt rgb24 - | od -An -tu1 -v | tr -s ' ' '\n' | awk 'NF' | paste - - - |
+        awk '$1 > 200 && $2 > 90 && $2 < 160 && $3 < 60 { found = 1 } END { exit !found }' ||
+        fail G-REMOTE-ACCESS-INDICATOR "no orange sharing indicator in the panel"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-sharing-stop.json" 20 \
+        --press "Stop Screen Sharing" || fail G-REMOTE-ACCESS-INDICATOR "could not press Stop Screen Sharing"
+    : >"$ARTIFACTS/portal-indicator.revoke"
+    wait "$PORTAL_CLIENT" ||
+        fail G-REMOTE-ACCESS-INDICATOR "Stop did not end the share: $(tail -3 "$ARTIFACTS/portal-indicator.log")"
+    end=$(($(date +%s) + 12))
+    until sharing_dump a11y-sharing-stopped.json && hidden "$ARTIFACTS/a11y-sharing-stopped.json" "Stop Screen Sharing" ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 0.5; done
+    hidden "$ARTIFACTS/a11y-sharing-stopped.json" "Stop Screen Sharing" ||
+        fail G-REMOTE-ACCESS-INDICATOR "the indicator stayed after the share ended"
+    cstate '.capture_streams == 0' "no capture stream after Stop" 5 ||
+        fail G-REMOTE-ACCESS-INDICATOR "a capture stream survived Stop"
+    pass G-REMOTE-ACCESS-INDICATOR "a granted portal share shows GNOME's orange Stop Screen Sharing button; pressing it: $(grep -h 'removed PipeWire node\|closed the app' "$ARTIFACTS/portal-indicator.log" | tr '\n' ' ')and the button hides"
+}
+
 # The panel is up once the shell registers on the a11y bus with its
 # controls; that also proves the accessible tree.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel.json" 60 ||
@@ -2178,6 +2255,16 @@ if [ "$WINDOW_LEAK_ONLY" = 1 ]; then
     # Let the startup cover settle before the first window.
     sleep 3
     window_leak_proof
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
+if [ "$REMOTE_ACCESS_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "remote access desktop ready" ||
+        fail G-REMOTE-ACCESS-INDICATOR "desktop never became ready"
+    [ -n "$PW_PIDS" ] || fail G-REMOTE-ACCESS-INDICATOR "--remote-access-only needs pipewire and wireplumber"
+    sleep 3
+    remote_access_indicator_gate
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
     exit 0
@@ -11378,23 +11465,7 @@ if [ -n "$PW_PIDS" ] && command -v gst-launch-1.0 >/dev/null 2>&1; then
         fail G-CAPTURE-DENY "capture admission failed: $(tail -3 "$ARTIFACTS/capture-denial.log")"
     pass G-CAPTURE-DENY "untrusted callers and forged portal name denied screenshots, screencasts and shell recorder"
 
-    # Use the installed frontend/backend, with their genuine root-owned
-    # executable identities, on this proof's private session bus.
-    PORTAL_BACKEND=/usr/libexec/xdg-desktop-portal-gnome
-    [ -x "$PORTAL_BACKEND" ] || PORTAL_BACKEND=/usr/lib/xdg-desktop-portal-gnome
-    [ -x "$PORTAL_BACKEND" ] || fail G-PORTAL-CONSENT "installed GNOME backend missing"
-    mkdir -p "$XDG_CONFIG_HOME/xdg-desktop-portal"
-    printf '[preferred]\ndefault=gnome;gtk;\norg.freedesktop.impl.portal.ScreenCast=gnome\n' >"$XDG_CONFIG_HOME/xdg-desktop-portal/portals.conf"
-    XDG_CURRENT_DESKTOP=GNOME WAYLAND_DISPLAY="$SOCKET_NAME" GDK_BACKEND=wayland GTK_A11Y=atspi XDG_SESSION_TYPE=wayland "$PORTAL_BACKEND" --replace >"$ARTIFACTS/portal-gnome.log" 2>&1 &
-    PORTAL_BACKEND_PID=$!
-    PORTAL_PIDS="$PORTAL_BACKEND_PID"
-    "$PY" "$ROOT/scripts/lib/tuna-portal-ready.py" org.freedesktop.impl.portal.desktop.gnome org.freedesktop.impl.portal.ScreenCast "$ARTIFACTS/portal-backend-ready.json" --pid "$PORTAL_BACKEND_PID" ||
-        fail G-PORTAL-CONSENT "installed backend capabilities never became ready"
-    XDG_CURRENT_DESKTOP=GNOME /usr/libexec/xdg-desktop-portal --replace >"$ARTIFACTS/portal-frontend.log" 2>&1 &
-    PORTAL_FRONTEND_PID=$!
-    PORTAL_PIDS="$PORTAL_PIDS $PORTAL_FRONTEND_PID"
-    "$PY" "$ROOT/scripts/lib/tuna-portal-ready.py" org.freedesktop.portal.Desktop org.freedesktop.portal.ScreenCast "$ARTIFACTS/portal-frontend-ready.json" --pid "$PORTAL_FRONTEND_PID" ||
-        fail G-PORTAL-CONSENT "frontend capabilities never became ready"
+    portal_start
     for decision in cancel grant; do
         "$PY" "$ROOT/scripts/lib/tuna-portal-capture-client.py" "$ARTIFACTS/portal-$decision.png" "$decision" >"$ARTIFACTS/portal-$decision.log" 2>&1 &
         PORTAL_CLIENT=$!
@@ -11405,6 +11476,7 @@ if [ -n "$PW_PIDS" ] && command -v gst-launch-1.0 >/dev/null 2>&1; then
     [ -s "$ARTIFACTS/portal-grant.png" ] || fail G-PORTAL-CONSENT "granted frontend returned no consumed frame"
     [ ! -f "$ARTIFACTS/portal-cancel.png" ] || fail G-PORTAL-CONSENT "cancel produced frame"
     pass G-PORTAL-CONSENT "actual GNOME picker Cancel denies; Share grants and streams; owner Close removes node"
+    remote_access_indicator_gate
 
     # GNOME's screen recorder: the screenshot UI's video switch records
     # the selection (GNOME's first one, a centred quarter) as VP8 WebM in

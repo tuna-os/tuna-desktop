@@ -65,7 +65,7 @@ class Selection(unittest.TestCase):
             self.assertEqual(pr(path), ["gtk-shell"], path)
         self.assertEqual(pr("docs/parity-ledger.md"),
                          ["journey", "drm-smoke", "gtk-shell", "orca-speech",
-                          "arch-package", "marlin-vm", "parity-ledger"])
+                          "remote-security", "arch-package", "marlin-vm", "parity-ledger"])
         self.assertEqual(pr("scripts/tuna-orca-speech-proof"), ["orca-speech"])
         self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
 
@@ -126,6 +126,25 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("scripts/tests/test_colord_startup.py"), ["drm-smoke"])
         # Control: a test only the always-on check job runs adds no lane.
         self.assertEqual(pr("scripts/tests/test_disk_guard.py"), [])
+
+    def test_remote_desktop_reference_inputs_always_run_remote_security(self):
+        # #1169/#1172: the reference harness and the helpers only it runs
+        # rotated remote-security in two runs out of nine, so their gates
+        # (R-EIS-REVOKE, R-GRD-ENABLE) first ran after merge.
+        for path in ("tests/remote-desktop-reference/run.sh",
+                     "tests/remote-desktop-reference/Containerfile",
+                     "scripts/tuna-remote-security",
+                     "scripts/lib/tuna-portal-remote-client.py",
+                     "scripts/lib/tuna-remote-ei.c",
+                     "scripts/lib/tuna-remote-security-client.py"):
+            for run in range(len(m.ROTATION)):
+                with self.subTest(path=path, run=run):
+                    self.assertEqual(pr(path, run=run), ["remote-security", "arch-package"])
+        for run in range(len(m.ROTATION)):
+            self.assertEqual(pr("scripts/lib/tuna-service-identity-probe.c", run=run),
+                             ["gtk-shell", "remote-security", "arch-package"])
+        # Control: another portal helper still rotates.
+        self.assertIn("gtk-shell", pr("scripts/lib/tuna-portal-consent.py", run=0))
 
     def test_proof_example_clients_run_the_lane_that_runs_them(self):
         # G-SUBSURFACE-STACKING's client runs only in the gtk-shell job's

@@ -69,7 +69,8 @@ NEEDS = {
     "niri-parity": ["arch-package"],
     "marlin-image": ["arch-package"],
     "marlin-vm": ["arch-package"],
-    "parity-ledger": ["journey", "gtk-shell", "orca-speech", "drm-smoke", "marlin-vm"],
+    "parity-ledger": ["journey", "gtk-shell", "orca-speech", "drm-smoke", "marlin-vm",
+                      "remote-security"],
     "docs-shots": ["journey", "app-content", "scroll-proof"],
 }
 
@@ -156,6 +157,11 @@ OWNED = [
     ("tests/portal-reference/*", ["portal-security"]),
     ("scripts/tuna-remote-security", ["remote-security"]),
     ("tests/remote-desktop-reference/*", ["remote-security"]),
+    # Helpers only the remote desktop reference harness runs.
+    ("scripts/lib/tuna-portal-remote-client.py", ["remote-security"]),
+    ("scripts/lib/tuna-remote-*", ["remote-security"]),
+    # The in-binary identity probe: G-SCREENSHOT-WINDOWS-DENY and R-GRD-ENABLE.
+    ("scripts/lib/tuna-service-identity-probe.c", ["gtk-shell", "remote-security"]),
     ("scripts/tuna-niri-*", ["niri-parity"]),
     ("tests/niri-reference/*", ["niri-parity"]),
     ("packaging/arch/*", PACKAGE_CONSUMERS),

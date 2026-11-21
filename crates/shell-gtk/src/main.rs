@@ -160,6 +160,7 @@ mod privacy;
 mod privacy_portal;
 mod providers;
 mod public_search_diagnostic;
+mod remote_access;
 mod removable_media;
 mod renderer;
 mod rfkill;
@@ -272,6 +273,9 @@ struct Drained {
     tablet: Vec<TabletUi>,
     /// Mutter's seat touch-mode, when the compositor changed it.
     touch_mode: Option<bool>,
+    /// The latest active remote access grants, when the compositor sent
+    /// them (#1162 F2).
+    remote_access: Option<Vec<tuna_shell_control::RemoteAccessHandle>>,
 }
 
 /// One compositor request for the tablet OSDs (wire 0.45).
@@ -423,6 +427,7 @@ fn drain(
             // Read back through `lock_screen_shown`; a frame was handled,
             // so the screen saver syncs after this drain.
             Handled::LockScreenShown(_) => {}
+            Handled::RemoteAccess(handles) => out.remote_access = Some(handles),
             Handled::CommandResult { id, status } => out.results.push((
                 id,
                 matches!(status, tuna_shell_control::CommandStatus::Applied),
@@ -2254,8 +2259,20 @@ fn build(app: &adw::Application) {
         indicators.append(&image);
         image
     };
-    // Privacy indicators lead (the microphone in use, orange unless
-    // muted).
+    // Privacy indicators lead: GNOME's remote access applet (an active
+    // screen recording other than ours), then the microphone in use
+    // (orange unless muted).
+    let remote_access = {
+        let shell = shell.clone();
+        Rc::new(remote_access::RemoteAccessUi::new(Rc::new(
+            move |kind, id| {
+                if let Some(control) = shell.borrow_mut().control.as_mut() {
+                    let _ = control.stop_remote_access(kind, id);
+                }
+            },
+        )))
+    };
+    indicators.append(&remote_access.recording);
     let panel_mic = status_icon("microphone-sensitivity-medium-symbolic", false);
     panel_mic.update_property(&[gtk::accessible::Property::Label("Microphone in use")]);
     let panel_network = status_icon("network-wired-symbolic", false);
@@ -2541,9 +2558,10 @@ fn build(app: &adw::Application) {
         )
     };
     // AppIndicator items sit right after the screen-recording indicator
-    // (`addToStatusArea(id, icon, 1)` in the extension), ahead of the
-    // dwell-click chooser.
+    // (`addToStatusArea(id, icon, 1)` in the extension), ahead of GNOME's
+    // screen-sharing indicator and the dwell-click chooser.
     end.append(&tray_box);
+    end.append(&remote_access.sharing);
     end.append(&dwell_chooser.button);
     end.append(&input);
     end.append(&a11y);
@@ -4140,6 +4158,7 @@ fn build(app: &adw::Application) {
                     tablet,
                     osk: osk_updates,
                     touch_mode,
+                    remote_access: remote_access_update,
                 } = drained;
                 let mut shell = shell.borrow_mut();
                 let locked = shell.control.as_ref().is_some_and(|c| c.locked());
@@ -4252,6 +4271,12 @@ fn build(app: &adw::Application) {
                         let entry = app_id.and_then(|id| providers::provider_app(&apps, id));
                         close_dialog::app_name(entry.map(|entry| entry.name.as_str()), app_id)
                     });
+                }
+                // GNOME's remote access indicators: a new connection
+                // replays the grants still active.
+                remote_access.sync_connection(auth_generation);
+                if let Some(handles) = remote_access_update {
+                    remote_access.update(&handles);
                 }
                 if locked {
                     pad_osd_ui.close();
