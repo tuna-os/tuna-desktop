@@ -200,7 +200,8 @@ it can affect:
   `parity-ledger`), and any other code picks `gtk-shell` plus a rotating
   slice. Shared CI inputs still pick every lane.
 - A newer push supersedes the older run (`concurrency` with
-  `cancel-in-progress`, except for `main`).
+  `cancel-in-progress`, except for `main`). The superseded run queues no
+  `ci-gate` ([below](#queue-supersession-and-closed-pull-requests)).
 - `marlin-tuna-nightly` qualifies the published image on schedule and
   dispatch only; dispatch it on a branch to test a change to it.
 
@@ -215,6 +216,14 @@ performance baseline. Native concurrency keeps at most one running and one
 pending run per group; it replaces older pending runs, not every main run
 finishing in order. Existing schedule, manual and performance concurrency
 policies remain unchanged.
+
+`ci-gate` runs `if: ${{ !cancelled() }}`, so a cancelled run (superseded, or
+cancelled by hand) skips it instead of queueing it. With `if: always()` the
+superseded run's gate still waited for a `tuna-ci-24.04` slot, and its
+replacement in the same concurrency group stayed `pending` until that slot
+came, for hours while the queue was full (#1258). In a run that is not
+cancelled the gate still runs and still fails when a selected job failed,
+timed out or was cancelled on its own.
 
 Closing a PR does not create a newer run in its concurrency group, so native
 supersession cannot retire its queued work. The repository-owned
