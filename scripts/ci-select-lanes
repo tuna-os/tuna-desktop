@@ -163,6 +163,8 @@ OWNED = [
     ("packaging/marlin/*", ["marlin-image", "marlin-vm"]),
     ("scripts/tuna-vm-lane", ["marlin-vm"]),
     ("scripts/lib/vm_guest_agent.py", ["marlin-vm"]),
+    # The native-desktop driver: marlin-vm's autotz profile drives it (#1013).
+    ("scripts/lib/vm_native_desktop.py", ["marlin-vm"]),
     ("scripts/lib/vm_gnome_reference.py", ["marlin-vm"]),
     ("scripts/lib/vm_strip_*", ["marlin-vm"]),
     ("scripts/tuna-ledger", ["parity-ledger"]),

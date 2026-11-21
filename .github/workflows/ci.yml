@@ -178,6 +178,9 @@ jobs:
       - run: python3 scripts/tests/test_ci_closed_pr_cleanup.py
       - run: python3 scripts/tests/test_ci_prepare_artifacts.py
       - run: python3 scripts/tests/test_vm_guest_agent_deadline.py
+      # The native-desktop driver's readiness verdict and late child
+      # retirement under a fake guest and clock (#1013).
+      - run: python3 scripts/tests/test_vm_native_desktop.py
       - run: python3 scripts/tests/test_vm_reference_login.py
       - run: python3 scripts/tests/test_gnome_reference_guest.py
       - run: python3 scripts/tests/test_native_switcher_reference.py

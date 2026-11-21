@@ -121,8 +121,15 @@ The root `autotz DOMAIN OPERATION JSON` route delegates to the installed
 standalone observer. QGA acquisition and nested commands share finite
 absolute deadlines; reconnecting cannot renew them. Failure diagnostics
 contain only bounded domain/operation/type/sites and optional numeric codes,
-never raw arguments or exception text. Unconfirmed guest-child retirement
-remains fatal. `V-AUTOTZ` requires the consumer's explicit complete qualified
+never raw arguments or exception text. An operation that misses its deadline
+still fails; afterwards the agent polls only the timed-out child's
+`guest-exec-status` for a bounded 10 s grace (on a fresh connection if the
+old one was cut mid-reply) and clears it once the child is seen exiting.
+Unconfirmed guest-child retirement remains fatal. A readiness wait whose
+poll the readiness deadline cut short, with the child retired, fails with its
+own `actual readiness absolute deadline expired` verdict and last
+observation; a timeout with budget left propagates unchanged (#1013).
+`V-AUTOTZ` requires the consumer's explicit complete qualified
 result; an exception, missing native session or missing result fails the
 row and therefore the existing aggregate CI gate. The consumer retains its
 actual original-shell AddAgent, source/provider, daemon location/timezone

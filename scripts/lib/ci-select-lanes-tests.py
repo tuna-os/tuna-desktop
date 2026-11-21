@@ -127,6 +127,14 @@ class Selection(unittest.TestCase):
         # Control: a test only the always-on check job runs adds no lane.
         self.assertEqual(pr("scripts/tests/test_disk_guard.py"), [])
 
+    def test_native_desktop_driver_runs_the_vm_lane_that_drives_it(self):
+        # #1013: a shared-driver change runs the VM lane whose autotz profile
+        # drives it, not whatever slice the rotation picks.
+        for run in range(len(m.ROTATION)):
+            with self.subTest(run=run):
+                self.assertEqual(pr("scripts/lib/vm_native_desktop.py", run=run),
+                                 ["arch-package", "marlin-vm"])
+
     def test_proof_example_clients_run_the_lane_that_runs_them(self):
         # G-SUBSURFACE-STACKING's client runs only in the gtk-shell job's
         # --subsurface-only slice; the check job compiles it.
