@@ -1119,6 +1119,14 @@ jobs:
       # one of them already failed the job.
       - if: ${{ !cancelled() }}
         run: shellcheck -x scripts/tuna-osk-proof && scripts/tuna-osk-proof --artifacts gtk-shell-artifacts/osk
+      # The login screen (#1164, P-LK-03): tuna-compositor --greeter and
+      # tuna-greeter against a GDM 51 and AccountsService mock on a private
+      # system bus, driven through real X11 input and checked through
+      # AT-SPI. Independent of the proofs above, like the OSK proof.
+      - name: Prove the Tuna greeter on GDM's greeter API
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: shellcheck -x scripts/tuna-greeter-proof && scripts/tuna-greeter-proof --artifacts gtk-shell-artifacts/greeter
       # Keep runnable binaries even when a later live proof assertion fails.
       # #1124: tuna-wallpaper-svg is built only by scripts/tuna-gtk-shell-proof
       # and the layer-shell library is installed by the ci-tool step. After an
@@ -2204,6 +2212,7 @@ jobs:
           --assertions ledger-in/gtk-shell/osk/assertions.txt
           --assertions ledger-in/gtk-shell/subsurface/assertions.txt
           --assertions ledger-in/gtk-shell/lock-auth/assertions.txt
+          --assertions ledger-in/gtk-shell/greeter/assertions.txt
           --assertions ledger-in/gtk-shell/ibus-owner/assertions.txt
           --assertions ledger-in/gtk-shell/lock-idle-frames/assertions.txt
           --assertions ledger-in/orca-speech/assertions.txt

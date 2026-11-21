@@ -4125,6 +4125,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuna-auth-prompt"
+version = "0.1.0"
+dependencies = [
+ "gtk4",
+ "tuna-shell-control",
+]
+
+[[package]]
 name = "tuna-backlight"
 version = "0.1.0"
 dependencies = [
@@ -4177,6 +4185,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuna-greeter"
+version = "0.1.0"
+dependencies = [
+ "gio",
+ "glib",
+ "gtk4",
+ "gtk4-layer-shell",
+ "libadwaita",
+ "tempfile",
+ "tuna-auth-prompt",
+ "tuna-shell-control",
+]
+
+[[package]]
 name = "tuna-magnifier"
 version = "0.1.0"
 dependencies = [
@@ -4225,6 +4247,7 @@ dependencies = [
  "serde_json",
  "svgtypes",
  "tempfile",
+ "tuna-auth-prompt",
  "tuna-backlight",
  "tuna-magnifier",
  "tuna-output",

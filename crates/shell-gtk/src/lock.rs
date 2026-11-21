@@ -7,7 +7,7 @@
 //! in once the session is idle) and the unlock prompt, moved between on
 //! GNOME's transition by keys, clicks, drags and touchpad swipes and
 //! scrolls (`lock_curtain.rs`), and drives GNOME's `AuthPrompt` flow over the
-//! control protocol (`lock_auth.rs`): password and fingerprint side by
+//! control protocol (`tuna-auth-prompt`, shared with the greeter): password and fingerprint side by
 //! side, each PAM question in turn, GNOME's messages and Back. When the
 //! password conversation is unavailable it falls back to one redacted
 //! `Unlock` command. It releases its lock surfaces once the compositor's
@@ -23,9 +23,10 @@ use gtk4 as gtk;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4_session_lock as session_lock;
+use tuna_auth_prompt::entry::PromptEntry;
+use tuna_auth_prompt::{AuthMachine, Effect, Host, MessageKind, View};
 use tuna_shell_control::{AuthEvent, AuthService};
 
-use crate::lock_auth::{AuthMachine, Effect, Host, MessageKind, View};
 use crate::lock_curtain::{self, Curtain, Page, Source};
 use crate::lock_notifications::{LockEntry, NotificationsBox};
 use crate::lock_wiggle::Wiggle;
@@ -83,119 +84,6 @@ impl Host for AuthPort {
 fn trace(line: &str) {
     if std::env::var_os("TUNA_LOCK_TRACE").is_some() {
         eprintln!("tuna-shell-gtk: {line}");
-    }
-}
-
-/// GNOME's two prompt entries (authPrompt.js `_passwordEntry`,
-/// `_textEntry`): one at a time in the entry area, swapped with the text
-/// kept when a question changes between hidden and visible input
-/// (`updateEntry`).
-struct PromptEntry {
-    area: gtk::Overlay,
-    password: gtk::PasswordEntry,
-    text: gtk::Entry,
-    secret: Cell<bool>,
-}
-
-impl PromptEntry {
-    fn current(&self) -> gtk::Widget {
-        if self.secret.get() {
-            self.password.clone().upcast()
-        } else {
-            self.text.clone().upcast()
-        }
-    }
-
-    fn editable(&self) -> gtk::Editable {
-        if self.secret.get() {
-            self.password.clone().upcast()
-        } else {
-            self.text.clone().upcast()
-        }
-    }
-
-    fn has_focus(&self) -> bool {
-        let current = self.current();
-        current
-            .root()
-            .and_then(|root| root.focus())
-            .is_some_and(|focus| focus == current || focus.is_ancestor(&current))
-    }
-
-    /// Swap to the hidden or the visible entry (authPrompt.js
-    /// `updateEntry`). Visible text moves into the hidden entry with its
-    /// cursor and selection; hidden text is never revealed: going visible
-    /// empties both.
-    fn set_secret(&self, secret: bool) {
-        if self.secret.get() == secret {
-            return;
-        }
-        let (old, focused) = (self.editable(), self.has_focus());
-        let carried = secret.then(|| (old.text(), old.position(), old.selection_bounds()));
-        self.secret.set(secret);
-        let new = self.editable();
-        self.area.set_child(Some(&self.current()));
-        match carried {
-            Some((text, position, selection)) => {
-                new.set_text(&text);
-                new.set_position(position);
-                if let Some((start, end)) = selection {
-                    new.select_region(start, end);
-                }
-            }
-            None => new.set_text(""),
-        }
-        // The inactive entry keeps no copy of what was typed.
-        old.set_text("");
-        if focused {
-            self.focus();
-        }
-    }
-
-    /// Give the shown entry the keyboard focus without selecting what is
-    /// typed (Clutter's `grab_key_focus`). GtkText's `grab_focus` selects
-    /// all whenever the focus was not inside it, including when it was
-    /// the text itself, so a re-focus while typing would have the next
-    /// key replace the start of the answer (the wake character).
-    fn focus(&self) {
-        match self
-            .editable()
-            .delegate()
-            .and_then(|d| d.downcast::<gtk::Text>().ok())
-        {
-            Some(text) => {
-                text.grab_focus_without_selecting();
-            }
-            None => {
-                self.current().grab_focus();
-            }
-        }
-    }
-
-    /// The question as the hint and accessible label of both entries;
-    /// unchanged, nothing is touched (no accessibility churn).
-    fn set_hint(&self, hint: &str) {
-        let current = self.password.property::<Option<String>>("placeholder-text");
-        if current.as_deref() == Some(hint) && self.text.placeholder_text().as_deref() == Some(hint)
-        {
-            return;
-        }
-        self.password.set_property("placeholder-text", hint);
-        self.text.set_placeholder_text(Some(hint));
-        self.password
-            .update_property(&[gtk::accessible::Property::Label(hint)]);
-        self.text
-            .update_property(&[gtk::accessible::Property::Label(hint)]);
-    }
-
-    fn set_sensitive(&self, sensitive: bool) {
-        self.password.set_sensitive(sensitive);
-        self.text.set_sensitive(sensitive);
-    }
-
-    fn clear(&self) {
-        self.password.set_text("");
-        self.text.set_text("");
     }
 }
 
@@ -316,7 +204,7 @@ impl LockUi {
         port: AuthPort,
         clock_format: Box<dyn Fn() -> logic::ClockFormat>,
     ) -> Rc<Self> {
-        let multiplier = crate::lock_auth::parse_message_multiplier(
+        let multiplier = tuna_auth_prompt::parse_message_multiplier(
             std::env::var("GDM_MESSAGE_TIME_MULTIPLIER").ok().as_deref(),
         );
         let ui = Rc::new(Self {
@@ -610,6 +498,9 @@ impl LockUi {
                         }
                     }
                     Effect::Trace(line) => trace(&line),
+                    // The unlock dialog always retries (`can_retry`'s
+                    // default), so it is never done trying.
+                    Effect::GiveUp => {}
                 }
             }
         }
@@ -750,7 +641,7 @@ impl LockUi {
             }
             widget.add_controller(submit_keys);
         }
-        entry.set_hint(crate::lock_auth::DEFAULT_QUESTION);
+        entry.set_hint(tuna_auth_prompt::DEFAULT_QUESTION);
         // The Submit arrow sits inside the entry's right end.
         let next = gtk::Button::from_icon_name("go-next-symbolic");
         next.add_css_class("next-button");
