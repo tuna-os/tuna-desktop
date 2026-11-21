@@ -55,6 +55,11 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("scripts/tuna-scroll-proof"), ["scroll-proof"])
         # The vkms gates (D-*) live in the DRM smoke.
         self.assertEqual(pr("scripts/tuna-drm-smoke"), ["drm-smoke"])
+        # D-INPUT-AT-STARTUP's helper and its tests run in the DRM smoke.
+        for path in ("scripts/lib/drm_input_startup.py", "scripts/tests/test_drm_input_startup.py"):
+            for run in (0, 4, 19):
+                with self.subTest(path=path, run=run):
+                    self.assertEqual(pr(path, run=run), ["drm-smoke"])
         self.assertEqual(pr("docs/walkthrough.tsv"), ["gtk-shell"])
         self.assertEqual(pr("packaging/marlin/vm-lane/Containerfile"),
                          ["arch-package", "marlin-image", "marlin-vm"])

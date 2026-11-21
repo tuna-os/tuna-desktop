@@ -609,6 +609,18 @@ or a still-missing module fails setup, and package installation errors are
 fatal. Module loading and the real vkms device and presentation assertions
 remain mandatory in the smoke test.
 
+`D-INPUT-AT-STARTUP` (P-IN-04) creates a uinput mouse before the main
+session's compositor starts (`scripts/lib/drm_input_startup.py hold`) and
+requires it among the compositor state's `input_devices` within 10 s of
+the launch, while nothing produces input. libinput queues the devices
+already present when the compositor assigns its seat without making its
+fd readable; the compositor drains that queue on the loop's first
+dispatch and after every session resume
+(`crates/compositor/src/drm/input_drain.rs`). Before that, devices present
+at login were added, and got their settings, only at the first input or
+hotplug: drm-smoke's sessions without input hotplug reported
+`input_devices` `[]` throughout.
+
 The smoke test also drives real libinput with uinput devices (ADR 0008),
 so it needs `python3-evdev` and the GTK 4 PyGObject client packages the
 CI job installs. `D-TABLET` emulates a Wacom Cintiq 22HD
