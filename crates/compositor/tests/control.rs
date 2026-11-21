@@ -1077,6 +1077,11 @@ fn hub_round_reports_whether_anything_arrived_on_its_sockets() {
     assert!(hub.poll(&mut model).received, "a command frame was read");
     assert!(!hub.poll(&mut model).received, "and only once");
 
+    // Hang up with shutdown, not close alone: a concurrent test's child
+    // spawn (ControlHub::bind runs gsettings) holds a duplicate of this
+    // descriptor until its exec, so dropping ours may not release the
+    // socket before the next round looks.
+    client.shutdown(std::net::Shutdown::Both).unwrap();
     drop(client);
     assert!(hub.poll(&mut model).received, "the hang-up was read");
     assert!(!hub.poll(&mut model).received);

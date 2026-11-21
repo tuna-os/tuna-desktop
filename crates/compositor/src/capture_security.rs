@@ -672,6 +672,25 @@ mod tests {
         .unwrap();
         numeric(pid).set_process_fd(descriptor.into())
     }
+    /// Spawn `program` and return once the child runs it. `spawn` returns
+    /// as soon as the child releases this process's memory (glibc
+    /// `posix_spawn` is a vfork), which is before `execve` installs the
+    /// new image: until then `/proc/<pid>/exe` still names this test
+    /// binary, and under load (the child waits on this process's mmap
+    /// lock) that window is long enough to read. A close-on-exec socket
+    /// end the child inherits is closed only after the new image is in
+    /// place, so its peer's EOF marks the exec as done.
+    fn spawn_exec(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> std::process::Child {
+        use std::io::Read;
+        let (mut exec_done, inherited) = std::os::unix::net::UnixStream::pair().unwrap();
+        let child = std::process::Command::new(program)
+            .args(args)
+            .spawn()
+            .unwrap();
+        drop(inherited);
+        assert_eq!(exec_done.read(&mut [0u8; 1]).unwrap(), 0, "exec closes it");
+        child
+    }
     #[test]
     fn remote_desktop_daemon_identity_is_the_root_owned_installed_binary() {
         // This test process, a missing pid and pid 0 are not grd.
@@ -692,10 +711,7 @@ mod tests {
         ));
         // The identity check accepts a root-owned, non-writable binary
         // the process really runs (here coreutils' sleep stands in)...
-        let mut sleep = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
+        let mut sleep = spawn_exec("/bin/sleep", &["60"]);
         assert!(installed_executable(&numeric(sleep.id()), &["/bin/sleep"]));
         assert!(installed_executable(
             &pinned(sleep.id(), sleep.id()),
@@ -719,7 +735,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        let mut spoof = std::process::Command::new(&copy).arg("60").spawn().unwrap();
+        let mut spoof = spawn_exec(&copy, &["60"]);
         let copy_path = copy.to_str().unwrap();
         let spoofed = pinned(spoof.id(), spoof.id());
         assert!(!installed_executable(&spoofed, &[copy_path]));
@@ -733,14 +749,8 @@ mod tests {
     /// before this one) admitted it. An exited pin is no identity either.
     #[test]
     fn a_recycled_pid_does_not_inherit_the_installed_executable() {
-        let mut caller = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
-        let mut genuine = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
+        let mut caller = spawn_exec("/bin/sleep", &["60"]);
+        let mut genuine = spawn_exec("/bin/sleep", &["60"]);
         let recycled = pinned(genuine.id(), caller.id());
         assert!(
             !installed_executable(&recycled, &["/bin/sleep"]),
