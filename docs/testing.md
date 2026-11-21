@@ -1227,6 +1227,14 @@ Read `nested.log` in the artifacts directory first (`compositor.log` for
 retry a deterministic test until it passes: the timing rule in the
 [development guide](development.md#writing-a-test) applies.
 
+If the compositor cannot start the shell at all, for example because
+`--shell-bin` or `TUNA_PROOF_BIN_DIR` names a missing binary, `nested.log`
+says `shell supervision: SpawnFailed { kind: NotFound }` and has no
+`tuna-shell-gtk:` lines. Every gate that waits for the shell then times out,
+usually first as A11Y-PANEL. In CI, the `gtk-shell` slices that use
+`TUNA_PROOF_BIN_DIR` run only after the `proof-binaries` build step
+succeeds.
+
 ## Nested stress and torture suite
 
 `nested stress` (`scripts/tuna-stress`, `.github/workflows/stress.yml`)

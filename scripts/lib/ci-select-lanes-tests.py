@@ -357,6 +357,29 @@ class WorkflowSync(unittest.TestCase):
         # produced on the other events.
         self.assertIn("pull_request", self.jobs["native-reference-context"]["if"])
 
+    def test_gtk_shell_slices_run_on_binaries_this_job_built(self):
+        # The slices run when an unrelated earlier step failed and skipped
+        # the full proof, whose build used to be the only one: they then
+        # launched a compositor with no tuna-shell-gtk and all failed
+        # A11Y-PANEL. Their binaries come from a build step of their own.
+        steps = self.jobs["gtk-shell"]["steps"]
+        build = [s.get("id") for s in steps].index("proof-binaries")
+        self.assertEqual(steps[build].get("if"), "${{ !cancelled() }}")
+        proof = (ROOT / "scripts/tuna-gtk-shell-proof").read_text()
+        packages = "-p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host"
+        self.assertIn(packages, steps[build]["run"])
+        self.assertIn(packages, proof)
+        full = next(i for i, s in enumerate(steps)
+                    if s.get("run", "").strip() == "scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts")
+        self.assertLess(build, full)
+        slices = [(i, s) for i, s in enumerate(steps) if "TUNA_PROOF_BIN_DIR" in (s.get("env") or {})]
+        self.assertGreaterEqual(len(slices), 5)
+        for index, step in slices:
+            with self.subTest(step=step.get("name")):
+                self.assertGreater(index, build)
+                self.assertEqual(step.get("if"),
+                                 "${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}")
+
 
 if __name__ == "__main__":
     unittest.main()

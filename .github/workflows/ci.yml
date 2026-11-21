@@ -1036,6 +1036,18 @@ jobs:
       - run: /usr/bin/python3 scripts/lib/lock-curtain-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/ws-anim-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/gsd-media-keys-bus-tests.py
+      # The binaries the proof builds, in a step of their own: the slices
+      # below run whenever the job is not cancelled and use target/debug,
+      # so they need this commit's shell even when an unrelated earlier step
+      # failed and the full proof was skipped. Without it every slice failed
+      # A11Y-PANEL with no shell binary (jobs 136589617134, 136611210918,
+      # 136757959409). The full proof's own build is then a no-op.
+      - name: Build the nested proof binaries
+        id: proof-binaries
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build --locked -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host
+          cargo build --locked -p tuna-compositor --example icon-probe --example shortcut-inhibit-client
       - run: scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts
         env:
           TUNA_REQUIRE_PAM_WRAPPER: "1"
@@ -1045,7 +1057,7 @@ jobs:
       # Closed windows must free their surfaces and textures (#1088): 100
       # libadwaita windows leave the compositor within a fixed bound.
       - name: Closed windows leave no memory behind
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
         timeout-minutes: 8
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
@@ -1054,7 +1066,7 @@ jobs:
       # from the hot corner and the Activities button, activate a window
       # preview after 750 ms, and return to the starting workspace.
       - name: Client drags through the overview
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
         timeout-minutes: 8
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
@@ -1063,7 +1075,7 @@ jobs:
       # Run the unchanged shared hover/reorder assertions independently of
       # unrelated full-suite assertions, using this job's just-built binaries.
       - name: Stationary-start native DnD grid hover
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
         timeout-minutes: 5
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
@@ -1071,7 +1083,7 @@ jobs:
       # Searches with results must hand their shm buffers back (#1084):
       # the shell's GDK mappings and both processes' descriptors stay put.
       - name: Overview searches leave no shm buffers behind
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
         timeout-minutes: 8
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
@@ -1080,7 +1092,7 @@ jobs:
       # and below it, on the desktop, in the overview and in the window's
       # screenshot (G-SUBSURFACE-STACKING).
       - name: Subsurfaces stack above and below their window
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
         timeout-minutes: 8
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug

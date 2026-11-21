@@ -351,6 +351,9 @@ pub enum SupervisorEvent {
     /// The restart budget is spent; the shell stays down until an
     /// operator-requested relaunch.
     BudgetExhausted,
+    /// The shell could not be started (a missing or non-executable
+    /// `--shell-bin`, for one); a retry is armed. Only the error kind.
+    SpawnFailed { kind: io::ErrorKind },
 }
 
 /// What [`ShellDriver::poll`] found this tick.
@@ -462,6 +465,19 @@ impl ShellDriver {
                     self.reported_exhausted = true;
                 }
                 ShellStatus::Exhausted
+            }
+            Err(SuperviseError::SpawnFailed(e)) => {
+                // Once per absence, and not as a `ShellExited`: no shell
+                // ever ran, so the backoff repeats below stay silent too.
+                if !self.reported_down {
+                    self.events
+                        .push(SupervisorEvent::SpawnFailed { kind: e.kind() });
+                    let delay_ms = supervisor.backoff_remaining_ms(now_ms);
+                    self.events
+                        .push(SupervisorEvent::RestartScheduled { delay_ms });
+                    self.reported_down = true;
+                }
+                ShellStatus::Fault(e.to_string())
             }
             Err(e) => ShellStatus::Fault(e.to_string()),
         }
@@ -638,12 +654,25 @@ mod tests {
             dir.path().join("control.sock"),
         );
         assert!(matches!(driver.poll(0), ShellStatus::Fault(_)));
+        // The missing binary is named once, never as a shell that ran
+        // and exited (CI's A11Y-PANEL cascade logged only that).
+        assert_eq!(
+            driver.drain_events(),
+            vec![
+                SupervisorEvent::SpawnFailed {
+                    kind: io::ErrorKind::NotFound
+                },
+                SupervisorEvent::RestartScheduled { delay_ms: 1_000 },
+            ]
+        );
         // Spawn failure arms the backoff: same tick reports waiting,
-        // never a hot respawn loop.
+        // never a hot respawn loop, and the repeats stay silent.
         assert!(matches!(
             driver.poll(0),
             ShellStatus::Waiting { .. } | ShellStatus::Fault(_)
         ));
+        assert!(matches!(driver.poll(1_000), ShellStatus::Fault(_)));
+        assert!(driver.drain_events().is_empty());
     }
 
     #[test]
@@ -789,6 +818,12 @@ mod tests {
             format!("{:?}", SupervisorEvent::ShellExited { code: Some(1) }),
             format!("{:?}", SupervisorEvent::RestartScheduled { delay_ms: 250 }),
             format!("{:?}", SupervisorEvent::BudgetExhausted),
+            format!(
+                "{:?}",
+                SupervisorEvent::SpawnFailed {
+                    kind: io::ErrorKind::NotFound
+                }
+            ),
             format!("{:?}", ShellStatus::Running),
             format!("{:?}", ShellStatus::Waiting { delay_ms: 250 }),
             format!("{:?}", ShellStatus::Exhausted),
@@ -799,9 +834,10 @@ mod tests {
         assert_eq!(rendered[0], "ShellExited { code: Some(1) }");
         assert_eq!(rendered[1], "RestartScheduled { delay_ms: 250 }");
         assert_eq!(rendered[2], "BudgetExhausted");
-        assert_eq!(rendered[3], "Running");
-        assert_eq!(rendered[4], "Waiting { delay_ms: 250 }");
-        assert_eq!(rendered[5], "Exhausted");
+        assert_eq!(rendered[3], "SpawnFailed { kind: NotFound }");
+        assert_eq!(rendered[4], "Running");
+        assert_eq!(rendered[5], "Waiting { delay_ms: 250 }");
+        assert_eq!(rendered[6], "Exhausted");
         for event in &rendered {
             assert!(!event.contains(title), "diagnostic leaked: {event}");
             assert!(!event.contains(token), "diagnostic leaked: {event}");
