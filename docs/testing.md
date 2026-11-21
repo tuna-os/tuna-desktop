@@ -1110,8 +1110,13 @@ which the parity-ledger job reads.
 ## Parity ledger check
 
 The `parity-ledger` job runs `scripts/tuna-ledger` against the test list
-from `check` and the `assertions.txt` files from the proofs. Reproduce it
-after running the proofs above:
+from `check` and the `assertions.txt` files from the proofs, including all
+three marlin-vm legs it cites: `marlin-vm` (with `app-integration/`),
+`marlin-vm-autotz` (V-AUTOTZ) and `marlin-vm-orca51` (V-ORCA-* with upstream
+Orca 51). A pull request that runs `parity-ledger` therefore also runs the
+Orca 51 leg (`vm_matrix` in `scripts/ci-select-lanes`). The `nested stress`
+workflow's `hotplug` H-* results are a separate workflow and not a ledger
+input. Reproduce it after running the proofs above:
 
 ```sh
 cargo test --workspace -q -- --list --format terse > test-list.txt

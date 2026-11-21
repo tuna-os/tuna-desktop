@@ -77,23 +77,21 @@ jobs:
           if [ "$DRAFT" = true ]; then
             DRAFT=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .draft) || DRAFT=true
           fi
+          # The selector also prints the marlin-vm legs (vm_matrix): a pull
+          # request runs the primary lifecycle leg and the required native
+          # automatic-timezone leg, plus the Orca 51 leg when it runs
+          # parity-ledger, whose V-ORCA-* citations that leg's assertions
+          # feed; the paired GNOME/Tuna references run on main, schedule and
+          # dispatch with the Orca 51 leg (each leg rebuilds the image and
+          # boots a VM for ~30 hosted minutes).
           if [ "$DRAFT" = true ]; then
-            echo 'lanes=[]' >> "$GITHUB_OUTPUT"
+            scripts/ci-select-lanes --draft >> "$GITHUB_OUTPUT"
           elif [ -n "$BASE_SHA" ]; then
             git fetch --no-tags --quiet origin "$BASE_SHA"
             git diff --name-only "$BASE_SHA...HEAD" | scripts/ci-select-lanes --changed - --base "$BASE_SHA" >> "$GITHUB_OUTPUT"
           else
             scripts/ci-select-lanes >> "$GITHUB_OUTPUT"
           fi
-          # marlin-vm legs: a pull request runs the primary lifecycle leg and
-          # the required native automatic-timezone leg (one boot, no tour);
-          # the Orca 51 leg and the paired GNOME/Tuna references run on
-          # main, schedule and dispatch (each leg rebuilds the image and boots
-          # a VM for ~30 hosted minutes).
-          primary='{"profile":"lifecycle","orca":"distribution","artifact":"marlin-vm"},{"profile":"autotz","orca":"distribution","artifact":"marlin-vm-autotz"}'
-          extra='{"profile":"lifecycle","orca":"upstream51","artifact":"marlin-vm-orca51"},{"profile":"gnome-reference","session":"gnome","orca":"distribution","artifact":"native-gnome51-reference"},{"profile":"tuna-reference","session":"tuna","orca":"distribution","artifact":"native-tuna-reference"}'
-          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then legs="$primary"; else legs="$primary,$extra"; fi
-          echo "vm_matrix={\"include\":[$legs]}" >> "$GITHUB_OUTPUT"
 
   check:
     # Typically 10 min, slowest seen 16; a hung test must not hold a runner 6 h.
@@ -2153,7 +2151,9 @@ jobs:
     timeout-minutes: 15
     # GNOME 51 parity ledger gate (#66): every row marked pass must cite
     # tests, and every cited cargo test / journey assertion must have
-    # passed in this run.
+    # passed in this run. `needs: marlin-vm` waits for every leg of its
+    # matrix; selecting this lane adds the Orca 51 leg to a pull request's
+    # matrix (scripts/ci-select-lanes vm_matrix), so its artifact always exists.
     runs-on: *runner-24
     needs: [select-lanes, check, journey, gtk-shell, orca-speech, drm-smoke, marlin-vm]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'parity-ledger')
@@ -2189,6 +2189,14 @@ jobs:
         with:
           name: marlin-vm
           path: ledger-in/marlin-vm
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: marlin-vm-autotz
+          path: ledger-in/marlin-vm-autotz
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: marlin-vm-orca51
+          path: ledger-in/marlin-vm-orca51
       - run: >-
           scripts/tuna-ledger check --tests ledger-in/test-list.txt
           --assertions ledger-in/journey/assertions.txt
@@ -2210,6 +2218,8 @@ jobs:
           --assertions ledger-in/drm-smoke/assertions.txt
           --assertions ledger-in/marlin-vm/assertions.txt
           --assertions ledger-in/marlin-vm/app-integration/assertions.txt
+          --assertions ledger-in/marlin-vm-autotz/assertions.txt
+          --assertions ledger-in/marlin-vm-orca51/assertions.txt
 
   docs-shots:
     timeout-minutes: 20

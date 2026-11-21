@@ -10,7 +10,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / "tuna-ledger"
 HEADER = "| ID | GNOME 51 behavior | Tuna Desktop status | Tests | Evidence / notes | Deviation and owner |\n|---|---|---|---|---|---|\n"
 
 class LedgerQualification(unittest.TestCase):
-    def check(self, rows, *, complete=False, assertions="G-TEST pass test\n", header=HEADER):
+    def check(self, rows, *, complete=False, assertions="G-TEST pass test\n", header=HEADER, extra=()):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "ledger").write_text(header + rows)
@@ -18,6 +18,9 @@ class LedgerQualification(unittest.TestCase):
             (root / "assertions").write_text(assertions)
             argv = [sys.executable, str(SCRIPT), "check", "--ledger", str(root / "ledger"),
                     "--tests", str(root / "tests"), "--assertions", str(root / "assertions")]
+            for index, text in enumerate(extra):
+                (root / f"extra-{index}").write_text(text)
+                argv += ["--assertions", str(root / f"extra-{index}")]
             if complete:
                 argv.append("--require-complete")
             return subprocess.run(argv, capture_output=True, text=True, timeout=60)
@@ -63,6 +66,20 @@ class LedgerQualification(unittest.TestCase):
         self.assertEqual(self.check(self.row(), complete=True, assertions="G-TEST fail test\n").returncode, 1)
         self.assertEqual(self.check(self.row(refs=""), complete=True).returncode, 1)
         self.assertEqual(self.check(self.row(refs="cargo:gone"), complete=True).returncode, 1)
+
+    def test_a_citation_passes_only_with_the_lane_file_that_records_it(self):
+        # A partial row's citations are checked too: a gate recorded only by
+        # another lane's assertions.txt (the VM legs: marlin-vm-orca51,
+        # marlin-vm-autotz) fails until that file is an input.
+        row = self.row(status="partial", refs="proof:G-TEST, proof:V-ORCA-NATIVE-KEYBOARD")
+        withheld = self.check(row)
+        self.assertEqual(withheld.returncode, 1)
+        self.assertIn("P-TEST: proof assertion 'V-ORCA-NATIVE-KEYBOARD' did not pass", withheld.stderr)
+        fed = self.check(row, extra=["V-ORCA-NATIVE-KEYBOARD pass spoken command\n"])
+        self.assertEqual(fed.returncode, 0, fed.stderr)
+        # A failure in any input wins over a pass in another.
+        self.assertEqual(self.check(row, extra=["V-ORCA-NATIVE-KEYBOARD pass a\n",
+                                                "V-ORCA-NATIVE-KEYBOARD fail b\n"]).returncode, 1)
 
 if __name__ == "__main__":
     unittest.main()
