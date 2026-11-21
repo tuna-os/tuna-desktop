@@ -260,6 +260,27 @@ menu's gates alone, the same functions the full GTK proof calls
 wall clock's next minute to see the world clocks tick. The Weather card is
 fed from `TUNA_WEATHER_FIXTURE`, so the slice needs no network.
 
+`scripts/tuna-gtk-shell-proof --panel-dash-only --artifacts DIR` runs
+GNOME 51's top bar and dash checks (`scripts/lib/tuna-panel-dash-proof.sh`,
+measured by `scripts/lib/tuna-panel-dash-check.py`). G-PANEL-LAYOUT (#1199)
+reads Activities, Date and Time and System from the bar's accessible tree,
+in the reading direction, with the clock's centre within one physical pixel
+of the output's; then it hovers each control and measures its drawn pill:
+Activities starts and the system menu ends within GNOME's 3px panel-button
+border of the output's edges, and the clock's pill is centred to a physical
+pixel. GTK reports a padded button's accessible origin at its content box, so
+the edges come from pixels. G-DASH-FAVORITES-RUNNING (#1198) sets
+`org.gnome.shell favorite-apps` (two apps and a missing one between them)
+before the shell starts, with no Tuna pins, runs one favourite and one other
+app, and opens the overview: the dash's accessible tree must list the
+favourites in schema order, then the running app after a separator, then
+Show Apps, along the reading direction, with the running dot (in the tree
+and as near-white pixels under the tile) under exactly the two running apps.
+The slice runs at `TUNA_SCALE` in the proof's locale: a scale other than 1
+adds `-FRACTIONAL` and a right-to-left locale `-RTL` to both gate names. CI
+runs it at 100%, at 125% and under `he_IL.UTF-8`, mirrored as GNOME mirrors
+it; the locale must be generated, or the slice fails.
+
 `scripts/tuna-gtk-shell-proof --search-leak-only --artifacts DIR` runs
 G-SEARCH-LEAK (#1084): after five warm-up searches, 50 overview searches
 with results (`TUNA_SEARCH_LEAK_SEARCHES` sets the count), each typed with

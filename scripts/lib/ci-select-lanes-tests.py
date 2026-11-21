@@ -68,6 +68,10 @@ class Selection(unittest.TestCase):
                           "arch-package", "marlin-vm", "parity-ledger"])
         self.assertEqual(pr("scripts/tuna-orca-speech-proof"), ["orca-speech"])
         self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
+        # The GTK proof sources the top bar and dash slice; only gtk-shell
+        # runs its checker (#1198, #1199).
+        self.assertEqual(pr("scripts/lib/tuna-panel-dash-proof.sh"), ["journey", "gtk-shell"])
+        self.assertEqual(pr("scripts/lib/tuna-panel-dash-check.py"), ["gtk-shell"])
 
 
     def test_transition_policy_and_suite_always_run_journey(self):

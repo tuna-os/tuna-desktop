@@ -127,6 +127,9 @@ OWNED = [
     ("scripts/tuna-a11y-golden", ["gtk-shell"]),
     ("scripts/tuna-wayland-info-compare", ["gtk-shell"]),
     ("scripts/lib/tuna-a11y-proof-guard.py", ["gtk-shell"]),
+    # Sourced by every GTK proof run, journey's installed run included.
+    ("scripts/lib/tuna-panel-dash-proof.sh", ["gtk-shell", "journey"]),
+    ("scripts/lib/tuna-panel-dash-check.py", ["gtk-shell"]),
     ("docs/walkthrough*", ["gtk-shell"]),
     ("scripts/tuna-journey", ["journey"]),
     ("scripts/tuna-release", ["journey"]),

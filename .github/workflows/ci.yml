@@ -1032,6 +1032,7 @@ jobs:
       - run: python3 scripts/lib/cursor-proof-theme-tests.py
       - run: python3 scripts/lib/cursor-pixels-tests.py
       - run: /usr/bin/python3 scripts/lib/wellbeing-pixels-tests.py
+      - run: /usr/bin/python3 scripts/lib/panel-dash-check-tests.py
       - run: /usr/bin/python3 scripts/lib/gtk-folder-watch-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/lock-curtain-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/ws-anim-proof-tests.py
@@ -1076,6 +1077,21 @@ jobs:
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/tuna-gtk-shell-proof --search-leak-only --artifacts gtk-shell-artifacts/search-leak
+      # GNOME 51's top bar and dash (#1198, #1199): Activities at the
+      # leading edge, the clock centred and the system menu at the trailing
+      # edge, and the dash's favourites, running app and running dots, at
+      # 100%, at 125% and right to left (Hebrew).
+      - name: Top bar layout and dash at 100%, 125% and right to left
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: |
+          locale -a | grep -qix 'he_IL.utf8' || sudo locale-gen he_IL.UTF-8
+          scripts/tuna-gtk-shell-proof --panel-dash-only --artifacts gtk-shell-artifacts/panel-dash/scale-1
+          TUNA_SCALE=1.25 scripts/tuna-gtk-shell-proof --panel-dash-only --artifacts gtk-shell-artifacts/panel-dash/scale-1.25
+          LANG=he_IL.UTF-8 LC_ALL=he_IL.UTF-8 scripts/tuna-gtk-shell-proof --panel-dash-only --artifacts gtk-shell-artifacts/panel-dash/rtl
+          cat gtk-shell-artifacts/panel-dash/*/assertions.txt > gtk-shell-artifacts/panel-dash/assertions.txt
       # A window's subsurfaces stack where its client placed them, above
       # and below it, on the desktop, in the overview and in the window's
       # screenshot (G-SUBSURFACE-STACKING).
@@ -2204,6 +2220,7 @@ jobs:
           --assertions ledger-in/gtk-shell/osk/assertions.txt
           --assertions ledger-in/gtk-shell/subsurface/assertions.txt
           --assertions ledger-in/gtk-shell/lock-auth/assertions.txt
+          --assertions ledger-in/gtk-shell/panel-dash/assertions.txt
           --assertions ledger-in/gtk-shell/ibus-owner/assertions.txt
           --assertions ledger-in/gtk-shell/lock-idle-frames/assertions.txt
           --assertions ledger-in/orca-speech/assertions.txt
