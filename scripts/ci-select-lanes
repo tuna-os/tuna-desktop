@@ -92,6 +92,19 @@ OWNED = [
     ("scripts/tuna-scale-proof", ["gtk-shell"]),
     ("scripts/tuna-slow-portal-proof", ["gtk-shell"]),
     ("scripts/tuna-session-restore-proof", ["gtk-shell"]),
+    # Window motion paired with GNOME 51 (#493-#498): the gtk-shell job runs
+    # these proofs on its frozen minimize build, against the distilled
+    # capture.
+    ("scripts/tuna-minimize-ci-proof", ["gtk-shell"]),
+    ("scripts/tuna-minimize-proof", ["gtk-shell"]),
+    ("scripts/tuna-motion-pairing-proof", ["gtk-shell"]),
+    ("scripts/tuna-modal-dim-proof", ["gtk-shell"]),
+    ("scripts/tuna-window-lifecycle-proof", ["gtk-shell"]),
+    ("scripts/tuna-x11-icon-geometry-proof", ["gtk-shell"]),
+    ("scripts/lib/motion_pairing.py", ["gtk-shell"]),
+    ("scripts/lib/tuna-window-lifecycle-client.py", ["gtk-shell"]),
+    ("scripts/lib/tuna-x11-icon-geometry-client.py", ["gtk-shell"]),
+    ("tests/gnome-reference/motion-reference.json", ["gtk-shell"]),
     ("scripts/tuna-walkthrough", ["gtk-shell"]),
     # Example clients only a lane's proof runs (the check job builds every
     # example): G-SUBSURFACE-STACKING's client.

@@ -1081,3 +1081,95 @@ fn hub_round_reports_whether_anything_arrived_on_its_sockets() {
     assert!(hub.poll(&mut model).received, "the hang-up was read");
     assert!(!hub.poll(&mut model).received);
 }
+
+/// #1193: the shell's app launches reach the hub outcome as startup
+/// sequences (mutter's `MetaLaunchContext`); empty or oversized ids are
+/// denied and nothing is queued.
+#[test]
+fn app_launch_startup_sequences_reach_the_hub_outcome() {
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub =
+        ControlHub::bind(path.clone(), std::rc::Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = StateModel::new();
+    let mut client = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut client);
+    let long = "x".repeat(tuna_shell_control::MAX_TITLE_LEN + 1);
+    for (id, app_id, wm_class, applied) in [
+        (1, "org.gnome.TextEditor", Some("gnome-text-editor"), true),
+        (2, "", None, false),
+        (3, long.as_str(), None, false),
+        (4, "xterm", Some(long.as_str()), false),
+        (5, "xterm", None, true),
+    ] {
+        client_write(
+            &mut client,
+            &Message::Command {
+                id,
+                kind: CommandKind::BeginStartupSequence {
+                    app_id: app_id.into(),
+                    wm_class: wm_class.map(Into::into),
+                },
+            },
+        );
+        let outcome = hub.poll(&mut model);
+        let expected = if applied {
+            vec![(app_id.to_owned(), wm_class.map(str::to_owned))]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(outcome.startup_sequences, expected);
+        let Message::CommandResult { id: reply, status } = client_read(&mut client) else {
+            panic!("expected command result");
+        };
+        assert_eq!(reply, id);
+        assert_eq!(matches!(status, CommandStatus::Applied), applied);
+    }
+}
+
+/// `BeginStartupSequence` is new in 0.53: a 0.52 peer gets
+/// `UnknownCommand`, a 0.53 peer's launch is applied.
+#[test]
+fn startup_sequences_require_minor53() {
+    for minor in [52, 53] {
+        let mut model = StateModel::new();
+        let (conn, mut client) = pair();
+        client_write(
+            &mut client,
+            &Message::Hello {
+                version: ProtocolVersion::new(0, minor),
+            },
+        );
+        let mut session = Session::handshake(conn, &model).unwrap();
+        assert!(matches!(client_read(&mut client), Message::Hello { .. }));
+        assert!(matches!(client_read(&mut client), Message::Snapshot { .. }));
+        client_write(
+            &mut client,
+            &Message::Command {
+                id: 31,
+                kind: CommandKind::BeginStartupSequence {
+                    app_id: "org.gnome.TextEditor".into(),
+                    wm_class: None,
+                },
+            },
+        );
+        session.handle_next(&mut model).unwrap();
+        if minor >= 53 {
+            assert_eq!(
+                client_read(&mut client),
+                Message::CommandResult {
+                    id: 31,
+                    status: CommandStatus::Applied,
+                }
+            );
+        } else {
+            assert!(matches!(
+                client_read(&mut client),
+                Message::Error {
+                    kind: ErrorKind::UnknownCommand,
+                    ..
+                }
+            ));
+        }
+    }
+}

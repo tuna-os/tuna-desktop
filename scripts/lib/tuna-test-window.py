@@ -7,7 +7,9 @@ Maps one Adw.ApplicationWindow titled TITLE with a header bar, a big
 label, a menu button whose popover proves xdg popups, and a scrollable
 list that proves wheel scrolling. Exits when the window closes. With
 TUNA_TEST_POPOVER=1 the popover opens by itself once the window shows
-(parity captures cannot rely on headless input). With TUNA_TEST_DRAG=LOG
+(parity captures cannot rely on headless input). TUNA_TEST_SIZE=WxH
+replaces the 640x420 default size, and TUNA_TEST_APP_ID the app id
+(tuna-test-<lowercased TITLE>). With TUNA_TEST_DRAG=LOG
 the big label starts a real GTK drag of its text and takes a drop of it,
 each step (drag-begin, drag-end, drag-cancel, drop) appended to LOG.
 """
@@ -37,7 +39,8 @@ def build(loop):
     # No Gtk.Application: harness windows must not need a session bus.
     win = Adw.Window(title=TITLE)
     win.connect("close-request", lambda *_: loop.quit() or False)
-    win.set_default_size(640, 420)
+    width, height = (int(n) for n in os.environ.get("TUNA_TEST_SIZE", "640x420").split("x"))
+    win.set_default_size(width, height)
     css = Gtk.CssProvider()
     css.load_from_string(f".tuna-test {{ background: {COLOR}; color: white; }}")
     Gtk.StyleContext.add_provider_for_display(
@@ -106,7 +109,7 @@ def build(loop):
 
 
 # Distinct app ids let journeys target each window (xdg_toplevel app_id).
-GLib.set_prgname("tuna-test-" + TITLE.lower())
+GLib.set_prgname(os.environ.get("TUNA_TEST_APP_ID") or "tuna-test-" + TITLE.lower())
 Adw.init()
 main_loop = GLib.MainLoop()
 build(main_loop)

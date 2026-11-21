@@ -234,8 +234,8 @@ pub enum X11ManagerEvent {
     Maximize(u32, bool),
     /// An X11 fullscreen/unfullscreen request (X11 window id, on?).
     Fullscreen(u32, bool),
-    /// An X11 window asked to be iconified (ICCCM `WM_CHANGE_STATE`
-    /// IconicState), which Mutter honours by minimizing it (X11 window id).
+    /// ICCCM `WM_CHANGE_STATE` to IconicState: Mutter minimizes
+    /// (`window-x11.c`); NormalState is not a restore request there.
     Minimize(u32),
 }
 

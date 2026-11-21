@@ -174,6 +174,8 @@
 #               frames: the shell's caret is steady, as GNOME's (#503);
 #               the window never spans the panel clock's minute turn
 #   G-OV-LAUNCH Enter launches the top result and closes the overview
+#   G-BUSY-CURSOR that launch shows the wait cursor while it is pending,
+#               until its window maps (#1193, P-IN-07)
 #   G-OV-APPGRID Show Apps opens the app grid
 #   G-X11-APP      XWayland is on by default: an X11 app launched from
 #                  overview search gets DISPLAY and maps a window (#59)
@@ -187,6 +189,9 @@
 #   G-SETTINGS-INPUT GNOME's input sources set the keymap (Super+Space
 #                  switches), repeat-interval the repeat rate, and
 #                  enable-hot-corners the hot corner (#60)
+#   G-OVERLAY-KEY org.gnome.mutter overlay-key 'Super_R' moves the lone
+#                  overview tap from Super_L to Super_R, '' disables it
+#                  (#1191, P-OV-07)
 #   G-SETTINGS-POINTER GNOME's touchpad, mouse, trackball and pointing-stick
 #                  keys (send-events, click method, scroll methods, tap
 #                  options, middle-click and scroll-wheel emulation,
@@ -493,6 +498,9 @@
 #                  except G-A11Y-MENU-RESTART's one deliberate restart
 
 #   G-APP-DRAG  dragging an app's header bar moves the window (#58)
+#   G-EDGE-RESISTANCE a header drag holds at the screen edge for 32 px,
+#               a keyboard move (Alt+F7) stops on it, and Shift snaps a
+#               drag flush to an edge (#1192, P-WM-12)
 #   G-TILE-PREVIEW dragging a window to the left edge shows GNOME's tile
 #               preview over the left half; dragging back drops it
 #   G-EDGE-TILING-OFF with org.gnome.mutter edge-tiling off the same
@@ -504,6 +512,8 @@
 #               again compacts (P-WM-08)
 #   G-CENTER-NEW-WINDOWS new windows are centred, or take mutter's first
 #               fit with center-new-windows off (P-WM-08)
+#   G-AUTO-MAXIMIZE a first map over 80% of the work area opens
+#               maximized; with auto-maximize off it floats (#1190, P-WM-12)
 #   G-TRAY      an AppIndicator item shows in the panel with its
 #               tooltip, its menu row reaches the item, and the row
 #               leaves the panel when the item exits (P-TR-01)
@@ -709,10 +719,25 @@ for t in alpha beta gamma delta; do
     printf '[Desktop Entry]\nName=Tuna Desktop Test %s\nExec=true\nType=Application\nNoDisplay=true\n' "$t" \
         >"$XDG_DATA_HOME/applications/tuna-test-$t.desktop"
 done
+# While $PROBE_HOLD exists, a launched probe stays pending with no window
+# until the file goes, then maps a window of its own app id
+# (G-BUSY-CURSOR); otherwise it leaves only the marker.
+PROBE_HOLD="$ARTIFACTS/probe-hold"
+rm -f "$PROBE_HOLD"
+mkdir -p "$ARTIFACTS/bin"
+cat >"$ARTIFACTS/bin/tuna-probe" <<EOF
+#!/bin/sh
+"$PY" "$ARTIFACTS/launch-environment.py" "$PROBE_MARKER" || exit
+[ -e "$PROBE_HOLD" ] || exit 0
+echo \$\$ >"$ARTIFACTS/probe-window.pid"
+while [ -e "$PROBE_HOLD" ]; do sleep 0.1; done
+TUNA_TEST_APP_ID=tuna-probe exec "$PY" "$ROOT/scripts/lib/tuna-test-window.py" "Tuna Probe" "#c061cb"
+EOF
+chmod +x "$ARTIFACTS/bin/tuna-probe"
 cat >"$XDG_DATA_HOME/applications/tuna-probe.desktop" <<EOF
 [Desktop Entry]
 Name=Tuna Probe
-Exec=$PY $ARTIFACTS/launch-environment.py $PROBE_MARKER
+Exec=$ARTIFACTS/bin/tuna-probe
 Icon=applications-system
 Type=Application
 EOF
@@ -828,11 +853,6 @@ cleanup() {
     if [ -n "$OCCLUSION_PIDS" ]; then kill $OCCLUSION_PIDS 2>/dev/null || true; fi
     # shellcheck disable=SC2086
     if [ -n "$IME_PIDS" ]; then kill $IME_PIDS 2>/dev/null || true; fi
-    # The bridge daemonized ibus-daemon for this session's display.
-    if [ -n "${SOCKET_NAME:-}" ] && command -v ibus >/dev/null 2>&1; then
-        env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" \
-            ibus exit >/dev/null 2>&1 || true
-    fi
     if [ -n "$SCREENSAVER_PID" ]; then kill "$SCREENSAVER_PID" 2>/dev/null || true; fi
     if [ -n "$CAL_PID" ]; then kill "$CAL_PID" 2>/dev/null || true; fi
     for gsd_pid in $GSD_MEDIA_KEYS_PID $MPRIS_PID $GSD_BUS_PID $PW_PULSE_PID; do
@@ -1941,16 +1961,17 @@ subsurface_sample() {
         SUBSURFACE_BAD="${SUBSURFACE_BAD:+$SUBSURFACE_BAD; }$1: $6 shows $sub_got, not $5"
     fi
 }
+# subsurface_point SCENE PNG X Y W H CX CY WANT NAME: samples the client
+# point (CX, CY) of the 400x300 window drawn at (X, Y) at W x H in PNG.
+subsurface_point() {
+    subsurface_sample "$1" "$2" $(($3 + $7 * $5 / 400)) $(($4 + $8 * $6 / 300)) "$9" "${10}"
+}
 # subsurface_scene SCENE PNG X Y W H: the window's geometry (400x300 in
 # the client) drawn at (X, Y) at W x H in PNG.
 subsurface_scene() {
-    sub_at() { echo "$(($3 + $1 * $5 / 400)) $(($4 + $2 * $6 / 300))"; }
-    # shellcheck disable=SC2046
-    subsurface_sample "$1" "$2" $(sub_at 200 50 "$3" "$4" "$5" "$6") "$SUBSURFACE_RED" "the parent"
-    # shellcheck disable=SC2046
-    subsurface_sample "$1" "$2" $(sub_at 100 150 "$3" "$4" "$5" "$6") "$SUBSURFACE_GREEN" "the subsurface placed above"
-    # shellcheck disable=SC2046
-    subsurface_sample "$1" "$2" $(sub_at 350 150 "$3" "$4" "$5" "$6") "$SUBSURFACE_RED" "the parent over the subsurface placed below"
+    subsurface_point "$1" "$2" "$3" "$4" "$5" "$6" 200 50 "$SUBSURFACE_RED" "the parent"
+    subsurface_point "$1" "$2" "$3" "$4" "$5" "$6" 100 150 "$SUBSURFACE_GREEN" "the subsurface placed above"
+    subsurface_point "$1" "$2" "$3" "$4" "$5" "$6" 350 150 "$SUBSURFACE_RED" "the parent over the subsurface placed below"
 }
 subsurface_stacking_gate() {
     SUBSURFACE_BAD=""
@@ -2595,6 +2616,93 @@ cstate "(.pointer_position == [$((bx + 270)), $((by + 80))]) and (.windows[] | s
     fail G-APP-DRAG "dragging Beta's header bar did not move it by the drag distance"
 pass G-APP-DRAG "dragging an app's header bar moves the window (#58)"
 
+# Edge resistance and snapping (#1192; mutter 51 edge-resistance.c): a
+# header drag 20 or 31 px past the left screen edge holds the window on
+# it and 40 px past (beyond mutter's 32 px) goes through; a keyboard move
+# (Alt+F7, then Left in 10 px steps) stops on the edge it would cross;
+# Shift snaps a drag flush to an edge. Beta goes back where it was. The
+# comparison slice's old binaries predate edge resistance.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    read -r er_id er_x er_y er_w er_h er_ws <<EOF2
+$(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | "\(.id) \(.rect[0]) \(.rect[1]) \(.rect[2]) \(.rect[3]) \(.workspace)"' "$CSTATE")
+EOF2
+    er_gy=$((er_y + 20))
+    er_rect() { jq -c --argjson id "$er_id" '[.windows[] | select(.id == $id)][0].rect' "$CSTATE"; }
+    # Press Beta's header bar with the window's left edge at $1 and let
+    # GTK hand its move to the compositor; er_px and er_wx are then the
+    # pointer's and the window's x, which move together from there.
+    er_grab() {
+        xdotool mousemove --window "$WID" $(($1 + 120)) "$er_gy"
+        xdotool mousedown 1
+        xdotool mousemove --window "$WID" $(($1 + 131)) "$er_gy"
+        cstate ".interactive_move_window == $er_id and .pointer_position == [$(($1 + 131)), $er_gy]" "Beta move admitted" ||
+            { xdotool mouseup 1; fail G-EDGE-RESISTANCE "GTK never handed Beta's header drag to the compositor"; }
+        er_px=$(($1 + 131))
+        er_wx="$(er_rect | jq '.[0]')"
+    }
+    # Move the pointer so the window's left edge would be at $1 if
+    # nothing resisted, and wait for it to be at $2.
+    er_drag() {
+        er_to=$((er_px + $1 - er_wx))
+        xdotool mousemove --window "$WID" "$er_to" "$er_gy"
+        cstate ".pointer_position == [$er_to, $er_gy] and ([.windows[] | select(.id == $er_id)][0].rect[0] == $2)" "$3" 5 ||
+            { xdotool mouseup 1; fail G-EDGE-RESISTANCE "$4: Beta at $(er_rect)"; }
+    }
+    er_grab "$er_x"
+    er_drag -20 0 "held 20 px past the edge" "a drag 20 px past the left screen edge did not hold Beta on it"
+    er_drag -31 0 "held 31 px past the edge" "a drag 31 px past the left screen edge did not hold Beta on it"
+    snapshot_state "$CSTATE" "$ARTIFACTS/edge-resistance-held.json"
+    er_drag -40 -40 "through 40 px past the edge" "a drag 40 px past the left screen edge did not go through"
+    er_drag 47 47 "free away from the edge" "a drag away from the edge was resisted"
+    xdotool mouseup 1
+    cstate ".interactive_move_window == null and ([.windows[] | select(.id == $er_id)][0].rect == [47, $er_y, $er_w, $er_h])" "Beta dropped at x 47" ||
+        fail G-EDGE-RESISTANCE "Beta did not stay where the drag left it: $(er_rect)"
+    # A keyboard move stops on the first edge it crosses, another
+    # window's too: none may lie between Beta and the screen edge.
+    jq -e --argjson id "$er_id" --argjson ws "$er_ws" --argjson y "$er_y" --argjson h "$er_h" \
+        '[.windows[] | select(.id != $id and .workspace == $ws) | .rect | select(.[1] < $y + $h and .[1] + .[3] > $y) | .[0], .[0] + .[2] | select(. > -3 and . < 47)] | length == 0' \
+        "$CSTATE" >/dev/null ||
+        fail G-EDGE-RESISTANCE "another window's edge lies between Beta and the screen edge; the keyboard move would stop there first"
+    xdotool key alt+F7
+    cstate ".interactive_move_window == $er_id" "keyboard move" 5 ||
+        fail G-EDGE-RESISTANCE "Alt+F7 did not start a keyboard move of Beta"
+    for er_step in 37 27 17 7 0; do
+        xdotool key Left
+        cstate "[.windows[] | select(.id == $er_id)][0].rect[0] == $er_step" "keyboard move to x $er_step" 5 ||
+            { xdotool key Escape; fail G-EDGE-RESISTANCE "Left in the keyboard move did not take Beta to x $er_step (10 px steps, stopping on the screen edge): $(er_rect)"; }
+    done
+    snapshot_state "$CSTATE" "$ARTIFACTS/edge-resistance-keyboard.json"
+    xdotool key Return
+    cstate ".interactive_move_window == null and ([.windows[] | select(.id == $er_id)][0].rect == [0, $er_y, $er_w, $er_h])" "keyboard move ended on the edge" 5 ||
+        fail G-EDGE-RESISTANCE "Return did not end the keyboard move on the screen edge: $(er_rect)"
+    # Shift: a drag to x 30 lands flush on the nearest edge instead.
+    er_grab 0
+    xdotool keydown Shift_L
+    er_to=$((er_px + 30 - er_wx))
+    xdotool mousemove --window "$WID" "$er_to" "$er_gy"
+    cstate ".pointer_position == [$er_to, $er_gy]" "Shift drag delivered" 5 ||
+        { xdotool keyup Shift_L mouseup 1; fail G-EDGE-RESISTANCE "the Shift drag never reached the compositor"; }
+    sleep 0.3
+    snapshot_state "$CSTATE" "$ARTIFACTS/edge-resistance-snapped.json"
+    xdotool mouseup 1
+    xdotool keyup Shift_L
+    jq -e --argjson id "$er_id" --argjson ws "$er_ws" --argjson y "$er_y" --argjson width "$WIDTH" '
+        ([.windows[] | select(.id == $id)][0].rect) as $r |
+        ([0, $width] + [.windows[] | select(.id != $id and .workspace == $ws) | .rect | .[0], .[0] + .[2]]) as $edges |
+        $r[0] != 30 and $r[1] == $y and any($edges[]; . == $r[0] or . == $r[0] + $r[2])
+        ' "$ARTIFACTS/edge-resistance-snapped.json" >/dev/null ||
+        fail G-EDGE-RESISTANCE "a Shift drag to x 30 did not snap Beta flush to an edge: $(jq -c --argjson id "$er_id" '[.windows[] | select(.id == $id)][0].rect' "$ARTIFACTS/edge-resistance-snapped.json")"
+    er_snapped="$(jq -c --argjson id "$er_id" '[.windows[] | select(.id == $id)][0].rect' "$ARTIFACTS/edge-resistance-snapped.json")"
+    cstate ".interactive_move_window == null and ([.windows[] | select(.id == $er_id)][0].rect == $er_snapped) and .tile_preview == null" "snapped drop" 5 ||
+        fail G-EDGE-RESISTANCE "Beta did not stay snapped and floating at $er_snapped after the drop: $(er_rect)"
+    er_grab "$(echo "$er_snapped" | jq '.[0]')"
+    er_drag "$er_x" "$er_x" "Beta back" "Beta could not be dragged back"
+    xdotool mouseup 1
+    cstate ".interactive_move_window == null and ([.windows[] | select(.id == $er_id)][0].rect == [$er_x, $er_y, $er_w, $er_h])" "Beta back where it was" ||
+        fail G-EDGE-RESISTANCE "Beta did not go back to where it was: $(er_rect)"
+    pass G-EDGE-RESISTANCE "a header drag holds at the screen edge for 32 px and then goes through, a keyboard move stops on the edge it crosses, and Shift snaps a drag flush to an edge"
+fi
+
 # Edge tiling: held at the left edge, GNOME's tile preview covers the
 # left half (accent at half opacity); dragged back, it goes and the
 # window does not tile.
@@ -3047,6 +3155,49 @@ EOF2
     cstate ".active_workspace == $mt_home" "home after placement" ||
         fail G-CENTER-NEW-WINDOWS "could not return to the home workspace"
     pass G-CENTER-NEW-WINDOWS "new windows are centred with center-new-windows and take mutter's first fit without it"
+
+    # org.gnome.mutter auto-maximize (#1190; mutter 51 place.c:1088-1100):
+    # a window first mapping over 80% of the work area
+    # (MAX_UNMAXIMIZED_WINDOW_AREA) opens maximized; with the key off the
+    # same window keeps its size.
+    xdotool key super+Page_Down
+    cstate ". as \$s | .active_workspace != $mt_home and ([.windows[] | select(.workspace == \$s.active_workspace)] | length) == 0" "empty workspace" ||
+        fail G-AUTO-MAXIMIZE "Super+Page_Down did not reach an empty workspace"
+    am_work_area="[0, 32, $WIDTH, $((HEIGHT - 32))]"
+    for am_on in true false; do
+        if [ "$am_on" = false ]; then
+            gsettings set org.gnome.mutter auto-maximize false
+            cstate '.multitasking.auto_maximize == false' "auto-maximize off" ||
+                fail G-AUTO-MAXIMIZE "auto-maximize=false never reached the compositor"
+        fi
+        WAYLAND_DISPLAY="$SOCKET_NAME" TUNA_TEST_SIZE=1200x720 "$PY" "$ROOT/scripts/lib/tuna-test-window.py" \
+            Delta "#9141ac" >"$ARTIFACTS/window-Delta-auto-maximize-$am_on.log" 2>&1 &
+        am_pid=$!
+        cstate ". as \$s | .focused_app_id == \"tuna-test-delta\" and any(.windows[]; .app_id == \"tuna-test-delta\" and .workspace == \$s.active_workspace and .rect[2] > 0)" "large window mapped" ||
+            fail G-AUTO-MAXIMIZE "the 1200x720 window never mapped"
+        sleep 1
+        snapshot_state "$CSTATE" "$ARTIFACTS/auto-maximize-$am_on.json"
+        scrot "$ARTIFACTS/08g-auto-maximize-$am_on.png" >/dev/null
+        am_rect="$(jq -c '[.windows[] | select(.app_id == "tuna-test-delta")][0].rect' "$ARTIFACTS/auto-maximize-$am_on.json")"
+        if [ "$am_on" = true ]; then
+            [ "$am_rect" = "$(echo "$am_work_area" | jq -c .)" ] ||
+                fail G-AUTO-MAXIMIZE "a 1200x720 first map in the ${WIDTH}x$((HEIGHT - 32)) work area opened at $am_rect, not maximized to $am_work_area"
+        else
+            echo "$am_rect" | jq -e --argjson work "$am_work_area" '.[2] < $work[2] and .[3] < $work[3] and .[2] * .[3] * 10 > $work[2] * $work[3] * 8' >/dev/null ||
+                fail G-AUTO-MAXIMIZE "with auto-maximize off the 1200x720 window opened at $am_rect, not floating over 80% of the work area"
+        fi
+        kill "$am_pid"
+        wait "$am_pid" 2>/dev/null || true
+        cstate 'all(.windows[]; .app_id != "tuna-test-delta")' "large window gone" ||
+            fail G-AUTO-MAXIMIZE "the test window did not close"
+    done
+    gsettings reset org.gnome.mutter auto-maximize
+    cstate '.multitasking.auto_maximize == true' "auto-maximize restored" ||
+        fail G-AUTO-MAXIMIZE "resetting auto-maximize did not reach the compositor"
+    xdotool key super+Page_Up
+    cstate ".active_workspace == $mt_home" "home after auto-maximize" ||
+        fail G-AUTO-MAXIMIZE "could not return to the home workspace"
+    pass G-AUTO-MAXIMIZE "a first map over 80% of the work area opens maximized to it; with auto-maximize off the same window floats at its own size"
 fi
 for key in cycle-group cycle-group-backward cycle-windows cycle-windows-backward switch-windows switch-windows-backward; do
     gsettings reset org.gnome.desktop.wm.keybindings "$key"
@@ -3203,6 +3354,10 @@ if [ "$GRID_CANCEL_OLD_NEGATIVE" != 1 ]; then
     pass G-OV-SEARCH-STILL "the focused overview search sits still: no frames while nothing changes"
 fi
 
+# The probe launched now holds its window back (G-BUSY-CURSOR below). The
+# comparison slice's old binaries predate startup sequences.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then touch "$PROBE_HOLD"; fi
+busy_launched=$(date +%s)
 xdotool key Return
 end=$(($(date +%s) + 15))
 until [ -f "$PROBE_MARKER" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
@@ -3211,6 +3366,37 @@ cmp -s "$PROBE_MARKER" "$ARTIFACTS/launch-environment-expected.json" ||
     fail G-OV-LAUNCH "desktop-entry launch inherited shell-private portal flags"
 cstate '.overview_open | not' "closed" || fail G-OV-LAUNCH "overview stayed open after launch"
 pass G-OV-LAUNCH "Enter launches the top result with the caller's portal flags and closes the overview"
+
+# GNOME's busy cursor (#1193; mutter 51 compositor.c:1132-1146): the
+# shell's launch is a startup sequence, and while it is pending the theme
+# cursors the compositor picks become the wait cursor (a client's own
+# cursor surface stays, as in mutter, so the pointer rests on the
+# desktop); the launched app's window completes it, long before mutter's
+# 15 s timeout would.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    jq -e '.windows | all(.rect | 150 < .[0] or 150 >= .[0] + .[2] or 500 < .[1] or 500 >= .[1] + .[3])' "$CSTATE" >/dev/null ||
+        fail G-BUSY-CURSOR "a window covers the desktop point 150,500"
+    xdotool mousemove --window "$WID" 150 500
+    busy_pending='.pointer_position == [150, 500] and .startup.busy and any(.startup.pending[]; .app_id == "tuna-probe" and .source == "launch") and .cursor.source == "busy" and .cursor.name == "wait"'
+    cstate "$busy_pending" "busy cursor while the launch is pending" 5 ||
+        fail G-BUSY-CURSOR "the pending launch did not show the wait cursor on the desktop"
+    snapshot_state "$CSTATE" "$ARTIFACTS/busy-cursor-pending.json"
+    scrot "$ARTIFACTS/10b-busy-cursor.png" >/dev/null
+    sleep 1
+    jq -e "$busy_pending" "$CSTATE" >/dev/null ||
+        fail G-BUSY-CURSOR "the wait cursor did not last while the launch stayed pending"
+    rm -f "$PROBE_HOLD"
+    cstate '.pointer_position == [150, 500] and any(.windows[]; .app_id == "tuna-probe") and (.startup.busy | not) and (.startup.pending | length) == 0 and .cursor.source == "default" and .cursor.name == "default"' "launch completed by its window" 10 ||
+        fail G-BUSY-CURSOR "the probe's window mapped but the wait cursor stayed"
+    [ "$(date +%s)" -lt $((busy_launched + 14)) ] ||
+        fail G-BUSY-CURSOR "the wait cursor cleared too late to tell the window's map from mutter's 15 s timeout"
+    snapshot_state "$CSTATE" "$ARTIFACTS/busy-cursor-completed.json"
+    kill "$(cat "$ARTIFACTS/probe-window.pid")"
+    cstate 'all(.windows[]; .app_id != "tuna-probe")' "probe window closed" ||
+        fail G-BUSY-CURSOR "the probe's window did not close"
+    xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
+    pass G-BUSY-CURSOR "a pending launch turns the desktop's default cursor into the wait cursor (startup sequence from the shell) until its window maps, then the default returns"
+fi
 
 # An app installed while the shell runs is searchable at once (GNOME
 # watches the application directories too).
@@ -6280,6 +6466,50 @@ cstate '.keyboard.layout == "German"' "German again" ||
 gsettings set org.gnome.desktop.peripherals.keyboard repeat-interval 50
 cstate '.keyboard.repeat_rate == 20' "repeat" ||
     fail G-SETTINGS-INPUT "repeat-interval 50 ms did not set 20 keys/s"
+# org.gnome.mutter overlay-key (#1191; mutter 51 prefs.c:1474-1526): the
+# lone-key overview tap follows it live. 'Super_R' leaves Super_L
+# nothing to toggle and Super_R the overview; '' disables both. A key
+# that must not toggle is watched for 1.5 s. Super_R is tapped by its X
+# keycode (134, <RWIN>): xdotool's keysym lookup holds Super_L with it,
+# which is no lone tap.
+overlay_super_r=134
+overlay_stays_closed() {
+    for _ in 1 2 3 4 5; do
+        jq -e '.overview_open | not' "$CSTATE" >/dev/null || return 1
+        sleep 0.3
+    done
+}
+cstate '.overview_open | not' "overview closed before overlay-key" ||
+    fail G-OVERLAY-KEY "the overview was open before the overlay-key change"
+gsettings set org.gnome.mutter overlay-key 'Super_R'
+cstate '.multitasking.overlay_key == "Super_R" and .multitasking.overlay_keycodes == [126]' "overlay-key Super_R" ||
+    fail G-OVERLAY-KEY "overlay-key='Super_R' never reached the compositor as one key"
+xdotool key Super_L
+overlay_stays_closed || fail G-OVERLAY-KEY "Super_L still toggled the overview with overlay-key 'Super_R'"
+xdotool key "$overlay_super_r"
+cstate '.overview_open' "Super_R opens the overview" 5 ||
+    fail G-OVERLAY-KEY "Super_R did not toggle the overview with overlay-key 'Super_R'"
+xdotool key "$overlay_super_r"
+cstate '.overview_open | not' "Super_R closes the overview" 5 ||
+    fail G-OVERLAY-KEY "a second Super_R tap did not close the overview"
+gsettings set org.gnome.mutter overlay-key ''
+cstate '.multitasking.overlay_key == "" and .multitasking.overlay_keycodes == []' "overlay-key disabled" ||
+    fail G-OVERLAY-KEY "overlay-key='' never reached the compositor as no key"
+for overlay_tap in Super_L "$overlay_super_r"; do
+    xdotool key "$overlay_tap"
+    overlay_stays_closed || fail G-OVERLAY-KEY "key $overlay_tap toggled the overview with overlay-key ''"
+done
+gsettings reset org.gnome.mutter overlay-key
+overlay_default="$(gsettings get org.gnome.mutter overlay-key | tr -d "'")"
+cstate ".multitasking.overlay_key == \"$overlay_default\" and (.multitasking.overlay_keycodes | length) >= 1" "overlay-key restored" ||
+    fail G-OVERLAY-KEY "resetting overlay-key did not reach the compositor"
+xdotool key Super_L
+cstate '.overview_open' "Super_L opens the overview again" 5 ||
+    fail G-OVERLAY-KEY "Super_L did not toggle the overview after overlay-key was reset"
+xdotool key Escape
+cstate '.overview_open | not' "overview closed after overlay-key" ||
+    fail G-OVERLAY-KEY "the overview did not close"
+pass G-OVERLAY-KEY "overlay-key 'Super_R' moves the overview tap from Super_L to Super_R, '' disables it, and the reset brings Super_L back"
 gsettings set org.gnome.desktop.interface enable-hot-corners false
 sleep 1
 xdotool mousemove --window "$WID" 1 1

@@ -103,6 +103,7 @@ pub mod display_config;
 pub mod dnd_overview;
 #[cfg(feature = "drm")]
 pub mod drm;
+pub mod edge_resistance;
 pub mod edid;
 pub(crate) mod focus_caret;
 pub mod focus_policy;
@@ -169,6 +170,7 @@ pub mod size_change;
 pub mod sleep;
 pub mod slideshow;
 pub mod spring;
+pub mod startup;
 pub mod state;
 mod state_snapshot;
 pub mod supervise;
@@ -322,6 +324,8 @@ pub struct State {
     /// Serial of the latest pointer button press sent to a client: Mutter's
     /// `grab_serial`, which xdg_toplevel.show_window_menu must name.
     pub(crate) pointer_press_serial: Option<Serial>,
+    /// Pending app launches' startup sequences: the busy cursor (#1193).
+    pub startup: startup::StartupNotification,
     /// Exact native parent at role destruction, consumed on the next reconcile.
     /// Smithay clears role data immediately after `toplevel_destroyed` returns.
     pub(crate) closed_toplevel_parents:
@@ -1325,6 +1329,7 @@ impl State {
             retired_output_globals: Vec::new(),
             window_requests: Vec::new(),
             pointer_press_serial: None,
+            startup: startup::StartupNotification::default(),
             closed_toplevel_parents: std::collections::HashMap::new(),
             pongs: Vec::new(),
             protocols: protocols::Protocols::new(dh),

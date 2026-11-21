@@ -507,6 +507,12 @@ impl overview::OverviewActions for ShellActions {
         }
     }
 
+    fn launch_started(&self, app_id: &str) {
+        if let Some(control) = self.0.borrow_mut().control.as_mut() {
+            let _ = control.begin_startup_sequence(app_id);
+        }
+    }
+
     fn window_icon(&self, id: u64) -> Option<String> {
         self.0
             .borrow()
@@ -2003,6 +2009,24 @@ fn take_screenshot(window: bool, notify: Rc<notify::NotifyUi>) {
             },
         );
     });
+}
+
+/// org.gnome.mutter `auto-maximize` and `overlay-key` (mutter 51
+/// prefs.c:380,423; #1190, #1191) into `out`. A schema without a key
+/// leaves `out`'s value, GNOME 51's default.
+fn read_auto_maximize_and_overlay_key(
+    mutter: &gio::Settings,
+    out: &mut tuna_shell_control::InputSettings,
+) {
+    let Some(schema) = mutter.settings_schema() else {
+        return;
+    };
+    if schema.has_key("auto-maximize") {
+        out.auto_maximize = mutter.boolean("auto-maximize");
+    }
+    if schema.has_key("overlay-key") {
+        out.overlay_key = mutter.string("overlay-key").to_string();
+    }
 }
 
 fn build(app: &adw::Application) {
@@ -3793,6 +3817,7 @@ fn build(app: &adw::Application) {
                     {
                         out.center_new_windows = mutter.boolean("center-new-windows");
                     }
+                    read_auto_maximize_and_overlay_key(mutter, &mut out);
                 }
                 if let Some(mutter) = all[8].as_ref() {
                     if let Some(schema) = mutter.settings_schema() {
@@ -4549,4 +4574,82 @@ fn main() -> glib::ExitCode {
     app.connect_startup(privacy_portal::start);
     app.connect_activate(build);
     app.run_with_args::<&str>(&[])
+}
+
+#[cfg(test)]
+mod mutter_prefs_tests {
+    use super::read_auto_maximize_and_overlay_key;
+    use gio::prelude::*;
+    use tuna_shell_control::InputSettings;
+
+    /// org.gnome.mutter from `xml`, compiled into a private directory,
+    /// over a memory backend.
+    fn mutter(xml: &str) -> (tempfile::TempDir, gio::Settings) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("org.gnome.mutter.gschema.xml"), xml).unwrap();
+        assert!(std::process::Command::new("glib-compile-schemas")
+            .arg("--strict")
+            .arg(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        let source = gio::SettingsSchemaSource::from_directory(dir.path(), None, false).unwrap();
+        let schema = source.lookup("org.gnome.mutter", false).unwrap();
+        let backend = gio::memory_settings_backend_new();
+        let settings = gio::Settings::new_full(&schema, Some(&backend), None);
+        (dir, settings)
+    }
+
+    /// The GNOME 51 keys the nested proofs install where mutter's schema
+    /// is missing: their defaults are InputSettings', and live values
+    /// replace them, `''` (no overlay key) included.
+    #[test]
+    fn auto_maximize_and_overlay_key_are_read_from_org_gnome_mutter() {
+        let (_dir, settings) = mutter(include_str!(
+            "../../../tests/settings/gnome51-mutter.gschema.xml"
+        ));
+        let mut out = InputSettings {
+            auto_maximize: false,
+            overlay_key: "stale".into(),
+            ..InputSettings::default()
+        };
+        read_auto_maximize_and_overlay_key(&settings, &mut out);
+        let defaults = InputSettings::default();
+        assert_eq!(
+            (out.auto_maximize, out.overlay_key.as_str()),
+            (defaults.auto_maximize, defaults.overlay_key.as_str())
+        );
+        assert_eq!(
+            (out.auto_maximize, out.overlay_key.as_str()),
+            (true, "Super")
+        );
+
+        settings.set_boolean("auto-maximize", false).unwrap();
+        settings.set_string("overlay-key", "Super_R").unwrap();
+        read_auto_maximize_and_overlay_key(&settings, &mut out);
+        assert_eq!(
+            (out.auto_maximize, out.overlay_key.as_str()),
+            (false, "Super_R")
+        );
+
+        settings.set_string("overlay-key", "").unwrap();
+        read_auto_maximize_and_overlay_key(&settings, &mut out);
+        assert_eq!(out.overlay_key, "");
+    }
+
+    /// A mutter schema without the keys keeps the values already there.
+    #[test]
+    fn a_schema_without_the_keys_keeps_the_defaults() {
+        let (_dir, settings) = mutter(
+            r#"<schemalist>
+  <schema id="org.gnome.mutter" path="/org/gnome/mutter/">
+    <key name="center-new-windows" type="b"><default>false</default></key>
+  </schema>
+</schemalist>"#,
+        );
+        let mut out = InputSettings::default();
+        read_auto_maximize_and_overlay_key(&settings, &mut out);
+        assert!(out.auto_maximize);
+        assert_eq!(out.overlay_key, "Super");
+    }
 }

@@ -1,0 +1,585 @@
+#!/usr/bin/env bash
+# tuna-ibus-owner-proof: exactly one party owns the session's ibus-daemon,
+# and session end leaves none of it behind (#1014).
+#
+# Usage: scripts/tuna-ibus-owner-proof [ARTIFACT_DIR]
+#
+# Runs the real nested compositor (winit on Xvfb, private session bus,
+# private HOME) twice and reads the processes it leaves:
+#
+#   own   No IBus unit exists for the session (nested sessions never name
+#         one). The bridge starts one `ibus-daemon --panel disable` that is
+#         its own child, not daemonized (it leads its own process group,
+#         as ibus-daemon always does); the bus file's IBUS_DAEMON_PID names
+#         it, and it is the only ibus-daemon for the display. After SIGTERM
+#         to the compositor (what logind's session stop sends) neither it
+#         nor its config component (ibus-dconf, or ibus-memconf) is left,
+#         and the compositor logged that it retired the bridge's group and
+#         the daemon's. Before that end, G-IBUS-OWNER-RESTART: the bridge
+#         stands in for the daemon's unit manager. A daemon a signal ended
+#         is replaced at once (within 10 s) by a new child of the same
+#         bridge (as the unit's Restart=on-abnormal would); a SIGKILLed
+#         bridge takes its daemon, the daemon's config component and the
+#         rest of its group with it, and the compositor's replacement
+#         bridge starts a daemon of its own, waiting out a start-up the
+#         proof slows past 10 s; a daemon that quit (`ibus exit`) stays
+#         gone for longer than the bridge's longest IBus retry; and the
+#         bridge after that quit starts its own again. Never two daemons
+#         for the display. A daemon's own start-up (its bus, its config
+#         component) gets what GNOME's session gives its IBus unit:
+#         systemd's 90 s start timeout.
+#   unit  The session names a user unit (TUNA_IBUS_UNIT, as the compositor
+#         does on the hardware session) that a stub `systemctl` reports
+#         down while the session is not up yet, then up: the bridge starts
+#         no daemon of its own before that, asks the manager once, and
+#         the single daemon is the unit's (a stub systemd detaches it, so it
+#         is not the bridge's child or in its group). Session end retires
+#         nothing of the manager's; the stub manager then stops its unit,
+#         as systemd does at session end (the unit is PartOf=
+#         gnome-session-initialized.target).
+#
+# In both modes, after session end no ibus-* process of the display's
+# (by WAYLAND_DISPLAY in its environment, so a daemonized escapee counts)
+# is left running.
+#
+# Writes assertions.txt (one `GATE pass|fail text` line each).
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+art=${1:-$root/ibus-owner-artifacts}
+mkdir -p "$art"
+art=$(realpath "$art")
+assertions="$art/assertions.txt"
+: >"$assertions"
+
+for tool in ibus-daemon ibus Xvfb dbus-run-session pgrep ps python3; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "tuna-ibus-owner-proof: $tool is required" >&2
+        exit 1
+    }
+done
+ibus_daemon=$(command -v ibus-daemon)
+
+cargo build --locked --manifest-path "$root/Cargo.toml" -p tuna-compositor -p tuna-shell-host
+bin_dir=${CARGO_TARGET_DIR:-$root/target}/debug
+
+pass() {
+    echo "$1 pass $2" >>"$assertions"
+    echo "tuna-ibus-owner-proof: $1 pass: $2"
+}
+fail() {
+    echo "$1 fail $2" >>"$assertions"
+    echo "tuna-ibus-owner-proof: $1 FAIL: $2" >&2
+    tail -30 "${log:-/dev/null}" >&2 || true
+    exit 1
+}
+
+# Whatever a session started, should a gate fail part way: the proof must
+# not itself leave behind the processes it looks for. Runs at the end of
+# each session's subshell, after its gates.
+teardown() {
+    local pid
+    pkill -TERM -f "^[^ ]*/tuna-compositor --backend winit --socket $socket( |$)" 2>/dev/null || true
+    sleep 1
+    for pid in $(pgrep '^ibus' || true); do
+        if tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx "WAYLAND_DISPLAY=$socket"; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+    [ -z "${bus_done:-}" ] || touch "$bus_done"
+    [ -z "${runner:-}" ] || kill "$runner" 2>/dev/null || true
+    [ -z "${xvfb:-}" ] || kill "$xvfb" 2>/dev/null || true
+    rm -rf "${run:-}"
+}
+
+restart_gate=G-IBUS-OWNER-RESTART
+
+# The live (not zombie) pids among $@, one per line.
+alive() {
+    local pid stat
+    for pid in "$@"; do
+        stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+        case "$stat" in "" | Z*) ;; *) echo "$pid" ;; esac
+    done
+}
+
+# Runs "${@:2}" every 0.25 s until it succeeds; fails after $1 seconds.
+within() {
+    local tries=$(($1 * 4))
+    shift
+    for _ in $(seq 1 "$tries"); do
+        "$@" && return 0
+        sleep 0.25
+    done
+    return 1
+}
+
+# The display's live ibus-daemons, whoever started them, one per line.
+display_daemons() {
+    local pid
+    for pid in $(pgrep -x ibus-daemon || true); do
+        if tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx "WAYLAND_DISPLAY=$socket"; then
+            alive "$pid"
+        fi
+    done
+}
+
+# What still runs of the pids $@ and of the process groups they lead.
+left_of() {
+    local pid groups=()
+    for pid in "$@"; do
+        mapfile -t -O "${#groups[@]}" groups < <(pgrep -g "$pid" || true)
+    done
+    alive "$@" "${groups[@]}" | sort -u | tr '\n' ' '
+}
+
+gone() {
+    [ -z "$(left_of "$@")" ]
+}
+
+# Succeeds, setting $child, once the display's one ibus-daemon is a new one
+# (not $2) that is the bridge $1's own: its non-daemonized child, leading
+# its own process group. ibus-daemon's setpgid comes early in its own
+# start-up, so a child not leading one yet is looked at again. A second
+# daemon, or one that is not the bridge's, fails the gate.
+bridge_child() {
+    local daemons=() ppid pgid args
+    mapfile -t daemons < <(display_daemons)
+    [ "${#daemons[@]}" -le 1 ] ||
+        fail "$restart_gate" "more than one ibus-daemon for $socket: ${daemons[*]}"
+    [ "${#daemons[@]}" = 1 ] && [ "${daemons[0]}" != "$2" ] || return 1
+    read -r ppid pgid < <(ps -o ppid=,pgid= -p "${daemons[0]}") || return 1
+    [ "$ppid" = "$1" ] ||
+        fail "$restart_gate" "ibus-daemon ${daemons[0]}'s parent is $ppid, not the bridge ($1)"
+    args=$(tr '\0' ' ' <"/proc/${daemons[0]}/cmdline")
+    case "$args" in
+    *--daemonize* | *" -d "*) fail "$restart_gate" "ibus-daemon is daemonized: $args" ;;
+    esac
+    [ "$pgid" = "${daemons[0]}" ] || return 1
+    child=${daemons[0]}
+}
+
+# Succeeds, setting $owner, once the bus file names the bridge $1's new
+# daemon (bridge_child, not $2): the daemon's own start-up is done.
+bridge_daemon() {
+    bridge_child "$1" "$2" || return 1
+    [ "$(sed -n 's/^IBUS_DAEMON_PID=//p' "$busfile" 2>/dev/null)" = "$child" ] || return 1
+    owner=$child
+}
+
+# bridge_daemon for the compositor's first replacement bridge, whose daemon
+# start is slowed: that bridge exiting meanwhile (it gave its slow daemon
+# up) fails the gate.
+patient_daemon() {
+    logged "tuna-compositor: ime: bridge exited" 2 &&
+        fail "$restart_gate" "the replacement bridge gave up on its slow ibus-daemon: $(grep -m1 'tuna-ibus-bridge: ibus-daemon did not come up' "$log" || true)"
+    bridge_daemon "$1" "$2"
+}
+
+# Succeeds, setting $components, once the daemon $owner runs its config
+# component.
+daemon_components() {
+    mapfile -t components < <(pgrep -P "$owner" -x 'ibus-dconf|ibus-memconf' || true)
+    [ "${#components[@]}" -gt 0 ]
+}
+
+# Succeeds, setting $bridge, once the compositor runs a bridge other than $1.
+new_bridge() {
+    local pids=() found
+    mapfile -t pids < <(pgrep -P "$compositor" -f '(^|/)tuna-ibus-bridge( |$)' || true)
+    found=$(alive "${pids[@]}" | head -1)
+    [ -n "$found" ] && [ "$found" != "$1" ] || return 1
+    bridge=$found
+}
+
+# Succeeds once at least $2 lines of the session log hold $1.
+logged() {
+    [ "$(grep -c -- "$1" "$log" || true)" -ge "$2" ]
+}
+
+# What the gate last saw, for a failure: the display's daemons with their
+# parents and process groups, and the daemon the bus file names.
+seen() {
+    local pid listed=""
+    for pid in $(display_daemons); do
+        listed+="$pid (parent, group $(ps -o ppid=,pgid= -p "$pid" | tr -s ' ' | sed 's/^ //; s/ /, /')) "
+    done
+    echo "daemons: ${listed:-none }bus file names: $(sed -n 's/^IBUS_DAEMON_PID=//p' "$busfile" 2>/dev/null)"
+}
+
+# How long a daemon's own start-up may take, up to its bus and its config
+# component: what GNOME's session gives its IBus unit (Type=dbus, so
+# systemd's DefaultTimeoutStartSec, 90 s). A loaded host has taken more
+# than 30 s here with the new daemon already the bridge's child.
+daemon_start=90
+
+# G-IBUS-OWNER-RESTART, in the own session before it ends (see the top).
+# Runs within session(), whose $bridge, $owner, $components, $compositor,
+# $busfile, $socket, $log, $dir and $slow_start it reads; it leaves the
+# last bridge and its daemon in $bridge, $owner and $components for the
+# session's end.
+restart_case() {
+    local old old_bridge old_components=() daemons child first started
+    local trail="$dir/restart.txt"
+    echo "start: bridge $bridge, daemon $owner, components ${components[*]}" >"$trail"
+
+    # A daemon a signal ended: the same bridge starts a new one at once, as
+    # the unit's manager would (Restart=on-abnormal, after systemd's 100 ms
+    # RestartSec): on its next look for IBus, 250 ms on.
+    old=$owner
+    old_components=("${components[@]}")
+    kill -KILL "$old"
+    within 10 bridge_child "$bridge" "$old" ||
+        fail "$restart_gate" "the bridge started no new ibus-daemon of its own within 10 s of $old's SIGKILL; $(seen)"
+    within "$daemon_start" bridge_daemon "$bridge" "$old" ||
+        fail "$restart_gate" "the bridge's new ibus-daemon $child never published its bus; $(seen)"
+    logged "tuna-ibus-bridge: ibus-daemon ended (signal: 9" 1 ||
+        fail "$restart_gate" "the bridge never logged replacing the daemon a signal ended"
+    [ -n "$(alive "$bridge")" ] || fail "$restart_gate" "the bridge died with its daemon"
+    within 10 gone "$old" "${old_components[@]}" ||
+        fail "$restart_gate" "the SIGKILLed daemon's group still holds: $(left_of "$old" "${old_components[@]}")"
+    within "$daemon_start" daemon_components ||
+        fail "$restart_gate" "the replacement daemon $owner never started its config component"
+    echo "daemon $old SIGKILLed: bridge $bridge started daemon $owner (components ${components[*]})" >>"$trail"
+
+    # A bridge killed while its daemon runs: nothing of its group, its
+    # daemon or the daemon's group is left, and the compositor's
+    # replacement bridge starts a daemon of its own. That daemon's start-up
+    # is slowed past 10 s ($slow_start): the bridge waits it out, as GNOME's
+    # session waits for its IBus unit, and never gives it up for another.
+    old_bridge=$bridge old=$owner
+    old_components=("${components[@]}")
+    : >"$slow_start"
+    kill -KILL "$old_bridge"
+    within 10 gone "$old_bridge" "$old" "${old_components[@]}" ||
+        fail "$restart_gate" "the SIGKILLed bridge left behind: $(left_of "$old_bridge" "$old" "${old_components[@]}")"
+    within 10 logged "tuna-compositor: ime: bridge exited (signal: 9" 1 ||
+        fail "$restart_gate" "the compositor never logged the bridge's exit"
+    within 30 new_bridge "$old_bridge" ||
+        fail "$restart_gate" "the compositor did not restart the SIGKILLed bridge"
+    within 10 bridge_child "$bridge" "$old" ||
+        fail "$restart_gate" "the replacement bridge $bridge started no ibus-daemon of its own within 10 s; $(seen)"
+    first=$child started=$SECONDS
+    within "$daemon_start" patient_daemon "$bridge" "$old" ||
+        fail "$restart_gate" "the replacement bridge's slow ibus-daemon $first never published its bus; $(seen)"
+    [ -e "$slow_start.taken" ] || fail "$restart_gate" "the replacement bridge's daemon start was not the slowed one"
+    [ "$owner" = "$first" ] ||
+        fail "$restart_gate" "the replacement bridge's daemon is $owner, not the slow one it started ($first)"
+    within "$daemon_start" daemon_components ||
+        fail "$restart_gate" "the replacement bridge's daemon $owner never started its config component"
+    # Up and on its daemon's bus before that daemon quits: a daemon gone
+    # before the bridge's start-up ends that bridge, which is the
+    # compositor's to restart, not the quit this gate is after.
+    within 30 logged "tuna-ibus-bridge: ready" 2 ||
+        fail "$restart_gate" "the replacement bridge $bridge never came up on its daemon"
+    echo "bridge $old_bridge SIGKILLed with daemon $old: bridge $bridge started daemon $owner, which published its bus $((SECONDS - started)) s later" >>"$trail"
+
+    # A daemon that quit stays gone, as its unit's would.
+    old=$owner
+    old_components=("${components[@]}")
+    env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$socket" \
+        ibus exit >>"$trail" 2>&1 || fail "$restart_gate" "ibus exit failed"
+    within 10 gone "$old" "${old_components[@]}" ||
+        fail "$restart_gate" "ibus exit left: $(left_of "$old" "${old_components[@]}")"
+    # The bridge looks at its daemon on its IBus retry backoff (at most 5 s).
+    within 30 logged "tuna-ibus-bridge: ibus-daemon quit (exit status: 0)" 1 ||
+        fail "$restart_gate" "the bridge never saw its daemon quit"
+    # Longer than that backoff, from the bridge's verdict.
+    for _ in $(seq 1 28); do
+        daemons=$(display_daemons | tr '\n' ' ')
+        [ -z "$daemons" ] || fail "$restart_gate" "an ibus-daemon came back after ibus exit: $daemons"
+        sleep 0.25
+    done
+    [ -n "$(alive "$bridge")" ] || fail "$restart_gate" "the bridge did not outlive its daemon's quit"
+    logged "tuna-ibus-bridge: ibus-daemon ended" 2 &&
+        fail "$restart_gate" "the bridge restarted the daemon that quit"
+    echo "daemon $old quit (ibus exit): none for 7 s, bridge $bridge still running" >>"$trail"
+
+    # The bridge after that quit, killed: the compositor's next bridge
+    # starts its own daemon again (the one session end then retires).
+    old_bridge=$bridge
+    kill -KILL "$old_bridge"
+    within 10 gone "$old_bridge" ||
+        fail "$restart_gate" "the SIGKILLed bridge left behind: $(left_of "$old_bridge")"
+    within 30 new_bridge "$old_bridge" ||
+        fail "$restart_gate" "the compositor did not restart the bridge a second time"
+    within 10 bridge_child "$bridge" "$old" ||
+        fail "$restart_gate" "the second replacement bridge $bridge started no ibus-daemon of its own within 10 s; $(seen)"
+    within "$daemon_start" bridge_daemon "$bridge" "$old" ||
+        fail "$restart_gate" "the second replacement bridge's ibus-daemon $child never published its bus; $(seen)"
+    within "$daemon_start" daemon_components ||
+        fail "$restart_gate" "the second replacement bridge's daemon $owner never started its config component"
+    within 30 logged "tuna-ibus-bridge: ready" 3 ||
+        fail "$restart_gate" "the second replacement bridge $bridge never came up on its daemon"
+    echo "bridge $old_bridge SIGKILLed after the quit: bridge $bridge started daemon $owner" >>"$trail"
+    pass "$restart_gate" "the bridge replaced its SIGKILLed ibus-daemon with a child of its own at once; a SIGKILLed bridge took its daemon, config component and group with it and the compositor's replacement started its own, waiting out a start-up slowed past 10 s; after ibus exit no daemon returned for 7 s; never two daemons"
+}
+
+# One session. $1 is the mode (own|unit); runs under its own private bus,
+# in a subshell, so the globals it sets for teardown stay its own.
+session() {
+    local mode=$1
+    local dir="$art/$mode"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    socket=tuna-ibus-$mode-$$
+    runner="" xvfb="" bus_done=""
+    run=$(mktemp -d "${TMPDIR:-/tmp}/tuna-ibus-$mode.XXXXXX")
+    trap teardown EXIT
+    chmod 700 "$run"
+    export XDG_RUNTIME_DIR=$run
+    export HOME=$dir/home XDG_CONFIG_HOME=$dir/config XDG_CACHE_HOME=$dir/cache
+    export XDG_DATA_HOME=$dir/data XDG_STATE_HOME=$dir/state
+    export GSETTINGS_BACKEND=keyfile
+    mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
+    log=$dir/nested.log
+    local gate=G-IBUS-OWNER-${mode^^}
+
+    local xvfb_display="$dir/xvfb-display"
+    "$root/scripts/lib/tuna-xvfb" -displayfd 3 -screen 0 1024x768x24 \
+        3>"$xvfb_display" >"$dir/xvfb.log" 2>&1 &
+    xvfb=$!
+    for _ in $(seq 1 60); do [ -s "$xvfb_display" ] && break; sleep 0.5; done
+    [ -s "$xvfb_display" ] || fail "$gate" "Xvfb did not start"
+    DISPLAY=":$(cat "$xvfb_display")"
+    export DISPLAY
+
+    if [ "$mode" = unit ]; then
+        mkdir -p "$dir/stub"
+        export STUB_DIR=$dir/stub
+        cat >"$dir/stub/systemctl" <<'STUB'
+#!/bin/sh
+# A stand-in user manager with one IBus unit. The session is "not up"
+# for the first three is-active probes of its initialized target.
+echo "$*" >>"$STUB_DIR/calls"
+case "$*" in
+*"show "*)
+    echo "LoadState=loaded"
+    if [ -e "$STUB_DIR/started" ]; then echo "ActiveState=active"; else echo "ActiveState=inactive"; fi
+    ;;
+*"is-active --quiet gnome-session-initialized.target"*)
+    n=$(cat "$STUB_DIR/probes" 2>/dev/null || echo 0)
+    echo $((n + 1)) >"$STUB_DIR/probes"
+    [ "$n" -ge 3 ]
+    ;;
+*"start "*)
+    touch "$STUB_DIR/started"
+    # The manager, not the caller, owns what a unit starts: a detached
+    # parent that outlives this call, as systemd does (a non-daemonized
+    # ibus-daemon quits when its parent dies).
+    setsid sh -c 'ibus-daemon --panel disable & wait' >"$STUB_DIR/unit-daemon.log" 2>&1 </dev/null &
+    ;;
+esac
+STUB
+        chmod +x "$dir/stub/systemctl"
+        export PATH=$dir/stub:$PATH
+        export TUNA_IBUS_UNIT=tuna-proof-ibus.service
+    else
+        unset TUNA_IBUS_UNIT
+        # The session's ibus-daemon is the installed one, except for the one
+        # start G-IBUS-OWNER-RESTART asks for by creating $slow_start: that
+        # start takes 15 s (longer than a bridge used to wait) before the
+        # daemon proper runs, as a loaded host's has. Meanwhile it is what
+        # ibus-daemon is early in its own start-up: named ibus-daemon,
+        # leading its own process group, no bus yet.
+        slow_start=$dir/slow-start
+        mkdir -p "$dir/shim"
+        {
+            echo '#!/bin/sh'
+            printf 'daemon=%q slow=%q\n' "$ibus_daemon" "$slow_start"
+            cat <<'SHIM'
+mv "$slow" "$slow.taken" 2>/dev/null || exec "$daemon" "$@"
+exec python3 -c '
+import ctypes, os, sys, time
+ctypes.CDLL(None).prctl(15, b"ibus-daemon", 0, 0, 0)
+os.setpgid(0, 0)
+time.sleep(15)
+os.execv(sys.argv[1], ["ibus-daemon"] + sys.argv[2:])
+' "$daemon" "$@"
+SHIM
+        } >"$dir/shim/ibus-daemon"
+        chmod +x "$dir/shim/ibus-daemon"
+        export PATH=$dir/shim:$PATH
+    fi
+
+    # Compositor and daemon run under one private bus, which outlives the
+    # compositor as the user's bus outlives a session: session end, not
+    # the bus going away, must be what retires a daemon.
+    bus_done="$dir/bus-done"
+    # shellcheck disable=SC2016 # expanded by the inner shell
+    LIBGL_ALWAYS_SOFTWARE=1 WINIT_UNIX_BACKEND=x11 GDK_BACKEND=x11 BUS_DONE="$bus_done" \
+        dbus-run-session -- sh -c '
+            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u IBUS_ADDRESS -u BUS_DONE "$@"
+            while [ ! -e "$BUS_DONE" ]; do sleep 0.2; done' sh \
+        "$bin_dir/tuna-compositor" --backend winit --socket "$socket" \
+        --width 1024 --height 768 --shell-bin "$bin_dir/tuna-shell-host" >"$log" 2>&1 &
+    runner=$!
+    local ready=0
+    for _ in $(seq 1 120); do
+        grep -q "tuna-ibus-bridge: ready" "$log" && { ready=1; break; }
+        kill -0 "$runner" 2>/dev/null || break
+        sleep 0.5
+    done
+    [ "$ready" = 1 ] || fail "$gate" "the IBus bridge never came up"
+
+    local compositor bridge
+    # Anchored: dbus-run-session's own command line holds the same words.
+    compositor=$(pgrep -f "^[^ ]*/tuna-compositor --backend winit --socket $socket( |$)" | head -1 || true)
+    bridge=$(pgrep -P "$compositor" -f '(^|/)tuna-ibus-bridge( |$)' | head -1 || true)
+    if [ -z "$compositor" ] || [ -z "$bridge" ]; then
+        fail "$gate" "no compositor or bridge process"
+    fi
+
+    # The bus file of this display names the daemon that owns the bus.
+    local busfile owner
+    busfile=$(grep -l -s "" "$XDG_CONFIG_HOME"/ibus/bus/*-"$socket" | head -1 || true)
+    [ -n "$busfile" ] || fail "$gate" "no IBus bus file for $socket"
+    owner=$(sed -n 's/^IBUS_DAEMON_PID=//p' "$busfile")
+    [ -n "$owner" ] || fail "$gate" "the bus file names no daemon pid"
+
+    # Every ibus-daemon for this display, whoever started it.
+    local daemons=() pid
+    for pid in $(pgrep -x ibus-daemon); do
+        if tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx "WAYLAND_DISPLAY=$socket"; then
+            daemons+=("$pid")
+        fi
+    done
+    {
+        echo "bus file: $busfile (owner pid $owner)"
+        echo "ibus-daemon pids for $socket: ${daemons[*]:-}"
+        ps -o pid,ppid,pgid,sid,args -p "${daemons[*]:-0}" 2>&1 || true
+        echo "bridge pid $bridge, compositor pid $compositor"
+    } >"$dir/processes.txt"
+    [ "${#daemons[@]}" = 1 ] ||
+        fail "$gate" "expected one ibus-daemon for $socket, found ${#daemons[@]}: ${daemons[*]:-}"
+    [ "${daemons[0]}" = "$owner" ] ||
+        fail "$gate" "the one ibus-daemon (${daemons[0]}) is not the bus file's owner ($owner)"
+    local args
+    args=$(tr '\0' ' ' <"/proc/$owner/cmdline")
+    case "$args" in
+    *"--panel disable"*) ;;
+    *) fail "$gate" "ibus-daemon lost --panel disable: $args" ;;
+    esac
+    case "$args" in
+    *--daemonize* | *" -d "*) fail "$gate" "ibus-daemon is daemonized: $args" ;;
+    esac
+    local ppid pgid
+    read -r ppid pgid < <(ps -o ppid=,pgid= -p "$owner")
+
+    # The daemon's config component: ibus-dconf, or ibus-memconf where the
+    # daemon picks that. #1014's logout hang was one left in the scope.
+    local components=()
+    for _ in $(seq 1 40); do
+        mapfile -t components < <(pgrep -P "$owner" -x 'ibus-dconf|ibus-memconf' || true)
+        [ "${#components[@]}" -gt 0 ] && break
+        sleep 0.25
+    done
+    [ "${#components[@]}" -gt 0 ] || fail "$gate" "the daemon never started its config component"
+
+    if [ "$mode" = own ]; then
+        [ "$ppid" = "$bridge" ] ||
+            fail "$gate" "ibus-daemon's parent is $ppid, not the bridge ($bridge)"
+        [ "$pgid" = "$owner" ] ||
+            fail "$gate" "ibus-daemon does not lead its own process group ($pgid)"
+        pass "$gate" "one ibus-daemon (pid $owner) owns the bus file: the bridge's own non-daemonized child"
+    else
+        if [ "$ppid" = "$bridge" ] || [ "$pgid" = "$bridge" ]; then
+            fail "$gate" "the bridge started a daemon beside its unit (parent $ppid group $pgid)"
+        fi
+        local starts
+        starts=$(grep -c -- '--no-block start tuna-proof-ibus.service' "$STUB_DIR/calls" || true)
+        [ "$starts" = 1 ] ||
+            fail "$gate" "the unit was started $starts times, not once"
+        [ "$(cat "$STUB_DIR/probes")" -gt 3 ] ||
+            fail "$gate" "the unit was started before the session was up"
+        grep -q "no IBus unit" "$log" &&
+            fail "$gate" "the bridge started its own daemon in a session with a unit"
+        pass "$gate" "one ibus-daemon (pid $owner) owns the bus file: the unit's, started once after the session came up, none of the bridge's"
+    fi
+
+    if [ "$mode" = own ]; then restart_case; fi
+
+    # Session end, as logind's session stop does it.
+    kill -TERM "$compositor"
+    for _ in $(seq 1 60); do
+        kill -0 "$compositor" 2>/dev/null || break
+        sleep 0.5
+    done
+    kill -0 "$compositor" 2>/dev/null && fail "$gate" "the compositor did not exit on SIGTERM"
+
+    # Live ibus-* processes of this display, wherever they sit (a
+    # daemonized daemon leaves the bridge's group and session), plus
+    # whatever is still in the bridge's group or the daemon's, and the
+    # daemon and its config component themselves. A dead process awaiting
+    # its parent's reap is not running.
+    display_ibus() {
+        local pid stat
+        {
+            pgrep -g "$bridge" || true
+            pgrep -g "$owner" || true
+            echo "$owner"
+            printf '%s\n' "${components[@]}"
+            for pid in $(pgrep '^ibus' || true); do
+                if tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx "WAYLAND_DISPLAY=$socket"; then
+                    echo "$pid"
+                fi
+            done
+        } | sort -u | while read -r pid; do
+            stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+            case "$stat" in "" | Z*) ;; *) echo "$pid" ;; esac
+        done | tr '\n' ' '
+    }
+    # Polls until display_ibus is empty or ~5 s pass; prints what is left.
+    settle() {
+        local left=""
+        for _ in $(seq 1 20); do
+            left=$(display_ibus)
+            left=${left% }
+            [ -z "$left" ] && break
+            sleep 0.25
+        done
+        echo "$left"
+    }
+    # What was left, for the artifacts.
+    record_left() {
+        if [ -n "$1" ]; then
+            ps -o pid,ppid,pgid,stat,args -p "$1" 2>&1 || true
+        else
+            echo "nothing left"
+        fi >"$dir/left-after-end.txt"
+    }
+
+    local left
+    if [ "$mode" = own ]; then
+        left=$(settle)
+        record_left "$left"
+        [ -z "$left" ] || fail "$gate-END" "ibus processes survived session end: $left"
+        grep -q "tuna-compositor: ime: bridge group retired pid=$bridge groups=2 " "$log" ||
+            fail "$gate-END" "the compositor never logged retiring the bridge's group and the daemon's"
+        pass "$gate-END" "no ibus-daemon, config component or other ibus process of the display remains after the compositor ends the session"
+    else
+        left=$(pgrep -g "$bridge" | tr '\n' ' ' || true)
+        left=${left% }
+        [ -z "$left" ] || fail "$gate-END" "the bridge's group still holds: $left"
+        grep -q "tuna-compositor: ime: bridge group retired pid=$bridge groups=1 " "$log" ||
+            fail "$gate-END" "the compositor did not retire the bridge's group alone"
+        kill -0 "$owner" 2>/dev/null ||
+            fail "$gate-END" "session end killed the manager's daemon (its manager stops it)"
+        # The stub manager stops its unit as systemd does: SIGTERM to
+        # everything the unit started (ibus-daemon leads its own group).
+        kill -TERM -- "-$owner" 2>/dev/null || true
+        left=$(settle)
+        record_left "$left"
+        [ -z "$left" ] || fail "$gate-END" "ibus processes survived the unit's stop: $left"
+        pass "$gate-END" "session end retired nothing of the manager's; once the manager stopped its unit no ibus process of the display remains"
+    fi
+    touch "$bus_done"
+    wait "$runner" 2>/dev/null || true
+    kill "$xvfb" 2>/dev/null || true
+    wait "$xvfb" 2>/dev/null || true
+    rm -rf "$run"
+}
+
+for mode in own unit; do
+    (session "$mode")
+done

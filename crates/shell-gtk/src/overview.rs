@@ -37,6 +37,9 @@ pub trait OverviewActions {
     fn close_overview(&self);
     /// Raise an existing window by compositor id.
     fn activate_window(&self, id: u64);
+    /// An app was launched (`app_id` its desktop id): the compositor shows
+    /// the busy cursor until its window maps (mutter's startup sequence).
+    fn launch_started(&self, _app_id: &str) {}
     /// Running windows as `(id, app_id)`.
     fn window_icon(&self, _id: u64) -> Option<String> {
         None
@@ -123,7 +126,10 @@ fn activate_app(
     match activation {
         // Do not spawn a replacement after a stale/denied activation request.
         Activation::Raise(window) => actions.activate_window(window),
-        Activation::Launch | Activation::NewWindow => spawn(entry, activation)?,
+        Activation::Launch | Activation::NewWindow => {
+            spawn(entry, activation)?;
+            actions.launch_started(&entry.app_id);
+        }
     }
     activated(activation);
     actions.close_overview();
@@ -3235,6 +3241,8 @@ mod app_activation_tests {
     struct Actions {
         windows: RefCell<Vec<(u64, Option<String>)>>,
         events: RefCell<Vec<String>>,
+        /// `launch_started` calls: the event before each, and the app id.
+        started: RefCell<Vec<(Option<String>, String)>>,
     }
     impl OverviewActions for Actions {
         fn running(&self) -> Vec<(u64, Option<String>)> {
@@ -3245,6 +3253,10 @@ mod app_activation_tests {
         }
         fn close_overview(&self) {
             self.events.borrow_mut().push("close".into());
+        }
+        fn launch_started(&self, app_id: &str) {
+            let before = self.events.borrow().last().cloned();
+            self.started.borrow_mut().push((before, app_id.to_owned()));
         }
         fn set_search(&self, _: bool) {}
         fn set_app_grid(&self, _: bool) {}
@@ -3461,6 +3473,42 @@ mod app_activation_tests {
         });
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
         assert!(actions.events.borrow().is_empty());
+        assert!(
+            actions.started.borrow().is_empty(),
+            "no startup sequence for a launch that never happened"
+        );
+    }
+
+    /// #1193: a launch or a new window begins the app's startup sequence
+    /// (the compositor's busy cursor) right after its spawn, under the
+    /// desktop id; raising a running window begins none.
+    #[test]
+    fn launches_and_new_windows_begin_a_startup_sequence_raises_do_not() {
+        let actions = Actions::default();
+        activate(&actions, &entry(DISKS), false).unwrap();
+        *actions.windows.borrow_mut() = vec![(1, Some("org.gnome.DiskUtility".into()))];
+        activate(&actions, &entry(DISKS), true).unwrap();
+        activate(&actions, &entry(DISKS), false).unwrap();
+        assert_eq!(
+            actions.take(),
+            [
+                "launch",
+                "zoom",
+                "close",
+                "new-window",
+                "zoom",
+                "close",
+                "activate:1",
+                "close"
+            ]
+        );
+        assert_eq!(
+            actions.started.take(),
+            [
+                (Some("launch".to_owned()), DISKS.to_owned()),
+                (Some("new-window".to_owned()), DISKS.to_owned()),
+            ]
+        );
     }
 }
 

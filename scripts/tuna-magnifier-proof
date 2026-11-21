@@ -97,6 +97,14 @@ px() {
     ffmpeg -loglevel error -i "$1" -vf "crop=1:1:$2:$3" -f rawvideo -pix_fmt rgb24 - |
         od -An -tu1 | tr -s ' ' | sed 's/^ //; s/ $//'
 }
+# px_rgb PNG X Y: sets PXR PXG PXB to the pixel at (X, Y) of PNG. A
+# missing channel ends the run, as `set -u` does for a missing field.
+px_rgb() {
+    read -r PXR PXG PXB <<EOF
+$(px "$1" "$2" "$3")
+EOF
+    : "${PXB:?no pixel at ($2,$3) of $1}"
+}
 # near R G B R G B TOL: every channel within TOL.
 near() {
     awk -v a="$1,$2,$3" -v b="$4,$5,$6" -v t="$7" 'BEGIN {
@@ -217,21 +225,9 @@ sleep 1
 
 capture 01-off M-OFF
 # Self-calibrate: panel strip vs desktop background from the baseline.
-# shellcheck disable=SC2086
-# shellcheck disable=SC2046
-set -- $(px "$ARTIFACTS/01-off.png" 300 10); PANEL="$1 $2 $3"
-# shellcheck disable=SC2086
-# shellcheck disable=SC2046
-set -- $(px "$ARTIFACTS/01-off.png" 300 48); BELOW="$1 $2 $3"
-# shellcheck disable=SC2086
-# shellcheck disable=SC2046
-set -- $(px "$ARTIFACTS/01-off.png" 300 700); BG="$1 $2 $3"
-# shellcheck disable=SC2086
-set -- $PANEL; PR=$1 PG=$2 PB=$3
-# shellcheck disable=SC2086
-set -- $BELOW; BR=$1 BG2=$2 BB=$3
-# shellcheck disable=SC2086
-set -- $BG; GR=$1 GG=$2 GB=$3
+px_rgb "$ARTIFACTS/01-off.png" 300 10; PR=$PXR PG=$PXG PB=$PXB PANEL="$PXR $PXG $PXB"
+px_rgb "$ARTIFACTS/01-off.png" 300 48; BR=$PXR BG2=$PXG BB=$PXB BELOW="$PXR $PXG $PXB"
+px_rgb "$ARTIFACTS/01-off.png" 300 700; GR=$PXR GG=$PXG GB=$PXB BG="$PXR $PXG $PXB"
 near "$BR" "$BG2" "$BB" "$GR" "$GG" "$GB" 12 ||
     fail M-OFF "below-panel ($BELOW) is not the background ($BG)"
 far "$PR" "$PG" "$PB" "$GR" "$GG" "$GB" 60 ||
@@ -251,14 +247,10 @@ cstate '.pointer_position == [640, 200]' 10 ||
 capture 02-zoom M-ZOOM
 # ROI centers on (640,200): 640x400 source over the full viewport, so
 # (300,48) shows source (470,24), inside the doubled panel strip.
-# shellcheck disable=SC2086
-# shellcheck disable=SC2046
-set -- $(px "$ARTIFACTS/02-zoom.png" 300 48); ZR=$1 ZG=$2 ZB=$3
+px_rgb "$ARTIFACTS/02-zoom.png" 300 48; ZR=$PXR ZG=$PXG ZB=$PXB
 near "$ZR" "$ZG" "$ZB" "$PR" "$PG" "$PB" 12 ||
     fail M-ZOOM "(300,48) is $ZR $ZG $ZB, not the doubled panel ($PANEL)"
-# shellcheck disable=SC2086
-# shellcheck disable=SC2046
-set -- $(px "$ARTIFACTS/02-zoom.png" 100 700); ZR=$1 ZG=$2 ZB=$3
+px_rgb "$ARTIFACTS/02-zoom.png" 100 700; ZR=$PXR ZG=$PXG ZB=$PXB
 near "$ZR" "$ZG" "$ZB" "$GR" "$GG" "$GB" 12 ||
     fail M-ZOOM "(100,700) is $ZR $ZG $ZB, not background ($BG)"
 pass M-ZOOM "2x zoom doubles the panel edge and holds the background"
@@ -269,9 +261,7 @@ cstate '.pointer_position == [640, 600]' 10 ||
 capture 03-tracked M-TRACK
 # ROI now centers on (640,600): the viewport top shows source row 405,
 # desktop background where the doubled panel was.
-# shellcheck disable=SC2086
-# shellcheck disable=SC2046
-set -- $(px "$ARTIFACTS/03-tracked.png" 300 10); TR=$1 TG=$2 TB=$3
+px_rgb "$ARTIFACTS/03-tracked.png" 300 10; TR=$PXR TG=$PXG TB=$PXB
 near "$TR" "$TG" "$TB" "$GR" "$GG" "$GB" 12 ||
     fail M-TRACK "(300,10) is $TR $TG $TB, not the tracked background ($BG)"
 pass M-TRACK "the magnified view follows the pointer"
@@ -316,18 +306,15 @@ capture 04-focus M-FOCUS
 # title text it shows the blue label body.
 if [ $((640 - ww + 15)) -ge 0 ]; then
     edge=$((640 - ww + 15))
-    # shellcheck disable=SC2046
-    set -- $(px "$ARTIFACTS/04-focus.png" "$edge" 400); FR=$1 FG=$2 FB=$3
+    px_rgb "$ARTIFACTS/04-focus.png" "$edge" 400; FR=$PXR FG=$PXG FB=$PXB
     blueish "$FR" "$FG" "$FB" ||
         fail M-FOCUS "($edge,400) is $FR $FG $FB, not the focused window blue"
 else
     # Wide window: both flanks of the mid-row are blue body.
-    # shellcheck disable=SC2046
-    set -- $(px "$ARTIFACTS/04-focus.png" 100 400); FR=$1 FG=$2 FB=$3
+    px_rgb "$ARTIFACTS/04-focus.png" 100 400; FR=$PXR FG=$PXG FB=$PXB
     blueish "$FR" "$FG" "$FB" ||
         fail M-FOCUS "(100,400) is $FR $FG $FB, not the focused window blue"
-    # shellcheck disable=SC2046
-    set -- $(px "$ARTIFACTS/04-focus.png" 1180 400); FR=$1 FG=$2 FB=$3
+    px_rgb "$ARTIFACTS/04-focus.png" 1180 400; FR=$PXR FG=$PXG FB=$PXB
     blueish "$FR" "$FG" "$FB" ||
         fail M-FOCUS "(1180,400) is $FR $FG $FB, not the focused window blue"
 fi
@@ -633,9 +620,7 @@ pass M-HALF "left-half view zooms beside the unmagnified right half"
 gsettings set org.gnome.desktop.a11y.applications screen-magnifier-enabled false
 snapshot '.enabled == false' || fail M-DISABLE "disabling never reached the snapshot"
 capture 05-disable M-DISABLE
-# shellcheck disable=SC2086
-# shellcheck disable=SC2046
-set -- $(px "$ARTIFACTS/05-disable.png" 300 48); DR=$1 DG=$2 DB=$3
+px_rgb "$ARTIFACTS/05-disable.png" 300 48; DR=$PXR DG=$PXG DB=$PXB
 near "$DR" "$DG" "$DB" "$GR" "$GG" "$GB" 12 ||
     fail M-DISABLE "(300,48) is $DR $DG $DB after disable, not background ($BG)"
 pass M-DISABLE "disabling restores the unmagnified frame"

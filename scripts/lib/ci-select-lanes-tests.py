@@ -58,6 +58,11 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("docs/walkthrough.tsv"), ["gtk-shell"])
         self.assertEqual(pr("packaging/marlin/vm-lane/Containerfile"),
                          ["arch-package", "marlin-image", "marlin-vm"])
+        # MP-*, WL-*, X11-* window-motion gates and the capture they pair with.
+        for path in ("scripts/tuna-motion-pairing-proof", "scripts/tuna-x11-icon-geometry-proof",
+                     "scripts/lib/motion_pairing.py",
+                     "tests/gnome-reference/motion-reference.json"):
+            self.assertEqual(pr(path), ["gtk-shell"], path)
         self.assertEqual(pr("docs/parity-ledger.md"),
                          ["journey", "drm-smoke", "gtk-shell", "orca-speech",
                           "arch-package", "marlin-vm", "parity-ledger"])
