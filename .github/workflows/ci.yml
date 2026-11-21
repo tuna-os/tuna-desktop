@@ -179,6 +179,7 @@ jobs:
       - run: python3 scripts/tests/test_ci_prepare_artifacts.py
       - run: python3 scripts/tests/test_vm_guest_agent_deadline.py
       - run: python3 scripts/tests/test_vm_reference_login.py
+      - run: python3 scripts/tests/test_vm_unlock_wake.py
       - run: python3 scripts/tests/test_gnome_reference_guest.py
       - run: python3 scripts/tests/test_native_switcher_reference.py
       - run: python3 scripts/tests/test_overview_recording.py
