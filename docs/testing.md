@@ -251,6 +251,18 @@ without the unrelated earlier gates. It adds no target motion or timing
 relaxation. CI runs this slice with its freshly built compositor and shell;
 the no-post-start-motion wire tests establish the precise protocol ordering.
 
+`scripts/tuna-gtk-shell-proof --x11-frames-only --artifacts DIR` runs the X11
+frame gates of the full GTK proof alone (`G-X11-FRAME`,
+`G-X11-FRAME-ACTIONS`, `G-X11-FRAME-CSD`, `G-X11-FRAME-RECOVERY`; P-WM-10):
+real X11 clients on the session's own Xwayland, the frames client
+`tuna-x11-frames` beside the compositor, and the real pointer on the title
+bar. After them it runs `G-X11-MENU` and `G-X11-TOOLTIP` (P-SY-04: a GTK3
+program's menus and tooltip, override-redirect windows, drawn and driven
+with the real pointer) and `G-RESIZE-BORDER` (P-WM-04: a GTK4 window resized
+from the invisible border outside its edge). It needs `xclock`, `xeyes`,
+`xev` (x11-apps), `xprop` and `xwininfo` (x11-utils), and GTK 3 for Python
+(gir1.2-gtk-3.0). CI runs this slice too, with its freshly built binaries.
+
 `scripts/tuna-gtk-shell-proof --datemenu-only --artifacts DIR` runs the date
 menu's gates alone, the same functions the full GTK proof calls
 (`scripts/lib/tuna-datemenu-proof.sh`): `G-CAL-OPEN`, `G-CAL-EVENTS`,
@@ -815,7 +827,7 @@ click and key is QEMU input.
 
 | ID | What it asserts |
 |---|---|
-| `V-PICKER` | For an X11 (`GDK_BACKEND=x11`) and a native Wayland GTK 4 caller, each opening the installed GNOME FileChooser portal (Nautilus) through its own parent handle: the caller is allocated its requested 1100x700; for OpenFile and SaveFile, cancel (Escape) and accept (type-ahead and Enter), the dialog maps as the focused transient child of the caller, horizontally centred on it; a click on the exposed parent is blocked; the portal answers 1 with no URI or 0 with the chosen file (SaveFile's file is then written by the caller); focus returns to the caller and a real key and click reach it; an unrelated bystander app receives nothing |
+| `V-PICKER` | For an X11 (`GDK_BACKEND=x11`) and a native Wayland GTK 4 caller, each opening the installed GNOME FileChooser portal (Nautilus) through its own parent handle: the caller is allocated its requested 1100x700 (the X11 caller, with no title bar of its own, is framed by `tuna-x11-frames` and its managed rectangle is that size grown by the frame's `_NET_FRAME_EXTENTS`); for OpenFile and SaveFile, cancel (Escape) and accept (type-ahead and Enter), the dialog maps as the focused transient child of the caller, horizontally centred on it; a click on the exposed parent is blocked; the portal answers 1 with no URI or 0 with the chosen file (SaveFile's file is then written by the caller); focus returns to the caller and a real key and click reach it; an unrelated bystander app receives nothing |
 | `V-INTROSPECT-SCREEN` | A session-bus client subscribed to Introspect `PropertiesChanged` sees `ScreenSize` equal the union of Mutter `GetCurrentState` logical monitors initially (1280x800), after hotplugging a 1024x768 second head, after rotating it 90° through `ApplyMonitorsConfig`, and after unplugging it, with no notification that repeats an unchanged size |
 | `V-INTROSPECT-SANDBOX` | After installing the local Flatpak, xdg-desktop-portal-gnome's `Background.GetAppState` omits an unsandboxed client claiming the app ID `org.tuna.VmSandbox`, reports the Flatpak-sandboxed one as running or active, and drops it after it exits |
 

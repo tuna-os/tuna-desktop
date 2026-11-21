@@ -921,6 +921,10 @@ pub struct Runtime {
     x11_display: Option<u32>,
     #[cfg(feature = "xwayland")]
     x11_icon_reader: crate::x11_icons::Reader,
+    /// The X11 frames client (P-WM-10): GTK title bars for X11 windows,
+    /// started once the X11 window manager is ready.
+    #[cfg(feature = "xwayland")]
+    x11_frames: crate::x11_frames::X11Frames,
     /// Real-time anchor of the last input event. Input stamps live on
     /// the backend event clock while idle is measured here, so each
     /// tick evaluates the lock in the input base as
@@ -1582,6 +1586,8 @@ impl Runtime {
             x11_display: None,
             #[cfg(feature = "xwayland")]
             x11_icon_reader: crate::x11_icons::Reader::new(),
+            #[cfg(feature = "xwayland")]
+            x11_frames: crate::x11_frames::X11Frames::new(),
             overview_search: false,
             overview_app_grid: false,
             overview_drag: None,
@@ -2905,26 +2911,46 @@ impl Runtime {
                 .map(|w| w.id)
                 .filter(|id| self.manager.is_above(*id))
                 .collect::<Vec<_>>(),
-            "windows": self.manager.overview_windows().iter().map(|w| serde_json::json!({
-                "id": w.id,
-                "app_id": app_of(w.id),
-                "introspect_eligible": self.manager.is_introspect_eligible(w.id),
-                "x11_window_id": self.manager.x11_window_id(w.id),
-                // `_NET_WM_ICON_GEOMETRY`, the X11 client's minimize target.
-                "client_icon_geometry": self.manager.client_icon_geometry(w.id)
-                    .map(|r| [r.loc.x, r.loc.y, r.size.w, r.size.h]),
-                "parent_window_id": self.manager.transient_parent(w.id),
-                "application_window_id": self.manager.application_window(w.id),
-                "icon": model.window(w.id).and_then(|w| w.icon.clone()),
-                "workspace": w.workspace,
-                "rect": [w.geometry.loc.x, w.geometry.loc.y, w.geometry.size.w, w.geometry.size.h],
-                // The committed buffer, client shadows included (GNOME's buffer rect).
-                "buffer_rect": self.manager.surface_of(w.id).and_then(|s| {
-                    let size = crate::windows::buffer_size(&s)?;
-                    let origin = crate::popup::surface_origin(&s, w.geometry.loc);
-                    Some([origin.x, origin.y, size.w, size.h])
-                }),
-            })).collect::<Vec<_>>(),
+            "windows": self.manager.overview_windows().iter().map(|w| {
+                // An X11 window's frame (P-WM-10); all three null for a
+                // native window.
+                let x11_frame = self.manager.x11_frame_state(w.id);
+                let surface = self.manager.surface_input_state(w.id);
+                serde_json::json!({
+                    // The window's surface, shadow included (null while
+                    // it has no buffer: an X11 window whose frame just
+                    // came or went), and the bounding box of its input
+                    // region (null: none set, the whole surface takes
+                    // input).
+                    "surface_rect": surface.map(|(rect, _)| rect),
+                    "input_rect": surface.and_then(|(_, input)| input),
+                    "id": w.id,
+                    "app_id": app_of(w.id),
+                    "introspect_eligible": self.manager.is_introspect_eligible(w.id),
+                    "x11_window_id": self.manager.x11_window_id(w.id),
+                    // `_NET_WM_ICON_GEOMETRY`, the X11 client's minimize target.
+                    "client_icon_geometry": self.manager.client_icon_geometry(w.id)
+                        .map(|r| [r.loc.x, r.loc.y, r.size.w, r.size.h]),
+                    // Whether a frames-client frame holds the window.
+                    "x11_framed": x11_frame.map(|(framed, _, _)| framed),
+                    // Its visible borders: left, right, top, bottom.
+                    "x11_frame_extents": x11_frame.map(|(_, extents, _)| extents),
+                    // The X11 window carrying the surface: `rect` grown
+                    // by the invisible borders (shadow, resize handles).
+                    "x11_buffer_rect": x11_frame.map(|(_, _, buffer)| buffer),
+                    "parent_window_id": self.manager.transient_parent(w.id),
+                    "application_window_id": self.manager.application_window(w.id),
+                    "icon": model.window(w.id).and_then(|w| w.icon.clone()),
+                    "workspace": w.workspace,
+                    "rect": [w.geometry.loc.x, w.geometry.loc.y, w.geometry.size.w, w.geometry.size.h],
+                    // The committed buffer, client shadows included (GNOME's buffer rect).
+                    "buffer_rect": self.manager.surface_of(w.id).and_then(|s| {
+                        let size = crate::windows::buffer_size(&s)?;
+                        let origin = crate::popup::surface_origin(&s, w.geometry.loc);
+                        Some([origin.x, origin.y, size.w, size.h])
+                    }),
+                })
+            }).collect::<Vec<_>>(),
             "previews": previews,
             "thumbnails": thumbnails,
             "workspace_placeholder": scene.as_ref().and_then(|s| s.placeholder).map(|(at, r)| serde_json::json!({
@@ -2998,6 +3024,28 @@ impl Runtime {
         });
         // Bottom-to-top stacking and GNOME's live focus policy (P-WM-09).
         doc["stacking"] = serde_json::json!(self.manager.stacking_order());
+        // Override-redirect X11 windows (menus, tooltips), bottom to top:
+        // drawn, never in `windows` or `stacking` (P-SY-04). `rect` is
+        // where the X server has the window, `owner` the window it shows
+        // with, `shown` whether it is on screen now.
+        #[cfg(feature = "xwayland")]
+        let x11_unmanaged = self
+            .manager
+            .x11_unmanaged_state()
+            .into_iter()
+            .map(|(xid, rect, owner, shown, kind)| {
+                serde_json::json!({
+                    "x11_window_id": xid,
+                    "rect": [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h],
+                    "owner": owner,
+                    "shown": shown,
+                    "type": kind,
+                })
+            })
+            .collect::<Vec<_>>();
+        #[cfg(not(feature = "xwayland"))]
+        let x11_unmanaged = Vec::<serde_json::Value>::new();
+        doc["x11_unmanaged"] = x11_unmanaged.into();
         let focus_policy = self.manager.focus_policy();
         doc["focus_policy"] = serde_json::json!({
             "focus_mode": focus_policy.mode.as_str(),
@@ -5352,6 +5400,18 @@ impl Runtime {
             {
                 due(retry.saturating_duration_since(now));
             }
+            // The frames client's restart gate and its offers of unframed
+            // windows, and the end of a window's wait for its frame.
+            let frame_deadline = self.manager.x11_frame_deadline();
+            if let Some(ms) = self
+                .x11_frames
+                .next_wake_ms(system_now, frame_deadline.is_some())
+            {
+                due(Duration::from_millis(ms));
+            }
+            if let Some(deadline) = frame_deadline {
+                due(deadline.saturating_duration_since(now));
+            }
         }
         if let Some(ms) = self
             .ime
@@ -5842,6 +5902,10 @@ impl Runtime {
         if let Some(ime) = &mut self.ime {
             ime.set_ready_x11_display(ready_x11_display);
         }
+        // The frames client is an X11 client too, and X11 windows keep
+        // their title bars while the session is locked.
+        #[cfg(feature = "xwayland")]
+        self.x11_frames_tick(ready_x11_display);
         // Overview focus follows the hub flag (shell commands and
         // runtime triggers converge here); the next reconcile parks
         // or restores keyboard focus.
@@ -5943,6 +6007,8 @@ impl Runtime {
                 if let Some(ime) = &mut self.ime {
                     ime.set_ready_x11_display(None);
                 }
+                self.x11_frames.set_ready_x11_display(None);
+                self.manager.set_x11_frames_client(false);
                 self.manager.clear_x11_windows(&mut self.state);
                 self.x11_icon_reader.reset();
                 self.xwayland.disconnected(now);
@@ -6363,6 +6429,38 @@ impl Runtime {
         }
     }
 
+    /// Supervise the X11 frames client (P-WM-10) and serve it: publish the
+    /// title-bar settings its header bars read as XSETTINGS, and offer it
+    /// the windows that still want a frame (see [`crate::x11_frames`]).
+    #[cfg(feature = "xwayland")]
+    fn x11_frames_tick(&mut self, ready_x11_display: Option<u32>) {
+        let now_ms = crate::state::system_millis();
+        self.x11_frames.set_ready_x11_display(ready_x11_display);
+        self.x11_frames.poll(now_ms);
+        self.manager
+            .set_x11_frames_client(self.x11_frames.running());
+        let Some(xwm) = self.state.xwm.as_mut() else {
+            return;
+        };
+        if let Some(settings) = self.x11_frames.take_xsettings() {
+            let settings = settings.into_iter().map(|(name, value)| {
+                (
+                    name.to_owned(),
+                    smithay::xwayland::xwm::settings::Value::String(value),
+                )
+            });
+            if let Err(error) = xwm.set_xsettings(settings) {
+                eprintln!("tuna-compositor: x11 frames: XSETTINGS refused: {error}");
+            }
+        }
+        let window_waits = self.manager.x11_frame_deadline().is_some();
+        if self.x11_frames.offer_due(now_ms, window_waits) {
+            if let Err(error) = xwm.request_frames() {
+                eprintln!("tuna-compositor: x11 frames: offer refused: {error}");
+            }
+        }
+    }
+
     /// GNOME's focus policy (P-WM-09): install a completed settings read,
     /// then repick the pointer window (a crossing without motion) and run
     /// the pointer-rest and auto-raise timers. Native reads stay on the
@@ -6389,6 +6487,12 @@ impl Runtime {
             self.manager.set_focus_policy(policy);
             if let Some(ms) = raw.check_alive_timeout_ms {
                 self.manager.set_check_alive_timeout(ms);
+            }
+            // The title-bar keys of the same schema, for the GTK header
+            // bars of X11 frames.
+            #[cfg(feature = "xwayland")]
+            if let Some(titlebar) = raw.titlebar {
+                self.x11_frames.set_titlebar(titlebar);
             }
         }
         if !self.is_locked() {
@@ -8233,9 +8337,22 @@ fn scene_elements(
                 .map(|e| (elements.len(), e, 1.0)),
         );
     }
+    // Unmanaged X11 windows (menus, tooltips) sit above every window and
+    // the shell's Top layer (the top bar), below its Overlay layer, where
+    // GNOME Shell stacks Mutter's top window group (windows/unmanaged.rs).
+    #[cfg(feature = "xwayland")]
+    let mut unmanaged = manager.x11_unmanaged_entries();
     // Layer shell above windows: panel strip, then overview, each with
     // its popups (toolkit popovers hang off layer surfaces).
-    for (surface, (x, y), _) in crate::layer::layer_layout(state) {
+    for (surface, (x, y), layer) in crate::layer::layer_layout(state) {
+        #[cfg(feature = "xwayland")]
+        if layer == smithay::wayland::shell::wlr_layer::Layer::Overlay {
+            for (surface, rect) in unmanaged.drain(..) {
+                tree(renderer, &mut elements, &surface, rect.loc, 1.0, 1.0);
+            }
+        }
+        #[cfg(not(feature = "xwayland"))]
+        let _ = layer;
         tree(renderer, &mut elements, &surface, (x, y).into(), 1.0, 1.0);
         for popup in crate::popup::placed_popups(&surface, (x, y).into(), false) {
             tree(
@@ -8255,6 +8372,10 @@ fn scene_elements(
                     .map(|e| (elements.len(), e, 1.0)),
             );
         }
+    }
+    #[cfg(feature = "xwayland")]
+    for (surface, rect) in unmanaged {
+        tree(renderer, &mut elements, &surface, rect.loc, 1.0, 1.0);
     }
     // `elements` accumulates bottom-to-top (windows, then
     // background-to-overlay layers); Smithay 0.7 draws the first
@@ -8775,6 +8896,10 @@ fn send_surface_scales(state: &State, manager: &WindowManager) {
         if let Some(surface) = window.wl_surface() {
             send(&surface, state.scale_for(geometry));
         }
+    }
+    #[cfg(feature = "xwayland")]
+    for (surface, rect) in manager.x11_unmanaged_entries() {
+        send(&surface, state.scale_for(rect));
     }
     for (surface, (x, y), _) in crate::layer::layer_layout(state) {
         send(

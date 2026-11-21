@@ -23,6 +23,15 @@
 //! - `src/compositor/meta-window-drag.c`: a grab raises at its start with
 //!   `raise-on-click`; without it, only a grab that never moved 8 px raises
 //!   at its end.
+//!
+//! The same schema's title-bar keys (`button-layout`,
+//! `action-double-click-titlebar`, `action-middle-click-titlebar`,
+//! `action-right-click-titlebar`) are read with them as
+//! [`TitlebarSettings`]. The compositor draws no title bar: they reach the
+//! GTK header bars of X11 frames (P-WM-10) as XSETTINGS, named and
+//! translated as gnome-settings-daemon's xsettings plugin does
+//! (`plugins/xsettings/gsd-xsettings-manager.c` `translations`,
+//! `wm-button-layout-translation.c`).
 
 use std::time::Duration;
 
@@ -96,6 +105,75 @@ pub struct RawFocusSettings {
     /// is not installed. Not a focus key: read here because Mutter's
     /// `prefs.c` reads the whole schema together.
     pub check_alive_timeout_ms: Option<u32>,
+    /// The title-bar keys; `None` when the schema lacks any of them.
+    pub titlebar: Option<TitlebarSettings>,
+}
+
+/// `org.gnome.desktop.wm.preferences` title-bar keys, as read (the enum
+/// keys by their nick). [`Default`] is the GNOME 51 session default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TitlebarSettings {
+    /// `button-layout`, in the window manager's vocabulary.
+    pub button_layout: String,
+    /// `action-double-click-titlebar`.
+    pub double_click: String,
+    /// `action-middle-click-titlebar`.
+    pub middle_click: String,
+    /// `action-right-click-titlebar`.
+    pub right_click: String,
+}
+
+impl Default for TitlebarSettings {
+    fn default() -> Self {
+        Self {
+            button_layout: "appmenu:close".into(),
+            double_click: "toggle-maximize".into(),
+            middle_click: "none".into(),
+            right_click: "menu".into(),
+        }
+    }
+}
+
+impl TitlebarSettings {
+    /// The XSETTINGS GTK reads these keys from, as gsd-xsettings
+    /// publishes them: the layout translated to GTK's button names, the
+    /// actions as their nicks (`translate_string_string`).
+    pub fn xsettings(&self) -> [(&'static str, String); 4] {
+        [
+            (
+                "Gtk/DecorationLayout",
+                gtk_decoration_layout(&self.button_layout),
+            ),
+            ("Gtk/TitlebarDoubleClick", self.double_click.clone()),
+            ("Gtk/TitlebarMiddleClick", self.middle_click.clone()),
+            ("Gtk/TitlebarRightClick", self.right_click.clone()),
+        ]
+    }
+}
+
+/// gsd-xsettings' `translate_wm_button_layout_to_gtk`: each side of the
+/// colon keeps its known buttons in order, renamed for GTK (`menu` is the
+/// window icon, `appmenu` GTK's `menu`); unknown names are dropped. A
+/// layout without a colon has a left side only.
+pub fn gtk_decoration_layout(layout: &str) -> String {
+    let side = |buttons: &str| {
+        buttons
+            .split(',')
+            .filter_map(|button| match button {
+                "menu" => Some("icon"),
+                "appmenu" => Some("menu"),
+                "minimize" => Some("minimize"),
+                "maximize" => Some("maximize"),
+                "close" => Some("close"),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    match layout.split_once(':') {
+        Some((left, right)) => format!("{}:{}", side(left), side(right)),
+        None => side(layout),
+    }
 }
 
 /// The effective focus policy. [`Default`] is GNOME 51's session default.
@@ -356,11 +434,62 @@ mod tests {
             resize_with_right_button: false,
             focus_change_on_pointer_rest: Some(true),
             check_alive_timeout_ms: Some(5000),
+            titlebar: None,
         }
     }
 
     const FRAME: (i32, i32, i32, i32) = (100, 100, 300, 300);
     const CORNER: (f64, f64) = (390.0, 390.0);
+
+    #[test]
+    fn button_layout_translates_to_gtk_names_as_gsd_xsettings_does() {
+        // GNOME's default: no window icon, the app menu slot, close.
+        assert_eq!(gtk_decoration_layout("appmenu:close"), "menu:close");
+        assert_eq!(
+            gtk_decoration_layout("menu:minimize,maximize,close"),
+            "icon:minimize,maximize,close"
+        );
+        assert_eq!(
+            gtk_decoration_layout("close,minimize,maximize:"),
+            "close,minimize,maximize:"
+        );
+        // Names GTK has no button for are dropped, order kept.
+        assert_eq!(
+            gtk_decoration_layout("shade,close:above,maximize,spacer"),
+            "close:maximize"
+        );
+        // Only the first colon separates the sides, as strsep leaves the
+        // rest in the right side, where "close:minimize" is no button.
+        assert_eq!(gtk_decoration_layout("menu:close:minimize"), "icon:");
+        assert_eq!(gtk_decoration_layout("close"), "close");
+        assert_eq!(gtk_decoration_layout(""), "");
+        assert_eq!(gtk_decoration_layout(":"), ":");
+    }
+
+    #[test]
+    fn titlebar_keys_publish_under_the_gtk_xsettings_names() {
+        let defaults = TitlebarSettings::default().xsettings();
+        assert_eq!(
+            defaults,
+            [
+                ("Gtk/DecorationLayout", "menu:close".to_owned()),
+                ("Gtk/TitlebarDoubleClick", "toggle-maximize".to_owned()),
+                ("Gtk/TitlebarMiddleClick", "none".to_owned()),
+                ("Gtk/TitlebarRightClick", "menu".to_owned()),
+            ]
+        );
+        let custom = TitlebarSettings {
+            button_layout: "close,minimize,maximize:appmenu".into(),
+            double_click: "minimize".into(),
+            middle_click: "lower".into(),
+            right_click: "none".into(),
+        }
+        .xsettings();
+        assert_eq!(custom[0].1, "close,minimize,maximize:menu");
+        assert_eq!(custom[1].1, "minimize");
+        assert_eq!(custom[2].1, "lower");
+        assert_eq!(custom[3].1, "none");
+    }
 
     #[test]
     fn schema_defaults_are_gnome_51_session_defaults() {

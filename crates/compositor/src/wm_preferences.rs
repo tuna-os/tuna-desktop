@@ -1,5 +1,7 @@
 //! Owned GIO reader for GNOME's focus policy keys
-//! (`org.gnome.desktop.wm.preferences`, `org.gnome.mutter`) and Mutter's
+//! (`org.gnome.desktop.wm.preferences`, `org.gnome.mutter`), the same
+//! schema's title-bar keys (`button-layout` and the three title-bar click
+//! actions, for the GTK header bars of X11 frames) and Mutter's
 //! `check-alive-timeout`, read by the compositor itself as Mutter's
 //! `prefs.c` does in-process.
 //!
@@ -13,7 +15,7 @@
 //! and the consumer on GNOME 51's defaults ([`FocusPolicy::default`]).
 //!
 //! [`FocusPolicy::default`]: crate::focus_policy::FocusPolicy
-use crate::focus_policy::{RawFocusSettings, MUTTER_SCHEMA, WM_SCHEMA};
+use crate::focus_policy::{RawFocusSettings, TitlebarSettings, MUTTER_SCHEMA, WM_SCHEMA};
 use crate::night_light::ReadError;
 use crate::night_light_settings::CacheStatus;
 use crate::wake::Wake;
@@ -42,6 +44,18 @@ const WM_KEYS: [(&str, &str); 6] = [
     (KEY_RAISE_ON_CLICK, "b"),
     (KEY_MOUSE_BUTTON_MODIFIER, "s"),
     (KEY_RESIZE_WITH_RIGHT_BUTTON, "b"),
+];
+const KEY_BUTTON_LAYOUT: &str = "button-layout";
+const KEY_DOUBLE_CLICK: &str = "action-double-click-titlebar";
+const KEY_MIDDLE_CLICK: &str = "action-middle-click-titlebar";
+const KEY_RIGHT_CLICK: &str = "action-right-click-titlebar";
+/// Read together or not at all: a schema without them (older than GNOME
+/// 3.14's title-bar actions) keeps GNOME 51's defaults.
+const TITLEBAR_KEYS: [(&str, &str); 4] = [
+    (KEY_BUTTON_LAYOUT, "s"),
+    (KEY_DOUBLE_CLICK, "s"),
+    (KEY_MIDDLE_CLICK, "s"),
+    (KEY_RIGHT_CLICK, "s"),
 ];
 
 #[derive(Clone, Copy)]
@@ -357,7 +371,10 @@ fn watch(settings: &gio::Settings, shared: Weak<Shared>) -> glib::SignalHandlerI
     settings.connect_changed(None, move |_, key| {
         if key == KEY_POINTER_REST
             || key == KEY_CHECK_ALIVE_TIMEOUT
-            || WM_KEYS.iter().any(|(known, _)| *known == key)
+            || WM_KEYS
+                .iter()
+                .chain(&TITLEBAR_KEYS)
+                .any(|(known, _)| *known == key)
         {
             if let Some(shared) = shared.upgrade() {
                 shared.request(Instant::now());
@@ -374,6 +391,8 @@ struct GioReader {
     pointer_rest: bool,
     /// Whether `mutter` has `check-alive-timeout` (a `u`).
     check_alive: bool,
+    /// Whether `wm` has every title-bar key (strings and enum nicks).
+    titlebar: bool,
     handlers: Vec<(gio::Settings, glib::SignalHandlerId)>,
 }
 impl GioReader {
@@ -395,6 +414,7 @@ impl GioReader {
         if !schema_matches(wm, &WM_KEYS) {
             return Err(ReadError("wm preferences key/type mismatch".into()));
         }
+        let titlebar = schema_matches(wm, &TITLEBAR_KEYS);
         let wm = gio::Settings::new_full(wm, backend, None);
         let pointer_rest =
             mutter.is_some_and(|schema| schema_matches(schema, &[(KEY_POINTER_REST, "b")]));
@@ -412,6 +432,7 @@ impl GioReader {
             mutter,
             pointer_rest,
             check_alive,
+            titlebar,
             handlers,
         })
     }
@@ -448,6 +469,18 @@ impl NativeReader for GioReader {
                 .transpose()?,
             check_alive_timeout_ms: mutter(self.check_alive, KEY_CHECK_ALIVE_TIMEOUT)
                 .map(|read| read.get::<u32>().ok_or_else(error))
+                .transpose()?,
+            titlebar: self
+                .titlebar
+                .then(|| {
+                    let string = |key| value(key).get::<String>().ok_or_else(error);
+                    Ok::<_, ReadError>(TitlebarSettings {
+                        button_layout: string(KEY_BUTTON_LAYOUT)?,
+                        double_click: string(KEY_DOUBLE_CLICK)?,
+                        middle_click: string(KEY_MIDDLE_CLICK)?,
+                        right_click: string(KEY_RIGHT_CLICK)?,
+                    })
+                })
                 .transpose()?,
         })
     }
@@ -617,6 +650,57 @@ mod tests {
         let mut policy = FocusPolicy::default();
         policy.apply(&raw);
         assert_eq!(policy, FocusPolicy::default());
+        retire(&reader);
+    }
+
+    #[test]
+    fn titlebar_keys_read_as_nicks_and_stay_absent_from_a_schema_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let action_enum = "<enum id='org.gnome.desktop.GDesktopTitlebarAction'>\
+            <value nick='toggle-shade' value='0'/><value nick='toggle-maximize' value='1'/>\
+            <value nick='minimize' value='4'/><value nick='none' value='5'/>\
+            <value nick='lower' value='6'/><value nick='menu' value='7'/></enum>";
+        let titlebar = "<key name='button-layout' type='s'><default>'menu:minimize,close'</default></key>\
+            <key name='action-double-click-titlebar' enum='org.gnome.desktop.GDesktopTitlebarAction'><default>'minimize'</default></key>\
+            <key name='action-middle-click-titlebar' enum='org.gnome.desktop.GDesktopTitlebarAction'><default>'lower'</default></key>\
+            <key name='action-right-click-titlebar' enum='org.gnome.desktop.GDesktopTitlebarAction'><default>'menu'</default></key>\
+            </schema>";
+        compile(
+            dir.path(),
+            &format!(
+                "<schemalist>{ENUM_XML}{action_enum}{}</schemalist>",
+                WM_XML.replace("</schema>", titlebar)
+            ),
+        );
+        let (wake, mut loop_) = wake_loop();
+        let reader = gio_reader(&wake, dir.path().to_path_buf(), false);
+        let raw = completed(&reader, &mut loop_, Instant::now());
+        let read = raw.titlebar.expect("all four title-bar keys are installed");
+        assert_eq!(read.button_layout, "menu:minimize,close");
+        assert_eq!(read.double_click, "minimize");
+        assert_eq!(read.middle_click, "lower");
+        assert_eq!(read.right_click, "menu");
+        // What GTK's header bars are told, under gsd-xsettings' names.
+        assert_eq!(
+            read.xsettings()[0],
+            ("Gtk/DecorationLayout", "icon:minimize,close".to_owned())
+        );
+        assert_eq!(
+            read.xsettings()[1],
+            ("Gtk/TitlebarDoubleClick", "minimize".to_owned())
+        );
+        retire(&reader);
+
+        // The focus-only schema of the other tests: read, without them.
+        let bare = tempfile::tempdir().unwrap();
+        compile(
+            bare.path(),
+            &format!("<schemalist>{ENUM_XML}{WM_XML}</schemalist>"),
+        );
+        let reader = gio_reader(&wake, bare.path().to_path_buf(), false);
+        let raw = completed(&reader, &mut loop_, Instant::now());
+        assert_eq!(raw.titlebar, None);
+        assert_eq!(raw.focus_mode, "click");
         retire(&reader);
     }
 
