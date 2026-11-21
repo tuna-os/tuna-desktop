@@ -54,6 +54,10 @@
 #              reverses the gestures, and under reduced motion the held
 #              swipe follows and eases while with animations off it lands
 #              at once
+#   D-OVERVIEW-EXIT Escape from the overview a session starts in (a
+#              uinput keyboard), with no further input: the slowed exit
+#              draws its own frames past the input's linger, settles and
+#              stops repainting, and the scanout is the settled desktop
 # and captures a scanout screenshot with ffmpeg kmsgrab when possible.
 # Needs root (sudo) for modprobe, seatd and uinput. Exits nonzero on any failure.
 set -eu
@@ -69,7 +73,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --seconds) SECONDS_UP="$2"; shift 2 ;;
-        --help|-h) sed -n '2,57p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,61p' "$0"; exit 0 ;;
         *) echo "tuna-drm-smoke: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -92,6 +96,7 @@ EMU_PID=""
 CLIENT_PID=""
 TOUCHPAD_EMU_PID=""
 TOUCHPAD_CLIENT_PID=""
+KEYBOARD_EMU_PID=""
 
 cleanup() {
     if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
@@ -99,8 +104,10 @@ cleanup() {
     # The emulators (root) exit when their command pipes close.
     exec 8>&- 2>/dev/null || true
     exec 9>&- 2>/dev/null || true
+    exec 7>&- 2>/dev/null || true
     if [ -n "$EMU_PID" ]; then wait "$EMU_PID" 2>/dev/null || true; fi
     if [ -n "$TOUCHPAD_EMU_PID" ]; then wait "$TOUCHPAD_EMU_PID" 2>/dev/null || true; fi
+    if [ -n "$KEYBOARD_EMU_PID" ]; then wait "$KEYBOARD_EMU_PID" 2>/dev/null || true; fi
     if [ -n "$COMP_PID" ]; then kill "$COMP_PID" 2>/dev/null || true; fi
     if [ -n "$CALIBRATION_PID" ]; then kill "$CALIBRATION_PID" 2>/dev/null || true; fi
     colord_stop
@@ -1406,5 +1413,169 @@ kill -TERM "$COMP_PID"
 wait "$COMP_PID" || true
 COMP_PID=""
 if grep -q panicked "$TOUCHPAD_LOG"; then fail D-NOPANIC "panic in the touchpad session"; fi
+
+# The overview's exit with no further input (D-OVERVIEW-EXIT): a session
+# that starts in the overview, as a GDM login does, and one Escape from
+# a uinput keyboard (scripts/lib/tuna-uinput-keyboard.py) to the GTK
+# shell. GNOME_SHELL_SLOWDOWN_FACTOR=4 stretches GNOME's 250 ms exit to
+# a second, past the 500 ms that display-rate ticks outlive an input
+# event, so the transition itself must drive its frames to the end, as
+# Mutter's stage clock does. Then the presented frames stop and the
+# kernel's scanout (kmsgrab) is the settled desktop: no workspace card
+# left part-way (the VM journeys' frame 06).
+kill "$DBUS_PID" 2>/dev/null || true
+EXIT_LOG="$ARTIFACTS/compositor-overview-exit.log"
+CSTATE="$ARTIFACTS/compositor-state-overview-exit.json"
+KB_OUT="$ARTIFACTS/keyboard-emulator.log"
+XDG_CONFIG_HOME="$ARTIFACTS/config-overview-exit"
+GSETTINGS_BACKEND=keyfile
+mkdir -p "$XDG_CONFIG_HOME"
+export XDG_CONFIG_HOME GSETTINGS_BACKEND
+# GNOME's plain primary colour behind the desktop: settled, the scanout
+# below the top bar is that one colour.
+gsettings set org.gnome.desktop.background picture-uri ''
+gsettings set org.gnome.desktop.background picture-uri-dark ''
+dbus-daemon --session --fork --print-address=1 --print-pid=1 >"$ARTIFACTS/dbus-overview-exit.txt"
+DBUS_SESSION_BUS_ADDRESS="$(sed -n 1p "$ARTIFACTS/dbus-overview-exit.txt")"
+DBUS_PID="$(sed -n 2p "$ARTIFACTS/dbus-overview-exit.txt")"
+export DBUS_SESSION_BUS_ADDRESS
+LOG="$EXIT_LOG"
+env -u DISPLAY -u WAYLAND_DISPLAY \
+    XDG_RUNTIME_DIR="$RUNTIME" XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$ARTIFACTS/data" \
+    LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD" TUNA_COMPOSITOR_STATE="$CSTATE" \
+    GNOME_SHELL_SLOWDOWN_FACTOR=4 \
+    "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-overview-exit \
+    --startup-overview --shell-bin "$ROOT/target/debug/tuna-shell-gtk" >"$EXIT_LOG" 2>&1 &
+COMP_PID=$!
+state '.layers | any(.namespace == "tuna-panel")' 30 ||
+    fail D-OVERVIEW-EXIT "the GTK shell never mapped its panel"
+state '.animation_slowdown == 4 and .overview_open and .overview_progress == 1
+       and .overview_motion.running == null' 30 ||
+    fail D-OVERVIEW-EXIT "the session did not settle in the overview: $(jq -c '{animation_slowdown, overview_open, overview_progress}' "$CSTATE")"
+EXIT_OUTPUT="$(sed -n 's/.*drm: output [^ ]* \([0-9]*x[0-9]*\) .*/\1/p' "$EXIT_LOG" | head -1)"
+[ -n "$EXIT_OUTPUT" ] || fail D-OVERVIEW-EXIT "no output mode in the log"
+
+mkfifo "$ARTIFACTS/keyboard-emulator.fifo"
+# shellcheck disable=SC2024
+sudo python3 "$ROOT/scripts/lib/tuna-uinput-keyboard.py" <"$ARTIFACTS/keyboard-emulator.fifo" >"$KB_OUT" 2>&1 &
+KEYBOARD_EMU_PID=$!
+exec 7>"$ARTIFACTS/keyboard-emulator.fifo"
+state '.input_devices | any(.name == "Tuna Smoke Keyboard")' 15 ||
+    fail D-OVERVIEW-EXIT "libinput did not add the emulated keyboard: $(cat "$KB_OUT")"
+# settled_frames SECONDS: within SECONDS, a whole second passes in which
+# the frame counter holds still (at most the frame in flight).
+settled_frames() {
+    end=$(($(date +%s) + $1))
+    while [ "$(date +%s)" -le "$end" ]; do
+        before=$(jq -er '.rendered_frames' "$CSTATE")
+        sleep 1
+        after=$(jq -er '.rendered_frames' "$CSTATE")
+        [ "$((after - before))" -le 1 ] && return 0
+    done
+    return 1
+}
+# The shell's startup work done, nothing moves before the key.
+settled_frames 30 || fail D-OVERVIEW-EXIT "the open overview kept repainting before the key"
+
+# One Escape, then no input at all while the state is sampled for 3 s.
+echo "tap esc" >&7
+python3 - "$CSTATE" "$ARTIFACTS/overview-exit-samples.jsonl" 3 <<'PY'
+import json
+import sys
+import time
+
+source, destination, seconds = sys.argv[1], sys.argv[2], float(sys.argv[3])
+start = time.monotonic()
+last = None
+with open(destination, "w", encoding="utf-8") as out:
+    while time.monotonic() - start < seconds:
+        try:
+            with open(source, encoding="utf-8") as stream:
+                state = json.load(stream)
+        except (OSError, ValueError):
+            time.sleep(0.005)
+            continue
+        row = {
+            "frames": state["rendered_frames"],
+            "open": state["overview_open"],
+            "progress": state["overview_progress"],
+            "running": state["overview_motion"]["running"] is not None,
+        }
+        if row != last:
+            out.write(json.dumps({"t": round(time.monotonic() - start, 3), **row}) + "\n")
+            last = row
+        time.sleep(0.01)
+PY
+grep -q '^ok$' "$KB_OUT" || fail D-OVERVIEW-EXIT "the keyboard emulator did not press Escape: $(cat "$KB_OUT")"
+exit_report="$(python3 - "$ARTIFACTS/overview-exit-samples.jsonl" <<'PY'
+import json
+import sys
+
+
+def check(ok, failure):
+    if not ok:
+        print(failure)
+        sys.exit(1)
+
+
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+closing = [r for r in rows if not r["open"]]
+check(closing, "Escape did not close the overview")
+settled = next((r for r in closing if r["progress"] == 0 and not r["running"]), None)
+check(settled, f"the exit never settled; last sample {rows[-1]}")
+# Past the input's 500 ms linger (plus the shell's round trip), the
+# running transition alone draws: new frames while it is part-way.
+late = sorted({r["frames"] for r in closing if r["t"] >= 0.6 and 0 < r["progress"] < 1})
+check(len(late) >= 3, f"only {len(late)} frames drew the exit after the input linger: {late}")
+print(f"settled {settled['t']} s after Escape at frame {settled['frames']}, "
+      f"{len(late)} frames drawn past the input linger")
+PY
+)" || fail D-OVERVIEW-EXIT "$exit_report (overview-exit-samples.jsonl)"
+jq -e '.overview_motion.close.duration_ms == 1000' "$CSTATE" >/dev/null ||
+    fail D-OVERVIEW-EXIT "the exit did not run GNOME's 250 ms slowed four times: $(jq -c '.overview_motion.close | del(.samples)' "$CSTATE")"
+settled_frames 5 || fail D-OVERVIEW-EXIT "the settled desktop kept repainting"
+# The presented frame is the settled desktop: below the bar, the scanout
+# is the desktop's one colour, not the overview's backdrop or a card.
+scanout="$ARTIFACTS/overview-exit-scanout.rgb"
+for format in bgra bgr0; do
+    sudo ffmpeg -loglevel error -y -device "$CARD" -f kmsgrab -i - -frames:v 1 \
+        -vf "hwdownload,format=$format,format=rgb24" -f rawvideo "$scanout" \
+        2>>"$ARTIFACTS/overview-exit-kmsgrab.log" && break
+done
+[ -s "$scanout" ] || fail D-OVERVIEW-EXIT "kmsgrab could not read the scanout: $(tail -2 "$ARTIFACTS/overview-exit-kmsgrab.log")"
+scanout_report="$(python3 - "$scanout" "$EXIT_OUTPUT" <<'PY'
+import sys
+from collections import Counter
+
+
+def check(ok, failure):
+    if not ok:
+        print(failure)
+        sys.exit(1)
+
+
+data = open(sys.argv[1], "rb").read()
+width, height = map(int, sys.argv[2].split("x"))
+check(len(data) == width * height * 3, f"kmsgrab read {len(data)} bytes for {width}x{height}")
+# The top bar is 32 logical pixels at scale 1; the pointer rests in it.
+below = data[40 * width * 3:]
+colours = Counter(below[i:i + 3] for i in range(0, len(below), 3))
+colour, count = colours.most_common(1)[0]
+share = count / (len(below) // 3)
+rgb = tuple(colour)
+check(rgb != (34, 34, 38), "the overview's backdrop is still scanned out")
+check(share >= 0.999, f"{1 - share:.2%} of the scanout below the bar is not the desktop's {rgb}: not the settled desktop")
+print(f"the {width}x{height} scanout below the bar is {share:.3%} the desktop's {rgb}")
+PY
+)" || fail D-OVERVIEW-EXIT "$scanout_report (overview-exit-scanout.rgb)"
+pass D-OVERVIEW-EXIT "Escape from the startup overview with no further input: $exit_report; $scanout_report"
+
+exec 7>&-
+wait "$KEYBOARD_EMU_PID" 2>/dev/null || true
+KEYBOARD_EMU_PID=""
+kill -TERM "$COMP_PID"
+wait "$COMP_PID" || true
+COMP_PID=""
+if grep -q panicked "$EXIT_LOG"; then fail D-NOPANIC "panic in the overview-exit session"; fi
 
 echo "tuna-drm-smoke: OK, artifacts in $ARTIFACTS"

@@ -127,6 +127,14 @@ class Selection(unittest.TestCase):
         # Control: a test only the always-on check job runs adds no lane.
         self.assertEqual(pr("scripts/tests/test_disk_guard.py"), [])
 
+    def test_uinput_emulators_run_drm_smoke_without_rotation(self):
+        # Only tuna-drm-smoke drives them; as code paths they rotated lanes
+        # and could skip drm-smoke.
+        for name in ("keyboard", "touchpad", "tablet"):
+            for run in range(len(m.ROTATION)):
+                self.assertEqual(pr(f"scripts/lib/tuna-uinput-{name}.py", run=run),
+                                 ["drm-smoke"], name)
+
     def test_proof_example_clients_run_the_lane_that_runs_them(self):
         # G-SUBSURFACE-STACKING's client runs only in the gtk-shell job's
         # --subsurface-only slice; the check job compiles it.
