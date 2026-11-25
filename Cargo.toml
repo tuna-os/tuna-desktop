@@ -38,7 +38,7 @@ libadwaita = "0.9"
 # supported library is libgweather 4.4.2 (Ubuntu 24.04).
 libgweather = "4.8"
 gtk4-layer-shell = "0.9"
-gtk4-session-lock = { version = "0.4", features = ["v1_1"] }
+gtk4-session-lock = { version = "0.5", features = ["v1_1"] }
 glib = "0.22"
 gio = "0.22"
 jiff = "0.2"
