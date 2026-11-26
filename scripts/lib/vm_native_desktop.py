@@ -131,8 +131,7 @@ class NativeDesktop:
             failure = {'last_observation': observed, 'readiness_timeout_sec': timeout}
             if late is not None:
                 failure['late_observation_error'] = str(late)[:2000]
-            if last_error is not None:
-                failure['last_read_error'] = repr(last_error)
+            failure['last_read_error'] = None if last_error is None else repr(last_error)
             self.retain('failed-' + label, failure)
             if late is not None:
                 raise TimeoutError('actual readiness absolute deadline expired: ' + label) from late
