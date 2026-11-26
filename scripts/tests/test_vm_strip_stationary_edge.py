@@ -46,12 +46,14 @@ def observations(before):
 
 
 class Tests(unittest.TestCase):
-    def run_observer(self, before, values, *, budget=1):
+    def run_observer(self, before, values, *, budget=1, interrupted=None):
         iterator = iter(values)
         last = values[-1]
+        # Only the interruption test passes the new argument.
+        extra = {} if interrupted is None else {'interrupted': interrupted}
         with patch.object(proof.time, 'sleep', lambda _: None):
             return proof.await_stationary_edge(lambda _: next(iterator, last), before['owner'], before,
-                                                deadline=time.monotonic() + budget)
+                                                deadline=time.monotonic() + budget, **extra)
 
     def test_live_demand_then_one_real_terminal_frame_with_three_steady_observations(self):
         before = sample()
@@ -64,6 +66,19 @@ class Tests(unittest.TestCase):
         with self.assertRaises(proof.NotReady):
             proof.windows(trace[1], before['owner'], edge=True)
         self.assertEqual(len(proof.windows(trace[1], before['owner'], edge=True, live_edge=True)), 4)
+
+    def test_banner_mid_hold_returns_at_once_without_waiting_for_the_terminal(self):
+        # Run 44656894802: a critical updater banner dropped in mid-scroll.
+        before = sample()
+        values = observations(before)
+        values[1]['notification_ui']['layers'].append({'namespace': 'tuna-shell-banners', 'rect': [384, 32, 512, 108]})
+        held, trace = self.run_observer(before, values, interrupted=proof.banner_shown)
+        self.assertIs(held, values[1])
+        self.assertEqual(len(trace), 2)
+        # Without the interruption the observer still waits out the terminal.
+        terminal, trace = self.run_observer(before, values)
+        self.assertFalse(terminal['inventory']['state']['strip_animating'])
+        self.assertEqual(len(trace), 6)
 
     def test_stationary_pointer_or_input_change_is_terminal(self):
         for mutation in ('pointer', 'keys', 'moves', 'bool_counter'):

@@ -57,7 +57,7 @@ and this page together.
 | Global | Version | Notes |
 |---|---|---|
 | wl_compositor | 6 | preferred buffer scale sent per surface, for the output it is on |
-| wl_subcompositor | 1 | |
+| wl_subcompositor | 1 | a subsurface placed above or below its parent is drawn there on the desktop, in the overview's window previews and in window screenshots (G-SUBSURFACE-STACKING, #1255) |
 | wl_shm | 2 | |
 | wl_seat | 9 | |
 | wl_output | 4 | one per connected output |

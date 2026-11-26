@@ -55,7 +55,7 @@ use smithay::{
     },
     desktop::{Window, WindowSurface},
     input::{
-        keyboard::{FilterResult, KeyboardHandle, Keycode, ModifiersState, XkbConfig},
+        keyboard::{xkb, FilterResult, KeyboardHandle, Keycode, ModifiersState, XkbConfig},
         pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
@@ -221,10 +221,15 @@ enum PointerGrab {
         height_start: i32,
     },
     /// Move: the window follows the pointer from where the drag began.
+    /// `keyboard` marks mutter's keyboard move (Alt+F7, the window
+    /// menu's Move): the arrow keys move it too. `origin` is where the
+    /// window was when the move began, for Escape.
     Move {
         id: u64,
         pointer_start: Point<f64, Logical>,
         loc_start: Point<i32, Logical>,
+        origin: Point<i32, Logical>,
+        keyboard: bool,
     },
     /// Resize from `edges` (xdg ResizeEdge bits).
     Resize {
@@ -298,6 +303,10 @@ const EDGE_RIGHT: u32 = 8;
 pub const MIN_WINDOW_SIZE: (i32, i32) = (120, 80);
 /// Distance from the top/side edge that snaps a dropped window.
 pub const SNAP_EDGE_PX: f64 = 2.0;
+/// Mutter's `MAX_UNMAXIMIZED_WINDOW_AREA` (window-private.h:212, mutter
+/// 51): a first-mapped window larger than this share of the work area
+/// opens maximized under `auto-maximize`.
+pub const MAX_UNMAXIMIZED_WINDOW_AREA: f64 = 0.8;
 
 /// New rectangle for a resize from `edges` by `(dx, dy)`, never smaller
 /// than [`MIN_WINDOW_SIZE`]; the opposite edges stay put.
@@ -524,6 +533,8 @@ pub struct WindowManager {
     workspace_policy: tuna_shell_control::WorkspacePolicy,
     /// `org.gnome.mutter center-new-windows` (default on, as in GNOME).
     center_new_windows: bool,
+    /// `org.gnome.mutter auto-maximize` (default on, as in GNOME).
+    auto_maximize: bool,
     /// The shell's text direction: mutter mirrors automatic placement.
     right_to_left: bool,
     workspace_outputs: Vec<crate::workspace_policy::OutputBounds>,
@@ -544,6 +555,12 @@ pub struct WindowManager {
     /// Pending auto-raise `(window, due)`.
     auto_raise: Option<(u64, std::time::Instant)>,
     grab_raise: Option<GrabRaise>,
+    /// Mutter's edge-resistance data for the window being moved, built
+    /// when the move began (`meta_window_drag_ensure_edge_resistance_data`).
+    move_edges: Option<(u64, crate::edge_resistance::EdgeData)>,
+    /// The last move step snapped (Shift held): no tiling then, and the
+    /// release does not tile (`end_grab_op`'s `last_edge_resistance_flags`).
+    move_snapping: bool,
     /// Mutter's alive checks and the close dialog (#1035).
     alive: alive::AliveState,
     /// Mutter's suspend state of the native windows (#503).
@@ -674,6 +691,12 @@ impl WindowManager {
         self.right_to_left = right_to_left;
     }
 
+    /// Follow `org.gnome.mutter auto-maximize` live; it decides for
+    /// windows placed from now on, as in mutter.
+    pub fn set_auto_maximize(&mut self, enabled: bool) {
+        self.auto_maximize = enabled;
+    }
+
     /// Last known pointer position, for position-less events (button
     /// presses) that need a location, e.g. the Activities-strip trigger.
     pub fn pointer_pos(&self) -> Point<f64, Logical> {
@@ -775,6 +798,7 @@ impl WindowManager {
             window_lifecycle: Default::default(),
             workspace_policy: Default::default(),
             center_new_windows: true,
+            auto_maximize: true,
             right_to_left: false,
             workspace_outputs: Vec::new(),
             floating_workareas: Vec::new(),
@@ -789,6 +813,8 @@ impl WindowManager {
             pointer_rest: None,
             auto_raise: None,
             grab_raise: None,
+            move_edges: None,
+            move_snapping: false,
             alive: alive::AliveState::new(state),
             suspension: Default::default(),
         }
@@ -1200,8 +1226,37 @@ impl WindowManager {
             .get(&id)
             .is_some_and(|w| w.layout == WindowLayout::Fullscreen)
     }
+    /// Shell-published dash icon bounds for `id`.
     pub fn icon_geometry(&self, id: u64) -> Option<Rectangle<i32, Logical>> {
         self.icon_geometries.get(&id).copied()
+    }
+    /// The client's own minimize target: X11 `_NET_WM_ICON_GEOMETRY`, as
+    /// Mutter's `meta_window_get_icon_geometry` reports it (Wayland clients
+    /// have no such request).
+    pub fn client_icon_geometry(&self, id: u64) -> Option<Rectangle<i32, Logical>> {
+        match self.windows.get(&id)?.surface.underlying_surface() {
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(surface) => surface.icon_geometry(),
+            _ => None,
+        }
+    }
+    /// Published dash icon bounds as `[window, x, y, w, h]`, by window id.
+    pub fn icon_geometries_json(&self) -> serde_json::Value {
+        let mut rows: Vec<_> = self
+            .icon_geometries
+            .iter()
+            .map(|(id, r)| {
+                [
+                    *id as i64,
+                    r.loc.x.into(),
+                    r.loc.y.into(),
+                    r.size.w.into(),
+                    r.size.h.into(),
+                ]
+            })
+            .collect();
+        rows.sort_unstable();
+        serde_json::json!(rows)
     }
     /// Replace trusted shell-published global logical dash icon bounds.
     pub fn set_icon_geometries(&mut self, geometries: Vec<(u64, Rectangle<i32, Logical>)>) {
@@ -1643,7 +1698,7 @@ impl WindowManager {
             match self.surface_index.get(&wl).copied() {
                 Some(id) => {
                     seen.push(id);
-                    self.sync_title(id, surface);
+                    self.sync_title(state, id, surface);
                 }
                 None => {
                     seen.push(self.map(state, surface));
@@ -1826,6 +1881,10 @@ impl WindowManager {
         let title = read_title(surface).unwrap_or_else(|| "untitled".to_owned());
         let app_id = read_app_id(surface);
         let window = Window::new_wayland_window(surface.clone());
+        // A launch of this app is over: its window is here (#1193).
+        if let Some(app_id) = app_id.as_deref() {
+            state.startup.window_mapped([app_id]);
+        }
         let id = self.insert_managed(&title, app_id.as_deref());
         self.surface_index.insert(surface.wl_surface().clone(), id);
         let target = state
@@ -1945,14 +2004,7 @@ impl WindowManager {
         target: Option<Rectangle<i32, Logical>>,
         centered: bool,
     ) -> Rectangle<i32, Logical> {
-        let work = target
-            .map(|output| {
-                Rectangle::new(
-                    (output.loc.x, output.loc.y + WORK_AREA_TOP).into(),
-                    (output.size.w, (output.size.h - WORK_AREA_TOP).max(0)).into(),
-                )
-            })
-            .unwrap_or_else(|| Self::work_area(state));
+        let work = Self::placement_work_area(state, target);
         if work.size.w <= 0 || work.size.h <= 0 {
             let mut rect = self.cascade_geometry();
             if let Some(size) = wanted {
@@ -2042,6 +2094,8 @@ impl WindowManager {
                 });
                 let centered = self.center_new_windows;
                 let geometry = self.placement_on(state, Some(size), target, centered);
+                let maximize =
+                    self.auto_maximizes(id, size, Self::placement_work_area(state, target));
                 if let Some(window) = self.windows.get_mut(&id) {
                     window.geometry = geometry;
                     window.unplaced = false;
@@ -2051,11 +2105,69 @@ impl WindowManager {
                 if let Some(parent) = parent {
                     self.place_above(parent, id);
                 }
+                if maximize {
+                    self.auto_maximize_now(state, id);
+                }
                 let focused = self.model.focused() == Some(id);
                 self.configure(id, focused);
             } else if let Some(window) = self.windows.get_mut(&id) {
                 window.unplaced = false;
             }
+        }
+    }
+
+    /// The work area automatic placement uses on `target` (the output's
+    /// below the top bar), else the primary's.
+    fn placement_work_area(
+        state: &State,
+        target: Option<Rectangle<i32, Logical>>,
+    ) -> Rectangle<i32, Logical> {
+        target
+            .map(|output| {
+                Rectangle::new(
+                    (output.loc.x, output.loc.y + WORK_AREA_TOP).into(),
+                    (output.size.w, (output.size.h - WORK_AREA_TOP).max(0)).into(),
+                )
+            })
+            .unwrap_or_else(|| Self::work_area(state))
+    }
+
+    /// Mutter's `maybe_automaximize` (place.c:1088-1100, mutter 51): with
+    /// `auto-maximize` on, a window placed for the first time whose size
+    /// covers more than [`MAX_UNMAXIMIZED_WINDOW_AREA`] of the work area
+    /// it is placed in opens maximized, unless it cannot maximize (a fixed
+    /// size, mutter's `has_maximize_func`). Scroll mode has columns, not
+    /// maximized windows.
+    fn auto_maximizes(
+        &self,
+        id: u64,
+        size: Size<i32, Logical>,
+        work: Rectangle<i32, Logical>,
+    ) -> bool {
+        if !self.auto_maximize
+            || self.mode == SessionMode::Scroll
+            || work.size.w <= 0
+            || work.size.h <= 0
+        {
+            return false;
+        }
+        let (min, max) = self.size_hints(id);
+        let fixed = max.w > 0 && max.h > 0 && min.w >= max.w && min.h >= max.h;
+        let window_area = f64::from(size.w.max(0)) * f64::from(size.h.max(0));
+        let work_area = f64::from(work.size.w) * f64::from(work.size.h);
+        !fixed && window_area > work_area * MAX_UNMAXIMIZED_WINDOW_AREA
+    }
+
+    /// `idle_auto_maximize_cb`: maximize a window before it is first
+    /// shown, keeping its placed rectangle to restore to. Not animated:
+    /// mutter maximizes before the first frame. The caller configures.
+    fn auto_maximize_now(&mut self, state: &State, id: u64) {
+        let area = Self::work_area(state);
+        if let Some(window) = self.windows.get_mut(&id) {
+            window.restore = Some(window.geometry);
+            window.layout = WindowLayout::Maximized;
+            window.geometry = area;
+            eprintln!("tuna-compositor: window {id} auto-maximized");
         }
     }
 
@@ -2202,6 +2314,11 @@ impl WindowManager {
     fn map_x11(&mut self, state: &mut State, surface: &X11Surface) -> u64 {
         let (title, app_id) =
             map_x11_identity(&surface.title(), &surface.class(), &surface.instance());
+        // mutter's find_startup_sequence_by_wmclass: class or instance.
+        let (class, instance) = (surface.class(), surface.instance());
+        state
+            .startup
+            .window_mapped([class.as_str(), instance.as_str()]);
         let window = Window::new_x11_window(surface.clone());
         let id = self.insert_managed(&title, app_id.as_deref());
         self.x11_index.insert(surface.window_id(), id);
@@ -2240,6 +2357,15 @@ impl WindowManager {
             self.place_above(parent, id);
         }
         self.note_preferred_output(state, id);
+        // maybe_automaximize at the size the client asked for.
+        if let Some(size) = wanted {
+            let target = state
+                .new_window_output()
+                .map(|entry| Rectangle::new(entry.loc.into(), entry.size));
+            if self.auto_maximizes(id, size, Self::placement_work_area(state, target)) {
+                self.auto_maximize_now(state, id);
+            }
+        }
         self.finish_map(state, id);
         id
     }
@@ -2601,10 +2727,20 @@ impl WindowManager {
         }
     }
 
-    /// Copy the client's current title into the model entry.
-    fn sync_title(&mut self, id: u64, surface: &ToplevelSurface) {
+    /// Copy the client's current title into the model entry. An app id
+    /// first set after the window mapped ends that app's launch (#1193).
+    fn sync_title(&mut self, state: &mut State, id: u64, surface: &ToplevelSurface) {
         let title = read_title(surface);
         let app_id = Some(read_app_id(surface));
+        if let Some(Some(new)) = &app_id {
+            if self
+                .model
+                .window(id)
+                .is_some_and(|entry| entry.app_id.is_none())
+            {
+                state.startup.window_mapped([new.as_str()]);
+            }
+        }
         if title.is_some() || app_id != Some(None) {
             self.model.update(
                 id,
@@ -3285,10 +3421,133 @@ impl WindowManager {
                 id,
                 pointer_start: pointer,
                 loc_start: window.geometry.loc,
+                origin: window.geometry.loc,
+                keyboard: false,
             });
+            self.move_edges = Some((id, self.move_edge_data(state, id)));
+            self.move_snapping = false;
             self.note_grab_start(id);
         }
-        let _ = state;
+    }
+
+    /// The edges a move of `id` resists and snaps to (mutter's
+    /// `compute_resistance_and_snapping_edges`): every output, the top bar
+    /// of each as a strut, and the other visible windows bottom to top.
+    fn move_edge_data(&self, state: &State, id: u64) -> crate::edge_resistance::EdgeData {
+        let outputs: Vec<Rectangle<i32, Logical>> = state
+            .outputs
+            .iter()
+            .map(|entry| Rectangle::new(entry.loc.into(), entry.size))
+            .collect();
+        let struts: Vec<Rectangle<i32, Logical>> = outputs
+            .iter()
+            .map(|output| {
+                Rectangle::new(
+                    output.loc,
+                    (output.size.w, WORK_AREA_TOP.min(output.size.h)).into(),
+                )
+            })
+            .collect();
+        let windows: Vec<Rectangle<i32, Logical>> = self
+            .visible_entries()
+            .into_iter()
+            .filter(|(other, _, _)| *other != id)
+            .map(|(other, _, geometry)| self.shifted(other, geometry))
+            .collect();
+        crate::edge_resistance::EdgeData::new(&outputs, &struts, &windows)
+    }
+
+    /// Mutter's `process_keyboard_move_grab` (meta-window-drag.c:618-751)
+    /// for a keyboard move: an arrow (or keypad direction) moves the
+    /// window 10 px, 1 px with Ctrl, and with Shift snaps to the next
+    /// edge; edges resist as for every keyboard move (other windows' edges
+    /// included). Escape puts the window back where the move began and
+    /// ends it; any other key ends it there. Modifiers pass through.
+    /// Whether the key was the move's.
+    fn keyboard_move_key(&mut self, state: &mut State, keycode: u32) -> bool {
+        let Some(PointerGrab::Move {
+            id,
+            origin,
+            keyboard: true,
+            ..
+        }) = self.grab
+        else {
+            return false;
+        };
+        if matches!(
+            keycode,
+            SHIFT_LEFT_KEYCODE
+                | SHIFT_RIGHT_KEYCODE
+                | CTRL_LEFT_KEYCODE
+                | CTRL_RIGHT_KEYCODE
+                | ALT_LEFT_KEYCODE
+                | ALT_RIGHT_KEYCODE
+                | SUPER_LEFT_KEYCODE
+                | SUPER_RIGHT_KEYCODE
+                | 58 // KEY_CAPSLOCK
+        ) {
+            return false;
+        }
+        let mods = self.held_mods();
+        let snap = mods & tuna_shell_control::MOD_SHIFT != 0;
+        let step = if snap || mods & tuna_shell_control::MOD_CTRL != 0 {
+            1
+        } else {
+            10
+        };
+        // evdev KEY_KP7/8/9/4/6/1/2/3 are KP_Home/Up/Prior/Left/Right/End/Down/Next.
+        let (dx, dy) = match keycode {
+            ARROW_UP_KEYCODE | 72 => (0, -step),
+            ARROW_DOWN_KEYCODE | 80 => (0, step),
+            ARROW_LEFT_KEYCODE | 75 => (-step, 0),
+            ARROW_RIGHT_KEYCODE | 77 => (step, 0),
+            71 => (-step, -step),
+            73 => (step, -step),
+            79 => (-step, step),
+            81 => (step, step),
+            _ => {
+                self.grab = None;
+                self.grab_raise = None;
+                self.move_edges = None;
+                self.move_snapping = false;
+                if keycode == ESCAPE_KEYCODE {
+                    if let Some(window) = self.windows.get_mut(&id) {
+                        window.geometry.loc = origin;
+                    }
+                } else {
+                    self.note_preferred_output(state, id);
+                }
+                return true;
+            }
+        };
+        let flags = crate::edge_resistance::Flags {
+            snap,
+            windows: true,
+            keyboard: true,
+        };
+        let edges = self.move_edges.as_ref().filter(|(owner, _)| *owner == id);
+        let Some(window) = self.windows.get_mut(&id) else {
+            return true;
+        };
+        let old = window.geometry;
+        let proposed = old.loc + Point::from((dx, dy));
+        window.geometry.loc = match edges {
+            Some((_, edges)) => edges.resist_move(old, proposed, flags),
+            None => proposed,
+        };
+        let loc = window.geometry.loc;
+        // The pointer goes on from here (mutter warps it with the window).
+        let pointer = self.pointer_pos;
+        if let Some(PointerGrab::Move {
+            pointer_start,
+            loc_start,
+            ..
+        }) = self.grab.as_mut()
+        {
+            *pointer_start = pointer;
+            *loc_start = loc;
+        }
+        true
     }
 
     /// meta-window-drag.c: a grab raises its window as it starts with
@@ -3574,13 +3833,29 @@ impl WindowManager {
                 id,
                 pointer_start,
                 loc_start,
+                ..
             } => {
+                // meta-window-drag.c:1909-1922: Shift snaps, Ctrl adds the
+                // other windows' edges; then calculate_window_position's
+                // edge resistance (:1299-1303).
+                let mods = self.held_mods();
+                let flags = crate::edge_resistance::Flags {
+                    snap: mods & tuna_shell_control::MOD_SHIFT != 0,
+                    windows: mods & tuna_shell_control::MOD_CTRL != 0,
+                    keyboard: false,
+                };
+                self.move_snapping = flags.snap;
+                let proposed: Point<i32, Logical> = (
+                    loc_start.x + (pos.x - pointer_start.x).round() as i32,
+                    loc_start.y + (pos.y - pointer_start.y).round() as i32,
+                )
+                    .into();
+                let edges = self.move_edges.as_ref().filter(|(owner, _)| *owner == id);
                 if let Some(window) = self.windows.get_mut(&id) {
-                    window.geometry.loc = (
-                        loc_start.x + (pos.x - pointer_start.x).round() as i32,
-                        loc_start.y + (pos.y - pointer_start.y).round() as i32,
-                    )
-                        .into();
+                    window.geometry.loc = match edges {
+                        Some((_, edges)) => edges.resist_move(window.geometry, proposed, flags),
+                        None => proposed,
+                    };
                 }
             }
             PointerGrab::Resize {
@@ -3639,9 +3914,12 @@ impl WindowManager {
             return;
         }
         if let PointerGrab::Move { id, .. } = grab {
+            self.move_edges = None;
             // A user move picks the output the window returns to.
             self.note_preferred_output(state, id);
-            if !self.workspace_policy.edge_tiling {
+            // A snapping move never tiles, and its release is ignored.
+            let snapped = std::mem::take(&mut self.move_snapping);
+            if !self.workspace_policy.edge_tiling || snapped {
                 return;
             }
             match snap_target(self.pointer_pos, state.primary_size().w) {
@@ -3724,6 +4002,10 @@ impl WindowManager {
             ));
         }
         if !self.workspace_policy.edge_tiling {
+            return None;
+        }
+        // update_move: no tile preview while snapping.
+        if self.move_snapping {
             return None;
         }
         let Some(PointerGrab::Move { id, .. }) = self.grab else {
@@ -3892,7 +4174,8 @@ impl WindowManager {
     /// motion, as Mutter's meta_wayland_pointer_update does on the
     /// repick, so a first click on a freshly mapped window lands there
     /// (#425). An interactive move/resize, pointer constraint or a seat
-    /// grab (an implicit button press, drag-and-drop) keeps its focus.
+    /// grab (an implicit button press) keeps its focus; a drag-and-drop's
+    /// target follows the scene, as it follows the pointer.
     fn repick_pointer_surface(&mut self, state: &mut State) {
         // Picking builds the popup/layer presentation. Do not rebuild an
         // unchanged scene on every idle tick, especially in click-focus
@@ -3910,7 +4193,10 @@ impl WindowManager {
         let Some(pointer) = self.pointer.clone() else {
             return;
         };
-        if pointer.is_grabbed() {
+        // A client's drag-and-drop is a grab too, but its target is where
+        // the pointer is: when the overview closes under it, the window
+        // now beneath is what the drop lands on (#1189).
+        if pointer.is_grabbed() && !state.client_dnd_active() {
             return;
         }
         self.pointer_scene_dirty.set(false);
@@ -4738,7 +5024,8 @@ impl WindowManager {
         {
             return true;
         }
-        if pressed && keycode == ESCAPE_KEYCODE && self.cancel_strip_pointer(state) {
+        let move_key = pressed && !self.lock_input_active && self.keyboard_move_key(state, keycode);
+        if move_key || (pressed && keycode == ESCAPE_KEYCODE && self.cancel_strip_pointer(state)) {
             keyboard.input_discard(
                 state,
                 keycode.saturating_add(XKB_X11_OFFSET).into(),
@@ -4984,6 +5271,10 @@ impl WindowManager {
             WindowAction::Move => {
                 self.focus(state, Some(id));
                 self.begin_move(state, id);
+                // mutter's keyboard move (META_GRAB_OP_KEYBOARD_MOVING).
+                if let Some(PointerGrab::Move { keyboard, .. }) = self.grab.as_mut() {
+                    *keyboard = true;
+                }
                 true
             }
             WindowAction::Resize => {
@@ -7220,16 +7511,188 @@ pub enum TriggerAction {
     Open,
 }
 
-/// Tap-detecting overview trigger state: a lone Super press+release
+/// Read-only queries on the seat keymap. smithay's `Xkb::keymap` is
+/// unsafe because a ref-count of the keymap must not outlive the `Xkb`;
+/// the view borrows it no longer than the `Xkb` and hands out queries
+/// only, never the keymap or a clone of it.
+struct KeymapView<'a>(&'a xkb::Keymap);
+
+impl<'a> KeymapView<'a> {
+    fn of(xkb: &'a smithay::input::keyboard::Xkb) -> Self {
+        // SAFETY: the reference lives no longer than `xkb`, and nothing
+        // in this view can clone the keymap or let it escape.
+        Self(unsafe { xkb.keymap() })
+    }
+
+    /// The keymap's lowest and highest raw keycodes.
+    fn keycode_range(&self) -> (u32, u32) {
+        (self.0.min_keycode().raw(), self.0.max_keycode().raw())
+    }
+
+    fn syms_by_level(&self, key: Keycode, layout: u32, level: u32) -> &'a [xkb::Keysym] {
+        self.0.key_get_syms_by_level(key, layout, level)
+    }
+
+    fn num_levels(&self, key: Keycode, layout: u32) -> u32 {
+        self.0.num_levels_for_key(key, layout)
+    }
+}
+
+/// Every evdev keycode of the seat's keymap with the level-one keysyms it
+/// produces in any layout, for resolving the overlay key. Empty without a
+/// seat keyboard.
+pub fn keymap_keysyms(state: &mut State) -> Vec<(u32, Vec<u32>)> {
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return Vec::new();
+    };
+    keyboard.with_xkb_state(state, |context| {
+        let Ok(xkb) = context.xkb().lock() else {
+            return Vec::new();
+        };
+        let (min, max) = KeymapView::of(&xkb).keycode_range();
+        (min.max(XKB_X11_OFFSET)..=max)
+            .filter_map(|code| {
+                let syms: Vec<u32> = xkb
+                    .layouts()
+                    .flat_map(|layout| {
+                        xkb.raw_syms_for_key_in_layout(code.into(), layout)
+                            .iter()
+                            .map(|sym| sym.raw())
+                    })
+                    .collect();
+                (!syms.is_empty()).then(|| (code - XKB_X11_OFFSET, syms))
+            })
+            .collect()
+    })
+}
+
+/// Tap-detecting overview trigger state: a lone overlay-key press+release
 /// toggles, while any other input in between cancels the tap so client
 /// Super-combos keep working. Hot corner and Activities strip open.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TriggerState {
     super_armed: bool,
     /// GNOME's `enable-hot-corners` off (default on, as in GNOME).
     hot_corner_off: bool,
     right_to_left: bool,
     pressure_only: bool,
+    client_drag: bool,
+    /// `org.gnome.mutter overlay-key`, as last parsed.
+    overlay: OverlayKey,
+    /// The evdev keycodes producing it in the current keymap.
+    overlay_keycodes: Vec<u32>,
+}
+
+impl Default for TriggerState {
+    fn default() -> Self {
+        Self {
+            super_armed: false,
+            hot_corner_off: false,
+            right_to_left: false,
+            pressure_only: false,
+            client_drag: false,
+            overlay: OverlayKey::default(),
+            // Super_L and Super_R in every evdev keymap.
+            overlay_keycodes: vec![SUPER_LEFT_KEYCODE, SUPER_RIGHT_KEYCODE],
+        }
+    }
+}
+
+/// `org.gnome.mutter overlay-key` parsed as mutter 51's
+/// `parse_special_key` does (`src/core/prefs.c:1474-1526`): the value as
+/// one accelerator, else `<value>_L` and `<value>_R` (so `Super` is both
+/// Super keys); an empty value or `disabled` binds nothing. Modifiers are
+/// dropped (`combos[i].modifiers = 0`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayKey {
+    /// Keysyms that trigger.
+    keysyms: Vec<u32>,
+    /// Raw `0x..` X keycodes that trigger, as evdev codes.
+    keycodes: Vec<u32>,
+}
+
+impl Default for OverlayKey {
+    /// Mutter 51's default `Super`.
+    fn default() -> Self {
+        Self {
+            keysyms: vec![xkb::keysyms::KEY_Super_L, xkb::keysyms::KEY_Super_R],
+            keycodes: Vec::new(),
+        }
+    }
+}
+
+impl OverlayKey {
+    /// `parse_special_key`; `None` when the value does not parse, which
+    /// mutter answers by keeping the previous key.
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut key = Self {
+            keysyms: Vec::new(),
+            keycodes: Vec::new(),
+        };
+        if let Some(combo) = parse_accelerator(value) {
+            key.push(combo);
+            return Some(key);
+        }
+        key.push(parse_accelerator(&format!("{value}_L"))?);
+        key.push(parse_accelerator(&format!("{value}_R"))?);
+        Some(key)
+    }
+
+    fn push(&mut self, (keysym, keycode): (u32, u32)) {
+        if keysym != 0 {
+            self.keysyms.push(keysym);
+        }
+        // X keycodes are evdev + 8.
+        if keycode >= 8 {
+            self.keycodes.push(keycode - 8);
+        }
+    }
+}
+
+/// mutter 51 `meta_parse_accelerator` (`src/core/meta-accel-parse.c:177-338`)
+/// reduced to what the overlay key keeps: `(keysym, X keycode)`, `(0, 0)`
+/// for an empty or `disabled` value, `None` when it does not parse.
+/// `<...>` modifier groups are skipped; the key name is a `0x..` keycode
+/// or a keysym name matched without case, with mutter's `XF86` retry.
+fn parse_accelerator(accel: &str) -> Option<(u32, u32)> {
+    if accel.is_empty() || accel == "disabled" {
+        return Some((0, 0));
+    }
+    // xkbcommon's helper panics on embedded NUL.
+    if accel.contains('\0') {
+        return None;
+    }
+    let mut rest = accel;
+    while let Some(group) = rest.strip_prefix('<') {
+        rest = match group.find('>') {
+            Some(end) => &group[end + 1..],
+            None => "",
+        };
+    }
+    if rest.is_empty() {
+        return Some((0, 0));
+    }
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 4
+        && bytes[0] == b'0'
+        && bytes[1] == b'x'
+        && bytes[2].is_ascii_hexdigit()
+        && bytes[3].is_ascii_hexdigit()
+    {
+        let digits: String = rest[2..]
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .collect();
+        return Some((0, u32::from_str_radix(&digits, 16).unwrap_or(0)));
+    }
+    let lookup = |name: &str| xkb::keysym_from_name(name, xkb::KEYSYM_CASE_INSENSITIVE).raw();
+    match lookup(rest) {
+        0 => match lookup(&format!("XF86{rest}")) {
+            0 => None,
+            keysym => Some((keysym, 0)),
+        },
+        keysym => Some((keysym, 0)),
+    }
 }
 
 impl TriggerState {
@@ -7243,6 +7706,15 @@ impl TriggerState {
         self.pressure_only = enabled;
     }
 
+    /// Whether a client's drag-and-drop is under way. The drag holds the
+    /// pointer, which presses against no barrier, so GNOME's hot corner
+    /// answers the hover itself (layout.js `HotCorner.handleDragOver`):
+    /// it opens on hover even where physical pressure is required
+    /// otherwise.
+    pub fn set_client_drag(&mut self, active: bool) {
+        self.client_drag = active;
+    }
+
     /// Follow GNOME's `enable-hot-corners`.
     pub fn set_hot_corner(&mut self, enabled: bool) {
         self.hot_corner_off = !enabled;
@@ -7251,6 +7723,42 @@ impl TriggerState {
     /// Follow the shell's default text direction, including live updates.
     pub fn set_right_to_left(&mut self, right_to_left: bool) {
         self.right_to_left = right_to_left;
+    }
+
+    /// Follow `org.gnome.mutter overlay-key` live and resolve it against
+    /// `keymap`, each evdev keycode with the keysyms it produces in any
+    /// layout (mutter re-resolves its overlay combo on every keymap
+    /// change). A value that does not parse keeps the previous key, as in
+    /// mutter; an empty `keymap` (no seat keyboard yet) keeps the
+    /// resolved keycodes.
+    pub fn set_overlay_key(
+        &mut self,
+        value: &str,
+        keymap: impl IntoIterator<Item = (u32, Vec<u32>)>,
+    ) {
+        if let Some(key) = OverlayKey::parse(value) {
+            self.overlay = key;
+        }
+        let mut codes = self.overlay.keycodes.clone();
+        let mut seen_keymap = false;
+        for (code, syms) in keymap {
+            seen_keymap = true;
+            if syms.iter().any(|sym| self.overlay.keysyms.contains(sym)) && !codes.contains(&code) {
+                codes.push(code);
+            }
+        }
+        if seen_keymap {
+            codes.sort_unstable();
+            if codes != self.overlay_keycodes {
+                self.super_armed = false;
+            }
+            self.overlay_keycodes = codes;
+        }
+    }
+
+    /// The evdev keycodes that toggle the overview on a lone tap.
+    pub fn overlay_keycodes(&self) -> &[u32] {
+        &self.overlay_keycodes
     }
 
     /// Decide the overview action for one input event. `overview_open`
@@ -7284,21 +7792,10 @@ impl TriggerState {
         let outputs = outputs
             .filter(|(rect, _)| rect.size.w > 0 && rect.size.h > 0)
             .enumerate();
-        let in_region =
-            |pos: Point<f64, Logical>, rect: Rectangle<i32, Logical>, w: f64, h: f64| {
-                let x = if self.right_to_left {
-                    f64::from(rect.loc.x) + f64::from(rect.size.w) - pos.x
-                } else {
-                    pos.x - f64::from(rect.loc.x)
-                };
-                let y = pos.y - f64::from(rect.loc.y);
-                let within_x = if self.right_to_left {
-                    x > 0.0 && x <= w.min(f64::from(rect.size.w))
-                } else {
-                    (0.0..w.min(f64::from(rect.size.w))).contains(&x)
-                };
-                within_x && (0.0..h.min(f64::from(rect.size.h))).contains(&y)
-            };
+        let in_region = |pos: Point<f64, Logical>,
+                         rect: Rectangle<i32, Logical>,
+                         w: f64,
+                         h: f64| { self.in_region(pos, rect, w, h) };
         let corner = if let ManagerInput::Motion { pos, .. } = input {
             outputs.clone().any(|(index, (rect, primary))| {
                 if !in_region(*pos, rect, HOT_CORNER_PX, HOT_CORNER_PX) {
@@ -7329,6 +7826,45 @@ impl TriggerState {
         self.feed_regions(input, overview_open, corner, strip)
     }
 
+    /// Whether `pointer` is on the primary output's Activities control
+    /// (the strip's left end, mirrored in right-to-left): where a client
+    /// drag held for a moment opens the overview (panel.js
+    /// `ActivitiesButton.handleDragOver`).
+    pub fn activities_at(
+        &self,
+        pointer: Point<f64, Logical>,
+        outputs: impl Iterator<Item = (Rectangle<i32, Logical>, bool)>,
+    ) -> bool {
+        outputs
+            .filter(|(rect, _)| rect.size.w > 0 && rect.size.h > 0)
+            .any(|(rect, primary)| {
+                primary && self.in_region(pointer, rect, ACTIVITIES_WIDTH_PX, ACTIVITIES_STRIP_PX)
+            })
+    }
+
+    /// `pos` within the `w` x `h` region at `rect`'s top-left corner
+    /// (top-right in right-to-left).
+    fn in_region(
+        &self,
+        pos: Point<f64, Logical>,
+        rect: Rectangle<i32, Logical>,
+        w: f64,
+        h: f64,
+    ) -> bool {
+        let x = if self.right_to_left {
+            f64::from(rect.loc.x) + f64::from(rect.size.w) - pos.x
+        } else {
+            pos.x - f64::from(rect.loc.x)
+        };
+        let y = pos.y - f64::from(rect.loc.y);
+        let within_x = if self.right_to_left {
+            x > 0.0 && x <= w.min(f64::from(rect.size.w))
+        } else {
+            (0.0..w.min(f64::from(rect.size.w))).contains(&x)
+        };
+        within_x && (0.0..h.min(f64::from(rect.size.h))).contains(&y)
+    }
+
     fn feed_regions(
         &mut self,
         input: &ManagerInput,
@@ -7339,7 +7875,7 @@ impl TriggerState {
         match *input {
             ManagerInput::Key {
                 keycode, pressed, ..
-            } if keycode == SUPER_LEFT_KEYCODE || keycode == SUPER_RIGHT_KEYCODE => {
+            } if self.overlay_keycodes.contains(&keycode) => {
                 if pressed {
                     self.super_armed = true;
                     TriggerAction::None
@@ -7352,7 +7888,8 @@ impl TriggerState {
             }
             ManagerInput::Motion { .. } => {
                 self.super_armed = false;
-                if !self.pressure_only && !self.hot_corner_off && !overview_open && corner {
+                let hover_opens = !self.pressure_only || self.client_drag;
+                if hover_opens && !self.hot_corner_off && !overview_open && corner {
                     TriggerAction::Open
                 } else {
                     TriggerAction::None
@@ -7376,10 +7913,14 @@ impl TriggerState {
             }
             ManagerInput::CornerPressure { .. } => {
                 self.super_armed = false;
-                if !self.hot_corner_off {
-                    TriggerAction::Toggle
-                } else {
+                // A client drag's hover already opened the overview as the
+                // pointer reached the corner; the pressure that follows it
+                // must not toggle it shut (GNOME's `shouldToggleByCornerOrButton`
+                // holds the same corner's second activation off).
+                if self.hot_corner_off || (self.client_drag && overview_open) {
                     TriggerAction::None
+                } else {
+                    TriggerAction::Toggle
                 }
             }
             ManagerInput::RelativeMotion { .. }
@@ -8295,10 +8836,8 @@ impl WindowManager {
         keyboard.with_xkb_state(state, |context| {
             let xkb = context.xkb().lock().ok()?;
             let layout = xkb.active_layout().0;
-            // SAFETY: the keymap is only borrowed while the lock is held.
-            let keymap = unsafe { xkb.keymap() };
-            keymap
-                .key_get_syms_by_level((keycode + XKB_X11_OFFSET).into(), layout, 0)
+            KeymapView::of(&xkb)
+                .syms_by_level((keycode + XKB_X11_OFFSET).into(), layout, 0)
                 .first()
                 .map(|sym| sym.raw())
         })
@@ -8312,14 +8851,13 @@ impl WindowManager {
         keyboard.with_xkb_state(state, |context| {
             let xkb = context.xkb().lock().ok()?;
             let layout = xkb.active_layout().0;
-            // SAFETY: the keymap is only borrowed while the lock is held.
-            let keymap = unsafe { xkb.keymap() };
-            let (min, max) = (keymap.min_keycode().raw(), keymap.max_keycode().raw());
+            let keymap = KeymapView::of(&xkb);
+            let (min, max) = keymap.keycode_range();
             (min..max).find_map(|keycode| {
-                let levels = keymap.num_levels_for_key(keycode.into(), layout);
+                let levels = keymap.num_levels(keycode.into(), layout);
                 (0..levels).find_map(|level| {
                     keymap
-                        .key_get_syms_by_level(keycode.into(), layout, level)
+                        .syms_by_level(keycode.into(), layout, level)
                         .iter()
                         .any(|sym| sym.raw() == keysym)
                         .then(|| (keycode - XKB_X11_OFFSET, level))
@@ -8900,6 +9438,54 @@ mod tests {
         );
     }
 
+    /// #1191, mutter 51 `parse_special_key` (prefs.c:1474-1526): `Super`
+    /// is both Super keys, `Super_R` only the right one, `''` and
+    /// `disabled` nothing; an unparsable value keeps the previous key.
+    #[test]
+    fn overlay_key_follows_mutters_parse_and_rebinds_live() {
+        let keymap = || {
+            vec![
+                (SUPER_LEFT_KEYCODE, vec![xkb::keysyms::KEY_Super_L]),
+                (SUPER_RIGHT_KEYCODE, vec![xkb::keysyms::KEY_Super_R]),
+                (ALT_RIGHT_KEYCODE, vec![xkb::keysyms::KEY_Alt_R]),
+            ]
+        };
+        let tap = |t: &mut TriggerState, code| {
+            t.feed(&key(code, true), false, (0.0, 100.0).into());
+            t.feed(&key(code, false), false, (0.0, 100.0).into())
+        };
+        let mut t = TriggerState::default();
+        t.set_overlay_key("Super", keymap());
+        assert_eq!(
+            t.overlay_keycodes(),
+            [SUPER_LEFT_KEYCODE, SUPER_RIGHT_KEYCODE]
+        );
+        t.set_overlay_key("Super_R", keymap());
+        assert_eq!(t.overlay_keycodes(), [SUPER_RIGHT_KEYCODE]);
+        assert_eq!(tap(&mut t, SUPER_LEFT_KEYCODE), TriggerAction::None);
+        assert_eq!(tap(&mut t, SUPER_RIGHT_KEYCODE), TriggerAction::Toggle);
+        t.set_overlay_key("not a key!", keymap());
+        assert_eq!(t.overlay_keycodes(), [SUPER_RIGHT_KEYCODE], "kept");
+        t.set_overlay_key("<Alt>Alt_R", keymap());
+        assert_eq!(
+            t.overlay_keycodes(),
+            [ALT_RIGHT_KEYCODE],
+            "modifiers dropped"
+        );
+        for off in ["", "disabled"] {
+            t.set_overlay_key(off, keymap());
+            assert!(t.overlay_keycodes().is_empty());
+            assert_eq!(tap(&mut t, SUPER_LEFT_KEYCODE), TriggerAction::None);
+            assert_eq!(tap(&mut t, SUPER_RIGHT_KEYCODE), TriggerAction::None);
+        }
+        t.set_overlay_key("0x86", keymap());
+        assert_eq!(
+            t.overlay_keycodes(),
+            [SUPER_RIGHT_KEYCODE],
+            "X keycode 0x86"
+        );
+    }
+
     #[test]
     fn lone_super_tap_toggles() {
         let mut triggers = TriggerState::default();
@@ -8972,6 +9558,49 @@ mod tests {
         );
         assert_eq!(
             triggers.feed(&motion(400.0, 300.0), false, (0.0, 300.0).into()),
+            TriggerAction::None
+        );
+    }
+
+    #[test]
+    fn a_client_drag_opens_a_pressure_only_corner_by_hover_and_pressure_never_closes_it() {
+        let mut triggers = TriggerState::default();
+        triggers.set_pressure_only(true);
+        let pressure = ManagerInput::CornerPressure {
+            pos: (0.0, 3.0).into(),
+            time: 0,
+        };
+        let pointer = (0.0, 3.0).into();
+        // Without a drag a native seat's corner is pressure's alone.
+        assert_eq!(
+            triggers.feed(&motion(2.0, 3.0), false, pointer),
+            TriggerAction::None
+        );
+        assert_eq!(
+            triggers.feed(&pressure, true, pointer),
+            TriggerAction::Toggle
+        );
+        triggers.set_client_drag(true);
+        assert_eq!(
+            triggers.feed(&motion(2.0, 3.0), false, pointer),
+            TriggerAction::Open
+        );
+        // The pressure after the hover does not undo it.
+        assert_eq!(triggers.feed(&pressure, true, pointer), TriggerAction::None);
+        assert_eq!(
+            triggers.feed(&pressure, false, pointer),
+            TriggerAction::Toggle
+        );
+        // GNOME's setting still decides whether there is a corner.
+        triggers.set_hot_corner(false);
+        assert_eq!(
+            triggers.feed(&motion(2.0, 3.0), false, pointer),
+            TriggerAction::None
+        );
+        triggers.set_hot_corner(true);
+        triggers.set_client_drag(false);
+        assert_eq!(
+            triggers.feed(&motion(2.0, 3.0), false, pointer),
             TriggerAction::None
         );
     }
@@ -9118,15 +9747,22 @@ mod resize_tests {
     }
 }
 
+/// The main surface's buffer size in logical pixels: the extent GNOME's
+/// `meta_window_get_buffer_rect` covers, client-side shadows included.
+/// `None` before the first buffer.
+pub(crate) fn buffer_size(
+    surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+) -> Option<Size<i32, Logical>> {
+    smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| s.surface_size())
+        .flatten()
+}
+
 /// The size a client committed for its window: its xdg window geometry,
 /// else its buffer's size. `None` before the first buffer.
 pub(crate) fn committed_size(
     surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
 ) -> Option<Size<i32, Logical>> {
-    let buffer = smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
-        s.surface_size()
-    })
-    .flatten()?;
+    let buffer = buffer_size(surface)?;
     let geometry = smithay::wayland::compositor::with_states(surface, |states| {
         states
             .cached_state

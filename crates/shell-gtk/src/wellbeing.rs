@@ -2594,6 +2594,31 @@ mod tests {
     }
 
     #[test]
+    fn proof_session_zone_keeps_the_day_across_the_utc_3am_boundary() {
+        // PR #1214's gtk-shell job began at 02:34 UTC; in UTC its
+        // both-fade-2000 bracket straddled 03:00 and the day turned inside
+        // it. scripts/lib/proof-session-tz.py runs such a proof in `<-11>11`.
+        let at = |hour, minute, second| {
+            jiff::civil::date(2026, 11, 21)
+                .at(hour, minute, second, 0)
+                .to_zoned(jiff::tz::TimeZone::UTC)
+                .unwrap()
+                .timestamp()
+                .as_second()
+        };
+        let utc = jiff::tz::TimeZone::UTC;
+        assert_ne!(
+            start_of_today_in(&utc, at(2, 59, 59)).0,
+            start_of_today_in(&utc, at(3, 0, 1)).0
+        );
+        let proof = jiff::tz::TimeZone::posix("<-11>11").unwrap();
+        let day = start_of_today_in(&proof, at(2, 34, 0)).0;
+        for t in (at(2, 34, 0)..=at(8, 34, 0)).step_by(60) {
+            assert_eq!(start_of_today_in(&proof, t).0, day);
+        }
+    }
+
+    #[test]
     fn active_time_counts_open_and_partial_intervals() {
         // Active [T0-100, T0-40], then open from T0-10; day starts at T0-50.
         let ts = vec![

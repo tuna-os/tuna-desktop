@@ -222,5 +222,84 @@ class GtkShellUploadContract(unittest.TestCase):
         self.assertIn("mkdir -p gtk-shell-artifacts/bin", produced)
 
 
+class GtkShellBinaryCollection(unittest.TestCase):
+    """#1124: an earlier failure must stay the job's reported failure.
+
+    Runs the workflow's own collection script under the runner's default
+    shell options, with /usr/local/lib pointed at a temporary tree.
+    """
+
+    BINARIES = ("tuna-compositor", "tuna-shell-gtk", "tuna-wallpaper-svg")
+    LIBRARIES = ("libgtk4-layer-shell.so", "libgtk4-layer-shell.so.0")
+
+    def setUp(self):
+        steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["gtk-shell"]["steps"]
+        found = [step for step in steps if "mkdir -p gtk-shell-artifacts/bin" in step.get("run", "")]
+        self.assertEqual(len(found), 1)
+        self.step = found[0]
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.lib = self.root / "usr-local-lib"
+        (self.root / "target/debug").mkdir(parents=True)
+        (self.lib / "x86_64-linux-gnu").mkdir(parents=True)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def build(self, *names, libraries=LIBRARIES):
+        for name in names:
+            (self.root / "target/debug" / name).write_text(name)
+        for name in libraries:
+            (self.lib / "x86_64-linux-gnu" / name).write_text(name)
+
+    def collect(self, job_status):
+        script = self.step["run"].replace("/usr/local/lib", str(self.lib))
+        return subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+                              cwd=self.root, env={**os.environ, "JOB_STATUS": job_status},
+                              text=True, capture_output=True, timeout=30)
+
+    def collected(self):
+        return sorted(path.name for path in (self.root / "gtk-shell-artifacts/bin").iterdir())
+
+    def test_step_always_runs_and_reads_the_job_status(self):
+        self.assertEqual(self.step["if"], "always()")
+        self.assertEqual(self.step["env"]["JOB_STATUS"], "${{ job.status }}")
+
+    def test_everything_built_collects_every_binary_and_library(self):
+        self.build(*self.BINARIES)
+        result = self.collect("success")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.collected(), sorted(self.BINARIES + self.LIBRARIES))
+        self.assertNotIn("::warning::", result.stdout)
+
+    def test_unversioned_library_directory_is_the_fallback(self):
+        self.build(*self.BINARIES, libraries=())
+        (self.lib / "libgtk4-layer-shell.so.0").write_text("flat")
+        result = self.collect("success")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.collected(), sorted(self.BINARIES + ("libgtk4-layer-shell.so.0",)))
+
+    def test_after_an_earlier_failure_what_exists_is_collected_without_a_new_failure(self):
+        self.build("tuna-compositor", "tuna-shell-gtk")
+        result = self.collect("failure")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.collected(), sorted(("tuna-compositor", "tuna-shell-gtk") + self.LIBRARIES))
+        self.assertIn("::warning::not collected, never built or installed: target/debug/tuna-wallpaper-svg",
+                      result.stdout)
+
+    def test_failure_before_any_build_or_install_still_succeeds(self):
+        self.build(libraries=())
+        result = self.collect("failure")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.collected(), [])
+        self.assertEqual(result.stdout.count("::warning::"), 4)
+
+    def test_a_missing_binary_fails_the_step_when_nothing_failed_before(self):
+        self.build("tuna-compositor", "tuna-shell-gtk")
+        result = self.collect("success")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("target/debug/tuna-wallpaper-svg", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
