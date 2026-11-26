@@ -19,6 +19,11 @@
 #
 # ffmpeg is required: successful capture always includes every requested video.
 set -eu
+# One owned session (#1082): tuna-proof-session ends every process this
+# run started once it exits, however it exits.
+if [ -z "${TUNA_PROOF_SESSION:-}" ]; then
+    exec "$(dirname -- "$0")/lib/tuna-proof-session" -- "$0" "$@"
+fi
 
 unset CDPATH
 

@@ -28,7 +28,7 @@ jobs:
           ref: 667edf09b70eb88b2a6398ae834d4c841c13f629
           path: corral-source
           persist-credentials: false
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version-file: corral-source/go.mod
       - uses: sigstore/cosign-installer@v4.1.3

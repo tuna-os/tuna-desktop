@@ -1792,4 +1792,41 @@ mod tests {
             assert!(cursor_position(&options(bad)).is_err());
         }
     }
+
+    /// #1162 F2: a capturing session is a remote access grant (mutter's
+    /// handle from activation to release); the user's Stop closes it for
+    /// good and input goes back to the desktop.
+    #[test]
+    fn a_capturing_session_is_a_remote_access_grant_the_user_can_stop() {
+        use tuna_shell_control::{
+            RemoteAccessHandle, RemoteAccessKind, RemoteAccessOwner, RemoteAccessTarget,
+        };
+        let (session, _channel, mut router) = armed();
+        let captures = router.sessions.clone();
+        let handles = || {
+            super::super::remote_access_handles(&Default::default(), &Default::default(), &captures)
+        };
+        assert!(handles().is_empty(), "enabled, not capturing");
+        route(&mut router, motion(0.0, 10.0, -6.0, 0.0), (1.0, 10.0));
+        assert_eq!(session.activation(), Some(1));
+        assert_eq!(
+            handles(),
+            vec![RemoteAccessHandle {
+                kind: RemoteAccessKind::InputCapture,
+                id: 1,
+                owner: RemoteAccessOwner::Portal,
+                owner_name: ":1.1".into(),
+                recording: false,
+                targets: vec![RemoteAccessTarget::Input],
+            }]
+        );
+        let stops = super::super::RemoteAccessStops::default();
+        stops.stop(RemoteAccessKind::InputCapture, 1);
+        stops.apply(&Default::default(), &Default::default(), &captures);
+        assert!(session.is_closed());
+        assert!(handles().is_empty());
+        assert!(session.enable().is_err(), "closed for good");
+        let routed = route(&mut router, key(30, true), (0.0, 10.0));
+        assert!(!routed.captured && routed.deliver.len() == 1);
+    }
 }
