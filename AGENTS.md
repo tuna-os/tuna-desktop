@@ -346,3 +346,22 @@ codebase itself. A broad grep or file scan run to understand
 current-state behavior should treat `.spektacular/specs/`,
 `.spektacular/plans/`, `working-context.md` and the changelog as out of scope,
 unless the task explicitly concerns them.
+
+## Repository guide
+
+Not managed by `spektacular init`; edit in place.
+
+- [docs/README.md](docs/README.md) maps every document and says which are
+  living references and which are dated, historical evidence.
+- [docs/v1.md](docs/v1.md) is the v1 checklist and its current evidence;
+  [docs/parity-ledger.md](docs/parity-ledger.md) records each GNOME 51
+  capability's status and the tests that prove it.
+- [docs/testing.md](docs/testing.md) runs every CI check locally
+  (`just check`, `just proof <name>`) and explains lane selection.
+- Current behaviour comes from the code, tests, `.github/workflows/ci.yml`
+  and `scripts/`; when a document disagrees, fix the document.
+- Every feature pull request adds unit tests and an integration gate: an
+  assertion in a proof lane of `.github/workflows/ci.yml`, routed to that
+  lane by `scripts/ci-select-lanes`, whose assertions reach the
+  `parity-ledger` job's `scripts/tuna-ledger check` step and are cited by
+  the matching ledger row ([CONTRIBUTING.md](CONTRIBUTING.md#every-feature-ships-with-tests)).

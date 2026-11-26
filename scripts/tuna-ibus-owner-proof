@@ -44,6 +44,12 @@
 #
 # Writes assertions.txt (one `GATE pass|fail text` line each).
 set -euo pipefail
+# One owned session (#1082): tuna-proof-session ends every process this run
+# started once it exits. Each gate's private bus below is a nested --bus
+# session, so it skips the host preflight the outer one already ran.
+if [ -z "${TUNA_IBUS_OWNER_SESSION:-}" ]; then
+    TUNA_IBUS_OWNER_SESSION=1 exec "$(dirname -- "${BASH_SOURCE[0]}")/lib/tuna-proof-session" -- "$0" "$@"
+fi
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 art=${1:-$root/ibus-owner-artifacts}
@@ -52,7 +58,7 @@ art=$(realpath "$art")
 assertions="$art/assertions.txt"
 : >"$assertions"
 
-for tool in ibus-daemon ibus Xvfb dbus-run-session pgrep ps python3; do
+for tool in ibus-daemon ibus Xvfb dbus-daemon pgrep ps python3; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "tuna-ibus-owner-proof: $tool is required" >&2
         exit 1
@@ -408,7 +414,7 @@ SHIM
     bus_done="$dir/bus-done"
     # shellcheck disable=SC2016 # expanded by the inner shell
     LIBGL_ALWAYS_SOFTWARE=1 WINIT_UNIX_BACKEND=x11 GDK_BACKEND=x11 BUS_DONE="$bus_done" \
-        dbus-run-session -- sh -c '
+        "$root/scripts/lib/tuna-proof-session" --bus -- sh -c '
             env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u IBUS_ADDRESS -u BUS_DONE "$@"
             while [ ! -e "$BUS_DONE" ]; do sleep 0.2; done' sh \
         "$bin_dir/tuna-compositor" --backend winit --socket "$socket" \
@@ -423,7 +429,7 @@ SHIM
     [ "$ready" = 1 ] || fail "$gate" "the IBus bridge never came up"
 
     local compositor bridge
-    # Anchored: dbus-run-session's own command line holds the same words.
+    # Anchored: the session helper's own command line holds the same words.
     compositor=$(pgrep -f "^[^ ]*/tuna-compositor --backend winit --socket $socket( |$)" | head -1 || true)
     bridge=$(pgrep -P "$compositor" -f '(^|/)tuna-ibus-bridge( |$)' | head -1 || true)
     if [ -z "$compositor" ] || [ -z "$bridge" ]; then

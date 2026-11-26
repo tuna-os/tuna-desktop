@@ -332,8 +332,8 @@ fi
 # A private session bus per process, as the GTK shell proof does. (--all
 # re-execs once here, then once more per stage subprocess, so stages
 # never share a bus.)
-if [ -z "${TUNA_VISUAL_PRIVATE_BUS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
-    TUNA_VISUAL_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+if [ -z "${TUNA_VISUAL_PRIVATE_BUS:-}" ]; then
+    TUNA_VISUAL_PRIVATE_BUS=1 exec "$(dirname -- "$0")/lib/tuna-proof-session" --bus -- "$0" "$@"
 fi
 
 PY=/usr/bin/python3

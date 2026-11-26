@@ -6,6 +6,7 @@
 #   --screenshot-keys-only runs panel readiness and actual keyboard captures only.
 #   --a11y-focus-only runs panel readiness, G-FOCUS-RING, G-FOCUS-RING-TIMEOUT,
 #   G-A11Y-MENU-CLOSE-STABLE, G-A11Y-MENU-RESTART and G-SHELL-STABLE only.
+#   --folder-dnd-only runs panel readiness and the unchanged G-FOLDER-DND gate.
 #   --notify-lock-only runs panel readiness and the lock-screen notification
 #   and notification sound gates only (needs pam_wrapper).
 #   --tray-only runs panel readiness and the AppIndicator pointer, library,
@@ -41,6 +42,9 @@
 #   cancel and drop, #1189) and G-SHELL-STABLE only.
 #   --lock-menu-only runs panel readiness, G-LOCK-WITH-MENU-OPEN and
 #   G-SHELL-STABLE only (needs pam_wrapper).
+#   --remote-access-only runs panel readiness, G-REMOTE-ACCESS-INDICATOR
+#   (a portal share's Stop Screen Sharing button, #1162 F2) and
+#   G-SHELL-STABLE only (needs pipewire, wireplumber and the portal).
 #   --grid-cancel-only --grid-cancel-admission FILE is an exact CI comparison slice.
 #   --expect-grid-cancel-old-negative is permitted only in that admitted slice.
 #   Run at most one --*-only slice at a time.
@@ -127,8 +131,12 @@
 #   G-NOTIFY-LOCK-PIXELS a redacted source's pixels do not depend on its
 #                    text; details change them and taking them back
 #                    restores the frame
+#   G-NOTIFY-LOCK-PUSH a list taller than the room under the clock raises
+#                    the clock, at most to a tenth of the height from the top
 #   G-NOTIFY-LOCK-LIVE arrivals and policy keys reach the locked screen at
 #                    once; unlocking brings the queued banners and sounds
+#   G-NOTIFY-LOCK-MEDIA an MPRIS player lists on the lock screen with its
+#                    track and controls that reach it, by its app's policy
 #   G-NOTIFY-SOUND   banners play sound-name / sound-file as they show,
 #                    silenced by enable-sound-alerts or event-sounds off
 #   G-NOTIFY-RESTORE re-enabling a disabled app brings what it sent while
@@ -573,8 +581,23 @@
 # Frames and accessibility dumps land in the artifacts dir; assertions in
 # assertions.txt for the parity ledger.
 set -eu
-if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
-    TUNA_PROOF_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+# GNOME's screen-time day starts at 03:00 local time: a proof crossing it
+# resets the day's usage mid-gate, and a reached daily limit turns Active.
+# The proof, its private buses and the session all run in a fixed-offset
+# zone where it is about 15:00, twelve hours from either boundary. Chosen
+# once, before the private bus, so activated services inherit it too.
+if [ -z "${TUNA_PROOF_SESSION_TZ:-}" ]; then
+    TUNA_PROOF_SESSION_TZ="$(python3 "$(dirname -- "$0")/lib/proof-session-tz.py")"
+    export TUNA_PROOF_SESSION_TZ
+    echo "tuna-gtk-shell-proof: session TZ=$TUNA_PROOF_SESSION_TZ, local time $(TZ="$TUNA_PROOF_SESSION_TZ" date +%H:%M)" >&2
+fi
+TZ="$TUNA_PROOF_SESSION_TZ"
+export TZ
+# One owned session on a private bus (#1082): tuna-proof-session ends every
+# process this run started once it exits, on pass, on a failed gate and on a
+# signal, and fails the proof if one is still alive afterwards.
+if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ]; then
+    TUNA_PROOF_PRIVATE_BUS=1 exec "$(dirname -- "$0")/lib/tuna-proof-session" --bus -- "$0" "$@"
 fi
 unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -599,7 +622,9 @@ SEARCH_LEAK_ONLY=0
 WINDOW_LEAK_ONLY=0
 DND_OVERVIEW_ONLY=0
 LOCK_MENU_ONLY=0
+REMOTE_ACCESS_ONLY=0
 GRID_CANCEL_ONLY=0
+FOLDER_DND_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
 GRID_CANCEL_ADMISSION=""
 COMPANIONS="${TUNA_PROOF_COMPANIONS:-$ROOT/target/debug/examples}"
@@ -645,8 +670,10 @@ while [ $# -gt 0 ]; do
         --search-leak-only) SEARCH_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --window-leak-only) WINDOW_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --lock-menu-only) LOCK_MENU_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
+        --folder-dnd-only) FOLDER_DND_ONLY=1; only_mode "$1" no-examples; shift ;;
         --dnd-overview-only) DND_OVERVIEW_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --x11-iconic-only) X11_ICONIC_ONLY=1; only_mode "$1"; shift ;;
+        --remote-access-only) REMOTE_ACCESS_ONLY=1; only_mode "$1"; shift ;;
         --subsurface-only) SUBSURFACE_ONLY=1; only_mode "$1" source-build no-media-source no-examples no-camera-policy; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
@@ -897,11 +924,22 @@ cleanup() {
     if [ -n "$PW_PIDS" ]; then kill $PW_PIDS 2>/dev/null || true; fi
     for portal_pid in $PORTAL_PIDS; do kill "$portal_pid" 2>/dev/null || true; done
     if [ -n "${AT_SPI_PID:-}" ]; then kill "$AT_SPI_PID" 2>/dev/null || true; fi
+    # By PID, not over a bus that may be gone (#1082): the bridge's
+    # `ibus-daemon --daemonize` (`ibus exit` needs IBus's bus) and the AT-SPI
+    # registry, which outlives its accessibility bus.
+    cleanup_status=0
+    "$ROOT/scripts/lib/tuna-proof-session" --stop ibus-daemon at-spi2-registryd || cleanup_status=1
     rm -rf "${PIPEWIRE_RUNTIME_DIR:-/nonexistent}"
     if [ -n "$OWNED_RUNTIME" ]; then rm -rf "$OWNED_RUNTIME"; fi
     if [ -n "$SYSBUS_PID" ]; then kill "$SYSBUS_PID" 2>/dev/null || true; fi
+    # Nothing this run started may outlive it: a daemon that escapes the
+    # cleanup above fails the proof (tuna-proof-session then stops it).
+    "$ROOT/scripts/lib/tuna-proof-session" --check || cleanup_status=1
+    [ "$cleanup_status" = 0 ] || exit 1
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # Drive compositor animation time (TUNA_ANIMATION_CLOCK): the first
 # write freezes it, later writes move it to that moment plus N ms, and
 # removing the file resumes real time.
@@ -1147,6 +1185,73 @@ pass G-GRID-ON-DEMAND "no grid tiles on the window picker or after close; a held
 . "$ROOT/scripts/lib/tuna-search-leak-proof.sh"
 . "$ROOT/scripts/lib/tuna-window-leak-proof.sh"
 . "$ROOT/scripts/lib/tuna-dnd-overview-proof.sh"
+
+folder_dnd_proof() {
+# GNOME's folder edits by drag: one app onto another makes a folder of
+# the two (org.gnome.desktop.app-folders); one dragged out of the
+# folder's dialog onto the shade leaves it. Two apps named to sort first
+# sit in the first two cells (113px tiles 12px apart, centred).
+for n in One Two; do
+    printf '[Desktop Entry]\nName=AAA Drag %s\nExec=true\nType=Application\n' "$n" \
+        >"$XDG_DATA_HOME/applications/tuna-drag-$n.desktop"
+done
+sleep 1.5
+before="$(gsettings get org.gnome.desktop.app-folders folder-children)"
+drag() {
+    xdotool mousemove --window "$WID" "$1" "$2"
+    sleep 0.3
+    xdotool mousedown 1
+    sleep 0.2
+    for i in $(seq 1 20); do
+        xdotool mousemove --window "$WID" $(($1 + ($3 - $1) * i / 20)) $(($2 + ($4 - $2) * i / 20))
+        sleep 0.03
+    done
+    sleep 0.4
+    xdotool mouseup 1
+    sleep 1.5
+}
+xdotool key super+a
+cstate '.overview_open and .overview_app_grid' "app grid" || fail G-FOLDER-DND "Super+A did not show the app grid"
+sleep 1.5
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-drag-source.json" 20 || fail G-FOLDER-DND "source dump failed"
+grid_origin
+source_point="$(grid_point "$ARTIFACTS/a11y-folder-drag-source.json" "AAA Drag Two")" || fail G-FOLDER-DND "source bounds missing"
+target_point="$(grid_point "$ARTIFACTS/a11y-folder-drag-source.json" "AAA Drag One")" || fail G-FOLDER-DND "target bounds missing"
+# shellcheck disable=SC2086
+drag $source_point $target_point
+scrot "$ARTIFACTS/11e-folder-made.png" >/dev/null
+after="$(gsettings get org.gnome.desktop.app-folders folder-children)"
+folder=""
+for f in $(echo "$after" | tr -d "[]',"); do
+    case " $(echo "$before" | tr -d "[]',") " in *" $f "*) ;; *) folder="$f" ;; esac
+done
+[ -n "$folder" ] || fail G-FOLDER-DND "dropping an app on another made no folder ($after)"
+fpath="org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder/"
+apps="$(gsettings get "$fpath" apps)"
+case "$apps" in
+    *tuna-drag-One.desktop*tuna-drag-Two.desktop*|*tuna-drag-Two.desktop*tuna-drag-One.desktop*) ;;
+    *) fail G-FOLDER-DND "the new folder holds $apps" ;;
+esac
+name="$(gsettings get "$fpath" name | tr -d "'")"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-new.json" 20 \
+    --press "$name" || fail G-FOLDER-DND "could not open the new folder '$name'"
+sleep 1.5
+scrot "$ARTIFACTS/11f-folder-dialog.png" >/dev/null
+# The dialog's second tile (AAA Drag Two) out onto the shade.
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-dialog-source.json" 20 || fail G-FOLDER-DND "dialog dump failed"
+grid_origin tuna-folder-dialog
+source_point="$(grid_point "$ARTIFACTS/a11y-folder-dialog-source.json" "AAA Drag Two")" || fail G-FOLDER-DND "dialog source bounds missing"
+# shellcheck disable=SC2086
+drag $source_point 140 560
+apps="$(gsettings get "$fpath" apps)"
+[ "$apps" = "['tuna-drag-One.desktop']" ] ||
+    fail G-FOLDER-DND "dragging an app out left the folder with $apps"
+pass G-FOLDER-DND "an app dropped on another makes a GNOME folder; one dragged out of its dialog leaves it"
+xdotool key Escape
+cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-FOLDER-DND "overview stayed open"; }
+rm -f "$XDG_DATA_HOME"/applications/tuna-drag-*.desktop
+sleep 1.5
+}
 
 # Compositor-side state (overview, focus, previews) for app stages.
 CSTATE="$ARTIFACTS/compositor-state.json"
@@ -2116,6 +2221,78 @@ lock_with_menu_gate() {
     pass G-LOCK-WITH-MENU-OPEN "locking over the open date menu or quick settings closes it; the password typed at once and Return unlock through PAM"
 }
 
+# The installed GNOME portal frontend and backend, with their genuine
+# root-owned executable identities, on this proof's private session bus.
+portal_start() {
+    [ -z "$PORTAL_PIDS" ] || return 0
+    PORTAL_BACKEND=/usr/libexec/xdg-desktop-portal-gnome
+    [ -x "$PORTAL_BACKEND" ] || PORTAL_BACKEND=/usr/lib/xdg-desktop-portal-gnome
+    [ -x "$PORTAL_BACKEND" ] || fail G-PORTAL-CONSENT "installed GNOME backend missing"
+    mkdir -p "$XDG_CONFIG_HOME/xdg-desktop-portal"
+    printf '[preferred]\ndefault=gnome;gtk;\norg.freedesktop.impl.portal.ScreenCast=gnome\n' >"$XDG_CONFIG_HOME/xdg-desktop-portal/portals.conf"
+    XDG_CURRENT_DESKTOP=GNOME WAYLAND_DISPLAY="$SOCKET_NAME" GDK_BACKEND=wayland GTK_A11Y=atspi XDG_SESSION_TYPE=wayland "$PORTAL_BACKEND" --replace >"$ARTIFACTS/portal-gnome.log" 2>&1 &
+    PORTAL_BACKEND_PID=$!
+    PORTAL_PIDS="$PORTAL_BACKEND_PID"
+    "$PY" "$ROOT/scripts/lib/tuna-portal-ready.py" org.freedesktop.impl.portal.desktop.gnome org.freedesktop.impl.portal.ScreenCast "$ARTIFACTS/portal-backend-ready.json" --pid "$PORTAL_BACKEND_PID" ||
+        fail G-PORTAL-CONSENT "installed backend capabilities never became ready"
+    XDG_CURRENT_DESKTOP=GNOME /usr/libexec/xdg-desktop-portal --replace >"$ARTIFACTS/portal-frontend.log" 2>&1 &
+    PORTAL_FRONTEND_PID=$!
+    PORTAL_PIDS="$PORTAL_PIDS $PORTAL_FRONTEND_PID"
+    "$PY" "$ROOT/scripts/lib/tuna-portal-ready.py" org.freedesktop.portal.Desktop org.freedesktop.portal.ScreenCast "$ARTIFACTS/portal-frontend-ready.json" --pid "$PORTAL_FRONTEND_PID" ||
+        fail G-PORTAL-CONSENT "frontend capabilities never became ready"
+}
+
+# G-REMOTE-ACCESS-INDICATOR (#1162 F2): a portal screen share the user
+# granted shows GNOME 51's orange "Stop Screen Sharing" panel button
+# (status/remoteAccess.js ScreenSharingIndicator); pressing it through
+# AT-SPI ends the PipeWire stream within two seconds and closes the app's
+# portal session, and the button hides (after GNOME's five-second minimum).
+remote_access_indicator_gate() {
+    portal_start
+    sharing_dump() {
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/$1" 5 >/dev/null 2>&1
+    }
+    # A share an earlier gate closed keeps the button its five seconds.
+    end=$(($(date +%s) + 12))
+    until sharing_dump a11y-sharing-before.json && hidden "$ARTIFACTS/a11y-sharing-before.json" "Stop Screen Sharing" ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 0.5; done
+    hidden "$ARTIFACTS/a11y-sharing-before.json" "Stop Screen Sharing" ||
+        fail G-REMOTE-ACCESS-INDICATOR "the sharing indicator showed with no share active"
+    rm -f "$ARTIFACTS"/portal-indicator.*
+    "$PY" "$ROOT/scripts/lib/tuna-portal-capture-client.py" "$ARTIFACTS/portal-indicator.png" indicator-stop >"$ARTIFACTS/portal-indicator.log" 2>&1 &
+    PORTAL_CLIENT=$!
+    "$PY" "$ROOT/scripts/lib/tuna-portal-consent.py" "$ARTIFACTS/a11y-portal-indicator.json" grant ||
+        fail G-REMOTE-ACCESS-INDICATOR "actual picker could not grant the share"
+    end=$(($(date +%s) + 30))
+    until [ -f "$ARTIFACTS/portal-indicator.active" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
+    [ -f "$ARTIFACTS/portal-indicator.active" ] ||
+        fail G-REMOTE-ACCESS-INDICATOR "the granted share never streamed: $(tail -3 "$ARTIFACTS/portal-indicator.log")"
+    end=$(($(date +%s) + 10))
+    until sharing_dump a11y-sharing.json && button_showing "$ARTIFACTS/a11y-sharing.json" "Stop Screen Sharing" ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+    button_showing "$ARTIFACTS/a11y-sharing.json" "Stop Screen Sharing" ||
+        fail G-REMOTE-ACCESS-INDICATOR "no Stop Screen Sharing button while the share streams"
+    scrot "$ARTIFACTS/24k-screen-sharing-indicator.png" >/dev/null
+    # GNOME's $privacy_indicator_color ($orange_3, #ff7800) panel button.
+    ffmpeg -loglevel error -i "$ARTIFACTS/24k-screen-sharing-indicator.png" -vf "crop=$WIDTH:1:0:16" \
+        -f rawvideo -pix_fmt rgb24 - | od -An -tu1 -v | tr -s ' ' '\n' | awk 'NF' | paste - - - |
+        awk '$1 > 200 && $2 > 90 && $2 < 160 && $3 < 60 { found = 1 } END { exit !found }' ||
+        fail G-REMOTE-ACCESS-INDICATOR "no orange sharing indicator in the panel"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-sharing-stop.json" 20 \
+        --press "Stop Screen Sharing" || fail G-REMOTE-ACCESS-INDICATOR "could not press Stop Screen Sharing"
+    : >"$ARTIFACTS/portal-indicator.revoke"
+    wait "$PORTAL_CLIENT" ||
+        fail G-REMOTE-ACCESS-INDICATOR "Stop did not end the share: $(tail -3 "$ARTIFACTS/portal-indicator.log")"
+    end=$(($(date +%s) + 12))
+    until sharing_dump a11y-sharing-stopped.json && hidden "$ARTIFACTS/a11y-sharing-stopped.json" "Stop Screen Sharing" ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 0.5; done
+    hidden "$ARTIFACTS/a11y-sharing-stopped.json" "Stop Screen Sharing" ||
+        fail G-REMOTE-ACCESS-INDICATOR "the indicator stayed after the share ended"
+    cstate '.capture_streams == 0' "no capture stream after Stop" 5 ||
+        fail G-REMOTE-ACCESS-INDICATOR "a capture stream survived Stop"
+    pass G-REMOTE-ACCESS-INDICATOR "a granted portal share shows GNOME's orange Stop Screen Sharing button; pressing it: $(grep -h 'removed PipeWire node\|closed the app' "$ARTIFACTS/portal-indicator.log" | tr '\n' ' ')and the button hides"
+}
+
 # The panel is up once the shell registers on the a11y bus with its
 # controls; that also proves the accessible tree.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel.json" 60 ||
@@ -2221,6 +2398,16 @@ if [ "$WINDOW_LEAK_ONLY" = 1 ]; then
     shell_stable_gate
     exit 0
 fi
+if [ "$REMOTE_ACCESS_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "remote access desktop ready" ||
+        fail G-REMOTE-ACCESS-INDICATOR "desktop never became ready"
+    [ -n "$PW_PIDS" ] || fail G-REMOTE-ACCESS-INDICATOR "--remote-access-only needs pipewire and wireplumber"
+    sleep 3
+    remote_access_indicator_gate
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
 if [ "$LOCK_MENU_ONLY" = 1 ]; then
     cstate '.active_workspace != null and .locked == false' "lock menu desktop ready" ||
         fail G-LOCK-WITH-MENU-OPEN "desktop never became ready"
@@ -2271,6 +2458,14 @@ if [ "$A11Y_FOCUS_ONLY" = 1 ]; then
     a11y_focus_ring_proof
     if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_transient_stable_proof; fi
     if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_menu_restart_proof; fi
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
+if [ "$FOLDER_DND_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "folder desktop ready" ||
+        fail G-FOLDER-DND "desktop never became ready"
+    folder_dnd_proof
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
     exit 0
@@ -2542,19 +2737,16 @@ end=$(($(date +%s) + 10))
 until [ -s "$TRAY_MARKER" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 grep -q "^clicked 1" "$TRAY_MARKER" 2>/dev/null || fail G-TRAY "the menu row never reached the item"
 kill "$TRAY_PID" 2>/dev/null || true
-tray_absent=0
-for _ in $(seq 1 30); do
-    if "$PY" "$ROOT/scripts/lib/tuna_tray_absence.py" "$ARTIFACTS/privacy-portal/receipt.json" \
-        "$ARTIFACTS/a11y-tray-gone.json" "$ROOT/scripts/lib/tuna-a11y-dump.py"; then
-        tray_absent=1
-        break
-    else
-        tray_observation=$?
-        [ "$tray_observation" = 2 ] || fail G-TRAY "fresh owner-bound tray absence observation failed"
-    fi
-    sleep 0.5
-done
-[ "$tray_absent" = 1 ] || fail G-TRAY "the item stayed in the panel after it exited"
+# Up to 30 fresh owner-bound observations 0.5 s apart; an AT-SPI child
+# vanishing inside the departing item's subtree is a retry, not a refusal.
+if "$PY" "$ROOT/scripts/lib/tuna_tray_absence.py" "$ARTIFACTS/privacy-portal/receipt.json" \
+    "$ARTIFACTS/a11y-tray-gone.json" "$ROOT/scripts/lib/tuna-a11y-dump.py"; then
+    :
+else
+    tray_observation=$?
+    [ "$tray_observation" = 2 ] || fail G-TRAY "fresh owner-bound tray absence observation failed"
+    fail G-TRAY "the item stayed in the panel after it exited"
+fi
 pass G-TRAY "an AppIndicator item shows with its tooltip, fires its menu, and leaves on exit"
 xdotool key Escape
 sleep 1
@@ -3597,8 +3789,17 @@ grid_samples() {
     samples_mark="$1"
     samples_name="$2"
     shift 2
-    "$PY" "$ROOT/scripts/lib/grid-anim-samples.py" --log "$LOG" --offset "$samples_mark" "$@" \
-        >"$ARTIFACTS/grid-anim-samples-$samples_name.txt" 2>&1
+    samples_output="$ARTIFACTS/grid-anim-samples-$samples_name.txt"
+    if "$PY" "$ROOT/scripts/lib/grid-anim-samples.py" --log "$LOG" --offset "$samples_mark" "$@" \
+        >"$samples_output" 2>&1; then
+        return 0
+    else
+        samples_status=$?
+    fi
+    printf 'tuna-gtk-shell-proof: grid animation mismatch (samples: %s; raw trace: %s)\n' \
+        "$samples_output" "$LOG" >&2
+    cat "$samples_output" >&2
+    return "$samples_status"
 }
 if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     log_has "$page_mark" "grid-anim page-switch start ms=300 motion=full" ||
@@ -3608,7 +3809,7 @@ if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     log_has "$page_mark" "grid-anim page-arrow start ms=200" ||
         fail G-GRID-PAGE-ANIM "the page arrows did not fade over 200 ms"
     grid_samples "$page_mark" next --from 0 --to 1 ||
-        fail G-GRID-PAGE-ANIM "page-switch frames or page dots strayed from GNOME's 300 ms out-cubic (grid-anim-samples-next.txt)"
+        fail G-GRID-PAGE-ANIM "page-switch frames or page dots strayed from GNOME's 300 ms out-cubic ($ARTIFACTS/grid-anim-samples-next.txt)"
     # With animations off the switch and the arrows jump.
     motion_policy Off
     page_mark="$(log_mark)"
@@ -3619,7 +3820,7 @@ if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     log_has "$page_mark" "grid-anim page-switch start" &&
         fail G-GRID-PAGE-ANIM "with animations off a page slide started"
     grid_samples "$page_mark" off --instant --to 0 ||
-        fail G-GRID-PAGE-ANIM "with animations off the pages or dots passed through between pages (grid-anim-samples-off.txt)"
+        fail G-GRID-PAGE-ANIM "with animations off the pages or dots passed through between pages ($ARTIFACTS/grid-anim-samples-off.txt)"
     "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-page1-off.json" 20 ||
         fail G-GRID-PAGE-ANIM "accessibility dump failed"
     showing "$ARTIFACTS/a11y-grid-page1-off.json" "Previous Page" &&
@@ -3630,7 +3831,7 @@ if [ "$GRID_CANCEL_ONLY" != 1 ]; then
         --press "Next Page" || fail G-GRID-PAGE-ANIM "could not return to page two"
     log_wait "$page_mark" "grid-anim page-switch settle" || fail G-GRID-PAGE-ANIM "the page switch back never settled"
     grid_samples "$page_mark" next-again --from 0 --to 1 ||
-        fail G-GRID-PAGE-ANIM "the second switch's frames or dots strayed from GNOME's curve (grid-anim-samples-next-again.txt)"
+        fail G-GRID-PAGE-ANIM "the second switch's frames or dots strayed from GNOME's curve ($ARTIFACTS/grid-anim-samples-next-again.txt)"
     sleep 0.5
     pass G-GRID-PAGE-ANIM "page switches ease out-cubic over 300 ms (every frame-clock sample on GNOME's curve, page dots following the drawn position) and the arrows fade over 200 ms; with animations off both jump"
 fi
@@ -3976,70 +4177,7 @@ cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overvie
 rm -f "$XDG_DATA_HOME"/applications/tuna-page-*.desktop
 sleep 1.5
 
-# GNOME's folder edits by drag: one app onto another makes a folder of
-# the two (org.gnome.desktop.app-folders); one dragged out of the
-# folder's dialog onto the shade leaves it. Two apps named to sort first
-# sit in the first two cells (113px tiles 12px apart, centred).
-for n in One Two; do
-    printf '[Desktop Entry]\nName=AAA Drag %s\nExec=true\nType=Application\n' "$n" \
-        >"$XDG_DATA_HOME/applications/tuna-drag-$n.desktop"
-done
-sleep 1.5
-before="$(gsettings get org.gnome.desktop.app-folders folder-children)"
-drag() {
-    xdotool mousemove --window "$WID" "$1" "$2"
-    sleep 0.3
-    xdotool mousedown 1
-    sleep 0.2
-    for i in $(seq 1 20); do
-        xdotool mousemove --window "$WID" $(($1 + ($3 - $1) * i / 20)) $(($2 + ($4 - $2) * i / 20))
-        sleep 0.03
-    done
-    sleep 0.4
-    xdotool mouseup 1
-    sleep 1.5
-}
-xdotool key super+a
-cstate '.overview_open and .overview_app_grid' "app grid" || fail G-FOLDER-DND "Super+A did not show the app grid"
-sleep 1.5
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-drag-source.json" 20 || fail G-FOLDER-DND "source dump failed"
-grid_origin
-source_point="$(grid_point "$ARTIFACTS/a11y-folder-drag-source.json" "AAA Drag Two")" || fail G-FOLDER-DND "source bounds missing"
-target_point="$(grid_point "$ARTIFACTS/a11y-folder-drag-source.json" "AAA Drag One")" || fail G-FOLDER-DND "target bounds missing"
-# shellcheck disable=SC2086
-drag $source_point $target_point
-scrot "$ARTIFACTS/11e-folder-made.png" >/dev/null
-after="$(gsettings get org.gnome.desktop.app-folders folder-children)"
-folder=""
-for f in $(echo "$after" | tr -d "[]',"); do
-    case " $(echo "$before" | tr -d "[]',") " in *" $f "*) ;; *) folder="$f" ;; esac
-done
-[ -n "$folder" ] || fail G-FOLDER-DND "dropping an app on another made no folder ($after)"
-fpath="org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder/"
-apps="$(gsettings get "$fpath" apps)"
-case "$apps" in
-    *tuna-drag-One.desktop*tuna-drag-Two.desktop*|*tuna-drag-Two.desktop*tuna-drag-One.desktop*) ;;
-    *) fail G-FOLDER-DND "the new folder holds $apps" ;;
-esac
-name="$(gsettings get "$fpath" name | tr -d "'")"
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-new.json" 20 \
-    --press "$name" || fail G-FOLDER-DND "could not open the new folder '$name'"
-sleep 1.5
-scrot "$ARTIFACTS/11f-folder-dialog.png" >/dev/null
-# The dialog's second tile (AAA Drag Two) out onto the shade.
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-dialog-source.json" 20 || fail G-FOLDER-DND "dialog dump failed"
-grid_origin tuna-folder-dialog
-source_point="$(grid_point "$ARTIFACTS/a11y-folder-dialog-source.json" "AAA Drag Two")" || fail G-FOLDER-DND "dialog source bounds missing"
-# shellcheck disable=SC2086
-drag $source_point 140 560
-apps="$(gsettings get "$fpath" apps)"
-[ "$apps" = "['tuna-drag-One.desktop']" ] ||
-    fail G-FOLDER-DND "dragging an app out left the folder with $apps"
-pass G-FOLDER-DND "an app dropped on another makes a GNOME folder; one dragged out of its dialog leaves it"
-xdotool key Escape
-cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-FOLDER-DND "overview stayed open"; }
-rm -f "$XDG_DATA_HOME"/applications/tuna-drag-*.desktop
-sleep 1.5
+folder_dnd_proof
 
 grid_hover_proof
 grid_on_demand_proof
@@ -11476,23 +11614,7 @@ if [ -n "$PW_PIDS" ] && command -v gst-launch-1.0 >/dev/null 2>&1; then
         fail G-CAPTURE-DENY "capture admission failed: $(tail -3 "$ARTIFACTS/capture-denial.log")"
     pass G-CAPTURE-DENY "untrusted callers and forged portal name denied screenshots, screencasts and shell recorder"
 
-    # Use the installed frontend/backend, with their genuine root-owned
-    # executable identities, on this proof's private session bus.
-    PORTAL_BACKEND=/usr/libexec/xdg-desktop-portal-gnome
-    [ -x "$PORTAL_BACKEND" ] || PORTAL_BACKEND=/usr/lib/xdg-desktop-portal-gnome
-    [ -x "$PORTAL_BACKEND" ] || fail G-PORTAL-CONSENT "installed GNOME backend missing"
-    mkdir -p "$XDG_CONFIG_HOME/xdg-desktop-portal"
-    printf '[preferred]\ndefault=gnome;gtk;\norg.freedesktop.impl.portal.ScreenCast=gnome\n' >"$XDG_CONFIG_HOME/xdg-desktop-portal/portals.conf"
-    XDG_CURRENT_DESKTOP=GNOME WAYLAND_DISPLAY="$SOCKET_NAME" GDK_BACKEND=wayland GTK_A11Y=atspi XDG_SESSION_TYPE=wayland "$PORTAL_BACKEND" --replace >"$ARTIFACTS/portal-gnome.log" 2>&1 &
-    PORTAL_BACKEND_PID=$!
-    PORTAL_PIDS="$PORTAL_BACKEND_PID"
-    "$PY" "$ROOT/scripts/lib/tuna-portal-ready.py" org.freedesktop.impl.portal.desktop.gnome org.freedesktop.impl.portal.ScreenCast "$ARTIFACTS/portal-backend-ready.json" --pid "$PORTAL_BACKEND_PID" ||
-        fail G-PORTAL-CONSENT "installed backend capabilities never became ready"
-    XDG_CURRENT_DESKTOP=GNOME /usr/libexec/xdg-desktop-portal --replace >"$ARTIFACTS/portal-frontend.log" 2>&1 &
-    PORTAL_FRONTEND_PID=$!
-    PORTAL_PIDS="$PORTAL_PIDS $PORTAL_FRONTEND_PID"
-    "$PY" "$ROOT/scripts/lib/tuna-portal-ready.py" org.freedesktop.portal.Desktop org.freedesktop.portal.ScreenCast "$ARTIFACTS/portal-frontend-ready.json" --pid "$PORTAL_FRONTEND_PID" ||
-        fail G-PORTAL-CONSENT "frontend capabilities never became ready"
+    portal_start
     for decision in cancel grant; do
         "$PY" "$ROOT/scripts/lib/tuna-portal-capture-client.py" "$ARTIFACTS/portal-$decision.png" "$decision" >"$ARTIFACTS/portal-$decision.log" 2>&1 &
         PORTAL_CLIENT=$!
@@ -11503,6 +11625,7 @@ if [ -n "$PW_PIDS" ] && command -v gst-launch-1.0 >/dev/null 2>&1; then
     [ -s "$ARTIFACTS/portal-grant.png" ] || fail G-PORTAL-CONSENT "granted frontend returned no consumed frame"
     [ ! -f "$ARTIFACTS/portal-cancel.png" ] || fail G-PORTAL-CONSENT "cancel produced frame"
     pass G-PORTAL-CONSENT "actual GNOME picker Cancel denies; Share grants and streams; owner Close removes node"
+    remote_access_indicator_gate
 
     # GNOME's screen recorder: the screenshot UI's video switch records
     # the selection (GNOME's first one, a centred quarter) as VP8 WebM in
