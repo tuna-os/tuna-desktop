@@ -112,7 +112,7 @@ def preflight():
         or type(companion['commit']) is not str
         or type(companion['files']) is not dict
         or companion['commit'] != run(['git', 'rev-parse', 'HEAD'])
-        or set(companion['files']) != {'icon-probe', 'shortcut-inhibit-client'}
+        or set(companion['files']) != {'icon-probe', 'shortcut-inhibit-client', 'tuna-bell-client'}
         or (companion['pr_head'] is not None and (
             type(companion['pr_head']) is not str
             or len(companion['pr_head']) != 40
