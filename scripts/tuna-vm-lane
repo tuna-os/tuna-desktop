@@ -1427,6 +1427,18 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
            "logind LockedHint no, then loginctl lock-session locks with yes, the password unlocks with no, "
            "Super+L locks with yes and loginctl unlock-session unlocks with no (lifecycle/locked-hint.json)")
 
+    # An unlock without input wakes the screen gsd-power blanked: every
+    # unlock emits WakeUpScreen, as GNOME 51's screenShield.js does (#1194).
+    from vm_unlock_wake import run as prove_unlock_wake
+
+    def password_unlock():
+        qmp.keys("ret")
+        time.sleep(0.3)
+        qmp.keys("ctrl", "a")
+        qmp.type_text("tuna")
+        qmp.keys("ret")
+    prove_unlock_wake(qmp, agent, evidence, record, password_unlock)
+
     # Real distribution Orca owns a credential-verified bus name under the ordinary
     # session user. Settings writes trigger Tuna Desktop's consumer, not test start/stop.
     orca_observations = []

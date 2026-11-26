@@ -4,6 +4,7 @@
 //! malformed callers.
 use super::remote_clipboard::{Effect, Registry};
 use super::*;
+use crate::capture_security::CaptureCaller;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -223,7 +224,11 @@ fn session_clipboard_and_keysyms_are_owned_bounded_and_revocable() {
     let owner = connect(&bus);
     let foreign = connect(&bus);
     let authority = crate::capture_security::Authority::default();
-    let grant = remote_desktop::RemoteGrant::new(1, owner.unique_name().unwrap().to_string());
+    let grant = remote_desktop::RemoteGrant::new(
+        1,
+        owner.unique_name().unwrap().to_string(),
+        CaptureCaller::RemoteDesktopDaemon,
+    );
     let (to_loop, from_dbus) = calloop::channel::channel();
     let _server = zbus::block_on(
         zbus::connection::Builder::address(bus.1.as_str())
@@ -596,6 +601,11 @@ fn capture_session(
 ) -> Session {
     Session {
         owner: owner.into(),
+        caller: if grant.is_some() {
+            CaptureCaller::RemoteDesktopDaemon
+        } else {
+            CaptureCaller::Portal
+        },
         authority: authority.clone(),
         id,
         outputs: Arc::new(Mutex::new(vec![monitor("Virtual-1")])),
@@ -689,7 +699,8 @@ fn linked_screencast_records_after_remote_start_and_serves_stream_start_stop() {
     let foreign = connect(&bus);
     let owner_name = owner.unique_name().unwrap().to_string();
     let authority = crate::capture_security::Authority::default();
-    let grant = remote_desktop::RemoteGrant::new(1, owner_name.clone());
+    let grant =
+        remote_desktop::RemoteGrant::new(1, owner_name.clone(), CaptureCaller::RemoteDesktopDaemon);
     let (to_loop, from_dbus) = calloop::channel::channel();
     let captures: Sessions = Default::default();
     let capture = capture_session(7, &owner_name, &authority, Some(&grant), &to_loop);
@@ -896,7 +907,8 @@ fn a_remote_grant_links_one_screencast_session_of_its_own_owner() {
         next_id: Arc::new(AtomicU64::new(1)),
         scan: Default::default(),
     };
-    let grant = remote_desktop::RemoteGrant::new(1, ":1.5".into());
+    let grant =
+        remote_desktop::RemoteGrant::new(1, ":1.5".into(), CaptureCaller::RemoteDesktopDaemon);
     remote
         .lock()
         .unwrap()
@@ -941,4 +953,204 @@ fn a_remote_grant_links_one_screencast_session_of_its_own_owner() {
         error_name(screencast.linked_grant(":1.5", "tuna-remote-1")),
         "AccessDenied"
     );
+}
+
+/// #1162 F2: mutter's remote access handles. Started ScreenCast and
+/// RemoteDesktop sessions are published with their owner, targets and
+/// `is-recording`; unstarted ones are not. The user's Stop revokes a
+/// grant for good: a stopped linked session ends its RemoteDesktop grant
+/// too, and neither owner can use its grant again.
+#[test]
+fn remote_access_lists_started_grants_and_stop_revokes_them_for_good() {
+    const SC_SESSION: &str = "org.gnome.Mutter.ScreenCast.Session";
+    const RD_PATH: &str = "/org/gnome/Mutter/RemoteDesktop/Session/u5";
+    let path = |id: u64| format!("/org/gnome/Mutter/ScreenCast/Session/u{id}");
+    let bus = bus();
+    let portal = connect(&bus);
+    let shell = connect(&bus);
+    let grd = connect(&bus);
+    let name = |conn: &Connection| conn.unique_name().unwrap().to_string();
+    let authority = crate::capture_security::Authority::default();
+    let (to_loop, _from_dbus) = calloop::channel::channel();
+    let sessions: Sessions = Default::default();
+    let remote: remote_desktop::RemoteSessions = Default::default();
+    let captures: input_capture::CaptureSessions = Default::default();
+    let grant = remote_desktop::RemoteGrant::new(5, name(&grd), CaptureCaller::RemoteDesktopDaemon);
+    remote
+        .lock()
+        .unwrap()
+        .insert("tuna-remote-5".into(), grant.clone());
+    let share = capture_session(3, &name(&portal), &authority, None, &to_loop);
+    let mut recording = capture_session(4, &name(&shell), &authority, None, &to_loop);
+    recording.caller = CaptureCaller::Shell;
+    let unstarted = capture_session(6, &name(&portal), &authority, None, &to_loop);
+    let linked = capture_session(7, &name(&grd), &authority, Some(&grant), &to_loop);
+    let mut server = zbus::connection::Builder::address(bus.1.as_str());
+    for session in [&share, &recording, &unstarted, &linked] {
+        sessions.lock().unwrap().push((
+            session.clone(),
+            OwnedObjectPath::try_from(path(session.id)).unwrap(),
+        ));
+        server = server.serve_at(path(session.id), session.clone());
+    }
+    let _server = zbus::block_on(
+        server
+            .serve_at(
+                RD_PATH,
+                remote_desktop::RemoteSession {
+                    grant: grant.clone(),
+                    authority: authority.clone(),
+                    captures: sessions.clone(),
+                    outputs: Default::default(),
+                    to_loop: to_loop.clone(),
+                },
+            )
+            .name(RD)
+            .build(),
+    )
+    .unwrap();
+    let handles = || remote_access_handles(&remote, &sessions, &captures);
+    assert!(handles().is_empty(), "nothing started yet");
+
+    let recorded = HashMap::from([("is-recording", Variant::from(true))]);
+    object_path(call(
+        &portal,
+        &path(3),
+        SC_SESSION,
+        "RecordMonitor",
+        &("Virtual-1", no_options()),
+    ));
+    call(&portal, &path(3), SC_SESSION, "Start", &()).unwrap();
+    object_path(call(
+        &shell,
+        &path(4),
+        SC_SESSION,
+        "RecordArea",
+        &(0, 0, 640, 400, recorded),
+    ));
+    call(&shell, &path(4), SC_SESSION, "Start", &()).unwrap();
+    object_path(call(
+        &portal,
+        &path(6),
+        SC_SESSION,
+        "RecordMonitor",
+        &("Virtual-1", no_options()),
+    ));
+    object_path(call(
+        &grd,
+        &path(7),
+        SC_SESSION,
+        "RecordMonitor",
+        &("", no_options()),
+    ));
+    call(&grd, RD_PATH, SESSION, "Start", &()).unwrap();
+
+    let monitor = || {
+        vec![RemoteAccessTarget::Monitor {
+            connector: "Virtual-1".into(),
+        }]
+    };
+    let cast = |id: u64, owner: RemoteAccessOwner, conn: &Connection, recording, targets| {
+        RemoteAccessHandle {
+            kind: RemoteAccessKind::ScreenCast,
+            id,
+            owner,
+            owner_name: name(conn),
+            recording,
+            targets,
+        }
+    };
+    let remote_control = RemoteAccessHandle {
+        kind: RemoteAccessKind::RemoteDesktop,
+        id: 5,
+        owner: RemoteAccessOwner::RemoteDesktopDaemon,
+        owner_name: name(&grd),
+        recording: false,
+        targets: vec![RemoteAccessTarget::Input],
+    };
+    let recorder = cast(
+        4,
+        RemoteAccessOwner::Shell,
+        &shell,
+        true,
+        vec![RemoteAccessTarget::Area {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 400,
+        }],
+    );
+    assert_eq!(
+        handles(),
+        vec![
+            cast(3, RemoteAccessOwner::Portal, &portal, false, monitor()),
+            recorder.clone(),
+            cast(
+                7,
+                RemoteAccessOwner::RemoteDesktopDaemon,
+                &grd,
+                false,
+                monitor()
+            ),
+            remote_control.clone(),
+        ]
+    );
+
+    // Stop the portal's share and the linked screen cast; an unknown
+    // grant is nothing to stop.
+    let stops = RemoteAccessStops::default();
+    stops.stop(RemoteAccessKind::ScreenCast, 3);
+    stops.stop(RemoteAccessKind::ScreenCast, 7);
+    stops.stop(RemoteAccessKind::InputCapture, 99);
+    stops.apply(&remote, &sessions, &captures);
+    assert!(share.stopped.load(Ordering::SeqCst));
+    assert!(
+        grant.stopped.load(Ordering::SeqCst),
+        "linked: the grant ends too"
+    );
+    assert!(!recording.stopped.load(Ordering::SeqCst));
+    assert_eq!(handles(), vec![recorder]);
+    // For good: the owners' sessions refuse them.
+    assert_error(
+        call(
+            &portal,
+            &path(3),
+            SC_SESSION,
+            "RecordMonitor",
+            &("Virtual-1", no_options()),
+        ),
+        "AccessDenied",
+    );
+    assert_error(
+        call(
+            &grd,
+            RD_PATH,
+            SESSION,
+            "NotifyPointerMotionRelative",
+            &(1.0, 0.0),
+        ),
+        "AccessDenied",
+    );
+    assert!(remote_desktop::queue_input(
+        &grant,
+        &to_loop,
+        remote_desktop::Input::Relative { dx: 1.0, dy: 0.0 }
+    )
+    .is_err());
+
+    // A RemoteDesktop handle stops by itself the same way.
+    let other = remote_desktop::RemoteGrant::new(8, name(&grd), CaptureCaller::RemoteDesktopDaemon);
+    other.started.store(true, Ordering::SeqCst);
+    remote
+        .lock()
+        .unwrap()
+        .insert("tuna-remote-8".into(), other.clone());
+    assert_eq!(
+        handles().last().map(|h| (h.kind, h.id)),
+        Some((RemoteAccessKind::RemoteDesktop, 8))
+    );
+    stops.stop(RemoteAccessKind::RemoteDesktop, 8);
+    stops.apply(&remote, &sessions, &captures);
+    assert!(other.stopped.load(Ordering::SeqCst));
+    assert_eq!(handles().len(), 1);
 }

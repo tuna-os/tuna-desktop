@@ -204,6 +204,9 @@ jobs:
       # retirement under a fake guest and clock (#1013).
       - run: python3 scripts/tests/test_vm_native_desktop.py
       - run: python3 scripts/tests/test_vm_reference_login.py
+      # The gdm51 overlay may update only gdm.service in the shipped-payload receipt.
+      - run: python3 scripts/tests/test_gdm51_payload_reconcile.py
+      - run: python3 scripts/tests/test_vm_unlock_wake.py
       - run: python3 scripts/tests/test_gnome_reference_guest.py
       - run: python3 scripts/tests/test_native_switcher_reference.py
       - run: python3 scripts/tests/test_overview_recording.py
@@ -218,6 +221,8 @@ jobs:
         run: python3 scripts/tuna-maintained-media-refresh --verify-if-changed "$MEDIA_BASE_SHA"
       - run: python3 scripts/tests/test_disk_guard.py
       - run: python3 scripts/tests/test_reaper.py
+      # Nested proofs end every process they start, on pass, fail and signal (#1082).
+      - run: python3 scripts/tests/test_proof_session.py
       - run: python3 scripts/tests/test_process_metrics.py
       - run: python3 scripts/tests/test_local_timeout.py
       - run: /usr/bin/python3 scripts/tests/test_vm_strip_acceptance.py
@@ -228,6 +233,7 @@ jobs:
       - run: python3 scripts/tests/test_try_tuna_signature_gate.py
       - run: python3 scripts/lib/keyring-owner-proof-tests.py
       - run: python3 scripts/lib/tray-absence-proof-tests.py
+      - run: python3 scripts/lib/proof-session-tz-tests.py
       - run: python3 scripts/lib/ledger-tests.py
       - run: python3 scripts/lib/ci-select-lanes-tests.py
       - run: python3 scripts/lib/tuna-orca-speech-tests.py
@@ -503,10 +509,11 @@ jobs:
           sudo install -d -m0755 /usr/libexec/tuna-deb-proof
           sudo install -m0755 target/release/examples/icon-probe target/release/examples/shortcut-inhibit-client /usr/libexec/tuna-deb-proof/
           python3 - <<'PY'
-          import hashlib, json, os
+          import hashlib, json, os, subprocess
           from pathlib import Path
           root = Path('target/release/examples')
-          value = {'commit': os.environ['GITHUB_SHA'], 'files': {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in ('icon-probe', 'shortcut-inhibit-client')}}
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          value = {'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'pr_head': event.get('pull_request', {}).get('head', {}).get('sha'), 'files': {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in ('icon-probe', 'shortcut-inhibit-client')}}
           Path('package-artifacts/installed/companions.json').write_text(json.dumps(value) + '\n')
           PY
           sudo install -m0644 package-artifacts/installed/companions.json /usr/libexec/tuna-deb-proof/provenance.json
@@ -525,7 +532,17 @@ jobs:
       # FIFOs and sockets left by the proofs make the zipper warn
       # ENTRYNOTSUPPORTED and drop them (#484); list and remove them first.
       - if: always()
-        run: scripts/ci-prepare-artifacts journey-artifacts package-artifacts/installed
+        run: |
+          scripts/ci-prepare-artifacts journey-artifacts package-artifacts/installed
+          # The installed GTK proof is separate from tuna-journey. Keep its
+          # raw animation trace and matcher output in journey-shots as well,
+          # even if the proof failed before reaching its final assertions.
+          if [ -d package-artifacts/installed/controls ]; then
+            mkdir -p journey-artifacts/installed-controls
+            for diagnostic in package-artifacts/installed/controls/nested.log package-artifacts/installed/controls/grid-anim-samples-*.txt; do
+              [ ! -f "$diagnostic" ] || cp "$diagnostic" journey-artifacts/installed-controls/
+            done
+          fi
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
@@ -616,7 +633,9 @@ jobs:
     # libseat (seatd), GBM/EGL scanout, page-flip pacing, shell attach.
     # Needs headroom: the DRM/apt install (including any missing vkms
     # modules for the running kernel) can take ~20 min on a cold cache.
-    runs-on: ubuntu-latest
+    # Pinned to the 26.04 image: its 7.0 kernel has vkms configfs (Linux
+    # 6.19+), which the two-output leg (scripts/tuna-drm-dual) needs.
+    runs-on: ubuntu-26.04
     needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'drm-smoke')
     timeout-minutes: 40
@@ -661,8 +680,14 @@ jobs:
       - run: shellcheck -x scripts/ci-install-vkms scripts/tuna-drm-smoke scripts/lib/colord-startup.sh scripts/tuna-frame-pacer-build
       - run: bash -n scripts/tuna-drm-smoke scripts/lib/colord-startup.sh
       - run: python3 scripts/tests/test_colord_startup.py
+      - run: python3 -m py_compile scripts/tuna-drm-dual scripts/lib/drm_dual.py scripts/lib/drm_kms_readback.py
+      - run: python3 scripts/tests/test_drm_dual.py
       - run: scripts/ci-install-vkms
       - run: scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts
+      # D-MIRROR-DISABLE, D-LAYOUT-KEEP, D-WORKSPACES-PRIMARY, D-SCALE-MIXED:
+      # two connectors of a vkms configfs device; the lines join drm-smoke's
+      # assertions.txt, the parity ledger's input.
+      - run: scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
@@ -864,7 +889,7 @@ jobs:
           /usr/bin/python3 scripts/tests/test_wellbeing_bundle.py
           /usr/bin/python3 scripts/tests/test_wellbeing_bytecode_contract.py
       - name: Prove live wellbeing framebuffer and screenshot pixels
-        run: dbus-run-session -- /usr/bin/python3 scripts/tuna-wellbeing-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --build-receipt "$RUNNER_TEMP/native-minimize/build.json" --artifacts "$RUNNER_TEMP/native-wellbeing" --display :111
+        run: /usr/bin/python3 scripts/tuna-wellbeing-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --build-receipt "$RUNNER_TEMP/native-minimize/build.json" --artifacts "$RUNNER_TEMP/native-wellbeing" --display :111
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
@@ -1007,7 +1032,7 @@ jobs:
           PY
       # Each proof's marker line is its assertions.txt ("<ID> pass <desc>"):
       # the parity ledger reads lock-idle-frames' (#1122).
-      - name: Prove real GTK OSD fade-out, panel menu close/switch (#501), lock curtain (#502) and a settled lock screen's idle frame clock (#1122)
+      - name: Prove real GTK OSD fade-out, panel menu close/switch (#501), lock curtain (#502) and a settled lock screen's idle frame clock (#1122) and remote access indicator (#1162 F2)
         run: |
           /usr/bin/python3 - <<'PY'
           import hashlib, json, os, pathlib, signal, subprocess
@@ -1023,12 +1048,16 @@ jobs:
               ('menu-motion', 'TUNA_REQUIRE_MENU_MOTION=1', 'transient::gtk_menu_tests::actual_gtk_menus_close_at_once_and_switch_fade_only', 'MENU-MOTION pass ', 'actual GTK widgets, frame clock and GLib timers under private X11; Wayland layer-shell and the compositor-drawn close are proven by G-TRANSIENT-CLOSE-CLOCK'),
               ('popup-submenu', 'TUNA_REQUIRE_MENU_MOTION=1', 'transient::gtk_menu_tests::actual_gtk_popup_submenus_ease_open_and_closed', 'POPUP-SUBMENU pass ', 'actual GTK widgets, frame clock and GLib timers under private X11 (PopupSubMenu height and arrow, #501); the NetworkManager and IBus menus holding them are not driven by a proof'),
               ('lock-curtain', 'TUNA_REQUIRE_LOCK_CURTAIN=1', 'lock_curtain::gtk_curtain_tests::actual_gtk_curtain_pages_follow_progress_and_policy', 'LOCK-CURTAIN pass ', 'actual GTK widget allocation, focus and frame clock under private X11; the session-lock surface, real input and frozen-clock frames are proven by G-LOCK-CURTAIN-CLOCK, G-LOCK-CURTAIN-POLICY and G-LOCK-CURTAIN-DRAG'),
+              ('grid-zoom', 'TUNA_REQUIRE_GRID_ZOOM=1', 'grid_animation::gtk_zoom_tests::actual_gtk_zoom_applies_all_properties_including_terminal_frame', 'GRID-ZOOM pass ', 'actual GTK Zoom setters apply translation, scale and opacity together, including a delayed terminal frame and drag scale/fade restoration; native folder drag is G-FOLDER-DND'),
+              ('grid-page-dots', 'TUNA_REQUIRE_GRID_ZOOM=1', 'overview::gtk_page_dot_tests::actual_gtk_page_dot_samples_observe_stored_look', 'GRID-PAGE-DOTS pass ', 'actual GTK page indicator samples read stored Zoom scale/opacity after simultaneous updates, including hover and pressed looks; callback coverage is G-GRID-PAGE-ANIM'),
+              ('grid-tick-trace', 'TUNA_REQUIRE_GRID_ZOOM=1', 'grid_animation::gtk_zoom_tests::actual_gtk_page_tick_trace_records_real_clock_and_thread_scheduler', 'GRID-TICK-TRACE pass ', 'actual GTK frame-clock ticks log monotonic and populated, monotonic Linux main-thread CPU/runqueue/timeslice counters; scheduling attribution uses nested traces'),
               ('lock-idle-frames', 'TUNA_REQUIRE_LOCK_IDLE_FRAMES=1', 'lock::auth_transport_ui_tests::actual_gtk_settled_lock_screen_requests_no_frames', 'LOCK-IDLE-FRAMES pass ', 'actual GTK lock window, frame clock and layout under private X11; the session-lock surface and compositor-side frame callbacks are measured on the vkms replica (#1122)'),
+              ('remote-access-indicator', 'TUNA_REQUIRE_REMOTE_ACCESS_INDICATOR=1', 'remote_access::tests::actual_gtk_indicator_shows_stops_and_hides', 'REMOTE-ACCESS-INDICATOR pass ', 'actual GTK button and icon visibility, Stop clicks and the five-second GLib hold under private X11; the compositor grants and the real Stop are proven by G-REMOTE-ACCESS-INDICATOR and R-REMOTE-INDICATOR'),
           ]
           for name, admit, test, marker, scope in proofs:
               artifacts = pathlib.Path('gtk-shell-artifacts') / name
               artifacts.mkdir(parents=True, exist_ok=False)
-              argv = ['env', '-u', 'WAYLAND_DISPLAY', '-u', 'WAYLAND_SOCKET', 'dbus-run-session', '--', 'xvfb-run', '-a', 'env', 'GDK_BACKEND=x11', admit, str(binary), test, '--exact', '--ignored', '--test-threads=1', '--nocapture']
+              argv = ['env', '-u', 'WAYLAND_DISPLAY', '-u', 'WAYLAND_SOCKET', 'dbus-run-session', '--', 'xvfb-run', '-a', 'env', 'GDK_BACKEND=x11', admit, str(binary), test, '--exact', '--include-ignored', '--test-threads=1', '--nocapture']
               with (artifacts / 'output.txt').open('w') as output:
                   child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
                   try:
@@ -1047,6 +1076,8 @@ jobs:
               (artifacts / 'receipt.json').write_text(json.dumps({'build_admission': admission, 'argv': argv, 'exit_status': exit_status, 'executable_unchanged_after': unchanged, 'output_sha256': hashlib.sha256((artifacts / 'output.txt').read_bytes()).hexdigest(), 'scope': scope}, indent=2) + '\n')
               if exit_status != 0 or not unchanged or '1 passed; 0 failed; 0 ignored' not in text or marker not in text:
                   raise RuntimeError(f'actual admitted {name} test did not pass')
+              if name == 'grid-tick-trace' and any(required not in text for required in ('grid-anim page-switch tick ', 'schedstat=available', 'grid-anim page-clock phase=before-paint ', 'grid-anim page-clock phase=after-paint ')):
+                  raise RuntimeError('grid tick/paint observer did not emit actual clock and populated scheduler observations')
               (artifacts / 'assertions.txt').write_text(text[text.index(marker):].splitlines()[0] + '\n')
           PY
       - name: Prove real MediaKeys callback completion and forced clamp interleave
@@ -1061,6 +1092,18 @@ jobs:
       - run: /usr/bin/python3 scripts/lib/lock-curtain-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/ws-anim-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/gsd-media-keys-bus-tests.py
+      # The binaries the proof builds, in a step of their own: the slices
+      # below run whenever the job is not cancelled and use target/debug,
+      # so they need this commit's shell even when an unrelated earlier step
+      # failed and the full proof was skipped. Without it every slice failed
+      # A11Y-PANEL with no shell binary (jobs 136589617134, 136611210918,
+      # 136757959409). The full proof's own build is then a no-op.
+      - name: Build the nested proof binaries
+        id: proof-binaries
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build --locked -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host
+          cargo build --locked -p tuna-compositor --example icon-probe --example shortcut-inhibit-client
       - run: scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts
         env:
           TUNA_REQUIRE_PAM_WRAPPER: "1"
@@ -1070,7 +1113,7 @@ jobs:
       # Closed windows must free their surfaces and textures (#1088): 100
       # libadwaita windows leave the compositor within a fixed bound.
       - name: Closed windows leave no memory behind
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
         timeout-minutes: 8
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
@@ -1079,7 +1122,7 @@ jobs:
       # from the hot corner and the Activities button, activate a window
       # preview after 750 ms, and return to the starting workspace.
       - name: Client drags through the overview
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
         timeout-minutes: 8
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
@@ -1088,7 +1131,7 @@ jobs:
       # Run the unchanged shared hover/reorder assertions independently of
       # unrelated full-suite assertions, using this job's just-built binaries.
       - name: Stationary-start native DnD grid hover
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
         timeout-minutes: 5
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
@@ -1096,7 +1139,7 @@ jobs:
       # Searches with results must hand their shm buffers back (#1084):
       # the shell's GDK mappings and both processes' descriptors stay put.
       - name: Overview searches leave no shm buffers behind
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
         timeout-minutes: 8
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
@@ -1105,7 +1148,7 @@ jobs:
       # and below it, on the desktop, in the overview and in the window's
       # screenshot (G-SUBSURFACE-STACKING).
       - name: Subsurfaces stack above and below their window
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
         timeout-minutes: 8
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
@@ -2397,7 +2440,7 @@ jobs:
     # tests, and every cited cargo test / journey assertion must have
     # passed in this run.
     runs-on: *runner-24
-    needs: [select-lanes, check, journey, gtk-shell, orca-speech, drm-smoke, marlin-vm, native-core-apps]
+    needs: [select-lanes, check, journey, gtk-shell, orca-speech, drm-smoke, marlin-vm, remote-security, native-core-apps]
     # Every producer must have passed, as before. The native Core join is
     # skipped only when its consumer was not selected (select-lanes'
     # core_apps); selected, it must have passed like the others. The explicit
@@ -2407,7 +2450,7 @@ jobs:
       && needs.select-lanes.result == 'success' && needs.check.result == 'success'
       && needs.journey.result == 'success' && needs.gtk-shell.result == 'success'
       && needs.orca-speech.result == 'success' && needs.drm-smoke.result == 'success'
-      && needs.marlin-vm.result == 'success'
+      && needs.marlin-vm.result == 'success' && needs.remote-security.result == 'success'
       && needs.native-core-apps.result == (needs.select-lanes.outputs.core_apps == 'true' && 'success' || 'skipped')
       && contains(fromJSON(needs.select-lanes.outputs.lanes), 'parity-ledger') }}
     steps:
@@ -2442,6 +2485,10 @@ jobs:
         with:
           name: marlin-vm
           path: ledger-in/marlin-vm
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: remote-security
+          path: ledger-in/remote-security
       # V-CORE-APPS and its per-leg ids exist only in the join's assertions
       # file, written as pass only when the whole native Core matrix passed.
       - uses: actions/download-artifact@v8.0.2
@@ -2476,6 +2523,7 @@ jobs:
             --assertions ledger-in/drm-smoke/assertions.txt \
             --assertions ledger-in/marlin-vm/assertions.txt \
             --assertions ledger-in/marlin-vm/app-integration/assertions.txt \
+            --assertions ledger-in/remote-security/assertions.txt \
             "${core[@]}"
 
   docs-shots:

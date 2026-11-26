@@ -1041,6 +1041,159 @@ fn close_dialog_answers_reach_the_hub_outcome_for_known_windows() {
     }
 }
 
+fn portal_share(id: u64) -> tuna_shell_control::RemoteAccessHandle {
+    tuna_shell_control::RemoteAccessHandle {
+        kind: tuna_shell_control::RemoteAccessKind::ScreenCast,
+        id,
+        owner: tuna_shell_control::RemoteAccessOwner::Portal,
+        owner_name: ":1.9".into(),
+        recording: false,
+        targets: vec![tuna_shell_control::RemoteAccessTarget::Monitor {
+            connector: "Virtual-1".into(),
+        }],
+    }
+}
+
+/// #1162 F2: the active remote access grants reach every live shell whole
+/// whenever they change (an empty list once the last ends), a shell that
+/// (re)connects gets them with its handshake, and a peer older than 0.54
+/// gets nothing.
+#[test]
+fn hub_publishes_remote_access_grants_and_hands_newcomers_the_list() {
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub =
+        ControlHub::bind(path.clone(), std::rc::Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = StateModel::new();
+    let mut client = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut client);
+
+    hub.set_remote_access(vec![portal_share(3)]);
+    hub.poll(&mut model);
+    let shown = Message::RemoteAccess {
+        handles: vec![portal_share(3)],
+    };
+    assert_eq!(client_read(&mut client), shown);
+    hub.set_remote_access(vec![portal_share(3)]);
+    hub.poll(&mut model);
+    client.set_nonblocking(true).unwrap();
+    let mut prefix = [0u8; 4];
+    match client.read_exact(&mut prefix) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("unchanged grants must stay quiet, got {other:?}"),
+    }
+    client.set_nonblocking(false).unwrap();
+
+    let mut newcomer = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut newcomer);
+    assert_eq!(client_read(&mut newcomer), shown);
+
+    hub.set_remote_access(Vec::new());
+    hub.poll(&mut model);
+    for client in [&mut client, &mut newcomer] {
+        assert_eq!(
+            client_read(client),
+            Message::RemoteAccess {
+                handles: Vec::new()
+            }
+        );
+    }
+    let mut late = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut late);
+    late.set_nonblocking(true).unwrap();
+    match late.read_exact(&mut prefix) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("no grant, nothing to hand over, got {other:?}"),
+    }
+
+    let (conn, mut old) = pair();
+    client_write(
+        &mut old,
+        &Message::Hello {
+            version: ProtocolVersion::new(CURRENT_VERSION.major, 53),
+        },
+    );
+    let mut session = Session::handshake(conn, &StateModel::new()).unwrap();
+    assert!(matches!(client_read(&mut old), Message::Hello { .. }));
+    assert!(matches!(client_read(&mut old), Message::Snapshot { .. }));
+    session.send_remote_access(&[portal_share(3)]).unwrap();
+    session.send_overview(true).unwrap();
+    assert_eq!(client_read(&mut old), Message::Overview { open: true });
+}
+
+/// #1162 F2: the indicator's Stop reaches the runtime for a published
+/// grant only, and needs a 0.54 peer.
+#[test]
+fn remote_access_stops_reach_the_hub_outcome_for_published_grants() {
+    use tuna_shell_control::RemoteAccessKind;
+    let dir = private_tempdir();
+    let path = dir.path().join("control.sock");
+    let mut hub =
+        ControlHub::bind(path.clone(), std::rc::Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
+    let mut model = StateModel::new();
+    let mut client = hub_client(&path);
+    hub_handshake(&mut hub, &mut model, &mut client);
+    hub.set_remote_access(vec![portal_share(3)]);
+    hub.poll(&mut model);
+    assert!(matches!(
+        client_read(&mut client),
+        Message::RemoteAccess { .. }
+    ));
+    for (id, kind, grant, applied) in [
+        (1, RemoteAccessKind::ScreenCast, 3, true),
+        // The same id of another kind, and an id never published.
+        (2, RemoteAccessKind::RemoteDesktop, 3, false),
+        (3, RemoteAccessKind::ScreenCast, 4, false),
+    ] {
+        client_write(
+            &mut client,
+            &Message::Command {
+                id,
+                kind: CommandKind::StopRemoteAccess { kind, id: grant },
+            },
+        );
+        let outcome = hub.poll(&mut model);
+        let expected = if applied {
+            vec![(kind, grant)]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(outcome.remote_access_stops, expected);
+        let Message::CommandResult { id: reply, status } = client_read(&mut client) else {
+            panic!("expected command result");
+        };
+        assert_eq!(reply, id);
+        assert_eq!(matches!(status, CommandStatus::Applied), applied);
+    }
+
+    let (conn, mut old) = pair();
+    client_write(
+        &mut old,
+        &Message::Hello {
+            version: ProtocolVersion::new(CURRENT_VERSION.major, 53),
+        },
+    );
+    let mut session = Session::handshake(conn, &model).unwrap();
+    assert!(matches!(client_read(&mut old), Message::Hello { .. }));
+    assert!(matches!(client_read(&mut old), Message::Snapshot { .. }));
+    client_write(
+        &mut old,
+        &Message::Command {
+            id: 9,
+            kind: CommandKind::StopRemoteAccess {
+                kind: RemoteAccessKind::ScreenCast,
+                id: 3,
+            },
+        },
+    );
+    assert!(matches!(
+        session.handle_next(&mut model),
+        Ok(Handled::ErrorSent {
+            kind: ErrorKind::UnknownCommand
+        })
+    ));
+}
+
 /// #503: a hub round reports whether anything arrived on its sockets, so
 /// the runtime's idle tick can tell a round that read something (which may
 /// change what is drawn) from one that only looked.

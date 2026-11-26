@@ -17,6 +17,16 @@
         "github-actions"
       ],
       "minimumReleaseAge": "7 days"
+    },
+    {
+      "description": "gtk4-session-lock 0.5 needs gtk4-layer-shell >= 1.2 (pkg-config), but CI builds layer-shell v1.1.1 (scripts/ci-install-gtk4-layer-shell). Hold the crate until that pinned build moves to >= 1.2 (#1299).",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "gtk4-session-lock"
+      ],
+      "allowedVersions": "<0.5"
     }
   ]
 }

@@ -92,6 +92,8 @@ and plans under `.spektacular/` are historical records, not current state
   planned extension architecture.
 - [ci-runners.md](ci-runners.md) — the self-hosted CI runners and fork
   isolation.
+- [ci-fast-iteration.md](ci-fast-iteration.md) — trying guest-side changes
+  in one reused karnataka VM (`scripts/tuna-corral-sync`) before you push.
 - [reference-repos.md](reference-repos.md) — read-only reference checkouts
   (niri, cosmic-comp, Mutter, GNOME Shell); never copy their source.
 - [research/README.md](research/README.md) — evidence rules for research
