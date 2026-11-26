@@ -52,13 +52,13 @@
 //! then delivers it by the grab's own rules. Presses on the shell's own
 //! surfaces stay the shell's.
 
+use super::WindowManager;
+use crate::State;
 use smithay::backend::input::ButtonState;
 use smithay::input::pointer::{ButtonEvent, MotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, SERIAL_COUNTER};
 use smithay::xwayland::{xwm::WmWindowType, X11Surface};
-use super::WindowManager;
-use crate::State;
 
 /// One unmanaged window as the state file lists it: X11 window id,
 /// rectangle, owner, shown flag and type name.
