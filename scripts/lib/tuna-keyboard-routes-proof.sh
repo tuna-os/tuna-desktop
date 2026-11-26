@@ -137,8 +137,10 @@ keyboard_quick_settings_proof() {
 # G-NOTIFICATION-KEYS: messageList.js binds Delete/BackSpace to close
 # the focused message; messageTray.js binds Escape to expire the focused
 # banner; calendar.js's message list collapses an expanded group on
-# Escape before the menu closes. The reasons are read back from the
-# bus's own NotificationClosed signals.
+# Escape before the menu closes. From the banner Super+N focused, Tab
+# reaches its Close (the expand arrow, an St.Button, takes no focus) and
+# Return presses it. The reasons are read back from the bus's own
+# NotificationClosed signals.
 keyboard_notification_proof() {
     gdbus monitor --session --dest org.freedesktop.Notifications \
         --object-path /org/freedesktop/Notifications >"$ARTIFACTS/kr-notification-signals.log" 2>&1 &
@@ -157,6 +159,20 @@ keyboard_notification_proof() {
     xdotool key Delete
     kr_until 'any(.[]; .name == "Delete Proof Banner" and .showing) | not' 5 "$ARTIFACTS/a11y-kr-banner-deleted.json" ||
         fail G-NOTIFICATION-KEYS "Delete did not close the focused banner"
+    kr_tab_id="$(kr_notify "Tab Proof Banner" "Closed by its focused Close")"
+    [ -n "$kr_tab_id" ] || fail G-NOTIFICATION-KEYS "Notify failed"
+    kr_until 'any(.[]; .name == "Tab Proof Banner" and .showing)' 5 "$ARTIFACTS/a11y-kr-banner-tab.json" ||
+        fail G-NOTIFICATION-KEYS "no banner to Tab through"
+    xdotool key super+n
+    kr_until 'any(.[]; .name == "Tab Proof Banner" and .showing and .focused)' 5 \
+        "$ARTIFACTS/a11y-kr-banner-tab-focus.json" ||
+        fail G-NOTIFICATION-KEYS "Super+N did not focus the Tab banner"
+    xdotool key Tab
+    kr_until 'any(.[]; .name == "Close" and .showing and .focused)' 5 "$ARTIFACTS/a11y-kr-banner-tab-close.json" ||
+        fail G-NOTIFICATION-KEYS "Tab from the focused banner did not reach its Close"
+    xdotool key Return
+    kr_until 'any(.[]; .name == "Tab Proof Banner" and .showing) | not' 5 "$ARTIFACTS/a11y-kr-banner-tab-closed.json" ||
+        fail G-NOTIFICATION-KEYS "Return on the focused Close did not close the banner"
     kr_escape_id="$(kr_notify "Escape Proof Banner" "Expired by keyboard")"
     [ -n "$kr_escape_id" ] || fail G-NOTIFICATION-KEYS "Notify failed"
     kr_until 'any(.[]; .name == "Escape Proof Banner" and .showing)' 5 "$ARTIFACTS/a11y-kr-banner2.json" ||
@@ -171,6 +187,8 @@ keyboard_notification_proof() {
     sleep 1
     grep -q "NotificationClosed (uint32 $kr_delete_id, uint32 2)" "$ARTIFACTS/kr-notification-signals.log" ||
         fail G-NOTIFICATION-KEYS "Delete did not close the banner as dismissed (reason 2)"
+    grep -q "NotificationClosed (uint32 $kr_tab_id, uint32 2)" "$ARTIFACTS/kr-notification-signals.log" ||
+        fail G-NOTIFICATION-KEYS "Tab and Return on Close did not close the banner as dismissed (reason 2)"
     grep -q "NotificationClosed (uint32 $kr_escape_id, uint32 1)" "$ARTIFACTS/kr-notification-signals.log" ||
         fail G-NOTIFICATION-KEYS "Escape did not expire the banner (reason 1)"
     # A second message from the same source makes a collapsed group in
@@ -206,7 +224,7 @@ keyboard_notification_proof() {
         fail G-NOTIFICATION-KEYS "Escape did not close the date menu"
     kill "$kr_monitor" 2>/dev/null || true
     wait "$kr_monitor" 2>/dev/null || true
-    pass G-NOTIFICATION-KEYS "Delete closes a focused banner (dismissed) and a focused list group; Escape expires a focused banner; Enter expands a group with focus inside, Escape collapses it back onto the group before the date menu closes"
+    pass G-NOTIFICATION-KEYS "Delete closes a focused banner (dismissed) and a focused list group; Tab from a focused banner reaches Close past the expand arrow and Return dismisses it; Escape expires a focused banner; Enter expands a group with focus inside, Escape collapses it back onto the group before the date menu closes"
 }
 
 # G-WINDOW-MENU-KEYS: the window menu is a PopupMenu, whose rows St's

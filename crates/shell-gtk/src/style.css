@@ -93,7 +93,18 @@ window.tuna-panel.overview.shaded {
   background-color: shade(#c01c28, 1.1);
 }
 
-/* #panel .privacy-indicator: the microphone while an app records. */
+/* #panel .screen-sharing-indicator: a filled $privacy_indicator_color
+   ($orange_3 on the dark panel) button, white icons 6px apart. */
+.tuna-panel button.panel-button.screen-sharing-indicator {
+  background-color: #ff7800;
+  color: #ffffff;
+}
+.tuna-panel button.panel-button.screen-sharing-indicator:hover {
+  background-color: shade(#ff7800, 1.1);
+}
+
+/* #panel .privacy-indicator: the microphone while an app records, and
+   the remote access applet's record icon. */
 .tuna-panel .privacy-indicator {
   color: #ff7800;
 }
@@ -848,6 +859,9 @@ window.tuna-banners {
   font-size: 9pt;
 }
 
+/* The header's round buttons: expand (banners) and close. Expanded, the
+   expand arrow turns over (messageList.js rotates it 180 degrees). */
+.message-expand-button,
 .message-close-button {
   min-width: 28px;
   min-height: 28px;
@@ -858,8 +872,13 @@ window.tuna-banners {
   box-shadow: none;
 }
 
+.message-expand-button:hover,
 .message-close-button:hover {
   background-color: rgba(255, 255, 255, 0.25);
+}
+
+.message.expanded .message-expand-button image {
+  -gtk-icon-transform: rotate(180deg);
 }
 
 .message-content {
@@ -1396,6 +1415,32 @@ window.tuna-lock .unlock-dialog-notification-count-text {
   color: #fafafb;
   background-color: rgba(250, 250, 251, 0.1);
   border-radius: 999px;
+}
+/* Its MediaMessages (_login-lock.scss `.message`, _message-list.scss
+   `.media-message`, `.message-media-control`): the same card, a 48px
+   cover (32px for the themed fallback) with 6px corners, transparent
+   controls dimmed to half while insensitive. */
+window.tuna-lock .unlock-dialog-notifications-container .message {
+  padding: 12px 16px;
+  border-radius: 16px;
+  background-color: rgba(250, 250, 251, 0.1);
+  color: #fafafb;
+}
+window.tuna-lock .unlock-dialog-notifications-container .message .message-header {
+  min-height: 0;
+  color: #fafafb;
+}
+window.tuna-lock .media-message .message-icon {
+  border-radius: 6px;
+}
+window.tuna-lock .message-media-control {
+  padding: 0 18px;
+  border-radius: 6px;
+  background-color: transparent;
+  color: #fafafb;
+}
+window.tuna-lock .message-media-control:disabled {
+  opacity: 0.5;
 }
 
 /* GNOME 51's OSD (.osd-window): a #2e2e33 pill, 12px by 18px of

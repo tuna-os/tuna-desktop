@@ -1023,6 +1023,12 @@ power_save_set() {
 main_wakes() {
     sed -n 's/^voluntary_ctxt_switches:[[:space:]]*//p' "/proc/$COMP_PID/task/$COMP_PID/status"
 }
+# Milliseconds since the epoch. Not %3N: uutils date (Ubuntu 26.04's date)
+# prints it without its zero padding, which turned the relight time
+# negative and the 2 s deadline into noise; the full %N is padded.
+now_ms() {
+    echo $(($(date +%s%N) / 1000000))
+}
 CONNECTOR_SYSFS="/sys/class/drm/$(basename "$CARD")-$CONNECTOR/enabled"
 [ "$(cat "$CONNECTOR_SYSFS")" = enabled ] || fail D-POWER-SAVE "$CONNECTOR was not lit before blanking"
 power_save_set 3 || fail D-POWER-SAVE "PowerSaveMode 3 refused"
@@ -1039,14 +1045,14 @@ blank_wakes=$((($(main_wakes) - wakes_before) / 5))
 [ "$(jq -er '.rendered_frames' "$CSTATE")" = "$blank_frames" ] ||
     fail D-POWER-SAVE "frames were scanned out while PowerSaveMode was 3"
 power_save_set 0 || fail D-POWER-SAVE "PowerSaveMode 0 refused"
-unblanked_at=$(date +%s%3N)
+unblanked_at=$(now_ms)
 until [ "$(cat "$CONNECTOR_SYSFS")" = enabled ] &&
     jq -e ".power_save_mode == 0 and .rendered_frames > $blank_frames" "$CSTATE" >/dev/null 2>&1; do
-    [ $(($(date +%s%3N) - unblanked_at)) -le 2000 ] ||
+    [ $(($(now_ms) - unblanked_at)) -le 2000 ] ||
         fail D-POWER-SAVE "PowerSaveMode 0 did not repaint and relight $CONNECTOR within 2 s"
     sleep 0.02
 done
-repaint_ms=$(($(date +%s%3N) - unblanked_at))
+repaint_ms=$(($(now_ms) - unblanked_at))
 state '.locked' 1 || fail D-POWER-SAVE "the session unlocked"
 pass D-POWER-SAVE "locked and blanked: $CONNECTOR off, $blank_wakes main-loop wakes/s, no scanout; PowerSaveMode 0 relit it with a full repaint in ${repaint_ms} ms"
 

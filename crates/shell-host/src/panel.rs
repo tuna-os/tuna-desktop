@@ -4453,7 +4453,6 @@ mod tests {
     mod live {
         use std::os::unix::net::UnixStream;
         use std::rc::Rc;
-        use std::sync::Mutex;
 
         use tuna_compositor::{
             control::ControlHub,
@@ -8258,51 +8257,14 @@ mod tests {
             assert!(host.launcher.states().is_empty());
         }
 
-        /// Env mutation is process-global while Rust runs tests in
-        /// parallel threads, so every env-touching test below holds
-        /// this lock (same pattern as the icons.rs fixture tests).
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-        struct EnvRestore {
-            data_home: Option<std::ffi::OsString>,
-            data_dirs: Option<std::ffi::OsString>,
-            home: Option<std::ffi::OsString>,
-        }
-
-        impl EnvRestore {
-            /// Point the icon resolver at `tmp`, away from real
-            /// system dirs.
-            fn install(tmp: &tempfile::TempDir) -> EnvRestore {
-                let prev = EnvRestore {
-                    data_home: std::env::var_os("XDG_DATA_HOME"),
-                    data_dirs: std::env::var_os("XDG_DATA_DIRS"),
-                    home: std::env::var_os("HOME"),
-                };
-                std::env::set_var("XDG_DATA_HOME", tmp.path());
-                std::env::set_var("XDG_DATA_DIRS", tmp.path().join("empty-dirs"));
-                std::env::set_var("HOME", tmp.path().join("home"));
-                prev
-            }
-
-            fn restore(key: &str, value: &Option<std::ffi::OsString>) {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-
-        impl Drop for EnvRestore {
-            fn drop(&mut self) {
-                EnvRestore::restore("XDG_DATA_HOME", &self.data_home);
-                EnvRestore::restore("XDG_DATA_DIRS", &self.data_dirs);
-                EnvRestore::restore("HOME", &self.home);
-            }
+        /// Point icon lookup on this thread at `tmp`, away from real
+        /// system dirs, without touching the process environment.
+        fn install_icon_dirs(tmp: &tempfile::TempDir) -> crate::icons::test_dirs::Fixture {
+            crate::icons::test_dirs::Fixture::install(tmp.path())
         }
 
         /// Theme tree holding one PNG icon: `<tmp>/icons/<theme>`
-        /// with a `32x32/apps` raster. Caller holds `ENV_LOCK` and
-        /// installs `EnvRestore` over the result.
+        /// with a `32x32/apps` raster. Callers [`install_icon_dirs`] it.
         fn icon_theme_fixture(theme: &str, name: &str) -> tempfile::TempDir {
             let tmp = tempfile::tempdir().expect("tempdir");
             let path = tmp
@@ -8399,9 +8361,8 @@ mod tests {
         /// behind: misses must not fill the bounded cache.
         #[test]
         fn icon_art_returns_none_for_bogus_name_without_caching() {
-            let _lock = ENV_LOCK.lock().expect("env lock");
             let tmp = tempfile::tempdir().expect("tempdir");
-            let _env = EnvRestore::install(&tmp);
+            let _dirs = install_icon_dirs(&tmp);
             let (mut host, _dir) = test_host();
             host.icon_theme = "CacheTheme".to_owned();
 
@@ -8416,9 +8377,8 @@ mod tests {
         /// call serves the cached artwork without growing the map.
         #[test]
         fn icon_art_caches_resolved_artwork() {
-            let _lock = ENV_LOCK.lock().expect("env lock");
             let tmp = icon_theme_fixture("CacheTheme", "tuna-cache-icon");
-            let _env = EnvRestore::install(&tmp);
+            let _dirs = install_icon_dirs(&tmp);
             let (mut host, _dir) = test_host();
             host.icon_theme = "CacheTheme".to_owned();
 
@@ -8464,9 +8424,8 @@ mod tests {
         /// keep the fallback.
         #[test]
         fn dock_icon_resolves_pinned_app_through_cache() {
-            let _lock = ENV_LOCK.lock().expect("env lock");
             let tmp = icon_theme_fixture("DockTheme", "tuna-dock-app");
-            let _env = EnvRestore::install(&tmp);
+            let _dirs = install_icon_dirs(&tmp);
             let (mut host, _dir) = dock_icon_test_host(Some("tuna-dock-app"));
             host.icon_theme = "DockTheme".to_owned();
             let items = host.dock_items();
@@ -8504,7 +8463,6 @@ mod tests {
         #[test]
         fn dock_repaint_picks_up_new_theme_art_on_flip() {
             use image::Rgba;
-            let _lock = ENV_LOCK.lock().expect("env lock");
             let tmp = tempfile::tempdir().expect("tempdir");
             for (theme, pixel) in [
                 ("DockFlipA", Rgba([200, 10, 10, 255])),
@@ -8518,7 +8476,7 @@ mod tests {
                 }
                 img.save(path.join("tuna-dock-flip.png")).expect("save png");
             }
-            let _env = EnvRestore::install(&tmp);
+            let _dirs = install_icon_dirs(&tmp);
             let (mut host, _dir) = dock_icon_test_host(Some("tuna-dock-flip"));
             host.icon_theme = "DockFlipA".to_owned();
             host.dock_paint_key = Some(some_dock_key());
@@ -8599,9 +8557,8 @@ mod tests {
         #[test]
         fn build_icon_attention_name_resolves_via_theme_fixture() {
             use crate::watcher::{IndicatorIcon, INDICATOR_CELL};
-            let _lock = ENV_LOCK.lock().expect("env lock");
             let tmp = icon_theme_fixture("TrayTheme", "tuna-tray-attention");
-            let _env = EnvRestore::install(&tmp);
+            let _dirs = install_icon_dirs(&tmp);
             let (mut host, _dir) = test_host();
             host.icon_theme = "TrayTheme".to_owned();
             let mut info = tray_info("NeedsAttention", "test.tray");
@@ -8627,9 +8584,8 @@ mod tests {
         #[test]
         fn build_icon_unknown_names_fall_back_to_named_service() {
             use crate::watcher::IndicatorIcon;
-            let _lock = ENV_LOCK.lock().expect("env lock");
             let tmp = tempfile::tempdir().expect("tempdir");
-            let _env = EnvRestore::install(&tmp);
+            let _dirs = install_icon_dirs(&tmp);
             let (mut host, _dir) = test_host();
             host.icon_theme = "TrayTheme".to_owned();
             let mut info = tray_info("Active", "test.tray");
@@ -8655,9 +8611,8 @@ mod tests {
         #[test]
         fn build_icon_symbolic_name_retints_toward_accent() {
             use crate::watcher::IndicatorIcon;
-            let _lock = ENV_LOCK.lock().expect("env lock");
             let tmp = icon_theme_fixture("TrayTheme", "tuna-tray-symbolic");
-            let _env = EnvRestore::install(&tmp);
+            let _dirs = install_icon_dirs(&tmp);
             let (mut host, _dir) = test_host();
             host.icon_theme = "TrayTheme".to_owned();
             let mut info = tray_info("Active", "test.tray");

@@ -49,6 +49,7 @@ exit 0
 
 COSIGN_STUB = """\
 echo "cosign $@" >> "$STUB_LOG/cosign.log"
+if [ "$1" = "version" ]; then echo "GitVersion:    ${COSIGN_STUB_VERSION:-v3.1.4}"; exit 0; fi
 ref="$2"
 case "$ref" in
   *@*) kind=digest ;;
@@ -61,7 +62,7 @@ exit 1
 """
 
 
-def run_script(tmp, log, tag_mode, digest_mode="unsigned"):
+def run_script(tmp, log, tag_mode, digest_mode="unsigned", cosign_version=None):
     write_stub(pathlib.Path(tmp) / "cosign", COSIGN_STUB)
     env = dict(os.environ,
                PATH=tmp + os.pathsep + os.environ["PATH"],
@@ -70,6 +71,8 @@ def run_script(tmp, log, tag_mode, digest_mode="unsigned"):
                COSIGN_digest_MODE=digest_mode,
                TRY_TUNA_IMAGE=FAKE_IMAGE,
                TRY_TUNA_NO_OPEN="1")
+    if cosign_version:
+        env["COSIGN_STUB_VERSION"] = cosign_version
     return subprocess.run(["bash", str(SCRIPT)], cwd=tmp, env=env,
                           capture_output=True, text=True, timeout=120)
 
@@ -117,6 +120,21 @@ class SignatureGateTests(unittest.TestCase):
             self.assertTrue(any("pull" in c for c in podman_calls),
                             "an inconclusive precheck must not block the authoritative check")
             self.assertIn("refusing to boot an unverified image", result.stderr)
+
+    def test_cosign_v2_is_refused_before_any_verification(self):
+        # TunaOS signs with cosign v3's bundle format, which cosign v2 reports
+        # as "no signatures found": a v2 install must be told to upgrade, not
+        # be shown an unsigned-image refusal for a signed image.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = make_bin(tmp)
+            result = run_script(tmp, log, tag_mode="signed", digest_mode="signed",
+                                cosign_version="v2.6.1")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cosign v3", result.stderr)
+            cosign_calls = read_lines(log, "cosign.log")
+            self.assertFalse(any(c.startswith("cosign verify") for c in cosign_calls),
+                             f"must not verify with cosign v2, saw: {cosign_calls}")
+            self.assertFalse(any("pull" in c for c in read_lines(log, "podman.log")))
 
 
 if __name__ == "__main__":

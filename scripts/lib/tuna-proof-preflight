@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""tuna-proof-preflight — what earlier proofs left on this host, and whether
+a nested proof still has the inotify instances it needs (#1082).
+
+Usage: scripts/lib/tuna-proof-preflight [--label NAME]
+
+scripts/lib/tuna-proof-session runs this before it starts a proof. It
+reports, for the current user:
+  - leftover session daemons of earlier proofs: processes carrying a
+    TUNA_PROOF_SESSION run marker whose tuna-proof-session is gone, and, for
+    proofs that ran without one, orphaned message buses, IBus, AT-SPI,
+    PipeWire and X servers whose environment names a proof (a
+    TUNA_*_PRIVATE_BUS/SESSION guard or TUNA_PROOF_RUN) and whose session
+    has no proof process left;
+  - inotify instances in use against fs.inotify.max_user_instances.
+
+Leftovers are reported, never stopped: they are not this run's to end.
+Exit 1, naming the leftovers that hold instances, when fewer than
+TUNA_PROOF_INOTIFY_NEED (default 32) instances are free: at the limit GIO
+has no file monitors, so the shell misses new .desktop files and keyfile
+settings and gates fail for reasons unrelated to the change under test.
+A gtk-shell proof session peaked at 22 (113 gates in, #1082 measurements).
+"""
+import ctypes
+import os
+import platform
+import re
+import sys
+import time
+
+NAME = "tuna-proof-preflight"
+LIMIT = "/proc/sys/fs/inotify/max_user_instances"
+# Session daemons that outlive an unwrapped proof: they detach, or their
+# parent dies first. `comm` is the first 15 bytes of the program name.
+DAEMONS = re.compile(
+    r"^(dbus-daemon|dbus-broker.*|ibus-.*|at-spi-bus-laun|at-spi2-registr|pipewire.*|wireplumber|Xvfb|Xwayland)$")
+GUARD = re.compile(rb"^(TUNA_[A-Z0-9_]*PRIVATE_(BUS|SESSION)|TUNA_PROOF_RUN)=")
+KCMP = {"x86_64": 312, "aarch64": 272}.get(platform.machine())
+KCMP_FILE = 0
+SHOWN = 20
+
+
+def read(path):
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+class Process:
+    def __init__(self, pid):
+        raw = read(f"/proc/{pid}/stat")
+        if raw is None:
+            raise ProcessLookupError(pid)
+        raw = raw.decode(errors="replace")
+        rest = raw[raw.rindex(")") + 2:].split()
+        self.pid = pid
+        self.comm = raw[raw.index("(") + 1:raw.rindex(")")]
+        self.state, self.ppid, self.start = rest[0], int(rest[1]), int(rest[19])
+        env = read(f"/proc/{pid}/environ") or b""
+        self.env = dict(item.split(b"=", 1) for item in env.split(b"\0") if b"=" in item)
+        self.marker = self.env.get(b"TUNA_PROOF_SESSION", b"").decode(errors="replace")
+        self.guarded = any(GUARD.match(key + b"=") for key in self.env)
+        self.bus = self.env.get(b"DBUS_SESSION_BUS_ADDRESS", b"")
+        self.inotify = []
+        try:
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                try:
+                    if os.readlink(f"/proc/{pid}/fd/{fd}") == "anon_inode:inotify":
+                        self.inotify.append(int(fd))
+                except OSError:
+                    pass
+            self.readable = True
+        except OSError:
+            self.readable = False
+
+
+def session_alive(marker, table):
+    """Is the tuna-proof-session that issued MARKER (label.pid.start) running?"""
+    try:
+        pid, start = (int(part) for part in marker.rsplit(".", 2)[1:])
+    except ValueError:
+        return False
+    owner = table.get(pid)
+    return owner is not None and owner.start == start and owner.state != "Z"
+
+
+def leftovers(table):
+    """Processes of proofs that have ended, as (process, what it belonged to)."""
+    private = {}
+    for process in table.values():
+        if process.guarded and not process.bus.startswith(b"unix:path=/run/user/"):
+            private.setdefault(process.bus, []).append(process)
+    found = []
+    for process in table.values():
+        if process.marker:
+            if not session_alive(process.marker, table):
+                found.append((process, f"run {process.marker}, which has ended"))
+            continue
+        parent = table.get(process.ppid)
+        orphan = process.ppid == 1 or (parent is not None and parent.comm == "systemd")
+        if not (process.guarded and orphan and DAEMONS.match(process.comm)):
+            continue
+        # A daemon that detached from a proof still running shares its
+        # private bus with the proof's own processes.
+        peers = private.get(process.bus, []) if process.bus in private else []
+        if any(not DAEMONS.match(peer.comm) for peer in peers):
+            continue
+        found.append((process, "a proof run outside tuna-proof-session, which has ended"))
+    return sorted(found, key=lambda item: item[0].pid)
+
+
+def instances(table):
+    """Distinct inotify instances per pid: a descriptor inherited across
+    fork is one instance, however many processes hold it."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    seen = {}
+    held = {}
+    for process in table.values():
+        for fd in process.inotify:
+            info = read(f"/proc/{process.pid}/fdinfo/{fd}")
+            same = False
+            if KCMP is not None and info is not None:
+                for other_pid, other_fd in seen.get(info, ()):
+                    if libc.syscall(KCMP, process.pid, other_pid, KCMP_FILE, fd, other_fd) == 0:
+                        same = True
+                        break
+                seen.setdefault(info, []).append((process.pid, fd))
+            if not same:
+                held[process.pid] = held.get(process.pid, 0) + 1
+    return held
+
+
+def age(process, now_ticks, hertz):
+    seconds = max(0, (now_ticks - process.start) // hertz)
+    if seconds >= 86400:
+        return f"{seconds // 86400}d{seconds % 86400 // 3600}h"
+    if seconds >= 3600:
+        return f"{seconds // 3600}h{seconds % 3600 // 60}m"
+    return f"{seconds // 60}m{seconds % 60}s"
+
+
+def main(argv):
+    label = ""
+    if len(argv) == 2 and argv[0] == "--label":
+        label = f" ({argv[1]})"
+    elif argv:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    try:
+        need = int(os.environ.get("TUNA_PROOF_INOTIFY_NEED", "32"))
+    except ValueError:
+        print(f"{NAME}: bad TUNA_PROOF_INOTIFY_NEED", file=sys.stderr)
+        return 2
+    actions = os.environ.get("GITHUB_ACTIONS") == "true"
+
+    def say(text, level=""):
+        print(f"{f'::{level}::' if actions and level else ''}{NAME}{label}: {text}", file=sys.stderr, flush=True)
+
+    uid = os.getuid()
+    table = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{name}").st_uid == uid:
+                table[int(name)] = Process(int(name))
+        except OSError:
+            pass
+    held = instances(table)
+    used = sum(held.values())
+    unreadable = sum(1 for process in table.values() if not process.readable)
+    left = leftovers(table)
+    left_held = sum(held.get(process.pid, 0) for process, _ in left)
+    hertz = os.sysconf("SC_CLK_TCK")
+    now_ticks = int(time.clock_gettime(time.CLOCK_BOOTTIME) * hertz)
+    for process, origin in left[:SHOWN]:
+        say(f"leftover: {process.comm} pid {process.pid} (up {age(process, now_ticks, hertz)}, "
+            f"{held.get(process.pid, 0)} inotify instance(s)) from {origin}", "warning")
+    if left:
+        more = f" ({len(left) - SHOWN} more not listed)" if len(left) > SHOWN else ""
+        say(f"{len(left)} leftover process(es) of earlier proofs hold {left_held} inotify instance(s){more}; "
+            f"to stop them: kill {' '.join(str(process.pid) for process, _ in left)}", "warning")
+    else:
+        say("no leftover session daemons of earlier proofs")
+    raw_limit = read(LIMIT)
+    if raw_limit is None:
+        say(f"cannot read {LIMIT}: inotify headroom unknown", "warning")
+        return 0
+    limit = int(raw_limit)
+    free = limit - used
+    blind = f"; {unreadable} process(es) could not be inspected" if unreadable else ""
+    usage = f"inotify instances: {used} of {limit} in use by uid {uid}, {free} free, a proof needs {need}{blind}"
+    if free >= need:
+        say(usage)
+        return 0
+    say(f"FAIL: {usage}. With none left GIO has no file monitors: the shell misses new .desktop files and "
+        f"keyfile settings, and gates fail for reasons unrelated to the change under test. "
+        + (f"Stop the {len(left)} leftover process(es) above ({left_held} instance(s)), or raise " if left else "Raise ")
+        + "the limit: sudo sysctl fs.inotify.max_user_instances=1024", "error")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
