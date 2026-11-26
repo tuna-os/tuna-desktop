@@ -27,7 +27,8 @@ class Selection(unittest.TestCase):
     def test_shared_inputs_run_every_lane(self):
         for path in (".github/workflows/ci.yml", "Cargo.lock", "Cargo.toml",
                      "third-party/smithay/src/lib.rs", "scripts/ci-select-lanes",
-                     "scripts/tuna-nested", ".github/actions/ci-tool/action.yml"):
+                     "scripts/tuna-nested", ".github/actions/ci-tool/action.yml",
+                     "scripts/lib/tuna-proof-session", "scripts/lib/tuna-proof-preflight"):
             self.assertEqual(pr("docs/x.md", path), m.LANES, path)
 
     def test_docs_only_runs_no_lane(self):
@@ -55,9 +56,16 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("scripts/tuna-scroll-proof"), ["scroll-proof"])
         # The vkms gates (D-*) live in the DRM smoke.
         self.assertEqual(pr("scripts/tuna-drm-smoke"), ["drm-smoke"])
+        # The two-output vkms leg (scripts/tuna-drm-dual) runs in drm-smoke.
+        for path in ("scripts/tuna-drm-dual", "scripts/lib/drm_dual.py",
+                     "scripts/lib/drm_kms_readback.py", "scripts/tests/test_drm_dual.py"):
+            for run in (0, 4, 19):
+                with self.subTest(path=path, run=run):
+                    self.assertEqual(pr(path, run=run), ["drm-smoke"])
         self.assertEqual(pr("docs/walkthrough.tsv"), ["gtk-shell"])
         self.assertEqual(pr("packaging/marlin/vm-lane/Containerfile"),
                          ["arch-package", "marlin-image", "marlin-vm"])
+        self.assertEqual(pr("scripts/lib/vm_unlock_wake.py"), ["arch-package", "marlin-vm"])
         # MP-*, WL-*, X11-* window-motion gates and the capture they pair with.
         for path in ("scripts/tuna-motion-pairing-proof", "scripts/tuna-x11-icon-geometry-proof",
                      "scripts/lib/motion_pairing.py",
@@ -148,6 +156,7 @@ class Selection(unittest.TestCase):
                              ["gtk-shell", "remote-security", "arch-package"])
         # Control: another portal helper still rotates.
         self.assertIn("gtk-shell", pr("scripts/lib/tuna-portal-consent.py", run=0))
+
     def test_native_desktop_driver_runs_the_vm_lane_that_drives_it(self):
         # #1013: a shared-driver change runs the VM lane whose autotz profile
         # drives it, not whatever slice the rotation picks.
@@ -385,6 +394,29 @@ class WorkflowSync(unittest.TestCase):
         # reference members that native-reference-context downloads are
         # produced on the other events.
         self.assertIn("pull_request", self.jobs["native-reference-context"]["if"])
+
+    def test_gtk_shell_slices_run_on_binaries_this_job_built(self):
+        # The slices run when an unrelated earlier step failed and skipped
+        # the full proof, whose build used to be the only one: they then
+        # launched a compositor with no tuna-shell-gtk and all failed
+        # A11Y-PANEL. Their binaries come from a build step of their own.
+        steps = self.jobs["gtk-shell"]["steps"]
+        build = [s.get("id") for s in steps].index("proof-binaries")
+        self.assertEqual(steps[build].get("if"), "${{ !cancelled() }}")
+        proof = (ROOT / "scripts/tuna-gtk-shell-proof").read_text()
+        packages = "-p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host"
+        self.assertIn(packages, steps[build]["run"])
+        self.assertIn(packages, proof)
+        full = next(i for i, s in enumerate(steps)
+                    if s.get("run", "").strip() == "scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts")
+        self.assertLess(build, full)
+        slices = [(i, s) for i, s in enumerate(steps) if "TUNA_PROOF_BIN_DIR" in (s.get("env") or {})]
+        self.assertGreaterEqual(len(slices), 5)
+        for index, step in slices:
+            with self.subTest(step=step.get("name")):
+                self.assertGreater(index, build)
+                self.assertEqual(step.get("if"),
+                                 "${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}")
 
 
 if __name__ == "__main__":

@@ -33,9 +33,15 @@ import select
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
+
+if not os.environ.get("TUNA_PROOF_SESSION"):
+    # One owned session (#1082): nothing this run starts outlives it.
+    session = str(Path(__file__).resolve().parent / "lib/tuna-proof-session")
+    os.execv(session, [session, "--", sys.executable, *sys.argv])
 
 ROOT = Path(__file__).resolve().parent.parent
 WIDTH, HEIGHT, PANEL = 1280, 800, 32

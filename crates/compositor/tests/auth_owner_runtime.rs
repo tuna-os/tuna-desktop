@@ -271,8 +271,16 @@ fn epoch_client() {
     // without the module ever being released to succeed.
     result(&mut original, 1, false);
     assert_helper_retired_unreleased(&root, 1);
-    assert_eq!(state(&root)["locked"], true);
-    assert_eq!(state(&root)["auth_owner"]["epoch"], 2);
+    // The control reply can overtake the state file, which the runtime
+    // republishes on its own tick (a stale file still shows epoch 1 and no
+    // pending attempt): wait for the post-injection publication.
+    assert_eq!(injected["after"], 2);
+    wait(|| {
+        let state = state(&root);
+        state["locked"] == true
+            && state["auth_owner"]["epoch"] == 2
+            && state["auth_owner"]["outer_pending"] == false
+    });
     drop(original);
     let mut replacement = connect();
     std::fs::write(root.join("release-2"), b"1").unwrap();
@@ -1098,6 +1106,15 @@ fn run_parent(bin: &Path, role: &str, kind: &str) {
             status.is_none(),
             "actual compositor exited before proof: {status:?}"
         );
+        // The supervised driver is libtest: its panic is in compositor.log,
+        // and the restarted driver cannot finish the proof it began.
+        let log = std::fs::read_to_string(root.path().join("compositor.log")).unwrap_or_default();
+        if let Some(at) = log.find("panicked at") {
+            panic!(
+                "supervised driver failed: {}",
+                log[at..].lines().take(4).collect::<Vec<_>>().join(" / ")
+            );
+        }
         assert!(Instant::now() < end, "actual runtime proof deadline");
         std::thread::sleep(Duration::from_millis(10));
     }

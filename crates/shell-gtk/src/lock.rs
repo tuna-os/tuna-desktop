@@ -27,7 +27,7 @@ use tuna_shell_control::{AuthEvent, AuthService};
 
 use crate::lock_auth::{AuthMachine, Effect, Host, MessageKind, View};
 use crate::lock_curtain::{self, Curtain, Page, Source};
-use crate::lock_notifications::{LockEntry, NotificationsBox};
+use crate::lock_notifications::{LockEntry, MediaActions, MediaEntry, NotificationsBox};
 use crate::lock_wiggle::Wiggle;
 use crate::logic;
 
@@ -41,6 +41,8 @@ fn touchpad_settings() -> Option<gio::Settings> {
 }
 /// What the lock screen's notifications show now.
 pub type LockNotifications = Rc<dyn Fn() -> Vec<LockEntry>>;
+/// The media players the lock screen shows now.
+pub type LockMedia = Rc<dyn Fn() -> Vec<MediaEntry>>;
 
 /// Sends a password with the single-password `Unlock`; returns the
 /// request id.
@@ -308,6 +310,9 @@ pub struct LockUi {
     hints: Rc<lock_curtain::HintWatch>,
     /// Where the notifications box reads what to show (#348).
     notifications: RefCell<Option<LockNotifications>>,
+    /// Where the notifications box reads its media players, and how its
+    /// controls reach them (#348).
+    media: RefCell<Option<(LockMedia, MediaActions)>>,
 }
 
 impl LockUi {
@@ -336,6 +341,7 @@ impl LockUi {
             osk: RefCell::new(None),
             hints: lock_curtain::HintWatch::new(),
             notifications: RefCell::new(None),
+            media: RefCell::new(None),
         });
         {
             // A refused request (ext_session_lock_v1.finished) leaves the
@@ -403,6 +409,28 @@ impl LockUi {
         }
     }
 
+    /// Read the lock screen's media players from `source`; `act` drives
+    /// one by its bus name.
+    pub fn set_media(&self, source: LockMedia, act: MediaActions) {
+        *self.media.borrow_mut() = Some((source, act));
+    }
+
+    /// Bring every lock screen's media players up to date (GNOME's
+    /// `MediaMessage` follows its player and its policy live).
+    pub fn refresh_media(&self) {
+        let screens = self.screens.borrow();
+        if screens.is_empty() {
+            return;
+        }
+        let Some((source, act)) = self.media.borrow().clone() else {
+            return;
+        };
+        let players = source();
+        for screen in screens.iter() {
+            screen.notifications.show_media(&players, &act);
+        }
+    }
+
     /// Drop every lock window. Their entries are wiped at once, which is
     /// no input; the windows are destroyed from the main loop afterwards.
     /// gtk4-session-lock emits `::unlocked` (and `::failed`) before it
@@ -457,6 +485,7 @@ impl LockUi {
             self.refresh_clock();
             self.hints.arm();
             self.refresh_notifications();
+            self.refresh_media();
             let weak = Rc::downgrade(self);
             *self.wall_clock.borrow_mut() =
                 Some(crate::wall_clock::WallClock::new(false, move || {
@@ -814,7 +843,7 @@ impl LockUi {
         bar.set_valign(gtk::Align::Start);
         overlay.add_overlay(&bar);
         // GNOME's NotificationsBox: the bottom of the column under the
-        // clock and the prompt.
+        // clock and the prompt, raising them when it is taller.
         let notifications = NotificationsBox::new();
         overlay.add_overlay(notifications.widget());
         // GNOME's keyboard box sits over the lock screen too: it opens
@@ -855,18 +884,21 @@ impl LockUi {
         // Vertical placement: GNOME puts the stack a third of the way
         // down (UnlockDialogLayout), which lands the 1280x800 clock at
         // y 275 and the prompt at y 205. The notifications take the
-        // bottom, never reaching up into the clock. Followed on every
-        // surface layout, never on a tick callback: one that never ends
-        // keeps the frame clock (and the session's frame callbacks)
-        // running at the refresh rate for as long as the lock screen is
-        // up, blanked or not (#1122). GTK's own layout handler, connected
-        // while the window realizes, runs first, so the window is already
-        // allocated; a widget queueing a resize (the clock's text) lays
-        // the surface out again.
+        // bottom; taller than the room below the stack, they raise the
+        // stack up to a tenth of the height from the top, and only the
+        // rest of them scrolls. Followed on every surface layout, never
+        // on a tick callback: one that never ends keeps the frame clock
+        // (and the session's frame callbacks) running at the refresh
+        // rate for as long as the lock screen is up, blanked or not
+        // (#1122). GTK's own layout handler, connected while the window
+        // realizes, runs first, so the window is already allocated; a
+        // widget queueing a resize (the clock's text) lays the surface
+        // out again.
         {
             let (clock_box, prompt) = (clock_box.clone(), prompt.clone());
             let scroller = notifications.widget().clone();
-            let last = Rc::new(Cell::new(-1));
+            let notes_height = Rc::new(notifications.natural_height());
+            let last = Rc::new(Cell::new((-1, -1)));
             window.connect_realize(move |w| {
                 let Some(surface) = w.surface() else {
                     return;
@@ -878,22 +910,32 @@ impl LockUi {
                     scroller.clone(),
                     last.clone(),
                 );
+                let notes_height = notes_height.clone();
                 surface.connect_layout(move |_, _, _| {
                     let Some(height) = window.upgrade().map(|w| w.height()) else {
                         return;
                     };
                     let (clock_top, prompt_top) = logic::lock_offsets(height);
-                    if height != last.replace(height) {
-                        clock_box.set_margin_top(clock_top);
-                        prompt.set_margin_top(prompt_top);
+                    let stack_top = clock_top - logic::LOCK_CLOCK_MARGIN;
+                    // GNOME's stack is as tall as the taller of the clock
+                    // (with its top margin) and the prompt. Measures
+                    // include margins, and may still hold the old ones
+                    // for a layout: take each one's own height.
+                    let own = |w: &gtk::Box| {
+                        let (_, natural, _, _) = w.measure(gtk::Orientation::Vertical, -1);
+                        natural - w.margin_top() - w.margin_bottom()
+                    };
+                    let stack = (logic::LOCK_CLOCK_MARGIN + own(&clock_box))
+                        .max(prompt_top - stack_top + own(&prompt));
+                    let (rise, shown) =
+                        logic::lock_notifications_layout(height, stack_top, stack, notes_height());
+                    if (height, rise) != last.get() {
+                        last.set((height, rise));
+                        clock_box.set_margin_top(clock_top - rise);
+                        prompt.set_margin_top(prompt_top - rise);
                     }
-                    // The measure includes margins, and may still hold the
-                    // old ones for a layout: take the clock's own height.
-                    let (_, natural, _, _) = clock_box.measure(gtk::Orientation::Vertical, -1);
-                    let clock = natural - clock_box.margin_top() - clock_box.margin_bottom();
-                    let room = (height - clock_top - clock).max(0);
-                    if scroller.max_content_height() != room {
-                        scroller.set_max_content_height(room);
+                    if scroller.max_content_height() != shown {
+                        scroller.set_max_content_height(shown);
                     }
                 });
             });
