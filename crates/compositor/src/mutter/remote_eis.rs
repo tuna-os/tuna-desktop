@@ -354,7 +354,11 @@ mod tests {
     #[test]
     fn a_delivered_eis_client_is_disconnected_when_its_grant_is_revoked() {
         let (server, client) = UnixStream::pair().unwrap();
-        let grant = RemoteGrant::new(7, ":1.7".into());
+        let grant = RemoteGrant::new(
+            7,
+            ":1.7".into(),
+            crate::capture_security::CaptureCaller::RemoteDesktopDaemon,
+        );
         grant.started.store(true, Ordering::SeqCst);
         let outputs: Outputs = Arc::new(Mutex::new(vec![super::super::OutputSnapshot {
             connector: "DP-1".into(),
