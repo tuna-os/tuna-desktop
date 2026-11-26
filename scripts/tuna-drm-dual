@@ -1,0 +1,800 @@
+#!/usr/bin/python3
+"""Two-output leg of drm-smoke on a vkms configfs device (Linux 6.19+).
+
+Usage:
+  scripts/tuna-drm-dual [--artifacts DIR] [--assertions FILE]
+
+A vkms configfs instance with two connected CRTC/connector pipes (A, B)
+is the hardware. tuna-compositor runs `--backend drm` on it under a
+private seatd and session bus with the GTK shell, real GTK 4 clients and
+a uinput keyboard and mouse, and the leg asserts on the kernel's KMS
+state (scripts/lib/drm_kms_readback.py, read with GET ioctls) and on
+the compositor's state document:
+  D-MIRROR-DISABLE  both connectors enumerate side by side, each on its own
+                    CRTC; GNOME Settings' ApplyMonitorsConfig mirroring A
+                    and B lights both CRTCs in one mode, disabling B turns
+                    its CRTC off in the kernel while A scans out, and
+                    extending again relights B (P-DS-02, #340)
+  D-LAYOUT-KEEP     a persistent mirror, then a persistent disable, each
+                    kept with Enter on the shell's "Keep these display
+                    settings?" dialog, are saved to monitors.xml and the
+                    next session starts mirrored, then with B off, in the
+                    kernel (P-DS-02)
+  D-WORKSPACES-PRIMARY with workspaces-only-on-primary a window on B stays
+                    shown (unthrottled, drawing) when Super+Page_Down
+                    switches workspace while A's window hides; with the key
+                    false both hide; a window dragged from B onto A lands on
+                    the active workspace (P-WM-08, mutter
+                    meta_window_on_all_workspaces_changed)
+  D-SCALE-MIXED     monitors.xml gives A a fractional scale and B scale 2; a
+                    GTK window dragged to span both gets B's scale when it
+                    overlaps B most and A's when it overlaps A most, over
+                    wp_fractional_scale, and its pointer events carry the
+                    compositor's logical pointer position (P-SY-03, #68)
+Each assertion line ("<ID> pass|fail <detail>") is appended to FILE
+(default DIR/assertions.txt), which the parity ledger reads with
+drm-smoke's. Needs root (sudo) for modprobe, configfs, seatd, uinput and
+the KMS readback. Exits nonzero on any failure.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts/lib"))
+import drm_dual as dual  # noqa: E402
+
+CONFIGFS = Path("/sys/kernel/config/vkms")
+INSTANCE = "tuna-dual"
+APP_PREFIX = "org.tuna.DrmDual."
+MOUSE = "Tuna dual mouse"
+KEYBOARD = "Tuna dual keyboard"
+CLIENT_SIZE = (360, 240)
+STATE_SIG = "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})"
+# Frames per second a shown client draws at least (vkms flips at 60 Hz)
+# and a hidden one at most (HIDDEN_FRAME_INTERVAL, 995 ms).
+SHOWN_FPS = 10
+HIDDEN_FPS = 3
+# Seconds after a workspace switch before frame rates are counted: more
+# than one HIDDEN_FRAME_INTERVAL, so callbacks owed from the slide (when
+# the window was still shown) are not counted as the hidden rate.
+RATE_SETTLE = 1.5
+# tuna_shell_control::MOD_ALT, the focus policy's modifier bit for the
+# `<Alt>` mouse-button-modifier the leg drags windows with.
+MOD_ALT = 8
+
+
+class GateFailure(Exception):
+    pass
+
+
+def client_worker(name):
+    """An undecorated GTK 4 window (its surface is its window geometry)
+    that animates every frame and reports ten times a second its frames,
+    its surface scale (wp_fractional_scale) and its last pointer motion
+    in surface coordinates."""
+    os.environ.setdefault("GSK_RENDERER", "cairo")
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gdk, Gio, GLib, Gtk
+
+    seen = {"frames": 0, "motion": None}
+    app = Gtk.Application(application_id=APP_PREFIX + name, flags=Gio.ApplicationFlags.NON_UNIQUE)
+
+    def activate(app):
+        window = Gtk.ApplicationWindow(application=app, title=f"Dual {name}")
+        window.set_decorated(False)
+        window.set_default_size(*CLIENT_SIZE)
+        area = Gtk.DrawingArea()
+
+        def draw(_area, cr, _width, _height):
+            shade = (seen["frames"] % 60) / 60
+            cr.set_source_rgb(shade, 0.5, 1 - shade)
+            cr.paint()
+
+        def tick(widget, _clock):
+            seen["frames"] += 1
+            widget.queue_draw()
+            return GLib.SOURCE_CONTINUE
+
+        def motion(_controller, x, y):
+            seen["motion"] = [x, y]
+
+        area.set_draw_func(draw)
+        area.add_tick_callback(tick)
+        controller = Gtk.EventControllerMotion()
+        controller.connect("motion", motion)
+        window.add_controller(controller)
+        window.set_child(area)
+        window.present()
+
+        def beat():
+            surface = window.get_surface()
+            monitor = surface and Gdk.Display.get_default().get_monitor_at_surface(surface)
+            # Gdk.Surface:scale (GTK 4.12+) is the wp_fractional_scale
+            # value; an older GTK has only the integer factor.
+            scale = None
+            if surface:
+                scale = surface.get_scale() if hasattr(surface, "get_scale") else float(surface.get_scale_factor())
+            print(json.dumps({"t": time.monotonic(), "frames": seen["frames"], "scale": scale,
+                              "motion": seen["motion"],
+                              "monitor": monitor.get_connector() if monitor else None}), flush=True)
+            return GLib.SOURCE_CONTINUE
+
+        GLib.timeout_add(100, beat)
+
+    app.connect("activate", activate)
+    app.run([])
+
+
+def seat_worker():
+    """uinput keyboard and relative mouse (root): one command per stdin
+    line, each answered with `ok`: `tap KEY[+KEY...]` (pressed in order,
+    released in reverse), `press KEY`, `release KEY`, `move DX DY`,
+    `button BTN 1|0`."""
+    from evdev import UInput, ecodes as e
+    keyboard = UInput({e.EV_KEY: list(range(e.KEY_ESC, e.KEY_MICMUTE + 1))},
+                      name=KEYBOARD, bustype=e.BUS_VIRTUAL)
+    mouse = UInput({e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
+                    e.EV_REL: [e.REL_X, e.REL_Y]},
+                   name=MOUSE, bustype=e.BUS_VIRTUAL)
+
+    def key(code, value):
+        keyboard.write(e.EV_KEY, code, value)
+        keyboard.syn()
+        time.sleep(0.03)
+
+    print("ready", flush=True)
+    for line in sys.stdin:
+        words = line.split()
+        if not words:
+            continue
+        try:
+            if words[0] == "tap":
+                codes = [getattr(e, name) for name in words[1].split("+")]
+                for code in codes:
+                    key(code, 1)
+                for code in reversed(codes):
+                    key(code, 0)
+            elif words[0] in ("press", "release"):
+                key(getattr(e, words[1]), 1 if words[0] == "press" else 0)
+            elif words[0] == "move":
+                mouse.write(e.EV_REL, e.REL_X, int(words[1]))
+                mouse.write(e.EV_REL, e.REL_Y, int(words[2]))
+                mouse.syn()
+                time.sleep(0.02)
+            elif words[0] == "button":
+                mouse.write(e.EV_KEY, getattr(e, words[1]), int(words[2]))
+                mouse.syn()
+                time.sleep(0.03)
+            else:
+                raise ValueError(f"unknown command {words[0]}")
+        except (AttributeError, IndexError, ValueError) as error:
+            print(f"error {error}", flush=True)
+            continue
+        print("ok", flush=True)
+    keyboard.close()
+    mouse.close()
+
+
+def sudo_sh(script):
+    subprocess.run(["sudo", "sh", "-eu", "-c", script], check=True)
+
+
+class Vkms:
+    """The configfs vkms instance: two pipes, both connected."""
+
+    def __init__(self):
+        self.path = CONFIGFS / INSTANCE
+        self.card = None
+        self.names = []
+
+    def create(self):
+        # A no-op when drm-smoke already loaded vkms; configfs registers
+        # with the module either way.
+        subprocess.run(["sudo", "modprobe", "vkms", "create_default_dev=0"], check=True)
+        if not CONFIGFS.is_dir():
+            raise GateFailure(f"{CONFIGFS} is missing: vkms configfs needs Linux 6.19 or newer "
+                              f"(running {os.uname().release})")
+        if self.path.exists():
+            sudo_sh(dual.configfs_teardown(self.path))
+        sudo_sh(dual.configfs_script(self.path, 2))
+        deadline = time.monotonic() + 10
+        while self.card is None:
+            for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
+                if "-" not in card.name and os.path.realpath(card / "device").endswith(f"/faux/{INSTANCE}"):
+                    self.card = card.name
+            if time.monotonic() > deadline:
+                raise GateFailure("the vkms configfs instance never appeared as a DRM card")
+            time.sleep(0.1)
+        connectors = sorted(Path("/sys/class/drm").glob(f"{self.card}-*"),
+                            key=lambda p: int(p.name.rsplit("-", 1)[1]))
+        self.names = [p.name.split("-", 1)[1] for p in connectors]
+        if len(self.names) != 2:
+            raise GateFailure(f"expected two connectors, found {self.names}")
+
+    def destroy(self):
+        if self.path.exists():
+            sudo_sh(dual.configfs_teardown(self.path))
+
+
+def run(args):
+    out = Path(args.artifacts).resolve()
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit("tuna-drm-dual: the artifacts directory must be fresh and empty")
+    out.mkdir(parents=True, exist_ok=True)
+    assertions = Path(args.assertions).resolve() if args.assertions else out / "assertions.txt"
+    # The runtime directory holds sockets, which an artifact upload cannot
+    # store: keep it out of the artifacts, as tuna-drm-smoke does.
+    private = Path(tempfile.mkdtemp(prefix="tuna-drm-dual-"))
+    os.chmod(private, 0o700)
+    config = out / "config"
+    config.mkdir()
+    schemas = out / "schemas"
+    schemas.mkdir()
+    gate = ["D-HARNESS"]
+    recorded = []
+
+    def record(gid, ok, detail):
+        line = f"{gid} {'pass' if ok else 'fail'} {detail}"
+        recorded.append(line)
+        with assertions.open("a") as stream:
+            stream.write(line + "\n")
+        print(f"tuna-drm-dual: {gid} {'pass' if ok else 'FAIL'}: {detail}", flush=True)
+
+    print("tuna-drm-dual: building")
+    subprocess.run(["cargo", "build", "--quiet", "--manifest-path", str(ROOT / "Cargo.toml"),
+                    "-p", "tuna-compositor", "-p", "tuna-shell-gtk"], check=True)
+
+    env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET")}
+    env.update(XDG_RUNTIME_DIR=str(private), XDG_CONFIG_HOME=str(config),
+               XDG_STATE_HOME=str(out / "state"), XDG_DATA_HOME=str(out / "data"),
+               GSK_RENDERER="cairo", ADW_DISABLE_PORTAL="1", LIBSEAT_BACKEND="seatd")
+    # Ubuntu's gsettings-desktop-schemas has no mutter schema (dynamic and
+    # primary-only workspaces, edge tiling): GNOME 51's, as drm-smoke does.
+    if subprocess.run(["gsettings", "range", "org.gnome.mutter", "workspaces-only-on-primary"],
+                      env=env, capture_output=True).returncode != 0:
+        shutil.copy(ROOT / "tests/settings/gnome51-mutter.gschema.xml", schemas)
+        subprocess.run(["glib-compile-schemas", str(schemas)], check=True)
+        env["GSETTINGS_SCHEMA_DIR"] = f"{schemas}:{env.get('GSETTINGS_SCHEMA_DIR', '')}".rstrip(":")
+
+    logs, processes = [], []
+    vkms = Vkms()
+    system_seatd = subprocess.run(["systemctl", "is-active", "--quiet", "seatd"]).returncode == 0
+    seatd = seat = compositor = None
+    dbus_pid = None
+    state_path = out / "state.json"
+    current = {"log": None, "card": None}
+
+    def launch(command, name, child_env=None, **kwargs):
+        log = (out / f"{name}.log").open("w")
+        logs.append(log)
+        process = subprocess.Popen(command, env=child_env or env, stdout=kwargs.pop("stdout", log),
+                                   stderr=log, start_new_session=True, **kwargs)
+        processes.append(process)
+        return process
+
+    def state():
+        try:
+            return json.loads(state_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def alive():
+        if compositor is not None and compositor.poll() is not None:
+            raise GateFailure(f"the compositor exited with {compositor.returncode}")
+
+    def wait_for(what, predicate, timeout=15):
+        deadline = time.monotonic() + timeout
+        while True:
+            alive()
+            value = predicate()
+            if value:
+                return value
+            if time.monotonic() > deadline:
+                raise GateFailure(f"timed out after {timeout}s: {what}")
+            time.sleep(0.1)
+
+    def kernel(label):
+        text = subprocess.run(["sudo", sys.executable, str(ROOT / "scripts/lib/drm_kms_readback.py"),
+                               current["card"]], check=True, capture_output=True, text=True).stdout
+        (out / f"kms-{label}.json").write_text(text)
+        return json.loads(text)
+
+    def wait_kernel(label, check, timeout=10):
+        """Poll the kernel readback until `check(readback)` has no problems."""
+        problems = []
+
+        def ok():
+            nonlocal problems
+            problems = check(kernel(label))
+            return not problems
+        try:
+            wait_for(f"{label} in the kernel", ok, timeout)
+        except GateFailure:
+            raise GateFailure(f"{label}: {'; '.join(problems)}") from None
+
+    def wait_state(label, check, timeout=15):
+        problems = []
+
+        def ok():
+            nonlocal problems
+            problems = check(state())
+            return not problems
+        try:
+            wait_for(label, ok, timeout)
+        except GateFailure:
+            raise GateFailure(f"{label}: {'; '.join(problems)}") from None
+        shutil.copy(state_path, out / f"state-{label.replace(' ', '-')}.json")
+
+    def gsettings(*words):
+        subprocess.run(["gsettings", "set", *words], env=env, check=True)
+
+    def start_session(name):
+        nonlocal compositor
+        if state_path.exists():
+            state_path.unlink()
+        compositor = launch([str(ROOT / "target/debug/tuna-compositor"), "--backend", "drm",
+                             "--socket", f"tuna-dual-{name}",
+                             "--shell-bin", str(ROOT / "target/debug/tuna-shell-gtk")],
+                            f"compositor-{name}",
+                            env | {"TUNA_DRM_DEVICE": current["card"], "TUNA_COMPOSITOR_STATE": str(state_path)})
+        current["log"] = out / f"compositor-{name}.log"
+        current["socket"] = f"tuna-dual-{name}"
+        wait_for(f"{name}: the GTK shell's panel",
+                 lambda: any(layer.get("namespace") == "tuna-panel" for layer in state().get("layers", [])), 60)
+        wait_for(f"{name}: DisplayConfig on the session bus",
+                 lambda: "serving org.gnome.Mutter.DisplayConfig" in current["log"].read_text(), 30)
+        # libinput queues the devices present at startup in
+        # udev_assign_seat, but the compositor only drains libinput when its
+        # fd turns readable: until some device produces an event (or one is
+        # hotplugged) no device is added, the host's included (drm-smoke's
+        # own sessions show input_devices [] throughout). Mouse motion that
+        # nets to zero wakes it, as a user touching the mouse does.
+        def devices_added():
+            if all(any(n in json.dumps(d) for d in state().get("input_devices", []))
+                   for n in (MOUSE, KEYBOARD)):
+                return True
+            send("move 1 0")
+            send("move -1 0")
+            time.sleep(0.4)
+            return False
+        wait_for(f"{name}: libinput adds the uinput mouse and keyboard", devices_added, 15)
+
+    def stop_session():
+        nonlocal compositor
+        if compositor is None:
+            return
+        os.killpg(compositor.pid, 15)
+        try:
+            compositor.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(compositor.pid, 9)
+            compositor.wait()
+        text = current["log"].read_text()
+        compositor = None
+        if "panicked" in text:
+            raise GateFailure(f"panic in {current['log'].name}")
+
+    clients = {}
+
+    def beats(name):
+        rows = []
+        for line in (out / f"client-{name}.jsonl").read_text().splitlines():
+            if line.startswith("{"):
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass  # a line still being written
+        return rows
+
+    def last_beat(name):
+        rows = beats(name)
+        return rows[-1] if rows else {}
+
+    def window(name):
+        return next((w for w in state().get("windows", []) if w.get("app_id") == APP_PREFIX + name), None)
+
+    try:
+        gate[0] = "D-MIRROR-DISABLE"
+        vkms.create()
+        A, B = vkms.names
+        current["card"] = f"/dev/dri/{vkms.card}"
+        print(f"tuna-drm-dual: vkms {INSTANCE} at {current['card']}, connectors {vkms.names}")
+
+        if system_seatd:
+            subprocess.run(["sudo", "systemctl", "stop", "seatd"], check=True)
+        seatd = launch(["sudo", "seatd", "-u", subprocess.check_output(["id", "-un"], text=True).strip(),
+                        "-g", subprocess.check_output(["id", "-gn"], text=True).strip()], "seatd")
+        wait_for("seatd socket", lambda: Path("/run/seatd.sock").exists(), 10)
+        # dconf-service inherits this environment, so gsettings writes
+        # land in config/ where the shell and compositor read them.
+        bus = subprocess.check_output(["dbus-daemon", "--session", "--fork", "--print-address=1",
+                                       "--print-pid=1"], env=env, text=True).splitlines()
+        env["DBUS_SESSION_BUS_ADDRESS"], dbus_pid = bus[0], int(bus[1])
+        seat = subprocess.Popen(["sudo", sys.executable, str(Path(__file__).resolve()), "--seat"],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=(out / "seat.log").open("w"), text=True, bufsize=1)
+        if seat.stdout.readline().strip() != "ready":
+            raise GateFailure("the uinput seat did not start; see seat.log")
+
+        def send(command):
+            seat.stdin.write(command + "\n")
+            answer = seat.stdout.readline().strip()
+            if answer != "ok":
+                raise GateFailure(f"uinput seat answered {answer!r} to {command!r}")
+
+        from gi.repository import Gio, GLib
+        dbus = Gio.DBusConnection.new_for_address_sync(
+            env["DBUS_SESSION_BUS_ADDRESS"],
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+            None, None)
+
+        def display_call(method, args=None, reply=None):
+            return dbus.call_sync("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+                                  "org.gnome.Mutter.DisplayConfig", method, args,
+                                  GLib.VariantType.new(reply) if reply else None,
+                                  Gio.DBusCallFlags.NONE, 10000, None)
+
+        def current_state():
+            return display_call("GetCurrentState", None, STATE_SIG).unpack()
+
+        def apply(method, logical):
+            serial = current_state()[0]
+            display_call("ApplyMonitorsConfig", GLib.Variant(
+                "(uua(iiduba(ssa{sv}))a{sv})", (serial, method, dual.apply_config(logical), {})))
+
+        def pointer():
+            return state().get("pointer_position")
+
+        def point_to(x, y, tolerance=3):
+            def there():
+                pos = pointer()
+                if not pos:
+                    return False
+                dx, dy = x - pos[0], y - pos[1]
+                if abs(dx) <= tolerance and abs(dy) <= tolerance:
+                    return True
+                send(f"move {max(-40, min(40, round(dx / 2)))} {max(-40, min(40, round(dy / 2)))}")
+                return False
+            wait_for(f"the pointer at ({x:.0f}, {y:.0f})", there, 30)
+
+        def point_into(name):
+            rect = dual.outputs(state())[name]["rect"]
+            point_to(rect[0] + rect[2] / 2, rect[1] + rect[3] / 2, min(rect[2], rect[3]) / 5)
+
+        def open_client(name, on):
+            point_into(on)
+            heartbeat = (out / f"client-{name}.jsonl").open("w")
+            logs.append(heartbeat)
+            clients[name] = launch([sys.executable, str(Path(__file__).resolve()), "--client", name],
+                                   f"client-{name}",
+                                   env | {"WAYLAND_DISPLAY": current["socket"], "GDK_BACKEND": "wayland"},
+                                   stdout=heartbeat)
+            mapped = wait_for(f"client {name} mapped on {on}",
+                              lambda: (w := window(name)) and dual.output_overlapping_most(w["rect"], state()) == on
+                              and last_beat(name).get("frames", 0) > 0 and w, 30)
+            return mapped["id"]
+
+        def close_clients():
+            for name, process in list(clients.items()):
+                if process.poll() is None:
+                    os.killpg(process.pid, 15)
+                    process.wait(timeout=5)
+                del clients[name]
+
+        def drag(name, x, y):
+            """Move the window by the window manager's modifier drag (Alt,
+            set below): grab its middle, carry it until its top-left is at
+            (x, y), release."""
+            rect = window(name)["rect"]
+            point_to(rect[0] + rect[2] / 2, rect[1] + rect[3] / 2, 4)
+            send("press KEY_LEFTALT")
+            send("button BTN_LEFT 1")
+            try:
+                wait_for(f"the window manager grabs {name} for the move",
+                         lambda: state().get("interactive_move_window") is not None, 5)
+
+                def placed():
+                    w = window(name)
+                    dx, dy = x - w["rect"][0], y - w["rect"][1]
+                    if abs(dx) <= 3 and abs(dy) <= 3:
+                        return True
+                    send(f"move {max(-30, min(30, round(dx / 2)))} {max(-30, min(30, round(dy / 2)))}")
+                    return False
+                wait_for(f"{name} carried to ({x}, {y})", placed, 30)
+            finally:
+                send("button BTN_LEFT 0")
+                send("release KEY_LEFTALT")
+            wait_for(f"the move of {name} ends", lambda: state().get("interactive_move_window") is None, 5)
+            return window(name)["rect"]
+
+        # D-MIRROR-DISABLE: enumeration, mirror, disable, extend again.
+        start_session("layout")
+        modes = dual.current_modes(current_state())
+        if sorted(modes) != sorted([A, B]):
+            raise GateFailure(f"GetCurrentState lists {sorted(modes)}, not {[A, B]}")
+        mode_a, wa, ha, _supported = modes[A]
+        listed = {spec[0]: ms for spec, ms, _ in current_state()[1]}
+        mode_b = next(m[0] for m in listed[B] if m[0] == mode_a)
+        # D-SCALE-MIXED's mode: Mutter offers scale 2 only from 800x480
+        # logical up, so not on vkms's 1024x768 default.
+        mixed = dual.mixed_scale_mode(listed[A])
+        size = f"{wa}x{ha}"
+        extended = {A: [0, 0, wa, ha], B: [wa, 0, modes[B][1], modes[B][2]]}
+        wait_state("enumerated", lambda s: dual.check_outputs(s, extended)
+                   + dual.check_display_config(s, {A: ([0, 0], None), B: ([wa, 0], None)})
+                   + ([] if dual.outputs(s).get(A, {}).get("primary") else [f"{A} is not the primary"]))
+        wait_kernel("enumerated", lambda k: dual.check_extended(k, {A: size, B: f"{modes[B][1]}x{modes[B][2]}"}))
+        apply(1, [(0, 0, 1.0, True, [(A, mode_a), (B, mode_b)])])
+        # Mutter adds a wl_output per mirrored monitor; Tuna only the
+        # leader (P-DS-02 deviation): any advertised one sits at the origin.
+        wait_state("mirrored", lambda s: ([] if A in dual.outputs(s) else [f"{A} is not a wl_output"])
+                   + [f"{n} is at {o['rect']}" for n, o in dual.outputs(s).items() if o["rect"] != [0, 0, wa, ha]]
+                   + dual.check_display_config(s, {A: ([0, 0], None), B: ([0, 0], A)}))
+        wait_kernel("mirrored", lambda k: dual.check_mirrored(k, A, B) + dual.check_extended(k, {A: size}))
+        apply(1, [(0, 0, 1.0, True, [(A, mode_a)])])
+        wait_state("disabled", lambda s: dual.check_outputs(s, {A: [0, 0, wa, ha]})
+                   + dual.check_display_config(s, {A: ([0, 0], None), B: (None, None)}))
+        wait_kernel("disabled", lambda k: dual.check_disabled(k, B, [A]))
+        apply(1, [(0, 0, 1.0, True, [(A, mode_a)]), (wa, 0, 1.0, False, [(B, mode_b)])])
+        wait_state("extended", lambda s: dual.check_outputs(s, extended))
+        wait_kernel("extended", lambda k: dual.check_extended(k, {A: size, B: size}))
+        record("D-MIRROR-DISABLE", True,
+               f"{A}+{B} enumerated side by side on their own CRTCs ({size}); ApplyMonitorsConfig mirror lit both "
+               f"CRTCs in one mode, disabling {B} turned its CRTC off in the kernel with {A} scanning out, "
+               f"extending relit {B}")
+
+        # D-LAYOUT-KEEP: persistent changes kept on the shell's dialog.
+        gate[0] = "D-LAYOUT-KEEP"
+        saved = config / "tuna/monitors.xml"
+
+        def keep(label):
+            wait_state(f"{label} awaits confirmation",
+                       lambda s: [] if s.get("display_config", {}).get("awaiting_confirmation")
+                       and any(l.get("namespace") == "tuna-display-change" for l in s.get("layers", []))
+                       else ["no Keep these display settings? dialog"])
+            for _ in range(5):
+                send("tap KEY_ENTER")
+                try:
+                    wait_for(f"{label}: Enter keeps the change",
+                             lambda: state().get("display_config", {}).get("awaiting_confirmation") is False, 3)
+                    break
+                except GateFailure:
+                    continue
+            else:
+                raise GateFailure(f"{label}: Enter on the dialog never kept the change")
+            wait_for(f"{label}: monitors.xml saved", saved.exists, 5)
+
+        apply(2, [(0, 0, 1.0, True, [(A, mode_a), (B, mode_b)])])
+        keep("persistent mirror")
+        problems = dual.check_kept(saved.read_text(), mirrored=[A, B], connectors=[A, B])
+        if problems:
+            raise GateFailure("; ".join(problems))
+        shutil.copy(saved, out / "monitors-kept-mirror.xml")
+        stop_session()
+        start_session("kept-mirror")
+        wait_state("restored mirror", lambda s: dual.check_display_config(s, {A: ([0, 0], None), B: ([0, 0], A)}))
+        wait_kernel("restored-mirror", lambda k: dual.check_mirrored(k, A, B) + dual.check_extended(k, {A: size}))
+        apply(2, [(0, 0, 1.0, True, [(A, mode_a)])])
+        keep("persistent disable")
+        wait_for("the disabled configuration saved",
+                 lambda: not dual.check_kept(saved.read_text(), disabled=B, connectors=[A, B]), 5)
+        shutil.copy(saved, out / "monitors-kept-disabled.xml")
+        stop_session()
+        start_session("kept-disabled")
+        wait_state("restored disabled", lambda s: dual.check_outputs(s, {A: [0, 0, wa, ha]})
+                   + dual.check_display_config(s, {A: ([0, 0], None), B: (None, None)}))
+        wait_kernel("restored-disabled", lambda k: dual.check_disabled(k, B, [A]))
+        stop_session()
+        saved.unlink()
+        record("D-LAYOUT-KEEP", True,
+               f"a persistent mirror and a persistent disable of {B}, each kept with Enter on the shell's dialog, "
+               f"were saved to monitors.xml; the next sessions started mirrored, then with {B}'s CRTC off")
+
+        # D-WORKSPACES-PRIMARY: secondary-output windows on every workspace.
+        gate[0] = "D-WORKSPACES-PRIMARY"
+        gsettings("org.gnome.desktop.wm.preferences", "mouse-button-modifier", "'<Alt>'")
+        gsettings("org.gnome.mutter", "edge-tiling", "false")
+        start_session("workspaces")
+        wait_state("multitasking defaults", lambda s: [] if s.get("multitasking", {}).get("workspaces_only_on_primary")
+                   is True and s["multitasking"].get("edge_tiling") is False
+                   and s.get("focus_policy", {}).get("modifier") == MOD_ALT
+                   else [f"multitasking is {s.get('multitasking')}, focus policy {s.get('focus_policy')}"])
+        p_id = open_client("P", A)
+        s_id = open_client("S", B)
+        home = state()["active_workspace"]
+
+        def switch(keys, label):
+            before = state()["active_workspace"]
+            send(f"tap {keys}")
+            wait_for(f"{label}: the workspace changes and the slide ends",
+                     lambda: (s := state()).get("active_workspace") != before
+                     and s.get("workspace_slide", {}).get("in_flight") is None, 10)
+
+        def rates(names, seconds=3):
+            """Frames each client drew in `seconds`, counted from its own
+            heartbeats once the switch has settled: a window hidden by
+            the switch was shown through the slide, and the frames it
+            was owed then arrive over the next frame interval
+            (HIDDEN_FRAME_INTERVAL is 995 ms), so the window opens
+            RATE_SETTLE after the switch ended."""
+            start = time.monotonic() + RATE_SETTLE
+            time.sleep(RATE_SETTLE + seconds + 0.3)
+            return {n: dual.frames_between(beats(n), start, start + seconds) for n in names}
+
+        def check_rates(label, shown=(), hidden=()):
+            seconds = 3
+            counted = rates([*shown, *hidden], seconds)
+            problems = []
+            for n in [*shown, *hidden]:
+                if counted[n] is None:
+                    problems.append(f"client {n}'s heartbeats do not cover the {seconds} s window")
+                    continue
+                problems += dual.check_frame_rate(n, counted[n], seconds, n in shown, SHOWN_FPS, HIDDEN_FPS)
+            if problems:
+                raise GateFailure(f"{label}: {'; '.join(problems)}")
+            return counted
+
+        switch("KEY_LEFTMETA+KEY_PAGEDOWN", "only on primary")
+        wait_state("only on primary switched", lambda s: dual.check_workspace_split(s, p_id, s_id, True))
+        sticky_rates = check_rates("only on primary", shown=["S"], hidden=["P"])
+        switch("KEY_LEFTMETA+KEY_PAGEUP", "back home")
+        if state()["active_workspace"] != home:
+            raise GateFailure("Super+Page_Up did not return to the first workspace")
+        gsettings("org.gnome.mutter", "workspaces-only-on-primary", "false")
+        wait_state("workspaces on every output",
+                   lambda s: [] if s.get("multitasking", {}).get("workspaces_only_on_primary") is False
+                   else ["workspaces-only-on-primary false did not reach the compositor"])
+        switch("KEY_LEFTMETA+KEY_PAGEDOWN", "on every output")
+        wait_state("every output switched", lambda s: dual.check_workspace_split(s, p_id, s_id, False))
+        every_rates = check_rates("on every output", hidden=["P", "S"])
+        switch("KEY_LEFTMETA+KEY_PAGEUP", "back home again")
+        gsettings("org.gnome.mutter", "workspaces-only-on-primary", "true")
+        wait_state("workspaces only on the primary again",
+                   lambda s: [] if s.get("multitasking", {}).get("workspaces_only_on_primary") is True
+                   else ["workspaces-only-on-primary true did not come back"])
+        # Leaving the secondary output ends the every-workspace state on
+        # the workspace showing then, not the one the window opened on.
+        switch("KEY_LEFTMETA+KEY_PAGEDOWN", "to carry S")
+        away = state()["active_workspace"]
+        wait_state("S shown away from home", lambda s: dual.check_workspace_split(s, p_id, s_id, True))
+        rect_a = dual.outputs(state())[A]["rect"]
+        drag("S", rect_a[0] + 80, rect_a[1] + 120)
+        wait_state("S on the primary", lambda s: dual.check_window_on(s, s_id, output=A, workspace=away, hidden=False))
+        switch("KEY_LEFTMETA+KEY_PAGEUP", "home without S")
+        wait_state("S stayed on the workspace it was carried on",
+                   lambda s: dual.check_window_on(s, s_id, workspace=away, hidden=True)
+                   + dual.check_window_on(s, p_id, output=A, workspace=home, hidden=False))
+        check_rates("S left behind", shown=["P"], hidden=["S"])
+        close_clients()
+        stop_session()
+        record("D-WORKSPACES-PRIMARY", True,
+               f"workspaces only on the primary: Super+Page_Down hid {A}'s window and kept {B}'s shown "
+               f"(frames in 3 s {sticky_rates}); on every output both hid ({every_rates}); a window carried "
+               f"from {B} onto {A} stayed on the workspace it was carried on")
+
+        # D-SCALE-MIXED: a fractional and an integer output side by side.
+        gate[0] = "D-SCALE-MIXED"
+        if mixed is None:
+            raise GateFailure(f"no mode of {A} supports both scale 2 and a fractional scale: {listed[A]}")
+        mode_m, wm, hm, refresh, frac = mixed
+        if all(m[0] != mode_m for m in listed[B]):
+            raise GateFailure(f"{B} lacks {A}'s mode {mode_m}")
+        la, lha = round(wm / frac), round(hm / frac)
+        lb, lhb = wm // 2, hm // 2
+        mode_xml = f"<mode><width>{wm}</width><height>{hm}</height><rate>{refresh!r}</rate></mode>"
+        (config / "monitors.xml").write_text(
+            '<monitors version="2"><configuration>'
+            f"<logicalmonitor><x>0</x><y>0</y><scale>{frac!r}</scale><primary>yes</primary>"
+            f"<monitor><monitorspec><connector>{A}</connector></monitorspec>{mode_xml}</monitor></logicalmonitor>"
+            f"<logicalmonitor><x>{la}</x><y>0</y><scale>2</scale><primary>no</primary>"
+            f"<monitor><monitorspec><connector>{B}</connector></monitorspec>{mode_xml}</monitor></logicalmonitor>"
+            "</configuration></monitors>\n")
+        start_session("scale")
+        wait_state("mixed scales", lambda s: dual.check_outputs(s, {A: [0, 0, la, lha], B: [la, 0, lb, lhb]}))
+        wait_kernel("mixed-scales", lambda k: dual.check_extended(k, {A: f"{wm}x{hm}", B: f"{wm}x{hm}"}))
+        m_id = open_client("M", A)
+
+        def scale_and_pointer(label, scale):
+            wait_for(f"{label}: the client's surface scale",
+                     lambda: not dual.check_client_scale(last_beat("M").get("scale"), scale), 10)
+            problems = []
+            for nudge in ("move 6 4", "move -6 -4", "move 3 0"):
+                send(nudge)
+
+                def matches():
+                    nonlocal problems
+                    w = dual.window_by_id(state(), m_id)
+                    problems = dual.check_pointer(last_beat("M").get("motion"), pointer(), w and w["rect"])
+                    return not problems
+                try:
+                    wait_for(f"{label}: client pointer events", matches, 5)
+                except GateFailure:
+                    raise GateFailure(f"{label}: {'; '.join(problems)}") from None
+            return last_beat("M")["scale"]
+
+        on_a = scale_and_pointer(f"on {A}", frac)
+        w, h = CLIENT_SIZE
+        rect = drag("M", la - round(w * 0.3), 40)
+        if not dual.spans(rect, state(), A, B) or dual.output_overlapping_most(rect, state()) != B:
+            raise GateFailure(f"the window at {rect} does not span {A} and {B} mostly on {B}")
+        on_b = scale_and_pointer(f"spanning, mostly on {B}", 2.0)
+        rect_back = drag("M", la - round(w * 0.7), 40)
+        if not dual.spans(rect_back, state(), A, B) or dual.output_overlapping_most(rect_back, state()) != A:
+            raise GateFailure(f"the window at {rect_back} does not span {A} and {B} mostly on {A}")
+        back = scale_and_pointer(f"spanning, mostly on {A}", frac)
+        close_clients()
+        stop_session()
+        record("D-SCALE-MIXED", True,
+               f"monitors.xml {A} at {frac:g} ({la}x{lha} logical), {B} at 2 ({lb}x{lhb}); the GTK window took "
+               f"surface scale {on_a:g} on {A}, {on_b:g} spanning mostly on {B} at {rect[:2]}, {back:g} mostly on "
+               f"{A} at {rect_back[:2]}; its pointer events matched the logical pointer each time")
+    except GateFailure as error:
+        record(gate[0], False, str(error))
+    except Exception as error:  # noqa: BLE001 - the harness failure is the gate's
+        record(gate[0], False, f"harness {type(error).__name__}: {error}")
+    finally:
+        if state_path.exists():
+            shutil.copy(state_path, out / "final-state.json")
+        if seat is not None:
+            seat.stdin.close()
+            try:
+                seat.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                subprocess.run(["sudo", "kill", str(seat.pid)])
+        for process in reversed(processes):
+            if process is seatd or process.poll() is not None:
+                continue
+            os.killpg(process.pid, 15)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, 9)
+                process.wait()
+        if seatd is not None:
+            subprocess.run(["sudo", "pkill", "-P", str(seatd.pid)])
+            seatd.wait(timeout=5)
+        if system_seatd:
+            subprocess.run(["sudo", "systemctl", "start", "seatd"])
+        if dbus_pid:
+            try:
+                os.kill(dbus_pid, 15)
+            except ProcessLookupError:
+                pass
+        for log in logs:
+            log.close()
+        try:
+            vkms.destroy()
+        except subprocess.CalledProcessError as error:
+            print(f"tuna-drm-dual: vkms teardown: {error}", file=sys.stderr)
+        shutil.rmtree(private, ignore_errors=True)
+    if not recorded or any(" fail " in line for line in recorded):
+        raise SystemExit(f"tuna-drm-dual: failed; evidence in {out}")
+    print(f"tuna-drm-dual: OK, artifacts in {out}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--artifacts", default="drm-smoke-artifacts/dual")
+    parser.add_argument("--assertions", help="append assertion lines here (default ARTIFACTS/assertions.txt)")
+    parser.add_argument("--client", help=argparse.SUPPRESS)
+    parser.add_argument("--seat", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.client:
+        client_worker(args.client)
+    elif args.seat:
+        seat_worker()
+    else:
+        run(args)
+
+
+if __name__ == "__main__":
+    main()

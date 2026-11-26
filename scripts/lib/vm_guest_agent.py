@@ -279,10 +279,16 @@ def speech_failure_diagnostic(encoded):
 class GuestAgent:
     """One owned QGA stream; deadline failure poisons it instead of accepting stale replies.
 
-    Transport retirement is not guest-exec child retirement. A timed-out guest PID
-    stays recorded for separate exact-owner cleanup by the installed proof runner.
+    Transport retirement is not guest-exec child retirement. After an operation
+    deadline the timed-out child's status is grace-polled: the operation still
+    fails at its deadline, but a child seen exiting within RETIREMENT_GRACE is
+    confirmed retired. Otherwise its guest PID stays recorded for separate
+    exact-owner cleanup by the installed proof runner.
     """
     MAX_REPLY = 1024 * 1024
+    # Bounds only the retirement observation after a missed deadline, never an
+    # operation's own budget or verdict (#1013).
+    RETIREMENT_GRACE = 10
 
     def __init__(self, path, *, deadline=None):
         if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
@@ -417,6 +423,10 @@ class GuestAgent:
         caller_deadline = getattr(self, "_caller_deadline", None)
         if caller_deadline is not None:
             deadline = min(deadline, caller_deadline)
+        return self._exchange(name, deadline, arguments)
+
+    def _exchange(self, name, deadline, arguments):
+        """One correlated request/reply bounded by exactly `deadline`."""
         if getattr(self, "poisoned", False):
             raise RuntimeError("guest-agent transport poisoned")
         try:
@@ -510,8 +520,8 @@ class GuestAgent:
                 status = self.command("guest-exec-status", pid=pid, deadline=deadline)
             except TimeoutError as error:
                 self._poison()
-                raise TimeoutError(f"guest lifecycle {action} timed out awaiting guest-exec-status "
-                                   f"for pid {pid}; child retirement unconfirmed ({error})") from error
+                raise self._retire_after_timeout(
+                    action, pid, f"timed out awaiting guest-exec-status for pid {pid}", error) from error
             except BaseException:
                 self._poison()
                 raise
@@ -556,8 +566,39 @@ class GuestAgent:
                     raise RuntimeError(f"guest lifecycle {action} failed (exit={status.get('exitcode')})")
                 return json.loads(base64.b64decode(status.get("out-data", ""), validate=True))
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        raise self._retire_after_timeout(action, pid, "timed out")
+
+    def _retire_after_timeout(self, action, pid, reason, error=None):
+        """Grace-poll a timed-out child's guest-exec-status past the missed
+        deadline and return the TimeoutError the operation fails with.
+
+        The verdict stays a timeout; only a child observed exiting within
+        RETIREMENT_GRACE is cleared to "none" (a late retirement), so a clock
+        expiry no longer leaves the caller holding an unretired child (#1013).
+        A transport that timed out mid-reply is replaced first: the new
+        connection's guest-sync-delimited discards the stale reply.
+        """
+        grace = time.monotonic() + self.RETIREMENT_GRACE
+        cause = f"{reason} ({error})" if error is not None else reason
+        try:
+            if getattr(self, "poisoned", False):
+                self._connect(grace)
+            while True:
+                status = self._exchange("guest-exec-status", grace, {"pid": pid})
+                if not isinstance(status, dict) or type(status.get("exited")) is not bool:
+                    raise RuntimeError("invalid guest-exec status")
+                if status["exited"]:
+                    break
+                time.sleep(min(0.1, self._remaining(grace)))
+        except Exception as failure:
+            self._poison()
+            return TimeoutError(f"guest lifecycle {action} {cause}; child retirement unconfirmed "
+                                f"after {self.RETIREMENT_GRACE}s grace ({type(failure).__name__})")
         self._poison()
-        raise TimeoutError(f"guest lifecycle {action} timed out; child retirement unconfirmed")
+        self.pending_guest_pid = None
+        self.guest_exec_state = "none"
+        return TimeoutError(f"guest lifecycle {action} {cause}; child retired late "
+                            f"(exit={status.get('exitcode')}) within {self.RETIREMENT_GRACE}s grace")
 
     def close(self):
         self._poison()

@@ -511,7 +511,7 @@ def inventory():
                                                       "native_relative_motion_count", "input_devices",
                                                       "mouse_left_handed", "touchpad_left_handed",
                                                       "hot_corners", "auth_owner", "power_save_mode",
-                                                      "sleep_delay")},
+                                                      "sleep_delay", "rendered_frames")},
                 "processes": sorted(processes, key=lambda item: item["pid"])}
     except Exception as error:
         error.inventory_stage = stage
