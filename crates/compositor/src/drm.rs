@@ -47,6 +47,7 @@ use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size};
 use crate::windows::ManagerInput;
 
 pub mod color;
+pub mod input_drain;
 pub mod libinput;
 pub mod libwacom;
 pub mod privacy;
@@ -279,6 +280,9 @@ pub struct DrmBackend {
     pub outputs: Vec<DrmOutput>,
     /// libinput context, suspended while the session is paused.
     pub libinput: Libinput,
+    /// Drains libinput's queue on the next dispatch: what `resume` queued
+    /// (the devices present again) does not make its fd readable.
+    input_drain: calloop::ping::Ping,
     /// Whether the session currently owns the VT.
     pub active: bool,
     sleep_reset_pending: bool,
@@ -336,8 +340,9 @@ pub struct DrmSources {
     pub session: LibSeatSessionNotifier,
     /// VBlank and device errors.
     pub drm: DrmDeviceNotifier,
-    /// Input events.
-    pub input: LibinputInputBackend,
+    /// Input events; drains what libinput queued for the devices already
+    /// present on the loop's first dispatch.
+    pub input: input_drain::Draining<input_drain::LibinputSource>,
     /// DRM device `change` uevents (privacy screen hw-state, #356);
     /// `None` when udev cannot be monitored.
     pub udev: Option<smithay::backend::udev::UdevBackend>,
@@ -670,13 +675,20 @@ impl DrmBackend {
         libinput
             .udev_assign_seat(&seat)
             .map_err(|()| DrmInitError(format!("libinput: cannot assign seat {seat}")))?;
-        let input = LibinputInputBackend::new(libinput.clone());
+        // The devices already present are queued now, without making the
+        // fd readable: the draining source hands them over on the loop's
+        // first dispatch instead of at the first later input (Mutter's
+        // seat processes its events right after assigning it).
+        let (input, input_drain) =
+            input_drain::Draining::new(input_drain::LibinputSource::new(libinput.clone()))
+                .map_err(|e| DrmInitError(format!("libinput: drain ping: {e}")))?;
         let mut backend = Self {
             session,
             drm,
             renderer,
             outputs,
             libinput,
+            input_drain,
             active: true,
             sleep_reset_pending: false,
             powered_off: false,
@@ -1311,6 +1323,9 @@ impl DrmBackend {
                 if self.libinput.resume().is_err() {
                     eprintln!("tuna-compositor: drm: libinput resume failed");
                 }
+                // resume re-adds every device without making the fd
+                // readable; take them on the next dispatch.
+                self.input_drain.ping();
                 // Display power saving (#355) keeps every CRTC off across
                 // a VT switch: the next owner may have lit them.
                 if let Err(e) = self.drm.activate(self.outputs_disabled) {

@@ -5,7 +5,9 @@ through GDM's UserVerifier: a password conversation and a fingerprint
 conversation run side by side, every PAM prompt and message reaches the
 prompt in order, and either service can unlock. The compositor plays GDM's
 part (`crates/compositor/src/runtime/auth.rs`); the GTK shell plays
-`authPrompt.js` (`crates/shell-gtk/src/lock.rs`).
+`authPrompt.js` (`crates/shell-gtk/src/lock.rs` over the
+`crates/auth-prompt` state machine, which the login screen shares with
+GDM's own UserVerifier as its host; see [greeter.md](../greeter.md)).
 
 GNOME 51 sources: [authPrompt.js](https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/gdm/authPrompt.js),
 [authServicesLegacy.js](https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/gdm/authServicesLegacy.js),

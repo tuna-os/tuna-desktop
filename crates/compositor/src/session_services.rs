@@ -97,23 +97,32 @@ fn bus_import_args(vars: &[(&str, &str)]) -> Vec<String> {
 pub struct SessionServices {
     alive: Arc<AtomicBool>,
     leader: Option<Leader>,
+    /// A user session queued tuna-session.target; the greeter queues none.
+    user_session: bool,
+    run: Utility,
+    hardware: &'static AtomicBool,
 }
 impl Drop for SessionServices {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
-        HARDWARE_SESSION.store(false, Ordering::Release);
-        let _ = run("systemctl", &argv(STOP_TARGET));
+        self.hardware.store(false, Ordering::Release);
+        if self.user_session {
+            let _ = (self.run)("systemctl", &argv(STOP_TARGET));
+        }
         if let Some(leader) = self.leader.take() {
             // gnome-session 51's leader on session end: start the shutdown
             // target, then hang up the FIFO the monitor watches (which
             // starts it again on a crash, when this never runs). Stopping
             // tuna-session.target alone leaves gnome-session.target and
             // with it graphical-session.target and the plugins running.
-            let _ = run("systemctl", &argv(SHUTDOWN_GNOME_SESSION));
+            let _ = (self.run)("systemctl", &argv(SHUTDOWN_GNOME_SESSION));
             drop(leader);
         }
     }
 }
+
+/// A session utility as [`run`] runs it; tests record instead.
+type Utility = fn(&str, &[String]) -> bool;
 
 const STOP_TARGET: &[&str] = &["--user", "--no-block", "stop", "tuna-session.target"];
 /// Enqueue the start job without waiting for it; the worker waits.
@@ -278,6 +287,34 @@ pub fn x11_display_closed() {
     run_detached(x11_closed_calls());
 }
 
+/// systemd's `sd_notify(0, "READY=1")`: `tuna-greeter.service` is
+/// `Type=notify`, as `org.gnome.Shell@gdm.service` is, so the login
+/// session's settings daemon plugins start once the login screen is up.
+/// Nothing happens outside a notify unit (`NOTIFY_SOCKET` unset).
+pub fn notify_ready() {
+    let Some(socket) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    if let Err(error) = send_notify(&socket, b"READY=1") {
+        eprintln!("tuna-compositor: session services: READY=1: {error}");
+    }
+}
+
+/// One datagram to `NOTIFY_SOCKET`: a path, or `@name` for the abstract
+/// namespace (sd_notify(3)).
+fn send_notify(socket: &std::ffi::OsStr, message: &[u8]) -> std::io::Result<()> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+    let bytes = socket.as_bytes();
+    let addr = match bytes.strip_prefix(b"@") {
+        Some(name) => SocketAddr::from_abstract_name(name)?,
+        None => SocketAddr::from_pathname(std::path::Path::new(socket))?,
+    };
+    UnixDatagram::unbound()?.send_to_addr(message, &addr)?;
+    Ok(())
+}
+
 /// The session worker. The graphical session starts as soon as activated
 /// services can see the display; it never waits on the shell. On
 /// dbus-daemon a client that activates the GNOME portal before
@@ -401,17 +438,51 @@ fn register_with_gdm(run: &mut Runner<'_>) {
 }
 
 /// Called only for the actual DRM backend, before its shell is started.
-pub fn publish(socket: &str) -> SessionServices {
-    let alive = Arc::new(AtomicBool::new(true));
-    let mut guard = SessionServices {
-        alive: alive.clone(),
-        leader: None,
-    };
+///
+/// In greeter mode (`greeter`) GDM's `gnome-session --session gnome-login`
+/// leads the session: its `gnome-session@gnome-login.target` starts this
+/// compositor in place of `org.gnome.Shell@gdm.service`, gnome-session
+/// holds the leader FIFO, and the greeter registers with GDM itself as
+/// GNOME Shell's login screen does. The compositor only publishes the
+/// display so the settings daemon plugins of the login session find it.
+pub fn publish(socket: &str, greeter: bool) -> SessionServices {
     let desktop = std::env::var("XDG_CURRENT_DESKTOP")
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Tuna:GNOME".into());
-    let vars = activation_vars(socket, &desktop);
+    publish_with(
+        socket,
+        greeter,
+        &desktop,
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        run,
+        &HARDWARE_SESSION,
+        |alive, mut run| {
+            std::thread::spawn(move || bring_up(&alive, &mut run, &mut std::thread::sleep));
+        },
+    )
+}
+
+/// [`publish`] with its environment, utilities, hardware-session flag and
+/// session worker (`start_worker` runs [`bring_up`]) explicit.
+fn publish_with(
+    socket: &str,
+    greeter: bool,
+    desktop: &str,
+    runtime_dir: Option<std::ffi::OsString>,
+    run: Utility,
+    hardware: &'static AtomicBool,
+    start_worker: impl FnOnce(Arc<AtomicBool>, Utility),
+) -> SessionServices {
+    let alive = Arc::new(AtomicBool::new(true));
+    let mut guard = SessionServices {
+        alive: alive.clone(),
+        leader: None,
+        user_session: !greeter,
+        run,
+        hardware,
+    };
+    let vars = activation_vars(socket, desktop);
     let systemd = run("systemctl", &systemd_import_args(&vars));
     let bus = run("gdbus", &bus_import_args(&vars));
     if !systemd && !bus {
@@ -421,6 +492,10 @@ pub fn publish(socket: &str) -> SessionServices {
     eprintln!(
         "tuna-compositor: session services: display environment imported (systemd={systemd} bus={bus})"
     );
+    if greeter {
+        hardware.store(systemd, Ordering::Release);
+        return guard;
+    }
     // Queue the graphical session before returning: the shell is spawned on
     // the first loop tick, after this. A portal its toolkit activates then
     // waits behind graphical-session.target (xdg-desktop-portal-gnome is
@@ -430,8 +505,8 @@ pub fn publish(socket: &str) -> SessionServices {
         eprintln!("tuna-compositor: session services: graphical target could not be queued");
     }
     if systemd {
-        HARDWARE_SESSION.store(true, Ordering::Release);
-        match std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
+        hardware.store(true, Ordering::Release);
+        match runtime_dir.filter(|dir| !dir.is_empty()) {
             Some(dir) => {
                 guard.leader = Some(Leader::hold(std::path::Path::new(&dir).join(LEADER_FIFO)))
             }
@@ -440,13 +515,31 @@ pub fn publish(socket: &str) -> SessionServices {
             ),
         }
     }
-    std::thread::spawn(move || bring_up(&alive, &mut run, &mut std::thread::sleep));
+    start_worker(alive, run);
     guard
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notify_reaches_path_and_abstract_sockets() {
+        use std::os::linux::net::SocketAddrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify");
+        let listener = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        send_notify(path.as_os_str(), b"READY=1").unwrap();
+        let mut buf = [0u8; 16];
+        let n = listener.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"READY=1");
+        let name = format!("tuna-notify-test-{}", std::process::id());
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let listener = std::os::unix::net::UnixDatagram::bind_addr(&addr).unwrap();
+        send_notify(std::ffi::OsStr::new(&format!("@{name}")), b"READY=1").unwrap();
+        let n = listener.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"READY=1");
+    }
 
     #[test]
     fn activation_import_names_only_the_hardware_display() {
@@ -703,5 +796,105 @@ mod tests {
             .iter()
             .any(|u| u == "gnome-session-initialized.target"));
         assert!(wanted.iter().any(|u| u == "gnome-session.target"));
+    }
+
+    static GREETER_CALLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    static GREETER_HARDWARE: AtomicBool = AtomicBool::new(false);
+    fn greeter_utility(program: &str, args: &[String]) -> bool {
+        GREETER_CALLS.lock().unwrap().push(line(program, args));
+        true
+    }
+
+    #[test]
+    fn the_greeter_publishes_only_its_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = publish_with(
+            "wayland-tuna",
+            true,
+            "Tuna:GNOME",
+            Some(dir.path().as_os_str().to_owned()),
+            greeter_utility,
+            &GREETER_HARDWARE,
+            |_, _| panic!("the greeter starts no session worker (no target, no GDM registration)"),
+        );
+        let imported = vec![
+            "systemctl --user set-environment WAYLAND_DISPLAY=wayland-tuna \
+             XDG_CURRENT_DESKTOP=Tuna:GNOME XDG_SESSION_TYPE=wayland DISPLAY="
+                .to_owned(),
+            line(
+                "gdbus",
+                &bus_import_args(&activation_vars("wayland-tuna", "Tuna:GNOME")),
+            ),
+        ];
+        assert_eq!(*GREETER_CALLS.lock().unwrap(), imported);
+        assert!(
+            guard.leader.is_none(),
+            "gnome-session holds the leader FIFO"
+        );
+        assert!(
+            GREETER_HARDWARE.load(Ordering::Acquire),
+            "its logind session is its own"
+        );
+        drop(guard);
+        assert_eq!(
+            *GREETER_CALLS.lock().unwrap(),
+            imported,
+            "the end stops no tuna-session.target and starts no session shutdown"
+        );
+        assert!(!GREETER_HARDWARE.load(Ordering::Acquire));
+        assert!(!dir.path().join(LEADER_FIFO).exists());
+    }
+
+    static USER_CALLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    static USER_HARDWARE: AtomicBool = AtomicBool::new(false);
+    fn user_utility(program: &str, args: &[String]) -> bool {
+        USER_CALLS.lock().unwrap().push(line(program, args));
+        true
+    }
+
+    #[test]
+    fn a_user_session_queues_its_target_leads_and_stops_it() {
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let worker = std::cell::Cell::new(false);
+        let guard = publish_with(
+            "wayland-tuna",
+            false,
+            "Tuna:GNOME",
+            Some(dir.path().as_os_str().to_owned()),
+            user_utility,
+            &USER_HARDWARE,
+            |_, _| worker.set(true),
+        );
+        assert!(worker.get(), "the session worker starts (target, then GDM)");
+        assert_eq!(
+            USER_CALLS.lock().unwrap().last().map(String::as_str),
+            Some("systemctl --user --no-block start tuna-session.target")
+        );
+        assert!(guard.leader.is_some());
+        assert!(USER_HARDWARE.load(Ordering::Acquire));
+        // Release the leader's blocking open as gnome-session-ctl would.
+        let fifo = dir.path().join(LEADER_FIFO);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !std::fs::metadata(&fifo).is_ok_and(|m| m.file_type().is_fifo()) {
+            assert!(std::time::Instant::now() < deadline, "no leader FIFO");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _monitor = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        drop(guard);
+        let calls = USER_CALLS.lock().unwrap().clone();
+        assert_eq!(
+            calls[calls.len() - 2..],
+            [
+                "systemctl --user --no-block stop tuna-session.target",
+                "systemctl --user --no-block --job-mode=replace-irreversibly start \
+                 gnome-session-shutdown.target",
+            ]
+        );
+        assert!(!USER_HARDWARE.load(Ordering::Acquire));
     }
 }

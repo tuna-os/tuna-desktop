@@ -10,6 +10,9 @@
 # minus real hardware. Asserts on state, not pixels:
 #   D-OUTPUT   the backend lit the vkms connector
 #   D-SHELL    the shell connected over the control socket (introspection)
+#   D-INPUT-AT-STARTUP a uinput mouse that exists before the compositor
+#              starts is among its input devices within 10 s, with no input
+#              event sent (libinput's startup queue is drained at once)
 #   D-IDLE     an unchanged scene stops redundant scanout submissions
 #   D-FRAMES   a real active Wayland client receives 240 page-flip presentations
 #   D-SCALE    a GNOME monitors.xml giving the connector scale 2 is
@@ -92,16 +95,21 @@ EMU_PID=""
 CLIENT_PID=""
 TOUCHPAD_EMU_PID=""
 TOUCHPAD_CLIENT_PID=""
+STARTUP_DEVICE_PID=""
 
 cleanup() {
     if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
     if [ -n "$TOUCHPAD_CLIENT_PID" ]; then kill "$TOUCHPAD_CLIENT_PID" 2>/dev/null || true; fi
     # The emulators (root) exit when their command pipes close.
+    exec 7>&- 2>/dev/null || true
     exec 8>&- 2>/dev/null || true
     exec 9>&- 2>/dev/null || true
     if [ -n "$EMU_PID" ]; then wait "$EMU_PID" 2>/dev/null || true; fi
     if [ -n "$TOUCHPAD_EMU_PID" ]; then wait "$TOUCHPAD_EMU_PID" 2>/dev/null || true; fi
     if [ -n "$COMP_PID" ]; then kill "$COMP_PID" 2>/dev/null || true; fi
+    # After the compositor: should a process still hold the startup
+    # mouse's pipe open, the holder only sees end-of-file once it is gone.
+    if [ -n "$STARTUP_DEVICE_PID" ]; then wait "$STARTUP_DEVICE_PID" 2>/dev/null || true; fi
     if [ -n "$CALIBRATION_PID" ]; then kill "$CALIBRATION_PID" 2>/dev/null || true; fi
     colord_stop
     if [ -n "$SYSTEM_BUS_PID" ]; then kill "$SYSTEM_BUS_PID" 2>/dev/null || true; fi
@@ -211,13 +219,32 @@ for _ in $(seq 1 50); do [ -S "$SEATD_SOCK" ] && break; sleep 0.1; done
 
 RUNTIME="$(mktemp -d)"
 chmod 700 "$RUNTIME"
+# D-INPUT-AT-STARTUP: a mouse present before the compositor starts, as a
+# login's keyboard and mouse are; it never sends an event.
+STARTUP_DEVICE="Tuna startup mouse"
+mkfifo "$ARTIFACTS/startup-device.fifo"
+# The log stays user-owned on purpose.
+# shellcheck disable=SC2024
+sudo python3 "$ROOT/scripts/lib/drm_input_startup.py" hold "$STARTUP_DEVICE" \
+    <"$ARTIFACTS/startup-device.fifo" >"$ARTIFACTS/startup-device.log" 2>&1 &
+STARTUP_DEVICE_PID=$!
+exec 7>"$ARTIFACTS/startup-device.fifo"
+end=$(($(date +%s) + 10))
+until grep -q '^ready$' "$ARTIFACTS/startup-device.log" 2>/dev/null; do
+    kill -0 "$STARTUP_DEVICE_PID" 2>/dev/null ||
+        fail D-INPUT-AT-STARTUP "the uinput mouse did not start: $(cat "$ARTIFACTS/startup-device.log")"
+    [ "$(date +%s)" -le "$end" ] || fail D-INPUT-AT-STARTUP "the uinput mouse was not created within 10 s"
+    sleep 0.1
+done
+udevadm settle --timeout=10 || true
+started_ms=$(($(date +%s%N) / 1000000))
 env -u DISPLAY -u WAYLAND_DISPLAY \
     XDG_RUNTIME_DIR="$RUNTIME" \
     XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$ARTIFACTS/data" \
     LIBSEAT_BACKEND=seatd \
     TUNA_DRM_DEVICE="$CARD" TUNA_INTROSPECT_FILE="$STATE" TUNA_COMPOSITOR_STATE="$CSTATE" \
     "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-smoke \
-    --shell-bin "$ROOT/target/debug/tuna-shell-host" >"$LOG" 2>&1 &
+    --shell-bin "$ROOT/target/debug/tuna-shell-host" >"$LOG" 2>&1 7>&- &
 COMP_PID=$!
 
 end=$(($(date +%s) + 30))
@@ -235,6 +262,46 @@ until [ -s "$STATE" ] && jq -e '.revision != null' "$STATE" >/dev/null 2>&1; do
     sleep 0.2
 done
 pass D-SHELL "shell connected (revision $(jq .revision "$STATE"))"
+
+# Nothing produces input: the device must come from libinput's startup
+# queue, which a readiness-only loop left alone until the first event.
+until python3 "$ROOT/scripts/lib/drm_input_startup.py" check "$CSTATE" "$STARTUP_DEVICE" \
+    >"$ARTIFACTS/input-at-startup.txt" 2>&1; do
+    kill -0 "$COMP_PID" 2>/dev/null || fail D-INPUT-AT-STARTUP "compositor exited"
+    [ $(($(date +%s%N) / 1000000 - started_ms)) -le 10000 ] ||
+        fail D-INPUT-AT-STARTUP "no input device from before startup within 10 s: $(cat "$ARTIFACTS/input-at-startup.txt")"
+    sleep 0.2
+done
+listed_ms=$(($(date +%s%N) / 1000000 - started_ms))
+snapshot_state "$CSTATE" "$ARTIFACTS/input-at-startup.json"
+pass D-INPUT-AT-STARTUP "$(cat "$ARTIFACTS/input-at-startup.txt") ${listed_ms} ms after the compositor started, with no input event"
+# Unplug it now, before the idle measurement: closing the pipe is the
+# holder's end-of-file, so no process started while it was open may keep
+# a copy (the compositor and its shell did, and the job hung here until
+# it was cancelled).
+exec 7>&-
+end=$(($(date +%s) + 10))
+# The holder runs under sudo: read its /proc state (gone or a zombie once
+# it exits) rather than signal a root process.
+while [ -r "/proc/$STARTUP_DEVICE_PID/stat" ] &&
+    [ "$(sed 's/.*) \(.\).*/\1/' "/proc/$STARTUP_DEVICE_PID/stat" 2>/dev/null)" != Z ]; do
+    if [ "$(date +%s)" -gt "$end" ]; then
+        holders=""
+        for proc in /proc/[0-9]*; do
+            for fd in "$proc"/fd/*; do
+                case "$(readlink "$fd" 2>/dev/null || true)" in
+                    *startup-device.fifo)
+                        holders="$holders ${proc#/proc/}($(cat "$proc/comm" 2>/dev/null || true))"
+                        break ;;
+                esac
+            done
+        done
+        fail D-INPUT-AT-STARTUP "the startup mouse was not unplugged within 10 s of closing its pipe; still open in:${holders:- nothing visible}"
+    fi
+    sleep 0.1
+done
+wait "$STARTUP_DEVICE_PID" || true
+STARTUP_DEVICE_PID=""
 
 sleep 2
 [ -s "$CSTATE" ] || fail D-IDLE "missing compositor frame counter"

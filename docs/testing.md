@@ -782,6 +782,41 @@ writes finish: only the explicit pending-transaction reply waits, for at
 most ten seconds. Other errors still fail immediately, and exact backlight
 readbacks remain required before blanking and fixture teardown.
 
+`--sound-alerts-only` runs just the bell and sound-feedback gates after the
+session starts (`just proof gtk-shell-proof --sound-alerts-only`):
+G-VISUAL-BELL (a real xdg-system-bell client; host pixels of the frame and
+whole-output flashes, none with `visual-bell` off, the original pixels after
+every case; `bell-window-system` only with `audible-bell` and
+`event-sounds`), G-X11-BELL (an X11 client's `XkbBell` through Xwayland, the
+same policy, Mutter's 100 ms repeat drop), G-XSETTINGS-SOUNDS (the
+distribution gsd-xsettings owns XSETTINGS and publishes
+`input-feedback-sounds` as `Net/EnableInputFeedbackSounds`) and
+G-QS-VOLUME-FEEDBACK (a real drag of the quick-settings volume slider sounds
+once at its end, a scroll once, a playing sink or `event-sounds` off never).
+The feedback gate first makes the built-in sink, the one the fixture can
+idle, the default again: the full proof's G-QS-SOUND-MENU leaves the HDMI
+output selected. Its scroll is one wheel notch through the compositor's proof
+input, because the nested winit backend turns an `xdotool click 5` into two
+notches (button press and release).
+A `canberra-gtk-play` stand-in logs every event sound to `canberra-calls`;
+none of these gates plays or captures audio.
+The `gtk-shell` CI job runs this focused slice before the full shell proof,
+so an unrelated earlier full-shell gate cannot prevent sound qualification.
+Its `sound-alerts/` artifacts and the retained `bin/examples/tuna-bell-client`
+belong to the same exact PR head as the compositor and shell binaries.
+
+The bell timeline presents each 50 ms leg's endpoint before reversing,
+including when a frame arrives late, as Mutter's Clutter timeline does.
+Deterministic bell tests cover delayed samples and a first frame after the
+nominal flash lifetime; the host-pixel coverage and intensity gates remain
+unchanged.
+
+The full GTK proof's media callback barrier waits at most 25 seconds:
+one key can execute four serialized `wpctl` subprocesses with five-second
+production timeouts, plus callback dispatch. It still requires accepted
+tokens to finish successfully and the actual scheduler to be idle; a
+fixture volume write alone never proves completion.
+
 `scripts/tuna-drm-smoke` loads a kernel module and starts seatd as root.
 Run it in a VM or a disposable machine rather than your desktop session.
 The Ubuntu setup helper first checks whether vkms is already installed for
@@ -792,6 +827,18 @@ includes vkms without a separate extra-modules package. No usable candidate
 or a still-missing module fails setup, and package installation errors are
 fatal. Module loading and the real vkms device and presentation assertions
 remain mandatory in the smoke test.
+
+`D-INPUT-AT-STARTUP` (P-IN-04) creates a uinput mouse before the main
+session's compositor starts (`scripts/lib/drm_input_startup.py hold`) and
+requires it among the compositor state's `input_devices` within 10 s of
+the launch, while nothing produces input. libinput queues the devices
+already present when the compositor assigns its seat without making its
+fd readable; the compositor drains that queue on the loop's first
+dispatch and after every session resume
+(`crates/compositor/src/drm/input_drain.rs`). Before that, devices present
+at login were added, and got their settings, only at the first input or
+hotplug: drm-smoke's sessions without input hotplug reported
+`input_devices` `[]` throughout.
 
 The smoke test also drives real libinput with uinput devices (ADR 0008),
 so it needs `python3-evdev` and the GTK 4 PyGObject client packages the

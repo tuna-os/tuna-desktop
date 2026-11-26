@@ -558,6 +558,10 @@
 #   G-SWITCHER  Alt+Tab shows the switcher with every app (GNOME's
 #               switch-applications; the three test windows are three apps), and
 #               releasing Alt focuses the highlighted one
+#   G-VISUAL-BELL, G-X11-BELL, G-XSETTINGS-SOUNDS, G-QS-VOLUME-FEEDBACK
+#               bells, input-feedback-sounds and slider feedback (#353);
+#               see scripts/lib/tuna-sound-alerts-proof.sh, which
+#               --sound-alerts-only runs alone
 # Frames and accessibility dumps land in the artifacts dir; assertions in
 # assertions.txt for the parity ledger.
 set -eu
@@ -601,6 +605,7 @@ SEARCH_LEAK_ONLY=0
 WINDOW_LEAK_ONLY=0
 DND_OVERVIEW_ONLY=0
 LOCK_MENU_ONLY=0
+SOUND_ALERTS_ONLY=0
 REMOTE_ACCESS_ONLY=0
 GRID_CANCEL_ONLY=0
 FOLDER_DND_ONLY=0
@@ -651,6 +656,7 @@ while [ $# -gt 0 ]; do
         --folder-dnd-only) FOLDER_DND_ONLY=1; only_mode "$1" no-examples; shift ;;
         --dnd-overview-only) DND_OVERVIEW_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --x11-iconic-only) X11_ICONIC_ONLY=1; only_mode "$1"; shift ;;
+        --sound-alerts-only) SOUND_ALERTS_ONLY=1; only_mode "$1"; shift ;;
         --remote-access-only) REMOTE_ACCESS_ONLY=1; only_mode "$1"; shift ;;
         --subsurface-only) SUBSURFACE_ONLY=1; only_mode "$1" source-build no-media-source no-examples no-camera-policy; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
@@ -864,6 +870,9 @@ GSD_MEDIA_KEYS_PID=""
 GSD_BUS_PID=""
 MPRIS_PID=""
 PW_PULSE_PID=""
+SOUND_ALERTS_WL_PID=""
+SOUND_ALERTS_X11_PID=""
+GSD_XSETTINGS_PID=""
 cleanup() {
     if [ -n "$ICON_PID" ]; then kill "$ICON_PID" 2>/dev/null || true; fi
     if [ -n "$HINTS_PID" ]; then kill "$HINTS_PID" 2>/dev/null || true; fi
@@ -882,7 +891,7 @@ cleanup() {
     if [ -n "$IME_PIDS" ]; then kill $IME_PIDS 2>/dev/null || true; fi
     if [ -n "$SCREENSAVER_PID" ]; then kill "$SCREENSAVER_PID" 2>/dev/null || true; fi
     if [ -n "$CAL_PID" ]; then kill "$CAL_PID" 2>/dev/null || true; fi
-    for gsd_pid in $GSD_MEDIA_KEYS_PID $MPRIS_PID $GSD_BUS_PID $PW_PULSE_PID; do
+    for gsd_pid in $GSD_MEDIA_KEYS_PID $MPRIS_PID $GSD_BUS_PID $PW_PULSE_PID $GSD_XSETTINGS_PID $SOUND_ALERTS_WL_PID $SOUND_ALERTS_X11_PID; do
         kill "$gsd_pid" 2>/dev/null || true
     done
     if [ -n "$ACCEL_PID" ]; then kill "$ACCEL_PID" 2>/dev/null || true; fi
@@ -1159,6 +1168,7 @@ pass G-GRID-ON-DEMAND "no grid tiles on the window picker or after close; a held
 . "$ROOT/scripts/lib/tuna-datemenu-proof.sh"
 . "$ROOT/scripts/lib/tuna-search-leak-proof.sh"
 . "$ROOT/scripts/lib/tuna-window-leak-proof.sh"
+. "$ROOT/scripts/lib/tuna-sound-alerts-proof.sh"
 . "$ROOT/scripts/lib/tuna-dnd-overview-proof.sh"
 
 folder_dnd_proof() {
@@ -1679,6 +1689,7 @@ if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example icon-probe
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
     fi
+    cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example tuna-bell-client
     if [ "$SUBSURFACE_ONLY" = 1 ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example tuna-subsurface-client
     fi
@@ -2377,6 +2388,14 @@ if [ "$LOCK_MENU_ONLY" = 1 ]; then
     lock_with_menu_gate
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
+    exit 0
+fi
+if [ "$SOUND_ALERTS_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "sound alerts desktop ready" ||
+        fail G-VISUAL-BELL "desktop never became ready"
+    # The startup cover must be gone before pixels are compared.
+    sleep 3
+    sound_alerts_proof
     exit 0
 fi
 if [ "$SCREENSHOT_KEYS_ONLY" = 1 ]; then
@@ -13517,6 +13536,9 @@ for scenario in allow remembered-allow deny remembered-deny unknown; do
 done
 jq -e '."tuna-consent-allow.desktop" == ["GRANTED"] and ."tuna-consent-deny.desktop" == ["DENIED"] and (has("tuna-consent-unknown.desktop") | not)' "$ARTIFACTS/shortcut-permissions.json" >/dev/null || fail G-SHORTCUT-CONSENT "PermissionStore did not remember exactly the known apps"
 pass G-SHORTCUT-CONSENT "live requests require Allow, Deny stays inactive, known app decisions persist without prompting, unknown apps are not remembered, Super+Escape restores input"
+
+# Bells, input-feedback-sounds and the slider's feedback (#353).
+sound_alerts_proof
 
 # Every transient animation (#501) that ran with animations on played
 # for its full GNOME duration and settled: the OSD and its level, the
