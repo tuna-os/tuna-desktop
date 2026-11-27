@@ -1,6 +1,7 @@
 """Actual FFmpeg frame readiness and retained-byte timeline validation; no UI proof."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -17,12 +18,13 @@ def probe_frames(path, timeout, first_only=False):
 
 
 def recording_command(path, input_args):
+    """FrameRecorder adds `-progress` on a pipe of its own."""
     return ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'info', '-nostats',
             '-copyts', *input_args, '-vf', 'settb=AVTB,trim=duration=12,showinfo,setpts=PTS-STARTPTS',
             '-t', '12', '-fps_mode', 'passthrough', '-c:v', 'libx264', '-preset', 'veryfast',
             '-tune', 'zerolatency', '-bf', '0', '-pix_fmt', 'yuv420p', '-enc_time_base', '1:1000000',
             '-video_track_timescale', '1000000', '-movflags', '+frag_every_frame+empty_moov+default_base_moof',
-            '-flush_packets', '1', '-stats_period', '0.05', '-progress', 'pipe:2', str(path)]
+            '-flush_packets', '1', '-stats_period', '0.05', str(path)]
 
 
 class FrameRecorder:
@@ -41,9 +43,26 @@ class FrameRecorder:
         self.offset_upper_ns = None
         self.clock_samples = []
         self.sample_clock()
-        self.process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        # FFmpeg 7+ logs showinfo from its filter thread while the main thread
+        # writes progress, and av_log writes one line in several parts: on one
+        # shared pipe a progress block can split a showinfo line. Progress gets
+        # its own pipe, so stderr carries only whole log lines.
+        progress_read, progress_write = os.pipe()
+        try:
+            self.process = subprocess.Popen([argv[0], '-progress', f'pipe:{progress_write}', *argv[1:]],
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                            pass_fds=(progress_write,))
+        except BaseException:
+            os.close(progress_read)
+            raise
+        finally:
+            os.close(progress_write)
+        self.progress_stream = os.fdopen(progress_read, 'rb')
         self.reader = threading.Thread(target=self.read_output, name='overview-ffmpeg-reader', daemon=True)
+        self.progress_reader = threading.Thread(target=self.read_progress, name='overview-ffmpeg-progress',
+                                                daemon=True)
         self.reader.start()
+        self.progress_reader.start()
 
     def sample_clock(self):
         before = time.monotonic_ns()
@@ -59,40 +78,58 @@ class FrameRecorder:
         self.clock_samples.append({'host_monotonic_before_ns': before, 'realtime_ns': realtime,
                                    'host_monotonic_after_ns': after})
 
-    def read_output(self):
-        progress = {}
+    def read_lines(self, stream, log_path, handle):
         try:
-            with self.log_path.open('wb') as log:
-                while line := self.process.stderr.readline(32769):
+            with log_path.open('wb') as log:
+                while line := stream.readline(32769):
                     if len(line) > 32768:
                         raise RuntimeError('FFmpeg telemetry line exceeds owned reader bound')
                     log.write(line)
                     text = line.decode('utf-8', errors='replace').strip()
-                    match = re.search(r'\[Parsed_showinfo_\d+ @ [^]]+\].*?\bn:\s*(\d+)\s+pts:\s*(-?\d+)\s', text)
                     with self.condition:
-                        if match:
-                            index, pts = map(int, match.groups())
-                            if (index != len(self.frames) or len(self.frames) >= 512
-                                    or (self.frames and pts <= self.frames[-1])):
-                                raise RuntimeError('capture frame lineage is missing, reordered, or unbounded')
-                            self.sample_clock()
-                            self.frames.append(pts)
-                        elif re.fullmatch(r'(frame|out_time_us|total_size)=-?\d+', text):
-                            key, value = text.split('=')
-                            progress[key] = int(value)
-                        elif text in ('progress=continue', 'progress=end'):
-                            self.progress = dict(progress)
-                            self.progress_host_monotonic_ns = time.monotonic_ns()
-                            progress.clear()
+                        handle(text)
                         self.condition.notify_all()
         except Exception as error:
             with self.condition:
-                self.error = error
+                self.error = self.error or error
                 self.condition.notify_all()
         finally:
-            self.process.stderr.close()
+            stream.close()
             with self.condition:
                 self.condition.notify_all()
+
+    def read_output(self):
+        def frame(text):
+            match = re.search(r'\[Parsed_showinfo_\d+ @ [^]]+\].*?\bn:\s*(\d+)\s+pts:\s*(-?\d+)\s', text)
+            if match:
+                index, pts = map(int, match.groups())
+                if (index != len(self.frames) or len(self.frames) >= 512
+                        or (self.frames and pts <= self.frames[-1])):
+                    raise RuntimeError('capture frame lineage is missing, reordered, or unbounded')
+                self.sample_clock()
+                self.frames.append(pts)
+        self.read_lines(self.process.stderr, self.log_path, frame)
+
+    def read_progress(self):
+        progress = {}
+        def report(text):
+            if re.fullmatch(r'(frame|out_time_us|total_size)=-?\d+', text):
+                key, value = text.split('=')
+                progress[key] = int(value)
+            elif text in ('progress=continue', 'progress=end'):
+                self.progress = dict(progress)
+                self.progress_host_monotonic_ns = time.monotonic_ns()
+                progress.clear()
+        self.read_lines(self.progress_stream, self.log_path.with_suffix('.progress' + self.log_path.suffix),
+                        report)
+
+    def readers_alive(self):
+        return self.reader.is_alive() or self.progress_reader.is_alive()
+
+    def join_readers(self, timeout):
+        deadline = time.monotonic() + timeout
+        for reader in (self.reader, self.progress_reader):
+            reader.join(timeout=max(0, deadline - time.monotonic()))
 
     def wait_ready(self, deadline_ns):
         """Never replace a recorded-frame acknowledgement with process liveness."""
@@ -135,8 +172,8 @@ class FrameRecorder:
     def finish(self):
         if self.process.wait(timeout=15) != 0:
             raise RuntimeError('actual screen recording failed')
-        self.reader.join(timeout=5)
-        if self.reader.is_alive():
+        self.join_readers(5)
+        if self.readers_alive():
             raise RuntimeError('owned FFmpeg telemetry reader did not finish')
         if self.error:
             raise self.error
@@ -149,12 +186,12 @@ class FrameRecorder:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=5)
-        self.reader.join(timeout=5)
-        if self.reader.is_alive():
+        self.join_readers(5)
+        if self.readers_alive():
             raise RuntimeError('owned FFmpeg telemetry reader did not stop')
 
     def receipt(self, journey_begin_ns):
-        if self.ready_ack is None or self.process.poll() != 0 or self.reader.is_alive() or self.error:
+        if self.ready_ack is None or self.process.poll() != 0 or self.readers_alive() or self.error:
             raise RuntimeError('recording has no successful completed encoded-frame acknowledgement')
         self.sample_clock()
         data = self.path.read_bytes()
