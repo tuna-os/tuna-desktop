@@ -178,19 +178,17 @@ struct Begun {
     channel: u64,
 }
 
-/// authServicesSSSDSwitchable.js `MechanismsStatus` (GNOME's names).
-#[allow(clippy::enum_variant_names)]
+/// authServicesSSSDSwitchable.js `MechanismsStatus`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Found {
+enum MechanismsStatus {
     Waiting,
     NotFound,
     Found,
 }
 
-/// authServicesSSSDSwitchable.js `PromptStatus` (GNOME's names).
-#[allow(clippy::enum_variant_names)]
+/// authServicesSSSDSwitchable.js `PromptStatus`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Prompt {
+enum PromptStatus {
     None,
     PasswordPrompt,
     PasswordWaiting,
@@ -378,13 +376,13 @@ struct State {
     switch_failures: u32,
     legacy_selected: Option<Role>,
     smartcard_in_progress: bool,
-    found: Found,
+    found: MechanismsStatus,
     switchables: Vec<Switchable>,
     priority: Vec<String>,
     selected: Option<usize>,
     saved_role: Option<Role>,
     certificate: Option<usize>,
-    prompt: Prompt,
+    prompt: PromptStatus,
     resetting_password: bool,
     web_timeout: Option<u64>,
 }
@@ -412,16 +410,16 @@ impl Conversations {
                 legacy_selected: None,
                 smartcard_in_progress: false,
                 found: if policy.switchable {
-                    Found::Waiting
+                    MechanismsStatus::Waiting
                 } else {
-                    Found::NotFound
+                    MechanismsStatus::NotFound
                 },
                 switchables: Vec::new(),
                 priority: Vec::new(),
                 selected: None,
                 saved_role: None,
                 certificate: None,
-                prompt: Prompt::None,
+                prompt: PromptStatus::None,
                 resetting_password: false,
                 web_timeout: None,
             }),
@@ -433,9 +431,9 @@ impl Conversations {
         let mut state = self.state.borrow_mut();
         if state.policy.switchable != policy.switchable {
             state.found = if policy.switchable {
-                Found::Waiting
+                MechanismsStatus::Waiting
             } else {
-                Found::NotFound
+                MechanismsStatus::NotFound
             };
         }
         state.policy = policy;
@@ -563,7 +561,7 @@ impl Conversations {
         state.legacy_selected = None;
         state.saved_role = None;
         if state.policy.switchable {
-            state.found = Found::Waiting;
+            state.found = MechanismsStatus::Waiting;
         }
         Self::clear(&mut state);
     }
@@ -572,7 +570,7 @@ impl Conversations {
     /// (`_onSmartcardChanged`).
     pub fn smartcard_changed(&self, inserted: bool) {
         let mut state = self.state.borrow_mut();
-        let restart = if state.found == Found::Found {
+        let restart = if state.found == MechanismsStatus::Found {
             state.selected.is_some() && state.switchables.iter().any(|m| m.role == Role::Smartcard)
         } else {
             state.legacy_selected == Some(Role::Smartcard)
@@ -685,7 +683,7 @@ impl Conversations {
         let Some(running) = running else {
             return Vec::new();
         };
-        if running == SWITCHABLE_SERVICE && state.found != Found::Found {
+        if running == SWITCHABLE_SERVICE && state.found != MechanismsStatus::Found {
             return Self::waiting_signal(&mut state, signal);
         }
         if running == SWITCHABLE_SERVICE {
@@ -738,29 +736,29 @@ impl Conversations {
     /// The legacy services hold their roles only while the switchable
     /// one found no mechanisms (`_redistributeRoles`).
     fn legacy_active(state: &State) -> bool {
-        state.found == Found::NotFound
+        state.found == MechanismsStatus::NotFound
     }
 
     fn mechanism_list(state: &State) -> Vec<Mechanism> {
         match state.found {
-            Found::Found => state
+            MechanismsStatus::Found => state
                 .switchables
                 .iter()
                 .map(Self::switchable_mechanism)
                 .collect(),
-            Found::Waiting => Vec::new(),
-            Found::NotFound => Self::legacy_mechanisms(&state.policy),
+            MechanismsStatus::Waiting => Vec::new(),
+            MechanismsStatus::NotFound => Self::legacy_mechanisms(&state.policy),
         }
     }
 
     fn selected_switchable(state: &State) -> Option<&Switchable> {
-        (state.found == Found::Found)
+        (state.found == MechanismsStatus::Found)
             .then(|| state.selected.and_then(|i| state.switchables.get(i)))
             .flatten()
     }
 
     fn selected_mechanism(state: &State) -> Option<Mechanism> {
-        if state.found == Found::Found {
+        if state.found == MechanismsStatus::Found {
             return Self::selected_switchable(state).map(Self::switchable_mechanism);
         }
         if !Self::legacy_active(state) {
@@ -822,19 +820,19 @@ impl Conversations {
 
     /// `_handleSelectMechanism` of the switchable service.
     fn start_switchable(state: &mut State) {
-        state.prompt = Prompt::None;
+        state.prompt = PromptStatus::None;
         let Some(m) = Self::selected_switchable(state).cloned() else {
             return;
         };
         match m.role {
             Role::Password => {
-                state.prompt = Prompt::PasswordPrompt;
+                state.prompt = PromptStatus::PasswordPrompt;
                 Self::query(state, Step::Json, &m.prompt, true);
             }
             Role::Smartcard => Self::start_smartcard(state, &m),
             Role::Passkey => {
                 if !m.key_connected {
-                    state.prompt = Prompt::InsertKey;
+                    state.prompt = PromptStatus::InsertKey;
                     Self::ask(
                         state,
                         Step::Instruction,
@@ -845,7 +843,7 @@ impl Conversations {
                     );
                     return;
                 }
-                state.prompt = Prompt::PinPrompt;
+                state.prompt = PromptStatus::PinPrompt;
                 Self::query(state, Step::Json, &m.pin_prompt, true);
                 if (1..=3).contains(&m.pin_attempts) {
                     let text = PASSKEY_ATTEMPTS.replace("%d", &m.pin_attempts.to_string());
@@ -859,7 +857,7 @@ impl Conversations {
     fn start_smartcard(state: &mut State, m: &Switchable) {
         if let [cert] = m.certificates.as_slice() {
             state.certificate = Some(0);
-            state.prompt = Prompt::PinPrompt;
+            state.prompt = PromptStatus::PinPrompt;
             Self::query(state, Step::Json, &cert.pin_prompt, true);
             return;
         }
@@ -868,7 +866,7 @@ impl Conversations {
         } else {
             "Select Identity"
         };
-        state.prompt = Prompt::CertList;
+        state.prompt = PromptStatus::CertList;
         Self::ask(
             state,
             Step::Certificate,
@@ -888,7 +886,7 @@ impl Conversations {
             return;
         }
         if let Some(label) = m.init_prompt.clone() {
-            state.prompt = Prompt::WebIntro;
+            state.prompt = PromptStatus::WebIntro;
             Self::ask(state, Step::WebIntro, Ask::Button { label });
         } else {
             Self::show_web_login(state, link, uri, m.code.clone());
@@ -896,7 +894,7 @@ impl Conversations {
     }
 
     fn show_web_login(state: &mut State, message: String, url: String, code: Option<String>) {
-        state.prompt = Prompt::WebDialog;
+        state.prompt = PromptStatus::WebDialog;
         Self::ask(state, Step::WebDone, Ask::WebLogin { message, url, code });
     }
 
@@ -944,7 +942,7 @@ impl Conversations {
     /// The switchable service has no mechanisms for this user: its roles
     /// cascade to the legacy services (`mechanisms-changed`).
     fn not_found(state: &mut State) {
-        state.found = Found::NotFound;
+        state.found = MechanismsStatus::NotFound;
         state.switchables.clear();
         state.selected = None;
         state.inputs.push(Input::Mechanisms);
@@ -966,7 +964,7 @@ impl Conversations {
                         Role::Passkey | Role::WebLogin => true,
                     })
                     .collect();
-                state.found = Found::Found;
+                state.found = MechanismsStatus::Found;
                 state.switchables = enabled;
                 state.priority = priority;
                 Self::track_web_timeout(state);
@@ -998,7 +996,7 @@ impl Conversations {
                     begun.service = None;
                     begun.outstanding = None;
                 }
-                if state.found == Found::Waiting {
+                if state.found == MechanismsStatus::Waiting {
                     Self::not_found(state);
                 }
             }
@@ -1141,7 +1139,7 @@ impl Conversations {
         state.priority.clear();
         state.selected = None;
         state.certificate = None;
-        state.prompt = Prompt::None;
+        state.prompt = PromptStatus::None;
         state.resetting_password = false;
         state.web_timeout = None;
         state.smartcard_in_progress = false;
@@ -1199,7 +1197,7 @@ impl Host for Conversations {
         state.next_request += 1;
         let request = state.next_request;
         let mut started = None;
-        if state.policy.switchable && state.found == Found::Waiting {
+        if state.policy.switchable && state.found == MechanismsStatus::Waiting {
             started = Some(SWITCHABLE_SERVICE);
         } else if Self::legacy_active(&state) {
             started = Self::selected_mechanism(&state).map(|m| m.service);
@@ -1257,10 +1255,10 @@ impl Host for Conversations {
                 let role = Self::selected_switchable(&state).map(|m| m.role)?;
                 Self::reply(&mut state, Some(&answer));
                 match role {
-                    Role::Password => state.prompt = Prompt::PasswordWaiting,
-                    Role::Smartcard => state.prompt = Prompt::PinWaiting,
+                    Role::Password => state.prompt = PromptStatus::PasswordWaiting,
+                    Role::Smartcard => state.prompt = PromptStatus::PinWaiting,
                     Role::Passkey => {
-                        state.prompt = Prompt::Touch;
+                        state.prompt = PromptStatus::Touch;
                         let touch = Self::selected_switchable(&state)
                             .map(|m| m.touch_instruction.clone())
                             .unwrap_or_default();
@@ -1280,7 +1278,7 @@ impl Host for Conversations {
                 let m = Self::selected_switchable(&state)?.clone();
                 let index = m.certificates.iter().position(|c| c.key_id == answer)?;
                 state.certificate = Some(index);
-                state.prompt = Prompt::PinPrompt;
+                state.prompt = PromptStatus::PinPrompt;
                 Self::query(
                     &mut state,
                     Step::Json,
@@ -1298,7 +1296,7 @@ impl Host for Conversations {
                 );
             }
             Step::WebDone => {
-                state.prompt = Prompt::WebWaiting;
+                state.prompt = PromptStatus::WebWaiting;
                 Self::reply(&mut state, None);
                 state.web_timeout = None;
             }
@@ -1312,9 +1310,9 @@ impl Host for Conversations {
     fn cancel(&self) -> Option<u64> {
         let mut state = self.state.borrow_mut();
         let begun = state.current.take()?;
-        if state.found == Found::Found {
+        if state.found == MechanismsStatus::Found {
             state.saved_role = Self::selected_switchable(&state).map(|m| m.role);
-            state.found = Found::Waiting;
+            state.found = MechanismsStatus::Waiting;
         }
         Self::clear(&mut state);
         let request = begun.request;
@@ -1348,7 +1346,7 @@ impl Host for Conversations {
 
     fn can_retry(&self) -> bool {
         let state = self.state.borrow();
-        let failures = if state.found == Found::Found {
+        let failures = if state.found == MechanismsStatus::Found {
             state.switch_failures
         } else {
             state.legacy_failures
@@ -1363,19 +1361,19 @@ impl Host for Conversations {
             return false;
         };
         match (m.role, state.prompt) {
-            (Role::Password, Prompt::PasswordWaiting)
-            | (Role::Smartcard, Prompt::PinWaiting)
-            | (Role::Passkey, Prompt::Touch)
-            | (Role::WebLogin, Prompt::WebWaiting) => {
+            (Role::Password, PromptStatus::PasswordWaiting)
+            | (Role::Smartcard, PromptStatus::PinWaiting)
+            | (Role::Passkey, PromptStatus::Touch)
+            | (Role::WebLogin, PromptStatus::WebWaiting) => {
                 state.inputs.push(Input::Restart);
                 true
             }
-            (Role::Smartcard, Prompt::PinPrompt) if m.certificates.len() > 1 => {
+            (Role::Smartcard, PromptStatus::PinPrompt) if m.certificates.len() > 1 => {
                 state.certificate = None;
                 Self::start_smartcard(&mut state, &m);
                 true
             }
-            (Role::WebLogin, Prompt::WebDialog) if m.init_prompt.is_some() => {
+            (Role::WebLogin, PromptStatus::WebDialog) if m.init_prompt.is_some() => {
                 Self::start_web_login(&mut state, &m);
                 true
             }

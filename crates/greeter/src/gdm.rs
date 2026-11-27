@@ -317,7 +317,7 @@ pub async fn open_reauthentication_channel(
             MANAGER_INTERFACE,
             "OpenReauthenticationChannel",
             Some(&(user,).to_variant()),
-            Some(glib::VariantTy::new("(s)").unwrap()),
+            glib::VariantTy::new("(s)").ok(),
             gio::DBusCallFlags::NONE,
             -1,
         )
