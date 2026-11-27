@@ -153,6 +153,9 @@ pub enum Handled {
     /// locked session (0.51). Read it back through
     /// [`ControlClient::lock_screen_shown`].
     LockScreenShown(bool),
+    /// Every active remote access grant, whole (0.54, #1162 F2): GNOME's
+    /// screen sharing and recording indicators follow it.
+    RemoteAccess(Vec<tuna_shell_control::RemoteAccessHandle>),
     /// The keyboard switched Sticky or Slow Keys: save and confirm.
     KeyboardAidToggled {
         aid: tuna_shell_control::KeyboardAid,
@@ -167,7 +170,7 @@ pub enum Handled {
         show: bool,
         touch_auto: bool,
     },
-    /// The focused text input asked to hide the input panel (0.53,
+    /// The focused text input asked to hide the input panel (0.55,
     /// mutter's input-panel OFF); follows the `OnScreenKeyboard` update it
     /// belongs to.
     HideInputPanel,
@@ -872,6 +875,21 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// The user stopped a remote access grant from the screen sharing
+    /// indicator (0.54): the compositor revokes it for good.
+    pub fn stop_remote_access(
+        &mut self,
+        kind: tuna_shell_control::RemoteAccessKind,
+        grant: u64,
+    ) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::StopRemoteAccess { kind, id: grant },
+        })?;
+        Ok(id)
+    }
+
     /// Carry out one of GNOME's window-menu actions. Returns the request id.
     pub fn window_action(
         &mut self,
@@ -895,6 +913,21 @@ impl ControlClient {
         self.write_message(&Message::Command {
             id,
             kind: CommandKind::SetWindowIconGeometries { geometries },
+        })?;
+        Ok(id)
+    }
+
+    /// An app launch's startup sequence (mutter's `MetaLaunchContext`,
+    /// #1193): the compositor shows the busy cursor until a window of
+    /// `app_id` (the desktop id without `.desktop`) maps or 15 s pass.
+    pub fn begin_startup_sequence(&mut self, app_id: &str) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::BeginStartupSequence {
+                app_id: app_id.trim_end_matches(".desktop").to_owned(),
+                wm_class: None,
+            },
         })?;
         Ok(id)
     }
@@ -1309,6 +1342,7 @@ impl ControlClient {
                 self.lock_shown = shown;
                 Ok(Handled::LockScreenShown(shown))
             }
+            Message::RemoteAccess { handles } => Ok(Handled::RemoteAccess(handles)),
             Message::KeyboardAidToggled { aid, enabled } => {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
@@ -1643,6 +1677,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::ShowCloseDialog { .. } => "ShowCloseDialog",
         Message::HideCloseDialog { .. } => "HideCloseDialog",
         Message::LockScreenShown { .. } => "LockScreenShown",
+        Message::RemoteAccess { .. } => "RemoteAccess",
     }
 }
 
@@ -2299,6 +2334,47 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn remote_access_grants_decode_and_stops_reach_the_compositor() {
+        use tuna_shell_control::{
+            RemoteAccessHandle, RemoteAccessKind, RemoteAccessOwner, RemoteAccessTarget,
+        };
+        let (mut client, mut peer) = handshook();
+        let handles = vec![RemoteAccessHandle {
+            kind: RemoteAccessKind::ScreenCast,
+            id: 3,
+            owner: RemoteAccessOwner::Portal,
+            owner_name: ":1.9".into(),
+            recording: false,
+            targets: vec![RemoteAccessTarget::Monitor {
+                connector: "DP-1".into(),
+            }],
+        }];
+        server_write(
+            &mut peer,
+            &Message::RemoteAccess {
+                handles: handles.clone(),
+            },
+        );
+        assert_eq!(
+            client.poll().expect("grants"),
+            Handled::RemoteAccess(handles)
+        );
+        let id = client
+            .stop_remote_access(RemoteAccessKind::ScreenCast, 3)
+            .expect("sent");
+        assert_eq!(
+            server_read(&mut peer),
+            Message::Command {
+                id,
+                kind: CommandKind::StopRemoteAccess {
+                    kind: RemoteAccessKind::ScreenCast,
+                    id: 3
+                },
+            }
+        );
     }
 
     #[test]
@@ -3440,6 +3516,30 @@ mod tests {
                 ..
             } if unique_name == ":1.42"
         ));
+    }
+
+    /// #1193: an app launch's startup sequence reaches the compositor as
+    /// `BeginStartupSequence` under the bare desktop id (no `.desktop`),
+    /// the app id its window will carry; the shell knows no WM class.
+    #[test]
+    fn a_launch_begins_its_startup_sequence_under_the_bare_desktop_id() {
+        let (mut client, mut peer) = handshook();
+        for (desktop_id, app_id) in [
+            ("org.gnome.TextEditor.desktop", "org.gnome.TextEditor"),
+            ("tuna-probe", "tuna-probe"),
+        ] {
+            let id = client.begin_startup_sequence(desktop_id).expect("sent");
+            assert_eq!(
+                server_read(&mut peer),
+                Message::Command {
+                    id,
+                    kind: CommandKind::BeginStartupSequence {
+                        app_id: app_id.into(),
+                        wm_class: None,
+                    },
+                }
+            );
+        }
     }
 
     #[test]

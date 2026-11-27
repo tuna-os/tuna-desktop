@@ -1358,7 +1358,7 @@ fn osk_update(focus: Option<TextFieldFocus>, show: bool) -> Message {
 /// show_input_panel and hide_input_panel are double-buffered until
 /// commit, the last one wins, and they set input-panel ON or OFF; enabling
 /// again asks for nothing. The shell hears ON in `OnScreenKeyboard` and OFF
-/// as `HideInputPanel` (0.53); a 0.52 shell gets the update alone.
+/// as `HideInputPanel` (0.55); a 0.54 shell gets the update alone.
 #[test]
 fn text_input_v2_panel_requests_reach_the_shell_like_mutter() {
     let (mut comp, mut manager) = compositor();
@@ -1383,7 +1383,7 @@ fn text_input_v2_panel_requests_reach_the_shell_like_mutter() {
         ControlHub::bind(path.clone(), std::rc::Rc::new(TokenStore::new()), SEAT_NAME).unwrap();
     let mut model = StateModel::new();
     let mut shell = shell_peer(&mut hub, &mut model, &path, CURRENT_VERSION.minor);
-    let mut old_shell = shell_peer(&mut hub, &mut model, &path, 52);
+    let mut old_shell = shell_peer(&mut hub, &mut model, &path, 54);
     let field = Some(TextFieldFocus {
         purpose: 0,
         hints: 0,

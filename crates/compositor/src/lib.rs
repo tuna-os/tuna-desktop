@@ -102,13 +102,16 @@ pub mod cursor;
 mod cursor_svg;
 mod dbus_signals;
 pub mod display_config;
+pub mod dnd_overview;
 #[cfg(feature = "drm")]
 pub mod drm;
+pub mod edge_resistance;
 pub mod edid;
 pub(crate) mod focus_caret;
 pub mod focus_policy;
 pub mod fprintd;
 pub mod frame_timing;
+mod grid_trace;
 pub mod icc;
 pub mod idle_monitor;
 mod idle_notify;
@@ -170,6 +173,7 @@ pub mod size_change;
 pub mod sleep;
 pub mod slideshow;
 pub mod spring;
+pub mod startup;
 pub mod state;
 mod state_snapshot;
 pub mod supervise;
@@ -250,6 +254,9 @@ pub struct State {
     /// The icon a client's drag-and-drop carries, drawn at the pointer
     /// until the drop.
     dnd_icon: Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    /// Whether the drag in progress is the supervised shell's own (its
+    /// dash and app grid), not an application's (#1189).
+    client_dnd_shell: bool,
     /// What the client under the pointer asked the cursor to be: a
     /// `wp_cursor_shape_v1` shape, its own surface, or hidden (#342).
     pub(crate) cursor_image: smithay::input::pointer::CursorImageStatus,
@@ -320,6 +327,8 @@ pub struct State {
     /// Serial of the latest pointer button press sent to a client: Mutter's
     /// `grab_serial`, which xdg_toplevel.show_window_menu must name.
     pub(crate) pointer_press_serial: Option<Serial>,
+    /// Pending app launches' startup sequences: the busy cursor (#1193).
+    pub startup: startup::StartupNotification,
     /// Exact native parent at role destruction, consumed on the next reconcile.
     /// Smithay clears role data immediately after `toplevel_destroyed` returns.
     pub(crate) closed_toplevel_parents:
@@ -825,6 +834,7 @@ impl CompositorHandler for State {
         smithay::wayland::compositor::add_pre_commit_hook::<State, _>(
             surface,
             |state, _dh, surface| {
+                crate::grid_trace::commit(state, surface, true);
                 if state.dead_layer_surfaces.contains(&surface.id()) {
                     smithay::wayland::compositor::with_states(surface, |states| {
                         let mut cached = states
@@ -838,6 +848,7 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &wl_surface::WlSurface) {
+        crate::grid_trace::commit(self, surface, false);
         self.pointer_scene_dirty = true;
         self.commit_count = self.commit_count.wrapping_add(1);
         on_commit_buffer_handler::<State>(surface);
@@ -920,9 +931,24 @@ impl ClientDndGrabHandler for State {
         &mut self,
         _source: Option<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
         icon: Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
-        _seat: Seat<Self>,
+        seat: Seat<Self>,
     ) {
+        use smithay::reexports::wayland_server::Resource;
         self.dnd_icon = icon;
+        // The surface the drag was pressed on belongs to the client that
+        // started it; the grab is not installed yet, the press's is.
+        let origin = seat
+            .get_pointer()
+            .and_then(|pointer| pointer.grab_start_data())
+            .and_then(|start| start.focus)
+            .or_else(|| {
+                seat.get_touch()
+                    .and_then(|touch| touch.grab_start_data())
+                    .and_then(|start| start.focus)
+            });
+        self.client_dnd_shell = origin
+            .and_then(|(surface, _)| self.dh.get_client(surface.id()).ok())
+            .is_some_and(|client| ClientState::privileged(&client, |data| data.supervised_shell));
     }
 
     fn dropped(
@@ -932,6 +958,7 @@ impl ClientDndGrabHandler for State {
         _seat: Seat<Self>,
     ) {
         self.dnd_icon = None;
+        self.client_dnd_shell = false;
     }
 }
 
@@ -942,6 +969,13 @@ impl State {
     ) -> Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface> {
         use smithay::reexports::wayland_server::Resource;
         self.dnd_icon.clone().filter(|s| s.is_alive())
+    }
+
+    /// Whether a drag a client started is under way that the overview
+    /// answers (#1189): not the supervised shell's own, whose dash and
+    /// app-grid drags happen inside the overview and are the shell's.
+    pub fn client_dnd_overview_active(&self) -> bool {
+        !self.client_dnd_shell && self.client_dnd_active()
     }
 }
 impl ServerDndGrabHandler for State {}
@@ -1278,6 +1312,7 @@ impl State {
             }),
             data_device_state: DataDeviceState::new::<State>(dh),
             dnd_icon: None,
+            client_dnd_shell: false,
             cursor_image: smithay::input::pointer::CursorImageStatus::default_named(),
             tablet_cursor: None,
             tablet_cursor_images: std::collections::HashMap::new(),
@@ -1299,6 +1334,7 @@ impl State {
             retired_output_globals: Vec::new(),
             window_requests: Vec::new(),
             pointer_press_serial: None,
+            startup: startup::StartupNotification::default(),
             closed_toplevel_parents: std::collections::HashMap::new(),
             pongs: Vec::new(),
             protocols: protocols::Protocols::new(dh),
@@ -1391,7 +1427,9 @@ impl State {
     /// removal live; it stays bindable until the runtime destroys it
     /// ([`take_retired_output_globals`](Self::take_retired_output_globals)),
     /// so a client binding it as it goes is not disconnected. Virtual
-    /// entries just drop. Returns whether an entry was removed.
+    /// entries just drop. A lock surface on the output goes with it: the
+    /// output that next takes the name waits for one of its own.
+    /// Returns whether an entry was removed.
     pub fn remove_output(&mut self, name: &str) -> bool {
         let Some(index) = self.outputs.iter().position(|entry| entry.name == name) else {
             return false;
@@ -1402,6 +1440,7 @@ impl State {
             self.retired_output_globals.push(id);
         }
         self.outputs.remove(index);
+        self.forget_output_lock_surface(name);
         if was_primary {
             if let Some(first) = self.outputs.first_mut() {
                 first.primary = true;
@@ -1609,6 +1648,8 @@ impl State {
 
     /// Overview input uses the compositor's current logical output geometry,
     /// including primary changes, negative origins, scale changes and hotplug.
+    /// A client's drag-and-drop in progress lets the hot corner answer hover
+    /// (see [`State::client_dnd_overview_active`]).
     pub fn overview_trigger_action(
         &self,
         triggers: &mut crate::windows::TriggerState,
@@ -1616,9 +1657,27 @@ impl State {
         overview_open: bool,
         pointer: smithay::utils::Point<f64, smithay::utils::Logical>,
     ) -> crate::windows::TriggerAction {
+        triggers.set_client_drag(self.client_dnd_overview_active());
         triggers.feed_on_outputs(
             input,
             overview_open,
+            pointer,
+            self.outputs.iter().map(|entry| {
+                (
+                    smithay::utils::Rectangle::new(entry.loc.into(), entry.size),
+                    entry.primary,
+                )
+            }),
+        )
+    }
+
+    /// Whether `pointer` is on the primary output's Activities control.
+    pub fn overview_activities_at(
+        &self,
+        triggers: &crate::windows::TriggerState,
+        pointer: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) -> bool {
+        triggers.activities_at(
             pointer,
             self.outputs.iter().map(|entry| {
                 (

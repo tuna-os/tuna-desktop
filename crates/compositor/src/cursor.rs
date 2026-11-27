@@ -564,7 +564,8 @@ struct Shown {
     /// Shape name for `named`.
     name: Option<&'static str>,
     /// Which shape requested it: `client` (cursor-shape protocol),
-    /// `grab` (the compositor's move/resize), or `default`.
+    /// `grab` (the compositor's move/resize), `busy` (a pending app
+    /// launch), or `default`.
     source: &'static str,
     /// Theme holding the image, `builtin` for the fallback arrow.
     theme: Option<String>,
@@ -606,6 +607,19 @@ impl Pointer {
                 Self::Surface(surface.clone())
             }
             CursorImageStatus::Surface(_) => Self::Named(CursorIcon::Default, "default"),
+        }
+    }
+
+    /// Mutter's global cursor while a startup sequence is pending
+    /// (`meta_compositor_update_global_cursor`, compositor.c:1132-1146):
+    /// every theme cursor becomes `CLUTTER_CURSOR_WAIT`
+    /// (`meta_backend_get_cursor`, meta-backend.c:2164-2177), the hidden
+    /// one (`CLUTTER_CURSOR_NONE`) included; a client's own cursor surface
+    /// does not come from the theme and stays.
+    pub fn busy(self, busy: bool) -> Self {
+        match self {
+            Self::Named(..) | Self::Hidden if busy => Self::Named(CursorIcon::Wait, "busy"),
+            other => other,
         }
     }
 }
@@ -1924,6 +1938,26 @@ mod tests {
             Pointer::resolve(&CursorImageStatus::Hidden, None, true),
             Pointer::Hidden
         );
+    }
+
+    /// #1193, mutter 51 `meta_backend_get_cursor`: a pending startup
+    /// sequence overrides every theme cursor (grab, client shape, default,
+    /// hidden) with `CLUTTER_CURSOR_WAIT`, found under its CSS and X names.
+    #[test]
+    fn a_pending_launch_shows_the_wait_cursor_over_theme_cursors() {
+        let named = CursorImageStatus::Named(CursorIcon::Crosshair);
+        let busy = Pointer::Named(CursorIcon::Wait, "busy");
+        for (status, grab, focused) in [
+            (&named, None, true),
+            (&named, None, false),
+            (&named, Some(CursorIcon::Move), true),
+            (&CursorImageStatus::Hidden, None, true),
+        ] {
+            let shown = Pointer::resolve(status, grab, focused);
+            assert_eq!(shown.clone().busy(false), shown, "nothing pending");
+            assert_eq!(shown.busy(true), busy);
+        }
+        assert_eq!(icon_names(CursorIcon::Wait)[..2], ["wait", "watch"]);
     }
 
     #[test]

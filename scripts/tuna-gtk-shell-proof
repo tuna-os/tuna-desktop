@@ -6,6 +6,7 @@
 #   --screenshot-keys-only runs panel readiness and actual keyboard captures only.
 #   --a11y-focus-only runs panel readiness, G-FOCUS-RING, G-FOCUS-RING-TIMEOUT,
 #   G-A11Y-MENU-CLOSE-STABLE, G-A11Y-MENU-RESTART and G-SHELL-STABLE only.
+#   --folder-dnd-only runs panel readiness and the unchanged G-FOLDER-DND gate.
 #   --notify-lock-only runs panel readiness and the lock-screen notification
 #   and notification sound gates only (needs pam_wrapper).
 #   --tray-only runs panel readiness and the AppIndicator pointer, library,
@@ -16,6 +17,8 @@
 #   protocol gates driven by a real client (G-XDG-WM-BASE-7,
 #   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR, G-OSK-INPUT-PANEL;
 #   #364, #588) only.
+#   --subsurface-only runs panel readiness and G-SUBSURFACE-STACKING (a
+#   window's subsurfaces stack where the client placed them) only.
 #   --grid-hover-only runs panel readiness, G-GRID-HOVER, G-GRID-REORDER,
 #   G-GRID-ON-DEMAND and G-SHELL-STABLE only.
 #   --keyboard-routes-only runs panel readiness and the P-A11Y-02 keyboard
@@ -31,8 +34,19 @@
 #   --window-leak-only runs panel readiness, G-WINDOW-LEAK (100 libadwaita
 #   windows opened and closed leave the compositor's memory within a fixed
 #   bound of its warm state, #1088) and G-SHELL-STABLE only.
+#   --dnd-overview-only runs panel readiness, G-DND-OVERVIEW (real GTK drags
+#   open the overview from the hot corner and the Activities button, activate
+#   a window preview after 750 ms, and return to the starting workspace on
+#   cancel and drop, #1189) and G-SHELL-STABLE only.
 #   --lock-menu-only runs panel readiness, G-LOCK-WITH-MENU-OPEN and
 #   G-SHELL-STABLE only (needs pam_wrapper).
+#   --panel-dash-only runs panel readiness, G-PANEL-LAYOUT and
+#   G-DASH-FAVORITES-RUNNING (#1198, #1199) and G-SHELL-STABLE only, at
+#   TUNA_SCALE in the proof's locale; a scale other than 1 adds
+#   -FRACTIONAL and a right-to-left locale -RTL to the gate names.
+#   --remote-access-only runs panel readiness, G-REMOTE-ACCESS-INDICATOR
+#   (a portal share's Stop Screen Sharing button, #1162 F2) and
+#   G-SHELL-STABLE only (needs pipewire, wireplumber and the portal).
 #   --grid-cancel-only --grid-cancel-admission FILE is an exact CI comparison slice.
 #   --expect-grid-cancel-old-negative is permitted only in that admitted slice.
 #   Run at most one --*-only slice at a time.
@@ -42,6 +56,13 @@
 # on a private session bus with the AT-SPI accessibility bus, then:
 #   G-PANEL     the panel maps (frame differs from the bare session)
 #   A11Y-PANEL  the panel controls are exposed to screen readers by name
+#   G-PANEL-LAYOUT (--panel-dash-only) Activities at the leading edge, the
+#               clock centred on the output to a physical pixel, the system
+#               menu at the trailing edge, from the bar's accessible tree
+#               and each control's hover fill (#1199)
+#   G-DASH-FAVORITES-RUNNING (--panel-dash-only) the dash lists
+#               favorite-apps in order, then the running non-favourite,
+#               with running dots under exactly the running apps (#1198)
 #   G-SHELL-CAIRO on software GL the compositor starts the shell with
 #               GSK_RENDERER=cairo and the shell loads no Mesa rasterizer (#503)
 #   G-CLOCK-DAMAGE a clock tick repaints the clock's rectangle in the bar,
@@ -119,12 +140,21 @@
 #   G-NOTIFY-LOCK-PIXELS a redacted source's pixels do not depend on its
 #                    text; details change them and taking them back
 #                    restores the frame
+#   G-NOTIFY-LOCK-PUSH a list taller than the room under the clock raises
+#                    the clock, at most to a tenth of the height from the top
 #   G-NOTIFY-LOCK-LIVE arrivals and policy keys reach the locked screen at
 #                    once; unlocking brings the queued banners and sounds
+#   G-NOTIFY-LOCK-MEDIA an MPRIS player lists on the lock screen with its
+#                    track and controls that reach it, by its app's policy
 #   G-NOTIFY-SOUND   banners play sound-name / sound-file as they show,
 #                    silenced by enable-sound-alerts or event-sounds off
 #   G-NOTIFY-RESTORE re-enabling a disabled app brings what it sent while
 #                    disabled back to the list, with no banner
+#   G-NOTIFY-EXPANDED banners open collapsed unless critical or
+#                    force-expanded; the pointer expands and holds them
+#   G-NOTIFY-CALENDAR-MEDIA an MPRIS player lists in the date menu above
+#                    the notifications, its controls reach it, by its
+#                    app's enable, gone when it leaves the bus (#1037)
 #   G-QS-SERVICES    quick settings shows the tiles of the services on
 #                    the bus (stub daemons on a private system bus, #55)
 #   G-QS-WIFI-MENU   the Wi-Fi menu scans, lists NetworkManager's networks
@@ -170,16 +200,24 @@
 #               frames: the shell's caret is steady, as GNOME's (#503);
 #               the window never spans the panel clock's minute turn
 #   G-OV-LAUNCH Enter launches the top result and closes the overview
+#   G-BUSY-CURSOR that launch shows the wait cursor while it is pending,
+#               until its window maps (#1193, P-IN-07)
 #   G-OV-APPGRID Show Apps opens the app grid
 #   G-X11-APP      XWayland is on by default: an X11 app launched from
 #                  overview search gets DISPLAY and maps a window (#59)
 #   G-X11-INPUT-FOCUS the X server's input focus is the focused X11 window
 #   G-X11-ICONIC a minimized X11 window is WM_STATE IconicState with
 #                  _NET_WM_STATE_HIDDEN, and NormalState without once restored
+#   G-SUBSURFACE-STACKING a subsurface placed above its window shows over
+#                  it and one placed below shows under it, on the desktop,
+#                  in the overview's preview and in the window's screenshot
 #   G-SETTINGS-CLOCK GNOME's clock-show-seconds key changes the panel clock
 #   G-SETTINGS-INPUT GNOME's input sources set the keymap (Super+Space
 #                  switches), repeat-interval the repeat rate, and
 #                  enable-hot-corners the hot corner (#60)
+#   G-OVERLAY-KEY org.gnome.mutter overlay-key 'Super_R' moves the lone
+#                  overview tap from Super_L to Super_R, '' disables it
+#                  (#1191, P-OV-07)
 #   G-SETTINGS-POINTER GNOME's touchpad, mouse, trackball and pointing-stick
 #                  keys (send-events, click method, scroll methods, tap
 #                  options, middle-click and scroll-wheel emulation,
@@ -419,6 +457,18 @@
 #                  overview, and a thumbnail click switches workspace
 #   G-OV-DND       dragging a window's preview onto the next workspace's
 #                  card moves the window there, the overview staying open
+#   G-DND-HOT-CORNER a real GTK drag (--dnd-overview-only, #1189) held over
+#                  the hot corner opens the overview and keeps the drag
+#   G-DND-WINDOW-SWITCH the drag resting 750 ms (GNOME's
+#                  DND_WINDOW_SWITCH_TIMEOUT) on a window preview activates
+#                  and raises that window, where the drop lands
+#   G-DND-ACTIVITIES the drag resting 250 ms on the Activities button
+#                  opens the overview
+#   G-DND-CANCEL-RETURNS / G-DND-DROP-RETURNS a workspace switched by
+#                  hovering a thumbnail returns to the starting workspace,
+#                  the overview closing, when the drag is cancelled
+#                  (Escape) or dropped
+#   G-DND-OVERVIEW all of the above
 #   G-SUSPEND-LOCK Suspend asks logind, and its PrepareForSleep locks
 #                  the session before sleep
 #   G-UNLOCK       GNOME's lock screen: a wrong password is refused and
@@ -474,6 +524,9 @@
 #                  except G-A11Y-MENU-RESTART's one deliberate restart
 
 #   G-APP-DRAG  dragging an app's header bar moves the window (#58)
+#   G-EDGE-RESISTANCE a header drag holds at the screen edge for 32 px,
+#               a keyboard move (Alt+F7) stops on it, and Shift snaps a
+#               drag flush to an edge (#1192, P-WM-12)
 #   G-TILE-PREVIEW dragging a window to the left edge shows GNOME's tile
 #               preview over the left half; dragging back drops it
 #   G-EDGE-TILING-OFF with org.gnome.mutter edge-tiling off the same
@@ -485,6 +538,8 @@
 #               again compacts (P-WM-08)
 #   G-CENTER-NEW-WINDOWS new windows are centred, or take mutter's first
 #               fit with center-new-windows off (P-WM-08)
+#   G-AUTO-MAXIMIZE a first map over 80% of the work area opens
+#               maximized; with auto-maximize off it floats (#1190, P-WM-12)
 #   G-TRAY      an AppIndicator item shows in the panel with its
 #               tooltip, its menu row reaches the item, and the row
 #               leaves the panel when the item exits (P-TR-01)
@@ -521,11 +576,30 @@
 #   G-SWITCHER  Alt+Tab shows the switcher with every app (GNOME's
 #               switch-applications; the three test windows are three apps), and
 #               releasing Alt focuses the highlighted one
+#   G-VISUAL-BELL, G-X11-BELL, G-XSETTINGS-SOUNDS, G-QS-VOLUME-FEEDBACK
+#               bells, input-feedback-sounds and slider feedback (#353);
+#               see scripts/lib/tuna-sound-alerts-proof.sh, which
+#               --sound-alerts-only runs alone
 # Frames and accessibility dumps land in the artifacts dir; assertions in
 # assertions.txt for the parity ledger.
 set -eu
-if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
-    TUNA_PROOF_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+# GNOME's screen-time day starts at 03:00 local time: a proof crossing it
+# resets the day's usage mid-gate, and a reached daily limit turns Active.
+# The proof, its private buses and the session all run in a fixed-offset
+# zone where it is about 15:00, twelve hours from either boundary. Chosen
+# once, before the private bus, so activated services inherit it too.
+if [ -z "${TUNA_PROOF_SESSION_TZ:-}" ]; then
+    TUNA_PROOF_SESSION_TZ="$(python3 "$(dirname -- "$0")/lib/proof-session-tz.py")"
+    export TUNA_PROOF_SESSION_TZ
+    echo "tuna-gtk-shell-proof: session TZ=$TUNA_PROOF_SESSION_TZ, local time $(TZ="$TUNA_PROOF_SESSION_TZ" date +%H:%M)" >&2
+fi
+TZ="$TUNA_PROOF_SESSION_TZ"
+export TZ
+# One owned session on a private bus (#1082): tuna-proof-session ends every
+# process this run started once it exits, on pass, on a failed gate and on a
+# signal, and fails the proof if one is still alive afterwards.
+if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ]; then
+    TUNA_PROOF_PRIVATE_BUS=1 exec "$(dirname -- "$0")/lib/tuna-proof-session" --bus -- "$0" "$@"
 fi
 unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -542,13 +616,19 @@ NOTIFY_LOCK_ONLY=0
 TRAY_ONLY=0
 X11_ICONIC_ONLY=0
 PROTOCOLS_ONLY=0
+SUBSURFACE_ONLY=0
 GRID_HOVER_ONLY=0
 KEYBOARD_ROUTES_ONLY=0
 DATEMENU_ONLY=0
 SEARCH_LEAK_ONLY=0
 WINDOW_LEAK_ONLY=0
+DND_OVERVIEW_ONLY=0
 LOCK_MENU_ONLY=0
+PANEL_DASH_ONLY=0
+SOUND_ALERTS_ONLY=0
+REMOTE_ACCESS_ONLY=0
 GRID_CANCEL_ONLY=0
+FOLDER_DND_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
 GRID_CANCEL_ADMISSION=""
 COMPANIONS="${TUNA_PROOF_COMPANIONS:-$ROOT/target/debug/examples}"
@@ -593,8 +673,14 @@ while [ $# -gt 0 ]; do
         --search-leak-only) SEARCH_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --window-leak-only) WINDOW_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --lock-menu-only) LOCK_MENU_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
+        --folder-dnd-only) FOLDER_DND_ONLY=1; only_mode "$1" no-examples; shift ;;
+        --panel-dash-only) PANEL_DASH_ONLY=1; only_mode "$1" source-build no-media-source no-examples no-camera-policy; shift ;;
+        --dnd-overview-only) DND_OVERVIEW_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --x11-iconic-only) X11_ICONIC_ONLY=1; only_mode "$1"; shift ;;
         --protocols-only) PROTOCOLS_ONLY=1; only_mode "$1" no-media-source no-camera-policy; shift ;;
+        --sound-alerts-only) SOUND_ALERTS_ONLY=1; only_mode "$1"; shift ;;
+        --remote-access-only) REMOTE_ACCESS_ONLY=1; only_mode "$1"; shift ;;
+        --subsurface-only) SUBSURFACE_ONLY=1; only_mode "$1" source-build no-media-source no-examples no-camera-policy; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --help|-h) sed -n '2,/^# end of --help$/{/^# end of --help$/!p;}' "$0"; exit 0 ;;
@@ -688,10 +774,25 @@ for t in alpha beta gamma delta; do
     printf '[Desktop Entry]\nName=Tuna Desktop Test %s\nExec=true\nType=Application\nNoDisplay=true\n' "$t" \
         >"$XDG_DATA_HOME/applications/tuna-test-$t.desktop"
 done
+# While $PROBE_HOLD exists, a launched probe stays pending with no window
+# until the file goes, then maps a window of its own app id
+# (G-BUSY-CURSOR); otherwise it leaves only the marker.
+PROBE_HOLD="$ARTIFACTS/probe-hold"
+rm -f "$PROBE_HOLD"
+mkdir -p "$ARTIFACTS/bin"
+cat >"$ARTIFACTS/bin/tuna-probe" <<EOF
+#!/bin/sh
+"$PY" "$ARTIFACTS/launch-environment.py" "$PROBE_MARKER" || exit
+[ -e "$PROBE_HOLD" ] || exit 0
+echo \$\$ >"$ARTIFACTS/probe-window.pid"
+while [ -e "$PROBE_HOLD" ]; do sleep 0.1; done
+TUNA_TEST_APP_ID=tuna-probe exec "$PY" "$ROOT/scripts/lib/tuna-test-window.py" "Tuna Probe" "#c061cb"
+EOF
+chmod +x "$ARTIFACTS/bin/tuna-probe"
 cat >"$XDG_DATA_HOME/applications/tuna-probe.desktop" <<EOF
 [Desktop Entry]
 Name=Tuna Probe
-Exec=$PY $ARTIFACTS/launch-environment.py $PROBE_MARKER
+Exec=$ARTIFACTS/bin/tuna-probe
 Icon=applications-system
 Type=Application
 EOF
@@ -791,6 +892,9 @@ GSD_MEDIA_KEYS_PID=""
 GSD_BUS_PID=""
 MPRIS_PID=""
 PW_PULSE_PID=""
+SOUND_ALERTS_WL_PID=""
+SOUND_ALERTS_X11_PID=""
+GSD_XSETTINGS_PID=""
 cleanup() {
     if [ -n "$ICON_PID" ]; then kill "$ICON_PID" 2>/dev/null || true; fi
     if [ -n "$HINTS_PID" ]; then kill "$HINTS_PID" 2>/dev/null || true; fi
@@ -807,14 +911,9 @@ cleanup() {
     if [ -n "$OCCLUSION_PIDS" ]; then kill $OCCLUSION_PIDS 2>/dev/null || true; fi
     # shellcheck disable=SC2086
     if [ -n "$IME_PIDS" ]; then kill $IME_PIDS 2>/dev/null || true; fi
-    # The bridge daemonized ibus-daemon for this session's display.
-    if [ -n "${SOCKET_NAME:-}" ] && command -v ibus >/dev/null 2>&1; then
-        env -u DISPLAY -u IBUS_ADDRESS -u WAYLAND_SOCKET WAYLAND_DISPLAY="$SOCKET_NAME" \
-            ibus exit >/dev/null 2>&1 || true
-    fi
     if [ -n "$SCREENSAVER_PID" ]; then kill "$SCREENSAVER_PID" 2>/dev/null || true; fi
     if [ -n "$CAL_PID" ]; then kill "$CAL_PID" 2>/dev/null || true; fi
-    for gsd_pid in $GSD_MEDIA_KEYS_PID $MPRIS_PID $GSD_BUS_PID $PW_PULSE_PID; do
+    for gsd_pid in $GSD_MEDIA_KEYS_PID $MPRIS_PID $GSD_BUS_PID $PW_PULSE_PID $GSD_XSETTINGS_PID $SOUND_ALERTS_WL_PID $SOUND_ALERTS_X11_PID; do
         kill "$gsd_pid" 2>/dev/null || true
     done
     if [ -n "$ACCEL_PID" ]; then kill "$ACCEL_PID" 2>/dev/null || true; fi
@@ -834,11 +933,22 @@ cleanup() {
     if [ -n "$PW_PIDS" ]; then kill $PW_PIDS 2>/dev/null || true; fi
     for portal_pid in $PORTAL_PIDS; do kill "$portal_pid" 2>/dev/null || true; done
     if [ -n "${AT_SPI_PID:-}" ]; then kill "$AT_SPI_PID" 2>/dev/null || true; fi
+    # By PID, not over a bus that may be gone (#1082): the bridge's
+    # `ibus-daemon --daemonize` (`ibus exit` needs IBus's bus) and the AT-SPI
+    # registry, which outlives its accessibility bus.
+    cleanup_status=0
+    "$ROOT/scripts/lib/tuna-proof-session" --stop ibus-daemon at-spi2-registryd || cleanup_status=1
     rm -rf "${PIPEWIRE_RUNTIME_DIR:-/nonexistent}"
     if [ -n "$OWNED_RUNTIME" ]; then rm -rf "$OWNED_RUNTIME"; fi
     if [ -n "$SYSBUS_PID" ]; then kill "$SYSBUS_PID" 2>/dev/null || true; fi
+    # Nothing this run started may outlive it: a daemon that escapes the
+    # cleanup above fails the proof (tuna-proof-session then stops it).
+    "$ROOT/scripts/lib/tuna-proof-session" --check || cleanup_status=1
+    [ "$cleanup_status" = 0 ] || exit 1
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # Drive compositor animation time (TUNA_ANIMATION_CLOCK): the first
 # write freezes it, later writes move it to that moment plus N ms, and
 # removing the file resumes real time.
@@ -1080,6 +1190,76 @@ pass G-GRID-ON-DEMAND "no grid tiles on the window picker or after close; a held
 . "$ROOT/scripts/lib/tuna-datemenu-proof.sh"
 . "$ROOT/scripts/lib/tuna-search-leak-proof.sh"
 . "$ROOT/scripts/lib/tuna-window-leak-proof.sh"
+. "$ROOT/scripts/lib/tuna-panel-dash-proof.sh"
+. "$ROOT/scripts/lib/tuna-sound-alerts-proof.sh"
+. "$ROOT/scripts/lib/tuna-dnd-overview-proof.sh"
+
+folder_dnd_proof() {
+# GNOME's folder edits by drag: one app onto another makes a folder of
+# the two (org.gnome.desktop.app-folders); one dragged out of the
+# folder's dialog onto the shade leaves it. Two apps named to sort first
+# sit in the first two cells (113px tiles 12px apart, centred).
+for n in One Two; do
+    printf '[Desktop Entry]\nName=AAA Drag %s\nExec=true\nType=Application\n' "$n" \
+        >"$XDG_DATA_HOME/applications/tuna-drag-$n.desktop"
+done
+sleep 1.5
+before="$(gsettings get org.gnome.desktop.app-folders folder-children)"
+drag() {
+    xdotool mousemove --window "$WID" "$1" "$2"
+    sleep 0.3
+    xdotool mousedown 1
+    sleep 0.2
+    for i in $(seq 1 20); do
+        xdotool mousemove --window "$WID" $(($1 + ($3 - $1) * i / 20)) $(($2 + ($4 - $2) * i / 20))
+        sleep 0.03
+    done
+    sleep 0.4
+    xdotool mouseup 1
+    sleep 1.5
+}
+xdotool key super+a
+cstate '.overview_open and .overview_app_grid' "app grid" || fail G-FOLDER-DND "Super+A did not show the app grid"
+sleep 1.5
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-drag-source.json" 20 || fail G-FOLDER-DND "source dump failed"
+grid_origin
+source_point="$(grid_point "$ARTIFACTS/a11y-folder-drag-source.json" "AAA Drag Two")" || fail G-FOLDER-DND "source bounds missing"
+target_point="$(grid_point "$ARTIFACTS/a11y-folder-drag-source.json" "AAA Drag One")" || fail G-FOLDER-DND "target bounds missing"
+# shellcheck disable=SC2086
+drag $source_point $target_point
+scrot "$ARTIFACTS/11e-folder-made.png" >/dev/null
+after="$(gsettings get org.gnome.desktop.app-folders folder-children)"
+folder=""
+for f in $(echo "$after" | tr -d "[]',"); do
+    case " $(echo "$before" | tr -d "[]',") " in *" $f "*) ;; *) folder="$f" ;; esac
+done
+[ -n "$folder" ] || fail G-FOLDER-DND "dropping an app on another made no folder ($after)"
+fpath="org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder/"
+apps="$(gsettings get "$fpath" apps)"
+case "$apps" in
+    *tuna-drag-One.desktop*tuna-drag-Two.desktop*|*tuna-drag-Two.desktop*tuna-drag-One.desktop*) ;;
+    *) fail G-FOLDER-DND "the new folder holds $apps" ;;
+esac
+name="$(gsettings get "$fpath" name | tr -d "'")"
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-new.json" 20 \
+    --press "$name" || fail G-FOLDER-DND "could not open the new folder '$name'"
+sleep 1.5
+scrot "$ARTIFACTS/11f-folder-dialog.png" >/dev/null
+# The dialog's second tile (AAA Drag Two) out onto the shade.
+"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-dialog-source.json" 20 || fail G-FOLDER-DND "dialog dump failed"
+grid_origin tuna-folder-dialog
+source_point="$(grid_point "$ARTIFACTS/a11y-folder-dialog-source.json" "AAA Drag Two")" || fail G-FOLDER-DND "dialog source bounds missing"
+# shellcheck disable=SC2086
+drag $source_point 140 560
+apps="$(gsettings get "$fpath" apps)"
+[ "$apps" = "['tuna-drag-One.desktop']" ] ||
+    fail G-FOLDER-DND "dragging an app out left the folder with $apps"
+pass G-FOLDER-DND "an app dropped on another makes a GNOME folder; one dragged out of its dialog leaves it"
+xdotool key Escape
+cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-FOLDER-DND "overview stayed open"; }
+rm -f "$XDG_DATA_HOME"/applications/tuna-drag-*.desktop
+sleep 1.5
+}
 
 # Compositor-side state (overview, focus, previews) for app stages.
 CSTATE="$ARTIFACTS/compositor-state.json"
@@ -1533,6 +1713,10 @@ if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example protocol-probe
     fi
+    cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example tuna-bell-client
+    if [ "$SUBSURFACE_ONLY" = 1 ]; then
+        cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example tuna-subsurface-client
+    fi
 fi
 # The compositor and the shell share this log from one file description.
 # Truncate first (a fresh log each run, as before), then append: O_APPEND
@@ -1540,6 +1724,9 @@ fi
 # interleave whole pieces, never overwrite bytes (tuna-fade-match tolerates
 # the interleaved pieces).
 : >"$LOG"
+if [ "$PANEL_DASH_ONLY" = 1 ]; then
+    panel_dash_setup
+fi
 # Persist the disabled policy before the GTK publisher starts. The portal
 # probe must observe it on first acquisition, before testing live toggles.
 if [ "$ONLY_NO_CAMERA_POLICY" = 0 ]; then
@@ -2005,6 +2192,97 @@ protocol_gaps_gates() {
     osk_input_panel_gate
 }
 
+# G-SUBSURFACE-STACKING: a window's subsurfaces stack where the client
+# placed them (wl_subsurface.place_above / place_below), as Mutter draws
+# them. tuna-subsurface-client's red 400x300 window has a green
+# subsurface above it at (50, 100) and a blue one below it at (300, 100),
+# half past its right edge: the parent never covers the green one and
+# always covers the blue one, which shows only past the parent's edge.
+# Checked in the three scenes that draw a window's surface tree: the
+# desktop, the overview's preview and the window's own screenshot
+# (Alt+Print, ScreenshotWindow). Each sampled pixel is kept in
+# subsurface-pixels.txt; every scene is sampled before the gate judges.
+SUBSURFACE_RED="200 40 40"
+SUBSURFACE_GREEN="40 200 40"
+SUBSURFACE_BLUE="40 40 200"
+# subsurface_sample SCENE PNG X Y WANT NAME: the pixel at (X, Y) of PNG is
+# within 30 of WANT ("r g b") in every channel.
+subsurface_sample() {
+    sub_got="$(px "$2" "$3" "$4")"
+    echo "$1 $6 ($3,$4) want $5 got $sub_got" >>"$ARTIFACTS/subsurface-pixels.txt"
+    if ! echo "$sub_got" | awk -v want="$5" '
+        BEGIN { split(want, w, " ") }
+        { for (i = 1; i <= 3; i++) { d = $i - w[i]; if (d < 0) d = -d; if (d > 30) exit 1 }; ok = 1 }
+        END { exit !ok }'; then
+        SUBSURFACE_BAD="${SUBSURFACE_BAD:+$SUBSURFACE_BAD; }$1: $6 shows $sub_got, not $5"
+    fi
+}
+# subsurface_point SCENE PNG X Y W H CX CY WANT NAME: samples the client
+# point (CX, CY) of the 400x300 window drawn at (X, Y) at W x H in PNG.
+subsurface_point() {
+    subsurface_sample "$1" "$2" $(($3 + $7 * $5 / 400)) $(($4 + $8 * $6 / 300)) "$9" "${10}"
+}
+# subsurface_scene SCENE PNG X Y W H: the window's geometry (400x300 in
+# the client) drawn at (X, Y) at W x H in PNG.
+subsurface_scene() {
+    subsurface_point "$1" "$2" "$3" "$4" "$5" "$6" 200 50 "$SUBSURFACE_RED" "the parent"
+    subsurface_point "$1" "$2" "$3" "$4" "$5" "$6" 100 150 "$SUBSURFACE_GREEN" "the subsurface placed above"
+    subsurface_point "$1" "$2" "$3" "$4" "$5" "$6" 350 150 "$SUBSURFACE_RED" "the parent over the subsurface placed below"
+}
+subsurface_stacking_gate() {
+    SUBSURFACE_BAD=""
+    : >"$ARTIFACTS/subsurface-pixels.txt"
+    WAYLAND_DISPLAY="$SOCKET_NAME" "$COMPANIONS/tuna-subsurface-client" >"$ARTIFACTS/subsurface-client.log" 2>&1 &
+    SUBSURFACE_PID=$!
+    cstate 'any(.windows[]; .app_id == "tuna-subsurface-proof")' "subsurface window" ||
+        fail G-SUBSURFACE-STACKING "the subsurface client's window never mapped"
+    sub_id="$(jq -r '.windows[] | select(.app_id == "tuna-subsurface-proof") | .id' "$CSTATE")"
+    cstate ".focused == $sub_id" "subsurface window focused" ||
+        fail G-SUBSURFACE-STACKING "the subsurface client's window never took focus"
+    # The open animation ends; the pointer leaves the window, away from
+    # the hot corner.
+    xdotool mousemove --window "$WID" $((WIDTH - 20)) $((HEIGHT - 20))
+    sleep 1
+    read -r sx sy sw sh <<EOF
+$(jq -r '.windows[] | select(.app_id == "tuna-subsurface-proof") | .rect | "\(.[0]) \(.[1]) \(.[2]) \(.[3])"' "$CSTATE")
+EOF
+    [ "$sw,$sh" = "400,300" ] || fail G-SUBSURFACE-STACKING "the window is ${sw}x$sh, not the client's 400x300"
+    scrot -o "$ARTIFACTS/subsurface-desktop.png" >/dev/null
+    subsurface_scene desktop "$ARTIFACTS/subsurface-desktop.png" "$sx" "$sy" 400 300
+    # The subsurface below is drawn: past the parent's right edge it shows.
+    subsurface_sample desktop "$ARTIFACTS/subsurface-desktop.png" $((sx + 425)) $((sy + 150)) \
+        "$SUBSURFACE_BLUE" "the subsurface placed below, past the parent's edge"
+
+    xdotool key Super_L
+    cstate ".overview_open and .overview_progress == 1 and any(.previews[]; .id == $sub_id)" "subsurface preview" ||
+        fail G-SUBSURFACE-STACKING "the overview shows no preview of the window"
+    sleep 1
+    read -r ox oy ow oh <<EOF
+$(jq -r ".previews[] | select(.id == $sub_id) | .rect | map(floor) | \"\(.[0]) \(.[1]) \(.[2]) \(.[3])\"" "$CSTATE")
+EOF
+    scrot -o "$ARTIFACTS/subsurface-overview.png" >/dev/null
+    subsurface_scene overview "$ARTIFACTS/subsurface-overview.png" "$ox" "$oy" "$ow" "$oh"
+    xdotool key Escape
+    cstate "(.overview_open | not) and .overview_progress == 0 and .focused == $sub_id" "subsurface overview closed" ||
+        fail G-SUBSURFACE-STACKING "Escape did not close the overview back to the window"
+
+    touch "$ARTIFACTS/subsurface-before-capture"
+    xdotool key alt+Print
+    end=$(($(date +%s) + 15))
+    until [ -n "$(find "$XDG_PICTURES_DIR/Screenshots" -name 'Screenshot From *.png' -newer "$ARTIFACTS/subsurface-before-capture" 2>/dev/null)" ] ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+    sub_shot="$(find "$XDG_PICTURES_DIR/Screenshots" -name 'Screenshot From *.png' -newer "$ARTIFACTS/subsurface-before-capture" 2>/dev/null | head -1)"
+    [ -n "$sub_shot" ] || fail G-SUBSURFACE-STACKING "Alt+Print saved no window screenshot"
+    cp "$sub_shot" "$ARTIFACTS/subsurface-window-capture.png"
+    sub_dims="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$sub_shot")"
+    [ "$sub_dims" = "400,300" ] || fail G-SUBSURFACE-STACKING "the window screenshot is $sub_dims, not 400,300"
+    subsurface_scene window-capture "$ARTIFACTS/subsurface-window-capture.png" 0 0 400 300
+
+    kill "$SUBSURFACE_PID" 2>/dev/null || true
+    [ -z "$SUBSURFACE_BAD" ] || fail G-SUBSURFACE-STACKING "$SUBSURFACE_BAD"
+    pass G-SUBSURFACE-STACKING "a subsurface placed above its window shows over it and one placed below shows under it (past its edge only) on the desktop, in the overview preview and in the window screenshot"
+}
+
 # G-LOCK-WITH-MENU-OPEN: GNOME's lock dismisses the open shell menu and
 # its grab, and the lock screen has the keyboard at once. Each menu is
 # opened from its keybinding, Super+L locks over it, and the password
@@ -2053,6 +2331,78 @@ lock_with_menu_gate() {
         scrot "$ARTIFACTS/lock-menu-$lock_menu_name-04-unlocked.png" >/dev/null
     done
     pass G-LOCK-WITH-MENU-OPEN "locking over the open date menu or quick settings closes it; the password typed at once and Return unlock through PAM"
+}
+
+# The installed GNOME portal frontend and backend, with their genuine
+# root-owned executable identities, on this proof's private session bus.
+portal_start() {
+    [ -z "$PORTAL_PIDS" ] || return 0
+    PORTAL_BACKEND=/usr/libexec/xdg-desktop-portal-gnome
+    [ -x "$PORTAL_BACKEND" ] || PORTAL_BACKEND=/usr/lib/xdg-desktop-portal-gnome
+    [ -x "$PORTAL_BACKEND" ] || fail G-PORTAL-CONSENT "installed GNOME backend missing"
+    mkdir -p "$XDG_CONFIG_HOME/xdg-desktop-portal"
+    printf '[preferred]\ndefault=gnome;gtk;\norg.freedesktop.impl.portal.ScreenCast=gnome\n' >"$XDG_CONFIG_HOME/xdg-desktop-portal/portals.conf"
+    XDG_CURRENT_DESKTOP=GNOME WAYLAND_DISPLAY="$SOCKET_NAME" GDK_BACKEND=wayland GTK_A11Y=atspi XDG_SESSION_TYPE=wayland "$PORTAL_BACKEND" --replace >"$ARTIFACTS/portal-gnome.log" 2>&1 &
+    PORTAL_BACKEND_PID=$!
+    PORTAL_PIDS="$PORTAL_BACKEND_PID"
+    "$PY" "$ROOT/scripts/lib/tuna-portal-ready.py" org.freedesktop.impl.portal.desktop.gnome org.freedesktop.impl.portal.ScreenCast "$ARTIFACTS/portal-backend-ready.json" --pid "$PORTAL_BACKEND_PID" ||
+        fail G-PORTAL-CONSENT "installed backend capabilities never became ready"
+    XDG_CURRENT_DESKTOP=GNOME /usr/libexec/xdg-desktop-portal --replace >"$ARTIFACTS/portal-frontend.log" 2>&1 &
+    PORTAL_FRONTEND_PID=$!
+    PORTAL_PIDS="$PORTAL_PIDS $PORTAL_FRONTEND_PID"
+    "$PY" "$ROOT/scripts/lib/tuna-portal-ready.py" org.freedesktop.portal.Desktop org.freedesktop.portal.ScreenCast "$ARTIFACTS/portal-frontend-ready.json" --pid "$PORTAL_FRONTEND_PID" ||
+        fail G-PORTAL-CONSENT "frontend capabilities never became ready"
+}
+
+# G-REMOTE-ACCESS-INDICATOR (#1162 F2): a portal screen share the user
+# granted shows GNOME 51's orange "Stop Screen Sharing" panel button
+# (status/remoteAccess.js ScreenSharingIndicator); pressing it through
+# AT-SPI ends the PipeWire stream within two seconds and closes the app's
+# portal session, and the button hides (after GNOME's five-second minimum).
+remote_access_indicator_gate() {
+    portal_start
+    sharing_dump() {
+        "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/$1" 5 >/dev/null 2>&1
+    }
+    # A share an earlier gate closed keeps the button its five seconds.
+    end=$(($(date +%s) + 12))
+    until sharing_dump a11y-sharing-before.json && hidden "$ARTIFACTS/a11y-sharing-before.json" "Stop Screen Sharing" ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 0.5; done
+    hidden "$ARTIFACTS/a11y-sharing-before.json" "Stop Screen Sharing" ||
+        fail G-REMOTE-ACCESS-INDICATOR "the sharing indicator showed with no share active"
+    rm -f "$ARTIFACTS"/portal-indicator.*
+    "$PY" "$ROOT/scripts/lib/tuna-portal-capture-client.py" "$ARTIFACTS/portal-indicator.png" indicator-stop >"$ARTIFACTS/portal-indicator.log" 2>&1 &
+    PORTAL_CLIENT=$!
+    "$PY" "$ROOT/scripts/lib/tuna-portal-consent.py" "$ARTIFACTS/a11y-portal-indicator.json" grant ||
+        fail G-REMOTE-ACCESS-INDICATOR "actual picker could not grant the share"
+    end=$(($(date +%s) + 30))
+    until [ -f "$ARTIFACTS/portal-indicator.active" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.2; done
+    [ -f "$ARTIFACTS/portal-indicator.active" ] ||
+        fail G-REMOTE-ACCESS-INDICATOR "the granted share never streamed: $(tail -3 "$ARTIFACTS/portal-indicator.log")"
+    end=$(($(date +%s) + 10))
+    until sharing_dump a11y-sharing.json && button_showing "$ARTIFACTS/a11y-sharing.json" "Stop Screen Sharing" ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
+    button_showing "$ARTIFACTS/a11y-sharing.json" "Stop Screen Sharing" ||
+        fail G-REMOTE-ACCESS-INDICATOR "no Stop Screen Sharing button while the share streams"
+    scrot "$ARTIFACTS/24k-screen-sharing-indicator.png" >/dev/null
+    # GNOME's $privacy_indicator_color ($orange_3, #ff7800) panel button.
+    ffmpeg -loglevel error -i "$ARTIFACTS/24k-screen-sharing-indicator.png" -vf "crop=$WIDTH:1:0:16" \
+        -f rawvideo -pix_fmt rgb24 - | od -An -tu1 -v | tr -s ' ' '\n' | awk 'NF' | paste - - - |
+        awk '$1 > 200 && $2 > 90 && $2 < 160 && $3 < 60 { found = 1 } END { exit !found }' ||
+        fail G-REMOTE-ACCESS-INDICATOR "no orange sharing indicator in the panel"
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-sharing-stop.json" 20 \
+        --press "Stop Screen Sharing" || fail G-REMOTE-ACCESS-INDICATOR "could not press Stop Screen Sharing"
+    : >"$ARTIFACTS/portal-indicator.revoke"
+    wait "$PORTAL_CLIENT" ||
+        fail G-REMOTE-ACCESS-INDICATOR "Stop did not end the share: $(tail -3 "$ARTIFACTS/portal-indicator.log")"
+    end=$(($(date +%s) + 12))
+    until sharing_dump a11y-sharing-stopped.json && hidden "$ARTIFACTS/a11y-sharing-stopped.json" "Stop Screen Sharing" ||
+        [ "$(date +%s)" -gt "$end" ]; do sleep 0.5; done
+    hidden "$ARTIFACTS/a11y-sharing-stopped.json" "Stop Screen Sharing" ||
+        fail G-REMOTE-ACCESS-INDICATOR "the indicator stayed after the share ended"
+    cstate '.capture_streams == 0' "no capture stream after Stop" 5 ||
+        fail G-REMOTE-ACCESS-INDICATOR "a capture stream survived Stop"
+    pass G-REMOTE-ACCESS-INDICATOR "a granted portal share shows GNOME's orange Stop Screen Sharing button; pressing it: $(grep -h 'removed PipeWire node\|closed the app' "$ARTIFACTS/portal-indicator.log" | tr '\n' ' ')and the button hides"
 }
 
 # The panel is up once the shell registers on the a11y bus with its
@@ -2122,6 +2472,15 @@ if [ "$PROTOCOLS_ONLY" = 1 ]; then
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     exit 0
 fi
+if [ "$SUBSURFACE_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "subsurface desktop ready" ||
+        fail G-SUBSURFACE-STACKING "desktop never became ready"
+    # Let the startup cover settle before the first window.
+    sleep 3
+    subsurface_stacking_gate
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    exit 0
+fi
 if [ "$KEYBOARD_ROUTES_ONLY" = 1 ]; then
     cstate '.active_workspace != null and .locked == false' "keyboard routes desktop ready" ||
         fail G-PANEL-MENU-KEYS "desktop never became ready"
@@ -2141,12 +2500,32 @@ if [ "$SEARCH_LEAK_ONLY" = 1 ]; then
     shell_stable_gate
     exit 0
 fi
+if [ "$DND_OVERVIEW_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "dnd overview desktop ready" ||
+        fail G-DND-OVERVIEW "desktop never became ready"
+    # Let the startup cover settle before the first window.
+    sleep 3
+    dnd_overview_proof
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
 if [ "$WINDOW_LEAK_ONLY" = 1 ]; then
     cstate '.active_workspace != null and .locked == false' "window leak desktop ready" ||
         fail G-WINDOW-LEAK "desktop never became ready"
     # Let the startup cover settle before the first window.
     sleep 3
     window_leak_proof
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
+if [ "$REMOTE_ACCESS_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "remote access desktop ready" ||
+        fail G-REMOTE-ACCESS-INDICATOR "desktop never became ready"
+    [ -n "$PW_PIDS" ] || fail G-REMOTE-ACCESS-INDICATOR "--remote-access-only needs pipewire and wireplumber"
+    sleep 3
+    remote_access_indicator_gate
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
     exit 0
@@ -2159,6 +2538,14 @@ if [ "$LOCK_MENU_ONLY" = 1 ]; then
     lock_with_menu_gate
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
+    exit 0
+fi
+if [ "$SOUND_ALERTS_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "sound alerts desktop ready" ||
+        fail G-VISUAL-BELL "desktop never became ready"
+    # The startup cover must be gone before pixels are compared.
+    sleep 3
+    sound_alerts_proof
     exit 0
 fi
 if [ "$SCREENSHOT_KEYS_ONLY" = 1 ]; then
@@ -2205,6 +2592,14 @@ if [ "$A11Y_FOCUS_ONLY" = 1 ]; then
     shell_stable_gate
     exit 0
 fi
+if [ "$FOLDER_DND_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "folder desktop ready" ||
+        fail G-FOLDER-DND "desktop never became ready"
+    folder_dnd_proof
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
 if [ "$GRID_HOVER_ONLY" = 1 ]; then
     cstate '.active_workspace != null and .locked == false' "grid hover desktop ready" ||
         fail G-GRID-HOVER "desktop never became ready"
@@ -2212,6 +2607,17 @@ if [ "$GRID_HOVER_ONLY" = 1 ]; then
     sleep 3
     grid_hover_proof
     grid_on_demand_proof
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
+if [ "$PANEL_DASH_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "panel and dash desktop ready" ||
+        fail "G-PANEL-LAYOUT$PANEL_DASH_SUFFIX" "desktop never became ready"
+    # The startup cover must be gone before frames are read.
+    sleep 3
+    panel_layout_gate
+    dash_favorites_running_gate
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
     exit 0
@@ -2459,19 +2865,16 @@ end=$(($(date +%s) + 10))
 until [ -s "$TRAY_MARKER" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
 grep -q "^clicked 1" "$TRAY_MARKER" 2>/dev/null || fail G-TRAY "the menu row never reached the item"
 kill "$TRAY_PID" 2>/dev/null || true
-tray_absent=0
-for _ in $(seq 1 30); do
-    if "$PY" "$ROOT/scripts/lib/tuna_tray_absence.py" "$ARTIFACTS/privacy-portal/receipt.json" \
-        "$ARTIFACTS/a11y-tray-gone.json" "$ROOT/scripts/lib/tuna-a11y-dump.py"; then
-        tray_absent=1
-        break
-    else
-        tray_observation=$?
-        [ "$tray_observation" = 2 ] || fail G-TRAY "fresh owner-bound tray absence observation failed"
-    fi
-    sleep 0.5
-done
-[ "$tray_absent" = 1 ] || fail G-TRAY "the item stayed in the panel after it exited"
+# Up to 30 fresh owner-bound observations 0.5 s apart; an AT-SPI child
+# vanishing inside the departing item's subtree is a retry, not a refusal.
+if "$PY" "$ROOT/scripts/lib/tuna_tray_absence.py" "$ARTIFACTS/privacy-portal/receipt.json" \
+    "$ARTIFACTS/a11y-tray-gone.json" "$ROOT/scripts/lib/tuna-a11y-dump.py"; then
+    :
+else
+    tray_observation=$?
+    [ "$tray_observation" = 2 ] || fail G-TRAY "fresh owner-bound tray absence observation failed"
+    fail G-TRAY "the item stayed in the panel after it exited"
+fi
 pass G-TRAY "an AppIndicator item shows with its tooltip, fires its menu, and leaves on exit"
 xdotool key Escape
 sleep 1
@@ -2584,6 +2987,93 @@ xdotool mouseup 1
 cstate "(.pointer_position == [$((bx + 270)), $((by + 80))]) and (.windows[] | select(.app_id == \"tuna-test-beta\") | (.rect[0] - $bx) >= 75 and (.rect[0] - $bx) <= 150 and (.rect[1] - $by) >= 30 and (.rect[1] - $by) <= 60)" "drag and final pointer delivered" ||
     fail G-APP-DRAG "dragging Beta's header bar did not move it by the drag distance"
 pass G-APP-DRAG "dragging an app's header bar moves the window (#58)"
+
+# Edge resistance and snapping (#1192; mutter 51 edge-resistance.c): a
+# header drag 20 or 31 px past the left screen edge holds the window on
+# it and 40 px past (beyond mutter's 32 px) goes through; a keyboard move
+# (Alt+F7, then Left in 10 px steps) stops on the edge it would cross;
+# Shift snaps a drag flush to an edge. Beta goes back where it was. The
+# comparison slice's old binaries predate edge resistance.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    read -r er_id er_x er_y er_w er_h er_ws <<EOF2
+$(jq -r '.windows[] | select(.app_id == "tuna-test-beta") | "\(.id) \(.rect[0]) \(.rect[1]) \(.rect[2]) \(.rect[3]) \(.workspace)"' "$CSTATE")
+EOF2
+    er_gy=$((er_y + 20))
+    er_rect() { jq -c --argjson id "$er_id" '[.windows[] | select(.id == $id)][0].rect' "$CSTATE"; }
+    # Press Beta's header bar with the window's left edge at $1 and let
+    # GTK hand its move to the compositor; er_px and er_wx are then the
+    # pointer's and the window's x, which move together from there.
+    er_grab() {
+        xdotool mousemove --window "$WID" $(($1 + 120)) "$er_gy"
+        xdotool mousedown 1
+        xdotool mousemove --window "$WID" $(($1 + 131)) "$er_gy"
+        cstate ".interactive_move_window == $er_id and .pointer_position == [$(($1 + 131)), $er_gy]" "Beta move admitted" ||
+            { xdotool mouseup 1; fail G-EDGE-RESISTANCE "GTK never handed Beta's header drag to the compositor"; }
+        er_px=$(($1 + 131))
+        er_wx="$(er_rect | jq '.[0]')"
+    }
+    # Move the pointer so the window's left edge would be at $1 if
+    # nothing resisted, and wait for it to be at $2.
+    er_drag() {
+        er_to=$((er_px + $1 - er_wx))
+        xdotool mousemove --window "$WID" "$er_to" "$er_gy"
+        cstate ".pointer_position == [$er_to, $er_gy] and ([.windows[] | select(.id == $er_id)][0].rect[0] == $2)" "$3" 5 ||
+            { xdotool mouseup 1; fail G-EDGE-RESISTANCE "$4: Beta at $(er_rect)"; }
+    }
+    er_grab "$er_x"
+    er_drag -20 0 "held 20 px past the edge" "a drag 20 px past the left screen edge did not hold Beta on it"
+    er_drag -31 0 "held 31 px past the edge" "a drag 31 px past the left screen edge did not hold Beta on it"
+    snapshot_state "$CSTATE" "$ARTIFACTS/edge-resistance-held.json"
+    er_drag -40 -40 "through 40 px past the edge" "a drag 40 px past the left screen edge did not go through"
+    er_drag 47 47 "free away from the edge" "a drag away from the edge was resisted"
+    xdotool mouseup 1
+    cstate ".interactive_move_window == null and ([.windows[] | select(.id == $er_id)][0].rect == [47, $er_y, $er_w, $er_h])" "Beta dropped at x 47" ||
+        fail G-EDGE-RESISTANCE "Beta did not stay where the drag left it: $(er_rect)"
+    # A keyboard move stops on the first edge it crosses, another
+    # window's too: none may lie between Beta and the screen edge.
+    jq -e --argjson id "$er_id" --argjson ws "$er_ws" --argjson y "$er_y" --argjson h "$er_h" \
+        '[.windows[] | select(.id != $id and .workspace == $ws) | .rect | select(.[1] < $y + $h and .[1] + .[3] > $y) | .[0], .[0] + .[2] | select(. > -3 and . < 47)] | length == 0' \
+        "$CSTATE" >/dev/null ||
+        fail G-EDGE-RESISTANCE "another window's edge lies between Beta and the screen edge; the keyboard move would stop there first"
+    xdotool key alt+F7
+    cstate ".interactive_move_window == $er_id" "keyboard move" 5 ||
+        fail G-EDGE-RESISTANCE "Alt+F7 did not start a keyboard move of Beta"
+    for er_step in 37 27 17 7 0; do
+        xdotool key Left
+        cstate "[.windows[] | select(.id == $er_id)][0].rect[0] == $er_step" "keyboard move to x $er_step" 5 ||
+            { xdotool key Escape; fail G-EDGE-RESISTANCE "Left in the keyboard move did not take Beta to x $er_step (10 px steps, stopping on the screen edge): $(er_rect)"; }
+    done
+    snapshot_state "$CSTATE" "$ARTIFACTS/edge-resistance-keyboard.json"
+    xdotool key Return
+    cstate ".interactive_move_window == null and ([.windows[] | select(.id == $er_id)][0].rect == [0, $er_y, $er_w, $er_h])" "keyboard move ended on the edge" 5 ||
+        fail G-EDGE-RESISTANCE "Return did not end the keyboard move on the screen edge: $(er_rect)"
+    # Shift: a drag to x 30 lands flush on the nearest edge instead.
+    er_grab 0
+    xdotool keydown Shift_L
+    er_to=$((er_px + 30 - er_wx))
+    xdotool mousemove --window "$WID" "$er_to" "$er_gy"
+    cstate ".pointer_position == [$er_to, $er_gy]" "Shift drag delivered" 5 ||
+        { xdotool keyup Shift_L mouseup 1; fail G-EDGE-RESISTANCE "the Shift drag never reached the compositor"; }
+    sleep 0.3
+    snapshot_state "$CSTATE" "$ARTIFACTS/edge-resistance-snapped.json"
+    xdotool mouseup 1
+    xdotool keyup Shift_L
+    jq -e --argjson id "$er_id" --argjson ws "$er_ws" --argjson y "$er_y" --argjson width "$WIDTH" '
+        ([.windows[] | select(.id == $id)][0].rect) as $r |
+        ([0, $width] + [.windows[] | select(.id != $id and .workspace == $ws) | .rect | .[0], .[0] + .[2]]) as $edges |
+        $r[0] != 30 and $r[1] == $y and any($edges[]; . == $r[0] or . == $r[0] + $r[2])
+        ' "$ARTIFACTS/edge-resistance-snapped.json" >/dev/null ||
+        fail G-EDGE-RESISTANCE "a Shift drag to x 30 did not snap Beta flush to an edge: $(jq -c --argjson id "$er_id" '[.windows[] | select(.id == $id)][0].rect' "$ARTIFACTS/edge-resistance-snapped.json")"
+    er_snapped="$(jq -c --argjson id "$er_id" '[.windows[] | select(.id == $id)][0].rect' "$ARTIFACTS/edge-resistance-snapped.json")"
+    cstate ".interactive_move_window == null and ([.windows[] | select(.id == $er_id)][0].rect == $er_snapped) and .tile_preview == null" "snapped drop" 5 ||
+        fail G-EDGE-RESISTANCE "Beta did not stay snapped and floating at $er_snapped after the drop: $(er_rect)"
+    er_grab "$(echo "$er_snapped" | jq '.[0]')"
+    er_drag "$er_x" "$er_x" "Beta back" "Beta could not be dragged back"
+    xdotool mouseup 1
+    cstate ".interactive_move_window == null and ([.windows[] | select(.id == $er_id)][0].rect == [$er_x, $er_y, $er_w, $er_h])" "Beta back where it was" ||
+        fail G-EDGE-RESISTANCE "Beta did not go back to where it was: $(er_rect)"
+    pass G-EDGE-RESISTANCE "a header drag holds at the screen edge for 32 px and then goes through, a keyboard move stops on the edge it crosses, and Shift snaps a drag flush to an edge"
+fi
 
 # Edge tiling: held at the left edge, GNOME's tile preview covers the
 # left half (accent at half opacity); dragged back, it goes and the
@@ -3037,6 +3527,49 @@ EOF2
     cstate ".active_workspace == $mt_home" "home after placement" ||
         fail G-CENTER-NEW-WINDOWS "could not return to the home workspace"
     pass G-CENTER-NEW-WINDOWS "new windows are centred with center-new-windows and take mutter's first fit without it"
+
+    # org.gnome.mutter auto-maximize (#1190; mutter 51 place.c:1088-1100):
+    # a window first mapping over 80% of the work area
+    # (MAX_UNMAXIMIZED_WINDOW_AREA) opens maximized; with the key off the
+    # same window keeps its size.
+    xdotool key super+Page_Down
+    cstate ". as \$s | .active_workspace != $mt_home and ([.windows[] | select(.workspace == \$s.active_workspace)] | length) == 0" "empty workspace" ||
+        fail G-AUTO-MAXIMIZE "Super+Page_Down did not reach an empty workspace"
+    am_work_area="[0, 32, $WIDTH, $((HEIGHT - 32))]"
+    for am_on in true false; do
+        if [ "$am_on" = false ]; then
+            gsettings set org.gnome.mutter auto-maximize false
+            cstate '.multitasking.auto_maximize == false' "auto-maximize off" ||
+                fail G-AUTO-MAXIMIZE "auto-maximize=false never reached the compositor"
+        fi
+        WAYLAND_DISPLAY="$SOCKET_NAME" TUNA_TEST_SIZE=1200x720 "$PY" "$ROOT/scripts/lib/tuna-test-window.py" \
+            Delta "#9141ac" >"$ARTIFACTS/window-Delta-auto-maximize-$am_on.log" 2>&1 &
+        am_pid=$!
+        cstate ". as \$s | .focused_app_id == \"tuna-test-delta\" and any(.windows[]; .app_id == \"tuna-test-delta\" and .workspace == \$s.active_workspace and .rect[2] > 0)" "large window mapped" ||
+            fail G-AUTO-MAXIMIZE "the 1200x720 window never mapped"
+        sleep 1
+        snapshot_state "$CSTATE" "$ARTIFACTS/auto-maximize-$am_on.json"
+        scrot "$ARTIFACTS/08g-auto-maximize-$am_on.png" >/dev/null
+        am_rect="$(jq -c '[.windows[] | select(.app_id == "tuna-test-delta")][0].rect' "$ARTIFACTS/auto-maximize-$am_on.json")"
+        if [ "$am_on" = true ]; then
+            [ "$am_rect" = "$(echo "$am_work_area" | jq -c .)" ] ||
+                fail G-AUTO-MAXIMIZE "a 1200x720 first map in the ${WIDTH}x$((HEIGHT - 32)) work area opened at $am_rect, not maximized to $am_work_area"
+        else
+            echo "$am_rect" | jq -e --argjson work "$am_work_area" '.[2] < $work[2] and .[3] < $work[3] and .[2] * .[3] * 10 > $work[2] * $work[3] * 8' >/dev/null ||
+                fail G-AUTO-MAXIMIZE "with auto-maximize off the 1200x720 window opened at $am_rect, not floating over 80% of the work area"
+        fi
+        kill "$am_pid"
+        wait "$am_pid" 2>/dev/null || true
+        cstate 'all(.windows[]; .app_id != "tuna-test-delta")' "large window gone" ||
+            fail G-AUTO-MAXIMIZE "the test window did not close"
+    done
+    gsettings reset org.gnome.mutter auto-maximize
+    cstate '.multitasking.auto_maximize == true' "auto-maximize restored" ||
+        fail G-AUTO-MAXIMIZE "resetting auto-maximize did not reach the compositor"
+    xdotool key super+Page_Up
+    cstate ".active_workspace == $mt_home" "home after auto-maximize" ||
+        fail G-AUTO-MAXIMIZE "could not return to the home workspace"
+    pass G-AUTO-MAXIMIZE "a first map over 80% of the work area opens maximized to it; with auto-maximize off the same window floats at its own size"
 fi
 for key in cycle-group cycle-group-backward cycle-windows cycle-windows-backward switch-windows switch-windows-backward; do
     gsettings reset org.gnome.desktop.wm.keybindings "$key"
@@ -3171,7 +3704,8 @@ scrot "$ARTIFACTS/10-search.png" >/dev/null
 # waits for that turn's frame to be drawn, and within 1 s after one it
 # starts once the turn is 1 s old.
 if [ "$GRID_CANCEL_OLD_NEGATIVE" != 1 ]; then
-    minute_ms() { echo $(($(date +%s%3N) % 60000)); }
+    # Not %3N: uutils date (Ubuntu 26.04's) ignores its width.
+    minute_ms() { echo $(($(date +%s%N) / 1000000 % 60000)); }
     sleep_ms() { sleep "$(printf '%d.%03d' $(($1 / 1000)) $(($1 % 1000)))"; }
     search_still_ms="$(minute_ms)"
     if [ "$search_still_ms" -ge 57000 ]; then
@@ -3192,6 +3726,10 @@ if [ "$GRID_CANCEL_OLD_NEGATIVE" != 1 ]; then
     pass G-OV-SEARCH-STILL "the focused overview search sits still: no frames while nothing changes"
 fi
 
+# The probe launched now holds its window back (G-BUSY-CURSOR below). The
+# comparison slice's old binaries predate startup sequences.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then touch "$PROBE_HOLD"; fi
+busy_launched=$(date +%s)
 xdotool key Return
 end=$(($(date +%s) + 15))
 until [ -f "$PROBE_MARKER" ] || [ "$(date +%s)" -gt "$end" ]; do sleep 0.3; done
@@ -3200,6 +3738,37 @@ cmp -s "$PROBE_MARKER" "$ARTIFACTS/launch-environment-expected.json" ||
     fail G-OV-LAUNCH "desktop-entry launch inherited shell-private portal flags"
 cstate '.overview_open | not' "closed" || fail G-OV-LAUNCH "overview stayed open after launch"
 pass G-OV-LAUNCH "Enter launches the top result with the caller's portal flags and closes the overview"
+
+# GNOME's busy cursor (#1193; mutter 51 compositor.c:1132-1146): the
+# shell's launch is a startup sequence, and while it is pending the theme
+# cursors the compositor picks become the wait cursor (a client's own
+# cursor surface stays, as in mutter, so the pointer rests on the
+# desktop); the launched app's window completes it, long before mutter's
+# 15 s timeout would.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    jq -e '.windows | all(.rect | 150 < .[0] or 150 >= .[0] + .[2] or 500 < .[1] or 500 >= .[1] + .[3])' "$CSTATE" >/dev/null ||
+        fail G-BUSY-CURSOR "a window covers the desktop point 150,500"
+    xdotool mousemove --window "$WID" 150 500
+    busy_pending='.pointer_position == [150, 500] and .startup.busy and any(.startup.pending[]; .app_id == "tuna-probe" and .source == "launch") and .cursor.source == "busy" and .cursor.name == "wait"'
+    cstate "$busy_pending" "busy cursor while the launch is pending" 5 ||
+        fail G-BUSY-CURSOR "the pending launch did not show the wait cursor on the desktop"
+    snapshot_state "$CSTATE" "$ARTIFACTS/busy-cursor-pending.json"
+    scrot "$ARTIFACTS/10b-busy-cursor.png" >/dev/null
+    sleep 1
+    jq -e "$busy_pending" "$CSTATE" >/dev/null ||
+        fail G-BUSY-CURSOR "the wait cursor did not last while the launch stayed pending"
+    rm -f "$PROBE_HOLD"
+    cstate '.pointer_position == [150, 500] and any(.windows[]; .app_id == "tuna-probe") and (.startup.busy | not) and (.startup.pending | length) == 0 and .cursor.source == "default" and .cursor.name == "default"' "launch completed by its window" 10 ||
+        fail G-BUSY-CURSOR "the probe's window mapped but the wait cursor stayed"
+    [ "$(date +%s)" -lt $((busy_launched + 14)) ] ||
+        fail G-BUSY-CURSOR "the wait cursor cleared too late to tell the window's map from mutter's 15 s timeout"
+    snapshot_state "$CSTATE" "$ARTIFACTS/busy-cursor-completed.json"
+    kill "$(cat "$ARTIFACTS/probe-window.pid")"
+    cstate 'all(.windows[]; .app_id != "tuna-probe")' "probe window closed" ||
+        fail G-BUSY-CURSOR "the probe's window did not close"
+    xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
+    pass G-BUSY-CURSOR "a pending launch turns the desktop's default cursor into the wait cursor (startup sequence from the shell) until its window maps, then the default returns"
+fi
 
 # An app installed while the shell runs is searchable at once (GNOME
 # watches the application directories too).
@@ -3336,8 +3905,17 @@ grid_samples() {
     samples_mark="$1"
     samples_name="$2"
     shift 2
-    "$PY" "$ROOT/scripts/lib/grid-anim-samples.py" --log "$LOG" --offset "$samples_mark" "$@" \
-        >"$ARTIFACTS/grid-anim-samples-$samples_name.txt" 2>&1
+    samples_output="$ARTIFACTS/grid-anim-samples-$samples_name.txt"
+    if "$PY" "$ROOT/scripts/lib/grid-anim-samples.py" --log "$LOG" --offset "$samples_mark" "$@" \
+        >"$samples_output" 2>&1; then
+        return 0
+    else
+        samples_status=$?
+    fi
+    printf 'tuna-gtk-shell-proof: grid animation mismatch (samples: %s; raw trace: %s)\n' \
+        "$samples_output" "$LOG" >&2
+    cat "$samples_output" >&2
+    return "$samples_status"
 }
 if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     log_has "$page_mark" "grid-anim page-switch start ms=300 motion=full" ||
@@ -3347,7 +3925,7 @@ if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     log_has "$page_mark" "grid-anim page-arrow start ms=200" ||
         fail G-GRID-PAGE-ANIM "the page arrows did not fade over 200 ms"
     grid_samples "$page_mark" next --from 0 --to 1 ||
-        fail G-GRID-PAGE-ANIM "page-switch frames or page dots strayed from GNOME's 300 ms out-cubic (grid-anim-samples-next.txt)"
+        fail G-GRID-PAGE-ANIM "page-switch frames or page dots strayed from GNOME's 300 ms out-cubic ($ARTIFACTS/grid-anim-samples-next.txt)"
     # With animations off the switch and the arrows jump.
     motion_policy Off
     page_mark="$(log_mark)"
@@ -3358,7 +3936,7 @@ if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     log_has "$page_mark" "grid-anim page-switch start" &&
         fail G-GRID-PAGE-ANIM "with animations off a page slide started"
     grid_samples "$page_mark" off --instant --to 0 ||
-        fail G-GRID-PAGE-ANIM "with animations off the pages or dots passed through between pages (grid-anim-samples-off.txt)"
+        fail G-GRID-PAGE-ANIM "with animations off the pages or dots passed through between pages ($ARTIFACTS/grid-anim-samples-off.txt)"
     "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-grid-page1-off.json" 20 ||
         fail G-GRID-PAGE-ANIM "accessibility dump failed"
     showing "$ARTIFACTS/a11y-grid-page1-off.json" "Previous Page" &&
@@ -3369,7 +3947,7 @@ if [ "$GRID_CANCEL_ONLY" != 1 ]; then
         --press "Next Page" || fail G-GRID-PAGE-ANIM "could not return to page two"
     log_wait "$page_mark" "grid-anim page-switch settle" || fail G-GRID-PAGE-ANIM "the page switch back never settled"
     grid_samples "$page_mark" next-again --from 0 --to 1 ||
-        fail G-GRID-PAGE-ANIM "the second switch's frames or dots strayed from GNOME's curve (grid-anim-samples-next-again.txt)"
+        fail G-GRID-PAGE-ANIM "the second switch's frames or dots strayed from GNOME's curve ($ARTIFACTS/grid-anim-samples-next-again.txt)"
     sleep 0.5
     pass G-GRID-PAGE-ANIM "page switches ease out-cubic over 300 ms (every frame-clock sample on GNOME's curve, page dots following the drawn position) and the arrows fade over 200 ms; with animations off both jump"
 fi
@@ -3715,70 +4293,7 @@ cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overvie
 rm -f "$XDG_DATA_HOME"/applications/tuna-page-*.desktop
 sleep 1.5
 
-# GNOME's folder edits by drag: one app onto another makes a folder of
-# the two (org.gnome.desktop.app-folders); one dragged out of the
-# folder's dialog onto the shade leaves it. Two apps named to sort first
-# sit in the first two cells (113px tiles 12px apart, centred).
-for n in One Two; do
-    printf '[Desktop Entry]\nName=AAA Drag %s\nExec=true\nType=Application\n' "$n" \
-        >"$XDG_DATA_HOME/applications/tuna-drag-$n.desktop"
-done
-sleep 1.5
-before="$(gsettings get org.gnome.desktop.app-folders folder-children)"
-drag() {
-    xdotool mousemove --window "$WID" "$1" "$2"
-    sleep 0.3
-    xdotool mousedown 1
-    sleep 0.2
-    for i in $(seq 1 20); do
-        xdotool mousemove --window "$WID" $(($1 + ($3 - $1) * i / 20)) $(($2 + ($4 - $2) * i / 20))
-        sleep 0.03
-    done
-    sleep 0.4
-    xdotool mouseup 1
-    sleep 1.5
-}
-xdotool key super+a
-cstate '.overview_open and .overview_app_grid' "app grid" || fail G-FOLDER-DND "Super+A did not show the app grid"
-sleep 1.5
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-drag-source.json" 20 || fail G-FOLDER-DND "source dump failed"
-grid_origin
-source_point="$(grid_point "$ARTIFACTS/a11y-folder-drag-source.json" "AAA Drag Two")" || fail G-FOLDER-DND "source bounds missing"
-target_point="$(grid_point "$ARTIFACTS/a11y-folder-drag-source.json" "AAA Drag One")" || fail G-FOLDER-DND "target bounds missing"
-# shellcheck disable=SC2086
-drag $source_point $target_point
-scrot "$ARTIFACTS/11e-folder-made.png" >/dev/null
-after="$(gsettings get org.gnome.desktop.app-folders folder-children)"
-folder=""
-for f in $(echo "$after" | tr -d "[]',"); do
-    case " $(echo "$before" | tr -d "[]',") " in *" $f "*) ;; *) folder="$f" ;; esac
-done
-[ -n "$folder" ] || fail G-FOLDER-DND "dropping an app on another made no folder ($after)"
-fpath="org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder/"
-apps="$(gsettings get "$fpath" apps)"
-case "$apps" in
-    *tuna-drag-One.desktop*tuna-drag-Two.desktop*|*tuna-drag-Two.desktop*tuna-drag-One.desktop*) ;;
-    *) fail G-FOLDER-DND "the new folder holds $apps" ;;
-esac
-name="$(gsettings get "$fpath" name | tr -d "'")"
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-new.json" 20 \
-    --press "$name" || fail G-FOLDER-DND "could not open the new folder '$name'"
-sleep 1.5
-scrot "$ARTIFACTS/11f-folder-dialog.png" >/dev/null
-# The dialog's second tile (AAA Drag Two) out onto the shade.
-"$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-folder-dialog-source.json" 20 || fail G-FOLDER-DND "dialog dump failed"
-grid_origin tuna-folder-dialog
-source_point="$(grid_point "$ARTIFACTS/a11y-folder-dialog-source.json" "AAA Drag Two")" || fail G-FOLDER-DND "dialog source bounds missing"
-# shellcheck disable=SC2086
-drag $source_point 140 560
-apps="$(gsettings get "$fpath" apps)"
-[ "$apps" = "['tuna-drag-One.desktop']" ] ||
-    fail G-FOLDER-DND "dragging an app out left the folder with $apps"
-pass G-FOLDER-DND "an app dropped on another makes a GNOME folder; one dragged out of its dialog leaves it"
-xdotool key Escape
-cstate '.overview_open | not' "closed" || { xdotool key Escape; cstate '.overview_open | not' "closed" || fail G-FOLDER-DND "overview stayed open"; }
-rm -f "$XDG_DATA_HOME"/applications/tuna-drag-*.desktop
-sleep 1.5
+folder_dnd_proof
 
 grid_hover_proof
 grid_on_demand_proof
@@ -6251,6 +6766,50 @@ cstate '.keyboard.layout == "German"' "German again" ||
 gsettings set org.gnome.desktop.peripherals.keyboard repeat-interval 50
 cstate '.keyboard.repeat_rate == 20' "repeat" ||
     fail G-SETTINGS-INPUT "repeat-interval 50 ms did not set 20 keys/s"
+# org.gnome.mutter overlay-key (#1191; mutter 51 prefs.c:1474-1526): the
+# lone-key overview tap follows it live. 'Super_R' leaves Super_L
+# nothing to toggle and Super_R the overview; '' disables both. A key
+# that must not toggle is watched for 1.5 s. Super_R is tapped by its X
+# keycode (134, <RWIN>): xdotool's keysym lookup holds Super_L with it,
+# which is no lone tap.
+overlay_super_r=134
+overlay_stays_closed() {
+    for _ in 1 2 3 4 5; do
+        jq -e '.overview_open | not' "$CSTATE" >/dev/null || return 1
+        sleep 0.3
+    done
+}
+cstate '.overview_open | not' "overview closed before overlay-key" ||
+    fail G-OVERLAY-KEY "the overview was open before the overlay-key change"
+gsettings set org.gnome.mutter overlay-key 'Super_R'
+cstate '.multitasking.overlay_key == "Super_R" and .multitasking.overlay_keycodes == [126]' "overlay-key Super_R" ||
+    fail G-OVERLAY-KEY "overlay-key='Super_R' never reached the compositor as one key"
+xdotool key Super_L
+overlay_stays_closed || fail G-OVERLAY-KEY "Super_L still toggled the overview with overlay-key 'Super_R'"
+xdotool key "$overlay_super_r"
+cstate '.overview_open' "Super_R opens the overview" 5 ||
+    fail G-OVERLAY-KEY "Super_R did not toggle the overview with overlay-key 'Super_R'"
+xdotool key "$overlay_super_r"
+cstate '.overview_open | not' "Super_R closes the overview" 5 ||
+    fail G-OVERLAY-KEY "a second Super_R tap did not close the overview"
+gsettings set org.gnome.mutter overlay-key ''
+cstate '.multitasking.overlay_key == "" and .multitasking.overlay_keycodes == []' "overlay-key disabled" ||
+    fail G-OVERLAY-KEY "overlay-key='' never reached the compositor as no key"
+for overlay_tap in Super_L "$overlay_super_r"; do
+    xdotool key "$overlay_tap"
+    overlay_stays_closed || fail G-OVERLAY-KEY "key $overlay_tap toggled the overview with overlay-key ''"
+done
+gsettings reset org.gnome.mutter overlay-key
+overlay_default="$(gsettings get org.gnome.mutter overlay-key | tr -d "'")"
+cstate ".multitasking.overlay_key == \"$overlay_default\" and (.multitasking.overlay_keycodes | length) >= 1" "overlay-key restored" ||
+    fail G-OVERLAY-KEY "resetting overlay-key did not reach the compositor"
+xdotool key Super_L
+cstate '.overview_open' "Super_L opens the overview again" 5 ||
+    fail G-OVERLAY-KEY "Super_L did not toggle the overview after overlay-key was reset"
+xdotool key Escape
+cstate '.overview_open | not' "overview closed after overlay-key" ||
+    fail G-OVERLAY-KEY "the overview did not close"
+pass G-OVERLAY-KEY "overlay-key 'Super_R' moves the overview tap from Super_L to Super_R, '' disables it, and the reset brings Super_L back"
 gsettings set org.gnome.desktop.interface enable-hot-corners false
 sleep 1
 xdotool mousemove --window "$WID" 1 1
@@ -7619,6 +8178,9 @@ wb_a11y_dump() {
 # press a banner that had already expired, so one keep-alive move per short
 # step keeps the user active and the press within about a second of the
 # banner showing. Waits 1.5 s after the press, like --press alone.
+# Normal/high notices open collapsed, with their action row hidden. Once
+# the owned title is showing, use GNOME's Super+N to expand the current
+# banner before the same-pass title/action press below.
 wb_press_banner() {
     wbpb_gate="$1" wbpb_out="$2" wbpb_title="$3" wbpb_button="$4"
     wbpb_until=$(($(date +%s) + $5)) wbpb_step=0
@@ -7627,6 +8189,11 @@ wb_press_banner() {
             fail "$wbpb_gate" "keep-alive failed"
         wbpb_step=$((wbpb_step + 1))
         sleep 0.5
+        if wb_a11y_dump "$wbpb_out" 20 >/dev/null 2>&1 &&
+            jq -e --arg title "$wbpb_title" 'any(.[]; .showing and .name == $title)' "$wbpb_out" >/dev/null; then
+            xdotool key super+n || fail "$wbpb_gate" "could not expand the due banner"
+            sleep 0.3
+        fi
         if wb_a11y_dump "$wbpb_out" 20 --when-showing "$wbpb_title" --press "$wbpb_button" >/dev/null 2>&1; then
             WB_PRESS_EPOCH="$(date +%s)"
             sleep 1.5
@@ -10989,6 +11556,12 @@ cstate ".active_workspace == $home_ws and .focused == $moved" "home" ||
     fail G-OV-DND "could not return the window home"
 sleep 1
 
+# GNOME's XDND handling of the overview (#1189): real GTK drags open it from
+# the hot corner and the Activities button, activate a window preview after
+# 750 ms, and return to the starting workspace on cancel and drop.
+dnd_overview_proof
+sleep 1
+
 # Direct callers may not bypass capture consent by calling Shell interfaces.
 reply="$(gdbus call --session --dest org.gnome.Shell.Screenshot \
     --object-path /org/gnome/Shell/Screenshot \
@@ -11105,23 +11678,7 @@ if [ -n "$PW_PIDS" ] && command -v gst-launch-1.0 >/dev/null 2>&1; then
         fail G-CAPTURE-DENY "capture admission failed: $(tail -3 "$ARTIFACTS/capture-denial.log")"
     pass G-CAPTURE-DENY "untrusted callers and forged portal name denied screenshots, screencasts and shell recorder"
 
-    # Use the installed frontend/backend, with their genuine root-owned
-    # executable identities, on this proof's private session bus.
-    PORTAL_BACKEND=/usr/libexec/xdg-desktop-portal-gnome
-    [ -x "$PORTAL_BACKEND" ] || PORTAL_BACKEND=/usr/lib/xdg-desktop-portal-gnome
-    [ -x "$PORTAL_BACKEND" ] || fail G-PORTAL-CONSENT "installed GNOME backend missing"
-    mkdir -p "$XDG_CONFIG_HOME/xdg-desktop-portal"
-    printf '[preferred]\ndefault=gnome;gtk;\norg.freedesktop.impl.portal.ScreenCast=gnome\n' >"$XDG_CONFIG_HOME/xdg-desktop-portal/portals.conf"
-    XDG_CURRENT_DESKTOP=GNOME WAYLAND_DISPLAY="$SOCKET_NAME" GDK_BACKEND=wayland GTK_A11Y=atspi XDG_SESSION_TYPE=wayland "$PORTAL_BACKEND" --replace >"$ARTIFACTS/portal-gnome.log" 2>&1 &
-    PORTAL_BACKEND_PID=$!
-    PORTAL_PIDS="$PORTAL_BACKEND_PID"
-    "$PY" "$ROOT/scripts/lib/tuna-portal-ready.py" org.freedesktop.impl.portal.desktop.gnome org.freedesktop.impl.portal.ScreenCast "$ARTIFACTS/portal-backend-ready.json" --pid "$PORTAL_BACKEND_PID" ||
-        fail G-PORTAL-CONSENT "installed backend capabilities never became ready"
-    XDG_CURRENT_DESKTOP=GNOME /usr/libexec/xdg-desktop-portal --replace >"$ARTIFACTS/portal-frontend.log" 2>&1 &
-    PORTAL_FRONTEND_PID=$!
-    PORTAL_PIDS="$PORTAL_PIDS $PORTAL_FRONTEND_PID"
-    "$PY" "$ROOT/scripts/lib/tuna-portal-ready.py" org.freedesktop.portal.Desktop org.freedesktop.portal.ScreenCast "$ARTIFACTS/portal-frontend-ready.json" --pid "$PORTAL_FRONTEND_PID" ||
-        fail G-PORTAL-CONSENT "frontend capabilities never became ready"
+    portal_start
     for decision in cancel grant; do
         "$PY" "$ROOT/scripts/lib/tuna-portal-capture-client.py" "$ARTIFACTS/portal-$decision.png" "$decision" >"$ARTIFACTS/portal-$decision.log" 2>&1 &
         PORTAL_CLIENT=$!
@@ -11132,6 +11689,7 @@ if [ -n "$PW_PIDS" ] && command -v gst-launch-1.0 >/dev/null 2>&1; then
     [ -s "$ARTIFACTS/portal-grant.png" ] || fail G-PORTAL-CONSENT "granted frontend returned no consumed frame"
     [ ! -f "$ARTIFACTS/portal-cancel.png" ] || fail G-PORTAL-CONSENT "cancel produced frame"
     pass G-PORTAL-CONSENT "actual GNOME picker Cancel denies; Share grants and streams; owner Close removes node"
+    remote_access_indicator_gate
 
     # GNOME's screen recorder: the screenshot UI's video switch records
     # the selection (GNOME's first one, a centred quarter) as VP8 WebM in
@@ -13121,6 +13679,9 @@ for scenario in allow remembered-allow deny remembered-deny unknown; do
 done
 jq -e '."tuna-consent-allow.desktop" == ["GRANTED"] and ."tuna-consent-deny.desktop" == ["DENIED"] and (has("tuna-consent-unknown.desktop") | not)' "$ARTIFACTS/shortcut-permissions.json" >/dev/null || fail G-SHORTCUT-CONSENT "PermissionStore did not remember exactly the known apps"
 pass G-SHORTCUT-CONSENT "live requests require Allow, Deny stays inactive, known app decisions persist without prompting, unknown apps are not remembered, Super+Escape restores input"
+
+# Bells, input-feedback-sounds and the slider's feedback (#353).
+sound_alerts_proof
 
 # Every transient animation (#501) that ran with animations on played
 # for its full GNOME duration and settled: the OSD and its level, the

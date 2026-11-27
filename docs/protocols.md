@@ -57,7 +57,7 @@ and this page together.
 | Global | Version | Notes |
 |---|---|---|
 | wl_compositor | 6 | preferred buffer scale sent per surface, for the output it is on |
-| wl_subcompositor | 1 | |
+| wl_subcompositor | 1 | a subsurface placed above or below its parent is drawn there on the desktop, in the overview's window previews and in window screenshots (G-SUBSURFACE-STACKING, #1255) |
 | wl_shm | 2 | |
 | wl_seat | 9 | |
 | wl_output | 4 | one per connected output |
@@ -86,7 +86,7 @@ and this page together.
 | xdg_wm_dialog_v1 | 1 | a modal dialog is attached to its parent: focusing the parent focuses the dialog (GNOME's attach-modal-dialogs) |
 | zxdg_exporter_v2, zxdg_importer_v2 | 1 | xdg-foreign: the portal parents its dialogs to the app's window, which centres and attaches them like the app's own |
 | zxdg_exporter_v1, zxdg_importer_v1 | 1 | GTK 3's xdg-foreign: one handle table with v2, as Mutter, so the portal's v2 import parents its dialogs to a GTK 3 window; revoking an export destroys its imports and clears their parents (`third-party/smithay/XDG-FOREIGN-V1-PATCH.diff`) |
-| xdg_system_bell_v1 | 1 | plays GNOME's `bell-window-system` sound through `canberra-gtk-play` when installed (Mutter's audible bell); a burst of rings is one sound |
+| xdg_system_bell_v1 | 1 | Mutter 51's bell (`src/core/bell.c`): with `audible-bell` and `event-sounds` it plays GNOME's `bell-window-system` through `canberra-gtk-play` when installed (a burst of rings is one sound); with `visual-bell` it flashes the ringing window's frame or the whole output per `visual-bell-type`, at most once per 500 ms. X11 clients' XKB bells take the same path through the window manager (`XkbBellNotify`, as Mutter's `src/x11/events.c`). Proofs G-VISUAL-BELL, G-X11-BELL |
 | xdg_toplevel_tag_manager_v1 | 1 | each window keeps its tag and description |
 | xdg_session_manager_v1 | 1 | window session save and restore as in Mutter 51 (P-SY-08): a client that opens a session gets its windows back after logout or reboot (workspace, position and size, maximized, tiled, fullscreen, output; minimized is not restored, as in Mutter); store `$XDG_DATA_HOME/tuna/window-sessions.json`, written 3 s after a change and at exit (`crates/compositor/src/xdg_session.rs`) |
 | zwp_keyboard_shortcuts_inhibit_manager_v1 | 1 | after Allow, the focused window gets every key, the shell's grabs, Super and Alt+Tab included; Super+Escape (Mutter's restore-shortcuts) takes them back until the window is focused again |
