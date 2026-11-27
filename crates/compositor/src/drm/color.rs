@@ -268,7 +268,7 @@ mod calibration_blob_tests {
 }
 
 /// The connector's `EDID` blob, when it has one.
-pub fn connector_edid(drm: &DrmDevice, connector: connector::Handle) -> Option<Vec<u8>> {
+pub fn connector_edid(drm: &impl ControlDevice, connector: connector::Handle) -> Option<Vec<u8>> {
     let props = drm.get_properties(connector).ok()?;
     let (handles, values) = props.as_props_and_values();
     for (&handle, &value) in handles.iter().zip(values) {

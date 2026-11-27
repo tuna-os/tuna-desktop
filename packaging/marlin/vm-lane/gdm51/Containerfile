@@ -5,6 +5,7 @@ FROM ${BASE_IMAGE}
 ARG GDM_SOURCE_SHA=7b52bdf34be22bc60fef62b157be64b589b13f6a
 COPY gdm51-artifacts/manifest.json gdm51-artifacts/packages/ /tmp/gdm51/
 RUN GDM_SOURCE_SHA=${GDM_SOURCE_SHA} python3 - <<'PY'
+import difflib
 import hashlib
 import json
 import os
@@ -33,6 +34,49 @@ def digest(path):
 
 def command(*args):
     return subprocess.check_output(args, text=True, timeout=60)
+
+# The one shipped-payload entry the candidate may legitimately change. The
+# receipt is taken from whatever gdm the repository carries at build time, while
+# the candidate is a fixed native build of one GNOME release, so their service
+# units can differ for benign upstream reasons (gdm 51.2-1 added
+# After=accounts-daemon.service) without the candidate being altered. PAM files,
+# the session files and every other payload entry stay strictly pinned.
+CANDIDATE_OWNED_UNIT = '/usr/lib/systemd/system/gdm.service'
+
+def reconcile_candidate_unit(receipt_path, gdm_archive, unit_before):
+    # Re-check the receipt; accept at most ONE mismatch, and only that unit, and
+    # only when the installed bytes are exactly the candidate archive's copy.
+    check = subprocess.run(['sha256sum', '--check', str(receipt_path)], capture_output=True,
+                           text=True, timeout=60)
+    if check.returncode == 0:
+        return None
+    lines = check.stdout.splitlines()
+    failed = [line[:-len(': FAILED')] for line in lines if line.endswith(': FAILED')]
+    require(failed == [CANDIDATE_OWNED_UNIT] and not any('FAILED open' in line for line in lines),
+            'shipped payload changed beyond the candidate-owned gdm.service: ' + ' '.join(failed or ['?']))
+    unit = Path(CANDIDATE_OWNED_UNIT)
+    member = subprocess.check_output(['bsdtar', '-xOf', gdm_archive, CANDIDATE_OWNED_UNIT.lstrip('/')],
+                                     timeout=60)
+    require(stat.S_ISREG(unit.lstat().st_mode) and unit.read_bytes() == member,
+            'installed gdm.service is not the candidate archive copy')
+    before_hex = hashlib.sha256(unit_before).hexdigest()
+    after_hex = hashlib.sha256(member).hexdigest()
+    rows = []
+    replaced = 0
+    for row in receipt_path.read_bytes().decode().splitlines(keepends=True):
+        fields = row.rstrip('\n').split(None, 1)
+        if len(fields) == 2 and fields[1] == CANDIDATE_OWNED_UNIT:
+            require(fields[0] == before_hex, 'receipt entry is not the pre-install gdm.service')
+            row = after_hex + '  ' + CANDIDATE_OWNED_UNIT + '\n'
+            replaced += 1
+        rows.append(row)
+    require(replaced == 1, 'receipt must hold exactly one gdm.service entry')
+    receipt_path.write_text(''.join(rows))
+    subprocess.run(['sha256sum', '--check', str(receipt_path)], check=True, timeout=60)
+    return {'path': CANDIDATE_OWNED_UNIT, 'before_sha256': before_hex, 'after_sha256': after_hex,
+            'diff': ''.join(difflib.unified_diff(
+                unit_before.decode().splitlines(keepends=True), member.decode().splitlines(keepends=True),
+                'repository-gdm/gdm.service', 'candidate-gdm/gdm.service'))}
 
 def validate_candidate(root, expected_source):
     # Read-only and unprivileged: admission finishes before any pacman operation.
@@ -96,6 +140,8 @@ out.mkdir()
 payload_manifest = Path('/usr/share/tuna-vm/shipped-payload.sha256')
 payload_receipt = payload_manifest.read_bytes()
 subprocess.run(['sha256sum', '--check', str(payload_manifest)], check=True, timeout=60)
+require(command('pacman', '-Qqo', CANDIDATE_OWNED_UNIT).strip() == 'gdm', 'gdm.service is not owned by gdm')
+unit_before = Path(CANDIDATE_OWNED_UNIT).read_bytes()
 policy = Path('/etc/pacman.conf').read_bytes()
 # Ordinary local package transaction; existing LocalFileSigLevel remains in force.
 with (out / 'install.log').open('wb') as log:
@@ -103,7 +149,7 @@ with (out / 'install.log').open('wb') as log:
                    stderr=subprocess.STDOUT, check=True, timeout=300)
 require(Path('/etc/pacman.conf').read_bytes() == policy, 'pacman policy changed')
 require(payload_manifest.read_bytes() == payload_receipt, 'shipped payload receipt changed')
-subprocess.run(['sha256sum', '--check', str(payload_manifest)], check=True, timeout=60)
+unit_update = reconcile_candidate_unit(payload_manifest, archives[0], unit_before)
 installed = command('pacman', '-Q', 'gdm', 'libgdm')
 require(installed == 'gdm 51.1.1-1.1\nlibgdm 51.1.1-1.1\n', 'installed version mismatch')
 members = {}
@@ -115,6 +161,8 @@ for member, owner in expected_members.items():
     require(actual == manifest['members'][member]['sha256'], 'installed member mismatch')
     members[member] = {'package': owner, 'sha256': actual}
 subprocess.run(['/usr/libexec/tuna-image-kernels', 'vm'], check=True, timeout=120)
+if unit_update is not None:
+    (out / 'gdm.service.diff').write_text(unit_update['diff'])
 (out / 'manifest.json').write_bytes(manifest_bytes)
 (out / 'installed-packages.txt').write_text(installed)
 (out / 'package-info.txt').write_text(command('pacman', '-Qi', 'gdm', 'libgdm'))
@@ -123,7 +171,10 @@ subprocess.run(['/usr/libexec/tuna-image-kernels', 'vm'], check=True, timeout=12
     'manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
     'packages': manifest['packages'], 'members': members,
     'shipped_payload_sha256': hashlib.sha256(payload_receipt).hexdigest(),
-    'shipped_payload_unchanged': True,
+    'shipped_payload_unchanged': unit_update is None,
+    'shipped_payload_candidate_owned_updates': (
+        [] if unit_update is None else [{k: unit_update[k] for k in ('path', 'before_sha256', 'after_sha256')}]),
+    'shipped_payload_updated_sha256': hashlib.sha256(payload_manifest.read_bytes()).hexdigest(),
     'pacman_conf_sha256': hashlib.sha256(policy).hexdigest(),
 }, indent=2) + '\n')
 PY

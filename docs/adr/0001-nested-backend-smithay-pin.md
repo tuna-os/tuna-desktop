@@ -1,6 +1,7 @@
 # ADR 0001: Nested backend and pinned Smithay/protocol revisions
 
-- Status: Decided (nested preview proven 001 T1–T5; production review stays a 004 gate)
+- Status: Decided (nested preview proven 001 T1–T5; production review stays a 004 gate);
+  amended 2026-11-13: keep and extend the vendored 0.7.0 fork (#1047)
 - Date: 2026-09-27
 - Owner: project (unassigned)
 - Dependent speks: 001 implementation (blocks compositor implementation
@@ -32,8 +33,9 @@ slices). Upstream reference revision is git tag `v0.7.0`.
   `XdgActivationState::create_external_token` and the calloop-native
   `WinitEventLoop`; rejected.
 - Waiting for a future release: no dated need; 0.7.0 is the latest
-  unyanked release and resolves cleanly. Revisit only if 0.7.x is
-  yanked or a later release changes the winit/calloop API.
+  unyanked release and resolves cleanly. The 2026-11-13 amendment
+  below replaces the original revisit condition (0.7.x yanked, or a
+  later release changing the winit/calloop API).
 
 ## Consequences
 
@@ -44,6 +46,50 @@ slices). Upstream reference revision is git tag `v0.7.0`.
   004 gate.
 - Follow-ups: EGL runtime probe on dev hardware; anvil/upstream-test
   review at tag `v0.7.0`.
+
+## Amendment 2026-11-13: keep and extend the vendored 0.7.0 fork (#1047)
+
+Colour management and HDR (#341) need protocols Smithay 0.7.0 does not
+have, so #1047 asked whether to stay on the fork or track upstream. The
+2026-11-10 audit of the fork against upstream master
+([#1047 audit](https://github.com/tuna-os/tuna-desktop/issues/1047#issuecomment-6780395901))
+found:
+
+- No Smithay release newer than 0.7.0 exists (GitHub tags and
+  crates.io); tracking upstream means a git pin with no semver
+  guarantees.
+- Of the protocols `docs/protocols.md` lists as blocked by Smithay,
+  master unblocks only `xdg_wm_base` 7, `ext_background_effect` and
+  `wl_fixes`. Colour management and representation have only stale
+  upstream drafts. DRM lease, DRM syncobj and dmabuf feedback v4+ are
+  already in 0.7.0; the gap is Tuna wiring.
+- Master carries breaking rewrites (`Dispatch2`, DnD, virtual keyboard,
+  input locking) of exactly the code the Tuna patches touch.
+
+Decision ([#1047 decision](https://github.com/tuna-os/tuna-desktop/issues/1047#issuecomment-6843130799),
+hanthor, 2026-11-13): keep the vendored Smithay 0.7.0 fork and keep
+extending it; do not track upstream git master now.
+
+- Build colour management and HDR (#341) as new isolated patches in
+  `third-party/smithay`, one `*-PATCH.diff` per feature, each described
+  in `third-party/smithay/ROOST-PATCH.md`.
+- Take the wins that need no Smithay move: wire the DRM lease, DRM
+  syncobj and dmabuf feedback v4 globals 0.7.0 already ships, and
+  backport `wl_fixes` (about 75 lines) if the locked wayland-server
+  0.31.14 has `destroy_object`.
+- Offering a generic Tuna patch upstream (for example
+  `PER-FRAME-READ-FENCE`, `SLEEP-RESET-API`) is welcome but blocks
+  nothing.
+
+Re-check trigger: re-evaluate when Smithay publishes a release newer
+than 0.7.0 on crates.io, or when upstream merges colour management. At
+that point rebase onto the release and drop the patches it absorbs; the
+2026-11-10 audit lists which Tuna patches have an upstream equivalent.
+
+Consequences: the cost of the fork grows with each patch, and the
+eventual rebase meets the `Dispatch2`, DnD, virtual-keyboard and input
+rewrites in one step. Moving now would cost that rebase plus a
+semver-less git pin and still not unblock #341.
 
 ## Evidence
 

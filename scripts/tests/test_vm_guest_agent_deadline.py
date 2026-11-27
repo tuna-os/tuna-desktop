@@ -20,6 +20,9 @@ class Tests(unittest.TestCase):
         actor.buffer = bytearray()
         actor.poisoned = False
         actor.pending_guest_pid = None
+        # The peer never answers a post-deadline status poll, so retirement
+        # stays unconfirmed; a short grace keeps the real-socket wait brief.
+        actor.RETIREMENT_GRACE = .05
         self.addCleanup(right.close)
         self.addCleanup(actor.close)
         return actor, right

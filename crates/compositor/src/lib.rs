@@ -116,6 +116,7 @@ pub(crate) mod focus_caret;
 pub mod focus_policy;
 pub mod fprintd;
 pub mod frame_timing;
+mod grid_trace;
 pub mod icc;
 pub mod idle_monitor;
 mod idle_notify;
@@ -840,6 +841,7 @@ impl CompositorHandler for State {
         smithay::wayland::compositor::add_pre_commit_hook::<State, _>(
             surface,
             |state, _dh, surface| {
+                crate::grid_trace::commit(state, surface, true);
                 if state.dead_layer_surfaces.contains(&surface.id()) {
                     smithay::wayland::compositor::with_states(surface, |states| {
                         let mut cached = states
@@ -853,6 +855,7 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &wl_surface::WlSurface) {
+        crate::grid_trace::commit(self, surface, false);
         self.pointer_scene_dirty = true;
         self.commit_count = self.commit_count.wrapping_add(1);
         on_commit_buffer_handler::<State>(surface);
@@ -1433,7 +1436,9 @@ impl State {
     /// removal live; it stays bindable until the runtime destroys it
     /// ([`take_retired_output_globals`](Self::take_retired_output_globals)),
     /// so a client binding it as it goes is not disconnected. Virtual
-    /// entries just drop. Returns whether an entry was removed.
+    /// entries just drop. A lock surface on the output goes with it: the
+    /// output that next takes the name waits for one of its own.
+    /// Returns whether an entry was removed.
     pub fn remove_output(&mut self, name: &str) -> bool {
         let Some(index) = self.outputs.iter().position(|entry| entry.name == name) else {
             return false;
@@ -1445,6 +1450,7 @@ impl State {
         }
         self.outputs.remove(index);
         self.protocols.color.output_removed(name);
+        self.forget_output_lock_surface(name);
         if was_primary {
             if let Some(first) = self.outputs.first_mut() {
                 first.primary = true;

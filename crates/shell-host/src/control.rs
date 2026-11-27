@@ -153,6 +153,9 @@ pub enum Handled {
     /// locked session (0.51). Read it back through
     /// [`ControlClient::lock_screen_shown`].
     LockScreenShown(bool),
+    /// Every active remote access grant, whole (0.54, #1162 F2): GNOME's
+    /// screen sharing and recording indicators follow it.
+    RemoteAccess(Vec<tuna_shell_control::RemoteAccessHandle>),
     /// The keyboard switched Sticky or Slow Keys: save and confirm.
     KeyboardAidToggled {
         aid: tuna_shell_control::KeyboardAid,
@@ -868,6 +871,21 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// The user stopped a remote access grant from the screen sharing
+    /// indicator (0.54): the compositor revokes it for good.
+    pub fn stop_remote_access(
+        &mut self,
+        kind: tuna_shell_control::RemoteAccessKind,
+        grant: u64,
+    ) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::StopRemoteAccess { kind, id: grant },
+        })?;
+        Ok(id)
+    }
+
     /// Carry out one of GNOME's window-menu actions. Returns the request id.
     pub fn window_action(
         &mut self,
@@ -1320,6 +1338,7 @@ impl ControlClient {
                 self.lock_shown = shown;
                 Ok(Handled::LockScreenShown(shown))
             }
+            Message::RemoteAccess { handles } => Ok(Handled::RemoteAccess(handles)),
             Message::KeyboardAidToggled { aid, enabled } => {
                 Ok(Handled::KeyboardAidToggled { aid, enabled })
             }
@@ -1652,6 +1671,7 @@ fn message_label(msg: &Message) -> &'static str {
         Message::ShowCloseDialog { .. } => "ShowCloseDialog",
         Message::HideCloseDialog { .. } => "HideCloseDialog",
         Message::LockScreenShown { .. } => "LockScreenShown",
+        Message::RemoteAccess { .. } => "RemoteAccess",
     }
 }
 
@@ -2278,6 +2298,47 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn remote_access_grants_decode_and_stops_reach_the_compositor() {
+        use tuna_shell_control::{
+            RemoteAccessHandle, RemoteAccessKind, RemoteAccessOwner, RemoteAccessTarget,
+        };
+        let (mut client, mut peer) = handshook();
+        let handles = vec![RemoteAccessHandle {
+            kind: RemoteAccessKind::ScreenCast,
+            id: 3,
+            owner: RemoteAccessOwner::Portal,
+            owner_name: ":1.9".into(),
+            recording: false,
+            targets: vec![RemoteAccessTarget::Monitor {
+                connector: "DP-1".into(),
+            }],
+        }];
+        server_write(
+            &mut peer,
+            &Message::RemoteAccess {
+                handles: handles.clone(),
+            },
+        );
+        assert_eq!(
+            client.poll().expect("grants"),
+            Handled::RemoteAccess(handles)
+        );
+        let id = client
+            .stop_remote_access(RemoteAccessKind::ScreenCast, 3)
+            .expect("sent");
+        assert_eq!(
+            server_read(&mut peer),
+            Message::Command {
+                id,
+                kind: CommandKind::StopRemoteAccess {
+                    kind: RemoteAccessKind::ScreenCast,
+                    id: 3
+                },
+            }
+        );
     }
 
     #[test]

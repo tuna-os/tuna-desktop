@@ -47,6 +47,12 @@ selects the account in GDM's user list, types the fixture password through
 QMP and requires a real non-root logind session with `Service=gdm-password`
 and the actual Tuna Desktop compositor (`V-GDM-LOGIN`). If the session runs
 another desktop, the check names it and does not type into that session.
+The lane polls the session and the guest inventory about once a second for
+up to 60 s. Tuna Desktop writes its state file shortly after it starts, so
+the first polls can fail at inventory's state read; those retries are not
+logged. Only the last unadmitted inventory record is logged, when the 60 s
+pass without a login, so a run whose `V-GDM-LOGIN` passes prints no
+`inventory failure` line from this wait (#1263).
 Selection tries Enter on
 the focused user, then Tab and Enter, then the typed user name, as
 tunaOS's own GDM login gate does. Portal checks require Settings, the

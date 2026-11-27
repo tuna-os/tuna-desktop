@@ -454,6 +454,14 @@ class DeviceInventoryProjection(unittest.TestCase):
         self.assertIn("input_devices", projected)
         self.assertIsNone(projected["input_devices"])
 
+    def test_power_save_mode_and_rendered_frames_reach_v_unlock_wake(self):
+        # V-UNLOCK-WAKE reads the blank and the frames after the wake from
+        # the inventory alone.
+        state = self.state() | {"power_save_mode": 3, "rendered_frames": 1234}
+        projected = self.inventory(state)["state"]
+        self.assertEqual((projected["power_save_mode"], projected["rendered_frames"]), (3, 1234))
+        self.assertIsNone(self.inventory(self.state())["state"]["rendered_frames"])
+
 
 class OrcaCommandWindow(unittest.TestCase):
     def check(self, started=10.0, ready=10.5, before=11.0, after=11.1, samples=96000):

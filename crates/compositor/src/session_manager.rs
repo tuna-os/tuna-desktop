@@ -1265,7 +1265,12 @@ mod tests {
 
         drop(as_player);
         drop(player);
-        wait_until("the player's inhibitor to go", || !share.idle_inhibited());
+        // The departure handler publishes the flag under the registry
+        // lock, then unexports the node in the same pass: wait for both.
+        wait_until("the player's inhibitor to go", || {
+            !share.idle_inhibited()
+                && zbus::block_on(node.call::<_, _, String>("GetReason", &())).is_err()
+        });
         let paths: Vec<zbus::OwnedObjectPath> =
             zbus::block_on(manager.call("GetInhibitors", &())).unwrap();
         assert_eq!(paths.len(), 1);

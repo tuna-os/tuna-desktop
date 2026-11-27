@@ -5,6 +5,8 @@
 use super::{Backend, Runtime};
 
 impl Runtime {
+    /// meta_monitor_manager_notify_monitors_changed →
+    /// meta_color_manager_monitors_changed: colord devices follow.
     #[cfg(feature = "drm")]
     pub(super) fn refresh_colord_monitors(&mut self) {
         let Backend::Drm(drm) = &self.backend else {

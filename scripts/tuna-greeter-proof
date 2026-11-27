@@ -1,0 +1,1022 @@
+#!/usr/bin/env bash
+# tuna-greeter-proof: the Tuna login screen on GDM's greeter API in the
+# nested session (#1164, docs/greeter.md, ledger P-LK-03).
+#
+# Usage:
+#   scripts/tuna-greeter-proof [--display :N] [--artifacts DIR]
+#
+# Binaries: $TUNA_PROOF_BIN_DIR when set, else a cargo build of
+# tuna-compositor and tuna-greeter (${CARGO_TARGET_DIR:-target}/debug).
+#
+# The real `tuna-compositor --greeter` runs nested on Xvfb and supervises
+# the real tuna-greeter (TUNA_GREETER_TRACE=1) on a private session bus,
+# AT-SPI bus and XDG dirs. GDM's daemon and AccountsService are
+# scripts/lib/tuna-gdm-mock.py on a private system bus (a dbus-daemon with
+# a permissive test policy) handed to the compositor only as
+# DBUS_SYSTEM_BUS_ADDRESS: Manager.OpenSession returns the address of a
+# GDBusServer on unix:dir= (GDM's /run/gdm/dbus), whose
+# /org/gnome/DisplayManager/Session serves UserVerifier and Greeter as GDM
+# 51.1.1 does for the gdm-password conversation. Users ada, grace and
+# katherine are listed; gdm-greeter (system) and mallory (locked) are not.
+# The sessions are fixture wayland-sessions Tuna (tuna, GDM's fallback, as
+# TunaOS sets FallbackSession=tuna) and GNOME (gnome). NOTIFY_SOCKET is a
+# datagram socket of this proof. Gates (assertions.txt carries the ID):
+#   G-GREETER-READY      the greeter's layer maps, the compositor sends
+#                        READY=1 once, the greeter registers with GDM
+#   G-GREETER-USER-LIST  the listed fixture users show (no system or locked
+#                        account), each a row with an avatar; ada's is her
+#                        AccountsService IconFile, on the list and her prompt
+#   G-GREETER-NO-SHELL   only the tuna-greeter layer; no shell process;
+#                        Super, the hot corner and Super+L open no
+#                        overview and no lock
+#   G-GREETER-NOT-LISTED "Not listed?" asks "Username" (visible entry);
+#                        the typed name begins gdm-password for it; Back
+#                        cancels to the list
+#   G-GREETER-GIVE-UP    three wrong passwords (allowed-failures 3) show
+#                        GDM's problem each time and return to the list
+#   G-GREETER-SESSION    Login Options shows GDM's default Tuna checked;
+#                        GNOME goes to SelectSession and is selected again
+#                        after the retry's begin; a login without a choice
+#                        sends no SelectSession and starts Tuna
+#   G-GREETER-WRONG-PASSWORD GDM's problem shows, gdm-password begins
+#                        again, and the retry with the right password logs in
+#   G-GREETER-PASSWORD   the typed secret reaches AnswerQuery (its SHA-256
+#                        matches; it is in no log or artifact)
+#   G-GREETER-START      StartSessionWhenReady(gdm-password, true) after
+#                        VerificationComplete and SessionOpened
+#   G-GREETER-SUPERVISION killing tuna-greeter restarts it (new channel,
+#                        user list back); with the restart budget spent the
+#                        compositor exits non-zero
+#   G-GREETER-HYGIENE    no password in any artifact; no panic
+# Then a second login screen on the same GDM, with GDM 51.1.1's
+# org.gnome.login-screen schema (scripts/lib) on the keyfile backend and
+# TUNA_SESSION_KIND=hardware (the mock also serves logind's power calls):
+#   G-GREETER-POLICY     disable-user-list asks "Username" (no list, no Back);
+#                        the banner text and the logo show; allowed-failures
+#                        1 gives up after one wrong password; with
+#                        disable-user-list off a restarted greeter lists
+#   G-GREETER-CAPS-LOCK  Caps Lock shows "Caps lock is on" under the
+#                        password entry only, and Caps Lock off hides it
+#   G-GREETER-POWER-MENU on hardware "Power Off / Log Out" offers Suspend,
+#                        Restart… and Power Off…; Suspend reaches logind;
+#                        disable-restart-buttons removes the menu
+#   G-GREETER-LIVE-USERS AccountsService's UserAdded adds a row and
+#                        UserDeleted removes it, on the list page
+#   G-GREETER-RECONNECT  GDM closing the greeter's channel: the greeter asks
+#                        for a new one and keeps its list; the begin owed a
+#                        result is denied and begins again on the new
+#                        channel, where the login completes
+# Screenshots (x11grab of the nested window) and AT-SPI dumps for each step;
+# A-1-user-list.png, C-1-prompt.png and P-1-policy.png are the review shots
+# against GNOME 51's login dialog. Writes assertions.txt and receipt.json;
+# exits non-zero naming the failed gate.
+set -eu
+
+if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ]; then
+    TUNA_PROOF_PRIVATE_BUS=1 exec "$(dirname -- "$0")/lib/tuna-proof-session" --bus -- "$0" "$@"
+fi
+unset CDPATH
+ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+DISPLAY_ARG=""
+ARTIFACTS="$ROOT/greeter-artifacts"
+WIDTH=1280
+HEIGHT=800
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --display) DISPLAY_ARG="$2"; shift 2 ;;
+        --artifacts) ARTIFACTS="$2"; shift 2 ;;
+        --help|-h) sed -n '2,72p' "$0"; exit 0 ;;
+        *) echo "tuna-greeter-proof: unknown argument $1" >&2; exit 2 ;;
+    esac
+done
+mkdir -p "$ARTIFACTS"
+ARTIFACTS="$(cd "$ARTIFACTS" && pwd)"
+LOG="$ARTIFACTS/nested.log"
+ASSERTIONS="$ARTIFACTS/assertions.txt"
+CSTATE="$ARTIFACTS/compositor-state.json"
+GDM_LOG="$ARTIFACTS/gdm-calls.jsonl"
+NOTIFY_LOG="$ARTIFACTS/notify.log"
+: >"$ASSERTIONS"
+: >"$LOG"
+: >"$GDM_LOG"
+: >"$NOTIFY_LOG"
+rm -f "$ARTIFACTS/receipt.json" "$CSTATE" "$ARTIFACTS"/*.png "$ARTIFACTS"/a11y-*.json "$ARTIFACTS"/a11y-*.err
+PY=/usr/bin/python3
+[ -x "$PY" ] || PY=python3
+ORIG_HOME="$HOME"
+BIN_DIR="${TUNA_PROOF_BIN_DIR:-${CARGO_TARGET_DIR:-$ROOT/target}/debug}"
+
+# Private runtime (AF_UNIX paths stay short) and XDG/HOME directories.
+RUN_PRIV="$(mktemp -d "${TMPDIR:-/tmp}/tuna-grp.XXXXXX")"
+chmod 700 "$RUN_PRIV"
+HOME="$ARTIFACTS/home"
+XDG_RUNTIME_DIR="$RUN_PRIV"
+XDG_CONFIG_HOME="$ARTIFACTS/config"
+XDG_DATA_HOME="$ARTIFACTS/data"
+XDG_CACHE_HOME="$ARTIFACTS/cache"
+XDG_STATE_HOME="$ARTIFACTS/state"
+FIXTURE="$ARTIFACTS/fixture"
+rm -rf "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$FIXTURE"
+mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" \
+    "$FIXTURE/share/wayland-sessions"
+# GDM's greeter environment (docs/greeter.md): its own data dir first,
+# the supported session types, keyfile settings in the private config.
+XDG_DATA_DIRS="$FIXTURE/share:/usr/local/share:/usr/share"
+GDM_SUPPORTED_SESSION_TYPES=wayland
+GSETTINGS_BACKEND=keyfile
+TUNA_COMPOSITOR_STATE="$CSTATE"
+TUNA_XWAYLAND=0
+export HOME XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME \
+    XDG_DATA_DIRS GDM_SUPPORTED_SESSION_TYPES GSETTINGS_BACKEND TUNA_COMPOSITOR_STATE TUNA_XWAYLAND
+# GDM's own org.gnome.login-screen (GDM 51.1.1, verbatim), compiled for
+# this run; keys are set with gsettings on the keyfile backend.
+GSETTINGS_SCHEMA_DIR="$FIXTURE/schemas"
+export GSETTINGS_SCHEMA_DIR
+unset WAYLAND_DISPLAY WAYLAND_SOCKET DBUS_SYSTEM_BUS_ADDRESS AT_SPI_BUS_ADDRESS NOTIFY_SOCKET \
+    GDM_MESSAGE_TIME_MULTIPLIER TUNA_GREETER_BIN TUNA_SHELL_BIN TUNA_SESSION_KIND
+
+# Secrets of this run only: never written below $ARTIFACTS.
+secret() { echo "$1-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"; }
+ADA_PASSWORD="$(secret ada)"
+GRACE_PASSWORD="$(secret grace)"
+KATHERINE_PASSWORD="$(secret katherine)"
+WRONG_PASSWORD="$(secret nope)"
+
+XVFB_PID=""
+ATSPI_PID=""
+SYSBUS_PID=""
+MOCK_PID=""
+NOTIFY_PID=""
+COMPOSITOR_PID=""
+COMPOSITOR_STATUS=""
+GREETER_PID=""
+WID=""
+CURRENT_GATE="SETUP"
+FAILED_GATE=""
+
+pass() {
+    echo "$1 pass $2" >>"$ASSERTIONS"
+    echo "tuna-greeter-proof: $1 pass: $2"
+}
+fail() {
+    FAILED_GATE="$1"
+    echo "$1 fail $2" >>"$ASSERTIONS"
+    echo "tuna-greeter-proof: $1 FAIL: $2" >&2
+    tail -40 "$LOG" >&2 2>/dev/null || true
+    exit 1
+}
+
+# Every process this proof started carries XDG_RUNTIME_DIR=$RUN_PRIV.
+owned_pids() {
+    : >"$ARTIFACTS/owned-pids.txt"
+    for environ in /proc/[0-9]*/environ; do
+        pid="${environ#/proc/}"
+        pid="${pid%/environ}"
+        [ "$pid" = "$$" ] && continue
+        if tr '\0' '\n' 2>/dev/null <"$environ" | grep -qxF "XDG_RUNTIME_DIR=$RUN_PRIV"; then
+            echo "$pid" >>"$ARTIFACTS/owned-pids.txt"
+        fi
+    done
+}
+
+stop_pid() {
+    [ -n "$1" ] || return 0
+    kill "$1" 2>/dev/null || return 0
+    for _ in $(seq 1 50); do kill -0 "$1" 2>/dev/null || break; sleep 0.1; done
+    kill -9 "$1" 2>/dev/null || true
+    wait "$1" 2>/dev/null || true
+}
+
+finish() {
+    status=$?
+    set +e
+    trap - EXIT INT TERM
+    if [ "$status" != 0 ] && [ -z "$FAILED_GATE" ]; then
+        FAILED_GATE="$CURRENT_GATE"
+        echo "$CURRENT_GATE fail exited with status $status" >>"$ASSERTIONS"
+    fi
+    [ -s "$CSTATE" ] && cp "$CSTATE" "$ARTIFACTS/final-state.json"
+    stop_pid "$COMPOSITOR_PID"
+    stop_pid "$MOCK_PID"
+    stop_pid "$NOTIFY_PID"
+    stop_pid "$SYSBUS_PID"
+    stop_pid "$ATSPI_PID"
+    stop_pid "$XVFB_PID"
+    owned_pids
+    swept=""
+    while read -r pid; do
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo gone)"
+        kill "$pid" 2>/dev/null && swept="$swept $pid:$comm"
+    done <"$ARTIFACTS/owned-pids.txt"
+    [ -n "$swept" ] && sleep 1
+    while read -r pid; do kill -9 "$pid" 2>/dev/null; done <"$ARTIFACTS/owned-pids.txt"
+    sleep 0.3
+    owned_pids
+    cp "$ARTIFACTS/owned-pids.txt" "$ARTIFACTS/leftover-pids.txt"
+    rm -rf "$RUN_PRIV"
+    leftover="$(tr '\n' ' ' <"$ARTIFACTS/leftover-pids.txt")"
+    if [ -n "$leftover" ]; then
+        echo "CLEANUP fail processes outlived the proof: $leftover" >>"$ASSERTIONS"
+        [ -n "$FAILED_GATE" ] || FAILED_GATE=CLEANUP
+    fi
+    if [ -e "$RUN_PRIV" ]; then
+        echo "CLEANUP fail $RUN_PRIV remains" >>"$ASSERTIONS"
+        FAILED_GATE="${FAILED_GATE:-CLEANUP}"
+    fi
+    "$PY" - "$ARTIFACTS" "$ROOT" "$BIN_DIR" "$FAILED_GATE" "$swept" "$COMPOSITOR_STATUS" <<'RECEIPT'
+import hashlib, json, pathlib, subprocess, sys
+out, root, bins, failed, swept, status = (pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]),
+                                          pathlib.Path(sys.argv[3]), sys.argv[4], sys.argv[5].split(), sys.argv[6])
+def sha(path):
+    try:
+        return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+def git(*args):
+    try:
+        return subprocess.run(['git', '-C', str(root), *args], capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+gates = []
+for line in (out / 'assertions.txt').read_text().splitlines():
+    gate, verdict, detail = (line.split(' ', 2) + ['', ''])[:3]
+    gates.append({'gate': gate, 'verdict': verdict, 'detail': detail})
+state = git('status', '--porcelain', '--untracked-files=no')
+receipt = {
+    'proof': 'tuna-greeter-proof', 'issue': 1164, 'ledger': 'P-LK-03',
+    'result': 'fail' if failed else 'pass', 'failed_gate': failed or None,
+    'source': {'head': git('rev-parse', 'HEAD'), 'dirty': bool(state),
+               'status_sha256': hashlib.sha256((state or '').encode()).hexdigest()},
+    'binaries': {name: sha(bins / name) for name in ('tuna-compositor', 'tuna-greeter')},
+    'fixtures': {name: sha(root / name) for name in (
+        'scripts/tuna-greeter-proof', 'scripts/lib/tuna-gdm-mock.py', 'scripts/lib/tuna-a11y-dump.py',
+        'scripts/lib/org.gnome.login-screen.gschema.xml')},
+    'bin_dir': str(bins), 'gates': gates,
+    'compositor_exit_status': int(status) if status.isdigit() else None,
+    'review_screenshots': ['A-1-user-list.png', 'C-1-prompt.png', 'C-2-wrong-password.png',
+                           'P-1-policy.png'],
+    'cleanup': {'swept_pids': swept,
+                'leftover_pids': (out / 'leftover-pids.txt').read_text().split()},
+    'scope': 'nested winit session on Xvfb; GDM 51 greeter API and AccountsService as a D-Bus '
+             'mock on a private system bus; real compositor (--greeter), tuna-greeter, GTK '
+             'widgets, X11 input and AT-SPI',
+    'not_covered': ['GDM itself: PAM, the session worker, VT handoff and session start',
+                    'gnome-session --session gnome-login and tuna-greeter.service (V-GDM-LOGIN)',
+                    'DRM hardware, the dynamic greeter user and GDM\'s uid checks',
+                    'fingerprint, smartcard, ChoiceList and CustomJSON web login'],
+}
+(out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+RECEIPT
+    if [ -n "$FAILED_GATE" ]; then
+        echo "tuna-greeter-proof: FAILED $FAILED_GATE (artifacts in $ARTIFACTS)" >&2
+        exit 1
+    fi
+    echo "tuna-greeter-proof: OK, artifacts in $ARTIFACTS"
+    exit 0
+}
+trap finish EXIT
+trap 'exit 130' INT TERM
+
+alive() { [ -n "$COMPOSITOR_PID" ] && kill -0 "$COMPOSITOR_PID" 2>/dev/null; }
+cstate() {
+    end=$(($(date +%s) + ${2:-20}))
+    while [ "$(date +%s)" -le "$end" ]; do
+        alive || return 1
+        [ -s "$CSTATE" ] && jq -e "$1" "$CSTATE" >/dev/null 2>&1 && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
+# Nested log: `mark` it, then wait for an exact greeter trace line after
+# the mark (`twait`); prints the line number.
+mark() { wc -l <"$LOG" | tr -d ' '; }
+twait() {
+    from="$1" text="tuna-greeter: $2" end=$(($(date +%s) + ${3:-20}))
+    while :; do
+        n="$(tail -n "+$((from + 1))" "$LOG" | grep -n -Fx -m1 -- "$text" | cut -d: -f1 || true)"
+        if [ -n "$n" ]; then echo $((from + n)); return 0; fi
+        [ "$(date +%s)" -ge "$end" ] && return 1
+        alive || return 1
+        sleep 0.2
+    done
+}
+
+# The GDM mock's log: `gmark`, then `gwait MARK JQ [TIMEOUT]` until an
+# entry after the mark satisfies the predicate; `gcount MARK JQ` counts.
+gmark() { wc -l <"$GDM_LOG" | tr -d ' '; }
+gsel() { tail -n "+$(($1 + 1))" "$GDM_LOG" | jq -c "select($2)"; }
+gcount() { gsel "$1" "$2" | wc -l | tr -d ' '; }
+gwait() {
+    end=$(($(date +%s) + ${3:-20}))
+    while :; do
+        [ "$(gcount "$1" "$2")" -gt 0 ] && return 0
+        [ "$(date +%s)" -ge "$end" ] && return 1
+        sleep 0.2
+    done
+}
+call() { echo ".kind == \"call\" and .member == \"$1\"${2:+ and $2}"; }
+sig() { echo ".kind == \"signal\" and .member == \"$1\"${2:+ and $2}"; }
+# The line (1-based, absolute) of the first entry after MARK matching JQ.
+gline() {
+    tail -n "+$(($1 + 1))" "$GDM_LOG" | jq -c "($2)" | grep -n -m1 -x true | cut -d: -f1 |
+        { read -r n && echo $(($1 + n)); } || true
+}
+sha() { printf %s "$1" | sha256sum | cut -d' ' -f1; }
+
+greeter_pid() { pgrep -P "$COMPOSITOR_PID" -x tuna-greeter | head -1 || true; }
+# A greeter other than $1 runs (the compositor restarted it).
+await_greeter() {
+    end=$(($(date +%s) + ${2:-30}))
+    while :; do
+        pid="$(greeter_pid)"
+        if [ -n "$pid" ] && [ "$pid" != "${1:-}" ]; then GREETER_PID="$pid"; return 0; fi
+        [ "$(date +%s)" -ge "$end" ] && return 1
+        alive || return 1
+        sleep 0.1
+    done
+}
+
+# AT-SPI dump of the running greeter.
+dump() {
+    "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-greeter "$ARTIFACTS/a11y-$1.json" 20 \
+        --pid "$GREETER_PID" "${@:2}" >/dev/null 2>"$ARTIFACTS/a11y-$1.err" ||
+        fail "$CURRENT_GATE" "accessibility dump $1 failed"
+}
+showing() { jq -e --arg n "$2" 'any(.[]; .name == $n and .showing)' "$ARTIFACTS/a11y-$1.json" >/dev/null; }
+hidden() { ! showing "$@"; }
+# shown_within DUMP TEXT SECONDS: dump until TEXT is showing, from now. GDM's
+# problem message stays up for about three seconds before a retry clears it,
+# and one dump started half a second late can miss it on a loaded host.
+shown_within() {
+    sw_end=$(($(date +%s%N) / 1000000 + $3 * 1000))
+    while :; do
+        dump "$1"
+        showing "$1" "$2" && return 0
+        [ "$(($(date +%s%N) / 1000000))" -ge "$sw_end" ] && return 1
+        sleep 0.1
+    done
+}
+role_of() {
+    jq -r --arg n "$2" 'first(.[] | select(.name == $n and .showing and .role != "label")) | .role' \
+        "$ARTIFACTS/a11y-$1.json"
+}
+checked() { jq -e --arg n "$2" 'any(.[]; .name == $n and .checked)' "$ARTIFACTS/a11y-$1.json" >/dev/null; }
+shot() {
+    geom="$(xdotool getwindowgeometry --shell "$WID")"
+    gx="$(echo "$geom" | sed -n 's/^X=//p')"
+    gy="$(echo "$geom" | sed -n 's/^Y=//p')"
+    ffmpeg -loglevel error -y -f x11grab -draw_mouse 0 -video_size "${WIDTH}x${HEIGHT}" \
+        -i "$DISPLAY+$gx,$gy" -frames:v 1 "$ARTIFACTS/$1.png" ||
+        fail "$CURRENT_GATE" "x11grab of the nested window failed for $1"
+}
+# Choose the INDEXth user of the list with the keyboard, as GDM's list is
+# driven: the first row has the focus, Down moves, Return activates. (GTK
+# 4.14 adds a GtkStack page's offset twice to its children's AT-SPI
+# extents, so the stack's pages are not clicked by their bounds.)
+pick_user() {
+    for _ in $(seq 1 "$1"); do xdotool key Down; sleep 0.2; done
+    xdotool key Return
+}
+focused() { jq -e --arg n "$2" 'any(.[]; .name == $n and .showing and .focused)' "$ARTIFACTS/a11y-$1.json" >/dev/null; }
+answer() {
+    xdotool type --delay 40 "$1"
+    xdotool key Return
+}
+
+# The mock's controls (the proof's hand on GDM and AccountsService).
+control() {
+    gdbus call --address "$SYS_ADDR" --dest org.gnome.DisplayManager \
+        --object-path /org/tuna/Proof/GdmMock --method "org.tuna.Proof.GdmMock.$1" "${@:2}" \
+        >/dev/null 2>>"$ARTIFACTS/control.err" || fail "$CURRENT_GATE" "the GDM mock refused $1"
+}
+# Pixels of screenshot $1 within 24 of the colour R G B ($2 $3 $4).
+colour_pixels() {
+    "$PY" - "$ARTIFACTS/$1.png" "$2" "$3" "$4" <<'COLOUR'
+import sys
+from PIL import Image
+img = Image.open(sys.argv[1]).convert('RGB')
+want = tuple(int(v) for v in sys.argv[2:5])
+print(sum(1 for px in img.getdata() if all(abs(a - b) <= 24 for a, b in zip(px, want))))
+COLOUR
+}
+
+GDM_FAILED="Sorry, password authentication didn’t work. Please try again."
+
+# The user's gdm-password conversation is asking for the password after
+# the mark: the mock's SecretInfoQuery, then the entry on screen.
+await_password_prompt() {
+    gwait "$1" "$(sig SecretInfoQuery '.args == ["gdm-password", "Password: "]')" 20 ||
+        fail "$CURRENT_GATE" "GDM's 'Password: ' query never came ($2)"
+    sleep 0.5
+    dump "$2"
+    showing "$2" "Password" || fail "$CURRENT_GATE" "no showing Password entry ($2)"
+    [ "$(role_of "$2" Password)" = "password text" ] ||
+        fail "$CURRENT_GATE" "the Password entry is not a hidden-text entry ($2)"
+}
+# Answer the focused password entry of a dump.
+type_password() {
+    focused "$1" "Password" || fail "$CURRENT_GATE" "the Password entry does not have the keyboard focus ($1)"
+    answer "$2"
+}
+
+# --- environment ------------------------------------------------------
+for tool in Xvfb xdotool ffmpeg jq gdbus dbus-daemon pgrep sha256sum gsettings glib-compile-schemas; do
+    command -v "$tool" >/dev/null 2>&1 || fail SETUP "$tool is required"
+done
+
+if [ -x /usr/libexec/at-spi-bus-launcher ]; then
+    /usr/libexec/at-spi-bus-launcher --launch-immediately >"$ARTIFACTS/atspi.log" 2>&1 &
+    ATSPI_PID=$!
+    AT_SPI_BUS_ADDRESS="$("$PY" - <<'AT_SPI_ADDRESS'
+import time
+from gi.repository import Gio
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+end = time.monotonic() + 10
+while True:
+    try:
+        reply = bus.call_sync('org.a11y.Bus', '/org/a11y/bus', 'org.a11y.Bus', 'GetAddress',
+                              None, None, Gio.DBusCallFlags.NO_AUTO_START, 2000, None)
+        print(reply.unpack()[0])
+        break
+    except Exception:
+        if time.monotonic() >= end:
+            raise
+        time.sleep(0.1)
+AT_SPI_ADDRESS
+)" || fail SETUP "the private accessibility bus did not start"
+    export AT_SPI_BUS_ADDRESS
+else
+    fail SETUP "at-spi-bus-launcher is required for the accessibility dumps"
+fi
+
+[ -n "$DISPLAY_ARG" ] && DISPLAY="$DISPLAY_ARG" && export DISPLAY
+if [ -z "$DISPLAY_ARG" ]; then
+    "$ROOT/scripts/lib/tuna-xvfb" -displayfd 3 -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp \
+        3>"$ARTIFACTS/xvfb-display" >"$ARTIFACTS/xvfb.log" 2>&1 &
+    XVFB_PID=$!
+    for _ in $(seq 1 30); do [ -s "$ARTIFACTS/xvfb-display" ] && break; sleep 0.5; done
+    [ -s "$ARTIFACTS/xvfb-display" ] || fail SETUP "Xvfb did not allocate a display"
+    DISPLAY=":$(cat "$ARTIFACTS/xvfb-display")"
+    export DISPLAY
+else
+    Xvfb "$DISPLAY" -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp >"$ARTIFACTS/xvfb.log" 2>&1 &
+    XVFB_PID=$!
+fi
+for _ in $(seq 1 30); do xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 0.5; done
+xdotool getdisplaygeometry >/dev/null 2>&1 || fail SETUP "no X display at $DISPLAY"
+
+if [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
+    RUSTUP_HOME="${RUSTUP_HOME:-$ORIG_HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$ORIG_HOME/.cargo}" \
+        cargo build --locked --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-greeter ||
+        fail SETUP "cargo build failed"
+fi
+for bin in tuna-compositor tuna-greeter; do
+    [ -x "$BIN_DIR/$bin" ] || fail SETUP "$BIN_DIR/$bin is missing"
+done
+
+# The sessions GDM would offer (gnome-greeter's data dir comes first).
+printf '[Desktop Entry]\nName=Tuna\nComment=Tuna Desktop\nExec=tuna-session\nType=Application\n' \
+    >"$FIXTURE/share/wayland-sessions/tuna.desktop"
+printf '[Desktop Entry]\nName=GNOME\nComment=GNOME\nExec=gnome-session\nType=Application\n' \
+    >"$FIXTURE/share/wayland-sessions/gnome.desktop"
+# Hide the host's other sessions as libgdm honours it (an earlier data
+# dir's Hidden=true file wins), so the menu is GNOME then Tuna everywhere.
+for desktop in /usr/local/share/wayland-sessions/*.desktop /usr/share/wayland-sessions/*.desktop; do
+    [ -e "$desktop" ] || continue
+    case "${desktop##*/}" in tuna.desktop | gnome.desktop) continue ;; esac
+    printf '[Desktop Entry]\nName=hidden\nType=Application\nHidden=true\n' \
+        >"$FIXTURE/share/wayland-sessions/${desktop##*/}"
+done
+cat >"$FIXTURE/users.json" <<'USERS'
+[
+  {"name": "ada", "real_name": "Ada Lovelace", "uid": 1001, "icon": "ada.png"},
+  {"name": "grace", "real_name": "Grace Hopper", "uid": 1002},
+  {"name": "katherine", "real_name": "Katherine Johnson", "uid": 1003},
+  {"name": "gdm-greeter", "real_name": "GDM Greeter", "uid": 60578, "system": true},
+  {"name": "mallory", "real_name": "Locked Account", "uid": 1004, "locked": true}
+]
+USERS
+printf 'ada:%s\ngrace:%s\nkatherine:%s\n' "$ADA_PASSWORD" "$GRACE_PASSWORD" "$KATHERINE_PASSWORD" \
+    >"$RUN_PRIV/secrets"
+chmod 600 "$RUN_PRIV/secrets"
+mkdir -p "$GSETTINGS_SCHEMA_DIR"
+cp "$ROOT/scripts/lib/org.gnome.login-screen.gschema.xml" "$GSETTINGS_SCHEMA_DIR/"
+glib-compile-schemas "$GSETTINGS_SCHEMA_DIR" || fail SETUP "glib-compile-schemas failed"
+gsettings get org.gnome.login-screen enable-password-authentication >/dev/null ||
+    fail SETUP "org.gnome.login-screen is not readable"
+# ada's avatar (solid yellow) and the logo (solid magenta): colours the
+# screenshots find.
+"$PY" - "$FIXTURE" <<'IMAGES' || fail SETUP "the avatar and logo fixtures could not be drawn"
+import sys
+from PIL import Image
+Image.new('RGB', (96, 96), (255, 255, 0)).save(f'{sys.argv[1]}/ada.png')
+Image.new('RGB', (96, 96), (255, 0, 255)).save(f'{sys.argv[1]}/logo.png')
+IMAGES
+
+# The private "system" bus: GDM's and AccountsService's only home here.
+cat >"$RUN_PRIV/system-bus.conf" <<BUSCONF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>tuna-proof-system</type>
+  <listen>unix:path=$RUN_PRIV/system_bus_socket</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow user="*"/>
+    <allow own="*"/>
+    <allow send_type="method_call"/>
+    <allow send_type="signal"/>
+    <allow send_type="method_return"/>
+    <allow send_type="error"/>
+    <allow receive_type="method_call"/>
+    <allow receive_type="method_return"/>
+    <allow receive_type="error"/>
+    <allow receive_type="signal"/>
+  </policy>
+</busconfig>
+BUSCONF
+dbus-daemon --config-file="$RUN_PRIV/system-bus.conf" --nofork --print-address=3 \
+    3>"$RUN_PRIV/system-bus-address" >"$ARTIFACTS/system-bus.log" 2>&1 &
+SYSBUS_PID=$!
+for _ in $(seq 1 50); do [ -s "$RUN_PRIV/system-bus-address" ] && break; sleep 0.1; done
+SYS_ADDR="$(head -1 "$RUN_PRIV/system-bus-address")"
+case "$SYS_ADDR" in unix:path=*) ;; *) fail SETUP "the private system bus did not start" ;; esac
+
+mkdir -m 711 "$RUN_PRIV/gdm-dbus"
+"$PY" "$ROOT/scripts/lib/tuna-gdm-mock.py" --address "$SYS_ADDR" --server-dir "$RUN_PRIV/gdm-dbus" \
+    --log "$GDM_LOG" --users "$FIXTURE/users.json" --secrets "$RUN_PRIV/secrets" \
+    --sessions tuna,gnome --fallback-session tuna \
+    >"$ARTIFACTS/gdm-mock.out" 2>"$ARTIFACTS/gdm-mock.err" &
+MOCK_PID=$!
+for _ in $(seq 1 50); do grep -q '^tuna-gdm-mock: ready ' "$ARTIFACTS/gdm-mock.out" && break; sleep 0.1; done
+grep -q '^tuna-gdm-mock: ready ' "$ARTIFACTS/gdm-mock.out" || fail SETUP "the GDM mock did not start"
+
+# systemd's side of Type=notify: one datagram socket, every message logged.
+"$PY" - "$RUN_PRIV/notify" "$NOTIFY_LOG" <<'NOTIFY' &
+import socket, sys, time
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+sock.bind(sys.argv[1])
+with open(sys.argv[2], 'a', encoding='utf-8') as out:
+    while True:
+        data = sock.recv(4096).decode(errors='replace')
+        out.write(f'{time.time():.3f} {data}\n')
+        out.flush()
+NOTIFY
+NOTIFY_PID=$!
+for _ in $(seq 1 50); do [ -S "$RUN_PRIV/notify" ] && break; sleep 0.1; done
+[ -S "$RUN_PRIV/notify" ] || fail SETUP "the notify socket did not appear"
+
+{
+    echo "source $(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    sha256sum "$BIN_DIR/tuna-compositor" "$BIN_DIR/tuna-greeter"
+} >"$ARTIFACTS/manifest.txt"
+
+env DBUS_SYSTEM_BUS_ADDRESS="$SYS_ADDR" NOTIFY_SOCKET="$RUN_PRIV/notify" \
+    TUNA_GREETER_BIN="$BIN_DIR/tuna-greeter" TUNA_GREETER_TRACE=1 RUST_BACKTRACE=1 \
+    "$BIN_DIR/tuna-compositor" --backend winit --socket "tuna-greeter-$$" --greeter >>"$LOG" 2>&1 &
+COMPOSITOR_PID=$!
+for _ in $(seq 1 90); do
+    alive || fail SETUP "the compositor exited during startup"
+    WID="$(xdotool search --name Smithay 2>/dev/null | head -1 || true)"
+    [ -n "$WID" ] && break
+    sleep 1
+done
+[ -n "$WID" ] || fail SETUP "no nested window"
+xdotool windowfocus --sync "$WID"
+
+# --- A: the login screen comes up ---------------------------------------
+CURRENT_GATE=G-GREETER-READY
+cstate '.layers | any(.namespace == "tuna-greeter")' 120 || fail G-GREETER-READY "the greeter's layer never mapped"
+await_greeter "" 10 || fail G-GREETER-READY "no tuna-greeter child of the compositor"
+for _ in $(seq 1 50); do grep -q ' READY=1$' "$NOTIFY_LOG" && break; sleep 0.1; done
+grep -q ' READY=1$' "$NOTIFY_LOG" || fail G-GREETER-READY "no READY=1 on NOTIFY_SOCKET after the greeter mapped"
+grep -qFx "tuna-compositor: greeter mapped; READY=1" "$LOG" ||
+    fail G-GREETER-READY "READY=1 was not sent for the mapped greeter"
+gwait 0 "$(call OpenSession)" 20 || fail G-GREETER-READY "the greeter never asked GDM for its channel"
+gwait 0 '.kind == "connect"' 20 || fail G-GREETER-READY "the greeter never connected to GDM's session server"
+gwait 0 "$(call RegisterSession)" 20 || fail G-GREETER-READY "the greeter did not register its session with GDM"
+gwait 0 "$(call RegisterDisplay)" 20 || fail G-GREETER-READY "the greeter did not register its display with GDM"
+pass G-GREETER-READY "the tuna-greeter layer mapped and READY=1 reached NOTIFY_SOCKET; OpenSession, the peer channel and RegisterSession/RegisterDisplay reached GDM"
+
+CURRENT_GATE=G-GREETER-USER-LIST
+m="$(mark)"
+twait 0 "greeter users names=ada,grace,katherine" 20 >/dev/null ||
+    fail G-GREETER-USER-LIST "the greeter did not list exactly ada, grace and katherine"
+gwait 0 "$(call ListCachedUsers)" 5 || fail G-GREETER-USER-LIST "AccountsService was not asked for its users"
+sleep 1.5
+dump A-1-user-list
+shot A-1-user-list
+for name in "Ada Lovelace" "Grace Hopper" "Katherine Johnson" "Not listed?"; do
+    showing A-1-user-list "$name" || fail G-GREETER-USER-LIST "'$name' is not showing"
+done
+for name in "GDM Greeter" "Locked Account" "Password"; do
+    hidden A-1-user-list "$name" || fail G-GREETER-USER-LIST "'$name' shows on the user list"
+done
+rows="$(jq '[.[] | select(.showing and (.role == "list item") and (.name | IN("Ada Lovelace", "Grace Hopper", "Katherine Johnson")))] | length' "$ARTIFACTS/a11y-A-1-user-list.json")"
+[ "$rows" = 3 ] || fail G-GREETER-USER-LIST "$rows user rows instead of 3"
+# Ada's IconFile is her avatar; the others' are the default.
+avatar_px="$(colour_pixels A-1-user-list 255 255 0)"
+if ! { [ "$avatar_px" -ge 2500 ] && [ "$avatar_px" -le 4500 ]; }; then
+    fail G-GREETER-USER-LIST "ada's 64 px avatar image is not on her row alone ($avatar_px avatar pixels)"
+fi
+pass G-GREETER-USER-LIST "Ada Lovelace, Grace Hopper and Katherine Johnson listed as rows with Not listed?, Ada's row with her IconFile avatar ($avatar_px px); the system and locked accounts are not (A-1-user-list.png)"
+
+CURRENT_GATE=G-GREETER-NO-SHELL
+namespaces="$(jq -c '[.layers[].namespace] | unique' "$CSTATE")"
+[ "$namespaces" = '["tuna-greeter"]' ] || fail G-GREETER-NO-SHELL "layers other than the greeter's: $namespaces"
+children="$(pgrep -P "$COMPOSITOR_PID" -l | awk '{print $2}' | sort | tr '\n' ' ')"
+case " $children " in *" tuna-shell-gtk "* | *" tuna-shell "*) fail G-GREETER-NO-SHELL "a shell runs: $children" ;; esac
+xdotool key --clearmodifiers super
+sleep 1
+xdotool mousemove --window "$WID" 0 0
+sleep 1.5
+xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
+xdotool key --clearmodifiers super+l
+sleep 1.5
+jq -e '.overview_open == false and .locked == false and ([.layers[].namespace] | unique) == ["tuna-greeter"]' "$CSTATE" >/dev/null ||
+    fail G-GREETER-NO-SHELL "Super, the hot corner or Super+L changed the login screen: $(jq -c '{overview_open, locked, layers: [.layers[].namespace]}' "$CSTATE")"
+pass G-GREETER-NO-SHELL "layers $namespaces only; compositor children: $children; Super, the hot corner and Super+L left overview_open=false and locked=false"
+
+# --- B: Not listed? -----------------------------------------------------
+CURRENT_GATE=G-GREETER-NOT-LISTED
+m="$(mark)"; g="$(gmark)"
+dump B-0-not-listed --press "Not listed?"
+twait "$m" "greeter page username" 10 >/dev/null || fail G-GREETER-NOT-LISTED "Not listed? did not ask for a username"
+sleep 0.5
+dump B-1-username
+shot B-1-username
+showing B-1-username "Username" || fail G-GREETER-NOT-LISTED "no showing Username entry"
+[ "$(role_of B-1-username Username)" != "password text" ] || fail G-GREETER-NOT-LISTED "the Username entry hides its text"
+[ "$(gcount "$g" "$(call BeginVerificationForUser)")" = 0 ] ||
+    fail G-GREETER-NOT-LISTED "verification began before a username was typed"
+answer dave
+gwait "$g" "$(call BeginVerificationForUser '.args == ["gdm-password", "dave"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-NOT-LISTED "the typed username did not begin gdm-password for dave"
+await_password_prompt "$g" B-2-password
+shot B-2-password
+showing B-2-password "dave" || fail G-GREETER-NOT-LISTED "the prompt does not name dave"
+m="$(mark)"; g2="$(gmark)"
+xdotool key Escape
+gwait "$g2" "$(call Cancel)" 10 || fail G-GREETER-NOT-LISTED "Back did not cancel the conversation"
+gwait "$g2" "$(sig ConversationStopped '.args == ["gdm-password"]')" 10 ||
+    fail G-GREETER-NOT-LISTED "GDM's conversation did not stop after Cancel"
+twait "$m" "greeter page users" 10 >/dev/null || fail G-GREETER-NOT-LISTED "Back did not return to the user list"
+sleep 0.5
+dump B-3-back
+showing B-3-back "Ada Lovelace" || fail G-GREETER-NOT-LISTED "the user list is not back"
+hidden B-3-back "Password" || fail G-GREETER-NOT-LISTED "the prompt still shows"
+pass G-GREETER-NOT-LISTED "Not listed? asked 'Username' (visible entry); 'dave' began gdm-password for dave with a hidden Password prompt; Back sent Cancel and returned to the list"
+
+# --- D: allowed-failures --------------------------------------------------
+CURRENT_GATE=G-GREETER-GIVE-UP
+m="$(mark)"; g="$(gmark)"
+pick_user 2
+twait "$m" "greeter page prompt user=katherine" 10 >/dev/null || fail G-GREETER-GIVE-UP "the prompt did not open for katherine"
+# Each retry's query may arrive while the previous problem is being dumped,
+# so it is awaited from before the previous answer, not from the loop's top.
+gt="$g"
+for try in 1 2 3; do
+    await_password_prompt "$gt" "D-$try-password"
+    gq="$(gmark)"
+    gt="$gq"
+    type_password "D-$try-password" "$WRONG_PASSWORD-$try"
+    gwait "$gq" "$(call AnswerQuery '.detail.matches_password == false and .detail.user == "katherine"')" 10 ||
+        fail G-GREETER-GIVE-UP "wrong answer $try did not reach AnswerQuery"
+    gwait "$gq" "$(sig VerificationFailed)" 10 || fail G-GREETER-GIVE-UP "GDM did not fail answer $try"
+    shown_within "D-$try-problem" "$GDM_FAILED" 3 ||
+        fail G-GREETER-GIVE-UP "GDM's problem is not shown after try $try"
+    [ "$try" = 1 ] && shot D-1-problem
+done
+twait "$m" "greeter give-up" 20 >/dev/null || fail G-GREETER-GIVE-UP "the greeter did not give up after three failures"
+twait "$m" "greeter page users" 20 >/dev/null || fail G-GREETER-GIVE-UP "the greeter did not return to the user list"
+sleep 1
+dump D-4-list
+shot D-4-list
+showing D-4-list "Katherine Johnson" || fail G-GREETER-GIVE-UP "the user list is not showing"
+hidden D-4-list "Password" || fail G-GREETER-GIVE-UP "the prompt still shows after giving up"
+begins="$(gcount "$g" "$(call BeginVerificationForUser '.args == ["gdm-password", "katherine"]')")"
+[ "$begins" = 3 ] || fail G-GREETER-GIVE-UP "$begins begins for katherine instead of 3"
+[ "$(gcount "$g" "$(sig VerificationFailed)")" = 3 ] || fail G-GREETER-GIVE-UP "not three VerificationFailed"
+pass G-GREETER-GIVE-UP "three wrong answers each showed '$GDM_FAILED'; after the third (allowed-failures 3) the greeter gave up to the user list with 3 begins in all"
+
+# --- C: wrong password, session choice, retry, start ---------------------
+CURRENT_GATE=G-GREETER-SESSION
+m="$(mark)"; g="$(gmark)"
+pick_user 0
+twait "$m" "greeter page prompt user=ada" 10 >/dev/null || fail G-GREETER-SESSION "the prompt did not open for ada"
+gwait "$g" "$(sig DefaultSessionNameChanged '.args == ["tuna"]')" 10 ||
+    fail G-GREETER-SESSION "GDM's default session (tuna) was not announced"
+await_password_prompt "$g" C-1-prompt
+shot C-1-prompt
+prompt_avatar_px="$(colour_pixels C-1-prompt 255 255 0)"
+[ "$prompt_avatar_px" -ge 9000 ] ||
+    fail G-GREETER-USER-LIST "ada's avatar image is not on her prompt ($prompt_avatar_px avatar pixels)"
+showing C-1-prompt "Ada Lovelace" || fail G-GREETER-SESSION "the prompt does not name Ada Lovelace"
+showing C-1-prompt "Login Options" || fail G-GREETER-SESSION "Login Options is not offered on the prompt"
+dump C-2-options --press "Login Options"
+shot C-2-options
+showing C-2-options "Tuna" || fail G-GREETER-SESSION "Login Options does not list Tuna"
+showing C-2-options "GNOME" || fail G-GREETER-SESSION "Login Options does not list GNOME"
+checked C-2-options "Tuna" || fail G-GREETER-SESSION "GDM's default Tuna is not the checked session"
+! checked C-2-options "GNOME" || fail G-GREETER-SESSION "GNOME is checked before it was chosen"
+# The menu has the focus on the checked item; GNOME is the one above it.
+focused C-2-options "Tuna" || fail G-GREETER-SESSION "the menu's focus is not on the checked Tuna"
+gs="$(gmark)"
+xdotool key Up
+how="Up (a radio group selects as its focus moves)"
+if ! gwait "$gs" "$(call SelectSession '.args == ["gnome"] and .outcome == "ok"')" 3; then
+    xdotool key space
+    how="Up, Space"
+fi
+gwait "$gs" "$(call SelectSession '.args == ["gnome"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-SESSION "choosing GNOME did not reach SelectSession"
+[ "$(gcount "$gs" "$(call SelectSession)")" = 1 ] ||
+    fail G-GREETER-SESSION "choosing GNOME sent other SelectSession calls: $(gsel "$gs" "$(call SelectSession)" | jq -c .args)"
+sleep 0.5
+dump C-3-closed
+hidden C-3-closed "Session Type" || fail G-GREETER-SESSION "Login Options stayed open after the choice"
+# As GNOME's menus do, closing gives the focus back to the prompt.
+focused C-3-closed "Password" || fail G-GREETER-SESSION "the Password entry did not get the focus back after the choice"
+dump C-3-gnome --press "Login Options"
+checked C-3-gnome "GNOME" || fail G-GREETER-SESSION "GNOME is not checked after choosing it"
+! checked C-3-gnome "Tuna" || fail G-GREETER-SESSION "Tuna is still checked after choosing GNOME"
+dump C-4-prompt --press "Login Options"
+hidden C-4-prompt "Session Type" || fail G-GREETER-SESSION "Login Options did not close"
+
+CURRENT_GATE=G-GREETER-WRONG-PASSWORD
+gw="$(gmark)"; m="$(mark)"
+type_password C-4-prompt "$WRONG_PASSWORD"
+gwait "$gw" "$(call AnswerQuery '.detail.matches_password == false and .detail.user == "ada"')" 10 ||
+    fail G-GREETER-WRONG-PASSWORD "the wrong answer did not reach AnswerQuery"
+gwait "$gw" "$(sig Problem "(.args == [\"gdm-password\", \"$GDM_FAILED\"])")" 10 ||
+    fail G-GREETER-WRONG-PASSWORD "GDM's problem was not sent"
+shown_within C-5-wrong-password "$GDM_FAILED" 3 || fail G-GREETER-WRONG-PASSWORD "GDM's problem is not shown"
+shot C-2-wrong-password
+await_password_prompt "$gw" C-6-retry
+gwait "$gw" "$(call BeginVerificationForUser '.args == ["gdm-password", "ada"] and .outcome == "ok"')" 5 ||
+    fail G-GREETER-WRONG-PASSWORD "gdm-password did not begin again for ada after the failure"
+CURRENT_GATE=G-GREETER-SESSION
+gwait "$gw" "$(call SelectSession '.args == ["gnome"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-SESSION "the chosen GNOME was not selected again after the retry's begin"
+
+CURRENT_GATE=G-GREETER-PASSWORD
+gp="$(gmark)"
+type_password C-6-retry "$ADA_PASSWORD"
+gwait "$gp" "$(call AnswerQuery ".detail.matches_password == true and .detail.user == \"ada\" and .detail.answer_sha256 == \"$(sha "$ADA_PASSWORD")\"")" 10 ||
+    fail G-GREETER-PASSWORD "ada's password did not reach AnswerQuery"
+pass G-GREETER-PASSWORD "the typed password reached AnswerQuery(gdm-password) on GDM's peer channel (SHA-256 matches ada's)"
+CURRENT_GATE=G-GREETER-WRONG-PASSWORD
+gwait "$gp" "$(sig VerificationComplete '.args == ["gdm-password"]')" 10 ||
+    fail G-GREETER-WRONG-PASSWORD "the retry did not verify"
+pass G-GREETER-WRONG-PASSWORD "a wrong password showed '$GDM_FAILED' (C-2-wrong-password.png); gdm-password began again for ada and the retry verified"
+
+CURRENT_GATE=G-GREETER-START
+gwait "$gp" "$(call StartSessionWhenReady '.args == ["gdm-password", true]')" 10 ||
+    fail G-GREETER-START "StartSessionWhenReady(gdm-password, true) never came"
+opened="$(gline "$gp" "$(sig SessionOpened)")"
+complete="$(gline "$gp" "$(sig VerificationComplete)")"
+started="$(gline "$gp" "$(call StartSessionWhenReady)")"
+if [ -z "$opened" ] || [ -z "$complete" ] || [ "$complete" -ge "$opened" ] || [ "$opened" -ge "$started" ]; then
+    fail G-GREETER-START "order VerificationComplete=$complete SessionOpened=$opened StartSessionWhenReady=$started"
+fi
+[ "$(gcount "$gp" "$(call StartSessionWhenReady)")" = 1 ] || fail G-GREETER-START "StartSessionWhenReady sent more than once"
+selected="$(gsel "$gp" "$(call StartSessionWhenReady)" | jq -r '.detail.selected_session')"
+CURRENT_GATE=G-GREETER-SESSION
+[ "$selected" = gnome ] || fail G-GREETER-SESSION "GDM would start $selected, not the chosen gnome"
+pass G-GREETER-START "VerificationComplete, SessionOpened, then one StartSessionWhenReady(gdm-password, true) (GDM log lines $complete, $opened, $started)"
+
+# --- E: supervision, and a login with GDM's default session -------------
+CURRENT_GATE=G-GREETER-SUPERVISION
+first="$GREETER_PID"
+g="$(gmark)"; m="$(mark)"
+kill -KILL "$first"
+await_greeter "$first" 30 || fail G-GREETER-SUPERVISION "the compositor did not restart a killed greeter"
+gwait "$g" '.kind == "disconnect"' 10 || fail G-GREETER-SUPERVISION "the killed greeter's channel did not close"
+gwait "$g" "$(call OpenSession)" 20 || fail G-GREETER-SUPERVISION "the restarted greeter did not ask GDM for its channel"
+twait "$m" "greeter page users" 30 >/dev/null || fail G-GREETER-SUPERVISION "the restarted greeter did not show the user list"
+cstate '.layers | any(.namespace == "tuna-greeter")' 20 || fail G-GREETER-SUPERVISION "the restarted greeter's layer did not map"
+sleep 1
+dump E-1-restarted
+shot E-1-restarted
+showing E-1-restarted "Grace Hopper" || fail G-GREETER-SUPERVISION "the restarted greeter's user list is not showing"
+[ "$(grep -c ' READY=1$' "$NOTIFY_LOG")" = 1 ] || fail G-GREETER-READY "READY=1 was sent again for a restarted greeter"
+restarted="$GREETER_PID"
+
+CURRENT_GATE=G-GREETER-SESSION
+m="$(mark)"; g="$(gmark)"
+pick_user 1
+twait "$m" "greeter page prompt user=grace" 10 >/dev/null || fail G-GREETER-SESSION "the prompt did not open for grace"
+await_password_prompt "$g" E-2-prompt
+type_password E-2-prompt "$GRACE_PASSWORD"
+gwait "$g" "$(call StartSessionWhenReady '.args == ["gdm-password", true]')" 15 ||
+    fail G-GREETER-SESSION "grace's login did not start"
+[ "$(gcount "$g" "$(call SelectSession)")" = 0 ] || fail G-GREETER-SESSION "SelectSession was sent without a choice"
+selected="$(gsel "$g" "$(call StartSessionWhenReady)" | jq -r '.detail.selected_session')"
+[ "$selected" = tuna ] || fail G-GREETER-SESSION "the default login would start $selected, not tuna"
+pass G-GREETER-SESSION "Login Options showed GDM's default Tuna checked; GNOME (keys: $how) reached SelectSession, the focus went back to the Password entry, GNOME was re-selected after the retry's begin and was the session started; a login without a choice sent no SelectSession and started tuna"
+
+CURRENT_GATE=G-GREETER-SUPERVISION
+kills=1
+previous="$restarted"
+while alive; do
+    kill -KILL "$previous" 2>/dev/null || true
+    kills=$((kills + 1))
+    [ "$kills" -le 10 ] || fail G-GREETER-SUPERVISION "the compositor outlived $kills greeter kills"
+    if ! await_greeter "$previous" 20; then
+        break
+    fi
+    previous="$GREETER_PID"
+done
+for _ in $(seq 1 100); do alive || break; sleep 0.1; done
+alive && fail G-GREETER-SUPERVISION "the compositor is still running after the greeter's budget ran out"
+if wait "$COMPOSITOR_PID"; then COMPOSITOR_STATUS=0; else COMPOSITOR_STATUS=$?; fi
+COMPOSITOR_PID=""
+[ "$COMPOSITOR_STATUS" != 0 ] || fail G-GREETER-SUPERVISION "the compositor exited 0 with the greeter's budget spent"
+grep -qF "tuna-compositor: greeter restart budget exhausted; ending the login screen" "$LOG" ||
+    fail G-GREETER-SUPERVISION "the compositor did not say the greeter's budget ran out"
+pass G-GREETER-SUPERVISION "a killed greeter came back as pid $restarted (was $first) with a new GDM channel and the user list; after $kills kills the budget ran out and the compositor exited $COMPOSITOR_STATUS"
+
+# --- P: login-screen policy, the power menu, live users, GDM restarts ----
+# A second login screen on the same GDM and AccountsService: the
+# compositor runs as on hardware (TUNA_SESSION_KIND=hardware, the power
+# menu's logind is the mock's) and org.gnome.login-screen is set first.
+CURRENT_GATE=G-GREETER-POLICY
+login_key() {
+    gsettings set org.gnome.login-screen "$@" 2>>"$ARTIFACTS/gsettings.err" ||
+        fail "$CURRENT_GATE" "gsettings could not set $1"
+}
+login_key disable-user-list true
+login_key allowed-failures 1
+login_key banner-message-enable true
+login_key banner-message-text "'Authorized use only.'"
+login_key logo "'$FIXTURE/logo.png'"
+[ -s "$CSTATE" ] && mv "$CSTATE" "$ARTIFACTS/first-state.json"
+m="$(mark)"; g="$(gmark)"
+env DBUS_SYSTEM_BUS_ADDRESS="$SYS_ADDR" TUNA_SESSION_KIND=hardware \
+    TUNA_GREETER_BIN="$BIN_DIR/tuna-greeter" TUNA_GREETER_TRACE=1 RUST_BACKTRACE=1 \
+    "$BIN_DIR/tuna-compositor" --backend winit --socket "tuna-greeter-p-$$" --greeter >>"$LOG" 2>&1 &
+COMPOSITOR_PID=$!
+WID=""
+for _ in $(seq 1 90); do
+    alive || fail G-GREETER-POLICY "the second compositor exited during startup"
+    WID="$(xdotool search --name Smithay 2>/dev/null | head -1 || true)"
+    [ -n "$WID" ] && break
+    sleep 1
+done
+[ -n "$WID" ] || fail G-GREETER-POLICY "no nested window for the second login screen"
+xdotool windowfocus --sync "$WID"
+cstate '.layers | any(.namespace == "tuna-greeter")' 120 || fail G-GREETER-POLICY "the greeter's layer never mapped"
+await_greeter "" 10 || fail G-GREETER-POLICY "no tuna-greeter child of the second compositor"
+twait "$m" "greeter users names=ada,grace,katherine" 30 >/dev/null || fail G-GREETER-POLICY "the greeter did not load its users"
+twait "$m" "greeter page username" 10 >/dev/null || fail G-GREETER-POLICY "disable-user-list did not ask for a username"
+tail -n "+$((m + 1))" "$LOG" | grep -qFx "tuna-greeter: greeter page users" &&
+    fail G-GREETER-POLICY "the user list showed under disable-user-list"
+sleep 1
+dump P-1-username
+shot P-1-policy
+showing P-1-username "Username" || fail G-GREETER-POLICY "no showing Username entry"
+for name in "Ada Lovelace" "Not listed?" "Back"; do
+    hidden P-1-username "$name" || fail G-GREETER-POLICY "'$name' shows under disable-user-list"
+done
+showing P-1-username "Authorized use only." || fail G-GREETER-POLICY "the banner text is not showing"
+logo_px="$(colour_pixels P-1-policy 255 0 255)"
+[ "$logo_px" -ge 1500 ] || fail G-GREETER-POLICY "the logo is not drawn ($logo_px logo pixels)"
+
+CURRENT_GATE=G-GREETER-CAPS-LOCK
+xdotool key Caps_Lock
+sleep 0.8
+dump P-2-caps-username
+hidden P-2-caps-username "Caps lock is on" || fail G-GREETER-CAPS-LOCK "the warning shows for the visible Username entry"
+xdotool key Caps_Lock
+sleep 0.5
+g="$(gmark)"
+answer katherine
+gwait "$g" "$(call BeginVerificationForUser '.args == ["gdm-password", "katherine"] and .outcome == "ok"')" 10 ||
+    fail G-GREETER-CAPS-LOCK "the typed username did not begin gdm-password for katherine"
+await_password_prompt "$g" P-3-password
+hidden P-3-password "Caps lock is on" || fail G-GREETER-CAPS-LOCK "the warning shows with Caps Lock off"
+xdotool key Caps_Lock
+sleep 0.8
+dump P-4-caps
+shot P-4-caps
+showing P-4-caps "Caps lock is on" || fail G-GREETER-CAPS-LOCK "Caps Lock on shows no warning under the password entry"
+xdotool key Caps_Lock
+sleep 0.8
+dump P-5-caps-off
+hidden P-5-caps-off "Caps lock is on" || fail G-GREETER-CAPS-LOCK "the warning stayed after Caps Lock went off"
+pass G-GREETER-CAPS-LOCK "Caps Lock left the visible Username entry without a warning; on the hidden Password entry 'Caps lock is on' showed (P-4-caps.png) and went with Caps Lock off"
+
+CURRENT_GATE=G-GREETER-POLICY
+m="$(mark)"; gq="$(gmark)"
+type_password P-5-caps-off "$WRONG_PASSWORD"
+gwait "$gq" "$(call AnswerQuery '.detail.matches_password == false and .detail.user == "katherine"')" 10 ||
+    fail G-GREETER-POLICY "the wrong answer did not reach AnswerQuery"
+gwait "$gq" "$(sig VerificationFailed)" 10 || fail G-GREETER-POLICY "GDM did not fail the answer"
+twait "$m" "greeter give-up" 20 >/dev/null || fail G-GREETER-POLICY "allowed-failures 1 did not give up after one failure"
+twait "$m" "greeter page username" 20 >/dev/null || fail G-GREETER-POLICY "giving up did not return to the username question"
+begins="$(gcount "$g" "$(call BeginVerificationForUser '.args == ["gdm-password", "katherine"]')")"
+[ "$begins" = 1 ] || fail G-GREETER-POLICY "$begins begins for katherine instead of 1"
+
+CURRENT_GATE=G-GREETER-POWER-MENU
+sleep 1
+dump P-6-panel
+showing P-6-panel "Power Off / Log Out" || fail G-GREETER-POWER-MENU "the hardware login screen has no power menu"
+dump P-7-power --press "Power Off / Log Out"
+sleep 0.8
+dump P-8-menu
+shot P-8-menu
+for item in "Suspend" "Restart…" "Power Off…"; do
+    showing P-8-menu "$item" || fail G-GREETER-POWER-MENU "'$item' is not in the power menu"
+done
+g="$(gmark)"
+dump P-9-suspend --press "Suspend"
+gwait "$g" "$(call Suspend '.args == [true]')" 10 || fail G-GREETER-POWER-MENU "Suspend did not reach logind"
+[ "$(gcount "$g" "$(call Reboot) or $(call PowerOff)")" = 0 ] || fail G-GREETER-POWER-MENU "Suspend also rebooted or powered off"
+
+# GDM restarts a greeter that read other keys: the list and no power menu.
+CURRENT_GATE=G-GREETER-POLICY
+login_key disable-user-list false
+login_key disable-restart-buttons true
+gsettings reset org.gnome.login-screen allowed-failures
+first="$GREETER_PID"
+m="$(mark)"
+kill -KILL "$first"
+await_greeter "$first" 30 || fail G-GREETER-POLICY "the compositor did not restart the greeter"
+twait "$m" "greeter page users" 30 >/dev/null || fail G-GREETER-POLICY "with disable-user-list off the greeter did not list its users"
+sleep 1
+dump P-10-list
+for name in "Ada Lovelace" "Grace Hopper" "Katherine Johnson" "Not listed?"; do
+    showing P-10-list "$name" || fail G-GREETER-POLICY "'$name' is not showing with disable-user-list off"
+done
+pass G-GREETER-POLICY "disable-user-list asked 'Username' with no list, Not listed? or Back; banner 'Authorized use only.' and the logo ($logo_px px) showed (P-1-policy.png); allowed-failures 1 gave up after one wrong password; a greeter started with disable-user-list off listed the users"
+CURRENT_GATE=G-GREETER-POWER-MENU
+hidden P-10-list "Power Off / Log Out" || fail G-GREETER-POWER-MENU "disable-restart-buttons did not remove the power menu"
+pass G-GREETER-POWER-MENU "on hardware 'Power Off / Log Out' offered Suspend, Restart… and Power Off… (P-8-menu.png); Suspend reached logind Suspend(true); under disable-restart-buttons the menu is gone"
+
+CURRENT_GATE=G-GREETER-LIVE-USERS
+m="$(mark)"; g="$(gmark)"
+control AddUser "'radia'" "'Radia Perlman'" 1020
+gwait "$g" "$(sig UserAdded)" 5 || fail G-GREETER-LIVE-USERS "AccountsService did not announce the new user"
+twait "$m" "greeter users names=ada,grace,katherine,radia" 15 >/dev/null ||
+    fail G-GREETER-LIVE-USERS "UserAdded did not add radia to the list"
+sleep 1
+dump P-11-added
+[ "$(role_of P-11-added "Radia Perlman")" = "list item" ] || fail G-GREETER-LIVE-USERS "Radia Perlman has no row"
+m="$(mark)"; g="$(gmark)"
+control DeleteUser "'radia'"
+gwait "$g" "$(sig UserDeleted)" 5 || fail G-GREETER-LIVE-USERS "AccountsService did not announce the deleted user"
+twait "$m" "greeter users names=ada,grace,katherine" 15 >/dev/null ||
+    fail G-GREETER-LIVE-USERS "UserDeleted did not remove radia from the list"
+sleep 1
+dump P-12-deleted
+hidden P-12-deleted "Radia Perlman" || fail G-GREETER-LIVE-USERS "Radia Perlman's row stayed"
+showing P-12-deleted "Ada Lovelace" || fail G-GREETER-LIVE-USERS "the list is not showing"
+pass G-GREETER-LIVE-USERS "UserAdded put a Radia Perlman row on the showing list and UserDeleted took it away"
+
+CURRENT_GATE=G-GREETER-RECONNECT
+m="$(mark)"; g="$(gmark)"
+control CloseGreeterChannels
+twait "$m" "greeter gdm-closed" 10 >/dev/null || fail G-GREETER-RECONNECT "the greeter did not see its channel close"
+gwait "$g" '.kind == "disconnect"' 10 || fail G-GREETER-RECONNECT "GDM did not close the channel"
+gwait "$g" "$(call OpenSession)" 10 || fail G-GREETER-RECONNECT "the greeter did not ask GDM for a new channel"
+gwait "$g" '.kind == "connect"' 10 || fail G-GREETER-RECONNECT "the greeter did not connect to the new channel"
+twait "$m" "greeter gdm-connected" 10 >/dev/null || fail G-GREETER-RECONNECT "the greeter did not reconnect"
+sleep 1
+dump P-13-reconnected
+showing P-13-reconnected "Grace Hopper" || fail G-GREETER-RECONNECT "the user list is not showing after the reconnect"
+m="$(mark)"; g="$(gmark)"
+pick_user 1
+twait "$m" "greeter page prompt user=grace" 10 >/dev/null || fail G-GREETER-RECONNECT "the prompt did not open for grace"
+await_password_prompt "$g" P-14-prompt
+old="$(gsel "$g" "$(call BeginVerificationForUser '.args == ["gdm-password", "grace"]')" | head -1 | jq -r .conn)"
+m="$(mark)"; g="$(gmark)"
+control CloseGreeterChannels
+twait "$m" "greeter gdm-closed" 10 >/dev/null || fail G-GREETER-RECONNECT "the greeter did not see its channel close mid-prompt"
+denied=""
+for _ in $(seq 1 50); do
+    denied="$(tail -n "+$((m + 1))" "$LOG" | grep -E -m1 '^tuna-greeter: auth result service=password request=[0-9]+ applied=false$' || true)"
+    [ -n "$denied" ] && break
+    sleep 0.2
+done
+[ -n "$denied" ] || fail G-GREETER-RECONNECT "the begin owed a result was not denied when the channel closed"
+gwait "$g" "$(call BeginVerificationForUser ".args == [\"gdm-password\", \"grace\"] and .outcome == \"ok\" and .conn > $old")" 15 ||
+    fail G-GREETER-RECONNECT "gdm-password did not begin again for grace on the new channel"
+await_password_prompt "$g" P-15-again
+gp="$(gmark)"
+type_password P-15-again "$GRACE_PASSWORD"
+gwait "$gp" "$(call StartSessionWhenReady ".args == [\"gdm-password\", true] and .conn > $old")" 15 ||
+    fail G-GREETER-RECONNECT "grace's login did not start on the new channel"
+pass G-GREETER-RECONNECT "GDM closed the channel: the greeter asked for a new one (OpenSession, connect) and kept its list; closed mid-prompt, the begin owed a result was denied ('${denied#tuna-greeter: }'), gdm-password began again for grace on the new channel (after conn $old) and her login started there"
+stop_pid "$COMPOSITOR_PID"
+COMPOSITOR_PID=""
+gsettings reset-recursively org.gnome.login-screen
+
+# --- Z: hygiene ---------------------------------------------------------
+CURRENT_GATE=G-GREETER-HYGIENE
+if grep -rlF -e "$ADA_PASSWORD" -e "$GRACE_PASSWORD" -e "$KATHERINE_PASSWORD" -e "$WRONG_PASSWORD" \
+    "$ARTIFACTS" >"$ARTIFACTS/secret-hits.txt" 2>/dev/null; then
+    fail G-GREETER-HYGIENE "a password reached the artifacts: $(tr '\n' ' ' <"$ARTIFACTS/secret-hits.txt")"
+fi
+grep -qi panicked "$LOG" && fail G-GREETER-HYGIENE "panic in the nested log"
+pass G-GREETER-HYGIENE "no password in any artifact or log; no panic"
