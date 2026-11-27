@@ -402,7 +402,9 @@ pass G-OSK-SHIFT "Shift T then u typed 'Tu'; the long-press latch typed 'NA' unt
 cstate "$OSK_MAPPED and .osk_window_slide == null" 5 ||
     fail G-OSK-SLIDE "a window slid for an entry the keyboard leaves clear"
 [ "$(wrect | cut -d' ' -f2)" -eq "$WY" ] || fail G-OSK-SLIDE "the probe moved to $(wrect) with entry b clear of the keyboard"
-read -r _ SKY _ SKH _ <<<"$(osk_rect)"
+rect="$(osk_rect)"
+SKY="$(echo "$rect" | cut -d' ' -f2)"
+SKH="$(echo "$rect" | cut -d' ' -f4)"
 press "$DX" "$DY" G-OSK-SLIDE
 cstate "$OSK_GONE" 10 || fail G-OSK-SLIDE "focus on the button never hid the keyboard"
 # Super+drag the probe down until entry b sits 40 px under the keyboard's top.
