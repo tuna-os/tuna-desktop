@@ -1425,6 +1425,18 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
            "logind LockedHint no, then loginctl lock-session locks with yes, the password unlocks with no, "
            "Super+L locks with yes and loginctl unlock-session unlocks with no (lifecycle/locked-hint.json)")
 
+    # An unlock without input wakes the screen gsd-power blanked: every
+    # unlock emits WakeUpScreen, as GNOME 51's screenShield.js does (#1194).
+    from vm_unlock_wake import run as prove_unlock_wake
+
+    def password_unlock():
+        qmp.keys("ret")
+        time.sleep(0.3)
+        qmp.keys("ctrl", "a")
+        qmp.type_text("tuna")
+        qmp.keys("ret")
+    prove_unlock_wake(qmp, agent, evidence, record, password_unlock)
+
     # Real distribution Orca owns a credential-verified bus name under the ordinary
     # session user. Settings writes trigger Tuna Desktop's consumer, not test start/stop.
     orca_observations = []
@@ -3095,10 +3107,20 @@ def await_login(agent, deadline):
     runs the Tuna Desktop compositor, and the last observed login session
     with the desktop processes it runs (None before any appears)."""
     login = None
+    unadmitted = None
     while time.monotonic() < deadline:
         try:
             login = agent.run("login-session")
-            owner = agent.run("inventory")
+            # The compositor publishes TUNA_COMPOSITOR_STATE asynchronously
+            # after it starts, so early polls fail at inventory's state-read
+            # with FileNotFoundError. That expected retry is not a failure;
+            # only the last unadmitted record is logged, at the deadline.
+            try:
+                owner = agent.run("inventory", log_failure=False)
+            except RuntimeError as error:
+                unadmitted = error
+                raise
+            unadmitted = None
             if (owner["session_uid"] != 0 and owner["session"]["Service"] == LOGIN_SERVICE
                     and owner["session"]["User"] == str(owner["session_uid"])
                     and any(p["executable"] == "tuna-compositor" for p in owner["processes"])):
@@ -3106,6 +3128,8 @@ def await_login(agent, deadline):
         except (OSError, RuntimeError, ValueError, KeyError):
             pass
         time.sleep(1)
+    if unadmitted is not None:
+        log(f"login deadline: last {unadmitted}")
     return False, login
 
 

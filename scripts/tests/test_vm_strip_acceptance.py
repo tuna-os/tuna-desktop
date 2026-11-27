@@ -703,6 +703,79 @@ class NotificationPreparation(unittest.TestCase):
             scope['strip_notification_ui']({'layers': []} | {'locked': True}, self.original, observe_control=True)
 
 
+class HeldStepBanner(unittest.TestCase):
+    """Run 44656894802: uupd's start-limit failure banner dropped in 7 s into
+    the stationary edge hold, and the capture refused keys with the button
+    held. A user lets the drag go, closes the banner, then drags again."""
+
+    def setUp(self):
+        self.notes = NotificationPreparation()
+        self.notes.setUp()
+        self.banner = self.notes.value
+        self.clean = copy.deepcopy(self.notes.after)
+        self.down = False
+        self.events = []
+
+    def hold_step(self, helds, *, step=0.0, deadline=100.0):
+        from unittest.mock import patch
+        helds = iter(helds)
+        clock = [0.0]
+        def hold(before):
+            clock[0] += step
+            self.events.append(('press', before))
+            self.down = True
+            return next(helds)
+        def let_go(before, held):
+            self.assertTrue(self.down)
+            self.events.append(('let go', before, held))
+            self.down = False
+            return held
+        def dismiss(idle):
+            self.events.append(('dismiss', idle))
+            # The real dismissal, told whether a button is held right now.
+            return self.notes.dismiss(before=idle, idle=not self.down)
+        with patch.object(proof.time, 'monotonic', side_effect=lambda: clock[0]):
+            return proof.hold_clear_of_banners('start', hold, let_go, dismiss, deadline=deadline)
+
+    def test_banner_arriving_mid_hold_is_closed_with_the_button_up_then_the_step_is_redone(self):
+        held = self.hold_step([self.banner, self.clean])
+        self.assertIs(held, self.clean)
+        self.assertEqual([event[0] for event in self.events], ['press', 'let go', 'dismiss', 'press'])
+        self.assertEqual(self.events[0][1], 'start')
+        self.assertEqual(self.events[1][1:], ('start', self.banner))
+        self.assertIs(self.events[2][1], self.banner)
+        # The redo starts from the observed banner-free sample, not the old one.
+        self.assertIs(self.events[3][1], self.notes.after)
+        self.assertEqual(self.notes.keys, [('meta_l', 'n'), ('tab',), ('ret',)])
+        self.assertTrue(self.notes.evidence['confirmed_absent'])
+        # The clean held state stays held for its capture and matching release.
+        self.assertTrue(self.down)
+
+    def test_clear_hold_sends_no_release_or_key(self):
+        self.assertIs(self.hold_step([self.clean]), self.clean)
+        self.assertEqual(self.events, [('press', 'start')])
+        self.assertFalse(hasattr(self.notes, 'keys'))
+
+    def test_banners_until_the_deadline_end_released_without_another_dismissal(self):
+        with self.assertRaisesRegex(TimeoutError, 'absolute deadline'):
+            self.hold_step([self.banner] * 8, step=30.0)
+        self.assertEqual([event[0] for event in self.events],
+                         ['press', 'let go', 'dismiss'] * 3 + ['press', 'let go'])
+        self.assertFalse(self.down)
+
+    def test_installed_edge_hold_lets_go_before_any_notification_key(self):
+        import inspect
+        source = inspect.getsource(proof.prove_installed_strip)
+        self.assertIn('interrupted=banner_shown', source)
+        self.assertIn('hold_clear_of_banners(before_edge, edge_hold, edge_let_go, edge_dismiss, deadline=deadline)',
+                      source)
+        self.assertLess(source.index('hold_clear_of_banners(before_edge'),
+                        source.index("capture(label, terminal, 'delta')"))
+        # Step 07's VT cancel lets go of both held titlebar moves.
+        self.assertIn('returned = cancel_held_move(held, before_cancel)', source)
+        self.assertIn('return cancel_held_move(held, windows(before, original, edge=True))', source)
+        self.assertIn('input_idle=not button_down', source)
+
 
 class CaptureFailureEvidence(unittest.TestCase):
     """Synthetic capture failures exercise the real receipt and cleanup path."""

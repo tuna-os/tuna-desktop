@@ -35,7 +35,7 @@ SERVICE
     TUNA_PROOF_PRIVATE_BUS=1
     export XDG_DATA_DIRS TUNA_PROOF_PRIVATE_BUS
     status=0
-    dbus-run-session -- "$0" "$@" || status=$?
+    "$(dirname -- "$0")/lib/tuna-proof-session" --bus -- "$0" "$@" || status=$?
     rm -rf "$services"
     exit "$status"
 fi
@@ -84,8 +84,9 @@ fail() {
     tail -20 "$LOG" >&2 2>/dev/null || true
     exit 1
 }
-# Milliseconds since the epoch.
-now_ms() { date +%s%3N; }
+# Milliseconds since the epoch. Not %3N: uutils date (Ubuntu 26.04's) ignores
+# its width; the full %N is nine digits everywhere.
+now_ms() { echo $(($(date +%s%N) / 1000000)); }
 
 # Start the hanging activation exactly as GTK's version check does.
 started="$(now_ms)"

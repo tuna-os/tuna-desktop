@@ -10,6 +10,9 @@
 # minus real hardware. Asserts on state, not pixels:
 #   D-OUTPUT   the backend lit the vkms connector
 #   D-SHELL    the shell connected over the control socket (introspection)
+#   D-INPUT-AT-STARTUP a uinput mouse that exists before the compositor
+#              starts is among its input devices within 10 s, with no input
+#              event sent (libinput's startup queue is drained at once)
 #   D-IDLE     an unchanged scene stops redundant scanout submissions
 #   D-FRAMES   a real active Wayland client receives 240 page-flip presentations
 #   D-SCALE    a GNOME monitors.xml giving the connector scale 2 is
@@ -43,6 +46,10 @@
 #              desktop and is offered; a lease's fd holds it and one CRTC,
 #              it is withdrawn while leased, and it is offered again after
 #              the client destroys the lease or closes the lease fd
+#   D-POWER-SAVE gsd-power's blank of the locked session: DisplayConfig
+#              PowerSaveMode 3 turns the connector off and the main loop
+#              all but sleeps (#1122); 0 relights it with a full repaint
+#              of the still lock screen at once (#355)
 #   D-TOUCHPAD-SWIPE an emulated (uinput) Synaptics clickpad through real
 #              libinput (P-IN-02, #593): three-finger swipes up/down open
 #              and close the overview following the fingers, left/right
@@ -57,6 +64,10 @@
 #              reverses the gestures, and under reduced motion the held
 #              swipe follows and eases while with animations off it lands
 #              at once
+#   D-OVERVIEW-EXIT Escape from the overview a session starts in (a
+#              uinput keyboard), with no further input: the slowed exit
+#              draws its own frames past the input's linger, settles and
+#              stops repainting, and the scanout is the settled desktop
 # and captures a scanout screenshot with ffmpeg kmsgrab when possible.
 # Needs root (sudo) for modprobe, seatd and uinput. Exits nonzero on any failure.
 set -eu
@@ -72,7 +83,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --seconds) SECONDS_UP="$2"; shift 2 ;;
-        --help|-h) sed -n '2,53p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,72p' "$0"; exit 0 ;;
         *) echo "tuna-drm-smoke: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -97,21 +108,37 @@ CARD_ACL=""
 CARD_RULE=""
 TOUCHPAD_EMU_PID=""
 TOUCHPAD_CLIENT_PID=""
+KEYBOARD_EMU_PID=""
+STARTUP_DEVICE_PID=""
 
 cleanup() {
     if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
     if [ -n "$TOUCHPAD_CLIENT_PID" ]; then kill "$TOUCHPAD_CLIENT_PID" 2>/dev/null || true; fi
     # The emulators (root) exit when their command pipes close.
+    exec 7>&- 2>/dev/null || true
     exec 8>&- 2>/dev/null || true
     exec 9>&- 2>/dev/null || true
+    exec 7>&- 2>/dev/null || true
     if [ -n "$EMU_PID" ]; then wait "$EMU_PID" 2>/dev/null || true; fi
     if [ -n "$TOUCHPAD_EMU_PID" ]; then wait "$TOUCHPAD_EMU_PID" 2>/dev/null || true; fi
+    if [ -n "$KEYBOARD_EMU_PID" ]; then wait "$KEYBOARD_EMU_PID" 2>/dev/null || true; fi
     if [ -n "$COMP_PID" ]; then kill "$COMP_PID" 2>/dev/null || true; fi
+    # After the compositor: should a process still hold the startup
+    # mouse's pipe open, the holder only sees end-of-file once it is gone.
+    if [ -n "$STARTUP_DEVICE_PID" ]; then wait "$STARTUP_DEVICE_PID" 2>/dev/null || true; fi
     if [ -n "$CALIBRATION_PID" ]; then kill "$CALIBRATION_PID" 2>/dev/null || true; fi
     colord_stop
     if [ -n "$SYSTEM_BUS_PID" ]; then kill "$SYSTEM_BUS_PID" 2>/dev/null || true; fi
     if [ -n "$DBUS_PID" ]; then kill "$DBUS_PID" 2>/dev/null || true; fi
-    if [ -n "$SEATD_PID" ]; then sudo kill "$SEATD_PID" 2>/dev/null || true; fi
+    # Our seatd unlinks /run/seatd.sock as it exits, so it must be gone
+    # before the system seatd comes back: otherwise it removes the system
+    # one's fresh socket and leaves the host's seatd listening on nothing.
+    # SEATD_PID is the backgrounded sudo, which relays the signal and only
+    # exits once seatd has.
+    if [ -n "$SEATD_PID" ]; then
+        sudo kill "$SEATD_PID" 2>/dev/null || true
+        wait "$SEATD_PID" 2>/dev/null || true
+    fi
     # Put a stopped system seatd back exactly as we found it.
     if [ -n "$SYSTEM_SEATD" ]; then sudo systemctl start seatd 2>/dev/null || true; fi
     if [ -n "$CARD_ACL" ]; then
@@ -237,13 +264,32 @@ for _ in $(seq 1 50); do [ -S "$SEATD_SOCK" ] && break; sleep 0.1; done
 
 RUNTIME="$(mktemp -d)"
 chmod 700 "$RUNTIME"
+# D-INPUT-AT-STARTUP: a mouse present before the compositor starts, as a
+# login's keyboard and mouse are; it never sends an event.
+STARTUP_DEVICE="Tuna startup mouse"
+mkfifo "$ARTIFACTS/startup-device.fifo"
+# The log stays user-owned on purpose.
+# shellcheck disable=SC2024
+sudo python3 "$ROOT/scripts/lib/drm_input_startup.py" hold "$STARTUP_DEVICE" \
+    <"$ARTIFACTS/startup-device.fifo" >"$ARTIFACTS/startup-device.log" 2>&1 &
+STARTUP_DEVICE_PID=$!
+exec 7>"$ARTIFACTS/startup-device.fifo"
+end=$(($(date +%s) + 10))
+until grep -q '^ready$' "$ARTIFACTS/startup-device.log" 2>/dev/null; do
+    kill -0 "$STARTUP_DEVICE_PID" 2>/dev/null ||
+        fail D-INPUT-AT-STARTUP "the uinput mouse did not start: $(cat "$ARTIFACTS/startup-device.log")"
+    [ "$(date +%s)" -le "$end" ] || fail D-INPUT-AT-STARTUP "the uinput mouse was not created within 10 s"
+    sleep 0.1
+done
+udevadm settle --timeout=10 || true
+started_ms=$(($(date +%s%N) / 1000000))
 env -u DISPLAY -u WAYLAND_DISPLAY \
     XDG_RUNTIME_DIR="$RUNTIME" \
     XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$ARTIFACTS/data" \
     LIBSEAT_BACKEND=seatd \
     TUNA_DRM_DEVICE="$CARD" TUNA_INTROSPECT_FILE="$STATE" TUNA_COMPOSITOR_STATE="$CSTATE" \
     "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-smoke \
-    --shell-bin "$ROOT/target/debug/tuna-shell-host" >"$LOG" 2>&1 &
+    --shell-bin "$ROOT/target/debug/tuna-shell-host" >"$LOG" 2>&1 7>&- &
 COMP_PID=$!
 
 end=$(($(date +%s) + 30))
@@ -261,6 +307,46 @@ until [ -s "$STATE" ] && jq -e '.revision != null' "$STATE" >/dev/null 2>&1; do
     sleep 0.2
 done
 pass D-SHELL "shell connected (revision $(jq .revision "$STATE"))"
+
+# Nothing produces input: the device must come from libinput's startup
+# queue, which a readiness-only loop left alone until the first event.
+until python3 "$ROOT/scripts/lib/drm_input_startup.py" check "$CSTATE" "$STARTUP_DEVICE" \
+    >"$ARTIFACTS/input-at-startup.txt" 2>&1; do
+    kill -0 "$COMP_PID" 2>/dev/null || fail D-INPUT-AT-STARTUP "compositor exited"
+    [ $(($(date +%s%N) / 1000000 - started_ms)) -le 10000 ] ||
+        fail D-INPUT-AT-STARTUP "no input device from before startup within 10 s: $(cat "$ARTIFACTS/input-at-startup.txt")"
+    sleep 0.2
+done
+listed_ms=$(($(date +%s%N) / 1000000 - started_ms))
+snapshot_state "$CSTATE" "$ARTIFACTS/input-at-startup.json"
+pass D-INPUT-AT-STARTUP "$(cat "$ARTIFACTS/input-at-startup.txt") ${listed_ms} ms after the compositor started, with no input event"
+# Unplug it now, before the idle measurement: closing the pipe is the
+# holder's end-of-file, so no process started while it was open may keep
+# a copy (the compositor and its shell did, and the job hung here until
+# it was cancelled).
+exec 7>&-
+end=$(($(date +%s) + 10))
+# The holder runs under sudo: read its /proc state (gone or a zombie once
+# it exits) rather than signal a root process.
+while [ -r "/proc/$STARTUP_DEVICE_PID/stat" ] &&
+    [ "$(sed 's/.*) \(.\).*/\1/' "/proc/$STARTUP_DEVICE_PID/stat" 2>/dev/null)" != Z ]; do
+    if [ "$(date +%s)" -gt "$end" ]; then
+        holders=""
+        for proc in /proc/[0-9]*; do
+            for fd in "$proc"/fd/*; do
+                case "$(readlink "$fd" 2>/dev/null || true)" in
+                    *startup-device.fifo)
+                        holders="$holders ${proc#/proc/}($(cat "$proc/comm" 2>/dev/null || true))"
+                        break ;;
+                esac
+            done
+        done
+        fail D-INPUT-AT-STARTUP "the startup mouse was not unplugged within 10 s of closing its pipe; still open in:${holders:- nothing visible}"
+    fi
+    sleep 0.1
+done
+wait "$STARTUP_DEVICE_PID" || true
+STARTUP_DEVICE_PID=""
 
 sleep 2
 [ -s "$CSTATE" ] || fail D-IDLE "missing compositor frame counter"
@@ -1008,6 +1094,55 @@ sleep 0.5
 client "r['event'] != 'ready'" 1 && fail D-TABLET "the pen reached the client while locked: $(tail -2 "$CLIENT_LOG")"
 pass D-TABLET "relative mapping moved from the cursor; unplug/replug; nothing reached the client while locked"
 
+# Blanked while locked (#355, #1122), as gsd-power blanks an idle locked
+# session: DisplayConfig PowerSaveMode 3 turns the CRTC off and the main
+# loop sleeps but for Mutter's 100 ms dummy flip and the hidden windows'
+# beat (a display-rate loop wakes it about 60 times a second); 0 lights
+# the CRTC again with a full repaint at once, although nothing on the
+# still lock screen or behind it changed.
+power_save_set() {
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.freedesktop.DBus.Properties.Set \
+        org.gnome.Mutter.DisplayConfig PowerSaveMode "<int32 $1>" >/dev/null
+}
+# The compositor main thread's sleeps so far (each one a wake).
+main_wakes() {
+    sed -n 's/^voluntary_ctxt_switches:[[:space:]]*//p' "/proc/$COMP_PID/task/$COMP_PID/status"
+}
+# Milliseconds since the epoch. Not %3N: uutils date (Ubuntu 26.04's date)
+# prints it without its zero padding, which turned the relight time
+# negative and the 2 s deadline into noise; the full %N is padded.
+now_ms() {
+    echo $(($(date +%s%N) / 1000000))
+}
+CONNECTOR_SYSFS="/sys/class/drm/$(basename "$CARD")-$CONNECTOR/enabled"
+[ "$(cat "$CONNECTOR_SYSFS")" = enabled ] || fail D-POWER-SAVE "$CONNECTOR was not lit before blanking"
+power_save_set 3 || fail D-POWER-SAVE "PowerSaveMode 3 refused"
+state '.power_save_mode == 3' || fail D-POWER-SAVE "the compositor did not apply PowerSaveMode 3"
+[ "$(cat "$CONNECTOR_SYSFS")" = disabled ] || fail D-POWER-SAVE "PowerSaveMode 3 left $CONNECTOR lit"
+# Past the input linger and the last frames' callbacks.
+sleep 2
+blank_frames=$(jq -er '.rendered_frames' "$CSTATE")
+wakes_before=$(main_wakes)
+sleep 5
+blank_wakes=$((($(main_wakes) - wakes_before) / 5))
+[ "$blank_wakes" -le 25 ] ||
+    fail D-POWER-SAVE "a blanked, locked session's main loop woke $blank_wakes times a second"
+[ "$(jq -er '.rendered_frames' "$CSTATE")" = "$blank_frames" ] ||
+    fail D-POWER-SAVE "frames were scanned out while PowerSaveMode was 3"
+power_save_set 0 || fail D-POWER-SAVE "PowerSaveMode 0 refused"
+unblanked_at=$(now_ms)
+until [ "$(cat "$CONNECTOR_SYSFS")" = enabled ] &&
+    jq -e ".power_save_mode == 0 and .rendered_frames > $blank_frames" "$CSTATE" >/dev/null 2>&1; do
+    [ $(($(now_ms) - unblanked_at)) -le 2000 ] ||
+        fail D-POWER-SAVE "PowerSaveMode 0 did not repaint and relight $CONNECTOR within 2 s"
+    sleep 0.02
+done
+repaint_ms=$(($(now_ms) - unblanked_at))
+state '.locked' 1 || fail D-POWER-SAVE "the session unlocked"
+pass D-POWER-SAVE "locked and blanked: $CONNECTOR off, $blank_wakes main-loop wakes/s, no scanout; PowerSaveMode 0 relit it with a full repaint in ${repaint_ms} ms"
+
 kill "$CLIENT_PID" 2>/dev/null || true
 CLIENT_PID=""
 exec 8>&-
@@ -1441,5 +1576,168 @@ kill -TERM "$COMP_PID"
 wait "$COMP_PID" || true
 COMP_PID=""
 if grep -q panicked "$TOUCHPAD_LOG"; then fail D-NOPANIC "panic in the touchpad session"; fi
+
+# The overview's exit with no further input (D-OVERVIEW-EXIT): a session
+# that starts in the overview, as a GDM login does, and one Escape from
+# a uinput keyboard (scripts/lib/tuna-uinput-keyboard.py) to the GTK
+# shell. GNOME_SHELL_SLOWDOWN_FACTOR=4 stretches GNOME's 250 ms exit to
+# a second, past the 500 ms that display-rate ticks outlive an input
+# event, so the transition itself must drive its frames to the end, as
+# Mutter's stage clock does. Then the presented frames stop and the
+# kernel's scanout (kmsgrab) is the settled desktop: no workspace card
+# left part-way (the VM journeys' frame 06).
+kill "$DBUS_PID" 2>/dev/null || true
+EXIT_LOG="$ARTIFACTS/compositor-overview-exit.log"
+CSTATE="$ARTIFACTS/compositor-state-overview-exit.json"
+KB_OUT="$ARTIFACTS/keyboard-emulator.log"
+XDG_CONFIG_HOME="$ARTIFACTS/config-overview-exit"
+GSETTINGS_BACKEND=keyfile
+mkdir -p "$XDG_CONFIG_HOME"
+export XDG_CONFIG_HOME GSETTINGS_BACKEND
+# GNOME's plain primary colour behind the desktop: settled, the scanout
+# below the top bar is that one colour.
+gsettings set org.gnome.desktop.background picture-uri ''
+gsettings set org.gnome.desktop.background picture-uri-dark ''
+dbus-daemon --session --fork --print-address=1 --print-pid=1 >"$ARTIFACTS/dbus-overview-exit.txt"
+DBUS_SESSION_BUS_ADDRESS="$(sed -n 1p "$ARTIFACTS/dbus-overview-exit.txt")"
+DBUS_PID="$(sed -n 2p "$ARTIFACTS/dbus-overview-exit.txt")"
+export DBUS_SESSION_BUS_ADDRESS
+LOG="$EXIT_LOG"
+env -u DISPLAY -u WAYLAND_DISPLAY \
+    XDG_RUNTIME_DIR="$RUNTIME" XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$ARTIFACTS/data" \
+    LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD" TUNA_COMPOSITOR_STATE="$CSTATE" \
+    GNOME_SHELL_SLOWDOWN_FACTOR=4 \
+    "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-overview-exit \
+    --startup-overview --shell-bin "$ROOT/target/debug/tuna-shell-gtk" >"$EXIT_LOG" 2>&1 &
+COMP_PID=$!
+state '.layers | any(.namespace == "tuna-panel")' 30 ||
+    fail D-OVERVIEW-EXIT "the GTK shell never mapped its panel"
+state '.animation_slowdown == 4 and .overview_open and .overview_progress == 1
+       and .overview_motion.running == null' 30 ||
+    fail D-OVERVIEW-EXIT "the session did not settle in the overview: $(jq -c '{animation_slowdown, overview_open, overview_progress}' "$CSTATE")"
+EXIT_OUTPUT="$(sed -n 's/.*drm: output [^ ]* \([0-9]*x[0-9]*\) .*/\1/p' "$EXIT_LOG" | head -1)"
+[ -n "$EXIT_OUTPUT" ] || fail D-OVERVIEW-EXIT "no output mode in the log"
+
+mkfifo "$ARTIFACTS/keyboard-emulator.fifo"
+sudo python3 "$ROOT/scripts/lib/tuna-uinput-keyboard.py" "$ARTIFACTS/keyboard-emulator.fifo" "$KB_OUT" &
+KEYBOARD_EMU_PID=$!
+exec 7>"$ARTIFACTS/keyboard-emulator.fifo"
+state '.input_devices | any(.name == "Tuna Smoke Keyboard")' 15 ||
+    fail D-OVERVIEW-EXIT "libinput did not add the emulated keyboard: $(cat "$KB_OUT")"
+# settled_frames SECONDS: within SECONDS, a whole second passes in which
+# the frame counter holds still (at most the frame in flight).
+settled_frames() {
+    end=$(($(date +%s) + $1))
+    while [ "$(date +%s)" -le "$end" ]; do
+        before=$(jq -er '.rendered_frames' "$CSTATE")
+        sleep 1
+        after=$(jq -er '.rendered_frames' "$CSTATE")
+        [ "$((after - before))" -le 1 ] && return 0
+    done
+    return 1
+}
+# The shell's startup work done, nothing moves before the key.
+settled_frames 30 || fail D-OVERVIEW-EXIT "the open overview kept repainting before the key"
+
+# One Escape, then no input at all while the state is sampled for 3 s.
+echo "tap esc" >&7
+python3 - "$CSTATE" "$ARTIFACTS/overview-exit-samples.jsonl" 3 <<'PY'
+import json
+import sys
+import time
+
+source, destination, seconds = sys.argv[1], sys.argv[2], float(sys.argv[3])
+start = time.monotonic()
+last = None
+with open(destination, "w", encoding="utf-8") as out:
+    while time.monotonic() - start < seconds:
+        try:
+            with open(source, encoding="utf-8") as stream:
+                state = json.load(stream)
+        except (OSError, ValueError):
+            time.sleep(0.005)
+            continue
+        row = {
+            "frames": state["rendered_frames"],
+            "open": state["overview_open"],
+            "progress": state["overview_progress"],
+            "running": state["overview_motion"]["running"] is not None,
+        }
+        if row != last:
+            out.write(json.dumps({"t": round(time.monotonic() - start, 3), **row}) + "\n")
+            last = row
+        time.sleep(0.01)
+PY
+grep -q '^ok$' "$KB_OUT" || fail D-OVERVIEW-EXIT "the keyboard emulator did not press Escape: $(cat "$KB_OUT")"
+exit_report="$(python3 - "$ARTIFACTS/overview-exit-samples.jsonl" <<'PY'
+import json
+import sys
+
+
+def check(ok, failure):
+    if not ok:
+        print(failure)
+        sys.exit(1)
+
+
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+closing = [r for r in rows if not r["open"]]
+check(closing, "Escape did not close the overview")
+settled = next((r for r in closing if r["progress"] == 0 and not r["running"]), None)
+check(settled, f"the exit never settled; last sample {rows[-1]}")
+# Past the input's 500 ms linger (plus the shell's round trip), the
+# running transition alone draws: new frames while it is part-way.
+late = sorted({r["frames"] for r in closing if r["t"] >= 0.6 and 0 < r["progress"] < 1})
+check(len(late) >= 3, f"only {len(late)} frames drew the exit after the input linger: {late}")
+print(f"settled {settled['t']} s after Escape at frame {settled['frames']}, "
+      f"{len(late)} frames drawn past the input linger")
+PY
+)" || fail D-OVERVIEW-EXIT "$exit_report (overview-exit-samples.jsonl)"
+jq -e '.overview_motion.close.duration_ms == 1000' "$CSTATE" >/dev/null ||
+    fail D-OVERVIEW-EXIT "the exit did not run GNOME's 250 ms slowed four times: $(jq -c '.overview_motion.close | del(.samples)' "$CSTATE")"
+settled_frames 5 || fail D-OVERVIEW-EXIT "the settled desktop kept repainting"
+# The presented frame is the settled desktop: below the bar, the scanout
+# is the desktop's one colour, not the overview's backdrop or a card.
+scanout="$ARTIFACTS/overview-exit-scanout.rgb"
+for format in bgra bgr0; do
+    sudo ffmpeg -loglevel error -y -device "$CARD" -f kmsgrab -i - -frames:v 1 \
+        -vf "hwdownload,format=$format,format=rgb24" -f rawvideo "$scanout" \
+        2>>"$ARTIFACTS/overview-exit-kmsgrab.log" && break
+done
+[ -s "$scanout" ] || fail D-OVERVIEW-EXIT "kmsgrab could not read the scanout: $(tail -2 "$ARTIFACTS/overview-exit-kmsgrab.log")"
+scanout_report="$(python3 - "$scanout" "$EXIT_OUTPUT" <<'PY'
+import sys
+from collections import Counter
+
+
+def check(ok, failure):
+    if not ok:
+        print(failure)
+        sys.exit(1)
+
+
+data = open(sys.argv[1], "rb").read()
+width, height = map(int, sys.argv[2].split("x"))
+check(len(data) == width * height * 3, f"kmsgrab read {len(data)} bytes for {width}x{height}")
+# The top bar is 32 logical pixels at scale 1; the pointer rests in it.
+below = data[40 * width * 3:]
+colours = Counter(below[i:i + 3] for i in range(0, len(below), 3))
+colour, count = colours.most_common(1)[0]
+share = count / (len(below) // 3)
+rgb = tuple(colour)
+check(rgb != (34, 34, 38), "the overview's backdrop is still scanned out")
+check(share >= 0.999, f"{1 - share:.2%} of the scanout below the bar is not the desktop's {rgb}: not the settled desktop")
+print(f"the {width}x{height} scanout below the bar is {share:.3%} the desktop's {rgb}")
+PY
+)" || fail D-OVERVIEW-EXIT "$scanout_report (overview-exit-scanout.rgb)"
+pass D-OVERVIEW-EXIT "Escape from the startup overview with no further input: $exit_report; $scanout_report"
+
+exec 7>&-
+wait "$KEYBOARD_EMU_PID" 2>/dev/null || true
+KEYBOARD_EMU_PID=""
+kill -TERM "$COMP_PID"
+wait "$COMP_PID" || true
+COMP_PID=""
+if grep -q panicked "$EXIT_LOG"; then fail D-NOPANIC "panic in the overview-exit session"; fi
 
 echo "tuna-drm-smoke: OK, artifacts in $ARTIFACTS"

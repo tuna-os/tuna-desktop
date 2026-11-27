@@ -615,3 +615,63 @@ fn a_window_whose_app_exits_frees_its_surfaces() {
 fn a_dialog_window_whose_app_exits_frees_its_surfaces() {
     close_by_disconnecting(true);
 }
+
+/// #1190, mutter 51 `place.c:1088-1100`: with `auto-maximize` (on by
+/// default) a window first mapping larger than 80% of the work area
+/// (`MAX_UNMAXIMIZED_WINDOW_AREA`) opens maximized; a smaller one, a
+/// fixed-size one, or any with the key off stays floating. On a 1366x768
+/// laptop screen the work area below the top bar is 1366x736.
+#[test]
+fn large_first_maps_open_maximized_under_auto_maximize() {
+    use tuna_compositor::windows::WindowLayout;
+    for (size, fixed, enabled, maximized) in [
+        ((1200, 700), false, true, true),
+        ((1000, 700), false, true, false),
+        ((1200, 700), true, true, false),
+        ((1200, 700), false, false, false),
+    ] {
+        let mut s = Session::new();
+        s.comp.state.set_output_size(1366, 768);
+        s.manager.set_auto_maximize(enabled);
+        let qh = s.qh.clone();
+        let surface = s.surface();
+        let xdg = s
+            .client
+            .xdg_base
+            .as_ref()
+            .unwrap()
+            .get_xdg_surface(&surface, &qh, ());
+        let toplevel = xdg.get_toplevel(&qh, ());
+        toplevel.set_title("Large".into());
+        if fixed {
+            toplevel.set_min_size(size.0, size.1);
+            toplevel.set_max_size(size.0, size.1);
+        }
+        surface.commit();
+        s.pump(|c| c.configures >= 1);
+        let frame = s.buffer(size.0, size.1);
+        surface.attach(Some(&frame.1), 0, 0);
+        surface.commit();
+        s.roundtrip();
+        s.roundtrip();
+        let id = s.manager.model().windows().next().expect("mapped").id;
+        let layout = s.manager.window_layout(id);
+        let case = format!("{size:?} fixed={fixed} enabled={enabled}");
+        if maximized {
+            assert_eq!(layout, Some(WindowLayout::Maximized), "{case}");
+            let geometry = s.manager.geometry(id).unwrap();
+            assert_eq!(
+                (
+                    geometry.loc.x,
+                    geometry.loc.y,
+                    geometry.size.w,
+                    geometry.size.h
+                ),
+                (0, 32, 1366, 736),
+                "{case}"
+            );
+        } else {
+            assert_eq!(layout, Some(WindowLayout::Floating), "{case}");
+        }
+    }
+}

@@ -1685,7 +1685,7 @@ fn native_source_less_drag_enters_same_surface_at_start_without_further_motion()
 
 // --- Clipboard retention after the owner goes (#1033) ---
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// What the first copying client serves (distinct from `PASTE_BYTES`).
 const COPY_A: &[u8] = b"copied by the first client";
@@ -2014,4 +2014,532 @@ fn new_client_selection_replaces_retained_copy() {
         t.paste("text/plain;charset=utf-8").is_empty(),
         "the first client's copy is gone"
     );
+}
+
+// A client's drag-and-drop through the overview (#1189): the hot corner and
+// the Activities control answer the drag, a window preview it rests on is
+// activated, and the end returns an overview still showing to where the drag
+// began. A second client's window is the drop target; the overview itself is
+// the compositor's own scene (the runtime's glue is mirrored by `apply`).
+
+use tuna_compositor::dnd_overview::{
+    DndAction, DndOverview, Hover, DND_ACTIVITIES_TIMEOUT, DND_WINDOW_SWITCH_TIMEOUT,
+};
+use tuna_compositor::overview::{layout_with_policy, OverviewLayout};
+use tuna_compositor::windows::{TriggerAction, TriggerState, WORK_AREA_TOP};
+
+const DRAG_OUTPUT: (i32, i32) = (1280, 800);
+
+type Peer = (Connection, EventQueue<ClipClient>, ClipClient);
+
+/// A native drag in flight between two windows of two clients, on a desktop
+/// of three workspaces, with the compositor's view of it.
+struct DragRig {
+    comp: TestCompositor,
+    manager: WindowManager,
+    dragger: Peer,
+    target: Peer,
+    dragger_id: u64,
+    target_id: u64,
+    dnd: DndOverview,
+    triggers: TriggerState,
+    overview_open: bool,
+    time: u32,
+    base: Instant,
+}
+
+impl DragRig {
+    /// Two mapped windows on workspace 0 (the dragger's above the target's)
+    /// and workspaces 1 and 2 beside them. `shell`: the dragger is the
+    /// supervised shell's connection.
+    fn new(shell: bool) -> Self {
+        let mut comp = TestCompositor::new();
+        comp.state
+            .add_output("tuna-0", None, DRAG_OUTPUT.0, DRAG_OUTPUT.1);
+        let mut manager = comp.window_manager();
+        let connect = |comp: &mut TestCompositor, shell: bool| {
+            let (server_stream, client_stream) = UnixStream::pair().unwrap();
+            if shell {
+                comp.add_shell_client(server_stream);
+            } else {
+                comp.add_client(server_stream);
+            }
+            let conn = Connection::from_socket(client_stream).unwrap();
+            let mut queue = conn.new_event_queue();
+            let qh = queue.handle();
+            let mut client = ClipClient::default();
+            conn.display().get_registry(&qh, ());
+            pump_one(comp, &mut queue, &mut client, |c| c.ready());
+            (conn, queue, client)
+        };
+        let mut target = connect(&mut comp, false);
+        map_selection_client(&mut comp, &target.0, &mut target.1, &mut target.2, "target");
+        manager.reconcile(&mut comp.state);
+        let mut dragger = connect(&mut comp, shell);
+        map_selection_client(
+            &mut comp,
+            &dragger.0,
+            &mut dragger.1,
+            &mut dragger.2,
+            "dragger",
+        );
+        manager.reconcile(&mut comp.state);
+        let id = |title: &str| {
+            manager
+                .model()
+                .windows()
+                .find(|w| w.title == title)
+                .unwrap()
+                .id
+        };
+        let (dragger_id, target_id) = (id("dragger"), id("target"));
+        // GNOME's fixed workspaces: 1 and 2 exist beside the windows' 0.
+        manager.model_mut().set_fixed_workspace_count(Some(3));
+        assert_eq!(manager.model().workspaces(), [0, 1, 2]);
+        let mut rig = Self {
+            comp,
+            manager,
+            dragger,
+            target,
+            dragger_id,
+            target_id,
+            dnd: DndOverview::default(),
+            triggers: TriggerState::default(),
+            overview_open: false,
+            time: 100,
+            base: Instant::now(),
+        };
+        rig.settle();
+        rig
+    }
+
+    /// Both clients have seen everything the compositor sent so far.
+    fn settle(&mut self) {
+        for (conn, queue, client) in [&mut self.dragger, &mut self.target] {
+            client.synced = false;
+            conn.display().sync(&queue.handle(), ());
+            pump_one(&mut self.comp, queue, client, |c| c.synced);
+        }
+    }
+
+    fn center(&self, id: u64) -> (f64, f64) {
+        let rect = self.manager.geometry(id).unwrap();
+        (
+            f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0,
+            f64::from(rect.loc.y) + f64::from(rect.size.h) / 2.0,
+        )
+    }
+
+    fn motion(&mut self, (x, y): (f64, f64)) {
+        self.time += 1;
+        self.manager.on_input(
+            &mut self.comp.state,
+            ManagerInput::Motion {
+                pos: (x, y).into(),
+                time: self.time,
+            },
+        );
+    }
+
+    /// The press on the dragger's window and the `StartDrag` the real
+    /// serial allows, followed by the compositor noticing the drag.
+    fn start(&mut self) {
+        let at = self.center(self.dragger_id);
+        self.motion(at);
+        self.time += 1;
+        self.manager.on_input(
+            &mut self.comp.state,
+            ManagerInput::Button {
+                button: 0x110,
+                pressed: true,
+                time: self.time,
+            },
+        );
+        self.settle();
+        let (_, queue, client) = &mut self.dragger;
+        let serial = *client.buttons.last().expect("real pointer serial");
+        let qh = queue.handle();
+        let source = client.manager.as_ref().unwrap().create_data_source(&qh, ());
+        source.offer("text/plain".into());
+        source.set_actions(wayland_client::protocol::wl_data_device_manager::DndAction::Move);
+        client.device.as_ref().unwrap().start_drag(
+            Some(&source),
+            client.surface.as_ref().unwrap(),
+            None,
+            serial,
+        );
+        client.source = Some(source);
+        self.settle();
+        assert!(self.comp.client_dnd_active(), "StartDrag must be accepted");
+        assert!(self.follow().is_empty());
+    }
+
+    fn release(&mut self) {
+        self.time += 1;
+        self.manager.on_input(
+            &mut self.comp.state,
+            ManagerInput::Button {
+                button: 0x110,
+                pressed: false,
+                time: self.time,
+            },
+        );
+        self.settle();
+    }
+
+    fn cancel(&mut self) {
+        self.time += 1;
+        assert!(self.comp.cancel_client_dnd(self.time));
+        self.settle();
+    }
+
+    /// What the runtime does before anything else with a drag: notice it
+    /// begin or end.
+    fn follow(&mut self) -> Vec<DndAction> {
+        let actions = self.dnd.sync(
+            self.comp.state.client_dnd_overview_active(),
+            self.manager.model().active_workspace(),
+            self.overview_open,
+        );
+        self.apply(&actions);
+        actions
+    }
+
+    fn open(&mut self, open: bool) {
+        self.overview_open = open;
+        self.manager.set_overview_open(open);
+    }
+
+    /// The runtime's `apply_dnd_actions`.
+    fn apply(&mut self, actions: &[DndAction]) {
+        for action in actions {
+            match *action {
+                DndAction::OpenOverview => self.open(true),
+                DndAction::SwitchWorkspace(ws) => {
+                    assert!(self.manager.switch_to_workspace(&mut self.comp.state, ws));
+                }
+                DndAction::ActivateWindow(id) => {
+                    let ws = self.manager.model().window(id).unwrap().workspace;
+                    if ws != self.manager.model().active_workspace() {
+                        self.manager.switch_to_workspace(&mut self.comp.state, ws);
+                    }
+                    self.manager.focus(&mut self.comp.state, Some(id));
+                    self.open(false);
+                }
+                DndAction::CloseOverview => self.open(false),
+            }
+        }
+    }
+
+    fn layout(&self) -> OverviewLayout {
+        let model = self.manager.model();
+        layout_with_policy(
+            smithay::utils::Rectangle::new((0, 0).into(), DRAG_OUTPUT.into()),
+            WORK_AREA_TOP,
+            model.workspaces(),
+            model.active_workspace(),
+            &self.manager.overview_windows(),
+            false,
+        )
+    }
+
+    fn hover(&self) -> Hover {
+        let pos = self.manager.pointer_pos();
+        let activities = self.comp.state.overview_activities_at(&self.triggers, pos);
+        if self.overview_open {
+            Hover::in_overview(&self.layout(), pos, activities)
+        } else {
+            Hover {
+                activities,
+                ..Hover::default()
+            }
+        }
+    }
+
+    fn at(&self, ms: u64) -> Instant {
+        self.base + Duration::from_millis(ms)
+    }
+
+    /// The drag moves to `to`, `ms` after the rig began.
+    fn drag_to(&mut self, to: (f64, f64), ms: u64) -> Vec<DndAction> {
+        self.motion(to);
+        let actions = self.dnd.motion(
+            self.hover(),
+            self.manager.model().active_workspace(),
+            self.at(ms),
+        );
+        self.apply(&actions);
+        actions
+    }
+
+    fn poll(&mut self, ms: u64) -> Vec<DndAction> {
+        let actions = self.dnd.poll(self.hover(), self.overview_open, self.at(ms));
+        self.apply(&actions);
+        actions
+    }
+
+    /// What the trigger makes of the pointer reaching `to`.
+    fn corner(&mut self, to: (f64, f64)) -> TriggerAction {
+        self.motion(to);
+        let input = ManagerInput::Motion {
+            pos: to.into(),
+            time: self.time,
+        };
+        self.comp.state.overview_trigger_action(
+            &mut self.triggers,
+            &input,
+            self.overview_open,
+            self.manager.pointer_pos(),
+        )
+    }
+
+    /// What the trigger makes of pressure against the corner's barrier.
+    fn pressure(&mut self) -> TriggerAction {
+        let input = ManagerInput::CornerPressure {
+            pos: (0.0, 3.0).into(),
+            time: self.time,
+        };
+        self.comp.state.overview_trigger_action(
+            &mut self.triggers,
+            &input,
+            self.overview_open,
+            self.manager.pointer_pos(),
+        )
+    }
+
+    fn preview_center(&self, id: u64) -> (f64, f64) {
+        let preview = self
+            .layout()
+            .previews
+            .into_iter()
+            .find(|p| p.id == id && p.active)
+            .expect("the window has a preview on the active card");
+        let rect = preview.rect;
+        (
+            f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0,
+            f64::from(rect.loc.y) + f64::from(rect.size.h) / 2.0,
+        )
+    }
+
+    /// Inside the thumbnail of workspace `ws`, clear of its miniatures.
+    fn thumbnail_corner(&self, ws: u32) -> (f64, f64) {
+        let rect = self
+            .layout()
+            .thumbnails
+            .into_iter()
+            .find(|t| t.workspace == ws)
+            .expect("a thumbnail per workspace")
+            .rect;
+        (f64::from(rect.loc.x) + 1.0, f64::from(rect.loc.y) + 1.0)
+    }
+}
+
+#[test]
+fn a_client_drag_opens_the_hot_corner_even_where_only_pressure_does() {
+    let mut rig = DragRig::new(false);
+    // A native seat opens its corner by pressure alone.
+    rig.triggers.set_pressure_only(true);
+    assert_eq!(rig.corner((2.0, 3.0)), TriggerAction::None);
+    rig.start();
+    assert!(rig.comp.state.client_dnd_overview_active());
+    // The drag holds the pointer: hovering the corner is what opens it.
+    assert_eq!(rig.corner((400.0, 400.0)), TriggerAction::None);
+    assert_eq!(rig.corner((2.0, 3.0)), TriggerAction::Open);
+    // Only the corner: not its surroundings, not an open overview, not a
+    // corner GNOME's setting took away.
+    assert_eq!(rig.corner((20.0, 3.0)), TriggerAction::None);
+    rig.open(true);
+    assert_eq!(rig.corner((2.0, 3.0)), TriggerAction::None);
+    rig.open(false);
+    rig.triggers.set_hot_corner(false);
+    assert_eq!(rig.corner((2.0, 3.0)), TriggerAction::None);
+    rig.triggers.set_hot_corner(true);
+    // The pressure that follows the hover (the pointer pushing on into
+    // the barrier) opens a closed overview but never closes the open one.
+    assert_eq!(rig.pressure(), TriggerAction::Toggle);
+    rig.open(true);
+    assert_eq!(rig.pressure(), TriggerAction::None);
+    rig.open(false);
+    // When the drag is over, the corner is pressure's again.
+    rig.cancel();
+    assert!(!rig.comp.client_dnd_active());
+    assert_eq!(rig.corner((2.0, 3.0)), TriggerAction::None);
+    rig.open(true);
+    assert_eq!(rig.pressure(), TriggerAction::Toggle);
+}
+
+#[test]
+fn the_shells_own_drags_are_not_the_overviews() {
+    // The dash and the app grid drag inside the overview: the supervised
+    // shell's drags never open the corner, arm a timer or end the overview.
+    let mut rig = DragRig::new(true);
+    rig.triggers.set_pressure_only(true);
+    rig.start();
+    assert!(rig.comp.client_dnd_active());
+    assert!(!rig.comp.state.client_dnd_overview_active());
+    assert_eq!(rig.corner((2.0, 3.0)), TriggerAction::None);
+    rig.open(true);
+    assert!(rig.drag_to((40.0, 10.0), 0).is_empty());
+    assert_eq!(rig.dnd.deadline(), None);
+    rig.cancel();
+    assert!(rig.follow().is_empty(), "the overview stays open");
+    assert!(!rig.dnd.active());
+    assert!(rig.overview_open);
+}
+
+#[test]
+fn a_drag_resting_on_the_activities_button_opens_the_overview() {
+    let mut rig = DragRig::new(false);
+    rig.start();
+    // Off the button: nothing waits.
+    assert!(rig.drag_to((400.0, 10.0), 0).is_empty());
+    assert_eq!(rig.dnd.deadline(), None);
+    // Onto the button: GNOME waits 250 ms from the last motion over it.
+    let wait = DND_ACTIVITIES_TIMEOUT.as_millis() as u64;
+    assert!(rig.drag_to((40.0, 10.0), 1_000).is_empty());
+    assert!(rig.drag_to((50.0, 12.0), 1_200).is_empty());
+    assert!(rig.poll(1_200 + wait - 1).is_empty());
+    assert!(!rig.overview_open);
+    assert_eq!(rig.poll(1_200 + wait), [DndAction::OpenOverview]);
+    assert!(rig.overview_open);
+    // Leaving the button first cancels it.
+    let mut rig = DragRig::new(false);
+    rig.start();
+    rig.drag_to((40.0, 10.0), 0);
+    rig.drag_to((400.0, 400.0), 100);
+    assert!(rig.poll(10_000).is_empty());
+    assert!(!rig.overview_open);
+}
+
+#[test]
+fn a_drag_resting_on_a_window_preview_activates_that_window() {
+    let mut rig = DragRig::new(false);
+    rig.start();
+    assert_eq!(rig.manager.model().focused(), Some(rig.dragger_id));
+    rig.open(true);
+    let target_id = rig.target_id;
+    let preview = rig.preview_center(target_id);
+    let wait = DND_WINDOW_SWITCH_TIMEOUT.as_millis() as u64;
+    assert!(rig.drag_to(preview, 100).is_empty());
+    // Moving within the preview does not restart the wait.
+    assert!(rig.drag_to((preview.0 + 1.0, preview.1), 400).is_empty());
+    assert!(rig.poll(100 + wait - 1).is_empty());
+    assert!(rig.overview_open);
+    assert_eq!(rig.poll(100 + wait), [DndAction::ActivateWindow(target_id)]);
+    // The window is up, raised, and the overview gone.
+    assert!(!rig.overview_open);
+    assert_eq!(rig.manager.model().focused(), Some(target_id));
+    assert_eq!(rig.manager.stacking_order().last(), Some(&target_id));
+    // The drop lands on it.
+    let at = rig.center(target_id);
+    rig.motion(at);
+    rig.settle();
+    let client = &rig.target.2;
+    assert_eq!(
+        client.drag_enters.last().map(|e| e.0.clone()),
+        client.surface.clone(),
+        "the activated window is the drag's target"
+    );
+    let offer = client.drag_enters.last().unwrap().3.clone().unwrap();
+    offer.accept(client.drag_enter_serial.unwrap(), Some("text/plain".into()));
+    offer.set_actions(
+        wayland_client::protocol::wl_data_device_manager::DndAction::Move,
+        wayland_client::protocol::wl_data_device_manager::DndAction::Move,
+    );
+    rig.settle();
+    rig.release();
+    assert_eq!(rig.target.2.drops, 1);
+    assert!(!rig.comp.client_dnd_active());
+    // The overview is gone: the drop stays where the window is.
+    assert!(rig.follow().is_empty());
+    assert_eq!(rig.manager.model().active_workspace(), 0);
+}
+
+#[test]
+fn a_preview_the_pointer_leaves_never_activates() {
+    let mut rig = DragRig::new(false);
+    rig.start();
+    rig.open(true);
+    let preview = rig.preview_center(rig.target_id);
+    let wait = DND_WINDOW_SWITCH_TIMEOUT.as_millis() as u64;
+    rig.drag_to(preview, 0);
+    rig.drag_to((640.0, 790.0), 700);
+    assert!(rig.poll(wait + 100).is_empty());
+    assert!(rig.overview_open);
+    assert_eq!(rig.manager.model().focused(), Some(rig.dragger_id));
+}
+
+#[test]
+fn the_window_under_a_stationary_drag_takes_it_when_the_overview_closes() {
+    let mut rig = DragRig::new(false);
+    rig.start();
+    rig.open(true);
+    let at = rig.center(rig.target_id);
+    rig.drag_to(at, 0);
+    rig.settle();
+    assert!(
+        rig.target.2.drag_enters.is_empty(),
+        "previews are not windows: nothing is entered in the overview"
+    );
+    // The target is raised (a click on its preview), the overview closes,
+    // and the pointer never moves.
+    let id = rig.target_id;
+    rig.manager.focus(&mut rig.comp.state, Some(id));
+    rig.open(false);
+    rig.manager.repick_pointer_window(&mut rig.comp.state);
+    rig.settle();
+    assert_eq!(
+        rig.target.2.drag_enters.last().map(|e| e.0.clone()),
+        rig.target.2.surface.clone(),
+        "the window now beneath the drag is its target"
+    );
+}
+
+#[test]
+fn hovering_a_thumbnail_activates_its_workspace() {
+    let mut rig = DragRig::new(false);
+    rig.start();
+    rig.open(true);
+    assert_eq!(rig.layout().thumbnails.len(), 3);
+    // No timer: GNOME switches as the drag enters the thumbnail.
+    let two = rig.thumbnail_corner(2);
+    assert_eq!(rig.drag_to(two, 0), [DndAction::SwitchWorkspace(2)]);
+    assert_eq!(rig.manager.model().active_workspace(), 2);
+    // Still inside it: nothing more. Another thumbnail: that workspace.
+    assert!(rig.drag_to((two.0 + 1.0, two.1), 10).is_empty());
+    let one = rig.thumbnail_corner(1);
+    assert_eq!(rig.drag_to(one, 20), [DndAction::SwitchWorkspace(1)]);
+    assert_eq!(rig.manager.model().active_workspace(), 1);
+}
+
+fn the_end_of_a_drag_returns_to_where_it_began(drop: bool) {
+    let mut rig = DragRig::new(false);
+    rig.start();
+    rig.open(true);
+    let two = rig.thumbnail_corner(2);
+    assert_eq!(rig.drag_to(two, 0), [DndAction::SwitchWorkspace(2)]);
+    assert_eq!(rig.manager.model().active_workspace(), 2);
+    if drop {
+        rig.release();
+    } else {
+        rig.cancel();
+    }
+    assert!(!rig.comp.client_dnd_active());
+    assert_eq!(
+        rig.follow(),
+        [DndAction::SwitchWorkspace(0), DndAction::CloseOverview]
+    );
+    assert_eq!(rig.manager.model().active_workspace(), 0);
+    assert!(!rig.overview_open);
+    assert!(!rig.dnd.active());
+}
+
+#[test]
+fn cancelling_a_drag_returns_to_the_starting_workspace() {
+    the_end_of_a_drag_returns_to_where_it_began(false);
+}
+
+#[test]
+fn dropping_a_drag_returns_to_the_starting_workspace() {
+    the_end_of_a_drag_returns_to_where_it_began(true);
 }
