@@ -48,6 +48,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -349,7 +350,9 @@ def run(args):
             wait_for(label, ok, timeout)
         except GateFailure:
             raise GateFailure(f"{label}: {'; '.join(problems)}") from None
-        shutil.copy(state_path, out / f"state-{label.replace(' ', '-')}.json")
+        # upload-artifact refuses NTFS-unsafe names (labels carry colons).
+        name = re.sub(r'[\s"*:<>?|]+', "-", label)
+        shutil.copy(state_path, out / f"state-{name}.json")
 
     def gsettings(*words):
         subprocess.run(["gsettings", "set", *words], env=env, check=True)
