@@ -1147,6 +1147,13 @@ impl Router {
         }
     }
 
+    /// A session holds the input: the local pointer is not where the
+    /// user is, so the compositor hides it (mutter's capture activation
+    /// hides the cursor sprite until the session deactivates).
+    pub(crate) fn is_capturing(&mut self) -> bool {
+        self.active_session().is_some()
+    }
+
     fn active_session(&mut self) -> Option<Arc<CaptureShared>> {
         let (session, id) = self.active.as_ref()?;
         if session.activation() == Some(*id) {
@@ -1609,7 +1616,8 @@ mod tests {
         ));
         assert_eq!(drain(&channel), vec![EisCommand::Start(1)]);
         assert_eq!(session.activation(), Some(1));
-        // Captured: nothing local, everything to EIS.
+        // Captured: nothing local, everything to EIS, no local cursor.
+        assert!(router.is_capturing());
         let routed = route(&mut router, motion(0.0, 10.0, 3.0, 2.0), (0.0, 10.0));
         assert!(routed.deliver.is_empty() && routed.captured);
         assert!(route(&mut router, key(30, true), (0.0, 10.0))
@@ -1658,6 +1666,7 @@ mod tests {
             .deliver
             .is_empty());
         session.release().unwrap();
+        assert!(!router.is_capturing());
         assert!(route(&mut router, key(32, false), (0.0, 10.0))
             .deliver
             .is_empty());

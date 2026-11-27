@@ -118,10 +118,12 @@ echo "tuna-app-content: display $DISPLAY geometry $(xdotool getdisplaygeometry)"
 echo "tuna-app-content: building"
 cargo build --quiet --manifest-path "$ROOT/Cargo.toml" \
     -p tuna-compositor -p tuna-shell-host
+# Where cargo put them: CI shares one build between proofs (CARGO_TARGET_DIR).
+BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 
 echo "tuna-app-content: starting compositor on socket $SOCKET"
-"$ROOT/target/debug/tuna-compositor" --socket "$SOCKET" \
-    --shell-bin "$ROOT/target/debug/tuna-shell-host" \
+"$BIN/tuna-compositor" --socket "$SOCKET" \
+    --shell-bin "$BIN/tuna-shell-host" \
     >"$LOG" 2>&1 &
 COMPOSITOR_PID=$!
 

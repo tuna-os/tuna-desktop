@@ -205,8 +205,12 @@ class GtkShellUploadContract(unittest.TestCase):
     def test_both_uploads_are_required_and_bounded_inside_the_job_deadline(self):
         _, evidence = self.upload("gtk-shell")
         _, binaries = self.upload("gtk-shell-binaries")
+        # The evidence always uploads; the executables (~300 MB) upload when
+        # the job failed and on every push, schedule and dispatch run, not on
+        # a passing pull request.
+        self.assertEqual(evidence["if"], "always()")
+        self.assertEqual(binaries["if"], "${{ failure() || github.event_name != 'pull_request' }}")
         for step in (evidence, binaries):
-            self.assertEqual(step["if"], "always()")
             self.assertEqual(step["with"]["if-no-files-found"], "error")
             self.assertNotIn("continue-on-error", step)
         self.assertEqual((evidence["timeout-minutes"], binaries["timeout-minutes"]), (5, 10))

@@ -236,7 +236,11 @@ just ci-artifacts <run-id>
 - A `gtk-shell` job uploads its evidence (logs, frames, receipts) as the
   `gtk-shell` artifact and its executables as `gtk-shell-binaries`, at the
   same relative paths, with their SHA-256 sums in the evidence's
-  `ci-detached-entries.txt`. Both uploads run after a failure too. The step
+  `ci-detached-entries.txt`. Both uploads run after a failure too; on a
+  passing pull request `gtk-shell-binaries` and the large raw evidence
+  (`native-minimize-proof`, `native-wellbeing-proof`,
+  `window-motion-proofs`) are skipped, while push, schedule and dispatch
+  runs always upload them. The step
   that collects the executables copies only what was built: after an
   earlier failure, a `not collected, never built or installed` warning is a
   consequence, and the first failed step is the cause. A missing executable
