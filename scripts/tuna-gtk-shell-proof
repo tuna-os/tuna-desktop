@@ -2192,19 +2192,20 @@ toplevel_drag_gate() {
     probe_line "$drag_log" ready "$DRAG_PID" G-TOPLEVEL-DRAG
     cstate '.focused == ([.windows[] | select(.app_id == "tuna-probe-drag-tabs") | .id][0])' "tab strip focused" ||
         fail G-TOPLEVEL-DRAG "the tab strip never took focus"
-    # shellcheck disable=SC2046
-    set -- $(jq -r '.windows[] | select(.app_id == "tuna-probe-drag-tabs") | .rect | map(tostring) | join(" ")' "$CSTATE")
-    xdotool mousemove --window "$WID" $(($1 + 100)) $(($2 + 60))
+    read -r strip_x strip_y _ <<EOF
+$(jq -r '.windows[] | select(.app_id == "tuna-probe-drag-tabs") | .rect | map(tostring) | join(" ")' "$CSTATE")
+EOF
+    xdotool mousemove --window "$WID" $((strip_x + 100)) $((strip_y + 60))
     sleep 0.3
     xdotool mousedown 1
     probe_line "$drag_log" dragging "$DRAG_PID" G-TOPLEVEL-DRAG
-    for drag_to in "400 300" "700 450"; do
-        # shellcheck disable=SC2086
-        set -- $drag_to
-        xdotool mousemove --window "$WID" "$1" "$2"
-        cstate ".windows | any(.app_id == \"tuna-probe-drag-tab\" and .rect[0] == $(($1 - 30)) and .rect[1] == $(($2 - 15)))" "tab at the pointer" || {
+    for drag_to in 400,300 700,450; do
+        drag_x=${drag_to%,*}
+        drag_y=${drag_to#*,}
+        xdotool mousemove --window "$WID" "$drag_x" "$drag_y"
+        cstate ".windows | any(.app_id == \"tuna-probe-drag-tab\" and .rect[0] == $((drag_x - 30)) and .rect[1] == $((drag_y - 15)))" "tab at the pointer" || {
             xdotool mouseup 1
-            fail G-TOPLEVEL-DRAG "the attached window is not at the pointer ($1, $2) less its offset (30, 15)"
+            fail G-TOPLEVEL-DRAG "the attached window is not at the pointer ($drag_x, $drag_y) less its offset (30, 15)"
         }
     done
     xdotool mouseup 1
