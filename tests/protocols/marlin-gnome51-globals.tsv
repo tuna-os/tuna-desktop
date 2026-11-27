@@ -13,7 +13,7 @@ wl_data_device_manager	3	capture	match
 xdg_toplevel_drag_manager_v1	1	capture	gap:#89
 zwp_primary_selection_device_manager_v1	1	capture	match
 wl_subcompositor	1	capture	match
-xdg_wm_base	7	capture	min:6
+xdg_wm_base	7	capture	match
 gtk_shell1	7	capture	absent:not planned, GTK4 needs none of it
 wp_viewporter	1	capture	match
 wp_fractional_scale_manager_v1	1	capture	match
@@ -25,8 +25,8 @@ zwp_relative_pointer_manager_v1	1	capture	match
 zwp_pointer_constraints_v1	1	capture	match
 zxdg_exporter_v2	1	capture	match
 zxdg_importer_v2	1	capture	match
-zxdg_exporter_v1	1	capture	gap:#61
-zxdg_importer_v1	1	capture	gap:#61
+zxdg_exporter_v1	1	capture	match
+zxdg_importer_v1	1	capture	match
 zwp_linux_dmabuf_v1	3	capture	match
 wp_single_pixel_buffer_manager_v1	1	capture	match
 zwp_keyboard_shortcuts_inhibit_manager_v1	1	capture	match
@@ -43,8 +43,8 @@ wp_commit_timing_manager_v1	1	capture	match
 wp_fifo_manager_v1	1	capture	match
 wp_cursor_shape_manager_v1	2	capture	match
 wp_color_representation_manager_v1	1	capture	gap:#89
-ext_background_effect_manager_v1	1	capture	gap:#89
-wl_fixes	1	capture	gap:#89
-wp_drm_lease_device_v1	1	capture	gap:#89
+ext_background_effect_manager_v1	1	capture	match
+wl_fixes	1	capture	match
+wp_drm_lease_device_v1	1	capture	cond:native-kms
 wp_linux_drm_syncobj_manager_v1	1	source	gap:#89
 zwp_xwayland_keyboard_grab_manager_v1	1	source	gap:#89

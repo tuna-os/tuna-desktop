@@ -20,6 +20,11 @@ pub fn duration(policy: MotionPolicy) -> Duration {
     }
 }
 /// Clutter's ease-out-expo has exact endpoints and 1 - 2^-10t inside.
+///
+/// Without motion (reduced motion or a monitor-sized window) GNOME Shell 51
+/// eases the restore's opacity on the still-hidden actor
+/// (`windowManager.js:1243-1251` never calls `actor.show()`), so Clutter
+/// skips the implicit transition and the window appears at full opacity.
 pub fn frame(effect: Effect, progress: f64, policy: MotionPolicy, monitor_sized: bool) -> Frame {
     let p = if policy.allows_fades() {
         progress.clamp(0.0, 1.0)
@@ -43,10 +48,13 @@ pub fn frame(effect: Effect, progress: f64, policy: MotionPolicy, monitor_sized:
         },
         alpha: match effect {
             Effect::Minimize => ((255.0 * (1.0 - ease)) as u8) as f32 / 255.0,
-            Effect::Unminimize if motion => 1.0,
-            Effect::Unminimize => ((255.0 * ease) as u8) as f32 / 255.0,
+            Effect::Unminimize => 1.0,
         },
     }
+}
+/// Whether a restore moves at all; otherwise it is instant (see [`frame`]).
+pub fn restore_animates(policy: MotionPolicy, monitor_sized: bool) -> bool {
+    policy.allows_motion() && !monitor_sized
 }
 /// Mutter 51: fullscreen or an exact whole-screen frame. A normal window
 /// matching only one monitor in a multi-monitor desktop still uses motion.
@@ -70,6 +78,33 @@ pub fn fallback(
             .into(),
         (0.0, 0.0).into(),
     )
+}
+/// The destination GNOME Shell 51 minimizes toward (`windowManager.js`
+/// `_minimizeWindow`, lines 1183-1201): `meta_window_get_icon_geometry`,
+/// else the monitor's upper leading corner at scale 0. Mutter sets icon
+/// geometry only from X11 `_NET_WM_ICON_GEOMETRY` (`src/x11/window-props.c`
+/// `reload_icon_geometry`, line 295), so `client_icon` is that property and
+/// wins whenever set. GNOME Shell never sets one on Wayland; Tuna's dash
+/// lives in the overview, so its published icon counts only while it is on
+/// screen.
+pub fn target(
+    client_icon: Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>>,
+    dash_icon: Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>>,
+    dash_visible: bool,
+    monitor: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
+    rtl: bool,
+) -> crate::size_change::RectF {
+    match (client_icon, dash_icon) {
+        (Some(icon), _) => icon.to_f64(),
+        (None, Some(icon)) if dash_visible => icon.to_f64(),
+        _ => fallback(monitor, rtl),
+    }
+}
+/// What besides the window decides a minimize destination.
+#[derive(Clone, Copy, Debug)]
+pub struct TargetContext {
+    pub right_to_left: bool,
+    pub dash_visible: bool,
 }
 /// Bounds of both layers when a resize crossfade is interrupted.
 pub fn bounds(
@@ -140,6 +175,40 @@ mod tests {
         assert_eq!(geometry(normal, icon, 0.5).size, (282.0, 207.0).into());
     }
     #[test]
+    fn hidden_dash_icons_fall_back_to_the_gnome_leading_corner() {
+        let monitor = smithay::utils::Rectangle::new((0, 0).into(), (1280, 800).into());
+        let icon = smithay::utils::Rectangle::new((600, 720).into(), (64, 64).into());
+        let corner = fallback(monitor, false);
+        assert_eq!(target(None, Some(icon), false, monitor, false), corner);
+        assert_eq!(target(None, None, true, monitor, false), corner);
+        assert_eq!(
+            target(None, None, false, monitor, true),
+            fallback(monitor, true)
+        );
+        assert_eq!(
+            target(None, Some(icon), true, monitor, false),
+            icon.to_f64()
+        );
+    }
+    #[test]
+    fn x11_icon_geometry_wins_like_mutter_get_icon_geometry() {
+        let monitor = smithay::utils::Rectangle::new((0, 0).into(), (1280, 800).into());
+        let dash = smithay::utils::Rectangle::new((600, 720).into(), (64, 64).into());
+        let client = smithay::utils::Rectangle::new((40, 760).into(), (32, 24).into());
+        for dash_visible in [false, true] {
+            for rtl in [false, true] {
+                assert_eq!(
+                    target(Some(client), Some(dash), dash_visible, monitor, rtl),
+                    client.to_f64()
+                );
+                assert_eq!(
+                    target(Some(client), None, dash_visible, monitor, rtl),
+                    client.to_f64()
+                );
+            }
+        }
+    }
+    #[test]
     fn minimize_400ms_expo_moves_scales_and_fades() {
         let p = MotionPolicy::default();
         assert_eq!(duration(p), Duration::from_millis(400));
@@ -169,8 +238,8 @@ mod tests {
             45.0 / 255.0
         );
         assert_eq!(
-            frame(Effect::Unminimize, 0.25, policy, true).alpha,
-            209.0 / 255.0
+            frame(Effect::Minimize, 0.25, policy, true).alpha,
+            45.0 / 255.0
         );
     }
     #[test]
@@ -199,7 +268,7 @@ mod tests {
         );
     }
     #[test]
-    fn reduced_and_monitor_sized_use_only_opacity() {
+    fn reduced_and_monitor_sized_minimize_fades_and_restore_shows_at_once() {
         let reduced = MotionPolicy {
             level: MotionLevel::FadeOnly,
             ..Default::default()
@@ -212,14 +281,18 @@ mod tests {
                     alpha: 7.0 / 255.0
                 }
             );
-            assert_eq!(
-                frame(Effect::Unminimize, 0.5, p, monitor),
-                Frame {
-                    icon_weight: 0.0,
-                    alpha: 247.0 / 255.0
-                }
-            );
+            assert!(!restore_animates(p, monitor));
+            for progress in [0.0, 0.25, 1.0] {
+                assert_eq!(
+                    frame(Effect::Unminimize, progress, p, monitor),
+                    Frame {
+                        icon_weight: 0.0,
+                        alpha: 1.0
+                    }
+                );
+            }
         }
+        assert!(restore_animates(MotionPolicy::default(), false));
     }
     #[test]
     fn off_is_immediate_and_slowdown_scales_duration() {

@@ -9,7 +9,6 @@
 //! catalog directory in front of the system's wins as for every other
 //! data file the login screen reads.
 
-use std::ffi::{c_char, CString};
 use std::path::{Path, PathBuf};
 
 use gtk4::glib;
@@ -17,34 +16,16 @@ use gtk4::glib;
 /// gnome-shell's gettext domain.
 const DOMAIN: &str = "gnome-shell";
 
-extern "C" {
-    // libintl, part of the C library.
-    fn bindtextdomain(domain: *const c_char, dir: *const c_char) -> *mut c_char;
-    fn bind_textdomain_codeset(domain: *const c_char, codeset: *const c_char) -> *mut c_char;
-}
-
 /// Bind gnome-shell's catalogs; call once, before the first string.
 pub fn init() {
-    let Ok(domain) = CString::new(DOMAIN) else {
-        return;
-    };
     let dirs = std::env::var("XDG_DATA_DIRS")
         .ok()
         .filter(|dirs| !dirs.is_empty())
         .unwrap_or_else(|| "/usr/local/share:/usr/share".to_owned());
     if let Some(dir) = catalog_dir(dirs.split(':').map(Path::new)) {
-        if let Some(dir) = dir.to_str().and_then(|d| CString::new(d).ok()) {
-            // SAFETY: both arguments are NUL-terminated strings that
-            // outlive the calls; libintl copies them.
-            unsafe {
-                bindtextdomain(domain.as_ptr(), dir.as_ptr());
-            }
-        }
+        let _ = gettextrs::bindtextdomain(DOMAIN, dir);
     }
-    // SAFETY: as above.
-    unsafe {
-        bind_textdomain_codeset(domain.as_ptr(), c"UTF-8".as_ptr());
-    }
+    let _ = gettextrs::bind_textdomain_codeset(DOMAIN, "UTF-8");
 }
 
 /// The first `<data dir>/locale` holding a `gnome-shell.mo` for any

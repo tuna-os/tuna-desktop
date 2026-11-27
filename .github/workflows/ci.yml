@@ -12,6 +12,13 @@ on:
   schedule:
     - cron: "7 2 * * *"
   workflow_dispatch:
+  # Merge queue: GitHub builds a temporary branch holding main plus the
+  # queued pull requests ahead of an entry and requires this workflow's
+  # ci-gate on it. Without this trigger the required check never reports
+  # and a queued pull request waits forever. A merge group is not a
+  # pull_request, so it runs every lane (scripts/ci-select-lanes) on the
+  # repository's own runners: the tree it tests is the one main becomes.
+  merge_group:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -54,7 +61,7 @@ jobs:
           # the pull request's base below.
           fetch-depth: 0
       # Which proof lanes this run executes (scripts/ci-select-lanes):
-      # every lane on main, nightly and dispatch; on a pull request only
+      # every lane on main, nightly, dispatch and a merge group; on a pull request only
       # what the change can affect, with a rotating slice of the
       # end-to-end lanes for code changes (repo variable
       # CI_ROUND_ROBIN_SIZE, default 2).
@@ -77,23 +84,21 @@ jobs:
           if [ "$DRAFT" = true ]; then
             DRAFT=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .draft) || DRAFT=true
           fi
+          # The selector also prints the marlin-vm legs (vm_matrix): a pull
+          # request runs the primary lifecycle leg and the required native
+          # automatic-timezone leg, plus the Orca 51 leg when it runs
+          # parity-ledger, whose V-ORCA-* citations that leg's assertions
+          # feed; the paired GNOME/Tuna references run on main, schedule and
+          # dispatch with the Orca 51 leg (each leg rebuilds the image and
+          # boots a VM for ~30 hosted minutes).
           if [ "$DRAFT" = true ]; then
-            echo 'lanes=[]' >> "$GITHUB_OUTPUT"
+            scripts/ci-select-lanes --draft >> "$GITHUB_OUTPUT"
           elif [ -n "$BASE_SHA" ]; then
             git fetch --no-tags --quiet origin "$BASE_SHA"
             git diff --name-only "$BASE_SHA...HEAD" | scripts/ci-select-lanes --changed - --base "$BASE_SHA" >> "$GITHUB_OUTPUT"
           else
             scripts/ci-select-lanes >> "$GITHUB_OUTPUT"
           fi
-          # marlin-vm legs: a pull request runs the primary lifecycle leg and
-          # the required native automatic-timezone leg (one boot, no tour);
-          # the Orca 51 leg and the paired GNOME/Tuna references run on
-          # main, schedule and dispatch (each leg rebuilds the image and boots
-          # a VM for ~30 hosted minutes).
-          primary='{"profile":"lifecycle","orca":"distribution","artifact":"marlin-vm"},{"profile":"autotz","orca":"distribution","artifact":"marlin-vm-autotz"}'
-          extra='{"profile":"lifecycle","orca":"upstream51","artifact":"marlin-vm-orca51"},{"profile":"gnome-reference","session":"gnome","orca":"distribution","artifact":"native-gnome51-reference"},{"profile":"tuna-reference","session":"tuna","orca":"distribution","artifact":"native-tuna-reference"}'
-          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then legs="$primary"; else legs="$primary,$extra"; fi
-          echo "vm_matrix={\"include\":[$legs]}" >> "$GITHUB_OUTPUT"
 
   check:
     # Typically 10 min, slowest seen 16; a hung test must not hold a runner 6 h.
@@ -170,6 +175,12 @@ jobs:
       # a guard that no branch brings the old name back.
       - run: python3 scripts/lib/rename-to-tuna-tests.py
       - run: scripts/rename-to-tuna --check --no-cargo
+      # Relative links and repo paths in the Markdown this change edits
+      # resolve (#1219); a schedule run has no base and checks against main.
+      - run: python3 scripts/lib/tuna-doc-refs-tests.py
+      - env:
+          DOC_REFS_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: scripts/tuna-doc-refs --base "$DOC_REFS_BASE"
       - run: python3 scripts/lib/tuna-soak-tests.py
       - run: python3 scripts/lib/tuna-resource-sample-tests.py
       - run: python3 scripts/lib/vm-boot-tests.py
@@ -178,7 +189,13 @@ jobs:
       - run: python3 scripts/tests/test_ci_closed_pr_cleanup.py
       - run: python3 scripts/tests/test_ci_prepare_artifacts.py
       - run: python3 scripts/tests/test_vm_guest_agent_deadline.py
+      # The native-desktop driver's readiness verdict and late child
+      # retirement under a fake guest and clock (#1013).
+      - run: python3 scripts/tests/test_vm_native_desktop.py
       - run: python3 scripts/tests/test_vm_reference_login.py
+      # The gdm51 overlay may update only gdm.service in the shipped-payload receipt.
+      - run: python3 scripts/tests/test_gdm51_payload_reconcile.py
+      - run: python3 scripts/tests/test_vm_unlock_wake.py
       - run: python3 scripts/tests/test_gnome_reference_guest.py
       - run: python3 scripts/tests/test_native_switcher_reference.py
       - run: python3 scripts/tests/test_overview_recording.py
@@ -189,10 +206,12 @@ jobs:
       - name: Reject stale proposed canonical media against actual main source inputs
         env:
           GH_TOKEN: ${{ github.token }}
-          MEDIA_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          MEDIA_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
         run: python3 scripts/tuna-maintained-media-refresh --verify-if-changed "$MEDIA_BASE_SHA"
       - run: python3 scripts/tests/test_disk_guard.py
       - run: python3 scripts/tests/test_reaper.py
+      # Nested proofs end every process they start, on pass, fail and signal (#1082).
+      - run: python3 scripts/tests/test_proof_session.py
       - run: python3 scripts/tests/test_process_metrics.py
       - run: python3 scripts/tests/test_local_timeout.py
       - run: /usr/bin/python3 scripts/tests/test_vm_strip_acceptance.py
@@ -203,6 +222,7 @@ jobs:
       - run: python3 scripts/tests/test_try_tuna_signature_gate.py
       - run: python3 scripts/lib/keyring-owner-proof-tests.py
       - run: python3 scripts/lib/tray-absence-proof-tests.py
+      - run: python3 scripts/lib/proof-session-tz-tests.py
       - run: python3 scripts/lib/ledger-tests.py
       - run: python3 scripts/lib/ci-select-lanes-tests.py
       - run: python3 scripts/lib/tuna-orca-speech-tests.py
@@ -252,6 +272,7 @@ jobs:
           /usr/bin/python3 scripts/lib/tuna-corral-ssh-export-tests.py
       - run: python3 scripts/lib/tuna-perf-repeatability-tests.py
       - run: python3 scripts/lib/tuna-perf-gate-tests.py
+      - run: python3 scripts/lib/tuna-perf-tests.py
       - run: python3 scripts/lib/perf-operation-budget-tests.py
       # Performance budgets only ratchet tighter; any change cites a run and
       # loosening needs an ADR (docs/perf/README.md, roadmap change control).
@@ -387,7 +408,10 @@ jobs:
   journey:
     # Same choice as select-lanes' runs-on, on the Ubuntu 26.04 runners.
     runs-on: &runner-26 ${{ vars.CI_RUNNERS != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-26.04' || 'ubuntu-26.04' }}
-    needs: [select-lanes, check]
+    # Runs beside check: self-hosted minutes are free, and a red check still
+    # fails ci-gate. (fprint-phase-proof, grid-cancel-comparison and
+    # gtk-shell stay behind check: they check out its tested_sha output.)
+    needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'journey')
     timeout-minutes: 60
     steps:
@@ -465,19 +489,20 @@ jobs:
       - name: Install exact Debian-format candidate and isolated companion fixtures
         run: |
           sudo apt-get install -y --no-install-recommends ./package-artifacts/*.deb
-          cargo build --locked --release -p tuna-compositor --example icon-probe --example shortcut-inhibit-client
+          cargo build --locked --release -p tuna-compositor --example icon-probe --example shortcut-inhibit-client --example tuna-bell-client
           mkdir -p package-artifacts/installed
           cp /etc/os-release package-artifacts/installed/os-release
           dpkg-query -W > package-artifacts/installed/dpkg-versions.txt
           apt-cache policy libgtk4-layer-shell0 libgtk-4-1 libadwaita-1-0 > package-artifacts/installed/apt-policy.txt
           sha256sum package-artifacts/*.deb > package-artifacts/installed/package.sha256
           sudo install -d -m0755 /usr/libexec/tuna-deb-proof
-          sudo install -m0755 target/release/examples/icon-probe target/release/examples/shortcut-inhibit-client /usr/libexec/tuna-deb-proof/
+          sudo install -m0755 target/release/examples/icon-probe target/release/examples/shortcut-inhibit-client target/release/examples/tuna-bell-client /usr/libexec/tuna-deb-proof/
           python3 - <<'PY'
-          import hashlib, json, os
+          import hashlib, json, os, subprocess
           from pathlib import Path
           root = Path('target/release/examples')
-          value = {'commit': os.environ['GITHUB_SHA'], 'files': {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in ('icon-probe', 'shortcut-inhibit-client')}}
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          value = {'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'pr_head': event.get('pull_request', {}).get('head', {}).get('sha'), 'files': {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in ('icon-probe', 'shortcut-inhibit-client', 'tuna-bell-client')}}
           Path('package-artifacts/installed/companions.json').write_text(json.dumps(value) + '\n')
           PY
           sudo install -m0644 package-artifacts/installed/companions.json /usr/libexec/tuna-deb-proof/provenance.json
@@ -496,7 +521,17 @@ jobs:
       # FIFOs and sockets left by the proofs make the zipper warn
       # ENTRYNOTSUPPORTED and drop them (#484); list and remove them first.
       - if: always()
-        run: scripts/ci-prepare-artifacts journey-artifacts package-artifacts/installed
+        run: |
+          scripts/ci-prepare-artifacts journey-artifacts package-artifacts/installed
+          # The installed GTK proof is separate from tuna-journey. Keep its
+          # raw animation trace and matcher output in journey-shots as well,
+          # even if the proof failed before reaching its final assertions.
+          if [ -d package-artifacts/installed/controls ]; then
+            mkdir -p journey-artifacts/installed-controls
+            for diagnostic in package-artifacts/installed/controls/nested.log package-artifacts/installed/controls/grid-anim-samples-*.txt; do
+              [ ! -f "$diagnostic" ] || cp "$diagnostic" journey-artifacts/installed-controls/
+            done
+          fi
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
@@ -513,7 +548,7 @@ jobs:
 
   app-content:
     runs-on: *runner-24
-    needs: [select-lanes, check]
+    needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'app-content')
     timeout-minutes: 25
     steps:
@@ -549,7 +584,7 @@ jobs:
 
   scroll-proof:
     runs-on: *runner-24
-    needs: [select-lanes, check]
+    needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'scroll-proof')
     timeout-minutes: 25
     steps:
@@ -587,7 +622,9 @@ jobs:
     # libseat (seatd), GBM/EGL scanout, page-flip pacing, shell attach.
     # Needs headroom: the DRM/apt install (including any missing vkms
     # modules for the running kernel) can take ~20 min on a cold cache.
-    runs-on: ubuntu-latest
+    # Pinned to the 26.04 image: its 7.0 kernel has vkms configfs (Linux
+    # 6.19+), which the two-output leg (scripts/tuna-drm-dual) needs.
+    runs-on: ubuntu-26.04
     needs: [select-lanes, check]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'drm-smoke')
     timeout-minutes: 40
@@ -621,7 +658,8 @@ jobs:
       # tablet and clickpad, the GTK 4 clients need PyGObject, the GTK
       # shell links gtk4-layer-shell, and gsettings-desktop-schemas holds
       # GNOME's touchpad and interface settings.
-      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config libwayland-dev wayland-protocols seatd jq ffmpeg shellcheck kmod dbus libglib2.0-bin libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libgweather-4-dev python3-gi gir1.2-gtk-4.0 python3-evdev libwacom-common meson ninja-build colord gsettings-desktop-schemas
+      # D-LEASE: acl grants the card's seat ACL (setfacl).
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config libwayland-dev wayland-protocols seatd jq ffmpeg shellcheck kmod dbus libglib2.0-bin libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libgweather-4-dev python3-gi gir1.2-gtk-4.0 python3-evdev libwacom-common meson ninja-build colord gsettings-desktop-schemas acl
       - name: Check out workflow-owned CI tooling
         uses: actions/checkout@v7.0.1
         with: *ci-tool-checkout
@@ -632,13 +670,74 @@ jobs:
       - run: shellcheck -x scripts/ci-install-vkms scripts/tuna-drm-smoke scripts/lib/colord-startup.sh scripts/tuna-frame-pacer-build
       - run: bash -n scripts/tuna-drm-smoke scripts/lib/colord-startup.sh
       - run: python3 scripts/tests/test_colord_startup.py
+      - run: python3 -m py_compile scripts/tuna-drm-dual scripts/lib/drm_dual.py scripts/lib/drm_kms_readback.py
+      - run: python3 scripts/tests/test_drm_dual.py
+      - run: python3 scripts/tests/test_drm_input_startup.py
       - run: scripts/ci-install-vkms
       - run: scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts
+      # D-MIRROR-DISABLE, D-LAYOUT-KEEP, D-WORKSPACES-PRIMARY, D-SCALE-MIXED:
+      # two connectors of a vkms configfs device; the lines join drm-smoke's
+      # assertions.txt, the parity ledger's input.
+      - run: scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
           name: drm-smoke
           path: drm-smoke-artifacts/
+          retention-days: 14
+
+  hotplug:
+    # Output hotplug on real DRM (#203): scripts/tuna-hotplug-stress plugs
+    # and unplugs the connectors of a vkms configfs instance under a
+    # hardware session with the GTK shell and real GTK clients. vkms
+    # configfs needs Linux 6.19+ (the hosted 26.04 image's 7.0 kernel) and
+    # loads a module, so the lane stays GitHub-hosted like drm-smoke. Its
+    # H-* assertions feed the parity ledger; the nested stress workflow runs
+    # the same storm nightly at 30 rounds. See docs/testing.md.
+    runs-on: ubuntu-26.04
+    needs: [select-lanes, check]
+    if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'hotplug')
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Identify native cache platform
+        id: cache-platform
+        run: |
+          . /etc/os-release
+          echo "distro=$ID-$VERSION_ID" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: ${{ steps.cache-platform.outputs.distro }}
+          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+      # libpam-wrapper: H-LOCK-HOTPLUG unlocks through a real PAM stack.
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config libwayland-dev wayland-protocols seatd kmod libpam-wrapper dbus libglib2.0-bin libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libgweather-4-dev python3-gi gir1.2-gtk-4.0 python3-evdev fonts-cantarell meson ninja-build
+      # H-COLORD: the real colord, started by the harness on a private
+      # system bus (as drm-smoke's D-COLORD does).
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y colord
+      - name: PipeWire and the GNOME portal backend for H-CAST-REMOVED
+        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools xdg-desktop-portal-gnome
+      - name: Check out workflow-owned CI tooling
+        uses: actions/checkout@v7.0.1
+        with: *ci-tool-checkout
+      - uses: $/.github/actions/ci-tool
+        with:
+          tool: gtk4-layer-shell
+          version: 4867d7b85cdf1e829fc1fd6f1d5f04c42cc99389
+      - run: python3 -m py_compile scripts/tuna-hotplug-stress scripts/lib/tuna_process_metrics.py
+      - run: scripts/ci-install-vkms
+      - run: cargo build -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk
+      - name: Plug and unplug outputs under a hardware session; gate outputs, windows, lock, colord, casts and growth
+        run: scripts/tuna-hotplug-stress --rounds 4 --out hotplug-artifacts
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: hotplug
+          path: hotplug-artifacts/
           retention-days: 14
 
   grid-cancel-comparison:
@@ -784,7 +883,7 @@ jobs:
         with:
           tool: gtk4-layer-shell
           version: 4867d7b85cdf1e829fc1fd6f1d5f04c42cc99389
-      - run: shellcheck -x scripts/tuna-gtk-shell-proof scripts/tuna-walkthrough scripts/tuna-gtk-accessibility-proof scripts/tuna-slow-portal-proof scripts/lib/tuna-fade-match
+      - run: shellcheck -x scripts/tuna-gtk-shell-proof scripts/tuna-walkthrough scripts/tuna-gtk-accessibility-proof scripts/tuna-slow-portal-proof scripts/tuna-ibus-owner-proof scripts/lib/tuna-fade-match
       # docs/walkthrough.md must match its manifest (docs/walkthrough.tsv).
       - run: scripts/tuna-walkthrough check
       - name: Prove password origin and epoch ownership in the actual nested runtime
@@ -837,12 +936,40 @@ jobs:
           /usr/bin/python3 scripts/tests/test_wellbeing_bundle.py
           /usr/bin/python3 scripts/tests/test_wellbeing_bytecode_contract.py
       - name: Prove live wellbeing framebuffer and screenshot pixels
-        run: dbus-run-session -- /usr/bin/python3 scripts/tuna-wellbeing-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --build-receipt "$RUNNER_TEMP/native-minimize/build.json" --artifacts "$RUNNER_TEMP/native-wellbeing" --display :111
+        run: /usr/bin/python3 scripts/tuna-wellbeing-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --build-receipt "$RUNNER_TEMP/native-minimize/build.json" --artifacts "$RUNNER_TEMP/native-wellbeing" --display :111
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
           name: native-wellbeing-proof
           path: ${{ runner.temp }}/native-wellbeing/
+          retention-days: 14
+      # Window motion paired with GNOME 51 (#493 #494 #495 #496 #498): the
+      # same clients and actions as tests/gnome-reference/motion.js, sampled
+      # on the frozen clock at GNOME's capture delays and compared with
+      # tests/gnome-reference/motion-reference.json. The modal-dim proof
+      # covers overlap, live settings and parent death; the window-lifecycle
+      # proof the retained close frame of a CSD GTK window; the X11 proof
+      # minimize toward _NET_WM_ICON_GEOMETRY on the session's XWayland.
+      - name: Prove window motion against the paired GNOME 51 capture
+        run: |
+          dbus-run-session -- /usr/bin/python3 scripts/tuna-motion-pairing-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --artifacts "$RUNNER_TEMP/motion-pairing" --display :112 --require-clean
+          dbus-run-session -- /usr/bin/python3 scripts/tuna-modal-dim-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --artifacts "$RUNNER_TEMP/modal-dim" --display :114
+          dbus-run-session -- /usr/bin/python3 scripts/tuna-window-lifecycle-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --artifacts "$RUNNER_TEMP/window-lifecycle" --display :115
+          dbus-run-session -- /usr/bin/python3 scripts/tuna-x11-icon-geometry-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --artifacts "$RUNNER_TEMP/x11-icon-geometry" --display :116
+          for proof in motion-pairing modal-dim window-lifecycle x11-icon-geometry; do
+            mkdir -p "gtk-shell-artifacts/$proof"
+            cp "$RUNNER_TEMP/$proof/assertions.txt" "$RUNNER_TEMP/$proof/manifest.json" "gtk-shell-artifacts/$proof/"
+          done
+          cp "$RUNNER_TEMP/motion-pairing/comparison.json" gtk-shell-artifacts/motion-pairing/
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: window-motion-proofs
+          path: |
+            ${{ runner.temp }}/motion-pairing/
+            ${{ runner.temp }}/modal-dim/
+            ${{ runner.temp }}/window-lifecycle/
+            ${{ runner.temp }}/x11-icon-geometry/
           retention-days: 14
       - name: Bound native privacy executor proof
         run: cargo test -p tuna-shell-gtk --bin tuna-shell-gtk privacy::tests::live_pw::live_native_executor_mutes_restores_and_refuses_wrong_identity -- --exact --nocapture
@@ -950,7 +1077,9 @@ jobs:
           if exit_status != 0 or not unchanged or '1 passed; 0 failed; 0 ignored' not in text or 'COUNTDOWN-OSD pass ' not in text:
               raise RuntimeError('actual admitted countdown OSD test did not pass')
           PY
-      - name: Prove real GTK OSD fade-out, panel menu close/switch (#501) and lock curtain (#502)
+      # Each proof's marker line is its assertions.txt ("<ID> pass <desc>"):
+      # the parity ledger reads lock-idle-frames' (#1122).
+      - name: Prove real GTK OSD fade-out, panel menu close/switch (#501), lock curtain (#502) and a settled lock screen's idle frame clock (#1122) and remote access indicator (#1162 F2)
         run: |
           /usr/bin/python3 - <<'PY'
           import hashlib, json, os, pathlib, signal, subprocess
@@ -966,11 +1095,16 @@ jobs:
               ('menu-motion', 'TUNA_REQUIRE_MENU_MOTION=1', 'transient::gtk_menu_tests::actual_gtk_menus_close_at_once_and_switch_fade_only', 'MENU-MOTION pass ', 'actual GTK widgets, frame clock and GLib timers under private X11; Wayland layer-shell and the compositor-drawn close are proven by G-TRANSIENT-CLOSE-CLOCK'),
               ('popup-submenu', 'TUNA_REQUIRE_MENU_MOTION=1', 'transient::gtk_menu_tests::actual_gtk_popup_submenus_ease_open_and_closed', 'POPUP-SUBMENU pass ', 'actual GTK widgets, frame clock and GLib timers under private X11 (PopupSubMenu height and arrow, #501); the NetworkManager and IBus menus holding them are not driven by a proof'),
               ('lock-curtain', 'TUNA_REQUIRE_LOCK_CURTAIN=1', 'lock_curtain::gtk_curtain_tests::actual_gtk_curtain_pages_follow_progress_and_policy', 'LOCK-CURTAIN pass ', 'actual GTK widget allocation, focus and frame clock under private X11; the session-lock surface, real input and frozen-clock frames are proven by G-LOCK-CURTAIN-CLOCK, G-LOCK-CURTAIN-POLICY and G-LOCK-CURTAIN-DRAG'),
+              ('grid-zoom', 'TUNA_REQUIRE_GRID_ZOOM=1', 'grid_animation::gtk_zoom_tests::actual_gtk_zoom_applies_all_properties_including_terminal_frame', 'GRID-ZOOM pass ', 'actual GTK Zoom setters apply translation, scale and opacity together, including a delayed terminal frame and drag scale/fade restoration; native folder drag is G-FOLDER-DND'),
+              ('grid-page-dots', 'TUNA_REQUIRE_GRID_ZOOM=1', 'overview::gtk_page_dot_tests::actual_gtk_page_dot_samples_observe_stored_look', 'GRID-PAGE-DOTS pass ', 'actual GTK page indicator samples read stored Zoom scale/opacity after simultaneous updates, including hover and pressed looks; callback coverage is G-GRID-PAGE-ANIM'),
+              ('grid-tick-trace', 'TUNA_REQUIRE_GRID_ZOOM=1', 'grid_animation::gtk_zoom_tests::actual_gtk_page_tick_trace_records_real_clock_and_thread_scheduler', 'GRID-TICK-TRACE pass ', 'actual GTK frame-clock ticks log monotonic and populated, monotonic Linux main-thread CPU/runqueue/timeslice counters; scheduling attribution uses nested traces'),
+              ('lock-idle-frames', 'TUNA_REQUIRE_LOCK_IDLE_FRAMES=1', 'lock::auth_transport_ui_tests::actual_gtk_settled_lock_screen_requests_no_frames', 'LOCK-IDLE-FRAMES pass ', 'actual GTK lock window, frame clock and layout under private X11; the session-lock surface and compositor-side frame callbacks are measured on the vkms replica (#1122)'),
+              ('remote-access-indicator', 'TUNA_REQUIRE_REMOTE_ACCESS_INDICATOR=1', 'remote_access::tests::actual_gtk_indicator_shows_stops_and_hides', 'REMOTE-ACCESS-INDICATOR pass ', 'actual GTK button and icon visibility, Stop clicks and the five-second GLib hold under private X11; the compositor grants and the real Stop are proven by G-REMOTE-ACCESS-INDICATOR and R-REMOTE-INDICATOR'),
           ]
           for name, admit, test, marker, scope in proofs:
               artifacts = pathlib.Path('gtk-shell-artifacts') / name
               artifacts.mkdir(parents=True, exist_ok=False)
-              argv = ['env', '-u', 'WAYLAND_DISPLAY', '-u', 'WAYLAND_SOCKET', 'dbus-run-session', '--', 'xvfb-run', '-a', 'env', 'GDK_BACKEND=x11', admit, str(binary), test, '--exact', '--ignored', '--test-threads=1', '--nocapture']
+              argv = ['env', '-u', 'WAYLAND_DISPLAY', '-u', 'WAYLAND_SOCKET', 'dbus-run-session', '--', 'xvfb-run', '-a', 'env', 'GDK_BACKEND=x11', admit, str(binary), test, '--exact', '--include-ignored', '--test-threads=1', '--nocapture']
               with (artifacts / 'output.txt').open('w') as output:
                   child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
                   try:
@@ -989,6 +1123,9 @@ jobs:
               (artifacts / 'receipt.json').write_text(json.dumps({'build_admission': admission, 'argv': argv, 'exit_status': exit_status, 'executable_unchanged_after': unchanged, 'output_sha256': hashlib.sha256((artifacts / 'output.txt').read_bytes()).hexdigest(), 'scope': scope}, indent=2) + '\n')
               if exit_status != 0 or not unchanged or '1 passed; 0 failed; 0 ignored' not in text or marker not in text:
                   raise RuntimeError(f'actual admitted {name} test did not pass')
+              if name == 'grid-tick-trace' and any(required not in text for required in ('grid-anim page-switch tick ', 'schedstat=available', 'grid-anim page-clock phase=before-paint ', 'grid-anim page-clock phase=after-paint ')):
+                  raise RuntimeError('grid tick/paint observer did not emit actual clock and populated scheduler observations')
+              (artifacts / 'assertions.txt').write_text(text[text.index(marker):].splitlines()[0] + '\n')
           PY
       - name: Prove real MediaKeys callback completion and forced clamp interleave
         run: |
@@ -998,10 +1135,31 @@ jobs:
       - run: python3 scripts/lib/cursor-proof-theme-tests.py
       - run: python3 scripts/lib/cursor-pixels-tests.py
       - run: /usr/bin/python3 scripts/lib/wellbeing-pixels-tests.py
+      - run: /usr/bin/python3 scripts/lib/panel-dash-check-tests.py
       - run: /usr/bin/python3 scripts/lib/gtk-folder-watch-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/lock-curtain-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/ws-anim-proof-tests.py
       - run: /usr/bin/python3 scripts/lib/gsd-media-keys-bus-tests.py
+      # The binaries the proof builds, in a step of their own: the slices
+      # below run whenever the job is not cancelled and use target/debug,
+      # so they need this commit's shell even when an unrelated earlier step
+      # failed and the full proof was skipped. Without it every slice failed
+      # A11Y-PANEL with no shell binary (jobs 136589617134, 136611210918,
+      # 136757959409). The full proof's own build is then a no-op.
+      - name: Build the nested proof binaries
+        id: proof-binaries
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build --locked -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host
+          cargo build --locked -p tuna-compositor --example icon-probe --example shortcut-inhibit-client
+      # Qualify sound gates before unrelated full-shell stages can stop them.
+      - name: Prove visual bells and output-slider feedback independently
+        run: scripts/tuna-gtk-shell-proof --sound-alerts-only --artifacts gtk-shell-artifacts/sound-alerts
+        env:
+          TUNA_REQUIRE_PAM_WRAPPER: "1"
+          TUNA_REQUIRE_IBUS: "1"
+          TUNA_REQUIRE_WAYLAND_INFO: "1"
+          TUNA_REQUIRE_GSD_MEDIA_KEYS: "1"
       - run: scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts
         env:
           TUNA_REQUIRE_PAM_WRAPPER: "1"
@@ -1011,16 +1169,25 @@ jobs:
       # Closed windows must free their surfaces and textures (#1088): 100
       # libadwaita windows leave the compositor within a fixed bound.
       - name: Closed windows leave no memory behind
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
         timeout-minutes: 8
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/tuna-gtk-shell-proof --window-leak-only --artifacts gtk-shell-artifacts/window-leak
+      # A client's drag through the overview (#1189): real GTK drags open it
+      # from the hot corner and the Activities button, activate a window
+      # preview after 750 ms, and return to the starting workspace.
+      - name: Client drags through the overview
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
+        timeout-minutes: 8
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: scripts/tuna-gtk-shell-proof --dnd-overview-only --artifacts gtk-shell-artifacts/dnd-overview
       # Initial DnD target focus must not wait for another physical motion.
       # Run the unchanged shared hover/reorder assertions independently of
       # unrelated full-suite assertions, using this job's just-built binaries.
       - name: Stationary-start native DnD grid hover
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
         timeout-minutes: 5
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
@@ -1028,11 +1195,47 @@ jobs:
       # Searches with results must hand their shm buffers back (#1084):
       # the shell's GDK mappings and both processes' descriptors stay put.
       - name: Overview searches leave no shm buffers behind
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
         timeout-minutes: 8
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/tuna-gtk-shell-proof --search-leak-only --artifacts gtk-shell-artifacts/search-leak
+      # GNOME 51's top bar and dash (#1198, #1199): Activities at the
+      # leading edge, the clock centred and the system menu at the trailing
+      # edge, and the dash's favourites, running app and running dots, at
+      # 100%, at 125% and right to left (Hebrew).
+      - name: Top bar layout and dash at 100%, 125% and right to left
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
+        timeout-minutes: 8
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: |
+          locale -a | grep -qix 'he_IL.utf8' || sudo locale-gen he_IL.UTF-8
+          scripts/tuna-gtk-shell-proof --panel-dash-only --artifacts gtk-shell-artifacts/panel-dash/scale-1
+          TUNA_SCALE=1.25 scripts/tuna-gtk-shell-proof --panel-dash-only --artifacts gtk-shell-artifacts/panel-dash/scale-1.25
+          LANG=he_IL.UTF-8 LC_ALL=he_IL.UTF-8 scripts/tuna-gtk-shell-proof --panel-dash-only --artifacts gtk-shell-artifacts/panel-dash/rtl
+          cat gtk-shell-artifacts/panel-dash/*/assertions.txt > gtk-shell-artifacts/panel-dash/assertions.txt
+      # Mutter 51's protocols (#364, #588), each answering a real client:
+      # xdg_wm_base 7 edge states, xdg-foreign v1, wl_fixes and the
+      # background blur drawn behind a clear window.
+      - name: Mutter 51 protocols answer a real client
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
+        timeout-minutes: 6
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+          TUNA_REQUIRE_WAYLAND_INFO: "1"
+        run: scripts/tuna-gtk-shell-proof --protocols-only --artifacts gtk-shell-artifacts/protocols
+      # A window's subsurfaces stack where its client placed them, above
+      # and below it, on the desktop, in the overview and in the window's
+      # screenshot (G-SUBSURFACE-STACKING).
+      - name: Subsurfaces stack above and below their window
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
+        timeout-minutes: 8
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: |
+          cargo build --locked -p tuna-compositor --example tuna-subsurface-client
+          scripts/tuna-gtk-shell-proof --subsurface-only --artifacts gtk-shell-artifacts/subsurface
       # Native/X11 geometry and physical input at all required virtual scales.
       - run: |
           for scale in 1 1.25 1.5 2; do
@@ -1043,6 +1246,10 @@ jobs:
       # dbus-daemon semantics: portal activation hangs instead of failing
       # fast, and the shell must still own org.gnome.Shell promptly.
       - run: scripts/tuna-slow-portal-proof --artifacts gtk-shell-artifacts/slow-portal
+      # One owner for the session's ibus-daemon (#1014): the bridge's own
+      # supervised child, or the session's unit, never both; session end
+      # leaves no ibus-* process of the display behind.
+      - run: scripts/tuna-ibus-owner-proof gtk-shell-artifacts/ibus-owner
       # Screen magnifier (#349): real GSettings writes, magnified pixels
       # in shell screenshot captures and live output frames. Independent
       # of the shell proof above, so it runs (and gates) even when that
@@ -1073,11 +1280,35 @@ jobs:
         timeout-minutes: 10
         run: shellcheck -x scripts/tuna-greeter-proof && scripts/tuna-greeter-proof --artifacts gtk-shell-artifacts/greeter
       # Keep runnable binaries even when a later live proof assertion fails.
+      # #1124: tuna-wallpaper-svg is built only by scripts/tuna-gtk-shell-proof
+      # and the layer-shell library is installed by the ci-tool step. After an
+      # earlier failure this copies what exists, so that earlier step stays the
+      # job's reported failure; with no earlier failure a missing file fails here.
       - if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
         run: |
-          mkdir -p gtk-shell-artifacts/bin
-          cp target/debug/tuna-compositor target/debug/tuna-shell-gtk target/debug/tuna-wallpaper-svg gtk-shell-artifacts/bin/
-          cp /usr/local/lib/*/libgtk4-layer-shell.so* gtk-shell-artifacts/bin/ 2>/dev/null || cp /usr/local/lib/libgtk4-layer-shell.so* gtk-shell-artifacts/bin/
+          mkdir -p gtk-shell-artifacts/bin/examples
+          shopt -s nullglob
+          layer_shell=(/usr/local/lib/*/libgtk4-layer-shell.so*)
+          [ ${#layer_shell[@]} -gt 0 ] || layer_shell=(/usr/local/lib/libgtk4-layer-shell.so*)
+          [ ${#layer_shell[@]} -gt 0 ] || layer_shell=(/usr/local/lib/libgtk4-layer-shell.so)
+          missing=0
+          for file in target/debug/tuna-compositor target/debug/tuna-shell-gtk target/debug/tuna-wallpaper-svg "${layer_shell[@]}"; do
+            if [ -e "$file" ]; then
+              cp "$file" gtk-shell-artifacts/bin/
+            else
+              echo "::warning::not collected, never built or installed: $file"
+              missing=1
+            fi
+          done
+          if [ -e target/debug/examples/tuna-bell-client ]; then
+            cp target/debug/examples/tuna-bell-client gtk-shell-artifacts/bin/examples/
+          else
+            echo "::warning::not collected, never built or installed: target/debug/examples/tuna-bell-client"
+            missing=1
+          fi
+          if [ "$missing" = 1 ] && [ "$JOB_STATUS" = success ]; then exit 1; fi
       # G-WS-INSERT publishes the targeted insertion frame/state. Full
       # parity captures need native fonts, wallpapers and installed apps;
       # use the binaries uploaded as gtk-shell-binaries with that reference
@@ -1151,7 +1382,7 @@ jobs:
     # against the nested session that owns the screen reader. Ubuntu
     # 24.04's Orca 46 predates GNOME's KeyboardMonitor.
     runs-on: *runner-26
-    needs: [select-lanes, check]
+    needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'orca-speech')
     timeout-minutes: 45
     steps:
@@ -2097,9 +2328,11 @@ jobs:
     timeout-minutes: 15
     # GNOME 51 parity ledger gate (#66): every row marked pass must cite
     # tests, and every cited cargo test / journey assertion must have
-    # passed in this run.
+    # passed in this run. `needs: marlin-vm` waits for every leg of its
+    # matrix; selecting this lane adds the Orca 51 leg to a pull request's
+    # matrix (scripts/ci-select-lanes vm_matrix), so its artifact always exists.
     runs-on: *runner-24
-    needs: [select-lanes, check, journey, gtk-shell, orca-speech, drm-smoke, marlin-vm]
+    needs: [select-lanes, check, journey, gtk-shell, orca-speech, drm-smoke, hotplug, marlin-vm, remote-security]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'parity-ledger')
     steps:
       - uses: actions/checkout@v7.0.1
@@ -2131,8 +2364,24 @@ jobs:
           path: ledger-in/drm-smoke
       - uses: actions/download-artifact@v8.0.2
         with:
+          name: hotplug
+          path: ledger-in/hotplug
+      - uses: actions/download-artifact@v8.0.2
+        with:
           name: marlin-vm
           path: ledger-in/marlin-vm
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: marlin-vm-autotz
+          path: ledger-in/marlin-vm-autotz
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: marlin-vm-orca51
+          path: ledger-in/marlin-vm-orca51
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: remote-security
+          path: ledger-in/remote-security
       - run: >-
           scripts/tuna-ledger check --tests ledger-in/test-list.txt
           --assertions ledger-in/journey/assertions.txt
@@ -2141,14 +2390,27 @@ jobs:
           --assertions ledger-in/gtk-shell/scale/assertions.txt
           --assertions ledger-in/gtk-shell/magnifier/assertions.txt
           --assertions ledger-in/gtk-shell/session-restore/assertions.txt
+          --assertions ledger-in/gtk-shell/motion-pairing/assertions.txt
+          --assertions ledger-in/gtk-shell/modal-dim/assertions.txt
+          --assertions ledger-in/gtk-shell/window-lifecycle/assertions.txt
+          --assertions ledger-in/gtk-shell/x11-icon-geometry/assertions.txt
           --assertions ledger-in/gtk-shell/osk/assertions.txt
+          --assertions ledger-in/gtk-shell/subsurface/assertions.txt
           --assertions ledger-in/gtk-shell/lock-auth/assertions.txt
+          --assertions ledger-in/gtk-shell/panel-dash/assertions.txt
+          --assertions ledger-in/gtk-shell/protocols/assertions.txt
           --assertions ledger-in/gtk-shell/greeter/assertions.txt
+          --assertions ledger-in/gtk-shell/ibus-owner/assertions.txt
+          --assertions ledger-in/gtk-shell/lock-idle-frames/assertions.txt
           --assertions ledger-in/orca-speech/assertions.txt
           --assertions ledger-in/orca-speech/greeter/assertions.txt
           --assertions ledger-in/drm-smoke/assertions.txt
+          --assertions ledger-in/hotplug/assertions.txt
           --assertions ledger-in/marlin-vm/assertions.txt
           --assertions ledger-in/marlin-vm/app-integration/assertions.txt
+          --assertions ledger-in/marlin-vm-autotz/assertions.txt
+          --assertions ledger-in/marlin-vm-orca51/assertions.txt
+          --assertions ledger-in/remote-security/assertions.txt
 
   docs-shots:
     timeout-minutes: 20
@@ -2188,9 +2450,12 @@ jobs:
   ci-gate:
     timeout-minutes: 10
     # One stable status for the run: lanes the selection skipped report
-    # skipped, any failed or cancelled job fails the gate.
-    if: always()
-    needs: [select-lanes, check, journey, app-content, scroll-proof, drm-smoke, grid-cancel-comparison, gtk-shell, orca-speech, portal-security, remote-security, niri-parity, arch-package, marlin-image, gdm51-native-package, marlin-vm, native-reference-context, parity-ledger, docs-shots]
+    # skipped, any failed or cancelled job fails the gate. A superseded run
+    # (cancel-in-progress) needs no gate: with always() its gate still queued
+    # for a self-hosted runner, and the replacing run stayed pending until it
+    # got one, often for hours.
+    if: ${{ !cancelled() }}
+    needs: [select-lanes, check, journey, app-content, scroll-proof, drm-smoke, hotplug, grid-cancel-comparison, gtk-shell, orca-speech, portal-security, remote-security, niri-parity, arch-package, marlin-image, gdm51-native-package, marlin-vm, native-reference-context, parity-ledger, docs-shots]
     runs-on: *runner-24
     steps:
       - env:

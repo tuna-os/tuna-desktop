@@ -113,7 +113,7 @@
 set -eu
 
 if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ]; then
-    TUNA_PROOF_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+    TUNA_PROOF_PRIVATE_BUS=1 exec "$(dirname -- "$0")/lib/tuna-proof-session" --bus -- "$0" "$@"
 fi
 unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -954,9 +954,9 @@ cstate '.magnifier.active == true' 10 || fail G-GREETER-A11Y-MENU "Zoom did not 
 a11y_toggle F-a11y-zoom-off "Zoom"
 cstate '.magnifier.active == false' 10 || fail G-GREETER-A11Y-MENU "Zoom did not turn the magnifier off"
 a11y_toggle F-a11y-bell "Visual Alerts"
-cstate '.bell.visual == true' 10 || fail G-GREETER-A11Y-MENU "Visual Alerts did not reach the compositor's bell"
+cstate '.bell_policy.visual == true' 10 || fail G-GREETER-A11Y-MENU "Visual Alerts did not reach the compositor's bell"
 a11y_toggle F-a11y-bell-off "Visual Alerts"
-cstate '.bell.visual == false' 10 || fail G-GREETER-A11Y-MENU "Visual Alerts did not turn off"
+cstate '.bell_policy.visual == false' 10 || fail G-GREETER-A11Y-MENU "Visual Alerts did not turn off"
 for aid in "Sticky Keys:sticky" "Slow Keys:slow" "Bounce Keys:bounce" "Mouse Keys:mouse"; do
     a11y_toggle "F-a11y-${aid#*:}" "${aid%%:*}"
     cstate ".input_aids.${aid#*:} == true" 10 || fail G-GREETER-A11Y-MENU "${aid%%:*} did not reach the compositor"

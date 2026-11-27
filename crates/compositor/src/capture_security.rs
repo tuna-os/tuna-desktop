@@ -262,11 +262,16 @@ impl Authority {
         }
         remote_desktop_daemon(&dbus, owner, &credentials).await
     }
-    pub async fn admit(&self, conn: &Connection, header: &Header<'_>) -> fdo::Result<String> {
+    /// Admit a capture caller, saying which desktop service it is.
+    pub async fn admit(
+        &self,
+        conn: &Connection,
+        header: &Header<'_>,
+    ) -> fdo::Result<(String, CaptureCaller)> {
         self.unlocked()?;
-        let sender = self.authenticate(conn, header).await?;
+        let admitted = self.authenticate_caller(conn, header).await?;
         self.unlocked()?;
-        Ok(sender)
+        Ok(admitted)
     }
     /// [`Self::admit`] for a call the supervised shell relays from its
     /// `org.gnome.Shell` connection on behalf of `caller` (GNOME Shell owns
@@ -293,18 +298,19 @@ impl Authority {
     }
     /// RemoteDesktop session creation (and only that, plus the ScreenCast
     /// session linked to it): the capture callers above, or the installed
-    /// gnome-remote-desktop daemon. GNOME's grd talks to Mutter directly
-    /// once Settings > System > Remote Desktop enabled it; its configured
-    /// credentials are the consent, as in GNOME (`grd-session.c`
-    /// `grd_session_start` calls `CreateSession` with no portal).
+    /// gnome-remote-desktop daemon while its sharing is enabled. GNOME's
+    /// grd talks to Mutter directly once Settings > System > Remote
+    /// Desktop enabled it; its configured credentials are the consent, as
+    /// in GNOME (`grd-session.c` `grd_session_start` calls `CreateSession`
+    /// with no portal).
     pub async fn admit_remote(
         &self,
         conn: &Connection,
         header: &Header<'_>,
-    ) -> fdo::Result<String> {
+    ) -> fdo::Result<(String, CaptureCaller)> {
         self.unlocked()?;
-        let sender = match self.authenticate(conn, header).await {
-            Ok(sender) => sender,
+        let admitted = match self.authenticate_caller(conn, header).await {
+            Ok(admitted) => admitted,
             Err(denial) => {
                 let sender = header.sender().ok_or_else(|| denied("missing sender"))?;
                 let dbus = fdo::DBusProxy::new(conn).await?;
@@ -316,11 +322,11 @@ impl Authority {
                 {
                     return Err(denial);
                 }
-                sender.to_string()
+                (sender.to_string(), CaptureCaller::RemoteDesktopDaemon)
             }
         };
         self.unlocked()?;
-        Ok(sender)
+        Ok(admitted)
     }
     /// InputCapture session creation: the installed portal backend only.
     /// Its InputCapture portal holds the user's consent; GNOME Shell
@@ -403,6 +409,9 @@ pub enum CaptureCaller {
     Shell,
     /// The installed xdg-desktop-portal-gnome backend.
     Portal,
+    /// The installed gnome-remote-desktop daemon, while its sharing is
+    /// enabled (RemoteDesktop and its linked ScreenCast only).
+    RemoteDesktopDaemon,
 }
 pub fn owns_session(owner: &str, sender: Option<&str>, revoked: bool) -> bool {
     !revoked && sender.is_some_and(|sender| sender == owner)
@@ -413,21 +422,44 @@ pub fn denied(reason: &str) -> fdo::Error {
 fn installed_portal(credentials: &fdo::ConnectionCredentials) -> bool {
     installed_service(credentials, ServiceClient::Portal)
 }
-/// gnome-remote-desktop's session-bus daemons (`grd-private.h`): the
-/// user-mode Desktop Sharing daemon, the remote-login handover daemon and
-/// the headless daemon. All three run `gnome-remote-desktop-daemon`.
-const REMOTE_DESKTOP_DAEMON_NAMES: [&str; 3] = [
-    "org.gnome.RemoteDesktop.User",
-    "org.gnome.RemoteDesktop.Handover",
-    "org.gnome.RemoteDesktop.Headless",
+/// gnome-remote-desktop 51's session-bus daemons (`grd-private.h`) that
+/// may drive a Tuna Desktop session, each with the GSettings schemas whose
+/// `enable` turns its backends on: the user-mode Desktop Sharing daemon
+/// follows `org.gnome.desktop.remote-desktop.{rdp,vnc}`
+/// (`grd-settings-user.c`, what Settings > System > Remote Desktop >
+/// Desktop Sharing writes), the headless daemon the `.headless` schemas
+/// (`grd-settings-headless.c`). The remote-login handover daemon
+/// (`org.gnome.RemoteDesktop.Handover`) is never admitted: its sessions
+/// always extend onto a virtual monitor (`grd-settings-handover.c`,
+/// `RecordVirtual`), which Tuna Desktop does not serve, so in a Tuna
+/// Desktop session that name can only be a pretender.
+const REMOTE_DESKTOP_DAEMONS: [(&str, [&str; 2]); 2] = [
+    (
+        "org.gnome.RemoteDesktop.User",
+        [
+            "org.gnome.desktop.remote-desktop.rdp",
+            "org.gnome.desktop.remote-desktop.vnc",
+        ],
+    ),
+    (
+        "org.gnome.RemoteDesktop.Headless",
+        [
+            "org.gnome.desktop.remote-desktop.rdp.headless",
+            "org.gnome.desktop.remote-desktop.vnc.headless",
+        ],
+    ),
 ];
 const REMOTE_DESKTOP_DAEMON: [&str; 2] = [
     "/usr/libexec/gnome-remote-desktop-daemon",
     "/usr/lib/gnome-remote-desktop-daemon",
 ];
-/// The caller is the root-owned installed grd executable and currently
-/// owns one of grd's well-known names, so neither a copied binary nor a
-/// process that merely claims a grd name passes.
+/// The caller is the root-owned installed grd executable, currently owns
+/// one of grd's well-known names, and that daemon's sharing is enabled, so
+/// neither a copied binary, a process that merely claims a grd name, nor
+/// the genuine binary run while the user has sharing off passes. Mutter
+/// 51 checks none of this (its RemoteDesktop admits any session-bus
+/// caller); the settings gate is Tuna Desktop's own hardening (#1162 F1),
+/// and also ends a running grant when the user turns sharing off.
 async fn remote_desktop_daemon(
     dbus: &fdo::DBusProxy<'_>,
     owner: &str,
@@ -436,17 +468,33 @@ async fn remote_desktop_daemon(
     if !installed_executable(credentials, &REMOTE_DESKTOP_DAEMON) {
         return false;
     }
-    for name in REMOTE_DESKTOP_DAEMON_NAMES {
+    for (name, schemas) in REMOTE_DESKTOP_DAEMONS {
         let name = zbus::names::BusName::try_from(name).unwrap();
         if dbus
             .get_name_owner(name)
             .await
             .is_ok_and(|current| current.as_str() == owner)
         {
-            return true;
+            return sharing_enabled(&schemas, installed_boolean);
         }
     }
     false
+}
+/// Whether any of `schemas` has `enable` set, as `read` reports it; a
+/// schema or key `read` cannot find counts as off.
+fn sharing_enabled(schemas: &[&str], read: impl Fn(&str, &str) -> Option<bool>) -> bool {
+    schemas
+        .iter()
+        .any(|schema| read(schema, "enable") == Some(true))
+}
+/// A boolean key of an installed GSettings schema, read now.
+fn installed_boolean(schema: &str, key: &str) -> Option<bool> {
+    use gio::prelude::SettingsExt as _;
+    let schema = gio::SettingsSchemaSource::default()?.lookup(schema, true)?;
+    if !(schema.has_key(key) && schema.key(key).value_type().as_str() == "b") {
+        return None;
+    }
+    Some(gio::Settings::new_full(&schema, None::<&gio::SettingsBackend>, None).boolean(key))
 }
 fn installed_service(credentials: &fdo::ConnectionCredentials, role: ServiceClient) -> bool {
     installed_executable(credentials, role.executables())
@@ -672,6 +720,25 @@ mod tests {
         .unwrap();
         numeric(pid).set_process_fd(descriptor.into())
     }
+    /// Spawn `program` and return once the child runs it. `spawn` returns
+    /// as soon as the child releases this process's memory (glibc
+    /// `posix_spawn` is a vfork), which is before `execve` installs the
+    /// new image: until then `/proc/<pid>/exe` still names this test
+    /// binary, and under load (the child waits on this process's mmap
+    /// lock) that window is long enough to read. A close-on-exec socket
+    /// end the child inherits is closed only after the new image is in
+    /// place, so its peer's EOF marks the exec as done.
+    fn spawn_exec(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> std::process::Child {
+        use std::io::Read;
+        let (mut exec_done, inherited) = std::os::unix::net::UnixStream::pair().unwrap();
+        let child = std::process::Command::new(program)
+            .args(args)
+            .spawn()
+            .unwrap();
+        drop(inherited);
+        assert_eq!(exec_done.read(&mut [0u8; 1]).unwrap(), 0, "exec closes it");
+        child
+    }
     #[test]
     fn remote_desktop_daemon_identity_is_the_root_owned_installed_binary() {
         // This test process, a missing pid and pid 0 are not grd.
@@ -692,10 +759,7 @@ mod tests {
         ));
         // The identity check accepts a root-owned, non-writable binary
         // the process really runs (here coreutils' sleep stands in)...
-        let mut sleep = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
+        let mut sleep = spawn_exec("/bin/sleep", &["60"]);
         assert!(installed_executable(&numeric(sleep.id()), &["/bin/sleep"]));
         assert!(installed_executable(
             &pinned(sleep.id(), sleep.id()),
@@ -719,7 +783,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        let mut spoof = std::process::Command::new(&copy).arg("60").spawn().unwrap();
+        let mut spoof = spawn_exec(&copy, &["60"]);
         let copy_path = copy.to_str().unwrap();
         let spoofed = pinned(spoof.id(), spoof.id());
         assert!(!installed_executable(&spoofed, &[copy_path]));
@@ -733,14 +797,8 @@ mod tests {
     /// before this one) admitted it. An exited pin is no identity either.
     #[test]
     fn a_recycled_pid_does_not_inherit_the_installed_executable() {
-        let mut caller = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
-        let mut genuine = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
+        let mut caller = spawn_exec("/bin/sleep", &["60"]);
+        let mut genuine = spawn_exec("/bin/sleep", &["60"]);
         let recycled = pinned(genuine.id(), caller.id());
         assert!(
             !installed_executable(&recycled, &["/bin/sleep"]),
@@ -756,6 +814,59 @@ mod tests {
             !installed_executable(&own, &["/bin/sleep"]),
             "an exited pin is no identity, whoever holds its PID now"
         );
+    }
+    #[test]
+    fn remote_desktop_daemons_need_their_sharing_enabled() {
+        let schemas = |daemon: &str| {
+            REMOTE_DESKTOP_DAEMONS
+                .iter()
+                .find(|(name, _)| *name == daemon)
+                .map(|(_, schemas)| *schemas)
+        };
+        let user = schemas("org.gnome.RemoteDesktop.User").unwrap();
+        let headless = schemas("org.gnome.RemoteDesktop.Headless").unwrap();
+        // Remote login extends onto a virtual monitor Tuna Desktop does
+        // not serve: its handover daemon is no admitted grd identity.
+        assert!(schemas("org.gnome.RemoteDesktop.Handover").is_none());
+        let enabled = |on: &'static [&'static str]| {
+            move |schema: &str, key: &str| {
+                assert_eq!(key, "enable");
+                Some(on.contains(&schema))
+            }
+        };
+        // Desktop Sharing (RDP) or VNC on: the user daemon passes.
+        assert!(sharing_enabled(
+            &user,
+            enabled(&["org.gnome.desktop.remote-desktop.rdp"])
+        ));
+        assert!(sharing_enabled(
+            &user,
+            enabled(&["org.gnome.desktop.remote-desktop.vnc"])
+        ));
+        // Everything off, or only the headless keys on: it does not.
+        assert!(!sharing_enabled(&user, enabled(&[])));
+        assert!(!sharing_enabled(
+            &user,
+            enabled(&[
+                "org.gnome.desktop.remote-desktop.rdp.headless",
+                "org.gnome.desktop.remote-desktop.vnc.headless",
+            ])
+        ));
+        // The headless daemon follows only its own keys.
+        assert!(!sharing_enabled(
+            &headless,
+            enabled(&[
+                "org.gnome.desktop.remote-desktop.rdp",
+                "org.gnome.desktop.remote-desktop.vnc",
+            ])
+        ));
+        assert!(sharing_enabled(
+            &headless,
+            enabled(&["org.gnome.desktop.remote-desktop.rdp.headless"])
+        ));
+        // No schema installed (no grd): off.
+        assert!(!sharing_enabled(&user, |_, _| None));
+        assert_eq!(installed_boolean("org.tuna.NoSuchSchema", "enable"), None);
     }
     #[test]
     fn arbitrary_process_cannot_be_the_installed_portal() {

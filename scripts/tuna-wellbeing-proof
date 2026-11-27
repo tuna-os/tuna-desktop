@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """Source-matched native wellbeing pixels; synthetic supervised control, no GTK policy claim.
-Run in dbus-run-session with the same build.json/frozen bundle as native minimize.
+Run under scripts/lib/tuna-proof-session --bus with the same build.json/frozen bundle as native minimize.
 """
 import sys
 # Admission must observe a clean source tree; imports must not create pyc
@@ -68,7 +68,7 @@ def main():
     art = args.artifacts.resolve()
     assert not art.exists(), 'fresh artifact directory required'
     assert ROOT not in art.parents and art != ROOT
-    assert os.environ.get('DBUS_SESSION_BUS_ADDRESS'), 'private dbus-run-session required'
+    assert os.environ.get('DBUS_SESSION_BUS_ADDRESS'), 'private session bus (scripts/lib/tuna-proof-session --bus) required'
     assert args.display is None or not Path(f'/tmp/.X11-unix/X{args.display[1:]}').exists(), 'refuse existing display'
     manifest = BUNDLE.admit(ROOT, args.bin_dir, args.build_receipt, art / 'bin')
     manifest.update({'proof_sha256': BUNDLE.digest(Path(__file__)), 'pixel_helper_sha256': BUNDLE.digest(ROOT / 'scripts/lib/wellbeing-pixels.py'), 'backend': 'native Wayland under winit/Xvfb/llvmpipe', 'installed_drm': False, 'gtk_wellbeing_policy': False})
@@ -326,4 +326,9 @@ def main():
 
 
 if __name__ == '__main__':
+    if not os.environ.get('TUNA_PROOF_PRIVATE_BUS'):
+        # One owned session on a private bus: nothing this run starts outlives it (#1082).
+        session = str(Path(__file__).resolve().parent / 'lib/tuna-proof-session')
+        os.execve(session, [session, '--bus', '--', sys.executable, *sys.argv],
+                  os.environ | {'TUNA_PROOF_PRIVATE_BUS': '1'})
     main()

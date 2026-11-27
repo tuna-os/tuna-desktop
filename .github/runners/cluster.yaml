@@ -126,6 +126,10 @@ spec:
 # together. The 28 CPU / 82 GiB request quota also permits old 2 CPU / 6 GiB
 # pods during rollout; the node scheduler still accounts for VM reservations.
 # Aggregate limits are overcommitted, not reserved memory. VMs preempt runners.
+# The limit quota must fit every configured runner at its own limit, or ARC
+# cannot create pods ("exceeded quota") and jobs queue behind idle slots:
+# 8 tuna-desktop runners at 24 GiB (values-*.yaml) and 3 iso-gpu runners at
+# 28 GiB = 276 GiB.
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -137,7 +141,7 @@ spec:
     requests.cpu: "28"
     limits.cpu: "56"
     requests.memory: 82Gi
-    limits.memory: 196Gi
+    limits.memory: 276Gi
     requests.ephemeral-storage: 280Gi
     limits.ephemeral-storage: 630Gi
 ---

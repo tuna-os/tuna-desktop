@@ -6,7 +6,7 @@ if [ "$#" -ne 3 ]; then
     exit 2
 fi
 if [ "${TUNA_A11Y_PRIVATE_SESSION:-}" != 1 ]; then
-    exec dbus-run-session -- env TUNA_A11Y_PRIVATE_SESSION=1 "$0" "$@"
+    TUNA_A11Y_PRIVATE_SESSION=1 exec "$(dirname -- "$0")/lib/tuna-proof-session" --bus -- "$0" "$@"
 fi
 TEST_BIN=$(realpath "$1")
 SOURCE_COMMIT=$2
