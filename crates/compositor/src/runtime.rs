@@ -448,7 +448,7 @@ pub fn current_exe_dir() -> Option<std::path::PathBuf> {
 }
 
 /// `GL_RENDERER` of the compositor's own context.
-fn gl_renderer_name(renderer: &mut GlesRenderer) -> Option<String> {
+pub(crate) fn gl_renderer_name(renderer: &mut GlesRenderer) -> Option<String> {
     use smithay::backend::renderer::gles::ffi;
     renderer
         .with_context(|gl| {
