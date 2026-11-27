@@ -61,10 +61,11 @@ in `_NET_SUPPORTED`, as Mutter does. GTK X11 applications therefore draw their
 own shadows and report them in `_GTK_FRAME_EXTENTS`; the compositor treats that
 margin, like a frame's, as outside the window's rectangle. The title-bar keys
 of `org.gnome.desktop.wm.preferences` (`button-layout` and the double, middle
-and right click actions) are published on the window manager's XSETTINGS
-selection as `Gtk/DecorationLayout`, `Gtk/TitlebarDoubleClick`,
-`Gtk/TitlebarMiddleClick` and `Gtk/TitlebarRightClick`, translated as
-gnome-settings-daemon does.
+and right click actions) reach the frames client as XSETTINGS
+(`Gtk/DecorationLayout`, `Gtk/TitlebarDoubleClick`,
+`Gtk/TitlebarMiddleClick` and `Gtk/TitlebarRightClick`) from
+gnome-settings-daemon's xsettings plugin: like Mutter, the window manager
+never owns the XSETTINGS selection.
 
 Three things a frame's header bar needs from the compositor, each as Mutter
 does it:

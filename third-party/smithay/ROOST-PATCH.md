@@ -304,14 +304,12 @@ frames of X11 windows, with the X11 protocol of Mutter 51's frames client
 (mutter src/x11/meta-x11-frame.c, events.c, window-x11.c; src/frames/). The
 frame handling is additive: without a frames client, and for a compositor
 that never calls set_needs_frame, a window is wrapped, mapped, configured
-and unmapped as before, with two corrections found while proving the frames
+and unmapped as before, with one correction found while proving the frames
 against a live Xwayland. The bare wrapper is created with the client's depth
 and visual (create_wrapper; a window of another depth than the root gets
 the client's colormap and a border pixel): in a wrapper of the root's depth
 the X server composited a 32-bit client without alpha, so a client-decorated
-GTK window showed an opaque black box where its shadow is transparent. And
-X11Wm::set_xsettings flushes: the changed property used to wait in the
-request buffer for the next unrelated request. New atoms:
+GTK window showed an opaque black box where its shadow is transparent. New atoms:
 _MUTTER_NEEDS_FRAME, _MUTTER_FRAME_FOR, _MUTTER_FRAME_EXTENTS,
 _GTK_FRAME_EXTENTS, _NET_FRAME_EXTENTS,
 _GTK_SHOW_WINDOW_MENU and _NET_CLOSE_WINDOW; _NET_SUPPORTED lists the last

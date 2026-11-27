@@ -33,16 +33,15 @@
 //!   offers such windows again (`X11Wm::request_frames`).
 //!
 //! The GTK header bars take their button layout and title-bar click
-//! actions from XSETTINGS, which gnome-settings-daemon publishes in a
-//! GNOME session. [`X11Frames::take_xsettings`] hands the window manager
-//! the same four settings ([`TitlebarSettings::xsettings`]) for its own
-//! XSETTINGS selection.
+//! actions from XSETTINGS (`Gtk/DecorationLayout`, `Gtk/Titlebar*Click`).
+//! As under Mutter, which never owns the XSETTINGS selection, the window
+//! manager leaves it to gnome-settings-daemon's xsettings plugin, which
+//! translates `org.gnome.desktop.wm.preferences` for every X11 client.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
-use crate::focus_policy::TitlebarSettings;
 use crate::supervise::RestartPolicy;
 
 /// The frames client's executable name.
@@ -136,9 +135,6 @@ pub struct X11Frames {
     /// No binary, or the restart budget is spent: nothing more starts on
     /// this display.
     gave_up: bool,
-    titlebar: TitlebarSettings,
-    /// The current title-bar settings reached this display's XSETTINGS.
-    published: bool,
 }
 
 impl Default for X11Frames {
@@ -161,8 +157,6 @@ impl X11Frames {
             offer_until_ms: 0,
             next_offer_ms: 0,
             gave_up: false,
-            titlebar: TitlebarSettings::default(),
-            published: false,
         }
     }
 
@@ -195,7 +189,6 @@ impl X11Frames {
         self.next_ms = 0;
         self.offer_until_ms = 0;
         self.gave_up = false;
-        self.published = false;
     }
 
     /// Start the client, or restart it after an exit (bounded), never
@@ -300,23 +293,6 @@ impl X11Frames {
                 .then(|| self.next_offer_ms.saturating_sub(now_ms));
         }
         (self.retired.is_none() && !self.gave_up).then(|| self.next_ms.saturating_sub(now_ms))
-    }
-
-    /// Install freshly read title-bar settings.
-    pub fn set_titlebar(&mut self, titlebar: TitlebarSettings) {
-        if self.titlebar != titlebar {
-            self.titlebar = titlebar;
-            self.published = false;
-        }
-    }
-
-    /// The XSETTINGS the ready display still lacks: the title-bar
-    /// settings, once per X server and after each change.
-    pub fn take_xsettings(&mut self) -> Option<[(&'static str, String); 4]> {
-        (self.display.is_some() && !self.published).then(|| {
-            self.published = true;
-            self.titlebar.xsettings()
-        })
     }
 }
 
@@ -518,29 +494,6 @@ mod tests {
         assert_eq!(frames.next_wake_ms(OFFER_WINDOW_MS, false), None);
         assert!(frames.offer_due(OFFER_WINDOW_MS, true));
         assert_eq!(frames.next_wake_ms(OFFER_WINDOW_MS + 40, true), Some(60));
-    }
-
-    #[test]
-    fn titlebar_settings_publish_once_per_server_and_on_change() {
-        let mut frames = X11Frames::new();
-        assert_eq!(frames.take_xsettings(), None, "no XSETTINGS owner yet");
-        frames.set_ready_x11_display(Some(1));
-        let defaults = frames.take_xsettings().expect("a ready display");
-        assert_eq!(defaults, TitlebarSettings::default().xsettings());
-        assert_eq!(frames.take_xsettings(), None);
-        frames.set_titlebar(TitlebarSettings::default());
-        assert_eq!(frames.take_xsettings(), None, "unchanged settings");
-        let custom = TitlebarSettings {
-            button_layout: "close:appmenu".into(),
-            ..TitlebarSettings::default()
-        };
-        frames.set_titlebar(custom.clone());
-        assert_eq!(frames.take_xsettings(), Some(custom.xsettings()));
-        // A restarted server has a new XSETTINGS owner with nothing set.
-        frames.set_ready_x11_display(None);
-        assert_eq!(frames.take_xsettings(), None);
-        frames.set_ready_x11_display(Some(1));
-        assert_eq!(frames.take_xsettings(), Some(custom.xsettings()));
     }
 
     #[test]

@@ -6799,20 +6799,9 @@ impl Runtime {
         self.x11_frames.poll(now_ms);
         self.manager
             .set_x11_frames_client(self.x11_frames.running());
-        let Some(xwm) = self.state.xwm.as_mut() else {
+        let Some(xwm) = self.state.xwm.as_ref() else {
             return;
         };
-        if let Some(settings) = self.x11_frames.take_xsettings() {
-            let settings = settings.into_iter().map(|(name, value)| {
-                (
-                    name.to_owned(),
-                    smithay::xwayland::xwm::settings::Value::String(value),
-                )
-            });
-            if let Err(error) = xwm.set_xsettings(settings) {
-                eprintln!("tuna-compositor: x11 frames: XSETTINGS refused: {error}");
-            }
-        }
         let window_waits = self.manager.x11_frame_deadline().is_some();
         if self.x11_frames.offer_due(now_ms, window_waits) {
             if let Err(error) = xwm.request_frames() {
@@ -6847,12 +6836,6 @@ impl Runtime {
             self.manager.set_focus_policy(policy);
             if let Some(ms) = raw.check_alive_timeout_ms {
                 self.manager.set_check_alive_timeout(ms);
-            }
-            // The title-bar keys of the same schema, for the GTK header
-            // bars of X11 frames.
-            #[cfg(feature = "xwayland")]
-            if let Some(titlebar) = raw.titlebar {
-                self.x11_frames.set_titlebar(titlebar);
             }
         }
         if !self.is_locked() {

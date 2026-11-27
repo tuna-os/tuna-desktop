@@ -1368,9 +1368,6 @@ impl X11Wm {
         }
 
         self.xsettings.update(&self.conn)?;
-        // Clients learn of the change from this property alone: it must
-        // not wait in the buffer for the next unrelated request.
-        self.conn.flush()?;
 
         Ok(())
     }

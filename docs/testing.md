@@ -304,8 +304,12 @@ bar. After them it runs `G-X11-MENU` and `G-X11-TOOLTIP` (P-SY-04: a GTK3
 program's menus and tooltip, override-redirect windows, drawn and driven
 with the real pointer) and `G-RESIZE-BORDER` (P-WM-04: a GTK4 window resized
 from the invisible border outside its edge). It needs `xclock`, `xeyes`,
-`xev` (x11-apps), `xprop` and `xwininfo` (x11-utils), and GTK 3 for Python
-(gir1.2-gtk-3.0). CI runs this slice too, with its freshly built binaries.
+`xev` (x11-apps), `xprop` and `xwininfo` (x11-utils), GTK 3 for Python
+(gir1.2-gtk-3.0) and the distribution `gsd-xsettings`
+(gnome-settings-daemon), which publishes `button-layout` and the title-bar
+click actions to the header bars: the window manager never owns
+XSETTINGS, as Mutter does not. CI runs this slice too, with its freshly
+built binaries.
 
 `scripts/tuna-gtk-shell-proof --datemenu-only --artifacts DIR` runs the date
 menu's gates alone, the same functions the full GTK proof calls

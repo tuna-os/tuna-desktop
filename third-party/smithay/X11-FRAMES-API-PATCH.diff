@@ -87,13 +87,10 @@ index b579e1584..ff2e421c4 100644
              ],
          )?;
          conn.change_property32(
-@@ -1314,10 +1360,69 @@ impl X11Wm {
+@@ -1314,10 +1360,66 @@ impl X11Wm {
          }
  
          self.xsettings.update(&self.conn)?;
-+        // Clients learn of the change from this property alone: it must
-+        // not wait in the buffer for the next unrelated request.
-+        self.conn.flush()?;
  
          Ok(())
      }
@@ -157,7 +154,7 @@ index b579e1584..ff2e421c4 100644
      /// Gets the current primary output as advertised by xrandr
      pub fn get_randr_primary_output(&self) -> Result<Option<String>, ReplyError> {
          let current_primary = self
-@@ -1441,16 +1546,19 @@ where
+@@ -1441,16 +1543,19 @@ where
                  return Ok(());
              }
  
@@ -181,7 +178,7 @@ index b579e1584..ff2e421c4 100644
              let geo = conn.get_geometry(n.window)?.reply()?;
              let geometry = Rectangle::<i32, Client>::new(
                  (geo.x as i32, geo.y as i32).into(),
-@@ -1477,17 +1585,35 @@ where
+@@ -1477,17 +1582,35 @@ where
              }
          }
          Event::MapRequest(r) => {
@@ -222,7 +219,7 @@ index b579e1584..ff2e421c4 100644
  
                      {
                          let _guard = scopeguard::guard((), |_| {
-@@ -1495,18 +1621,16 @@ where
+@@ -1495,18 +1618,16 @@ where
                          });
  
                          conn.grab_server()?;
@@ -250,7 +247,7 @@ index b579e1584..ff2e421c4 100644
                          )?;
                          let cookie2 = conn.reparent_window(win, frame_win, 0, 0)?;
                          conn.map_window(win)?;
-@@ -1515,8 +1639,7 @@ where
+@@ -1515,8 +1636,7 @@ where
                          // of the reparent_window() request, thus remember its sequence number. The
                          // grab_server()/ungrab_server() is done so that the server does not handle other clients
                          // in-between, which could cause other events to get the same sequence number.
@@ -260,7 +257,7 @@ index b579e1584..ff2e421c4 100644
                          xwm.sequences_to_ignore
                              .push(Reverse(cookie2.sequence_number() as u16));
                      }
-@@ -1530,6 +1653,13 @@ where
+@@ -1530,6 +1650,13 @@ where
                      // to prevent `set_mapped` and `configure` from failing.
                      surface.state.lock().unwrap().override_redirect = false;
  
@@ -274,7 +271,7 @@ index b579e1584..ff2e421c4 100644
                      drop(_guard);
                      state.map_window_request(xwm_id, surface);
                  }
-@@ -1553,22 +1683,26 @@ where
+@@ -1553,22 +1680,26 @@ where
                      drop(_guard);
                      state.mapped_override_redirect_window(xwm_id, surface);
                  } else {
@@ -317,7 +314,7 @@ index b579e1584..ff2e421c4 100644
                      drop(_guard);
                      state.map_window_notify(xwm_id, surface);
                  }
-@@ -1631,6 +1765,16 @@ where
+@@ -1631,6 +1762,16 @@ where
                      X11SurfaceError::Connection(err) => err,
                      X11SurfaceError::UnsupportedForOverrideRedirect => unreachable!(),
                  })?;
@@ -334,7 +331,7 @@ index b579e1584..ff2e421c4 100644
              }
          }
          Event::ConfigureNotify(n) => {
-@@ -1681,6 +1825,27 @@ where
+@@ -1681,6 +1822,27 @@ where
          }
          Event::UnmapNotify(n) => {
              if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
@@ -362,7 +359,7 @@ index b579e1584..ff2e421c4 100644
                  xwm.client_list.retain(|w| *w != surface.window_id());
                  xwm.client_list_stacking.retain(|w| *w != surface.window_id());
                  {
-@@ -1703,16 +1868,11 @@ where
+@@ -1703,16 +1865,11 @@ where
                          &xwm.client_list_stacking,
                      )?;
                      {
@@ -384,7 +381,7 @@ index b579e1584..ff2e421c4 100644
                      }
                  }
                  drop(_guard);
-@@ -1762,7 +1922,18 @@ where
+@@ -1762,7 +1919,18 @@ where
                  }
              }
  
@@ -404,7 +401,7 @@ index b579e1584..ff2e421c4 100644
                  let surface = xwm.windows.remove(pos);
                  surface.state.lock().unwrap().alive = false;
                  drop(_guard);
-@@ -2231,8 +2402,28 @@ where
+@@ -2231,8 +2399,28 @@ where
                  }
              }
  
@@ -435,7 +432,7 @@ index b579e1584..ff2e421c4 100644
                      drop(_guard);
                      state.property_notify(xwm_id, surface, property);
                  }
-@@ -2334,7 +2525,12 @@ where
+@@ -2334,7 +2522,12 @@ where
                  }
                  x if x == xwm.atoms.WM_CHANGE_STATE => {
                      let data = msg.data.as_data32();
@@ -449,7 +446,7 @@ index b579e1584..ff2e421c4 100644
                          drop(_guard);
                          match data[0] {
                              1 => state.unminimize_request(xwm_id, surface),
-@@ -2360,7 +2556,12 @@ where
+@@ -2360,7 +2553,12 @@ where
                              .reply_unchecked()?
                              .map(|reply| String::from_utf8(reply.name)),
                      );
@@ -463,7 +460,7 @@ index b579e1584..ff2e421c4 100644
                          drop(_guard);
                          match &data[1..=2] {
                              &[x, y]
-@@ -2409,7 +2610,12 @@ where
+@@ -2409,7 +2607,12 @@ where
                      }
                  }
                  x if x == xwm.atoms._NET_WM_MOVERESIZE => {
@@ -477,7 +474,7 @@ index b579e1584..ff2e421c4 100644
                          drop(_guard);
                          let data = msg.data.as_data32();
                          match data[2] {
-@@ -2432,6 +2638,35 @@ where
+@@ -2432,6 +2635,35 @@ where
                          }
                      }
                  }
@@ -513,7 +510,7 @@ index b579e1584..ff2e421c4 100644
                  x => {
                      debug!(
                          "Unhandled client msg of type {:?}",
-@@ -2465,6 +2700,25 @@ where
+@@ -2465,6 +2697,25 @@ where
      Ok(())
  }
  

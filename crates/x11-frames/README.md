@@ -73,8 +73,11 @@ GTK decides how to behave from what the window manager advertises:
 - `_NET_WM_STATE` and `_NET_WM_ALLOWED_ACTIONS` mirrored onto the frame
   window. The focused, maximized, tiled and fullscreen looks come from
   the frame window's own `_NET_WM_STATE`.
-- An XSETTINGS manager for `Gtk/DecorationLayout` and
-  `Gtk/TitlebarDoubleClick`; otherwise GTK's defaults apply.
+
+The button layout and title-bar click actions come from
+`Gtk/DecorationLayout` and `Gtk/TitlebarDoubleClick` (and the middle and
+right click actions) on XSETTINGS, which gnome-settings-daemon's xsettings
+plugin owns, not the window manager; without it GTK's defaults apply.
 
 ## Running
 

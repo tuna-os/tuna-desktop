@@ -154,7 +154,7 @@ x11f_drag() {
 # an X error is fatal to a GDK program, and a critical is a bug.
 x11f_log_errors() {
     tail -c +"$(($1 + 1))" "$LOG" |
-        grep -E 'tuna-x11-frames.*(CRITICAL|ERROR)|X Window System error|tuna-compositor: x11 frames: (offer|XSETTINGS) refused' || true
+        grep -E 'tuna-x11-frames.*(CRITICAL|ERROR)|X Window System error|tuna-compositor: x11 frames: offer refused' || true
 }
 
 # The frames client's launcher, and the file that holds its start.
@@ -210,6 +210,18 @@ done
 cstate '.x11_display != null' "xwayland" 30 || fail G-X11-FRAME "XWayland never came up"
 X11F_DISPLAY="$(jq -r '.x11_display' "$CSTATE")"
 x11f_mark="$(wc -c <"$LOG")"
+# The header bars read button-layout and the title-bar click actions as
+# XSETTINGS (Gtk/DecorationLayout, Gtk/Titlebar*Click). Like Mutter, the
+# window manager never owns that selection (G-XSETTINGS-SOUNDS checks it
+# is free); gnome-settings-daemon's xsettings plugin does, started with
+# Xwayland in a GNOME session. Run the distribution one on this display.
+x11f_gsd_xsettings=""
+for x11f_candidate in /usr/libexec/gsd-xsettings /usr/lib/gsd-xsettings; do
+    if [ -x "$x11f_candidate" ]; then x11f_gsd_xsettings="$x11f_candidate"; break; fi
+done
+[ -n "$x11f_gsd_xsettings" ] || fail G-X11-FRAME "the X11 frame gates need gsd-xsettings"
+DISPLAY="$X11F_DISPLAY" "$x11f_gsd_xsettings" >"$ARTIFACTS/gsd-xsettings-x11-frames.log" 2>&1 &
+GSD_XSETTINGS_PID=$!
 # The header bar's buttons are GNOME's button-layout; the journey sets
 # it, whatever the host's default is.
 x11f_layout="$(gsettings get org.gnome.desktop.wm.preferences button-layout)"
@@ -261,6 +273,8 @@ x11f_until 5 x11f_placed "$x11f_client" "$x11f_probe" client ||
     fail G-X11-FRAME "the client window is at '$(x11f_geometry "$x11f_client")', not under the title bar"
 # The header bar is GTK's own: the title and the buttons a screen reader
 # finds are what is drawn.
+kill -0 "$GSD_XSETTINGS_PID" 2>/dev/null ||
+    fail G-X11-FRAME "gsd-xsettings exited: $(tail -3 "$ARTIFACTS/gsd-xsettings-x11-frames.log")"
 x11f_a11y "$ARTIFACTS/a11y-x11-frame.json" 'frame("Tuna Frame Probe") | any(.[]; .role == "label" and .name == "Tuna Frame Probe" and .showing) and (buttons | map(.name) == ["Close"])' ||
     fail G-X11-FRAME "the frame's header bar does not show the window title and a lone Close button"
 gsettings set org.gnome.desktop.wm.preferences button-layout 'close:minimize,maximize'
@@ -655,6 +669,9 @@ kill "$x11f_xev_pid" "$x11f_other_pid" 2>/dev/null || true
 cstate "all(.windows[]; .id != $x11f_xev and .id != $x11f_other)" "probes closed" 10 ||
     fail G-X11-FRAME-RECOVERY "the probes stayed after their clients exited"
 gsettings set org.gnome.desktop.wm.preferences button-layout "$x11f_layout"
+kill "$GSD_XSETTINGS_PID" 2>/dev/null || true
+wait "$GSD_XSETTINGS_PID" 2>/dev/null || true
+GSD_XSETTINGS_PID=""
 x11f_errors="$(x11f_log_errors "$x11f_mark")"
 [ -z "$x11f_errors" ] || fail G-X11-FRAME "the frames client logged a failure: $x11f_errors"
 }
