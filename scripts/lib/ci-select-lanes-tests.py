@@ -3,6 +3,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import re
 import subprocess
 import unittest
 from pathlib import Path
@@ -24,6 +25,12 @@ class Selection(unittest.TestCase):
         for event in ("push", "schedule", "workflow_dispatch"):
             self.assertEqual(m.select(event, 7, 2, [])[0], m.LANES)
 
+    def test_a_merge_group_runs_every_lane(self):
+        # The merge queue's result is what lands on main: no path selection
+        # and no round robin, whatever the queued pull requests changed.
+        for run in range(4):
+            self.assertEqual(m.select("merge_group", run, 2, ["docs/x.md"])[0], m.LANES)
+
     def test_shared_inputs_run_every_lane(self):
         for path in (".github/workflows/ci.yml", "Cargo.lock", "Cargo.toml",
                      "third-party/smithay/src/lib.rs", "scripts/ci-select-lanes",
@@ -34,6 +41,13 @@ class Selection(unittest.TestCase):
     def test_docs_only_runs_no_lane(self):
         self.assertEqual(pr("README.md", "docs/perf/x.md", ".github/workflows/fuzz.yml",
                             "scripts/lib/ledger-tests.py", "fuzz/Cargo.toml"), [])
+
+    def test_doc_reference_resolver_runs_no_lane(self):
+        # #1219: the check job runs the resolver, its self-test and allowlist;
+        # no proof lane reads them.
+        for run in (0, 4):
+            self.assertEqual(pr("scripts/tuna-doc-refs", "scripts/lib/tuna-doc-refs-tests.py",
+                                "scripts/lib/tuna-doc-refs-allowlist.txt", run=run), [])
 
     def test_code_runs_gtk_shell_and_a_rotating_slice_with_producers(self):
         seen = set()
@@ -89,13 +103,39 @@ class Selection(unittest.TestCase):
                      "tests/gnome-reference/motion-reference.json"):
             self.assertEqual(pr(path), ["gtk-shell"], path)
         self.assertEqual(pr("docs/parity-ledger.md"),
-                         ["journey", "drm-smoke", "gtk-shell", "orca-speech",
+                         ["journey", "drm-smoke", "hotplug", "gtk-shell", "orca-speech",
                           "remote-security", "arch-package", "marlin-vm", "parity-ledger"])
         self.assertEqual(pr("scripts/tuna-orca-speech-proof"), ["orca-speech"])
         self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
+        # The GTK proof sources the top bar and dash slice; only gtk-shell
+        # runs its checker (#1198, #1199).
+        self.assertEqual(pr("scripts/lib/tuna-panel-dash-proof.sh"), ["journey", "gtk-shell"])
+        self.assertEqual(pr("scripts/lib/tuna-panel-dash-check.py"), ["gtk-shell"])
         # The guest's /usr/libexec/tuna-datetime-proof (G-DATETIME-*).
         self.assertEqual(pr("scripts/lib/tuna-datetime-proof.py"),
                          ["arch-package", "marlin-image", "marlin-vm"])
+        # The hotplug storm left NO_LANE when ci.yml began running it (#203).
+        self.assertEqual(pr("scripts/tuna-hotplug-stress"), ["hotplug"])
+        self.assertEqual(pr("scripts/lib/tuna_process_metrics.py"), ["hotplug"])
+
+    def test_hotplug_code_always_runs_the_hotplug_lane_beside_the_code_lanes(self):
+        # #203: window re-homing, lock surfaces on new outputs, colord
+        # devices and casts across connector hotplug have no nested proof;
+        # a change to them must not wait for the rotation to reach hotplug.
+        for path in ("crates/compositor/src/drm.rs", "crates/compositor/src/drm/libinput.rs",
+                     "crates/compositor/src/windows.rs", "crates/compositor/src/color_manager.rs",
+                     "crates/compositor/src/color_manager/tests.rs",
+                     "crates/compositor/src/session_lock.rs", "crates/compositor/src/screencast.rs",
+                     "crates/compositor/src/mutter.rs", "crates/compositor/src/mutter/remote_bus_tests.rs",
+                     "crates/compositor/src/runtime/display.rs", "crates/shell-gtk/src/lock.rs"):
+            for run in range(len(m.ROTATION)):
+                with self.subTest(path=path, run=run):
+                    lanes = pr(path, run=run)
+                    self.assertIn("hotplug", lanes)
+                    self.assertTrue(set(m.CORE + m.rotation(run, 2)) <= set(lanes))
+        # Control: other compositor code reaches hotplug only by rotation.
+        self.assertNotIn("hotplug", pr("crates/compositor/src/lib.rs", run=0))
+        self.assertIn("hotplug", m.ROTATION)
 
     def test_protocol_gate_inputs_run_the_gtk_shell_proof(self):
         # The Mutter 51 protocol gates (--protocols-only) and G-WAYLAND-INFO
@@ -106,6 +146,31 @@ class Selection(unittest.TestCase):
                          "tests/protocols/marlin-gnome51-globals.tsv"):
                 self.assertIn("gtk-shell", pr(path, run=run), (path, run))
         self.assertEqual(pr("scripts/tuna-wayland-info-compare"), ["gtk-shell"])
+
+    def test_vm_legs_follow_the_event_and_the_ledger(self):
+        def legs(event, lanes):
+            return [leg["artifact"] for leg in m.vm_matrix(event, lanes)["include"]]
+        primary = ["marlin-vm", "marlin-vm-autotz"]
+        self.assertEqual(legs("pull_request", pr("packaging/marlin/vm-lane/Containerfile")), primary)
+        self.assertEqual(legs("pull_request", []), primary)
+        # The ledger cites the Orca 51 leg's V-ORCA-* gates, so a pull request
+        # running it builds that leg too; the references stay off pull requests.
+        for lanes in (pr("docs/parity-ledger.md"), pr("scripts/tuna-ledger"), pr("Cargo.lock")):
+            self.assertEqual(legs("pull_request", lanes), primary + ["marlin-vm-orca51"])
+        for event in ("push", "schedule", "workflow_dispatch"):
+            self.assertEqual(legs(event, m.LANES), primary + ["marlin-vm-orca51", "native-gnome51-reference",
+                                                              "native-tuna-reference"])
+
+    def test_cli_prints_lanes_and_vm_matrix(self):
+        def run(*argv):
+            out = subprocess.run([str(ROOT / "scripts/ci-select-lanes"), *argv], check=True,
+                                 capture_output=True, text=True, cwd=ROOT).stdout.splitlines()
+            self.assertEqual([line.split("=", 1)[0] for line in out], ["lanes", "vm_matrix"])
+            return [json.loads(line.split("=", 1)[1]) for line in out]
+        lanes, matrix = run("--event", "pull_request", "--draft")
+        self.assertEqual((lanes, matrix), ([], m.vm_matrix("pull_request", [])))
+        lanes, matrix = run("--event", "push")
+        self.assertEqual((lanes, matrix), (m.LANES, m.vm_matrix("push", m.LANES)))
 
 
     def test_transition_policy_and_suite_always_run_journey(self):
@@ -184,6 +249,13 @@ class Selection(unittest.TestCase):
         # Control: another portal helper still rotates.
         self.assertIn("gtk-shell", pr("scripts/lib/tuna-portal-consent.py", run=0))
 
+    def test_uinput_emulators_run_drm_smoke_without_rotation(self):
+        # Only tuna-drm-smoke drives them; as code paths they rotated lanes
+        # and could skip drm-smoke.
+        for name in ("keyboard", "touchpad", "tablet"):
+            for run in range(len(m.ROTATION)):
+                self.assertEqual(pr(f"scripts/lib/tuna-uinput-{name}.py", run=run),
+                                 ["drm-smoke"], name)
     def test_native_desktop_driver_runs_the_vm_lane_that_drives_it(self):
         # #1013: a shared-driver change runs the VM lane whose autotz profile
         # drives it, not whatever slice the rotation picks.
@@ -417,10 +489,65 @@ class WorkflowSync(unittest.TestCase):
                         self.assertIn(lane, pr(path, size=0))
 
     def test_native_reference_artifacts_exist_only_off_pull_requests(self):
-        # A pull request builds the primary marlin-vm leg only; the two
+        # A pull request builds no paired reference leg (vm_matrix); the two
         # reference members that native-reference-context downloads are
         # produced on the other events.
         self.assertIn("pull_request", self.jobs["native-reference-context"]["if"])
+
+    def test_select_lanes_takes_the_vm_matrix_from_the_selector(self):
+        job = self.jobs["select-lanes"]
+        self.assertEqual(job["outputs"]["vm_matrix"], "${{ steps.lanes.outputs.vm_matrix }}")
+        step = next(step for step in job["steps"] if step.get("id") == "lanes")
+        self.assertNotIn("vm_matrix=", step["run"])
+        self.assertIn("scripts/ci-select-lanes --draft", step["run"])
+
+    def test_parity_ledger_reads_every_vm_leg_assertion_file_it_cites(self):
+        # The ledger cites V-AUTOTZ (marlin-vm-autotz) and the Orca 51 V-ORCA-*
+        # gates (marlin-vm-orca51): each leg's artifact must be downloaded,
+        # passed with --assertions, and built whenever parity-ledger runs.
+        job = self.jobs["parity-ledger"]
+        self.assertIn("marlin-vm", self.needs(job))
+        downloads = {step["with"]["name"]: step["with"]["path"] for step in job["steps"]
+                     if "actions/download-artifact" in str(step.get("uses", ""))
+                     and "name" in step.get("with", {})}
+        command = next(step["run"] for step in job["steps"] if "tuna-ledger check" in str(step.get("run", "")))
+        inputs = re.findall(r"--assertions (\S+)", command)
+        legs = {leg["artifact"] for leg in [*m.VM_PRIMARY, m.VM_ORCA51, *m.VM_REFERENCES]}
+        read = {name for name in downloads if name in legs}
+        self.assertEqual(read, {"marlin-vm", "marlin-vm-autotz", "marlin-vm-orca51"})
+        for name in read:
+            self.assertIn(f"{downloads[name]}/assertions.txt", inputs, name)
+        for lanes in (pr("docs/parity-ledger.md"), pr("scripts/tuna-ledger"), pr("Cargo.lock")):
+            built = {leg["artifact"] for leg in m.vm_matrix("pull_request", lanes)["include"]}
+            self.assertLessEqual(read, built, lanes)
+        for event in ("push", "schedule", "workflow_dispatch"):
+            built = {leg["artifact"] for leg in m.vm_matrix(event, m.LANES)["include"]}
+            self.assertLessEqual(read, built, event)
+
+    def test_vm_matrix_names_the_artifacts_the_vm_job_uploads(self):
+        uploads = m._upload_names(self.jobs["marlin-vm"])
+        self.assertIn("${{ matrix.artifact }}", uploads)
+        self.assertEqual(self.jobs["marlin-vm"]["strategy"]["matrix"],
+                         "${{ fromJSON(needs.select-lanes.outputs.vm_matrix) }}")
+
+    def test_the_merge_queue_gets_its_required_check(self):
+        # A repository rule requiring ci-gate from the merge queue holds
+        # every queued pull request until this workflow reports on the
+        # merge group; a workflow that does not trigger on it never does.
+        # PyYAML reads the key `on` as True.
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+        triggers = workflow.get("on", workflow.get(True))
+        self.assertIn("merge_group", triggers)
+        # The gate must not be skipped for the event, and the runner choice
+        # must not send the merge group to the fork (hosted) path.
+        self.assertEqual(self.jobs["ci-gate"]["if"], "${{ !cancelled() }}")
+        self.assertIn("github.event_name != 'pull_request'", self.jobs["select-lanes"]["runs-on"])
+        # Canonical media is compared with the group's base, not with a
+        # pull request base or a push's previous head, neither of which a
+        # merge group has.
+        media = next(s for s in self.jobs["check"]["steps"]
+                     if "MEDIA_BASE_SHA" in (s.get("env") or {}))
+        self.assertIn("github.event.merge_group.base_sha", media["env"]["MEDIA_BASE_SHA"])
 
     def test_gtk_shell_slices_run_on_binaries_this_job_built(self):
         # The slices run when an unrelated earlier step failed and skipped

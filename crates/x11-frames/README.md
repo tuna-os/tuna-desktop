@@ -120,7 +120,7 @@ cargo test -p tuna-x11-frames
 ```
 
 The unit tests cover `protocol.rs` and the start-up environment.
-`tests/cli.rs` runs the binary without a display. Nothing in `cargo test`
+`crates/x11-frames/tests/cli.rs` runs the binary without a display. Nothing in `cargo test`
 talks to an X server: frames on a live Xwayland need a running session.
 
 ## Licence
