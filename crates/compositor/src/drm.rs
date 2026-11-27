@@ -321,6 +321,8 @@ pub struct DrmBackend {
     gbm: GbmDevice<DrmDeviceFd>,
     render_formats: smithay::backend::allocator::format::FormatSet,
     native_device: Option<u64>,
+    /// Scanout buffers stay mapped for their life: OpenGL is software.
+    keep_scanout_mapped: bool,
     lease_names: Vec<String>,
 }
 
@@ -432,12 +434,23 @@ pub fn fallback_scale() -> f64 {
         .unwrap_or(1.0)
 }
 
+/// Whether scanout buffers stay mapped for their life
+/// ([`GbmAllocator::keep_mapped`]): only when OpenGL (`GL_RENDERER`) is
+/// Mesa's software rasterizer. On KMS that is kms_swrast, which otherwise
+/// maps and unmaps the target for every frame it draws, faulting its pages
+/// in again each time (#503). A hardware driver may copy a buffer to map it.
+fn scanout_keep_mapped(gl_renderer: Option<&str>) -> bool {
+    gl_renderer.is_some_and(tuna_shell_control::gl::is_software_renderer)
+}
+
 /// What lighting a connector needs from the device: at startup and on
 /// hotplug.
 struct Lighting<'a> {
     gbm: &'a GbmDevice<DrmDeviceFd>,
     render_formats: &'a smithay::backend::allocator::format::FormatSet,
     native_device: Option<u64>,
+    /// [`scanout_keep_mapped`] for this device's renderer.
+    keep_mapped: bool,
     resources: &'a control::ResourceHandles,
 }
 
@@ -497,7 +510,8 @@ impl Lighting<'_> {
         let allocator = GbmAllocator::new(
             self.gbm.clone(),
             GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-        );
+        )
+        .keep_mapped(self.keep_mapped);
         let surface = match GbmBufferedSurface::new(
             surface,
             allocator,
@@ -655,8 +669,13 @@ impl DrmBackend {
         let context = EGLContext::new(&egl).map_err(|e| err("egl context")(e.to_string()))?;
         let render_formats = context.dmabuf_render_formats().clone();
         // SAFETY: the context is current on this thread only.
-        let renderer =
+        let mut renderer =
             unsafe { GlesRenderer::new(context) }.map_err(|e| err("gles")(e.to_string()))?;
+        let keep_scanout_mapped =
+            scanout_keep_mapped(crate::runtime::gl_renderer_name(&mut renderer).as_deref());
+        if keep_scanout_mapped {
+            eprintln!("tuna-compositor: drm: software rendering; scanout buffers stay mapped");
+        }
 
         let resources = drm
             .resource_handles()
@@ -688,6 +707,7 @@ impl DrmBackend {
                 gbm: &gbm,
                 render_formats: &render_formats,
                 native_device,
+                keep_mapped: keep_scanout_mapped,
                 resources: &resources,
             };
             if let Some(out) = lighting.open(&mut drm, *handle, &info, &used, name) {
@@ -755,6 +775,7 @@ impl DrmBackend {
             gbm,
             render_formats,
             native_device,
+            keep_scanout_mapped,
             lease_names,
         };
         // With every connector for lease there is no layout to apply.
@@ -913,6 +934,7 @@ impl DrmBackend {
                 gbm: &self.gbm,
                 render_formats: &self.render_formats,
                 native_device: self.native_device,
+                keep_mapped: self.keep_scanout_mapped,
                 resources: &resources,
             };
             if let Some(out) = lighting.open(&mut self.drm, *handle, &info, &used, name) {
@@ -2040,5 +2062,20 @@ mod tests {
         // Far left: onto the left edge of the first output.
         let left = clamp_to_outputs((-50.0, 10.0).into(), &outputs);
         assert_eq!(left, (0.0, 10.0).into());
+    }
+
+    #[test]
+    fn only_software_gl_keeps_scanout_buffers_mapped() {
+        assert!(scanout_keep_mapped(Some(
+            "llvmpipe (LLVM 20.1.2, 256 bits)"
+        )));
+        assert!(scanout_keep_mapped(Some("softpipe")));
+        assert!(!scanout_keep_mapped(Some(
+            "AMD Radeon Graphics (radeonsi, renoir, LLVM 20.1.2, DRM 3.61)"
+        )));
+        assert!(!scanout_keep_mapped(Some(
+            "Mesa Intel(R) Graphics (ADL GT2)"
+        )));
+        assert!(!scanout_keep_mapped(None));
     }
 }
