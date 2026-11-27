@@ -24,6 +24,12 @@ class Selection(unittest.TestCase):
         for event in ("push", "schedule", "workflow_dispatch"):
             self.assertEqual(m.select(event, 7, 2, [])[0], m.LANES)
 
+    def test_a_merge_group_runs_every_lane(self):
+        # The merge queue's result is what lands on main: no path selection
+        # and no round robin, whatever the queued pull requests changed.
+        for run in range(4):
+            self.assertEqual(m.select("merge_group", run, 2, ["docs/x.md"])[0], m.LANES)
+
     def test_shared_inputs_run_every_lane(self):
         for path in (".github/workflows/ci.yml", "Cargo.lock", "Cargo.toml",
                      "third-party/smithay/src/lib.rs", "scripts/ci-select-lanes",
@@ -94,13 +100,35 @@ class Selection(unittest.TestCase):
                      "tests/gnome-reference/motion-reference.json"):
             self.assertEqual(pr(path), ["gtk-shell"], path)
         self.assertEqual(pr("docs/parity-ledger.md"),
-                         ["journey", "drm-smoke", "gtk-shell", "orca-speech",
+                         ["journey", "drm-smoke", "hotplug", "gtk-shell", "orca-speech",
                           "remote-security", "arch-package", "marlin-vm", "parity-ledger"])
         self.assertEqual(pr("scripts/tuna-orca-speech-proof"), ["orca-speech"])
         self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
         # The guest's /usr/libexec/tuna-datetime-proof (G-DATETIME-*).
         self.assertEqual(pr("scripts/lib/tuna-datetime-proof.py"),
                          ["arch-package", "marlin-image", "marlin-vm"])
+        # The hotplug storm left NO_LANE when ci.yml began running it (#203).
+        self.assertEqual(pr("scripts/tuna-hotplug-stress"), ["hotplug"])
+        self.assertEqual(pr("scripts/lib/tuna_process_metrics.py"), ["hotplug"])
+
+    def test_hotplug_code_always_runs_the_hotplug_lane_beside_the_code_lanes(self):
+        # #203: window re-homing, lock surfaces on new outputs, colord
+        # devices and casts across connector hotplug have no nested proof;
+        # a change to them must not wait for the rotation to reach hotplug.
+        for path in ("crates/compositor/src/drm.rs", "crates/compositor/src/drm/libinput.rs",
+                     "crates/compositor/src/windows.rs", "crates/compositor/src/color_manager.rs",
+                     "crates/compositor/src/color_manager/tests.rs",
+                     "crates/compositor/src/session_lock.rs", "crates/compositor/src/screencast.rs",
+                     "crates/compositor/src/mutter.rs", "crates/compositor/src/mutter/remote_bus_tests.rs",
+                     "crates/compositor/src/runtime/display.rs", "crates/shell-gtk/src/lock.rs"):
+            for run in range(len(m.ROTATION)):
+                with self.subTest(path=path, run=run):
+                    lanes = pr(path, run=run)
+                    self.assertIn("hotplug", lanes)
+                    self.assertTrue(set(m.CORE + m.rotation(run, 2)) <= set(lanes))
+        # Control: other compositor code reaches hotplug only by rotation.
+        self.assertNotIn("hotplug", pr("crates/compositor/src/lib.rs", run=0))
+        self.assertIn("hotplug", m.ROTATION)
 
     def test_protocol_gate_inputs_run_the_gtk_shell_proof(self):
         # The Mutter 51 protocol gates (--protocols-only) and G-WAYLAND-INFO
@@ -426,6 +454,25 @@ class WorkflowSync(unittest.TestCase):
         # reference members that native-reference-context downloads are
         # produced on the other events.
         self.assertIn("pull_request", self.jobs["native-reference-context"]["if"])
+
+    def test_the_merge_queue_gets_its_required_check(self):
+        # A repository rule requiring ci-gate from the merge queue holds
+        # every queued pull request until this workflow reports on the
+        # merge group; a workflow that does not trigger on it never does.
+        # PyYAML reads the key `on` as True.
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+        triggers = workflow.get("on", workflow.get(True))
+        self.assertIn("merge_group", triggers)
+        # The gate must not be skipped for the event, and the runner choice
+        # must not send the merge group to the fork (hosted) path.
+        self.assertEqual(self.jobs["ci-gate"]["if"], "${{ !cancelled() }}")
+        self.assertIn("github.event_name != 'pull_request'", self.jobs["select-lanes"]["runs-on"])
+        # Canonical media is compared with the group's base, not with a
+        # pull request base or a push's previous head, neither of which a
+        # merge group has.
+        media = next(s for s in self.jobs["check"]["steps"]
+                     if "MEDIA_BASE_SHA" in (s.get("env") or {}))
+        self.assertIn("github.event.merge_group.base_sha", media["env"]["MEDIA_BASE_SHA"])
 
     def test_gtk_shell_slices_run_on_binaries_this_job_built(self):
         # The slices run when an unrelated earlier step failed and skipped

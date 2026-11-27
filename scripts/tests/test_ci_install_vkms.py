@@ -319,19 +319,21 @@ exec 7>&-
             self.assertEqual([json.loads(line) for line in receipts.read_text().splitlines()],
                              [{"writer_closed": True}, {"writer_closed": True}])
 
-    def test_coldplug_uses_hotplug_configuration_without_consuming_other_events(self):
+    def test_coldplug_devices_arrive_through_the_draining_libinput_source(self):
+        # udev_assign_seat queues a device-added event for every device
+        # already present without making libinput's fd readable. The
+        # draining source (crates/compositor/src/drm/input_drain.rs) hands
+        # those over on the loop's first dispatch, through the same
+        # callback as ordinary input, so they get their settings as a
+        # hotplugged device does. A second reader of the context's queue
+        # here would consume events the drain is meant to deliver.
         drm = (ROOT / "crates/compositor/src/drm.rs").read_text()
         constructor = drm.split("pub fn new()", 1)[1].split("\n    /// Apply a layout", 1)[0]
-        coldplug = constructor.split("// udev_assign_seat has already queued", 1)[1]
         self.assertLess(constructor.index(".udev_assign_seat("),
-                        constructor.index("libinput_next_event_type("))
-        self.assertLess(coldplug.index("libinput_next_event_type("),
-                        coldplug.index("backend.libinput.next()"))
-        self.assertIn("== input_ffi::libinput_event_type_LIBINPUT_EVENT_DEVICE_ADDED", coldplug)
-        self.assertIn("LibinputEvent::Device(DeviceEvent::Added(added))", coldplug)
-        self.assertIn("backend.translate(InputEvent::DeviceAdded { device }, &[]);", coldplug)
-        self.assertNotIn(".dispatch()", coldplug)
-        self.assertLess(coldplug.index("backend.translate("), coldplug.index("Ok(("))
+                        constructor.index("input_drain::Draining::new("))
+        self.assertIn("input_drain::LibinputSource::new(libinput.clone())", constructor)
+        self.assertNotIn("libinput_next_event_type(", constructor)
+        self.assertNotIn("backend.libinput.next()", constructor)
 
     def test_restart_still_requires_retained_devices_with_applied_settings(self):
         source = SMOKE.read_text()
