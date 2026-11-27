@@ -22,7 +22,11 @@ future split stays a file move, not a rewrite:
 
 1. **Framing vs messages** in `tuna-shell-control`: length-prefix,
    negotiation, and caps must not import Tuna-specific message types.
-   (Today the crate mixes both; separate them before any split.)
+   The envelope lives in `src/framing.rs` (generic codec, stream
+   admission, `FrameError`); `tests/framing_tests.rs` fails if it imports
+   anything from the rest of the crate. The compositor and shell-host
+   control clients still read the length prefix themselves; moving them
+   onto `framing::complete_frame_len` finishes the seam (#805).
 2. **Supervisor stays std-only**: `supervise.rs` takes no compositor
    types and gains none. It remains portable by construction.
 3. **Shell-host talks wire-only**: all compositor contact goes through

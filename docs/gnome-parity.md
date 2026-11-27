@@ -217,7 +217,8 @@ Display power saving follows GNOME Settings Daemon 51's idle transitions
 backlight drop, writes DisplayConfig `PowerSaveMode` 3 and sees no frame
 rendered while the pointer moves, checks that -1 is ignored, writes 0 and
 sees a repaint, then `SetDimming(false)` restores the exact user baseline.
-The nested proof turns no CRTC off; see `docs/brightness-contract.md`.
+The nested proof turns no CRTC off; `D-POWER-SAVE` (`scripts/tuna-drm-smoke`)
+does on vkms, for a locked session; see `docs/brightness-contract.md`.
 
 ## Workspace insertion comparison
 
@@ -238,9 +239,10 @@ PR 234 head `bd18c76`). The full GTK proof, including `G-WS-INSERT`,
 passed. Capture with `--workspace-insertion-only` isolates this state
 from screenshot-helper startup and fails if the placeholder is absent.
 
-The candidate XWayland activation journey (#219) additionally checks native GTK
+The XWayland activation journey (#219, closed) additionally checks native GTK
 startup without an XWayland process, the first real X11 app launched from search,
 a killed compatibility process followed by same-display reconnect, preserved
 native window IDs, and listening-socket/display-lock cleanup on graceful exit.
 See `xwayland-on-demand.md`. These are runtime/lifecycle gates, separate from
-GNOME screenshot pixel comparisons; their exact-head CI qualification is pending.
+GNOME screenshot pixel comparisons; they run in `scripts/tuna-gtk-shell-proof`
+(`G-X11-DEMAND`, `G-X11-RESTART`, `G-X11-CLEANUP`; ledger P-SY-04).

@@ -20,6 +20,7 @@ from pathlib import Path
 import select
 import signal
 import subprocess
+import sys
 import time
 import wave
 
@@ -558,4 +559,8 @@ def main():
 
 
 if __name__ == '__main__':
+    if not os.environ.get('TUNA_PROOF_SESSION'):
+        # One owned session (#1082): nothing this run starts outlives it.
+        session = str(Path(__file__).with_name('tuna-proof-session'))
+        os.execv(session, [session, '--', sys.executable, *sys.argv])
     main()

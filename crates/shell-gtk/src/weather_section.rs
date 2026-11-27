@@ -255,7 +255,7 @@ impl WeatherSection {
             let forecast = &snapshot.forecasts[index];
             let at = jiff::Timestamp::from_second(forecast.update.unwrap_or(0))
                 .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
-                .to_zoned(zone.clone());
+                .to_zoned_datetime(zone.clone());
             let time = gtk::Label::new(Some(&logic::time_only(
                 at.hour(),
                 at.minute(),

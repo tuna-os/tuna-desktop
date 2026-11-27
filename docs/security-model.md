@@ -390,7 +390,8 @@ quality:
   [ADR 0011](adr/0011-lock-auth-and-capture-grant-lifecycle.md) (#1162) and
   awaiting the owner's decision. Their residual risks, including the gaps
   they record, are part of the gate 4 review
-  ([ADR register](adr/README.md#decision-register)).
+  ([ADR register](adr/README.md#decision-register)); fixes for the G6, G8
+  and G9 gaps are in open [#1169](https://github.com/tuna-os/tuna-desktop/pull/1169).
 
 The `portal-security` and `remote-security` CI lanes run the packaged
 compositor and GTK shell against the installed GNOME portal stack
