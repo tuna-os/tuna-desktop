@@ -2,11 +2,13 @@
 """ci-select-lanes — choose which ci.yml proof lanes a run executes.
 
 Usage:
-  scripts/ci-select-lanes [--event NAME] [--run-number N] [--size K] [--changed FILE|-]
+  scripts/ci-select-lanes [--event NAME] [--run-number N] [--size K] [--changed FILE|-] [--draft]
 
-Prints `lanes=<JSON array>` for $GITHUB_OUTPUT; the reason goes to
+Prints `lanes=<JSON array>` and the marlin-vm legs as `vm_matrix=<JSON>`
+(VM_PRIMARY etc. below) for $GITHUB_OUTPUT; the reason goes to
 stderr and, when set, $GITHUB_STEP_SUMMARY. The `select-lanes` and `check`
-jobs always run and are not proof lanes.
+jobs always run and are not proof lanes. A draft pull request (--draft)
+runs no proof lane until it is marked ready for review.
 
 push, schedule and workflow_dispatch run every lane. A pull_request runs
 what its changed files (`git diff --name-only HEAD^1 HEAD` on the merge
@@ -75,6 +77,26 @@ NEEDS = {
                       "remote-security"],
     "docs-shots": ["journey", "app-content", "scroll-proof"],
 }
+
+# marlin-vm matrix legs; ci.yml names each leg's job and artifact after
+# `artifact`. A marlin-vm run always has the primary lifecycle leg and the
+# required native automatic-timezone leg. The Orca 51 leg runs on push, schedule and
+# dispatch, and on a pull request that runs parity-ledger: the ledger cites its
+# V-ORCA-* gates from `marlin-vm-orca51/assertions.txt`, as it cites V-AUTOTZ
+# from `marlin-vm-autotz/assertions.txt`. The paired GNOME/Tuna references run
+# off pull requests only (each leg rebuilds the image and boots a VM for ~30
+# hosted minutes).
+VM_PRIMARY = [
+    {"profile": "lifecycle", "orca": "distribution", "artifact": "marlin-vm"},
+    {"profile": "autotz", "orca": "distribution", "artifact": "marlin-vm-autotz"},
+]
+VM_ORCA51 = {"profile": "lifecycle", "orca": "upstream51", "artifact": "marlin-vm-orca51"}
+VM_REFERENCES = [
+    {"profile": "gnome-reference", "session": "gnome", "orca": "distribution",
+     "artifact": "native-gnome51-reference"},
+    {"profile": "tuna-reference", "session": "tuna", "orca": "distribution",
+     "artifact": "native-tuna-reference"},
+]
 
 # Code (still CORE plus the rotation) whose only end-to-end proof is one
 # lane, which it therefore always runs. The nested backend has one fixed
@@ -164,6 +186,9 @@ OWNED = [
     ("scripts/tuna-a11y-golden", ["gtk-shell"]),
     ("scripts/tuna-wayland-info-compare", ["gtk-shell"]),
     ("scripts/lib/tuna-a11y-proof-guard.py", ["gtk-shell"]),
+    # Sourced by every GTK proof run, journey's installed run included.
+    ("scripts/lib/tuna-panel-dash-proof.sh", ["gtk-shell", "journey"]),
+    ("scripts/lib/tuna-panel-dash-check.py", ["gtk-shell"]),
     ("docs/walkthrough*", ["gtk-shell"]),
     ("scripts/tuna-journey", ["journey"]),
     ("scripts/tuna-release", ["journey"]),
@@ -189,6 +214,8 @@ OWNED = [
     ("scripts/lib/colord-startup.sh", ["drm-smoke"]),
     # Sourced by the GTK shell (and journey's installed run), DRM and Orca proofs.
     ("scripts/lib/tuna-state-snapshot.sh", ["gtk-shell", "journey", "drm-smoke", "orca-speech"]),
+    # The uinput keyboard, touchpad and tablet emulators tuna-drm-smoke drives.
+    ("scripts/lib/tuna-uinput-*.py", ["drm-smoke"]),
     ("scripts/tuna-orca-speech-proof", ["orca-speech"]),
     ("scripts/lib/tuna-orca-speech.py", ["orca-speech"]),
     ("scripts/tuna-frame-pacer-build", ["drm-smoke"]),
@@ -244,6 +271,10 @@ NO_LANE = [
     # ones a lane job runs first.
     "scripts/tests/*",
     "scripts/lib/*-tests.py",
+    # The changed-Markdown resolver and its allowlist: the check job runs
+    # them (#1219).
+    "scripts/tuna-doc-refs",
+    "scripts/lib/tuna-doc-refs-allowlist.txt",
     # Products and workflows of their own, never run by a ci.yml lane
     # (WorkflowSync.test_no_lane_scripts_are_not_run_by_a_lane keeps this
     # true): corral installed-image tooling, variant qualification, hero
@@ -421,6 +452,16 @@ def select(event, run_number, size, changed, wf_lanes=None):
     return [lane for lane in LANES if lane in chosen], "; ".join(reasons)
 
 
+def vm_matrix(event, lanes):
+    """The marlin-vm strategy matrix for this event and lane selection."""
+    legs = list(VM_PRIMARY)
+    if event != "pull_request" or "parity-ledger" in lanes:
+        legs.append(VM_ORCA51)
+    if event != "pull_request":
+        legs += VM_REFERENCES
+    return {"include": legs}
+
+
 def changed_files(source):
     if source == "-":
         return [line for line in sys.stdin.read().splitlines() if line]
@@ -442,13 +483,19 @@ def main():
                         "(default: git diff HEAD^1 HEAD on pull_request)")
     parser.add_argument("--base", help="pull request base revision; with it, an edit to "
                         "ci.yml selects only the lanes whose job definition changed")
+    parser.add_argument("--draft", action="store_true",
+                        help="a draft pull request: no proof lane until it is ready for review")
     args = parser.parse_args()
-    changed = changed_files(args.changed) if args.event == "pull_request" else []
-    wf_lanes = None
-    if args.event == "pull_request" and args.base and WORKFLOW in changed:
-        wf_lanes = workflow_lanes(*workflow_texts(args.base))
-    lanes, reason = select(args.event, args.run_number, args.size, changed, wf_lanes)
+    if args.draft:
+        lanes, reason = [], "draft pull request: check job only"
+    else:
+        changed = changed_files(args.changed) if args.event == "pull_request" else []
+        wf_lanes = None
+        if args.event == "pull_request" and args.base and WORKFLOW in changed:
+            wf_lanes = workflow_lanes(*workflow_texts(args.base))
+        lanes, reason = select(args.event, args.run_number, args.size, changed, wf_lanes)
     print("lanes=" + json.dumps(lanes, separators=(",", ":")))
+    print("vm_matrix=" + json.dumps(vm_matrix(args.event, lanes), separators=(",", ":")))
     message = f"ci lanes: {', '.join(lanes) or 'none'}\nreason: {reason}\n"
     sys.stderr.write(message)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
