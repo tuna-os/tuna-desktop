@@ -20,7 +20,7 @@ The primary monitor starts selected. The selection then holds across openings un
 
 Modified arrows do nothing in Screen mode. Return, Space or Ctrl+C saves only the selected output, in its own physical pixels: a scale-2 monitor yields its full mode size, not its logical size. Escape closes every overlay without saving. Recording in Screen mode records the selected monitor. A recording from Selection mode records the area, offset by the primary monitor's position. The area selection and the window selector stay on the primary monitor.
 
-`D-SCREENSHOT-KEYS-MULTI` in `scripts/tuna-drm-dual` (drm-smoke job; see [testing](testing.md)) proves this on two vkms connectors: one at scale 1 and one at scale 2. The nested session has a single output, so the focused proof below covers only the one-monitor path.
+`D-SCREENSHOT-KEYS-MULTI` in `scripts/tuna-drm-dual` (drm-smoke job; see [testing](../testing.md)) proves this on two vkms connectors: one at scale 1 and one at scale 2. The nested session has a single output, so the focused proof below covers only the one-monitor path.
 
 ## Focused runtime proof
 
