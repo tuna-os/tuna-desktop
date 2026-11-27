@@ -1,0 +1,15 @@
+[package]
+name = "tuna-auth-prompt"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "GNOME 51's AuthPrompt flow as a GTK-free state machine, shared by the lock screen and the greeter"
+
+[dependencies]
+tuna-shell-control = { path = "../shell-control-schema", version = "0.1.0" }
+gtk4 = { workspace = true, optional = true }
+
+[features]
+# GNOME's prompt entry widgets (`entry::PromptEntry`), for the GTK
+# consumers; the state machine itself never touches GTK.
+gtk = ["dep:gtk4"]

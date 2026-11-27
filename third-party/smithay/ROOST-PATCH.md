@@ -140,6 +140,61 @@ nested proof G-X11-INPUT-FOCUS (scripts/tuna-gtk-shell-proof) covers it.
 The isolated diff is retained in X11-INPUT-FOCUS-API-PATCH.diff; the pinned
 version stays 0.7.0.
 
+Issue #364 changes src/wayland/shell/xdg/mod.rs: xdg_wm_base is created at
+version 7, as Mutter 51 advertises it (META_XDG_WM_BASE_VERSION). Version 7
+adds only the four xdg_toplevel constrained_* states. A configure keeps
+every state a client's bind can name and drops the rest: tiled states below
+version 2, suspended below 6 and constrained below 7, the same version
+gates as Mutter's fill_states (meta-wayland-xdg-shell.c). Roost sets the
+states from Mutter's edge constraints. Real-client tests in
+crates/compositor/tests/windows.rs bind versions 7 and 6 and read the
+configure states. The isolated diff is retained in
+XDG-WM-BASE-7-PATCH.diff; the pinned version stays 0.7.0.
+
+Issue #364 additionally changes src/wayland/xdg_foreign/mod.rs and
+handlers.rs: zxdg_exporter_v1 and zxdg_importer_v1 join the v2 globals,
+sharing one handle table, as Mutter's meta-wayland-legacy-xdg-foreign.c
+calls the same export and import functions as v2. GTK 3 exports with v1 and
+the portal imports with v2, so each version imports the other's handles.
+Each import now parents at most one child (Mutter's imported->parent_of;
+upstream kept one child per export, so a second importer replaced the
+first's relationship), and revoking an export sends destroyed to every
+import and clears the parents they set, as meta_wayland_xdg_exported_destroy
+does; upstream only cleared the parent. An import of an unknown handle is
+destroyed at once, as before. An invalid v1 parent posts error 0 on the
+import, Mutter's WL_DISPLAY_ERROR_INVALID_OBJECT, since zxdg_imported_v1 has
+no error enum. Real socketpair tests in
+crates/compositor/tests/protocol_gaps.rs cover v1 export with v2 import, v2
+export with v1 import, revocation and unknown handles. The isolated diff is
+retained in XDG-FOREIGN-V1-PATCH.diff; the pinned version stays 0.7.0.
+
+Issues #364 and #588 change src/wayland/drm_lease/mod.rs, with a crate-private
+accessor in src/backend/drm/device/mod.rs and a crate-private re-export in
+src/backend/drm/mod.rs, for wp_drm_lease_device_v1 as Mutter 51 offers it
+(meta-wayland-drm-lease.c, meta-drm-lease.c). DrmLeaseBuilder is now Clone
+and shares its device's plane claims: a compositor keeps an empty builder and
+claims planes on a clone (DrmLeaseBuilder::claim_plane) when a request
+arrives, as the lease handler has no access to the DrmDevice. The additive
+DrmLeaseState::revoke_lease ends a lease from the compositor's side (finished,
+connectors offered again), for Mutter's update_leases (a lessee the kernel
+destroyed because its client closed the lease fd) and update_connectors (a
+leased connector unplugged). Request validation follows
+wp_drm_lease_request_request_connector and wp_drm_lease_request_submit: a
+connector of another lease device posts wrong_device and a repeated one
+duplicate_connector when it is requested (upstream checked only at submit
+and posted wrong_device for a withdrawn connector); an empty submit posts
+empty_lease and stops (upstream went on to call the handler); a connector
+withdrawn since it was requested fails the lease with finished. A binding
+that cannot open a non-master DRM fd stays pending without events, as
+Mutter's lease_device_bind keeps it, until
+DrmLeaseState::retry_pending_binds (session activation); upstream sent the
+released destructor from inside the bind, which made wayland-backend panic
+on the destroyed object, and refused to create the global when the
+compositor could not open the node, where Mutter advertises it anyway.
+drm-smoke's D-LEASE leases the vkms connector through it with a real
+client. The isolated diff is retained in DRM-LEASE-PATCH.diff; the pinned
+version stays 0.7.0.
+
 Issue #495 adds `_NET_WM_ICON_GEOMETRY` to src/xwayland/xwm/mod.rs and
 surface.rs. X11Surface reads it at map and on PropertyNotify (reported as
 the new WmWindowProperty::IconGeometry) and exposes it as
@@ -360,3 +415,44 @@ are nearest and show only source texels, while shrunk, grown, one-axis
 stretched and half-texel-shifted draws stay linear and filtered. The
 isolated diff is retained in UNSCALED-NEAREST-PATCH.diff; the pinned
 version stays 0.7.0.
+
+Issue #353 changes Cargo.toml (the xwayland feature enables x11rb's xkb
+protocol) and src/xwayland/xwm/mod.rs, additively. X11Wm::select_bell_events
+does what Mutter 51's init_x11_bell does (src/x11/meta-x11-display.c): select
+XkbBellNotify on the core keyboard and turn off its AudibleBell control, so
+X11 bells reach the new XwmHandler::bell callback (default: ignore) with the
+window the client named and the X server time, and Xwayland never rings them
+itself. X11Wm::release_xsettings_selection gives up the _XSETTINGS_S0
+selection start_wm takes: Mutter never owns XSETTINGS, and
+gnome-settings-daemon's xsettings plugin exits while another manager holds
+it. The isolated diff is retained in XKB-BELL-XSETTINGS-API-PATCH.diff; the
+pinned version stays 0.7.0.
+Issue #344 (P-IN-05) adds src/wayland/tablet_manager/tablet_pad.rs and
+changes the tablet manager's mod.rs, tablet.rs, tablet_seat.rs and
+tablet_tool.rs and src/backend/libinput/mod.rs for graphics tablets and
+their pads. Upstream 0.7.0 serves tablets and tools but not
+zwp_tablet_pad_v2 (upstream has only the unmerged drafts Smithay PR 1955
+and PR 1836), so a pad's buttons, rings and strips reached no client and
+GNOME's pad actions and pad OSD had nothing to follow. The additive
+TabletSeatHandle::add_pad, get_pad and remove_pad announce a
+TabletPadDescriptor (its buttons, and libinput's mode groups of buttons,
+rings and strips) to every bound tablet seat. The returned
+TabletPadHandle follows keyboard focus, paired with its tablet, and sends
+button, ring, strip and mode-switch events only to the focused client's
+objects, as Mutter 51 does (meta-wayland-tablet-pad*.c). The focused
+client's set_feedback labels for buttons, rings and strips are kept, but
+only when they quote the group's current mode-switch serial and never
+for a mode-switch button, and a focus change clears them;
+button_label, ring_label and strip_label give them to Roost's pad OSD
+(crates/compositor/src/runtime.rs). LibinputInputBackend's SpecialEvent
+becomes TabletPadEvent, so libinput pad events reach the compositor
+instead of being dropped. The manager offers version 2, as Mutter 51
+does, and sends zwp_tablet_v2.bustype; zwp_tablet_v2.path now names the
+/dev/input/eventN node instead of the sysfs path, and id sends the vendor
+before the product, as the protocol and Mutter do. Removing a tablet or
+a pad sends removed, so the clients' objects go inert. The tool's
+hardware_serial and hardware_id_wacom high halves are now the upper 32
+bits instead of bits 16 to 47. The emulated Wacom Cintiq 22HD pen and
+pad of D-TABLET (scripts/tuna-drm-smoke) cover it with a GTK 4 client
+and the shell's pad OSD. The isolated diff is retained in
+TABLET-PAD-API-PATCH.diff; the pinned version stays 0.7.0.
