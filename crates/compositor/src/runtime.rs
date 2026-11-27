@@ -7189,7 +7189,7 @@ impl Runtime {
                             .chain(wellbeing.bits())
                             .chain(zoom_plan.iter().flat_map(|plan| plan.signature_bits()))
                             .collect(),
-                        groups: FrameSignature::groups(&passes),
+                        groups: FrameSignature::groups(&passes, Rectangle::from_size(size)),
                     };
                     let mut roots: Vec<_> =
                         crate::frame_timing::drawn_roots(&self.state, &self.manager, locked)
@@ -7582,7 +7582,7 @@ impl Runtime {
                             .chain(wellbeing.bits())
                             .chain(zoom_plan.iter().flat_map(|plan| plan.signature_bits()))
                             .collect(),
-                        groups: FrameSignature::groups(&passes),
+                        groups: FrameSignature::groups(&passes, Rectangle::from_size(logical)),
                     };
                     let presented_cursor = crate::cursor::presented_surface(
                         &cursor,
