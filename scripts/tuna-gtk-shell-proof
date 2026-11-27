@@ -13,6 +13,9 @@
 #   keyboard and X11 tray gates only.
 #   --x11-iconic-only runs panel readiness and G-X11-ICONIC (a minimized
 #   X11 window is IconicState with _NET_WM_STATE_HIDDEN, #1078) only.
+#   --protocols-only runs panel readiness, G-WAYLAND-INFO and the Mutter 51
+#   protocol gates driven by a real client (G-XDG-WM-BASE-7,
+#   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR; #364, #588) only.
 #   --subsurface-only runs panel readiness and G-SUBSURFACE-STACKING (a
 #   window's subsurfaces stack where the client placed them) only.
 #   --grid-hover-only runs panel readiness, G-GRID-HOVER, G-GRID-REORDER,
@@ -558,6 +561,10 @@
 #   G-SWITCHER  Alt+Tab shows the switcher with every app (GNOME's
 #               switch-applications; the three test windows are three apps), and
 #               releasing Alt focuses the highlighted one
+#   G-VISUAL-BELL, G-X11-BELL, G-XSETTINGS-SOUNDS, G-QS-VOLUME-FEEDBACK
+#               bells, input-feedback-sounds and slider feedback (#353);
+#               see scripts/lib/tuna-sound-alerts-proof.sh, which
+#               --sound-alerts-only runs alone
 # Frames and accessibility dumps land in the artifacts dir; assertions in
 # assertions.txt for the parity ledger.
 set -eu
@@ -593,6 +600,7 @@ A11Y_FOCUS_ONLY=0
 NOTIFY_LOCK_ONLY=0
 TRAY_ONLY=0
 X11_ICONIC_ONLY=0
+PROTOCOLS_ONLY=0
 SUBSURFACE_ONLY=0
 GRID_HOVER_ONLY=0
 KEYBOARD_ROUTES_ONLY=0
@@ -601,6 +609,7 @@ SEARCH_LEAK_ONLY=0
 WINDOW_LEAK_ONLY=0
 DND_OVERVIEW_ONLY=0
 LOCK_MENU_ONLY=0
+SOUND_ALERTS_ONLY=0
 REMOTE_ACCESS_ONLY=0
 GRID_CANCEL_ONLY=0
 FOLDER_DND_ONLY=0
@@ -651,6 +660,8 @@ while [ $# -gt 0 ]; do
         --folder-dnd-only) FOLDER_DND_ONLY=1; only_mode "$1" no-examples; shift ;;
         --dnd-overview-only) DND_OVERVIEW_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --x11-iconic-only) X11_ICONIC_ONLY=1; only_mode "$1"; shift ;;
+        --protocols-only) PROTOCOLS_ONLY=1; only_mode "$1" no-media-source no-camera-policy; shift ;;
+        --sound-alerts-only) SOUND_ALERTS_ONLY=1; only_mode "$1"; shift ;;
         --remote-access-only) REMOTE_ACCESS_ONLY=1; only_mode "$1"; shift ;;
         --subsurface-only) SUBSURFACE_ONLY=1; only_mode "$1" source-build no-media-source no-examples no-camera-policy; shift ;;
         --display) DISPLAY_ARG="$2"; shift 2 ;;
@@ -864,6 +875,9 @@ GSD_MEDIA_KEYS_PID=""
 GSD_BUS_PID=""
 MPRIS_PID=""
 PW_PULSE_PID=""
+SOUND_ALERTS_WL_PID=""
+SOUND_ALERTS_X11_PID=""
+GSD_XSETTINGS_PID=""
 cleanup() {
     if [ -n "$ICON_PID" ]; then kill "$ICON_PID" 2>/dev/null || true; fi
     if [ -n "$HINTS_PID" ]; then kill "$HINTS_PID" 2>/dev/null || true; fi
@@ -882,7 +896,7 @@ cleanup() {
     if [ -n "$IME_PIDS" ]; then kill $IME_PIDS 2>/dev/null || true; fi
     if [ -n "$SCREENSAVER_PID" ]; then kill "$SCREENSAVER_PID" 2>/dev/null || true; fi
     if [ -n "$CAL_PID" ]; then kill "$CAL_PID" 2>/dev/null || true; fi
-    for gsd_pid in $GSD_MEDIA_KEYS_PID $MPRIS_PID $GSD_BUS_PID $PW_PULSE_PID; do
+    for gsd_pid in $GSD_MEDIA_KEYS_PID $MPRIS_PID $GSD_BUS_PID $PW_PULSE_PID $GSD_XSETTINGS_PID $SOUND_ALERTS_WL_PID $SOUND_ALERTS_X11_PID; do
         kill "$gsd_pid" 2>/dev/null || true
     done
     if [ -n "$ACCEL_PID" ]; then kill "$ACCEL_PID" 2>/dev/null || true; fi
@@ -1159,6 +1173,7 @@ pass G-GRID-ON-DEMAND "no grid tiles on the window picker or after close; a held
 . "$ROOT/scripts/lib/tuna-datemenu-proof.sh"
 . "$ROOT/scripts/lib/tuna-search-leak-proof.sh"
 . "$ROOT/scripts/lib/tuna-window-leak-proof.sh"
+. "$ROOT/scripts/lib/tuna-sound-alerts-proof.sh"
 . "$ROOT/scripts/lib/tuna-dnd-overview-proof.sh"
 
 folder_dnd_proof() {
@@ -1678,7 +1693,9 @@ if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
     if [ "$ONLY_NO_EXAMPLES" = 0 ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example icon-probe
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
+        cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example protocol-probe
     fi
+    cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example tuna-bell-client
     if [ "$SUBSURFACE_ONLY" = 1 ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example tuna-subsurface-client
     fi
@@ -2041,6 +2058,103 @@ x11_iconic_gate() {
     pass G-X11-ICONIC "Super+H, Hide and the client's own iconify make an X11 window IconicState with _NET_WM_STATE_HIDDEN; the overview and Alt+Tab make it NormalState without"
 }
 
+# The globals a client finds (P-SY-06, #89): wayland-info against this
+# session, compared with GNOME 51's capture. In the full proof this runs
+# after G-GL-WINDOW, so the renderer has reported its dmabuf formats.
+wayland_info_gate() {
+    if command -v wayland-info >/dev/null 2>&1; then
+        WAYLAND_DISPLAY="$SOCKET_NAME" wayland-info >"$ARTIFACTS/wayland-info.txt" 2>&1 ||
+            fail G-WAYLAND-INFO "wayland-info could not talk to the session"
+        "$PY" "$ROOT/scripts/tuna-wayland-info-compare" "$ARTIFACTS/wayland-info.txt" \
+            --report "$ARTIFACTS/wayland-info-compare.txt" ||
+            fail G-WAYLAND-INFO "globals short of GNOME 51's (see wayland-info-compare.txt)"
+        "$PY" "$ROOT/scripts/tuna-wayland-info-compare" "$ARTIFACTS/wayland-info.txt" \
+            --reference "$ROOT/tests/protocols/marlin-gnome51-globals.tsv" \
+            --report "$ARTIFACTS/wayland-info-marlin-compare.txt" ||
+            fail G-WAYLAND-INFO "globals short of native Marlin GNOME 51's recorded expectations"
+        pass G-WAYLAND-INFO "headless and native Marlin GNOME 51 comparisons satisfy version floors, with gaps recorded"
+    elif [ "${TUNA_REQUIRE_WAYLAND_INFO:-0}" = 1 ]; then
+        fail G-WAYLAND-INFO "wayland-info is required (TUNA_REQUIRE_WAYLAND_INFO=1) but not installed"
+    else
+        echo "tuna-gtk-shell-proof: G-WAYLAND-INFO skipped (no wayland-info)"
+    fi
+}
+
+# Mutter 51's protocols (#364, #588), each driven by a real client of this
+# session: crates/compositor/examples/protocol-probe.rs exits nonzero with
+# a FAIL line when the session answers otherwise than Mutter 51 does.
+protocol_probe() {
+    WAYLAND_DISPLAY="$SOCKET_NAME" timeout 60 "$COMPANIONS/protocol-probe" "$2" --state "$CSTATE" \
+        >"$ARTIFACTS/protocol-$2.log" 2>&1 || {
+        probe_why="$(grep -m1 '^FAIL' "$ARTIFACTS/protocol-$2.log")"
+        fail "$1" "${probe_why:-protocol-probe $2 exited without a verdict}"
+    }
+}
+background_blur_gate() {
+    blur_log="$ARTIFACTS/protocol-background-blur.log"
+    WAYLAND_DISPLAY="$SOCKET_NAME" "$COMPANIONS/protocol-probe" background-blur --state "$CSTATE" \
+        >"$blur_log" 2>&1 &
+    BLUR_PID=$!
+    blur_end=$(($(date +%s) + 30))
+    until grep -qx ready "$blur_log"; do
+        if ! kill -0 "$BLUR_PID" 2>/dev/null || [ "$(date +%s)" -gt "$blur_end" ]; then
+            kill "$BLUR_PID" 2>/dev/null || true
+            blur_why="$(grep -m1 '^FAIL' "$blur_log")"
+            fail G-BACKGROUND-BLUR "${blur_why:-the probe never mapped its windows}"
+        fi
+        sleep 0.3
+    done
+    # The clear window is focused, so it is drawn above the stripes.
+    cstate '.focused == ([.windows[] | select(.app_id == "tuna-probe-blur-frost") | .id][0])' "blurred window focused" ||
+        fail G-BACKGROUND-BLUR "the clear window never took focus"
+    sleep 1
+    scrot "$ARTIFACTS/background-blur.png" >/dev/null
+    blur_rects="$(jq -r '[(.windows[] | select(.app_id == "tuna-probe-blur-frost") | .rect[]), (.windows[] | select(.app_id == "tuna-probe-blur-stripes") | .rect[])] | map(tostring) | join(" ")' "$CSTATE")"
+    kill "$BLUR_PID" 2>/dev/null || true
+    # Mean step between neighbouring pixels: one-pixel black and white
+    # stripes step by about 255, Mutter's blur (radius 24) smooths them
+    # flat. Inside the clear window, away from its edges, the stripes
+    # must be blurred; beside it they must still be sharp.
+    # shellcheck disable=SC2086
+    blur_steps="$("$PY" - "$ARTIFACTS/background-blur.png" $blur_rects <<'BLUR'
+import subprocess, sys
+png = sys.argv[1]
+fx, fy, fw, fh, sx, sy, sw, sh = map(int, sys.argv[2:10])
+def step(x, y, w, h):
+    raw = subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-i", png, "-vf", f"crop={w}:{h}:{x}:{y}",
+         "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        check=True, capture_output=True).stdout
+    steps = [abs(raw[r * w + c + 1] - raw[r * w + c]) for r in range(h) for c in range(w - 1)]
+    return sum(steps) / len(steps)
+inset = 40
+inside = step(fx + inset, fy + inset, fw - 2 * inset, fh - 2 * inset)
+left, right = fx - sx, sx + sw - (fx + fw)
+if max(left, right) < 3 * inset:
+    sys.exit(f"no room beside the clear window: {left} and {right} px")
+bx = sx + inset if left >= right else fx + fw + inset
+beside = step(bx, fy + inset, inset, fh - 2 * inset)
+print(f"{inside:.1f} {beside:.1f}")
+BLUR
+)" || fail G-BACKGROUND-BLUR "could not sample the screenshot: $blur_steps"
+    # shellcheck disable=SC2086
+    set -- $blur_steps
+    "$PY" -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 16 and float(sys.argv[2]) > 128 else 1)' "$1" "$2" ||
+        fail G-BACKGROUND-BLUR "mean pixel step $1 inside the blur region (want < 16), $2 beside it (want > 128)"
+    cstate '(.windows | any(.app_id == "tuna-probe-blur-frost" or .app_id == "tuna-probe-blur-stripes")) | not' "blur probe windows gone" ||
+        fail G-BACKGROUND-BLUR "the probe's windows outlived it"
+    pass G-BACKGROUND-BLUR "ext_background_effect_manager_v1 offers blur and a blur region smooths one-pixel stripes behind a clear window (mean step $1) while beside it they stay sharp ($2)"
+}
+protocol_gaps_gates() {
+    protocol_probe G-XDG-WM-BASE-7 xdg-wm-base-7
+    pass G-XDG-WM-BASE-7 "xdg_wm_base 7: a maximized window is tiled and constrained on every edge; a version 6 bind gets the tiled states alone"
+    protocol_probe G-XDG-FOREIGN-V1 xdg-foreign-v1
+    pass G-XDG-FOREIGN-V1 "a GTK 3 zxdg_exporter_v1 handle imported through zxdg_importer_v2 parents the dialog; revoking the export destroys the import and unparents; v2 export imports through v1; an unknown v1 handle is destroyed"
+    protocol_probe G-WL-FIXES wl-fixes
+    pass G-WL-FIXES "wl_fixes 1 destroys a registry and the client's connection carries on"
+    background_blur_gate
+}
+
 # G-SUBSURFACE-STACKING: a window's subsurfaces stack where the client
 # placed them (wl_subsurface.place_above / place_below), as Mutter draws
 # them. tuna-subsurface-client's red 400x300 window has a green
@@ -2311,6 +2425,16 @@ if [ "$X11_ICONIC_ONLY" = 1 ]; then
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     exit 0
 fi
+if [ "$PROTOCOLS_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "protocols desktop ready" ||
+        fail G-WAYLAND-INFO "desktop never became ready"
+    # Let the startup cover settle before the first window.
+    sleep 3
+    wayland_info_gate
+    protocol_gaps_gates
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    exit 0
+fi
 if [ "$SUBSURFACE_ONLY" = 1 ]; then
     cstate '.active_workspace != null and .locked == false' "subsurface desktop ready" ||
         fail G-SUBSURFACE-STACKING "desktop never became ready"
@@ -2377,6 +2501,14 @@ if [ "$LOCK_MENU_ONLY" = 1 ]; then
     lock_with_menu_gate
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
+    exit 0
+fi
+if [ "$SOUND_ALERTS_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "sound alerts desktop ready" ||
+        fail G-VISUAL-BELL "desktop never became ready"
+    # The startup cover must be gone before pixels are compared.
+    sleep 3
+    sound_alerts_proof
     exit 0
 fi
 if [ "$SCREENSHOT_KEYS_ONLY" = 1 ]; then
@@ -5933,25 +6065,7 @@ if [ "$1" -lt 150 ] || [ "$2" -gt 80 ] || [ "$3" -gt 80 ]; then
 fi
 pass G-GL-WINDOW "a GL-rendered GTK window maps and paints"
 
-# The globals a client finds (P-SY-06, #89): wayland-info against this
-# session, compared with GNOME 51's capture. Here, after G-GL-WINDOW,
-# the renderer has reported its formats, so linux-dmabuf is advertised.
-if command -v wayland-info >/dev/null 2>&1; then
-    WAYLAND_DISPLAY="$SOCKET_NAME" wayland-info >"$ARTIFACTS/wayland-info.txt" 2>&1 ||
-        fail G-WAYLAND-INFO "wayland-info could not talk to the session"
-    "$PY" "$ROOT/scripts/tuna-wayland-info-compare" "$ARTIFACTS/wayland-info.txt" \
-        --report "$ARTIFACTS/wayland-info-compare.txt" ||
-        fail G-WAYLAND-INFO "globals short of GNOME 51's (see wayland-info-compare.txt)"
-    "$PY" "$ROOT/scripts/tuna-wayland-info-compare" "$ARTIFACTS/wayland-info.txt" \
-        --reference "$ROOT/tests/protocols/marlin-gnome51-globals.tsv" \
-        --report "$ARTIFACTS/wayland-info-marlin-compare.txt" ||
-        fail G-WAYLAND-INFO "globals short of native Marlin GNOME 51's recorded expectations"
-    pass G-WAYLAND-INFO "headless and native Marlin GNOME 51 comparisons satisfy version floors, with gaps recorded"
-elif [ "${TUNA_REQUIRE_WAYLAND_INFO:-0}" = 1 ]; then
-    fail G-WAYLAND-INFO "wayland-info is required (TUNA_REQUIRE_WAYLAND_INFO=1) but not installed"
-else
-    echo "tuna-gtk-shell-proof: G-WAYLAND-INFO skipped (no wayland-info)"
-fi
+wayland_info_gate
 
 # X11 by default (#59/#219): the shell advertises reserved sockets; the
 # first real X11 connection starts the server and maps that queued client.
@@ -13517,6 +13631,9 @@ for scenario in allow remembered-allow deny remembered-deny unknown; do
 done
 jq -e '."tuna-consent-allow.desktop" == ["GRANTED"] and ."tuna-consent-deny.desktop" == ["DENIED"] and (has("tuna-consent-unknown.desktop") | not)' "$ARTIFACTS/shortcut-permissions.json" >/dev/null || fail G-SHORTCUT-CONSENT "PermissionStore did not remember exactly the known apps"
 pass G-SHORTCUT-CONSENT "live requests require Allow, Deny stays inactive, known app decisions persist without prompting, unknown apps are not remembered, Super+Escape restores input"
+
+# Bells, input-feedback-sounds and the slider's feedback (#353).
+sound_alerts_proof
 
 # Every transient animation (#501) that ran with animations on played
 # for its full GNOME duration and settled: the OSD and its level, the
