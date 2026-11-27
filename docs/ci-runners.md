@@ -14,7 +14,7 @@ v4), `gh` logged in as an org admin, and `ssh karnataka` with sudo.
 | Piece | Where | What |
 | --- | --- | --- |
 | ARC controller | namespace `arc-systems`, Helm release `arc` | `gha-runner-scale-set-controller` chart; watches only `tuna-ci` |
-| Scale set `tuna-ci-24.04` | namespace `tuna-ci`, release `tuna-ci-24-04` | [values](../.github/runners/values-24.04.yaml); jobs that use `ubuntu-latest` on GitHub |
+| Scale set `tuna-ci-24.04` | namespace `tuna-ci`, release `tuna-ci-24-04` | [values](../.github/runners/values-24.04.yaml); jobs that use `ubuntu-24.04` on GitHub |
 | Scale set `tuna-ci-26.04` | namespace `tuna-ci`, release `tuna-ci-26-04` | [values](../.github/runners/values-26.04.yaml); jobs that use `ubuntu-26.04` on GitHub |
 | Runner image | node-local containerd, `localhost/tuna-ci-runner:<ubuntu>-<runner>-<stamp>` | [Containerfile](../.github/runners/image/Containerfile), built by [build-image](../.github/runners/build-image) |
 | Guard rails | [cluster.yaml](../.github/runners/cluster.yaml) | namespace, admission policy, NetworkPolicy, quota, priority class |
@@ -684,7 +684,7 @@ gh variable set CI_RUNNERS -b hosted -R tuna-os/tuna-desktop
 ```
 
 Every job evaluated afterwards uses its original GitHub-hosted label
-(`ubuntu-latest` / `ubuntu-26.04`); assertions are identical on both.
+(`ubuntu-24.04` / `ubuntu-26.04`); assertions are identical on both.
 Re-run queued runs as in [Drain](#drain-maintenance-on-karnataka).
 `gh variable delete CI_RUNNERS -R tuna-os/tuna-desktop` switches back.
 
@@ -715,7 +715,7 @@ ssh karnataka 'sudo k3s ctr -n k8s.io images ls -q | grep tuna-ci-runner | xargs
 ```
 
 and replace the `*runner-24` / `*runner-26` aliases and anchors in `ci.yml`
-with `ubuntu-latest` / `ubuntu-26.04`.
+with `ubuntu-24.04` / `ubuntu-26.04`.
 
 ## Caches
 

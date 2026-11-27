@@ -248,9 +248,12 @@ impl ProtocolVersion {
     /// `status/remoteAccess.js` over mutter's `MetaRemoteAccessHandle`s):
     /// compositor-to-shell `RemoteAccess` and the shell-to-compositor
     /// `StopRemoteAccess` (#1162 F2). Positional postcard peers must ship together.
+    /// `0.55` appends the shell-to-compositor `WakeUpScreen` command (a
+    /// notification wakes the locked, blanked screen, #348). Positional
+    /// postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 54,
+        minor: 55,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -565,6 +568,13 @@ pub enum CommandKind {
     /// anew. Denied for a grant the compositor does not publish (already
     /// gone, or never active).
     StopRemoteAccess { kind: RemoteAccessKind, id: u64 },
+    /// Since 0.55: a notification reached the lock screen's list
+    /// (unlockDialog.js `_wakeUpScreenForSource`): undo the idle shield's
+    /// fade as screenShield.js `_wakeUpScreen` turns its lightbox off,
+    /// without counting as user activity and without unlocking. Denied
+    /// while the session is unlocked (`_wakeUpScreen` returns unless the
+    /// shield is active).
+    WakeUpScreen,
 }
 
 /// Since 0.54: what a remote access grant is: the subclass of mutter 51's
@@ -2796,11 +2806,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_54() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 54));
-        // A 0.53 shell still negotiates; a newer minor does not.
-        assert!(ProtocolVersion::new(0, 53).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 55).is_compatible_with(&CURRENT_VERSION));
+    fn current_version_is_0_55() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 55));
+        // A 0.54 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 54).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 56).is_compatible_with(&CURRENT_VERSION));
     }
 
     fn remote_access_handle(targets: Vec<RemoteAccessTarget>) -> RemoteAccessHandle {
@@ -4280,6 +4290,24 @@ mod tablet_osd_wire_order_tests {
         );
         let bytes = postcard::to_slice(&touch, &mut buffer).unwrap();
         assert_eq!(postcard::from_bytes::<Message>(bytes).unwrap(), touch);
+    }
+
+    #[test]
+    fn wake_up_screen_follows_the_0_54_stop_remote_access() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 64];
+        let stop = tag(postcard::to_slice(
+            &CommandKind::StopRemoteAccess {
+                kind: RemoteAccessKind::ScreenCast,
+                id: 12,
+            },
+            &mut buffer,
+        )
+        .unwrap());
+        let wake = postcard::to_slice(&CommandKind::WakeUpScreen, &mut buffer).unwrap();
+        assert_eq!(wake, [stop + 1]);
+        let back: CommandKind = postcard::from_bytes(&[stop + 1]).unwrap();
+        assert_eq!(back, CommandKind::WakeUpScreen);
     }
 }
 

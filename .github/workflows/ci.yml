@@ -105,12 +105,14 @@ jobs:
     timeout-minutes: 45
     # Runner choice (docs/ci-runners.md): this repository's own pushes,
     # schedules, dispatches and branch pull requests run on the self-hosted
-    # karnataka scale sets; fork pull requests, and every job while the
-    # CI_RUNNERS repository variable is `hosted`, use GitHub-hosted runners.
-    # A merge group's two jobs (check, gtk-shell-smoke) use GitHub-hosted
-    # ubuntu-24.04, so the queue never waits behind pull request runs for a
-    # self-hosted slot.
-    runs-on: &runner-24 ${{ vars.CI_RUNNERS != 'hosted' && github.event_name != 'merge_group' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-24.04' || github.event_name == 'merge_group' && 'ubuntu-24.04' || 'ubuntu-latest' }}
+    # karnataka scale sets. Everything else uses GitHub-hosted ubuntu-24.04,
+    # the OS of tuna-ci-24.04 (ubuntu-latest became 26.04, where pinned
+    # 24.04 dependencies such as the GTK AT-SPI regression build refuse to
+    # run): fork pull requests, every job while the CI_RUNNERS repository
+    # variable is `hosted`, and a merge group's two jobs (check,
+    # gtk-shell-smoke), so the queue never waits behind pull request runs
+    # for a self-hosted slot.
+    runs-on: &runner-24 ${{ vars.CI_RUNNERS != 'hosted' && github.event_name != 'merge_group' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-24.04' || 'ubuntu-24.04' }}
     permissions:
       contents: read
       actions: read
