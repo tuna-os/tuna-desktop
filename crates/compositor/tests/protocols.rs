@@ -1309,3 +1309,49 @@ fn content_type_hint_is_recorded_per_surface_on_commit() {
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(surface_content_type(&mapped), Type::Video);
 }
+
+/// #1193, mutter 51 `token_commit` / `maybe_activate`: a minted
+/// activation token is a pending startup sequence (the busy cursor) until
+/// a window activates with it; one that never does times out after
+/// `STARTUP_TIMEOUT_MS`. A refused mint starts nothing.
+#[test]
+fn activation_tokens_are_startup_sequences_until_used() {
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    let mut peer = connect(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let first = window(&mut peer, "first");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let _second = window(&mut peer, "second");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let _refused = mint(&mut peer, false);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(
+        !comp.state.startup.pending(Instant::now()),
+        "no serial, no sequence"
+    );
+    peer.client.token = None;
+    let _token = mint(&mut peer, true);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let token = peer.client.token.take().expect("token issued");
+    assert!(
+        comp.state.startup.pending(Instant::now()),
+        "busy while pending"
+    );
+    assert!(
+        !comp.state.startup.pending(
+            Instant::now() + tuna_compositor::startup::STARTUP_TIMEOUT + Duration::from_millis(1)
+        ),
+        "a sequence never used times out"
+    );
+    peer.client
+        .activation
+        .as_ref()
+        .unwrap()
+        .activate(token, &first);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(
+        !comp.state.startup.pending(Instant::now()),
+        "used: complete"
+    );
+}

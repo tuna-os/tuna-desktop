@@ -29,13 +29,22 @@ pub const MAX_ICON_PX: u32 = 256;
 /// Base icon directories in lookup order: user dir, system dirs,
 /// then the legacy pixmaps catch-all.
 pub fn theme_dirs() -> Vec<PathBuf> {
+    #[cfg(test)]
+    if let Some(dirs) = test_dirs::current() {
+        return dirs;
+    }
+    theme_dirs_from(|key| std::env::var_os(key))
+}
+
+/// [`theme_dirs`] over an explicit environment lookup.
+fn theme_dirs_from(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+    if let Some(home) = var("XDG_DATA_HOME").map(PathBuf::from) {
         dirs.push(home.join("icons"));
-    } else if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    } else if let Some(home) = var("HOME").map(PathBuf::from) {
         dirs.push(home.join(".local/share/icons"));
     }
-    let data_dirs = std::env::var_os("XDG_DATA_DIRS")
+    let data_dirs = var("XDG_DATA_DIRS")
         .map(|dirs| {
             std::env::split_paths(&dirs)
                 .map(|dir| dir.join("icons"))
@@ -50,6 +59,49 @@ pub fn theme_dirs() -> Vec<PathBuf> {
     dirs.extend(data_dirs);
     dirs.push(PathBuf::from("/usr/share/pixmaps"));
     dirs
+}
+
+/// Icon base directories for test fixtures, per thread. Tests share
+/// one process, and others spawn children (bus and portal daemons,
+/// apps) that inherit its environment: a fixture that pointed
+/// `XDG_DATA_DIRS` or `HOME` at a temporary tree would hand those
+/// children a session with no schemas or service files. Fixtures
+/// install an override here instead and leave the environment alone.
+#[cfg(test)]
+pub(crate) mod test_dirs {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static DIRS: RefCell<Option<Vec<PathBuf>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn current() -> Option<Vec<PathBuf>> {
+        DIRS.with(|dirs| dirs.borrow().clone())
+    }
+
+    /// Lookup on this thread as in a session whose data home is
+    /// `root` and whose system data dirs are empty; cleared on drop.
+    pub(crate) struct Fixture;
+
+    impl Fixture {
+        pub(crate) fn install(root: &Path) -> Self {
+            let dirs = super::theme_dirs_from(|key| match key {
+                "XDG_DATA_HOME" => Some(root.into()),
+                "XDG_DATA_DIRS" => Some(root.join("empty-dirs").into()),
+                "HOME" => Some(root.join("home").into()),
+                _ => None,
+            });
+            DIRS.with(|current| *current.borrow_mut() = Some(dirs));
+            Self
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            DIRS.with(|current| *current.borrow_mut() = None);
+        }
+    }
 }
 
 /// Find the best file for `name` at `size` px under `theme`,
@@ -260,11 +312,7 @@ pub fn retint(art: &Artwork, color: [u8; 4]) -> Artwork {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::Mutex;
 
-    /// Env mutation is process-global while Rust runs tests in
-    /// parallel threads, so every env-touching test holds this.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
     /// Unlikely stems so `/usr/share/pixmaps` (always on the lookup
     /// path) can never shadow the fixture.
     const TOOL: &str = "tuna-icontool";
@@ -272,40 +320,9 @@ mod tests {
     const OTHER: &str = "tuna-iconother";
     const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="#ff0000"/></svg>"##;
 
-    struct EnvRestore {
-        data_home: Option<OsString>,
-        data_dirs: Option<OsString>,
-        home: Option<OsString>,
-    }
-
-    impl EnvRestore {
-        /// Point the resolver at `tmp`, away from real system dirs.
-        fn install(tmp: &tempfile::TempDir) -> EnvRestore {
-            let prev = EnvRestore {
-                data_home: std::env::var_os("XDG_DATA_HOME"),
-                data_dirs: std::env::var_os("XDG_DATA_DIRS"),
-                home: std::env::var_os("HOME"),
-            };
-            std::env::set_var("XDG_DATA_HOME", tmp.path());
-            std::env::set_var("XDG_DATA_DIRS", tmp.path().join("empty-dirs"));
-            std::env::set_var("HOME", tmp.path().join("home"));
-            prev
-        }
-
-        fn restore(key: &str, value: &Option<OsString>) {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            EnvRestore::restore("XDG_DATA_HOME", &self.data_home);
-            EnvRestore::restore("XDG_DATA_DIRS", &self.data_dirs);
-            EnvRestore::restore("HOME", &self.home);
-        }
+    /// Point lookup on this thread at `tmp`, away from real system dirs.
+    fn install(tmp: &tempfile::TempDir) -> test_dirs::Fixture {
+        test_dirs::Fixture::install(tmp.path())
     }
 
     fn write_png(path: &std::path::Path, size: u32, pixel: [u8; 4]) {
@@ -322,8 +339,7 @@ mod tests {
         std::fs::write(path, bytes).expect("write fixture");
     }
 
-    /// `<tmp>/icons/{Test,hicolor}` tree; caller holds `ENV_LOCK`
-    /// and installs `EnvRestore` over the result.
+    /// `<tmp>/icons/{Test,hicolor}` tree; callers [`install`] it.
     fn fixture() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");
         let icons = tmp.path().join("icons");
@@ -361,9 +377,8 @@ mod tests {
 
     #[test]
     fn exact_size_raster_wins() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
         let tmp = fixture();
-        let _env = EnvRestore::install(&tmp);
+        let _dirs = install(&tmp);
         let found16 = find_icon("Test", TOOL, 16).expect("16px icon");
         assert!(
             found16.ends_with(format!("16x16/apps/{TOOL}.png")),
@@ -378,9 +393,8 @@ mod tests {
 
     #[test]
     fn any_raster_beats_scalable_without_exact_match() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
         let tmp = fixture();
-        let _env = EnvRestore::install(&tmp);
+        let _dirs = install(&tmp);
         // No 24x24 dir exists, but rasters do: any raster must win
         // over the scalable vector, not the svg.
         let found = find_icon("Test", TOOL, 24).expect("24px icon");
@@ -395,18 +409,16 @@ mod tests {
 
     #[test]
     fn svg_only_name_resolves_to_svg() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
         let tmp = fixture();
-        let _env = EnvRestore::install(&tmp);
+        let _dirs = install(&tmp);
         let found = find_icon("Test", VEC, 48).expect("svg icon");
         assert_eq!(ext(&found), "svg", "got {found:?}");
     }
 
     #[test]
     fn absolute_path_bypasses_lookup() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
         let tmp = fixture();
-        let _env = EnvRestore::install(&tmp);
+        let _dirs = install(&tmp);
         let real = tmp
             .path()
             .join("icons/Test/16x16/apps")
@@ -420,9 +432,8 @@ mod tests {
 
     #[test]
     fn slash_null_and_missing_names_return_none() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
         let tmp = fixture();
-        let _env = EnvRestore::install(&tmp);
+        let _dirs = install(&tmp);
         assert_eq!(find_icon("Test", "apps/tool", 16), None);
         assert_eq!(find_icon("Test", "tool\0x", 16), None);
         assert_eq!(find_icon("Test", "no-such-tuna-icon", 16), None);
@@ -475,9 +486,8 @@ mod tests {
 
     #[test]
     fn resolve_end_to_end() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
         let tmp = fixture();
-        let _env = EnvRestore::install(&tmp);
+        let _dirs = install(&tmp);
         let art = resolve("Test", TOOL, 16).expect("resolve");
         assert_eq!(art.size, 16);
         assert_eq!(art.argb.len(), 16 * 16 * 4);
@@ -488,6 +498,56 @@ mod tests {
         assert_eq!(other.argb.len(), 48 * 48 * 4);
         assert_eq!(&other.argb[..4], &[255, 0, 0, 255]);
         assert_eq!(resolve("Test", "no-such-tuna-icon", 16), None);
+    }
+
+    #[test]
+    fn theme_dirs_read_data_home_then_home_then_data_dirs() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        let dirs = |paths: &[&str]| paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(
+            theme_dirs_from(env(&[
+                ("XDG_DATA_HOME", "/d"),
+                ("HOME", "/h"),
+                ("XDG_DATA_DIRS", "/a:/b"),
+            ])),
+            dirs(&["/d/icons", "/a/icons", "/b/icons", "/usr/share/pixmaps"])
+        );
+        assert_eq!(
+            theme_dirs_from(env(&[("HOME", "/h")])),
+            dirs(&[
+                "/h/.local/share/icons",
+                "/usr/local/share/icons",
+                "/usr/share/icons",
+                "/usr/share/pixmaps",
+            ])
+        );
+    }
+
+    /// Fixtures redirect lookup without touching the process
+    /// environment other tests' children inherit, and only on the
+    /// installing thread.
+    #[test]
+    fn fixture_dirs_leave_the_process_environment_alone() {
+        let keys = ["XDG_DATA_HOME", "XDG_DATA_DIRS", "HOME"];
+        let before = keys.map(std::env::var_os);
+        let tmp = fixture();
+        let dirs = install(&tmp);
+        assert_eq!(keys.map(std::env::var_os), before);
+        assert_eq!(theme_dirs()[0], tmp.path().join("icons"));
+        assert!(find_icon("Test", TOOL, 16).is_some());
+        let elsewhere = std::thread::spawn(theme_dirs)
+            .join()
+            .expect("lookup thread");
+        assert!(!elsewhere.contains(&tmp.path().join("icons")));
+        drop(dirs);
+        assert!(!theme_dirs().contains(&tmp.path().join("icons")));
     }
 
     #[test]

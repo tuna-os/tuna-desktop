@@ -48,6 +48,7 @@ use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size};
 use crate::windows::ManagerInput;
 
 pub mod color;
+pub mod input_drain;
 pub mod lease;
 pub mod libinput;
 pub mod libwacom;
@@ -281,6 +282,9 @@ pub struct DrmBackend {
     pub outputs: Vec<DrmOutput>,
     /// libinput context, suspended while the session is paused.
     pub libinput: Libinput,
+    /// Drains libinput's queue on the next dispatch: what `resume` queued
+    /// (the devices present again) does not make its fd readable.
+    input_drain: calloop::ping::Ping,
     /// Whether the session currently owns the VT.
     pub active: bool,
     sleep_reset_pending: bool,
@@ -339,8 +343,9 @@ pub struct DrmSources {
     pub session: LibSeatSessionNotifier,
     /// VBlank and device errors.
     pub drm: DrmDeviceNotifier,
-    /// Input events.
-    pub input: LibinputInputBackend,
+    /// Input events; drains what libinput queued for the devices already
+    /// present on the loop's first dispatch.
+    pub input: input_drain::Draining<input_drain::LibinputSource>,
     /// DRM device `change` uevents (privacy screen hw-state, #356);
     /// `None` when udev cannot be monitored.
     pub udev: Option<smithay::backend::udev::UdevBackend>,
@@ -713,13 +718,20 @@ impl DrmBackend {
         libinput
             .udev_assign_seat(&seat)
             .map_err(|()| DrmInitError(format!("libinput: cannot assign seat {seat}")))?;
-        let input = LibinputInputBackend::new(libinput.clone());
+        // The devices already present are queued now, without making the
+        // fd readable: the draining source hands them over on the loop's
+        // first dispatch instead of at the first later input (Mutter's
+        // seat processes its events right after assigning it).
+        let (input, input_drain) =
+            input_drain::Draining::new(input_drain::LibinputSource::new(libinput.clone()))
+                .map_err(|e| DrmInitError(format!("libinput: drain ping: {e}")))?;
         let mut backend = Self {
             session,
             drm,
             renderer,
             outputs,
             libinput,
+            input_drain,
             active: true,
             sleep_reset_pending: false,
             powered_off: false,
@@ -1230,18 +1242,24 @@ impl DrmBackend {
     }
 
     /// The monitors Mutter's colour manager registers with colord: every
-    /// connector with its EDID identity and CRTC gamma size; the first
-    /// output is primary.
+    /// connector with its EDID identity and CRTC gamma size. The primary
+    /// is the primary leader (`meta_monitor_is_primary`), the first lit
+    /// leader as in [`Self::display_state`], not whichever output is
+    /// first: a switched-off or mirroring output is never primary.
     pub fn colord_monitors(&self) -> Vec<crate::color_manager::ColordMonitor> {
         let atomic = self.drm.is_atomic();
+        let primary = self
+            .outputs
+            .iter()
+            .find(|o| o.is_leader())
+            .map(|o| o.name.as_str());
         self.outputs
             .iter()
-            .enumerate()
-            .map(|(i, out)| crate::color_manager::ColordMonitor {
+            .map(|out| crate::color_manager::ColordMonitor {
                 identity: crate::edid::MonitorIdentity::new(
                     &out.name,
                     out.edid.as_deref(),
-                    i == 0,
+                    primary == Some(out.name.as_str()),
                     out.size_mm,
                     color::pnp_vendor_name,
                 ),
@@ -1381,6 +1399,9 @@ impl DrmBackend {
                 if self.libinput.resume().is_err() {
                     eprintln!("tuna-compositor: drm: libinput resume failed");
                 }
+                // resume re-adds every device without making the fd
+                // readable; take them on the next dispatch.
+                self.input_drain.ping();
                 // Display power saving (#355) keeps every CRTC off across
                 // a VT switch: the next owner may have lit them.
                 if let Err(e) = self.drm.activate(self.outputs_disabled) {
@@ -1601,7 +1622,11 @@ impl DrmBackend {
                     self.input_settings.right_to_left,
                     self.active && self.hot_corner_active && self.input_settings.hot_corners,
                 );
-                self.pointer = clamp_to_outputs(attempt, &rects);
+                // No output to move on: the pointer stays where it was
+                // instead of wandering off into space no output covers.
+                if !rects.is_empty() {
+                    self.pointer = clamp_to_outputs(attempt, &rects);
+                }
                 let mut inputs = vec![
                     ManagerInput::Motion {
                         pos: self.pointer,
@@ -1722,6 +1747,12 @@ impl DrmBackend {
             }
             other => {
                 let mut inputs = crate::windows::translate_input(other, self.primary_size());
+                // An absolute device (touchscreen, tablet in mouse mode)
+                // maps onto an output: with none lit there is nowhere to
+                // point, so the pointer holds as for relative motion.
+                if self.output_rects().is_empty() {
+                    inputs.retain(|input| !matches!(input, ManagerInput::Motion { .. }));
+                }
                 // Rotation (#345): absolute devices report panel-native
                 // pixels; remap them into the rotated logical frame the
                 // manager works in. Touch and absolute pointers arrive
