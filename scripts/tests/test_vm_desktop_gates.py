@@ -179,11 +179,94 @@ class Minimize(unittest.TestCase):
             with self.subTest(name):
                 self.assertTrue(gates.target_problems(samples, self.CORNER, "corner"))
 
-    def test_dash_on_screen_goes_to_its_icon(self):
-        self.assertEqual(gates.target_problems(self.watch()["samples"], self.ICON, "icon"), [])
-        for name, icon in {"corner despite the dash": self.CORNER, "another icon": [100, 740, 48, 48]}.items():
+    def instant(self, **scene_extra):
+        watch = self.watch(samples=0, history=())
+        watch["scene"].update({"overview_open": True, **scene_extra})
+        return watch
+
+    def test_overview_open_minimizes_at_once_without_a_frame(self):
+        # windowManager.js 51.1 _shouldAnimate() is false while the overview is
+        # open: _minimizeWindow calls completed_minimize, nothing is drawn.
+        self.assertEqual(gates.instant_problems(self.instant(), 7), [])
+        animated = self.watch()
+        animated["scene"]["overview_open"] = True
+        cases = {
+            # What the gate asked for before: 400 ms toward the dash icon.
+            "animated toward the dash icon": animated,
+            "frames drawn": {**self.instant(), "samples": self.watch()["samples"]},
+            "started": {**self.instant(), "scene": {**self.instant()["scene"], "window_lifecycle": {
+                "history": [{"window": 7, "effect": "minimize", "outcome": "started-live", "at_ms": 2000}]}}},
+            "still running": self.instant(window_lifecycle={"minimizing": [{"window": 7}], "history": []}),
+            "overview closed": self.instant(overview_open=False),
+            "still shown": self.instant(minimized=[]),
+        }
+        for name, watch in cases.items():
             with self.subTest(name):
-                self.assertTrue(gates.target_problems(self.watch(icon=icon)["samples"], self.ICON, "icon"))
+                self.assertTrue(gates.instant_problems(watch, 7))
+        # An earlier animated minimize of the window (before the baseline) is not this one.
+        self.assertEqual(gates.instant_problems(self.instant(window_lifecycle={"history": [
+            {"window": 7, "effect": "minimize", "outcome": "started-live", "at_ms": 900}]}), 7), [])
+
+
+class FakeQmp:
+    def __init__(self, on_keys):
+        self.on_keys, self.pressed = on_keys, []
+
+    def keys(self, *names):
+        self.pressed.append(names)
+        self.on_keys(names)
+
+
+class Settle(unittest.TestCase):
+    MAIN = {"app_id": "org.tuna.VmGates.nk.main"}
+    BYSTANDER = {"app_id": "org.tuna.VmGates.nk.bystander"}
+
+    def desktop(self, overview, minimized):
+        windows = [{"id": 11, "app_id": self.MAIN["app_id"]}, {"id": 10, "app_id": self.BYSTANDER["app_id"]}]
+        return {"fixtures": {"main": self.MAIN, "bystander": self.BYSTANDER},
+                "scene": scene(windows=windows, overview_open=overview, minimized=minimized)}
+
+    def gates_on(self, desktop, out):
+        """Gates whose guest state follows the keys the fake QMP receives."""
+        state = {"value": desktop}
+
+        def on_keys(names):
+            scene_ = state["value"]["scene"]
+            if names == ("esc",):
+                state["value"] = self.desktop(False, scene_["minimized"])
+            elif names == ("alt", "tab"):
+                state["value"] = self.desktop(scene_["overview_open"], scene_["minimized"][1:])
+        agent = FakeAgent({"gates-state": lambda *_: state["value"]})
+        g = gates.Gates(FakeQmp(on_keys), agent, out, lambda *a: None, read_ppm=None)
+        return g, state
+
+    def test_a_failed_gate_leaves_the_overview_closed_and_the_window_restored(self):
+        with tempfile.TemporaryDirectory() as out:
+            g, state = self.gates_on(self.desktop(True, [11]), out)
+            records = {}
+            g.record = lambda name, ok, detail: records.__setitem__(name, ok)
+
+            def stops_mid_overview():
+                raise gates.GateError("no minimize started")
+            self.assertFalse(g.gate("V-MINIMIZE-ANIMATION", stops_mid_overview))
+            self.assertEqual(records, {"V-MINIMIZE-ANIMATION": False})
+            self.assertEqual(g.qmp.pressed, [("esc",), ("alt", "tab")])
+            self.assertFalse(state["value"]["scene"]["overview_open"])
+            self.assertEqual(state["value"]["scene"]["minimized"], [])
+
+    def test_a_settled_desktop_gets_no_input(self):
+        with tempfile.TemporaryDirectory() as out:
+            g, _ = self.gates_on(self.desktop(False, []), out)
+            self.assertTrue(g.gate("V-CURSOR", lambda: "ok"))
+            self.assertEqual(g.qmp.pressed, [])
+
+    def test_settle_never_raises_and_logs_what_it_could_not_do(self):
+        with tempfile.TemporaryDirectory() as out:
+            g = gates.Gates(FakeQmp(lambda names: None), FakeAgent({"gates-state": {"gates_error": "gone"}}),
+                            out, lambda *a: None, read_ppm=None)
+            g.settle()
+            self.assertEqual(g.log[-1]["action"], "settle")
+            self.assertIn("gone", g.log[-1]["error"])
 
 
 class Pixels(unittest.TestCase):
