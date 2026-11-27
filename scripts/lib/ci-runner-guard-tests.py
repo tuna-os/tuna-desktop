@@ -74,6 +74,10 @@ class RunsOnExpression(unittest.TestCase):
         for name, expression in expressions().items():
             hosted = 'ubuntu-latest' if name == 'runner-24' else 'ubuntu-26.04'
             own = 'tuna-ci-24.04' if name == 'runner-24' else 'tuna-ci-26.04'
+            # A merge group's runner-24 jobs (check, gtk-shell-smoke) never
+            # wait for a self-hosted slot; runner-26 jobs do not run in one.
+            group = 'ubuntu-24.04' if name == 'runner-24' else own
+            group_hosted = 'ubuntu-24.04' if name == 'runner-24' else hosted
             cases = [
                 # (CI_RUNNERS, event, head repository) -> label
                 ('', 'pull_request', REPO, own),
@@ -81,8 +85,10 @@ class RunsOnExpression(unittest.TestCase):
                 ('self-hosted', 'pull_request', FORK, hosted),
                 ('', 'push', None, own),
                 ('', 'schedule', None, own),
+                ('', 'merge_group', None, group),
                 ('hosted', 'pull_request', REPO, hosted),
                 ('hosted', 'push', None, hosted),
+                ('hosted', 'merge_group', None, group_hosted),
             ]
             for ci_runners, event, head, label in cases:
                 with self.subTest(alias=name, ci_runners=ci_runners, event=event, head=head):
@@ -94,10 +100,13 @@ class RunsOnExpression(unittest.TestCase):
 
 
 class JobStartedHook(unittest.TestCase):
-    def run_hook(self, repository, event, head=None):
+    def run_hook(self, repository, event, head=None, merge_group_ref=None):
         with tempfile.TemporaryDirectory() as tmp:
             payload = Path(tmp, 'event.json')
-            payload.write_text(json.dumps({'pull_request': {'head': {'repo': {'full_name': head}}}} if head else {}))
+            body = {'pull_request': {'head': {'repo': {'full_name': head}}}} if head else {}
+            if merge_group_ref is not None:
+                body = {'merge_group': {'head_ref': merge_group_ref}}
+            payload.write_text(json.dumps(body))
             env = dict(os.environ, GITHUB_REPOSITORY=repository, GITHUB_EVENT_NAME=event,
                        GITHUB_EVENT_PATH=str(payload), GITHUB_REF='refs/test')
             return subprocess.run(['bash', str(HOOK)], env=env, capture_output=True, text=True)
@@ -106,6 +115,22 @@ class JobStartedHook(unittest.TestCase):
         for event, head in (('pull_request', REPO), ('push', None), ('schedule', None), ('workflow_dispatch', None)):
             with self.subTest(event=event):
                 self.assertEqual(self.run_hook(REPO, event, head).returncode, 0)
+
+    def test_admits_the_merge_queues_own_branches(self):
+        ref = 'refs/heads/gh-readonly-queue/main/pr-981-bca594ee91268da6b358cf5be805abc440e30a80'
+        self.assertEqual(self.run_hook(REPO, 'merge_group', merge_group_ref=ref).returncode, 0)
+
+    def test_refuses_a_merge_group_that_is_not_a_queue_branch_or_not_ours(self):
+        for repository, ref in ((REPO, 'refs/heads/main'), (REPO, 'refs/heads/gh-readonly-queue'),
+                                (REPO, 'refs/pull/7/merge'), (REPO, ''), (FORK, 'refs/heads/gh-readonly-queue/main/pr-1-x')):
+            with self.subTest(repository=repository, ref=ref):
+                result = self.run_hook(repository, 'merge_group', merge_group_ref=ref)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('refused this job', result.stderr)
+        # No merge_group object at all.
+        result = self.run_hook(REPO, 'merge_group')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('refused this job', result.stderr)
 
     def test_refuses_forks_foreign_repositories_and_other_events(self):
         for repository, event, head in ((REPO, 'pull_request', FORK), (REPO, 'pull_request', None),

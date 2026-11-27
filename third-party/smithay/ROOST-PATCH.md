@@ -433,6 +433,43 @@ tests in crates/compositor/tests/protocol_gaps.rs cover surface_exists,
 invalid_timeline, unsupported_buffer and no_acquire_point. The isolated
 diff is retained in DRM-SYNCOBJ-PATCH.diff; the pinned version stays 0.7.0.
 
+Issue #503 additionally changes the instanced draws of GlesFrame
+(draw_solid, render_texture, and the custom-program solid draw) in
+src/backend/renderer/gles/mod.rs: each instance's rectangle is two
+triangles sharing its top-left to bottom-right diagonal (the corners of
+the non-instanced path's TRIANGLE_VERTS), drawn with
+DrawArraysInstanced(TRIANGLES, 0, 6, n), instead of a four-vertex
+triangle strip. llvmpipe recognises such a pair as one axis-aligned
+rectangle (lp_setup_vbuf.c tries lp_setup_rect for triangle lists, but
+for strips only with the first-vertex provoking convention, which GL
+does not use) and shades it tile by tile, rather than testing every
+pixel along the diagonal against two triangle edges. Cogl submits its
+rectangles as indexed triangle lists, so Mutter already takes that path.
+Coverage is the same; a scaled (filtered) draw's interpolants come from
+the rectangle setup instead of the triangle setup, which can move a
+filtered channel by one unit at most. On a vkms replica of the paired
+lane's overview phase it cut about 5% of the compositor's CPU (11% in a
+surfaceless llvmpipe micro-benchmark). GL tests in instanced_rect_tests
+(surfaceless Mesa EGL) check the vertex list (two equally wound halves of
+the unit square sharing the diagonal) and that translucent instanced
+rectangles cover each pixel exactly once. The isolated diff is retained
+in INSTANCED-TRIANGLES-PATCH.diff; the pinned version stays 0.7.0.
+
+Issue #503 also changes src/backend/allocator/gbm.rs: the additive
+GbmAllocator::keep_mapped(bool) builder makes every buffer create_buffer
+returns hold a read mapping (gbm_bo_map with GBM_BO_TRANSFER_READ of the
+whole buffer) until it is destroyed; GbmBuffer releases it with
+gbm_bo_unmap before the buffer object itself (field order). Mesa's
+kms_swrast winsys (kms_dri_sw_winsys.c) maps a render target's dumb
+buffer for every llvmpipe scene and unmaps it when its map count returns
+to zero, so each frame faulted in again every page it drew. With a
+mapping held for the buffer's life the renderer's own mapping persists.
+Hardware drivers may copy (detile) a buffer to map it, so the builder is
+off by default and Roost enables it only when GL_RENDERER is a Mesa
+software rasterizer (crates/compositor/src/drm.rs). Buffers from
+create_buffer_with_flags, from_bo and import_to are unchanged. The
+isolated diff is retained in GBM-KEEP-MAPPED-PATCH.diff; the pinned
+version stays 0.7.0.
 Issue #353 changes Cargo.toml (the xwayland feature enables x11rb's xkb
 protocol) and src/xwayland/xwm/mod.rs, additively. X11Wm::select_bell_events
 does what Mutter 51's init_x11_bell does (src/x11/meta-x11-display.c): select

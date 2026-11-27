@@ -17,6 +17,9 @@
 #              event sent (libinput's startup queue is drained at once)
 #   D-IDLE     an unchanged scene stops redundant scanout submissions
 #   D-FRAMES   a real active Wayland client receives 240 page-flip presentations
+#   D-SCANOUT-MAPPED on software GL (llvmpipe, as on vkms) the scanout
+#              buffers stay mapped between frames, so Mesa's kms_swrast does
+#              not map and fault them in again for every frame (#503)
 #   D-SCALE    a GNOME monitors.xml giving the connector scale 2 is
 #              honored: logical layout at half the mode size, frames flip
 #   D-MODES    GNOME Settings' DisplayConfig lists the connector's modes
@@ -383,6 +386,16 @@ timeout 20s env -u WAYLAND_SOCKET XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY=tun
     2>"$ARTIFACTS/presentation.stderr" || fail D-FRAMES "native presentation probe failed"
 validate_presentation "$ARTIFACTS/presentation.json" || fail D-FRAMES "invalid native presentation trace"
 pass D-FRAMES "240 changing client frames at default scale received real ordered page-flip feedback"
+# kms_swrast maps a render target for each frame and unmaps it when no map
+# is left; on software GL the compositor holds a read mapping of each
+# scanout buffer for its life (Mesa's own are read-write). Idle after the
+# client's frames, both buffers it drew are still mapped.
+grep -q 'software rendering; scanout buffers stay mapped' "$LOG" ||
+    fail D-SCANOUT-MAPPED "software GL on vkms did not keep its scanout buffers mapped"
+scanout_maps=$(grep -c " r--s .* $CARD\$" "/proc/$COMP_PID/maps" || true)
+[ "$scanout_maps" -ge 2 ] ||
+    fail D-SCANOUT-MAPPED "$scanout_maps held read mappings of $CARD between frames; the scanout buffers were unmapped"
+pass D-SCANOUT-MAPPED "$scanout_maps scanout buffers of $CARD held mapped between frames"
 env -u WAYLAND_SOCKET XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY=tuna-drm-smoke \
     timeout 20 "$ARTIFACTS/frame-pacer/tuna-frame-pacer" --endurance-seconds 16 \
     >"$ARTIFACTS/presentation-endurance.jsonl" \
