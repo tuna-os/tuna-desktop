@@ -37,7 +37,7 @@ schedule, dispatch or a pull request whose head repository is
 | --- | --- |
 | `tuna-ci-24.04` | select-lanes, check, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, native-core-apps (the join of the Core legs), native-reference-context, parity-ledger, docs-shots, ci-gate |
 | `tuna-ci-26.04` | journey, orca-speech, portal-security, remote-security, niri-parity |
-| GitHub-hosted, always | arch-package, drm-smoke, hotplug (`ubuntu-26.04`), marlin-vm (pull requests: the primary lifecycle leg only; push, schedule and dispatch add the Orca 51 leg and both paired reference members), core-apps-image and core-apps-leg (the native Core image and its five parallel boots, when selected), marlin-image (push, schedule and dispatch only), gdm51-native-package |
+| GitHub-hosted, always | arch-package, drm-smoke, hotplug (`ubuntu-26.04`), marlin-vm (pull requests: the primary lifecycle and automatic-timezone legs, plus the Orca 51 leg when parity-ledger runs; push, schedule and dispatch add the Orca 51 leg and both paired reference members), core-apps-image and core-apps-leg (the native Core image and its five parallel boots, when selected), marlin-image (push, schedule and dispatch only), gdm51-native-package |
 
 Why the always-hosted lanes stay hosted:
 

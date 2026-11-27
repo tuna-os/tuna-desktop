@@ -67,6 +67,10 @@ fmt-check:
 fmt:
     cargo fmt --all
 
+# Check relative links and repo paths in the Markdown changed since `base`, as CI's `check` job does.
+doc-refs base="origin/main":
+    scripts/tuna-doc-refs --base {{quote(base)}}
+
 # Clippy over every target with warnings as errors, as CI runs it.
 clippy: _disk _sccache
     TUNA_SLOT_TIMEOUT={{build_timeout_min}} {{lock}} {{timed}} {{build_timeout_min}} "just clippy (TUNA_BUILD_TIMEOUT)" cargo clippy {{target_arg}} --workspace --all-targets -- -D warnings

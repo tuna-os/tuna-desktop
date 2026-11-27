@@ -473,8 +473,12 @@ class Workflow(unittest.TestCase):
         self.assertEqual(image['outputs'], {'image_id': '${{ steps.image.outputs.image_id }}',
                                             'package_sha256': '${{ steps.image.outputs.package_sha256 }}'})
         # The ordinary lifecycle matrix no longer carries a Core member.
-        selector = next(step for step in self.jobs['select-lanes']['steps'] if step.get('id') == 'lanes')['run']
-        self.assertNotIn('core-apps', selector.split('primary=', 1)[1])
+        for event in ('pull_request', 'push'):
+            out = subprocess.run([str(ROOT / 'scripts/ci-select-lanes'), '--event', event, '--changed', '-'],
+                                 input='scripts/lib/core_apps.py\n', text=True, capture_output=True,
+                                 check=True, cwd=ROOT).stdout
+            matrix = next(line for line in out.splitlines() if line.startswith('vm_matrix='))
+            self.assertNotIn('core-apps', matrix)
         self.assertFalse(any('core-apps' in str(step.get('if', '')) for step in vm['steps']))
 
     def test_whole_consumer_is_selected_together(self):
