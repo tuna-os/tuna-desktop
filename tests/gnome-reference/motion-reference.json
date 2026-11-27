@@ -1,0 +1,2206 @@
+{
+ "gnome": {
+  "gnome_shell": "51.1",
+  "monitor": "1280x800",
+  "image": [
+   "image",
+   "5f127cfe31a6ac63dd8b8a0fc78e0b0ca9c18a8612e1badc9f1b1bea8bb1dab9",
+   "gnome-shell-51.1-1.fc45.x86_64",
+   "mutter-51.1-1.fc45.x86_64",
+   "gtk4-4.24.1-1.fc45.x86_64",
+   "mesa-dri-drivers-26.2.6-1.fc45.x86_64"
+  ],
+  "motion_js_sha256": "d2354d64aa6e79990a1ad95c30f73fed5577e24bafd23f560e0c9838edfcd4b8",
+  "source": "https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/ui/windowManager.js"
+ },
+ "tolerance": {
+  "opacity": 0.00588,
+  "rect": 0.01,
+  "progress": 0.01,
+  "multiplier": 0.00394,
+  "snapshot_alpha": 0.00588,
+  "live_size": 0.01,
+  "body_alpha": 0.06,
+  "pixel_multiplier": 0.03
+ },
+ "families": {
+  "map": {
+   "class": "transform",
+   "transitions": [
+    {
+     "role": "window",
+     "property": "opacity",
+     "duration_ms": 150
+    },
+    {
+     "role": "window",
+     "property": "scale-x",
+     "duration_ms": 150
+    },
+    {
+     "role": "window",
+     "property": "scale-y",
+     "duration_ms": 150
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "opacity": 0.0,
+     "rect": [
+      0.495,
+      0.95,
+      0.01,
+      0.05
+     ],
+     "body_alpha": null
+    },
+    {
+     "t_ms": 10,
+     "opacity": 0.36863,
+     "rect": [
+      0.31183,
+      0.59846,
+      0.37635,
+      0.40154
+     ],
+     "body_alpha": 0.37218
+    },
+    {
+     "t_ms": 25,
+     "opacity": 0.68235,
+     "rect": [
+      0.15592,
+      0.29924,
+      0.68817,
+      0.70076
+     ],
+     "body_alpha": 0.68111
+    },
+    {
+     "t_ms": 50,
+     "opacity": 0.89804,
+     "rect": [
+      0.04911,
+      0.09426,
+      0.90178,
+      0.90574
+     ],
+     "body_alpha": 0.90189
+    },
+    {
+     "t_ms": 75,
+     "opacity": 0.96863,
+     "rect": [
+      0.01547,
+      0.02968,
+      0.96906,
+      0.97032
+     ],
+     "body_alpha": 0.96818
+    },
+    {
+     "t_ms": 150,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 1.0
+    }
+   ]
+  },
+  "dialog-map-dim": {
+   "class": "dialog",
+   "transitions": [
+    {
+     "role": "window",
+     "property": "@effects.gnome-shell-window-dimmer.brightness",
+     "duration_ms": 500
+    },
+    {
+     "role": "dialog",
+     "property": "opacity",
+     "duration_ms": 100
+    },
+    {
+     "role": "dialog",
+     "property": "scale-y",
+     "duration_ms": 100
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "opacity": 0.0,
+     "rect": [
+      0.0,
+      0.5,
+      1.0,
+      0.0
+     ],
+     "multiplier": 1,
+     "pixel_multiplier": 1.0
+    },
+    {
+     "t_ms": 25,
+     "opacity": 0.43529,
+     "rect": [
+      0.0,
+      0.28125,
+      1.0,
+      0.4375
+     ],
+     "multiplier": 0.9685,
+     "pixel_multiplier": 0.96917
+    },
+    {
+     "t_ms": 50,
+     "opacity": 0.74902,
+     "rect": [
+      0.0,
+      0.125,
+      1.0,
+      0.75
+     ],
+     "multiplier": 0.93701,
+     "pixel_multiplier": 0.93965
+    },
+    {
+     "t_ms": 100,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 0.88189,
+     "pixel_multiplier": 0.88342
+    },
+    {
+     "t_ms": 250,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 0.76378,
+     "pixel_multiplier": 0.76272
+    },
+    {
+     "t_ms": 500,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 0.69291,
+     "pixel_multiplier": 0.6944
+    }
+   ]
+  },
+  "dialog-destroy-undim": {
+   "class": "dialog",
+   "transitions": [
+    {
+     "role": "window",
+     "property": "@effects.gnome-shell-window-dimmer.brightness",
+     "duration_ms": 250
+    },
+    {
+     "role": "dialog",
+     "property": "scale-y",
+     "duration_ms": 100
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 0.69291,
+     "pixel_multiplier": 0.6944
+    },
+    {
+     "t_ms": 25,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.21875,
+      1.0,
+      0.5625
+     ],
+     "multiplier": 0.74803,
+     "pixel_multiplier": 0.75063
+    },
+    {
+     "t_ms": 50,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.375,
+      1.0,
+      0.25
+     ],
+     "multiplier": 0.80315,
+     "pixel_multiplier": 0.80433
+    },
+    {
+     "t_ms": 100,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.5,
+      1.0,
+      0.0
+     ],
+     "multiplier": 0.88189,
+     "pixel_multiplier": 0.88342
+    },
+    {
+     "t_ms": 125,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.5,
+      1.0,
+      0.0
+     ],
+     "multiplier": 0.92126,
+     "pixel_multiplier": 0.92091
+    },
+    {
+     "t_ms": 250,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.5,
+      1.0,
+      0.0
+     ],
+     "multiplier": 1,
+     "pixel_multiplier": 1.0
+    }
+   ]
+  },
+  "minimize": {
+   "class": "minimize",
+   "transitions": [
+    {
+     "role": "window",
+     "property": "opacity",
+     "duration_ms": 400
+    },
+    {
+     "role": "window",
+     "property": "scale-x",
+     "duration_ms": 400
+    },
+    {
+     "role": "window",
+     "property": "scale-y",
+     "duration_ms": 400
+    },
+    {
+     "role": "window",
+     "property": "x",
+     "duration_ms": 400
+    },
+    {
+     "role": "window",
+     "property": "y",
+     "duration_ms": 400
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "opacity": 1.0,
+     "progress": [
+      -0.0,
+      -0.0,
+      -0.0,
+      -0.0
+     ],
+     "body_alpha": 1.0
+    },
+    {
+     "t_ms": 25,
+     "opacity": 0.64706,
+     "progress": [
+      0.35158,
+      0.35158,
+      0.35158,
+      0.35158
+     ],
+     "body_alpha": 0.64956
+    },
+    {
+     "t_ms": 50,
+     "opacity": 0.41961,
+     "progress": [
+      0.57955,
+      0.57956,
+      0.57955,
+      0.57955
+     ],
+     "body_alpha": 0.41793
+    },
+    {
+     "t_ms": 100,
+     "opacity": 0.17647,
+     "progress": [
+      0.82322,
+      0.82323,
+      0.82323,
+      0.82322
+     ],
+     "body_alpha": 0.1757
+    },
+    {
+     "t_ms": 200,
+     "opacity": 0.02745,
+     "progress": [
+      0.96875,
+      0.96875,
+      0.96875,
+      0.96875
+     ],
+     "body_alpha": null
+    },
+    {
+     "t_ms": 400,
+     "opacity": 0.0,
+     "progress": [
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": null
+    }
+   ]
+  },
+  "unminimize": {
+   "class": "minimize",
+   "transitions": [
+    {
+     "role": "window",
+     "property": "scale-x",
+     "duration_ms": 400
+    },
+    {
+     "role": "window",
+     "property": "scale-y",
+     "duration_ms": 400
+    },
+    {
+     "role": "window",
+     "property": "x",
+     "duration_ms": 400
+    },
+    {
+     "role": "window",
+     "property": "y",
+     "duration_ms": 400
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "opacity": 1.0,
+     "progress": [
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": null
+    },
+    {
+     "t_ms": 25,
+     "opacity": 1.0,
+     "progress": [
+      0.64842,
+      0.64842,
+      0.64842,
+      0.64842
+     ],
+     "body_alpha": 1.0
+    },
+    {
+     "t_ms": 50,
+     "opacity": 1.0,
+     "progress": [
+      0.42045,
+      0.42044,
+      0.42045,
+      0.42045
+     ],
+     "body_alpha": 1.0
+    },
+    {
+     "t_ms": 100,
+     "opacity": 1.0,
+     "progress": [
+      0.17678,
+      0.17677,
+      0.17677,
+      0.17678
+     ],
+     "body_alpha": 1.0
+    },
+    {
+     "t_ms": 200,
+     "opacity": 1.0,
+     "progress": [
+      0.03125,
+      0.03125,
+      0.03125,
+      0.03125
+     ],
+     "body_alpha": 1.0
+    },
+    {
+     "t_ms": 400,
+     "opacity": 1.0,
+     "progress": [
+      -0.0,
+      -0.0,
+      -0.0,
+      -0.0
+     ],
+     "body_alpha": 1.0
+    }
+   ]
+  },
+  "maximize": {
+   "class": "size",
+   "transitions": [
+    {
+     "role": "clone",
+     "property": "x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "opacity",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-y",
+     "duration_ms": 250
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "progress": 0.0,
+     "snapshot_alpha": 1.0,
+     "live_size": [
+      0.39062,
+      0.45573
+     ]
+    },
+    {
+     "t_ms": 25,
+     "progress": 0.19,
+     "snapshot_alpha": 0.80784,
+     "live_size": [
+      0.50641,
+      0.55914
+     ]
+    },
+    {
+     "t_ms": 62,
+     "progress": 0.43449,
+     "snapshot_alpha": 0.56471,
+     "live_size": [
+      0.6554,
+      0.69221
+     ]
+    },
+    {
+     "t_ms": 125,
+     "progress": 0.75,
+     "snapshot_alpha": 0.24706,
+     "live_size": [
+      0.84766,
+      0.86393
+     ]
+    },
+    {
+     "t_ms": 187,
+     "progress": 0.93649,
+     "snapshot_alpha": 0.06275,
+     "live_size": [
+      0.9613,
+      0.96543
+     ]
+    },
+    {
+     "t_ms": 250,
+     "progress": 1.0,
+     "snapshot_alpha": 0.0,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "old_frame": [
+    390,
+    241,
+    500,
+    350
+   ],
+   "new_frame": [
+    0,
+    32,
+    1280,
+    768
+   ]
+  },
+  "unmaximize": {
+   "class": "size",
+   "transitions": [
+    {
+     "role": "clone",
+     "property": "x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "opacity",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-y",
+     "duration_ms": 250
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "progress": 0.0,
+     "snapshot_alpha": 1.0,
+     "live_size": [
+      2.56,
+      2.19429
+     ]
+    },
+    {
+     "t_ms": 25,
+     "progress": 0.19,
+     "snapshot_alpha": 0.80784,
+     "live_size": [
+      2.2636,
+      1.96737
+     ]
+    },
+    {
+     "t_ms": 62,
+     "progress": 0.43449,
+     "snapshot_alpha": 0.56471,
+     "live_size": [
+      1.88219,
+      1.67537
+     ]
+    },
+    {
+     "t_ms": 125,
+     "progress": 0.75,
+     "snapshot_alpha": 0.24706,
+     "live_size": [
+      1.39,
+      1.29857
+     ]
+    },
+    {
+     "t_ms": 187,
+     "progress": 0.93649,
+     "snapshot_alpha": 0.06275,
+     "live_size": [
+      1.09906,
+      1.07585
+     ]
+    },
+    {
+     "t_ms": 250,
+     "progress": 1.0,
+     "snapshot_alpha": 0.0,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "old_frame": [
+    0,
+    32,
+    1280,
+    768
+   ],
+   "new_frame": [
+    390,
+    241,
+    500,
+    350
+   ]
+  },
+  "tile-left": {
+   "class": "size",
+   "transitions": [
+    {
+     "role": "clone",
+     "property": "x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "opacity",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-y",
+     "duration_ms": 250
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "progress": 0.0,
+     "snapshot_alpha": 1.0,
+     "live_size": [
+      0.78125,
+      0.45573
+     ]
+    },
+    {
+     "t_ms": 25,
+     "progress": 0.19001,
+     "snapshot_alpha": 0.80784,
+     "live_size": [
+      0.82281,
+      0.55914
+     ]
+    },
+    {
+     "t_ms": 62,
+     "progress": 0.43449,
+     "snapshot_alpha": 0.56471,
+     "live_size": [
+      0.87629,
+      0.69221
+     ]
+    },
+    {
+     "t_ms": 125,
+     "progress": 0.75,
+     "snapshot_alpha": 0.24706,
+     "live_size": [
+      0.94531,
+      0.86393
+     ]
+    },
+    {
+     "t_ms": 187,
+     "progress": 0.93649,
+     "snapshot_alpha": 0.06275,
+     "live_size": [
+      0.98611,
+      0.96543
+     ]
+    },
+    {
+     "t_ms": 250,
+     "progress": 1.0,
+     "snapshot_alpha": 0.0,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "old_frame": [
+    390,
+    241,
+    500,
+    350
+   ],
+   "new_frame": [
+    0,
+    32,
+    640,
+    768
+   ]
+  },
+  "untile-left": {
+   "class": "size",
+   "transitions": [
+    {
+     "role": "clone",
+     "property": "x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "opacity",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-y",
+     "duration_ms": 250
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "progress": 0.0,
+     "snapshot_alpha": 1.0,
+     "live_size": [
+      1.28,
+      2.19429
+     ]
+    },
+    {
+     "t_ms": 25,
+     "progress": 0.19001,
+     "snapshot_alpha": 0.80784,
+     "live_size": [
+      1.2268,
+      1.96737
+     ]
+    },
+    {
+     "t_ms": 62,
+     "progress": 0.43449,
+     "snapshot_alpha": 0.56471,
+     "live_size": [
+      1.15834,
+      1.67537
+     ]
+    },
+    {
+     "t_ms": 125,
+     "progress": 0.75,
+     "snapshot_alpha": 0.24706,
+     "live_size": [
+      1.07,
+      1.29857
+     ]
+    },
+    {
+     "t_ms": 187,
+     "progress": 0.93649,
+     "snapshot_alpha": 0.06275,
+     "live_size": [
+      1.01778,
+      1.07585
+     ]
+    },
+    {
+     "t_ms": 250,
+     "progress": 1.0,
+     "snapshot_alpha": 0.0,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "old_frame": [
+    0,
+    32,
+    640,
+    768
+   ],
+   "new_frame": [
+    390,
+    241,
+    500,
+    350
+   ]
+  },
+  "tile-right": {
+   "class": "size",
+   "transitions": [
+    {
+     "role": "clone",
+     "property": "x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "opacity",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-y",
+     "duration_ms": 250
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "progress": 0.0,
+     "snapshot_alpha": 1.0,
+     "live_size": [
+      0.78125,
+      0.45573
+     ]
+    },
+    {
+     "t_ms": 25,
+     "progress": 0.19001,
+     "snapshot_alpha": 0.80784,
+     "live_size": [
+      0.82281,
+      0.55914
+     ]
+    },
+    {
+     "t_ms": 62,
+     "progress": 0.43449,
+     "snapshot_alpha": 0.56471,
+     "live_size": [
+      0.8763,
+      0.69221
+     ]
+    },
+    {
+     "t_ms": 125,
+     "progress": 0.75,
+     "snapshot_alpha": 0.24706,
+     "live_size": [
+      0.94531,
+      0.86393
+     ]
+    },
+    {
+     "t_ms": 187,
+     "progress": 0.93649,
+     "snapshot_alpha": 0.06275,
+     "live_size": [
+      0.98611,
+      0.96543
+     ]
+    },
+    {
+     "t_ms": 250,
+     "progress": 1.0,
+     "snapshot_alpha": 0.0,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "old_frame": [
+    390,
+    241,
+    500,
+    350
+   ],
+   "new_frame": [
+    640,
+    32,
+    640,
+    768
+   ]
+  },
+  "untile-right": {
+   "class": "size",
+   "transitions": [
+    {
+     "role": "clone",
+     "property": "x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "opacity",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-y",
+     "duration_ms": 250
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "progress": 0.0,
+     "snapshot_alpha": 1.0,
+     "live_size": [
+      1.28,
+      2.19429
+     ]
+    },
+    {
+     "t_ms": 25,
+     "progress": 0.19001,
+     "snapshot_alpha": 0.80784,
+     "live_size": [
+      1.2268,
+      1.96737
+     ]
+    },
+    {
+     "t_ms": 62,
+     "progress": 0.43449,
+     "snapshot_alpha": 0.56471,
+     "live_size": [
+      1.15834,
+      1.67537
+     ]
+    },
+    {
+     "t_ms": 125,
+     "progress": 0.75,
+     "snapshot_alpha": 0.24706,
+     "live_size": [
+      1.07,
+      1.29857
+     ]
+    },
+    {
+     "t_ms": 187,
+     "progress": 0.93649,
+     "snapshot_alpha": 0.06275,
+     "live_size": [
+      1.01778,
+      1.07585
+     ]
+    },
+    {
+     "t_ms": 250,
+     "progress": 1.0,
+     "snapshot_alpha": 0.0,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "old_frame": [
+    640,
+    32,
+    640,
+    768
+   ],
+   "new_frame": [
+    390,
+    241,
+    500,
+    350
+   ]
+  },
+  "fullscreen": {
+   "class": "size",
+   "transitions": [
+    {
+     "role": "clone",
+     "property": "x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "opacity",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-y",
+     "duration_ms": 250
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "progress": 0.0,
+     "snapshot_alpha": 1.0,
+     "live_size": [
+      0.39062,
+      0.4375
+     ]
+    },
+    {
+     "t_ms": 25,
+     "progress": 0.19,
+     "snapshot_alpha": 0.80784,
+     "live_size": [
+      0.50641,
+      0.54438
+     ]
+    },
+    {
+     "t_ms": 62,
+     "progress": 0.4345,
+     "snapshot_alpha": 0.56471,
+     "live_size": [
+      0.6554,
+      0.6819
+     ]
+    },
+    {
+     "t_ms": 125,
+     "progress": 0.75,
+     "snapshot_alpha": 0.24706,
+     "live_size": [
+      0.84766,
+      0.85938
+     ]
+    },
+    {
+     "t_ms": 187,
+     "progress": 0.9365,
+     "snapshot_alpha": 0.06275,
+     "live_size": [
+      0.9613,
+      0.96428
+     ]
+    },
+    {
+     "t_ms": 250,
+     "progress": 1.0,
+     "snapshot_alpha": 0.0,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "old_frame": [
+    390,
+    241,
+    500,
+    350
+   ],
+   "new_frame": [
+    0,
+    0,
+    1280,
+    800
+   ]
+  },
+  "fullscreen-minimize": {
+   "class": "minimize",
+   "transitions": [
+    {
+     "role": "window",
+     "property": "opacity",
+     "duration_ms": 400
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 1.0
+    },
+    {
+     "t_ms": 25,
+     "opacity": 0.64706,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.64761
+    },
+    {
+     "t_ms": 50,
+     "opacity": 0.41961,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.41564
+    },
+    {
+     "t_ms": 100,
+     "opacity": 0.17647,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.17758
+    },
+    {
+     "t_ms": 200,
+     "opacity": 0.02745,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.02415
+    },
+    {
+     "t_ms": 400,
+     "opacity": 0.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.0
+    }
+   ]
+  },
+  "fullscreen-unminimize": {
+   "class": "instant",
+   "transitions": [],
+   "instant": true
+  },
+  "unfullscreen": {
+   "class": "size",
+   "transitions": [
+    {
+     "role": "clone",
+     "property": "x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "opacity",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "scale-y",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-y",
+     "duration_ms": 250
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "progress": 0.0,
+     "snapshot_alpha": 1.0,
+     "live_size": [
+      2.56,
+      2.28571
+     ]
+    },
+    {
+     "t_ms": 25,
+     "progress": 0.19,
+     "snapshot_alpha": 0.80784,
+     "live_size": [
+      2.2636,
+      2.04142
+     ]
+    },
+    {
+     "t_ms": 62,
+     "progress": 0.4345,
+     "snapshot_alpha": 0.56471,
+     "live_size": [
+      1.88219,
+      1.72708
+     ]
+    },
+    {
+     "t_ms": 125,
+     "progress": 0.75,
+     "snapshot_alpha": 0.24706,
+     "live_size": [
+      1.39,
+      1.32143
+     ]
+    },
+    {
+     "t_ms": 187,
+     "progress": 0.9365,
+     "snapshot_alpha": 0.06275,
+     "live_size": [
+      1.09906,
+      1.08165
+     ]
+    },
+    {
+     "t_ms": 250,
+     "progress": 1.0,
+     "snapshot_alpha": 0.0,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "old_frame": [
+    0,
+    0,
+    1280,
+    800
+   ],
+   "new_frame": [
+    390,
+    241,
+    500,
+    350
+   ]
+  },
+  "destroy": {
+   "class": "transform",
+   "transitions": [
+    {
+     "role": "window",
+     "property": "opacity",
+     "duration_ms": 150
+    },
+    {
+     "role": "window",
+     "property": "scale-x",
+     "duration_ms": 150
+    },
+    {
+     "role": "window",
+     "property": "scale-y",
+     "duration_ms": 150
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 1.0
+    },
+    {
+     "t_ms": 25,
+     "opacity": 0.69412,
+     "rect": [
+      0.03055,
+      0.03056,
+      0.93889,
+      0.93888
+     ],
+     "body_alpha": 0.6928
+    },
+    {
+     "t_ms": 50,
+     "opacity": 0.44314,
+     "rect": [
+      0.05555,
+      0.05555,
+      0.88889,
+      0.88889
+     ],
+     "body_alpha": 0.43953
+    },
+    {
+     "t_ms": 75,
+     "opacity": 0.24706,
+     "rect": [
+      0.075,
+      0.075,
+      0.84999,
+      0.85
+     ],
+     "body_alpha": 0.24151
+    },
+    {
+     "t_ms": 150,
+     "opacity": 0.0,
+     "rect": [
+      0.1,
+      0.1,
+      0.8,
+      0.80001
+     ],
+     "body_alpha": 0.0
+    }
+   ]
+  },
+  "reduced-map": {
+   "class": "transform",
+   "transitions": [
+    {
+     "role": "window",
+     "property": "opacity",
+     "duration_ms": 150
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "opacity": 0.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.0
+    },
+    {
+     "t_ms": 10,
+     "opacity": 0.36863,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.37218
+    },
+    {
+     "t_ms": 25,
+     "opacity": 0.68235,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.6808
+    },
+    {
+     "t_ms": 50,
+     "opacity": 0.89804,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.90065
+    },
+    {
+     "t_ms": 75,
+     "opacity": 0.96863,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.96828
+    },
+    {
+     "t_ms": 150,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 1.0
+    }
+   ]
+  },
+  "reduced-dialog-map-dim": {
+   "class": "dialog",
+   "transitions": [
+    {
+     "role": "window",
+     "property": "@effects.gnome-shell-window-dimmer.brightness",
+     "duration_ms": 500
+    },
+    {
+     "role": "dialog",
+     "property": "opacity",
+     "duration_ms": 100
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 1,
+     "pixel_multiplier": 1.0
+    },
+    {
+     "t_ms": 25,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 0.9685,
+     "pixel_multiplier": 0.96917
+    },
+    {
+     "t_ms": 50,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 0.93701,
+     "pixel_multiplier": 0.93965
+    },
+    {
+     "t_ms": 100,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 0.88189,
+     "pixel_multiplier": 0.88342
+    },
+    {
+     "t_ms": 250,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 0.76378,
+     "pixel_multiplier": 0.76272
+    },
+    {
+     "t_ms": 500,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 0.69291,
+     "pixel_multiplier": 0.6944
+    }
+   ]
+  },
+  "reduced-dialog-destroy-undim": {
+   "class": "dialog",
+   "transitions": [
+    {
+     "role": "window",
+     "property": "@effects.gnome-shell-window-dimmer.brightness",
+     "duration_ms": 250
+    },
+    {
+     "role": "dialog",
+     "property": "opacity",
+     "duration_ms": 100
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 0.69291,
+     "pixel_multiplier": 0.6944
+    },
+    {
+     "t_ms": 25,
+     "opacity": 0.56078,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 0.74803,
+     "pixel_multiplier": 0.75063
+    },
+    {
+     "t_ms": 50,
+     "opacity": 0.24706,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 0.80315,
+     "pixel_multiplier": 0.80433
+    },
+    {
+     "t_ms": 100,
+     "opacity": 0.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 0.88189,
+     "pixel_multiplier": 0.88342
+    },
+    {
+     "t_ms": 125,
+     "opacity": 0.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 0.92126,
+     "pixel_multiplier": 0.92091
+    },
+    {
+     "t_ms": 250,
+     "opacity": 0.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "multiplier": 1,
+     "pixel_multiplier": 1.0
+    }
+   ]
+  },
+  "reduced-minimize": {
+   "class": "minimize",
+   "transitions": [
+    {
+     "role": "window",
+     "property": "opacity",
+     "duration_ms": 400
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 1.0
+    },
+    {
+     "t_ms": 25,
+     "opacity": 0.64706,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.64687
+    },
+    {
+     "t_ms": 50,
+     "opacity": 0.41961,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.41645
+    },
+    {
+     "t_ms": 100,
+     "opacity": 0.17647,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.17546
+    },
+    {
+     "t_ms": 200,
+     "opacity": 0.02745,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.02324
+    },
+    {
+     "t_ms": 400,
+     "opacity": 0.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.0
+    }
+   ]
+  },
+  "reduced-unminimize": {
+   "class": "instant",
+   "transitions": [],
+   "instant": true
+  },
+  "reduced-maximize": {
+   "class": "size",
+   "transitions": [
+    {
+     "role": "clone",
+     "property": "x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "opacity",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-y",
+     "duration_ms": 250
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "progress": 0.0,
+     "snapshot_alpha": 1.0,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "t_ms": 25,
+     "progress": 0.0,
+     "snapshot_alpha": 0.80784,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "t_ms": 62,
+     "progress": 0.0,
+     "snapshot_alpha": 0.56471,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "t_ms": 125,
+     "progress": 0.0,
+     "snapshot_alpha": 0.24706,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "t_ms": 187,
+     "progress": 0.0,
+     "snapshot_alpha": 0.06275,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "t_ms": 250,
+     "progress": 0.0,
+     "snapshot_alpha": 0.0,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "old_frame": [
+    390,
+    241,
+    500,
+    350
+   ],
+   "new_frame": [
+    0,
+    32,
+    1280,
+    768
+   ]
+  },
+  "reduced-unmaximize": {
+   "class": "size",
+   "transitions": [
+    {
+     "role": "clone",
+     "property": "x",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "y",
+     "duration_ms": 250
+    },
+    {
+     "role": "clone",
+     "property": "opacity",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-x",
+     "duration_ms": 250
+    },
+    {
+     "role": "window",
+     "property": "translation-y",
+     "duration_ms": 250
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "progress": 0.0,
+     "snapshot_alpha": 1.0,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "t_ms": 25,
+     "progress": 0.0,
+     "snapshot_alpha": 0.80784,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "t_ms": 62,
+     "progress": 0.0,
+     "snapshot_alpha": 0.56471,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "t_ms": 125,
+     "progress": 0.0,
+     "snapshot_alpha": 0.24706,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "t_ms": 187,
+     "progress": 0.0,
+     "snapshot_alpha": 0.06275,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "t_ms": 250,
+     "progress": 0.0,
+     "snapshot_alpha": 0.0,
+     "live_size": [
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "old_frame": [
+    0,
+    32,
+    1280,
+    768
+   ],
+   "new_frame": [
+    390,
+    241,
+    500,
+    350
+   ]
+  },
+  "reduced-destroy": {
+   "class": "transform",
+   "transitions": [
+    {
+     "role": "window",
+     "property": "opacity",
+     "duration_ms": 150
+    }
+   ],
+   "samples": [
+    {
+     "t_ms": 0,
+     "opacity": 1.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 1.0
+    },
+    {
+     "t_ms": 25,
+     "opacity": 0.69412,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.69138
+    },
+    {
+     "t_ms": 50,
+     "opacity": 0.44314,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.43969
+    },
+    {
+     "t_ms": 75,
+     "opacity": 0.24706,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.24099
+    },
+    {
+     "t_ms": 150,
+     "opacity": 0.0,
+     "rect": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+     ],
+     "body_alpha": 0.0
+    }
+   ]
+  },
+  "off-map": {
+   "class": "instant",
+   "transitions": [],
+   "instant": true
+  },
+  "off-destroy": {
+   "class": "instant",
+   "transitions": [],
+   "instant": true
+  }
+ }
+}

@@ -8,6 +8,8 @@ pub(crate) type RemoteSessions = Arc<Mutex<HashMap<String, RemoteGrant>>>;
 pub(crate) struct RemoteGrant {
     pub id: u64,
     pub owner: String,
+    /// The desktop service `owner` passed admission as.
+    pub caller: crate::capture_security::CaptureCaller,
     pub stopped: Arc<AtomicBool>,
     pub started: Arc<AtomicBool>,
     pub pending: Arc<AtomicU32>,
@@ -219,11 +221,17 @@ pub(crate) fn valid_button(button: i32) -> fdo::Result<u32> {
 }
 
 impl RemoteGrant {
-    /// A fresh, unstarted grant for the unique bus name `owner`.
-    pub(crate) fn new(id: u64, owner: String) -> Self {
+    /// A fresh, unstarted grant for the unique bus name `owner`, admitted
+    /// as `caller`.
+    pub(crate) fn new(
+        id: u64,
+        owner: String,
+        caller: crate::capture_security::CaptureCaller,
+    ) -> Self {
         Self {
             id,
             owner,
+            caller,
             stopped: Arc::new(AtomicBool::new(false)),
             started: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(AtomicU32::new(0)),
@@ -241,7 +249,7 @@ impl RemoteDesktop {
         #[zbus(connection)] conn: &zbus::Connection,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> fdo::Result<OwnedObjectPath> {
-        let owner = self.authority.admit_remote(conn, &header).await?;
+        let (owner, caller) = self.authority.admit_remote(conn, &header).await?;
         if self
             .remote
             .lock()
@@ -252,7 +260,7 @@ impl RemoteDesktop {
             ));
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let grant = RemoteGrant::new(id, owner);
+        let grant = RemoteGrant::new(id, owner, caller);
         let session_id = format!("tuna-remote-{id}");
         let path =
             OwnedObjectPath::try_from(format!("/org/gnome/Mutter/RemoteDesktop/Session/u{id}"))
@@ -611,6 +619,7 @@ mod tests {
             grant: RemoteGrant {
                 id: 1,
                 owner: ":1.1".into(),
+                caller: crate::capture_security::CaptureCaller::Portal,
                 stopped: Arc::new(AtomicBool::new(false)),
                 started: Arc::new(AtomicBool::new(false)),
                 pending: Arc::new(AtomicU32::new(0)),
@@ -646,6 +655,7 @@ mod tests {
         let grant = RemoteGrant {
             id: 1,
             owner: ":1.1".into(),
+            caller: crate::capture_security::CaptureCaller::Portal,
             stopped: Arc::new(AtomicBool::new(false)),
             started: Arc::new(AtomicBool::new(true)),
             pending: Arc::new(AtomicU32::new(0)),

@@ -16,6 +16,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
+use rustix::process::Signal;
 use smithay::reexports::wayland_server::DisplayHandle;
 
 /// Restarts after the first start, as for the shell.
@@ -405,22 +406,18 @@ fn retire_group(child: &mut Child, grace: Duration) -> (usize, bool) {
     groups.extend(child_groups(bridge));
     // A group is empty once nothing answers signal 0 (a zombie leader
     // still answers, hence the reaping below).
-    let occupied = |group: libc::pid_t| {
-        // SAFETY: kill(2) with signal 0 only probes.
-        unsafe { libc::kill(-group, 0) == 0 }
-    };
-    let signal = |signal: libc::c_int| {
+    let occupied = |group: libc::pid_t| kill_group(group, None).is_ok();
+    let signal = |signal: Signal| {
         for &group in &groups {
+            // Our own child's group, or one a child of it leads; while
+            // members remain, the ID cannot belong to anyone else.
             if occupied(group) {
-                // SAFETY: kill(2) on our own child's group, or one a child
-                // of it leads; while members remain, the ID cannot belong
-                // to anyone else.
-                unsafe { libc::kill(-group, signal) };
+                let _ = kill_group(group, Some(signal));
             }
         }
     };
     let empty = || groups.iter().all(|&group| !occupied(group));
-    signal(libc::SIGTERM);
+    signal(Signal::TERM);
     let deadline = Instant::now() + grace;
     let mut reaped = false;
     loop {
@@ -433,7 +430,7 @@ fn retire_group(child: &mut Child, grace: Duration) -> (usize, bool) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    signal(libc::SIGKILL);
+    signal(Signal::KILL);
     let until = Instant::now() + REAP_BOUND;
     while !reaped && Instant::now() < until {
         reaped = !matches!(child.try_wait(), Ok(None));
@@ -445,11 +442,34 @@ fn retire_group(child: &mut Child, grace: Duration) -> (usize, bool) {
 /// SIGKILL what a reaped bridge left in its group. Only while members
 /// remain: they keep the group ID from belonging to anyone else.
 fn sweep_group(group: libc::pid_t) {
-    // SAFETY: kill(2) on the group of our own reaped child, probed first.
-    unsafe {
-        if libc::kill(-group, 0) == 0 {
-            libc::kill(-group, libc::SIGKILL);
-        }
+    if kill_group(group, None).is_ok() {
+        let _ = kill_group(group, Some(Signal::KILL));
+    }
+}
+
+/// kill(2) as `kill(-group, signal)`, where `None` is signal 0 (a probe):
+/// process group `group`, the caller's own group for 0, and the single
+/// process `-group` for a negative ID. `i32::MIN` has no negation, and
+/// the kernel answers it with ESRCH.
+fn kill_group(group: libc::pid_t, signal: Option<Signal>) -> rustix::io::Result<()> {
+    use rustix::process::{self, Pid};
+    if group == 0 {
+        return match signal {
+            Some(signal) => process::kill_current_process_group(signal),
+            None => process::test_kill_current_process_group(),
+        };
+    }
+    let (pid, whole_group) = if group > 0 {
+        (Pid::from_raw(group), true)
+    } else {
+        (group.checked_neg().and_then(Pid::from_raw), false)
+    };
+    let pid = pid.ok_or(rustix::io::Errno::SRCH)?;
+    match (whole_group, signal) {
+        (true, Some(signal)) => process::kill_process_group(pid, signal),
+        (true, None) => process::test_kill_process_group(pid),
+        (false, Some(signal)) => process::kill_process(pid, signal),
+        (false, None) => process::test_kill_process(pid),
     }
 }
 
@@ -671,6 +691,47 @@ mod tests {
         gone(pid)
     }
 
+    /// getpgid(2) with libc's answer shape: -1 when it fails.
+    fn pgid(pid: libc::pid_t) -> libc::pid_t {
+        rustix::process::getpgid(rustix::process::Pid::from_raw(pid))
+            .map_or(-1, |group| group.as_raw_nonzero().get())
+    }
+
+    /// `libc::kill(-group, signal)` as retire_group and sweep_group called
+    /// it before kill_group, errno included; `-i32::MIN` wrapped in release.
+    fn libc_kill(group: libc::pid_t, signal: libc::c_int) -> Result<(), i32> {
+        // SAFETY: kill(2) only on IDs this test owns or probes with 0.
+        match unsafe { libc::kill(group.wrapping_neg(), signal) } {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0)),
+        }
+    }
+
+    #[test]
+    fn kill_group_answers_as_kill_on_the_negated_id() {
+        let (mut child, _) = group_child("echo 0; exec sleep 30");
+        let live = child.id() as libc::pid_t;
+        let (mut dead, _) = group_child("echo 0");
+        let _ = dead.wait();
+        let dead = dead.id() as libc::pid_t;
+        let own = rustix::process::getpid().as_raw_nonzero().get();
+        let ids = [0, live, dead, -own, -dead, i32::MAX, i32::MIN];
+        for group in ids {
+            let ours = kill_group(group, None).map_err(|errno| errno.raw_os_error());
+            assert_eq!(ours, libc_kill(group, 0), "probe of {group}");
+        }
+        // A real signal takes the same route: CONT changes nothing here.
+        let ours = kill_group(live, Some(Signal::CONT)).map_err(|errno| errno.raw_os_error());
+        assert_eq!(ours, libc_kill(live, libc::SIGCONT));
+        assert_eq!(ours, Ok(()));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            kill_group(live, Some(Signal::CONT)).map_err(|errno| errno.raw_os_error()),
+            libc_kill(live, libc::SIGCONT)
+        );
+    }
+
     #[test]
     fn bridge_runs_in_its_own_group_and_learns_the_session_unit() {
         let envs = |command: &Command| {
@@ -693,8 +754,7 @@ mod tests {
 
         let (mut child, _) = group_child("echo 0; exec sleep 30");
         let pid = child.id() as libc::pid_t;
-        // SAFETY: getpgid(2) on our own live child.
-        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+        assert_eq!(pgid(pid), pid);
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -746,11 +806,7 @@ mod tests {
         // names itself once it leads that group.
         let (mut child, daemon) =
             group_child("setsid sh -c 'echo $$; exec sleep 30' & exec sleep 30");
-        // SAFETY: getpgid(2) on a live process.
-        assert_eq!(
-            unsafe { libc::getpgid(daemon as libc::pid_t) },
-            daemon as libc::pid_t
-        );
+        assert_eq!(pgid(daemon as libc::pid_t), daemon as libc::pid_t);
         let started = Instant::now();
         assert_eq!(retire_group(&mut child, SHUTDOWN_GRACE), (2, true));
         assert!(started.elapsed() < SHUTDOWN_GRACE);

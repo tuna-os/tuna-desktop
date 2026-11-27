@@ -243,6 +243,73 @@ mod display_readiness_tests {
     }
 }
 
+/// Send the events a render queued (frame `done`, presentation feedback, fifo
+/// releases) to the clients' sockets now rather than at the next dispatch.
+fn flush_rendered_events(display: &mut Display<State>, state: &State) -> Result<(), RuntimeError> {
+    crate::grid_trace::event(state, "flush_begin", format_args!("site=post_render"));
+    let flushed = display.flush_clients();
+    crate::grid_trace::event(
+        state,
+        "flush_end",
+        format_args!("site=post_render ok={}", flushed.is_ok()),
+    );
+    flushed.map_err(|e| RuntimeError::Dispatch(e.to_string()))
+}
+
+#[cfg(test)]
+mod rendered_event_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn frame_done_reaches_the_client_without_another_dispatch() {
+        let (mut compositor, mut wire, surface) = crate::grid_trace::tests::frame_client();
+        let output = smithay::output::Output::new(
+            "flush-test".into(),
+            smithay::output::PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: smithay::output::Subpixel::Unknown,
+                make: "test".into(),
+                model: "test".into(),
+            },
+        );
+        // The render path's sender: done is queued, not yet on the socket.
+        send_frames_surface_tree(
+            &surface,
+            &output,
+            Duration::ZERO,
+            Some(Duration::ZERO),
+            |_, _| Some(output.clone()),
+        );
+        let mut bytes = [0_u8; 4096];
+        assert!(
+            matches!(wire.read(&mut bytes), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "queued done must not reach the client before the render flush"
+        );
+        flush_rendered_events(&mut compositor.display, &compositor.state).unwrap();
+        let count = wire.read(&mut bytes).unwrap();
+        let words: Vec<u32> = bytes[..count]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_ne_bytes(*word))
+            .collect();
+        // wl_callback@5.done and @6.done (opcode 0, 12 bytes), each followed
+        // by wl_display.delete_id; no client request was dispatched between.
+        let mut done = Vec::new();
+        let mut at = 0;
+        while at + 1 < words.len() {
+            let (object, header) = (words[at], words[at + 1]);
+            let size = (header >> 16) as usize / 4;
+            if header & 0xffff == 0 && object != 1 && size == 3 {
+                done.push(object);
+            }
+            at += size.max(2);
+        }
+        assert_eq!(done, [5, 6]);
+    }
+}
+
 /// Default nested output size (physical pixels).
 const DEFAULT_WIDTH: i32 = 1280;
 const DEFAULT_HEIGHT: i32 = 800;
@@ -281,6 +348,13 @@ pub struct NestedSession {
     /// session normally runs inside a desktop that already has its own
     /// reader and accessibility manager (`--screen-reader`).
     pub screen_reader: bool,
+    /// Greeter mode (#1164): the login screen on GDM's daemon. The
+    /// supervised client is `tuna-greeter` (see [`resolve_greeter_bin`])
+    /// instead of the shell; there is no user session, so no lock screen,
+    /// no overview, no shell gestures and no Tuna session target, as
+    /// GNOME Shell's `gdm` session mode has none. Outputs, input and
+    /// accessibility are the same as in a user session.
+    pub greeter: bool,
 }
 
 /// Which display backend a session runs on.
@@ -344,6 +418,7 @@ impl NestedSession {
             backend: BackendChoice::Auto,
             startup_overview: false,
             screen_reader: false,
+            greeter: false,
         }
     }
 
@@ -500,13 +575,80 @@ pub fn resolve_shell_bin_in(
     exe_dir: Option<std::path::PathBuf>,
     path_var: Option<std::ffi::OsString>,
 ) -> std::path::PathBuf {
+    resolve_bin_in(&SHELL_BINARIES, configured, env_bin, exe_dir, path_var)
+}
+
+/// The login screen's client in greeter mode (#1164).
+pub const GREETER_BINARY: &str = "tuna-greeter";
+
+/// Greeter binary for a greeter session: explicit config, then
+/// `TUNA_GREETER_BIN`, then the sibling of this binary, then `PATH`, else
+/// the bare name for a spawn-time lookup.
+pub fn resolve_greeter_bin(configured: Option<&std::path::Path>) -> std::path::PathBuf {
+    resolve_greeter_bin_in(
+        configured,
+        std::env::var_os("TUNA_GREETER_BIN"),
+        current_exe_dir(),
+        std::env::var_os("PATH"),
+    )
+}
+
+/// [`resolve_greeter_bin`] with its inputs explicit, for tests.
+pub fn resolve_greeter_bin_in(
+    configured: Option<&std::path::Path>,
+    env_bin: Option<std::ffi::OsString>,
+    exe_dir: Option<std::path::PathBuf>,
+    path_var: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    resolve_bin_in(&[GREETER_BINARY], configured, env_bin, exe_dir, path_var)
+}
+
+/// Whether idle, suspend and logind's `Lock` lock the session. The login
+/// screen never locks: GDM 51's greeter profile sets
+/// `org.gnome.desktop.lockdown disable-lock-screen`
+/// (`data/dconf/defaults/00-upstream-settings`), so GNOME Shell's
+/// `screenShield.lock` refuses there, and the greeter has no lock surface
+/// to show.
+pub fn session_locks(greeter: bool) -> bool {
+    !greeter
+}
+
+/// Whether the session has the overview and workspaces: GNOME Shell's
+/// `gdm` mode has neither (`hasOverview`, `hasWorkspaces` false), so the
+/// login screen takes no Super, hot corner or shell swipe.
+pub fn session_has_overview(greeter: bool) -> bool {
+    !greeter
+}
+
+/// Whether the overview opens at start (`--startup-overview`, as GNOME
+/// greets a login): never on the login screen.
+pub fn startup_overview(requested: bool, greeter: bool) -> bool {
+    requested && session_has_overview(greeter)
+}
+
+/// Whether to send `READY=1` for `tuna-greeter.service` now: in greeter
+/// mode, once, when the greeter's layer first maps (a restarted greeter
+/// sends nothing more).
+pub fn greeter_ready_due(greeter: bool, layer_mapped: bool, sent: bool) -> bool {
+    greeter && layer_mapped && !sent
+}
+
+/// The first of `names` the inputs find, in [`resolve_shell_bin`]'s
+/// order; the last name, bare, when none is installed.
+fn resolve_bin_in(
+    names: &[&str],
+    configured: Option<&std::path::Path>,
+    env_bin: Option<std::ffi::OsString>,
+    exe_dir: Option<std::path::PathBuf>,
+    path_var: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
     if let Some(path) = configured {
         return path.to_owned();
     }
     if let Some(path) = env_bin.filter(|p| !p.is_empty()) {
         return std::path::PathBuf::from(path);
     }
-    for name in SHELL_BINARIES {
+    for name in names {
         if let Some(found) = exe_dir.as_deref().and_then(|dir| sibling_binary(dir, name)) {
             return found;
         }
@@ -514,12 +656,12 @@ pub fn resolve_shell_bin_in(
     let dirs: Vec<std::path::PathBuf> = path_var
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    for name in SHELL_BINARIES {
+    for name in names {
         if let Some(found) = dirs.iter().find_map(|dir| sibling_binary(dir, name)) {
             return found;
         }
     }
-    std::path::PathBuf::from(SHELL_BINARIES[1])
+    std::path::PathBuf::from(names[names.len() - 1])
 }
 
 #[cfg(test)]
@@ -618,6 +760,64 @@ mod shell_bin_tests {
             exe.path().join("tuna-shell-gtk")
         );
     }
+
+    #[test]
+    fn greeter_resolves_like_the_shell_under_its_own_name() {
+        let exe = tempfile::tempdir().unwrap();
+        let path = tempfile::tempdir().unwrap();
+        let exe_dir = Some(exe.path().to_owned());
+        let path_var = Some(path.path().as_os_str().to_owned());
+        let resolve = |env: Option<&str>| {
+            resolve_greeter_bin_in(None, env.map(Into::into), exe_dir.clone(), path_var.clone())
+        };
+        // A shell beside the compositor is never the greeter.
+        touch(exe.path(), "tuna-shell-gtk");
+        assert_eq!(resolve(None), std::path::PathBuf::from("tuna-greeter"));
+        touch(path.path(), "tuna-greeter");
+        assert_eq!(resolve(None), path.path().join("tuna-greeter"));
+        touch(exe.path(), "tuna-greeter");
+        assert_eq!(resolve(None), exe.path().join("tuna-greeter"));
+        assert_eq!(resolve(Some("")), exe.path().join("tuna-greeter"));
+        assert_eq!(
+            resolve(Some("/x/greeter")),
+            std::path::PathBuf::from("/x/greeter")
+        );
+    }
+
+    #[test]
+    fn the_login_screen_never_locks_and_has_no_overview() {
+        // A user session locks on idle, suspend and logind's Lock, and
+        // has the overview (Super, hot corner, swipes, startup overview).
+        assert!(session_locks(false));
+        assert!(session_has_overview(false));
+        assert!(startup_overview(true, false));
+        assert!(!startup_overview(false, false));
+        // GNOME Shell's gdm mode under GDM's greeter profile: none of it.
+        assert!(!session_locks(true));
+        assert!(!session_has_overview(true));
+        assert!(
+            !startup_overview(true, true),
+            "--startup-overview is ignored with --greeter"
+        );
+    }
+
+    #[test]
+    fn ready_is_sent_once_when_the_greeter_first_maps() {
+        assert!(!greeter_ready_due(true, false, false), "nothing mapped yet");
+        assert!(greeter_ready_due(true, true, false));
+        assert!(
+            !greeter_ready_due(true, true, true),
+            "a restarted greeter's map sends nothing more"
+        );
+        assert!(
+            !greeter_ready_due(true, false, true),
+            "between greeter restarts"
+        );
+        assert!(
+            !greeter_ready_due(false, true, false),
+            "a user session is no notify unit"
+        );
+    }
 }
 
 /// Summary of one nested run, for diagnostics (no sensitive content).
@@ -629,6 +829,9 @@ pub struct RunStats {
     pub clients: u64,
     /// Shell restarts consumed (initial spawn excluded).
     pub shell_restarts: u32,
+    /// Greeter mode only: the greeter's restart budget ran out, so the
+    /// session ended for GDM to restart the login screen.
+    pub greeter_exhausted: bool,
 }
 
 /// Ways the nested runtime can fail to start or run.
@@ -703,6 +906,10 @@ pub struct Runtime {
     manager: WindowManager,
     control: ControlHub,
     shell: ShellDriver,
+    /// [`NestedSession::greeter`]: the login screen, not a user session.
+    greeter: bool,
+    /// Greeter mode: `READY=1` went to systemd once the greeter mapped.
+    greeter_ready_sent: bool,
     orca: crate::orca::Reader,
     a11y_keyboard: Option<crate::a11y_keyboard::Monitor>,
     /// The IBus bridge, when IBus is installed.
@@ -851,6 +1058,9 @@ pub struct Runtime {
     remote_held: std::collections::HashMap<u64, RemoteHeld>,
     /// org.gnome.Mutter.InputCapture's input diversion (#1040).
     input_capture: crate::mutter::input_capture::Router,
+    /// The shell's Stop of a remote access grant, for the revocation scan
+    /// (#1162 F2).
+    remote_access_stops: std::sync::Arc<crate::mutter::RemoteAccessStops>,
     /// Keys the tablet action mappers' virtual keyboard holds (evdev).
     tablet_virtual_keys: std::collections::BTreeSet<u32>,
     /// The pad OSD labels the shell last received.
@@ -1073,6 +1283,18 @@ impl Runtime {
                     state.set_output_location(&out.name, out.loc);
                     state.note_output_global(&out.name, global);
                 }
+                // One lease device global per DRM device, native backend
+                // only (meta_wayland_drm_lease_manager_new).
+                match drm.lease_device(&dh) {
+                    Ok(device) => {
+                        eprintln!(
+                            "tuna-compositor: drm-lease: wp_drm_lease_device_v1 advertised ({} connector(s) for lease)",
+                            device.connector_count()
+                        );
+                        state.protocols.drm_lease = Some(device);
+                    }
+                    Err(e) => eprintln!("tuna-compositor: drm-lease: no lease device: {e}"),
+                }
                 let handle = event_loop.handle();
                 handle
                     .insert_source(sources.session, |event, _, rt: &mut Runtime| {
@@ -1080,6 +1302,11 @@ impl Runtime {
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
                 flips = Some(FlipLoop::new(sources.drm, &handle)?);
+                // Connector hotplug and lessee changes (Mutter's
+                // resources-changed and lease-changed) arrive as udev
+                // changes of the device: the lease device updates its
+                // leases and connectors first, so the desktop rescan sees
+                // the CRTCs leases still hold.
                 if let Some(udev) = sources.udev {
                     handle
                         .insert_source(udev, |event, _, rt: &mut Runtime| {
@@ -1092,6 +1319,9 @@ impl Runtime {
                             }
                             if matches!(&rt.backend, Backend::Drm(drm) if drm.is_device(device_id))
                             {
+                                if let Some(lease) = rt.state.protocols.drm_lease.as_mut() {
+                                    lease.device_changed();
+                                }
                                 rt.on_drm_hotplug();
                             }
                         })
@@ -1247,7 +1477,11 @@ impl Runtime {
         let shell_policy = RestartPolicy::default();
         let mut shell = ShellDriver::new(
             shell_policy,
-            resolve_shell_bin(session.shell_bin.as_deref()),
+            if session.greeter {
+                resolve_greeter_bin(session.shell_bin.as_deref())
+            } else {
+                resolve_shell_bin(session.shell_bin.as_deref())
+            },
             session.socket_name.clone(),
             control_path,
         );
@@ -1318,17 +1552,27 @@ impl Runtime {
             );
         }
 
-        // linux-dmabuf lists exactly what this renderer imports (#89).
+        // linux-dmabuf lists exactly what this renderer imports (#89),
+        // with feedback naming the renderer's device as Mutter's does.
         let mut backend = backend;
         let mut state = state;
         {
             use smithay::backend::renderer::ImportDma;
-            let formats: Vec<_> = match &mut backend {
-                Backend::Winit(winit) => winit.renderer().dmabuf_formats().into_iter().collect(),
+            let (formats, main_device): (Vec<_>, _) = match &mut backend {
+                Backend::Winit(winit) => {
+                    let renderer = winit.renderer();
+                    (
+                        renderer.dmabuf_formats().into_iter().collect(),
+                        crate::protocols::renderer_main_device(renderer),
+                    )
+                }
                 #[cfg(feature = "drm")]
-                Backend::Drm(drm) => drm.renderer.dmabuf_formats().into_iter().collect(),
+                Backend::Drm(drm) => (
+                    drm.renderer.dmabuf_formats().into_iter().collect(),
+                    crate::protocols::renderer_main_device(&drm.renderer),
+                ),
             };
-            state.enable_dmabuf(formats);
+            state.enable_dmabuf(formats, main_device);
         }
         // On software GL the shell draws with cairo. Telling it here saves
         // it a GL context of its own made only to read GL_RENDERER, which
@@ -1381,6 +1625,8 @@ impl Runtime {
         let capture_authority = crate::capture_security::Authority::default();
         let introspect = crate::introspect::start(state.desktop_size(), capture_authority.clone());
         let input_capture = crate::mutter::input_capture::Router::default();
+        let remote_access_stops: std::sync::Arc<crate::mutter::RemoteAccessStops> =
+            Default::default();
         event_loop
             .handle()
             .insert_source(
@@ -1395,6 +1641,7 @@ impl Runtime {
                     display_share.clone(),
                     color_share.clone(),
                     input_capture.sessions(),
+                    remote_access_stops.clone(),
                 ),
                 |event, _, rt: &mut Runtime| {
                     if let calloop::channel::Event::Msg(request) = event {
@@ -1532,6 +1779,8 @@ impl Runtime {
             manager,
             control,
             shell,
+            greeter: session.greeter,
+            greeter_ready_sent: false,
             ime: crate::ime::ImeBridge::configured(&session.socket_name),
             overlay,
             wallpaper: Wallpaper::new(),
@@ -1638,6 +1887,7 @@ impl Runtime {
             cast_grants: Default::default(),
             remote_held: Default::default(),
             input_capture,
+            remote_access_stops,
             tablet_virtual_keys: Default::default(),
             pad_osd_labels_sent: None,
             introspect,
@@ -1737,7 +1987,7 @@ impl Runtime {
             }
         }
         // GNOME Shell greets a login with the overview.
-        if session.startup_overview {
+        if startup_overview(session.startup_overview, session.greeter) {
             runtime.control.set_overview(true);
         }
         Ok((runtime, event_loop))
@@ -1919,6 +2169,13 @@ impl Runtime {
         if let Backend::Drm(drm) = &mut self.backend {
             drm.on_session_event(event);
         }
+        if let Some(lease) = self.state.protocols.drm_lease.as_mut() {
+            if activated {
+                lease.resume();
+            } else {
+                lease.pause();
+            }
+        }
         // Monitors may have come or gone while another VT
         // owned the device.
         if activated {
@@ -1930,6 +2187,12 @@ impl Runtime {
     /// snapshots), overview dismissed, and the exclusive lock surface
     /// up with an empty list — no window titles while locked.
     fn engage_lock(&mut self) {
+        // The login screen never locks ([`session_locks`]): idle, suspend
+        // and logind's Lock leave it as it is.
+        if !session_locks(self.greeter) {
+            self.lock.unlock(self.lock_now_ms());
+            return;
+        }
         // Motion that came before the lock is the session's, not the shield's.
         self.flush_motion();
         // Track lifecycle separately: idle check_timeout has already locked its flag.
@@ -2449,7 +2712,8 @@ impl Runtime {
         }
         // Swipes of three or more fingers are the shell's (GNOME 51):
         // consumed here. Other swipes reach the client.
-        if self.shell_swipe_input(&input) {
+        // The login screen has no workspaces or overview to swipe to.
+        if session_has_overview(self.greeter) && self.shell_swipe_input(&input) {
             self.publish_workspace_progress();
             return;
         }
@@ -2499,7 +2763,9 @@ impl Runtime {
             let inhibited =
                 matches!(input, ManagerInput::Key { .. }) && self.state.shortcuts_inhibited();
             let popup = crate::layer::exclusive_popup_keyboard_layer(&self.state).is_some();
-            let action = if inhibited || popup {
+            // The login screen has no overview (`gdm` mode's hasOverview
+            // is false): Super and the hot corner do nothing.
+            let action = if inhibited || popup || !session_has_overview(self.greeter) {
                 self.triggers.cancel();
                 TriggerAction::None
             } else {
@@ -2850,6 +3116,8 @@ impl Runtime {
             // Never emit key identities that could expose credential input.
             "seat_pressed_key_count": self.state.pressed_key_count(),
             "x11_ready": x11_ready,
+            "bell_rings": self.state.bell_rings(),
+            "bell_policy": self.state.protocols.bell.policy(),
             "idle_timeout_ms": self.lock.timeout_ms(),
             "idle_blank_alpha": self.blank_alpha(),
             "power_save_mode": self.power_save.mode(),
@@ -2913,11 +3181,20 @@ impl Runtime {
                 "app_id": app_of(w.id),
                 "introspect_eligible": self.manager.is_introspect_eligible(w.id),
                 "x11_window_id": self.manager.x11_window_id(w.id),
+                // `_NET_WM_ICON_GEOMETRY`, the X11 client's minimize target.
+                "client_icon_geometry": self.manager.client_icon_geometry(w.id)
+                    .map(|r| [r.loc.x, r.loc.y, r.size.w, r.size.h]),
                 "parent_window_id": self.manager.transient_parent(w.id),
                 "application_window_id": self.manager.application_window(w.id),
                 "icon": model.window(w.id).and_then(|w| w.icon.clone()),
                 "workspace": w.workspace,
                 "rect": [w.geometry.loc.x, w.geometry.loc.y, w.geometry.size.w, w.geometry.size.h],
+                // The committed buffer, client shadows included (GNOME's buffer rect).
+                "buffer_rect": self.manager.surface_of(w.id).and_then(|s| {
+                    let size = crate::windows::buffer_size(&s)?;
+                    let origin = crate::popup::surface_origin(&s, w.geometry.loc);
+                    Some([origin.x, origin.y, size.w, size.h])
+                }),
             })).collect::<Vec<_>>(),
             "previews": previews,
             "thumbnails": thumbnails,
@@ -2986,6 +3263,9 @@ impl Runtime {
             "workspaces_only_on_primary": policy.only_on_primary,
             "edge_tiling": policy.edge_tiling,
             "center_new_windows": self.input_settings.center_new_windows,
+            "auto_maximize": self.input_settings.auto_maximize,
+            "overlay_key": self.input_settings.overlay_key,
+            "overlay_keycodes": self.triggers.overlay_keycodes(),
         });
         // Bottom-to-top stacking and GNOME's live focus policy (P-WM-09).
         doc["stacking"] = serde_json::json!(self.manager.stacking_order());
@@ -3000,6 +3280,8 @@ impl Runtime {
             "focus_change_on_pointer_rest": focus_policy.focus_change_on_pointer_rest,
         });
         doc["window_lifecycle"] = self.manager.window_lifecycle().to_json();
+        // Published dash icons; minimize uses one only while the dash shows.
+        doc["dash_icon_targets"] = self.manager.icon_geometries_json();
         doc["menu_close"] = self.menu_close.to_json();
         doc["modal_dim"] = self.manager.modal_dim().to_json();
         doc["frame_cost"] = self
@@ -3008,6 +3290,9 @@ impl Runtime {
             .map(|(name, cost)| (name.clone(), cost.to_json()))
             .collect::<serde_json::Map<_, _>>()
             .into();
+        // The outputs whose lock surface the compositor draws while
+        // locked; the others show only the lock background.
+        doc["lock_outputs"] = self.state.lock_surface_outputs().into();
         // Windows whose frame callbacks run at the hidden rate, or not at
         // all once suspended.
         let clones_shown = self.overview_motion.progress() > 0.0
@@ -3082,6 +3367,8 @@ impl Runtime {
         doc["animation_clock_ms"] =
             serde_json::json!(manual.then(|| self.animation_clock.now().as_millis() as u64));
         doc["overview_motion"] = self.overview_motion.diagnostics();
+        // Pending app launches behind the busy cursor (#1193).
+        doc["startup"] = self.state.startup.snapshot(Instant::now());
         doc["cursor"] = self
             .cursor
             .diagnostics(self.animation_clock.now(), self.is_locked());
@@ -3174,7 +3461,7 @@ impl Runtime {
         if let Backend::Drm(drm) = &self.backend {
             doc["tablets"] = drm.tablets_introspect();
         }
-        let doc = doc.to_string();
+        let doc = crate::grid_trace::operation(&self.state, "state_serialize", || doc.to_string());
         publisher.publish(doc);
     }
 
@@ -4541,24 +4828,6 @@ impl Runtime {
             self.cast_grants.clear();
             return;
         }
-        // A cast window that closed ends its session, as in Mutter.
-        let manager = &self.manager;
-        self.casts.retain(|cast| {
-            let gone =
-                matches!(cast.target, CastTarget::Window(id) if manager.geometry(id).is_none());
-            if gone || cast.failed() {
-                if let Some(grant) = self.cast_grants.get(&cast.session_id) {
-                    grant.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-                cast.close();
-            }
-            !cast.failed()
-                && !gone
-                && !self
-                    .cast_grants
-                    .get(&cast.session_id)
-                    .is_none_or(|grant| grant.load(std::sync::atomic::Ordering::SeqCst))
-        });
         // Window casts follow their window's size.
         for index in 0..self.casts.len() {
             if let CastTarget::Window(id) = self.casts[index].target {
@@ -4567,6 +4836,30 @@ impl Runtime {
                 }
             }
         }
+        let guard = self.cast_outputs.lock().ok();
+        let outputs = guard.as_deref().map_or(&[][..], Vec::as_slice);
+        // A cast window that closed or a recorded monitor that left the
+        // layout ends its session, as in Mutter.
+        let manager = &self.manager;
+        crate::screencast::end_gone(&mut self.casts, &self.cast_grants, outputs, |id| {
+            manager.geometry(id).is_some()
+        });
+        // A kept monitor cast follows its monitor's mode (a scale switch
+        // that keeps the logical rect), as Mutter's monitor source does.
+        for cast in &mut self.casts {
+            let size = match (&cast.target, &cast.monitor) {
+                (CastTarget::Monitor(_), Some(recorded)) => {
+                    crate::mutter::monitor_after_change(recorded, outputs)
+                        .map(|o| (o.width, o.height))
+                }
+                _ => None,
+            };
+            if let Some((w, h)) = size {
+                cast.resize(w, h);
+            }
+        }
+        // An area cast with no output under it gets no frames
+        // (meta-stream-source-area.c watches only the views over it).
         let wanted: Vec<(usize, CastTarget, (i32, i32))> = self
             .casts
             .iter()
@@ -4576,6 +4869,7 @@ impl Runtime {
                     .map(|size| (i, cast.target.clone(), size))
             })
             .collect();
+        drop(guard);
         let xrgb = smithay::backend::allocator::Fourcc::Xrgb8888;
         for (index, target, size) in wanted {
             let frame = match &target {
@@ -4590,16 +4884,29 @@ impl Runtime {
                     };
                     self.render_pixels(output, xrgb)
                 }
-                CastTarget::Area(connector, area) => {
+                CastTarget::Area(logical) => {
+                    // Like meta-stream-source-area.c on_monitors_changed,
+                    // watch the current view over the fixed stage region,
+                    // not the connector that was there at RecordArea.
+                    let mapped = self
+                        .cast_outputs
+                        .lock()
+                        .ok()
+                        .and_then(|outputs| crate::mutter::area_on_output(&outputs, *logical));
+                    let Some((snapshot, area)) = mapped else {
+                        // No view covers it: keep the stream open and idle.
+                        continue;
+                    };
+                    self.casts[index].resize(area.2, area.3);
                     let output = match &self.backend {
                         Backend::Winit(_) => None,
                         #[cfg(feature = "drm")]
-                        Backend::Drm(_) => Some(connector.as_str()),
+                        Backend::Drm(_) => Some(snapshot.connector.as_str()),
                     };
                     #[cfg(not(feature = "drm"))]
-                    let _ = connector;
+                    let _ = snapshot;
                     self.render_pixels(output, xrgb).and_then(|(w, h, pixels)| {
-                        let cropped = crate::screencast::crop(&pixels, (w, h), *area);
+                        let cropped = crate::screencast::crop(&pixels, (w, h), area);
                         if cropped.is_none() {
                             eprintln!(
                                 "tuna-compositor: screen cast area {area:?} is not inside the {w}x{h} frame ({} bytes)",
@@ -4610,12 +4917,25 @@ impl Runtime {
                     })
                 }
             };
-            let Some((w, h, bgrx)) = frame else {
+            let Some(cast) = self.casts.get_mut(index) else {
                 continue;
             };
-            if let Some(cast) = self.casts.get_mut(index) {
-                cast.send_frame(w, h, &bgrx);
-            }
+            let Some((w, h, bgrx)) = frame else {
+                // Once per gap, so a cast of an output that cannot render
+                // shows in the log without flooding it.
+                if !cast.frameless {
+                    cast.frameless = true;
+                    if let CastTarget::Monitor(output) = &target {
+                        eprintln!(
+                            "tuna-compositor: screen cast {}: output {output} gave no frame",
+                            cast.session_id
+                        );
+                    }
+                }
+                continue;
+            };
+            cast.frameless = false;
+            cast.send_frame(w, h, &bgrx);
         }
     }
 
@@ -4847,6 +5167,7 @@ impl Runtime {
                 stream_id,
                 grant,
                 target,
+                monitor,
                 signal,
             } => {
                 if self.is_locked() || grant.load(std::sync::atomic::Ordering::SeqCst) {
@@ -4864,25 +5185,40 @@ impl Runtime {
                     }
                 }
                 let size = match &target {
-                    crate::mutter::CastTarget::Monitor(connector) => self
-                        .cast_outputs
-                        .lock()
-                        .ok()
-                        .and_then(|o| o.iter().find(|o| &o.connector == connector).cloned())
-                        .map(|o| (o.width, o.height)),
+                    // A monitor that changed since RecordMonitor already
+                    // stopped its stream in Mutter (`on_monitors_changed`).
+                    crate::mutter::CastTarget::Monitor(connector) => {
+                        self.cast_outputs.lock().ok().and_then(|outputs| {
+                            match &monitor {
+                                Some(recorded) => {
+                                    crate::mutter::monitor_after_change(recorded, &outputs)
+                                }
+                                None => outputs.iter().find(|o| &o.connector == connector),
+                            }
+                            .map(|o| (o.width, o.height))
+                        })
+                    }
                     crate::mutter::CastTarget::Window(id) => {
                         self.window_pixel_size(*id).map(|(size, _)| size)
                     }
-                    crate::mutter::CastTarget::Area(_, (_, _, w, h)) => Some((*w, *h)),
+                    crate::mutter::CastTarget::Area(logical) => self
+                        .cast_outputs
+                        .lock()
+                        .ok()
+                        .and_then(|outputs| crate::mutter::area_on_output(&outputs, *logical))
+                        .map(|(_, (_, _, w, h))| (w, h)),
                 };
-                let Some((width, height)) = size else {
+                let Some(size) = size else {
+                    if let Some(grant) = self.cast_grants.get(&session_id) {
+                        grant.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     signal.session_closed(session_id);
                     return;
                 };
                 let Some(pw) = self.pipewire.as_ref() else {
                     return;
                 };
-                match pw.start_cast(session_id, stream_id, target, width, height, signal) {
+                match pw.start_cast(session_id, stream_id, target, monitor, size, signal) {
                     Some(cast) => self.casts.push(cast),
                     None => eprintln!("tuna-compositor: screen cast: stream failed to start"),
                 }
@@ -4915,6 +5251,8 @@ impl Runtime {
                 self.set_power_save_mode(mode);
                 let _ = reply.send(());
             }
+            // GNOME 51's remote access indicators follow these (#1162 F2).
+            crate::mutter::ToLoop::RemoteAccess(handles) => self.control.set_remote_access(handles),
         }
     }
 
@@ -5020,6 +5358,7 @@ impl Runtime {
             .apply_workspace_policy(&mut self.state, settings.workspace_policy);
         self.manager
             .set_window_placement(settings.center_new_windows, settings.right_to_left);
+        self.manager.set_auto_maximize(settings.auto_maximize);
         // Release delayed/synthetic input under the OLD map. An unrelated
         // preference change must not reinstall the map or lose held state.
         if aids::keymap_changed(&self.input_settings, &settings) {
@@ -5029,6 +5368,9 @@ impl Runtime {
         } else {
             self.manager.apply_keyboard_repeat(&settings);
         }
+        // mutter's overlay-key, resolved against the keymap now installed.
+        let keymap = crate::windows::keymap_keysyms(&mut self.state);
+        self.triggers.set_overlay_key(&settings.overlay_key, keymap);
         self.triggers.set_hot_corner(settings.hot_corners);
         self.triggers.set_right_to_left(settings.right_to_left);
         self.configure_input_aids(&settings.keyboard_aids, &settings.pointer_aids);
@@ -5279,7 +5621,7 @@ impl Runtime {
                 clock.saturating_sub(*start).as_secs_f64()
                     < 0.2 * self.input_settings.motion.slowdown()
             })
-            || self.state.protocols.bell.visual(now).is_some()
+            || self.state.protocols.bell.visual_active()
             || self.shell_swipe.active()
             || !self.casts.is_empty()
             // A running PAM worker publishes its terminal phase before
@@ -5369,6 +5711,8 @@ impl Runtime {
             self.state.window_sessions().save_deadline(),
             // The lock conversation's shared idle/total deadline.
             self.auth.next_deadline(),
+            // A pending launch's startup sequence timing out (#1193).
+            self.state.startup.next_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -5522,16 +5866,28 @@ impl Runtime {
         // or take over from an owner that went away (MetaClipboardManager).
         self.state.retain_clipboard();
         self.admit_security_contexts();
-        self.display
-            .flush_clients()
-            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        crate::grid_trace::event(&self.state, "flush_begin", format_args!("site=pre_render"));
+        let flushed = self.display.flush_clients();
+        crate::grid_trace::event(
+            &self.state,
+            "flush_end",
+            format_args!("site=pre_render ok={}", flushed.is_ok()),
+        );
+        flushed.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
         self.manager.reconcile(&mut self.state);
+        crate::grid_trace::stage(&self.state, "reconciled");
+        // mutter's startup_sequence_timeout: the busy cursor ends with
+        // the last pending launch, and that frame is drawn.
+        if self.state.startup.expire(Instant::now()) {
+            self.active_at = Instant::now();
+        }
         self.state.window_sessions_mut().save_if_due(Instant::now());
         self.focus_policy_tick();
         self.client_dnd_tick();
         self.alive_checks_tick();
         self.tablet_settings_tick();
         self.poll_input_aids();
+        crate::grid_trace::stage(&self.state, "input_aids");
         #[cfg(feature = "xwayland")]
         // DISPLAY may be a reserved idle listener. An icon helper must not
         // connect and accidentally activate XWayland before a real client.
@@ -5545,6 +5901,7 @@ impl Runtime {
                 }
             }
         }
+        crate::grid_trace::stage(&self.state, "x11_icons");
         // A client's pointer warp moved the manager's pointer: the
         // drawn cursor follows (#89).
         // Not while coalesced motion is pending: the backend's pointer
@@ -5595,6 +5952,7 @@ impl Runtime {
                 .set_seat_touch_mode(drm.touch_mode().touch_mode());
         }
         let outcome = self.control.poll(self.manager.model_mut());
+        crate::grid_trace::stage(&self.state, "control_poll");
         // What reached a socket after an idle wait ended (`idle_tick`).
         let arrived = requests > 0 || outcome.received;
         for workspace in outcome.departed_workspaces.iter().copied() {
@@ -5627,6 +5985,17 @@ impl Runtime {
         // gnome-shell's close dialog answers (#1035): Wait or Force Quit.
         for (window, response) in outcome.close_dialog_responses {
             self.manager.close_dialog_response(window, response);
+        }
+        // The shell's app launches: busy cursor until the window maps.
+        for (app_id, wm_class) in outcome.startup_sequences {
+            self.state
+                .startup
+                .add_launch(app_id, wm_class, Instant::now());
+            self.active_at = Instant::now();
+        }
+        // The indicator's Stop: the scan revokes the grant for good.
+        for (kind, id) in outcome.remote_access_stops {
+            self.remote_access_stops.stop(kind, id);
         }
         self.queue_close_dialogs();
         if let Some(request) = self.state.take_shortcut_consent_update() {
@@ -5679,6 +6048,7 @@ impl Runtime {
         }
         let diagnostics_visible = !self.is_locked();
         let reader_changed = self.orca.poll(diagnostics_visible).is_some();
+        crate::grid_trace::stage(&self.state, "orca_poll");
         if reader_changed || outcome.screen_reader.is_some() {
             self.control
                 .queue_message(tuna_shell_control::Message::ScreenReader {
@@ -5821,6 +6191,7 @@ impl Runtime {
         for connection in outcome.auth_cancel {
             self.cancel_verification(connection);
         }
+        crate::grid_trace::stage(&self.state, "control_outcome");
         self.idle_monitor.tick();
         // Idle timeout from input timestamps: lock the untouched session.
         // An idle inhibitor on a surface the user sees (video,
@@ -5880,6 +6251,7 @@ impl Runtime {
             ShellStatus::Waiting { delay_ms } => Some(delay_ms),
             _ => None,
         };
+        crate::grid_trace::stage(&self.state, "shell_poll");
         // While locked the overlay stays up with its empty list no
         // matter what the shell does: a shell restart while locked
         // keeps the lock screen up.
@@ -5906,11 +6278,25 @@ impl Runtime {
                         self.overlay.hide();
                     }
                 }
+                ShellStatus::Exhausted if self.greeter => {
+                    // No graphical login without the greeter: end the
+                    // session so GDM restarts the login screen (GDM's
+                    // own greeter-failure recovery) instead of leaving
+                    // an empty shield up.
+                    if !self.stats.greeter_exhausted {
+                        eprintln!(
+                            "tuna-compositor: greeter restart budget exhausted; ending the login screen"
+                        );
+                    }
+                    self.stats.greeter_exhausted = true;
+                    self.exit = true;
+                }
                 ShellStatus::Waiting { .. } | ShellStatus::Fault(_) | ShellStatus::Exhausted => {
                     self.refresh_overlay()
                 }
             }
         }
+        crate::grid_trace::stage(&self.state, "ime_overlay");
         // Only the supervised shell may hold a control session (#30):
         // between restarts nobody may.
         self.control.set_auth_owner(
@@ -5938,6 +6324,7 @@ impl Runtime {
             self.finish_unlock(attempt);
         }
         self.poll_conversations();
+        crate::grid_trace::stage(&self.state, "conversations");
 
         for event in self.shell.drain_events() {
             eprintln!("tuna-compositor: shell supervision: {event:?}");
@@ -6000,9 +6387,11 @@ impl Runtime {
             };
             self.xwayland.tick(now, Some(&mut spawner));
         }
+        crate::grid_trace::stage(&self.state, "xwayland");
         self.stats.shell_restarts = self.shell.restarts_used();
         self.proof_swipe_input();
         self.animation_clock.poll();
+        crate::grid_trace::stage(&self.state, "animation_clock");
         // GNOME completes a flashing screenshot reply when its feedback ends.
         // Locking or disabling animations also ends pending feedback promptly.
         let now = self.animation_clock.now();
@@ -6022,12 +6411,17 @@ impl Runtime {
             self.state.primary_size().w,
             self.input_settings.motion,
         );
+        crate::grid_trace::stage(&self.state, "dynamic_workspaces");
         self.publish_state();
+        crate::grid_trace::stage(&self.state, "publish_state");
         self.publish_cast_outputs();
+        crate::grid_trace::stage(&self.state, "publish_cast_outputs");
         #[cfg(feature = "drm")]
         self.privacy_screen_tick();
         self.publish_display_state();
+        crate::grid_trace::stage(&self.state, "publish_display_state");
         self.publish_overview_previews();
+        crate::grid_trace::stage(&self.state, "publish_overview_previews");
         if !idle
             || arrived
             || self.overlay.visible != overlay_shown
@@ -6051,11 +6445,11 @@ impl Runtime {
         // Send what this tick queued for the shell now, not at the next
         // wake, which may be far off (#503).
         self.control.flush(self.manager.model());
-        // Every backend queues render-produced callbacks. Send them before
-        // sleeping, without requiring another client request or render wake.
-        self.display
-            .flush_clients()
-            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        // Rendering queues frame callbacks (and presentation/fifo events) for
+        // the frame it produced. Send them now, on every backend: waiting for
+        // the next tick's pre-dispatch flush delayed the nested shell's next
+        // frame by a whole loop wake (#965). One flush per tick, no new wake.
+        flush_rendered_events(&mut self.display, &self.state)?;
         Ok(!self.exit)
     }
 
@@ -6463,6 +6857,7 @@ impl Runtime {
     /// show — no windows, no layer-shell chrome (panel, notifications),
     /// no wallpaper — over a dark lock background.
     fn render(&mut self) -> Result<(), RuntimeError> {
+        crate::grid_trace::event(&self.state, "render_begin", format_args!(""));
         let locked = self.is_locked();
         #[cfg(feature = "drm")]
         if locked {
@@ -6478,6 +6873,12 @@ impl Runtime {
                 .and_then(|name| self.state.lock_surface_for(&name))
                 .is_some();
         let shell_ready = !crate::layer::layer_layout(&self.state).is_empty();
+        if greeter_ready_due(self.greeter, shell_ready, self.greeter_ready_sent) {
+            // The login screen is up: `tuna-greeter.service` is ready.
+            self.greeter_ready_sent = true;
+            crate::session_services::notify_ready();
+            eprintln!("tuna-compositor: greeter mapped; READY=1");
+        }
         // Animation time, so proofs can sample transitions at exact delays.
         let now = self.animation_clock.now();
         if self.animation_clock.is_manual() {
@@ -6548,7 +6949,10 @@ impl Runtime {
             now,
             self.input_settings.motion,
             allowed,
-            self.input_settings.right_to_left,
+            crate::minimize::TargetContext {
+                right_to_left: self.input_settings.right_to_left,
+                dash_visible: self.control.overview_open(),
+            },
         );
         self.menu_close.step(
             renderer,
@@ -6619,6 +7023,8 @@ impl Runtime {
         // The pointer is the compositor's to draw (#342): hidden while
         // locked or blanked, as the software pointer always was.
         let cursor_shown = !locked && blank_alpha < 1.0;
+        // A pending app launch shows the busy cursor (#1193).
+        let busy = self.state.startup.pending(Instant::now());
         // A tablet tool in proximity draws its own cursor where it is, and
         // the pointer's is hidden meanwhile (Mutter's tool sprite).
         let tablet_cursor = self
@@ -6633,7 +7039,10 @@ impl Runtime {
                     .get(tool)
                     .cloned()
                     .unwrap_or_else(smithay::input::pointer::CursorImageStatus::default_named);
-                (crate::cursor::Pointer::resolve(&image, None, true), *pos)
+                (
+                    crate::cursor::Pointer::resolve(&image, None, true).busy(busy),
+                    *pos,
+                )
             });
         let cursor_pos_override = tablet_cursor.as_ref().map(|(_, pos)| *pos);
         let cursor_what = if let Some((what, _)) = tablet_cursor {
@@ -6644,6 +7053,7 @@ impl Runtime {
                 self.manager.grab_cursor(),
                 self.state.pointer_focused(),
             )
+            .busy(busy)
         } else {
             crate::cursor::Pointer::Hidden
         };
@@ -6659,6 +7069,7 @@ impl Runtime {
             #[cfg(feature = "drm")]
             self.performance_trace.cancel();
             self.power_save_frame_beat(&throttled);
+            crate::grid_trace::event(&self.state, "render_end", format_args!("reason=power_save"));
             return Ok(());
         }
         // Screen magnifier (#349): this frame's tracking points; the
@@ -6669,14 +7080,21 @@ impl Runtime {
         }
         let queued = match &mut self.backend {
             Backend::Winit(backend) => {
+                crate::grid_trace::event(&self.state, "nested_repaint_begin", format_args!(""));
                 backend.window().set_cursor_visible(false);
                 let size = backend.window_size();
                 let age = self.winit_age;
                 let mut presented: PresentedFrame = None;
                 {
-                    let (renderer, mut framebuffer) = backend
-                        .bind()
-                        .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                    crate::grid_trace::event(&self.state, "nested_bind_begin", format_args!(""));
+                    let bound = backend.bind();
+                    crate::grid_trace::event(
+                        &self.state,
+                        "nested_bind_end",
+                        format_args!("ok={}", bound.is_ok()),
+                    );
+                    let (renderer, mut framebuffer) =
+                        bound.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                     let view = View {
                         offset: (0, 0),
                         scale: self.scale,
@@ -6784,7 +7202,15 @@ impl Runtime {
                     let passes = [
                         Tracked::pass(&paper, 1.0),
                         Tracked::pass(&previews, view.scale),
-                        Tracked::covered_pass(&elements.elements, view.scale, &cover),
+                        // A blur reads what lies under the windows in
+                        // front of it, so with one in the frame nothing is
+                        // culled (#503's cover only when no surface blurs).
+                        if elements.blur_markers.is_empty() {
+                            Tracked::covered_pass(&elements.elements, view.scale, &cover)
+                        } else {
+                            Tracked::pass(&elements.elements, view.scale)
+                        },
+                        Tracked::pass(&elements.blur_markers, 1.0),
                         Tracked::pass(&elements.tile, 1.0),
                         Tracked::pass(&elements.top, view.scale),
                         elements
@@ -6850,6 +7276,11 @@ impl Runtime {
                     if reset {
                         self.winit_tracker = None;
                     }
+                    crate::grid_trace::event(
+                        &self.state,
+                        "nested_repaint_decision",
+                        format_args!("present={present} pending_callbacks={timing} reset={reset}"),
+                    );
                     if present {
                         let tracker = self.winit_tracker.get_or_insert_with(|| {
                             smithay::backend::renderer::damage::OutputDamageTracker::new(
@@ -6869,7 +7300,7 @@ impl Runtime {
                         let damage = if zoom_plan.is_some() {
                             vec![Rectangle::from_size(size)]
                         } else {
-                            damage
+                            elements.blur_damage(damage, Rectangle::from_size(size))
                         };
                         self.winit_signature = Some(signature);
                         let zoom_program = zoom_plan
@@ -6950,10 +7381,23 @@ impl Runtime {
                                 drew
                             }
                         };
-                        let _ = frame
-                            .finish()
-                            .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
-                        let cost = FrameCost::new(&drew, &elements.owners, &damage, size);
+                        crate::grid_trace::event(
+                            &self.state,
+                            "nested_finish_begin",
+                            format_args!(""),
+                        );
+                        let finished = frame.finish();
+                        crate::grid_trace::event(
+                            &self.state,
+                            "nested_finish_end",
+                            format_args!("ok={}", finished.is_ok()),
+                        );
+                        let _ = finished.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                        let content_roots = roots.len()
+                            - usize::from(lock_surface.is_some())
+                            - usize::from(presented_cursor.is_some());
+                        let cost = FrameCost::new(&drew, &elements.owners, &damage, size)
+                            .with_roots(locked, lock_surface.is_some(), content_roots);
                         presented = Some((damage, cost, presented_cursor));
                     }
                 }
@@ -6963,9 +7407,14 @@ impl Runtime {
                     // Unknown until the swap succeeds: a failed one leaves
                     // the back buffer's contents unknown.
                     self.winit_age = 0;
-                    backend
-                        .submit(Some(&damage))
-                        .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+                    crate::grid_trace::event(&self.state, "nested_submit_begin", format_args!(""));
+                    let submitted = backend.submit(Some(&damage));
+                    crate::grid_trace::event(
+                        &self.state,
+                        "nested_submit_end",
+                        format_args!("ok={}", submitted.is_ok()),
+                    );
+                    submitted.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
                     self.winit_age = backend.buffer_age().unwrap_or(0);
                     if let Some(surface) = &presented_cursor {
                         crate::cursor::Cursor::frame_done(
@@ -6985,6 +7434,11 @@ impl Runtime {
                     self.stats.frames += 1;
                     true
                 } else {
+                    crate::grid_trace::event(
+                        &self.state,
+                        "nested_repaint_skipped",
+                        format_args!("reason=no_repaint_required"),
+                    );
                     false
                 }
             }
@@ -7139,7 +7593,15 @@ impl Runtime {
                     let passes = [
                         Tracked::pass(&paper, 1.0),
                         Tracked::pass(&previews, view.scale),
-                        Tracked::covered_pass(&elements.elements, view.scale, &cover),
+                        // A blur reads what lies under the windows in
+                        // front of it, so with one in the frame nothing is
+                        // culled (#503's cover only when no surface blurs).
+                        if elements.blur_markers.is_empty() {
+                            Tracked::covered_pass(&elements.elements, view.scale, &cover)
+                        } else {
+                            Tracked::pass(&elements.elements, view.scale)
+                        },
+                        Tracked::pass(&elements.blur_markers, 1.0),
                         Tracked::pass(&elements.tile, 1.0),
                         Tracked::pass(&elements.top, view.scale),
                         elements
@@ -7241,7 +7703,7 @@ impl Runtime {
                     let damage = if zoom_plan.is_some() {
                         vec![Rectangle::from_size(logical)]
                     } else {
-                        damage
+                        elements.blur_damage(damage, Rectangle::from_size(logical))
                     };
                     let zoom_program = zoom_plan
                         .as_ref()
@@ -7373,6 +7835,10 @@ impl Runtime {
                     }
                     cursor_presented |= presented_cursor.is_some();
                     out.last_frame = Some(signature);
+                    let content_roots = mine.len()
+                        - usize::from(lock_surface.is_some())
+                        - usize::from(presented_cursor.is_some());
+                    let cost = cost.with_roots(locked, lock_surface.is_some(), content_roots);
                     self.frame_costs.insert(out.name.clone(), cost);
                     queued = true;
                 }
@@ -7403,6 +7869,7 @@ impl Runtime {
             // let redraws outrun the display and keep the loop busy.
             send_frame_callbacks(&self.state, &self.manager, &throttled);
         }
+        crate::grid_trace::event(&self.state, "render_end", format_args!("queued={queued}"));
         // Hidden windows get theirs on a slow beat of their own, whether
         // or not anything was drawn.
         self.hidden_frame_beat(&throttled);
@@ -7754,6 +8221,11 @@ struct Scene {
     /// The window each of `elements` belongs to (popups included), for
     /// reporting which windows occlusion hid; `None` for layers.
     owners: Vec<Option<u64>>,
+    /// Surfaces with an ext-background-effect blur region, by element.
+    blur: Vec<crate::background_blur::Behind>,
+    /// Their sample areas, for damage tracking only (never drawn): a
+    /// region that changes or moves repaints old and new areas.
+    blur_markers: Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement>,
 }
 
 /// A size-change snapshot, drawn at scale 1.
@@ -7786,7 +8258,76 @@ impl Scene {
             brightness: vec![1.0; above],
             dim_program: None,
             owners: vec![None; above],
+            blur: Vec::new(),
+            blur_markers: Vec::new(),
         }
+    }
+
+    /// Find the surfaces among `elements` with a committed
+    /// ext-background-effect blur region (none: no work at all), in
+    /// frame pixels at the pass `scale`, clipped to the surface.
+    fn with_blur(mut self, state: &State, scale: f64) -> Self {
+        use smithay::backend::renderer::element::{solid::SolidColorRenderElement, Element};
+        let blurred = state.protocols.background_effects.blurred();
+        if blurred.is_empty() {
+            return self;
+        }
+        for (index, element) in self.elements.iter().enumerate() {
+            let Some(surface) = blurred.iter().find(|b| b.id == *element.id()) else {
+                continue;
+            };
+            if surface.size.w <= 0 || surface.size.h <= 0 {
+                continue;
+            }
+            // Logical surface pixels to frame pixels, rescaling included.
+            let geometry = element.geometry(scale.into());
+            let sx = f64::from(geometry.size.w) / f64::from(surface.size.w);
+            let sy = f64::from(geometry.size.h) / f64::from(surface.size.h);
+            let rects: Vec<_> = surface
+                .rects
+                .iter()
+                .filter_map(|r| {
+                    let x0 = geometry.loc.x + (f64::from(r.loc.x) * sx).round() as i32;
+                    let y0 = geometry.loc.y + (f64::from(r.loc.y) * sy).round() as i32;
+                    let x1 = geometry.loc.x + (f64::from(r.loc.x + r.size.w) * sx).round() as i32;
+                    let y1 = geometry.loc.y + (f64::from(r.loc.y + r.size.h) * sy).round() as i32;
+                    Rectangle::new((x0, y0).into(), (x1 - x0, y1 - y0).into())
+                        .intersection(geometry)
+                })
+                .collect();
+            let behind = crate::background_blur::Behind {
+                index,
+                rects,
+                radius: (crate::background_blur::BLUR_RADIUS * sx.max(sy)) as f32,
+                alpha: element.alpha(),
+            };
+            let Some(sample) = behind.sample() else {
+                continue;
+            };
+            self.blur_markers.push(SolidColorRenderElement::new(
+                surface.marker.clone(),
+                sample,
+                surface.commit,
+                Color32F::TRANSPARENT,
+                Kind::Unspecified,
+            ));
+            self.blur.push(behind);
+        }
+        self
+    }
+
+    /// The frame's damage with every blur sample area it touches.
+    fn blur_damage(
+        &self,
+        damage: Vec<Rectangle<i32, smithay::utils::Physical>>,
+        output: Rectangle<i32, smithay::utils::Physical>,
+    ) -> Vec<Rectangle<i32, smithay::utils::Physical>> {
+        if self.blur.is_empty() {
+            return damage;
+        }
+        crate::native_repaint::coalesce(crate::background_blur::expand_damage(
+            damage, &self.blur, output,
+        ))
     }
 
     /// How many surfaces draw beneath the tile preview. Only this changes
@@ -8054,7 +8595,8 @@ fn scene_elements(
                 )
             })
             .unwrap_or_default(),
-        );
+        )
+        .with_blur(state, view.scale);
     }
     if overview.is_some() {
         // Overview (#54): windows are drawn as rescaled previews in
@@ -8079,7 +8621,7 @@ fn scene_elements(
                 ));
             }
         }
-        return Scene::flat(crate::layer::front_to_back(elements));
+        return Scene::flat(crate::layer::front_to_back(elements)).with_blur(state, view.scale);
     }
     let mut elements: Vec<PreviewElement> = Vec::new();
     let mut owners: Vec<Option<u64>> = Vec::new();
@@ -8126,7 +8668,7 @@ fn scene_elements(
                 split_from = Some(elements.len());
             }
             let buffer_size =
-                crate::windows::committed_size(surface.as_ref()).unwrap_or(geometry.size);
+                crate::windows::buffer_size(surface.as_ref()).unwrap_or(geometry.size);
             let buffer_geometry = Rectangle::new(
                 crate::popup::surface_origin(&surface, geometry.loc),
                 buffer_size,
@@ -8183,7 +8725,7 @@ fn scene_elements(
                 continue;
             }
             let buffer_size =
-                crate::windows::committed_size(surface.as_ref()).unwrap_or(geometry.size);
+                crate::windows::buffer_size(surface.as_ref()).unwrap_or(geometry.size);
             let buffer_geometry = Rectangle::new(
                 crate::popup::surface_origin(&surface, geometry.loc),
                 buffer_size,
@@ -8202,12 +8744,10 @@ fn scene_elements(
                 continue;
             }
             if let Some(frame) = manager.window_lifecycle().opening_frame(id) {
-                let r = crate::window_lifecycle::rect(geometry, frame);
-                let geo = crate::popup::window_geometry_loc(&surface);
-                let origin = view.physical(
-                    r.loc.x - f64::from(geo.x) * frame.scale.0,
-                    r.loc.y - f64::from(geo.y) * frame.scale.1,
-                );
+                // GNOME scales the whole actor, client shadows included, so
+                // the pivot sits on the buffer rect (windowManager.js:1514).
+                let r = crate::window_lifecycle::rect(buffer_geometry, frame);
+                let origin = view.physical(r.loc.x, r.loc.y);
                 let alpha = frame.alpha * manager.render_alpha(&window);
                 elements.extend(surface_tree_bottom_to_top(renderer,&surface,origin,view.scale,alpha).into_iter().map(|e|smithay::backend::renderer::element::utils::RescaleRenderElement::from_element(e,origin,frame.scale)));
                 owners.resize(elements.len(), Some(id));
@@ -8308,7 +8848,10 @@ fn scene_elements(
         bell: Vec::new(),
         snapshots,
         owners: crate::layer::front_to_back(owners),
+        blur: Vec::new(),
+        blur_markers: Vec::new(),
     }
+    .with_blur(state, view.scale)
 }
 
 fn background_geometry(
@@ -8519,9 +9062,19 @@ fn draw_scene(
     draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan, opaque)
         .map_err(error)?;
     frame.clear_tex_program_override();
-    draw_slots(frame, scale, scene, &under, &under_plan, tint, opaque).map_err(error)?;
+    draw_slots(
+        frame,
+        output,
+        scale,
+        scene,
+        &under,
+        &under_plan,
+        tint,
+        opaque,
+    )
+    .map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan, opaque).map_err(error)?;
-    draw_slots(frame, scale, scene, &over, &over_plan, tint, opaque).map_err(error)?;
+    draw_slots(frame, output, scale, scene, &over, &over_plan, tint, opaque).map_err(error)?;
     set_tint(frame, 1.0);
     draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan, opaque).map_err(error)?;
     frame.clear_tex_program_override();
@@ -8675,9 +9228,21 @@ fn plan_slots(
         .iter()
         .map(|slot| {
             let plan = match *slot {
-                SceneSlot::Element(index) => occlusion
-                    .plan(scale, std::slice::from_ref(&scene.elements[index]))
-                    .remove(0),
+                SceneSlot::Element(index) => {
+                    let plan = occlusion
+                        .plan(scale, std::slice::from_ref(&scene.elements[index]))
+                        .remove(0);
+                    // What a background blur reads repaints beneath it.
+                    if let Some(sample) = scene
+                        .blur
+                        .iter()
+                        .find(|blur| blur.index == index)
+                        .and_then(crate::background_blur::Behind::sample)
+                    {
+                        occlusion.uncover(&[sample]);
+                    }
+                    plan
+                }
                 SceneSlot::Bell(k) => occlusion
                     .plan(1.0, std::slice::from_ref(&scene.bell[k].1))
                     .remove(0),
@@ -8690,8 +9255,12 @@ fn plan_slots(
         .unzip()
 }
 
+/// Draw the slots bottom to top; a surface with a background blur gets
+/// it painted under itself first, over what is already drawn.
+#[allow(clippy::too_many_arguments)]
 fn draw_slots(
     frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+    output: Rectangle<i32, smithay::utils::Physical>,
     scale: f64,
     scene: &Scene,
     slots: &[SceneSlot],
@@ -8701,6 +9270,22 @@ fn draw_slots(
 ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
     use crate::occlusion::draw_planned;
     for (slot, visible) in slots.iter().zip(plan).rev() {
+        if let SceneSlot::Element(index) = *slot {
+            if let Some(blur) = scene.blur.iter().find(|blur| blur.index == index) {
+                let under: Vec<_> = blur
+                    .rects
+                    .iter()
+                    .flat_map(|rect| visible.iter().filter_map(|v| v.intersection(*rect)))
+                    .collect();
+                crate::background_blur::draw_behind(
+                    frame,
+                    &under,
+                    blur.radius,
+                    blur.alpha,
+                    output,
+                )?;
+            }
+        }
         let visible = std::slice::from_ref(visible);
         let brightness = match *slot {
             SceneSlot::Element(index) => scene.brightness[index],
@@ -8903,9 +9488,7 @@ fn send_frame_callbacks(
         );
     }
     for (surface, _, _) in crate::layer::layer_layout(state) {
-        send_frames_surface_tree(&surface, &output, time, Some(Duration::ZERO), |_, _| {
-            Some(output.clone())
-        });
+        crate::grid_trace::send_layer_frames(state, &surface, &output, time);
     }
     // A drag's icon animates on frame callbacks too.
     if let Some(icon) = state.dnd_icon() {
@@ -9054,7 +9637,10 @@ fn run_loop(
     let (mut runtime, mut event_loop) = Runtime::launch(session)?;
     #[cfg(feature = "drm")]
     let _session_services = if matches!(runtime.backend, Backend::Drm(_)) {
-        Some(crate::session_services::publish(&session.socket_name))
+        Some(crate::session_services::publish(
+            &session.socket_name,
+            session.greeter,
+        ))
     } else {
         None
     };

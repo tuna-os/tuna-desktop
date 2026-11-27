@@ -37,7 +37,7 @@ schedule, dispatch or a pull request whose head repository is
 | --- | --- |
 | `tuna-ci-24.04` | select-lanes, check, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, native-reference-context, parity-ledger, docs-shots, ci-gate |
 | `tuna-ci-26.04` | journey, orca-speech, portal-security, remote-security, niri-parity |
-| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (pull requests: the primary lifecycle leg only; push, schedule and dispatch add the Orca 51 leg and both paired reference members), marlin-image (push, schedule and dispatch only), gdm51-native-package |
+| GitHub-hosted, always | arch-package, drm-smoke, hotplug (`ubuntu-26.04`), marlin-vm (pull requests: the primary lifecycle and automatic-timezone legs, plus the Orca 51 leg when parity-ledger runs; push, schedule and dispatch add the Orca 51 leg and both paired reference members), marlin-image (push, schedule and dispatch only), gdm51-native-package |
 
 Why the always-hosted lanes stay hosted:
 
@@ -47,6 +47,8 @@ Why the always-hosted lanes stay hosted:
   runner's kernel. On karnataka that is the shared host kernel under punjab
   and KubeVirt, a Fedora kernel the Ubuntu module install cannot target, and
   the module would expose a DRM device to the whole node.
+- **hotplug** loads `vkms` the same way and needs vkms configfs (Linux
+  6.19+), so it runs on the hosted `ubuntu-26.04` image's 7.0 kernel.
 - **marlin-vm** needs more than `/dev/kvm`: it runs
   `podman run --privileged --pid=host -v /dev:/dev … bootc install to-disk
   --via-loopback`, i.e. loop devices and a privileged container, which is
@@ -200,7 +202,8 @@ it can affect:
   `parity-ledger`), and any other code picks `gtk-shell` plus a rotating
   slice. Shared CI inputs still pick every lane.
 - A newer push supersedes the older run (`concurrency` with
-  `cancel-in-progress`, except for `main`).
+  `cancel-in-progress`, except for `main`). The superseded run queues no
+  `ci-gate` ([below](#queue-supersession-and-closed-pull-requests)).
 - `marlin-tuna-nightly` qualifies the published image on schedule and
   dispatch only; dispatch it on a branch to test a change to it.
 
@@ -215,6 +218,14 @@ performance baseline. Native concurrency keeps at most one running and one
 pending run per group; it replaces older pending runs, not every main run
 finishing in order. Existing schedule, manual and performance concurrency
 policies remain unchanged.
+
+`ci-gate` runs `if: ${{ !cancelled() }}`, so a cancelled run (superseded, or
+cancelled by hand) skips it instead of queueing it. With `if: always()` the
+superseded run's gate still waited for a `tuna-ci-24.04` slot, and its
+replacement in the same concurrency group stayed `pending` until that slot
+came, for hours while the queue was full (#1258). In a run that is not
+cancelled the gate still runs and still fails when a selected job failed,
+timed out or was cancelled on its own.
 
 Closing a PR does not create a newer run in its concurrency group, so native
 supersession cannot retire its queued work. The repository-owned

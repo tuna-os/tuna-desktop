@@ -37,6 +37,9 @@ pub trait OverviewActions {
     fn close_overview(&self);
     /// Raise an existing window by compositor id.
     fn activate_window(&self, id: u64);
+    /// An app was launched (`app_id` its desktop id): the compositor shows
+    /// the busy cursor until its window maps (mutter's startup sequence).
+    fn launch_started(&self, _app_id: &str) {}
     /// Running windows as `(id, app_id)`.
     fn window_icon(&self, _id: u64) -> Option<String> {
         None
@@ -123,7 +126,10 @@ fn activate_app(
     match activation {
         // Do not spawn a replacement after a stale/denied activation request.
         Activation::Raise(window) => actions.activate_window(window),
-        Activation::Launch | Activation::NewWindow => spawn(entry, activation)?,
+        Activation::Launch | Activation::NewWindow => {
+            spawn(entry, activation)?;
+            actions.launch_started(&entry.app_id);
+        }
     }
     activated(activation);
     actions.close_overview();
@@ -583,6 +589,7 @@ impl OverviewUi {
             tuna_shell_control::APP_GRID_NAMESPACE,
             "tuna-overview-grid",
         );
+        crate::grid_animation::observe_page_clock(&grid);
         for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
             grid.set_anchor(edge, true);
         }
@@ -2566,11 +2573,11 @@ fn paged_grid(
             let button = gtk::Button::builder().child(&look).build();
             button.add_css_class("page-indicator");
             button.update_property(&[gtk::accessible::Property::Label(&format!("Page {}", i + 1))]);
-            sync_page_dot(&button, i, carousel.position());
+            let _ = sync_page_dot(&button, i, carousel.position());
             let pager = carousel.downgrade();
             button.connect_state_flags_changed(move |button, _| {
                 if let Some(pager) = pager.upgrade() {
-                    sync_page_dot(button, i, pager.position());
+                    let _ = sync_page_dot(button, i, pager.position());
                 }
             });
             let carousel = carousel.clone();
@@ -2587,7 +2594,10 @@ fn paged_grid(
             let mut samples = Vec::new();
             for (i, dot) in dots.iter().enumerate() {
                 let Some(dot) = dot.upgrade() else { continue };
-                let (scale, opacity, hover, pressed) = sync_page_dot(&dot, i, position);
+                let Some((scale, opacity, hover, pressed)) = sync_page_dot(&dot, i, position)
+                else {
+                    continue;
+                };
                 if tracing {
                     samples.push(format!(
                         "{i}:{scale:.6}:{opacity:.6}:{}:{}",
@@ -3162,16 +3172,24 @@ fn scale_and_fade(tile: &gtk::Widget, slot: &Rc<crate::grid_animation::Slot>, aw
 }
 
 /// pageIndicators.js _updateIndicator on page dot `index` with the
-/// pages drawn at `position`: its (scale, opacity, hover, pressed).
-fn sync_page_dot(button: &gtk::Button, index: usize, position: f64) -> (f64, f64, bool, bool) {
+/// pages drawn at `position`: its stored (scale, opacity, hover, pressed).
+/// A disposed button with no drawing child has no sample.
+fn sync_page_dot(
+    button: &gtk::Button,
+    index: usize,
+    position: f64,
+) -> Option<(f64, f64, bool, bool)> {
     let flags = button.state_flags();
     let hover = flags.contains(gtk::StateFlags::PRELIGHT);
     let pressed = flags.contains(gtk::StateFlags::ACTIVE);
     let (scale, opacity) = crate::grid_animation::page_dot_look(position, index, hover, pressed);
-    if let Some(look) = button.child().and_downcast::<crate::grid_animation::Zoom>() {
-        look.set_look(scale, opacity);
-    }
-    (scale, opacity, hover, pressed)
+    let look = button
+        .child()
+        .and_downcast::<crate::grid_animation::Zoom>()?;
+    look.set_look(scale, opacity);
+    // Trace what snapshot() will read, not the intended values: a setter
+    // defect must not be hidden by logging its inputs.
+    Some((look.scale().0, look.alpha(), hover, pressed))
 }
 
 /// Accept a dropped string on `widget`: `act` edits the folders and
@@ -3199,6 +3217,45 @@ fn on_drop(
         true
     });
     widget.add_controller(target);
+}
+
+#[cfg(test)]
+mod gtk_page_dot_tests {
+    use super::*;
+
+    #[test]
+    fn actual_gtk_page_dot_samples_observe_stored_look() {
+        if !crate::grid_animation::gtk_zoom_tests::grid_zoom_admitted() {
+            return;
+        }
+        assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
+        gtk::init().expect("actual GTK display required");
+        for index in 0..2 {
+            let look =
+                crate::grid_animation::Zoom::new(&gtk::Box::new(gtk::Orientation::Vertical, 0));
+            let button = gtk::Button::builder().child(&look).build();
+            for flags in [
+                gtk::StateFlags::NORMAL,
+                gtk::StateFlags::PRELIGHT,
+                gtk::StateFlags::PRELIGHT | gtk::StateFlags::ACTIVE,
+            ] {
+                button.unset_state_flags(gtk::StateFlags::PRELIGHT | gtk::StateFlags::ACTIVE);
+                button.set_state_flags(flags, false);
+                for position in [0.0, 0.15, 0.5, 0.875, 1.0] {
+                    let (scale, opacity, hover, pressed) =
+                        sync_page_dot(&button, index, position).expect("live page dot");
+                    let expected =
+                        crate::grid_animation::page_dot_look(position, index, hover, pressed);
+                    assert_eq!((scale, opacity), expected, "dot {index} at {position}");
+                    assert_eq!(look.scale(), (scale, scale), "observed stored scale");
+                    assert_eq!(look.alpha(), opacity, "observed stored opacity");
+                }
+            }
+            button.set_child(gtk::Widget::NONE);
+            assert_eq!(sync_page_dot(&button, index, 0.5), None);
+        }
+        println!("GRID-PAGE-DOTS pass samples observe stored scale/opacity through page, hover and pressed updates; no sample for disposed drawing");
+    }
 }
 
 #[cfg(test)]
@@ -3235,6 +3292,8 @@ mod app_activation_tests {
     struct Actions {
         windows: RefCell<Vec<(u64, Option<String>)>>,
         events: RefCell<Vec<String>>,
+        /// `launch_started` calls: the event before each, and the app id.
+        started: RefCell<Vec<(Option<String>, String)>>,
     }
     impl OverviewActions for Actions {
         fn running(&self) -> Vec<(u64, Option<String>)> {
@@ -3245,6 +3304,10 @@ mod app_activation_tests {
         }
         fn close_overview(&self) {
             self.events.borrow_mut().push("close".into());
+        }
+        fn launch_started(&self, app_id: &str) {
+            let before = self.events.borrow().last().cloned();
+            self.started.borrow_mut().push((before, app_id.to_owned()));
         }
         fn set_search(&self, _: bool) {}
         fn set_app_grid(&self, _: bool) {}
@@ -3461,6 +3524,42 @@ mod app_activation_tests {
         });
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
         assert!(actions.events.borrow().is_empty());
+        assert!(
+            actions.started.borrow().is_empty(),
+            "no startup sequence for a launch that never happened"
+        );
+    }
+
+    /// #1193: a launch or a new window begins the app's startup sequence
+    /// (the compositor's busy cursor) right after its spawn, under the
+    /// desktop id; raising a running window begins none.
+    #[test]
+    fn launches_and_new_windows_begin_a_startup_sequence_raises_do_not() {
+        let actions = Actions::default();
+        activate(&actions, &entry(DISKS), false).unwrap();
+        *actions.windows.borrow_mut() = vec![(1, Some("org.gnome.DiskUtility".into()))];
+        activate(&actions, &entry(DISKS), true).unwrap();
+        activate(&actions, &entry(DISKS), false).unwrap();
+        assert_eq!(
+            actions.take(),
+            [
+                "launch",
+                "zoom",
+                "close",
+                "new-window",
+                "zoom",
+                "close",
+                "activate:1",
+                "close"
+            ]
+        );
+        assert_eq!(
+            actions.started.take(),
+            [
+                (Some("launch".to_owned()), DISKS.to_owned()),
+                (Some("new-window".to_owned()), DISKS.to_owned()),
+            ]
+        );
     }
 }
 

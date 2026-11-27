@@ -86,6 +86,8 @@ mod a11y_shadow;
 pub mod animation;
 pub mod animation_clock;
 mod auth_owner;
+mod background_blur;
+pub mod background_effect;
 mod bell;
 pub mod buffer_upload;
 pub mod capture_security;
@@ -103,11 +105,13 @@ pub mod display_config;
 pub mod dnd_overview;
 #[cfg(feature = "drm")]
 pub mod drm;
+pub mod edge_resistance;
 pub mod edid;
 pub(crate) mod focus_caret;
 pub mod focus_policy;
 pub mod fprintd;
 pub mod frame_timing;
+mod grid_trace;
 pub mod icc;
 pub mod idle_monitor;
 mod idle_notify;
@@ -169,6 +173,7 @@ pub mod size_change;
 pub mod sleep;
 pub mod slideshow;
 pub mod spring;
+pub mod startup;
 pub mod state;
 mod state_snapshot;
 pub mod supervise;
@@ -322,6 +327,8 @@ pub struct State {
     /// Serial of the latest pointer button press sent to a client: Mutter's
     /// `grab_serial`, which xdg_toplevel.show_window_menu must name.
     pub(crate) pointer_press_serial: Option<Serial>,
+    /// Pending app launches' startup sequences: the busy cursor (#1193).
+    pub startup: startup::StartupNotification,
     /// Exact native parent at role destruction, consumed on the next reconcile.
     /// Smithay clears role data immediately after `toplevel_destroyed` returns.
     pub(crate) closed_toplevel_parents:
@@ -827,6 +834,7 @@ impl CompositorHandler for State {
         smithay::wayland::compositor::add_pre_commit_hook::<State, _>(
             surface,
             |state, _dh, surface| {
+                crate::grid_trace::commit(state, surface, true);
                 if state.dead_layer_surfaces.contains(&surface.id()) {
                     smithay::wayland::compositor::with_states(surface, |states| {
                         let mut cached = states
@@ -840,6 +848,7 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &wl_surface::WlSurface) {
+        crate::grid_trace::commit(self, surface, false);
         self.pointer_scene_dirty = true;
         self.commit_count = self.commit_count.wrapping_add(1);
         on_commit_buffer_handler::<State>(surface);
@@ -1325,6 +1334,7 @@ impl State {
             retired_output_globals: Vec::new(),
             window_requests: Vec::new(),
             pointer_press_serial: None,
+            startup: startup::StartupNotification::default(),
             closed_toplevel_parents: std::collections::HashMap::new(),
             pongs: Vec::new(),
             protocols: protocols::Protocols::new(dh),
@@ -1417,7 +1427,9 @@ impl State {
     /// removal live; it stays bindable until the runtime destroys it
     /// ([`take_retired_output_globals`](Self::take_retired_output_globals)),
     /// so a client binding it as it goes is not disconnected. Virtual
-    /// entries just drop. Returns whether an entry was removed.
+    /// entries just drop. A lock surface on the output goes with it: the
+    /// output that next takes the name waits for one of its own.
+    /// Returns whether an entry was removed.
     pub fn remove_output(&mut self, name: &str) -> bool {
         let Some(index) = self.outputs.iter().position(|entry| entry.name == name) else {
             return false;
@@ -1428,6 +1440,7 @@ impl State {
             self.retired_output_globals.push(id);
         }
         self.outputs.remove(index);
+        self.forget_output_lock_surface(name);
         if was_primary {
             if let Some(first) = self.outputs.first_mut() {
                 first.primary = true;
