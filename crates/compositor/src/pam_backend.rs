@@ -576,7 +576,7 @@ fn run_job(mut job: Job, factory: &Factory, shutdown: &AtomicBool, state: &Atomi
         nonce: rand::random(),
         request: job.serial,
         generation: job.serial,
-        uid: unsafe { libc::getuid() },
+        uid: rustix::process::getuid().as_raw(),
     };
     let mut supervisor = match factory(
         identity,

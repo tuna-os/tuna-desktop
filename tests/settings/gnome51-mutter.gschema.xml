@@ -23,5 +23,13 @@
       <default>true</default>
       <summary>Place new windows in the center</summary>
     </key>
+    <key name="auto-maximize" type="b">
+      <default>true</default>
+      <summary>Auto maximize nearly monitor sized windows</summary>
+    </key>
+    <key name="overlay-key" type="s">
+      <default>'Super'</default>
+      <summary>Modifier to use for extended window management operations</summary>
+    </key>
   </schema>
 </schemalist>

@@ -6,8 +6,11 @@
 //! app has a text field focused it grabs the keyboard and sends each
 //! key to an IBus input context (`ProcessKeyEvent`); IBus's preedit and
 //! commits go to the app, and keys IBus does not take go back through
-//! the virtual keyboard only this client is allowed. Without IBus it
-//! starts `ibus-daemon --panel disable`, as GNOME Shell does. The
+//! the virtual keyboard only this client is allowed. Without IBus in the
+//! session it brings the daemon up with exactly one owner: the session's
+//! `IBus Daemon for GNOME` user unit when there is one (the bridge waits
+//! for it, or asks the manager to start it), else an `ibus-daemon
+//! --panel disable` child of its own, as GNOME Shell does. The
 //! compositor starts ibus-x11 separately once its own XWayland is ready,
 //! so XIM never connects to the inherited host DISPLAY. One
 //! GLib main loop drives both the Wayland socket and IBus's bus.
@@ -41,7 +44,8 @@ use gio::glib;
 use gio::prelude::*;
 use tuna_shell_host::eprintln;
 use tuna_shell_host::ibus::{
-    address as ibus_address, debug, text as ibus_text, text_variant as ibus_text_variant,
+    address as ibus_address, daemon_plan, debug, parse_unit, restart_owned, session_unit,
+    text as ibus_text, text_variant as ibus_text_variant, Daemon, Unit, SESSION_INITIALIZED_TARGET,
 };
 use wayland_client::protocol::{wl_compositor, wl_registry, wl_seat, wl_surface};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
@@ -128,7 +132,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // IBus sends the context's signals to this connection only; they
     // queue here and are applied on the Wayland side, in order.
     let incoming: Rc<RefCell<VecDeque<FromIbus>>> = Rc::default();
-    let context = open_context(ibus_connection()?, &incoming)?;
+    let (bus, daemon) = ibus_connection()?;
+    let context = open_context(bus, &incoming)?;
 
     let conn = Connection::connect_to_env()?;
     let mut queue: EventQueue<Bridge> = conn.new_event_queue();
@@ -136,6 +141,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     conn.display().get_registry(&qh, ());
     let mut bridge = Bridge {
         context: Some(context),
+        daemon,
         incoming,
         ..Bridge::default()
     };
@@ -286,27 +292,173 @@ fn ibus_bus(address: &str) -> Result<gio::DBusConnection, glib::Error> {
     )
 }
 
-/// The IBus bus, starting the daemon when none runs (GNOME Shell's
-/// `ibus-daemon --panel disable`).
-fn ibus_connection() -> Result<gio::DBusConnection, Box<dyn std::error::Error>> {
-    if let Some(address) = ibus_address() {
-        if let Ok(bus) = ibus_bus(&address) {
-            return Ok(bus);
+/// How long the session's IBus unit may take to bring the daemon up
+/// (the session manager starts it with the session).
+const UNIT_WAIT: Duration = Duration::from_secs(60);
+/// How long a daemon the bridge itself started may take to publish its
+/// bus: what GNOME's session gives the same `ibus-daemon --panel disable`
+/// (`org.freedesktop.IBus.session.GNOME.service` is `Type=dbus`, so
+/// systemd's 90 s `DefaultTimeoutStartSec`). A loaded host has taken
+/// longer than 10 s; giving up sooner killed a daemon that was coming up
+/// and spent one of the compositor's few bridge restarts on starting over.
+const CHILD_WAIT: Duration = Duration::from_secs(90);
+/// How long a stopped daemon gets to quit before it is killed.
+const DAEMON_STOP_GRACE: Duration = Duration::from_millis(1500);
+
+/// An `ibus-daemon` the bridge started because the session has no unit
+/// for it, and supervises: not daemonized, so it stays the bridge's child
+/// (it still leads its own process group, as `ibus-daemon` always does,
+/// which the compositor retires with the bridge's at session end), and it
+/// dies with the bridge.
+struct OwnedDaemon {
+    child: std::process::Child,
+}
+
+impl OwnedDaemon {
+    /// GNOME Shell's `ibus-daemon --panel disable`, minus `--daemonize`.
+    fn spawn() -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        let mut command = std::process::Command::new("ibus-daemon");
+        command
+            .args(["--panel", "disable"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        if !debug() {
+            command.stderr(Stdio::null());
+        }
+        let parent = rustix::process::getpid();
+        // SAFETY: prctl(2) and getppid(2) are async-signal-safe; nothing
+        // else runs between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                rustix::process::set_parent_process_death_signal(Some(
+                    rustix::process::Signal::TERM,
+                ))
+                .map_err(std::io::Error::from)?;
+                // The bridge died before the setting took hold.
+                if rustix::process::getppid() != Some(parent) {
+                    return Err(rustix::io::Errno::SRCH.into());
+                }
+                Ok(())
+            });
+        }
+        Ok(Self {
+            child: command.spawn()?,
+        })
+    }
+
+    fn exited(&mut self) -> bool {
+        !matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// How the daemon ended, once it has (and was reaped here).
+    fn status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+}
+
+impl Drop for OwnedDaemon {
+    /// SIGTERM, a bounded wait for the daemon to quit (its engines and
+    /// `ibus-dconf` go with it), then SIGKILL, then the reap.
+    fn drop(&mut self) {
+        if self.exited() {
+            return;
+        }
+        if let Some(pid) = rustix::process::Pid::from_raw(self.child.id() as i32) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        }
+        let until = Instant::now() + DAEMON_STOP_GRACE;
+        while !self.exited() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !self.exited() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
     }
-    std::process::Command::new("ibus-daemon")
-        .args(["--panel", "disable", "--daemonize"])
-        .status()?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
+}
+
+/// `systemctl --user` with `args`: its output, or `None` when it did not
+/// run or failed.
+fn systemctl(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// What the user manager says about the session's IBus unit; with no
+/// unit named there is nothing to ask.
+fn session_unit_state(unit: Option<&str>) -> Unit {
+    let Some(unit) = unit else {
+        return Unit::Absent;
+    };
+    match systemctl(&["show", "-p", "LoadState", "-p", "ActiveState", unit]) {
+        Some(show) => parse_unit(&show, || {
+            systemctl(&["is-active", "--quiet", SESSION_INITIALIZED_TARGET]).is_some()
+        }),
+        None => Unit::Unknown,
+    }
+}
+
+/// The IBus bus, with exactly one party owning its daemon (#1014). In a
+/// session whose manager has an IBus unit (`TUNA_IBUS_UNIT`) that is the
+/// manager: the session starts it (the bridge runs before then, so it
+/// waits) and systemd stops it with the session. Starting a second daemon
+/// beside the unit's raced it for the bus file and left one behind
+/// at logout. Only without a unit does the bridge start `ibus-daemon
+/// --panel disable` itself, as its supervised child. The daemon, if the
+/// bridge owns one, comes back with the connection.
+fn ibus_connection(
+) -> Result<(gio::DBusConnection, Option<OwnedDaemon>), Box<dyn std::error::Error>> {
+    let unit = session_unit();
+    let mut deadline = Instant::now() + UNIT_WAIT;
+    let mut asked = false;
+    let mut daemon: Option<OwnedDaemon> = None;
+    loop {
         if let Some(address) = ibus_address() {
             if let Ok(bus) = ibus_bus(&address) {
-                return Ok(bus);
+                return Ok((bus, daemon));
             }
+        }
+        match daemon.as_mut() {
+            Some(owned) => {
+                if owned.exited() {
+                    return Err("ibus-daemon exited before it published its bus".into());
+                }
+            }
+            None => match daemon_plan(session_unit_state(unit.as_deref()), asked) {
+                Daemon::SpawnChild => {
+                    eprintln!("tuna-ibus-bridge: no IBus unit; starting ibus-daemon");
+                    daemon = Some(OwnedDaemon::spawn()?);
+                    deadline = Instant::now() + CHILD_WAIT;
+                }
+                Daemon::StartUnit => {
+                    asked = true;
+                    if let Some(unit) = unit.as_deref() {
+                        eprintln!("tuna-ibus-bridge: asking the user manager to start {unit}");
+                        let _ = systemctl(&["--no-block", "start", unit]);
+                    }
+                }
+                Daemon::Wait => {}
+            },
+        }
+        if Instant::now() >= deadline {
+            return Err(match unit {
+                Some(unit) if daemon.is_none() => format!("{unit} did not bring up IBus"),
+                _ => "ibus-daemon did not come up".to_owned(),
+            }
+            .into());
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    Err("ibus-daemon did not come up".into())
 }
 
 /// A new input context on `bus` with GNOME Shell's capabilities. Its
@@ -572,6 +724,9 @@ struct Bridge {
     gone: bool,
     /// While IBus is gone: when to look for it next, and the wait after.
     ibus_retry: Option<(Instant, Duration)>,
+    /// The `ibus-daemon` this bridge started, when the session has no
+    /// IBus unit of its own (see [`ibus_connection`]).
+    daemon: Option<OwnedDaemon>,
 }
 
 impl Bridge {
@@ -611,6 +766,22 @@ impl Bridge {
         };
         if Instant::now() < at {
             return;
+        }
+        // A daemon the bridge owns that a signal ended is the bridge's to
+        // replace, as its unit's manager would (`restart_owned`); one that
+        // quit stays gone. The session manager restarts its unit's daemon.
+        let mut wait = wait;
+        if let Some(status) = self.daemon.as_mut().and_then(OwnedDaemon::status) {
+            self.daemon = None;
+            if restart_owned(status) {
+                eprintln!("tuna-ibus-bridge: ibus-daemon ended ({status}); starting it again");
+                self.daemon = OwnedDaemon::spawn().ok();
+                // A daemon of its own comes up in a moment: look again soon,
+                // not after the backoff the departed one built up.
+                wait = IBUS_RETRY_MIN;
+            } else {
+                eprintln!("tuna-ibus-bridge: ibus-daemon quit ({status})");
+            }
         }
         // A returned daemon's address names a live socket again.
         let context = match ibus_address().map(|address| ibus_bus(&address)) {
@@ -1151,5 +1322,15 @@ mod tests {
             assert!(!wait(&context, wayland.as_fd(), Some(Duration::from_secs(5))).unwrap());
         }
         signal.join().unwrap();
+    }
+
+    #[test]
+    fn an_owned_daemon_gets_the_start_up_gnomes_ibus_unit_gets() {
+        // org.freedesktop.IBus.session.GNOME.service is Type=dbus with no
+        // TimeoutStartSec of its own: systemd's DefaultTimeoutStartSec.
+        assert_eq!(CHILD_WAIT, Duration::from_secs(90));
+        // A daemon of the bridge's own is never given up on sooner than a
+        // session's unit would be waited for.
+        assert!(CHILD_WAIT >= UNIT_WAIT);
     }
 }

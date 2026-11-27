@@ -391,6 +391,13 @@ pub struct Session<'a> {
     /// The session-bus unique name the supervised shell declared over this
     /// session (`DeclareBusName`), read by [`ControlHub::shell_bus_names`].
     bus_name: Option<String>,
+    /// Admitted `BeginStartupSequence`s `(app_id, wm_class)`, drained by the hub.
+    startup_sequences: Vec<(String, Option<String>)>,
+    /// The hub's published remote access grants a `StopRemoteAccess` may
+    /// name (#1162 F2).
+    remote_access: std::rc::Rc<Vec<tuna_shell_control::RemoteAccessHandle>>,
+    /// Grants the shell stopped, drained by the hub.
+    remote_access_stops: Vec<(tuna_shell_control::RemoteAccessKind, u64)>,
 }
 
 impl std::fmt::Debug for Session<'_> {
@@ -494,6 +501,9 @@ impl<'a> Session<'a> {
             close_menu_unanimated: false,
             close_dialog_responses: Vec::new(),
             bus_name: None,
+            startup_sequences: Vec::new(),
+            remote_access: std::rc::Rc::default(),
+            remote_access_stops: Vec::new(),
         };
         let msg = match session.conn.read_frame() {
             Ok(msg) => msg,
@@ -716,6 +726,20 @@ impl<'a> Session<'a> {
             return Ok(());
         }
         self.conn.write_frame(&Message::LockScreenShown { shown })
+    }
+
+    /// Send every active remote access grant (#1162 F2). Peers older than
+    /// 0.54 cannot decode it and receive nothing.
+    pub fn send_remote_access(
+        &mut self,
+        handles: &[tuna_shell_control::RemoteAccessHandle],
+    ) -> Result<(), ControlError> {
+        if self.peer_minor < 54 {
+            return Ok(());
+        }
+        self.conn.write_frame(&Message::RemoteAccess {
+            handles: handles.to_vec(),
+        })
     }
 
     /// Send where the overview's window previews sit.
@@ -1242,6 +1266,67 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
+                kind: CommandKind::BeginStartupSequence { app_id, wm_class },
+            } => {
+                if self.peer_minor < 53 {
+                    self.conn.write_frame(&Message::Error {
+                        kind: ErrorKind::UnknownCommand,
+                        message: "startup sequences require negotiated minor 53".into(),
+                    })?;
+                    return Ok(Handled::ErrorSent {
+                        kind: ErrorKind::UnknownCommand,
+                    });
+                }
+                // Bounded like titles; the compositor holds at most a
+                // handful (see `startup::MAX_SEQUENCES`).
+                let fits = |s: &str| !s.is_empty() && s.len() <= tuna_shell_control::MAX_TITLE_LEN;
+                let status = if fits(&app_id) && wm_class.as_deref().is_none_or(fits) {
+                    self.startup_sequences.push((app_id, wm_class));
+                    CommandStatus::Applied
+                } else {
+                    CommandStatus::Denied {
+                        reason: "invalid startup sequence".into(),
+                    }
+                };
+                let applied = status == CommandStatus::Applied;
+                self.conn
+                    .write_frame(&Message::CommandResult { id, status })?;
+                Ok(Handled::CommandResult { id, applied })
+            }
+            Message::Command {
+                id,
+                kind: CommandKind::StopRemoteAccess { kind, id: grant },
+            } => {
+                if self.peer_minor < 54 {
+                    self.conn.write_frame(&Message::Error {
+                        kind: ErrorKind::UnknownCommand,
+                        message: "remote access stops require negotiated minor 54".into(),
+                    })?;
+                    return Ok(Handled::ErrorSent {
+                        kind: ErrorKind::UnknownCommand,
+                    });
+                }
+                // The revocation scan carries it out (drained by the hub).
+                // Stopping is always allowed, locked or not.
+                let status = if self
+                    .remote_access
+                    .iter()
+                    .any(|handle| handle.kind == kind && handle.id == grant)
+                {
+                    self.remote_access_stops.push((kind, grant));
+                    CommandStatus::Applied
+                } else {
+                    CommandStatus::Denied {
+                        reason: "unknown remote access grant".into(),
+                    }
+                };
+                let applied = status == CommandStatus::Applied;
+                self.conn
+                    .write_frame(&Message::CommandResult { id, status })?;
+                Ok(Handled::CommandResult { id, applied })
+            }
+            Message::Command {
+                id,
                 kind: CommandKind::WindowAction { window, action },
             } => {
                 // The window manager carries it out (drained by the hub);
@@ -1391,6 +1476,7 @@ impl<'a> Session<'a> {
             | Message::ShowCloseDialog { .. }
             | Message::HideCloseDialog { .. }
             | Message::LockScreenShown { .. }
+            | Message::RemoteAccess { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
                     kind: ErrorKind::UnknownCommand,
@@ -1455,6 +1541,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::ShowCloseDialog { .. } => "ShowCloseDialog",
         Message::HideCloseDialog { .. } => "HideCloseDialog",
         Message::LockScreenShown { .. } => "LockScreenShown",
+        Message::RemoteAccess { .. } => "RemoteAccess",
     }
 }
 
@@ -1634,6 +1721,8 @@ fn apply_command(
         | CommandKind::CloseMenuUnanimated
         | CommandKind::RespondCloseDialog { .. }
         | CommandKind::DeclareBusName { .. }
+        | CommandKind::BeginStartupSequence { .. }
+        | CommandKind::StopRemoteAccess { .. }
         | CommandKind::SwitchInputSource { .. }
         | CommandKind::SetWindowIconGeometries { .. }
         | CommandKind::SetWellbeingEffects { .. }
@@ -1715,6 +1804,11 @@ pub struct PollOutcome {
     pub close_menu_unanimated: bool,
     /// Close-dialog answers `(window, response)`, in order (#1035).
     pub close_dialog_responses: Vec<(u64, tuna_shell_control::CloseDialogResponse)>,
+    /// App launches' startup sequences `(app_id, wm_class)`, in order: the
+    /// busy cursor until their windows map (#1193).
+    pub startup_sequences: Vec<(String, Option<String>)>,
+    /// Remote access grants the shell stopped, in order (#1162 F2).
+    pub remote_access_stops: Vec<(tuna_shell_control::RemoteAccessKind, u64)>,
     /// Input-source switches to make (`true` backward), in order.
     pub input_source_switches: Vec<bool>,
     /// New switcher thumbnail frames, if the shell sent any.
@@ -1905,6 +1999,10 @@ pub struct ControlHub {
     /// the value every live session holds.
     lock_shown: bool,
     lock_shown_sent: Option<bool>,
+    /// The active remote access grants as last set by the runtime, and
+    /// the list every live session holds (#1162 F2).
+    remote_access: std::rc::Rc<Vec<tuna_shell_control::RemoteAccessHandle>>,
+    remote_access_sent: std::rc::Rc<Vec<tuna_shell_control::RemoteAccessHandle>>,
     /// Output inventory last handed to [`set_outputs`](Self::set_outputs)
     /// (multi-monitor): the runtime refreshes this every tick from the
     /// compositor's tracking, and [`poll`](Self::poll) broadcasts it
@@ -2006,6 +2104,8 @@ impl ControlHub {
             touch_mode_sent: Some(false),
             lock_shown: false,
             lock_shown_sent: Some(false),
+            remote_access: std::rc::Rc::default(),
+            remote_access_sent: std::rc::Rc::default(),
             outputs: Vec::new(),
             native_outputs: Vec::new(),
             pointer_output: None,
@@ -2182,6 +2282,7 @@ impl ControlHub {
             || self.osk_sent != Some(self.osk)
             || self.touch_mode_sent != Some(self.touch_mode)
             || self.lock_shown_sent != Some(self.lock_shown)
+            || self.remote_access != self.remote_access_sent
             || !self.accelerator_queue.is_empty()
             || !self.menu_queue.is_empty()
             || self.sessions.iter().any(|s| s.owes_deltas(model));
@@ -2257,6 +2358,13 @@ impl ControlHub {
     /// locked session); the next [`poll`](Self::poll) broadcasts a change.
     pub fn set_lock_screen_shown(&mut self, shown: bool) {
         self.lock_shown = shown;
+    }
+
+    /// Refresh the active remote access grants (#1162 F2); the next
+    /// [`poll`](Self::poll) broadcasts a change, and every newcomer gets
+    /// them right after the handshake.
+    pub fn set_remote_access(&mut self, handles: Vec<tuna_shell_control::RemoteAccessHandle>) {
+        self.remote_access = std::rc::Rc::new(handles);
     }
 
     /// Set the session environment (#59); the next [`poll`](Self::poll)
@@ -2527,6 +2635,7 @@ impl ControlHub {
                 let workspace_before = model.active_workspace();
                 let deltas_ok = session.emit_deltas(model).is_ok();
                 session.pad_targets = self.pad_targets.clone();
+                session.remote_access = self.remote_access.clone();
                 let cmd_ok = match session.handle_next(model) {
                     Ok(_) => {
                         received = true;
@@ -2571,6 +2680,12 @@ impl ControlHub {
                     outcome
                         .close_dialog_responses
                         .extend(std::mem::take(&mut session.close_dialog_responses));
+                    outcome
+                        .startup_sequences
+                        .extend(std::mem::take(&mut session.startup_sequences));
+                    outcome
+                        .remote_access_stops
+                        .extend(std::mem::take(&mut session.remote_access_stops));
                     outcome
                         .input_source_switches
                         .extend(std::mem::take(&mut session.input_source_switches));
@@ -2788,6 +2903,17 @@ impl ControlHub {
                 self.lock_shown_sent = Some(self.lock_shown);
             }
         }
+        if self.remote_access != self.remote_access_sent {
+            let mut all_sent = true;
+            for session in &mut self.sessions {
+                if session.send_remote_access(&self.remote_access).is_err() {
+                    all_sent = false;
+                }
+            }
+            if all_sent {
+                self.remote_access_sent = self.remote_access.clone();
+            }
+        }
         if self.outputs != self.outputs_sent {
             let mut all_sent = true;
             for session in &mut self.sessions {
@@ -2903,6 +3029,9 @@ impl ControlHub {
                 }
                 if self.lock_shown {
                     let _ = session.send_lock_screen_shown(true);
+                }
+                if !self.remote_access.is_empty() {
+                    let _ = session.send_remote_access(&self.remote_access);
                 }
                 if self.pointer_output.is_some() {
                     let _ = session.send_window_menu(&Message::PointerOutput {

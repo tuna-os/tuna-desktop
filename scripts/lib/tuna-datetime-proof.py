@@ -21,8 +21,9 @@ and the panel clock are the shipped ones) and evaluates these gates:
                     GnomeWallClock repaints on a zone change
   G-DATETIME-MANUAL manual time as the Settings panel sets it: SetTime is
                     refused while NTP is on; SetNTP(false) stops the
-                    provider; SetTime moves the clock; the real time and
-                    NTP are restored afterwards
+                    provider; SetTime moves the clock back; the real time
+                    and NTP are restored afterwards, and no systemd timer
+                    fired ahead of the real time
   G-DATETIME-CLOCK-SET  the panel clock shows the manually set time within
                     PANEL_FOLLOW_SECONDS
   G-DATETIME-POLKIT the desktop user's own non-interactive SetTimezone is
@@ -69,8 +70,17 @@ CLOCK_TOLERANCE_SECONDS = 120
 # (gnome-desktop 51.0 gnome-wall-clock.c); allow for the dump itself.
 PANEL_FOLLOW_SECONDS = 10
 # The manual-time jump: over two hours, so the panel clock cannot show
-# it by accident, and an odd minute count.
-MANUAL_OFFSET_SECONDS = 2 * 3600 + 7 * 60
+# it by accident, and an odd minute count. It goes back. systemd fires a
+# calendar timer once the realtime clock passes its next elapse, so a jump
+# forward fires every OnCalendar= timer it skips, early: on the shipped
+# image, uupd.timer (OnCalendar=*-*-* 04:00:00, RandomizedDelaySec=15m)
+# then ran a failing update and queued "Some System Updates Failed" banners
+# whenever the proof ran between about 01:53 and 04:15 UTC. A jump back
+# moves no next elapse closer (systemd bases a calendar timer on its last
+# trigger or activation, not on the jumped clock), and the restore ends at
+# the real time, so no timer elapses that real time would not have.
+# G-DATETIME-MANUAL fails if one does anyway (timers_fired_ahead).
+MANUAL_OFFSET_SECONDS = -(2 * 3600 + 7 * 60)
 MANUAL_TOLERANCE_SECONDS = 5
 NTP_UNITS = ("systemd-timesyncd.service", "chronyd.service")
 # GNOME 51 gnome-control-center panels/common/gnome-control-center.rules.in:
@@ -267,6 +277,16 @@ def active_ntp_unit(run_command):
     raise ValueError("no-active-ntp-provider")
 
 
+def timer_last_triggers(run_command):
+    """{timer unit: last trigger as realtime seconds, None if never} from
+    the system manager."""
+    code, out, err = run_command(["systemctl", "list-timers", "--all", "--output=json"])
+    if code != 0:
+        raise ValueError(f"list-timers-unavailable: {err.strip()}")
+    return {timer["unit"]: (timer["last"] / 1_000_000 if timer.get("last") else None)
+            for timer in json.loads(out)}
+
+
 def as_user(user, *argv):
     """argv run by `user`'s systemd manager: outside any logind session,
     as GNOME 51 launches apps, so polkit resolves the user's graphical
@@ -392,7 +412,8 @@ def collect_manual_time(run_command, offset=MANUAL_OFFSET_SECONDS,
     then. The real time is carried across the jump on the monotonic
     clock and written back before NTP is restored, so the guest never
     depends on a network resync. `observe(record)` runs while the manual
-    time is in force.
+    time is in force. The timers' last triggers are read before and after,
+    so a timer the jump fired early shows (timers_fired_ahead).
     """
     show = timedate1_show(run_command)
     unit = active_ntp_unit(run_command)
@@ -409,6 +430,7 @@ def collect_manual_time(run_command, offset=MANUAL_OFFSET_SECONDS,
     def real_now():
         return base + (monotonic() - base_monotonic)
 
+    record["timers_before"] = timer_last_triggers(run_command)
     clock_moved = False
     try:
         code, _, err = set_ntp(run_command, False)
@@ -436,6 +458,11 @@ def collect_manual_time(run_command, offset=MANUAL_OFFSET_SECONDS,
         record["ntp_restored"] = timedate1_show(run_command).get("NTP", "")
         record["unit_restored"] = unit_active(run_command, unit)[0]
         record["enabled_after"] = unit_enabled(run_command, unit)
+        record["restored_at"] = real_now()
+        try:
+            record["timers_after"] = timer_last_triggers(run_command)
+        except ValueError as error:
+            record["timers_after_error"] = str(error)
     return record
 
 
@@ -764,7 +791,7 @@ def evaluate(evidence, clock_tolerance=CLOCK_TOLERANCE_SECONDS):
     results.append(evaluate_manual(manual))
     results.append(evaluate_clock_follow(
         "G-DATETIME-CLOCK-SET", manual.get("panel"), clock_tolerance,
-        lambda: f"SetTime +{manual.get('offset')}s", baseline))
+        lambda: f"SetTime {signed_seconds(manual.get('offset'))}", baseline))
     results.append(evaluate_polkit(evidence.get("polkit") or {}))
     results.append(evaluate_ntp_absent(evidence.get("ntp_absent") or {}))
     errors = evidence.get("errors") or {}
@@ -808,6 +835,23 @@ def evaluate_clock_follow(gate, attempts, tolerance, what, baseline):
             + ("" if baseline else "; the panel was already wrong before the change"))
 
 
+def signed_seconds(value):
+    return f"{value:+d}s" if isinstance(value, int) else f"{value}s"
+
+
+def timers_fired_ahead(manual):
+    """Timers whose new last trigger lies after the restored real time:
+    only the manually set clock can have fired them, early. None when the
+    evidence is missing."""
+    before, after = manual.get("timers_before"), manual.get("timers_after")
+    restored = manual.get("restored_at")
+    if before is None or after is None or restored is None:
+        return None
+    return sorted(unit for unit, last in after.items()
+                  if last is not None and last != before.get(unit)
+                  and last > restored + MANUAL_TOLERANCE_SECONDS)
+
+
 def evaluate_manual(manual):
     gate = "G-DATETIME-MANUAL"
     if not manual.get("set"):
@@ -825,12 +869,16 @@ def evaluate_manual(manual):
         "NTP restored": manual.get("ntp_restored") == "yes"
         and manual.get("unit_restored") == "active",
         "provider enablement restored": manual.get("enabled_after") == manual.get("enabled_before"),
+        "no timer fired ahead of real time": timers_fired_ahead(manual) == [],
     }
     failed = [name for name, ok in checks.items() if not ok]
     detail = (f"{manual.get('unit')}: SetTime while NTP on -> exit "
               f"{(manual.get('set_while_ntp') or {}).get('exit')}; NTP off; "
-              f"+{manual.get('offset')}s observed (delta {manual.get('set_delta')}s); "
+              f"{signed_seconds(manual.get('offset'))} observed (delta {manual.get('set_delta')}s); "
               f"restored (delta {manual.get('restored_delta')}s), NTP={manual.get('ntp_restored')}")
+    ahead = timers_fired_ahead(manual)
+    if ahead:
+        detail += f"; fired by the set clock: {', '.join(ahead)}"
     if failed:
         detail += f"; failed: {', '.join(failed)}"
     return (gate, not failed, detail)

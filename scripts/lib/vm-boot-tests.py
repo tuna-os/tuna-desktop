@@ -454,6 +454,14 @@ class DeviceInventoryProjection(unittest.TestCase):
         self.assertIn("input_devices", projected)
         self.assertIsNone(projected["input_devices"])
 
+    def test_power_save_mode_and_rendered_frames_reach_v_unlock_wake(self):
+        # V-UNLOCK-WAKE reads the blank and the frames after the wake from
+        # the inventory alone.
+        state = self.state() | {"power_save_mode": 3, "rendered_frames": 1234}
+        projected = self.inventory(state)["state"]
+        self.assertEqual((projected["power_save_mode"], projected["rendered_frames"]), (3, 1234))
+        self.assertIsNone(self.inventory(self.state())["state"]["rendered_frames"])
+
 
 class OrcaCommandWindow(unittest.TestCase):
     def check(self, started=10.0, ready=10.5, before=11.0, after=11.1, samples=96000):
@@ -5098,6 +5106,59 @@ class InventoryProcessRaces(unittest.TestCase):
         message, log = self.transport(output)
         self.assertEqual(message, "guest lifecycle inventory failed (exit=1): " + json.dumps(record))
         self.assertEqual(log, "tuna-vm-lane: inventory failure " + json.dumps(record) + "\n")
+
+    STATE_READ_RECORD = {"stage": "state-read", "exception_type": "FileNotFoundError",
+                         "code": "observation-exception", "errno": 2,
+                         "frames": [["main", 2752], ["inventory", 458]]}
+
+    def await_login(self, failures):
+        """lane.await_login over a real GuestAgent whose first `failures`
+        inventory polls fail at state-read (None: every poll). Returns
+        ((started, login), host log, the guest's login-session reply)."""
+        import contextlib
+        actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        login = {"probe_uid": 0, "session_uid": 1000, "desktop": ["tuna-compositor"],
+                 "session": {"Service": lane.LOGIN_SERVICE, "User": "1000"}}
+        owner = {"probe_uid": 0, "session_uid": 1000, "session": login["session"],
+                 "processes": [{"executable": "tuna-compositor"}]}
+        actions = []
+
+        def command(name, **arguments):
+            if name == "guest-exec":
+                actions.append(arguments["arg"][0])
+                return {"pid": len(actions)}
+            if actions[-1] == "login-session":
+                exitcode, output = 0, login
+            elif failures is None or actions.count("inventory") <= failures:
+                exitcode, output = 1, {"inventory_error": self.STATE_READ_RECORD}
+            else:
+                exitcode, output = 0, owner
+            return {"exited": True, "exitcode": exitcode,
+                    "out-data": base64.b64encode(json.dumps(output).encode()).decode()}
+        clock = [1000.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log), patch.object(actor, "command", side_effect=command), \
+                patch.object(lane.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(lane.time, "sleep", side_effect=sleep):
+            result = lane.await_login(actor, 1060.0)
+        return result, log.getvalue(), login
+
+    def test_login_poll_before_first_state_snapshot_is_not_a_logged_failure(self):
+        # PR #1004 job 135799032962 and PR #1090's autotz run: the login poll
+        # read the state file before the compositor's first snapshot, and the
+        # retried state-read FileNotFoundError was logged as a failure.
+        result, log, login = self.await_login(failures=2)
+        self.assertEqual(result, (True, login))
+        self.assertEqual(log, "")
+
+    def test_login_deadline_logs_only_the_last_unadmitted_inventory_record(self):
+        result, log, login = self.await_login(failures=None)
+        self.assertEqual(result, (False, login))
+        self.assertEqual(log, "tuna-vm-lane: login deadline: last guest lifecycle inventory failed (exit=1): "
+                         + json.dumps(self.STATE_READ_RECORD) + "\n")
 
     def test_host_rejects_unknown_textual_or_unbounded_records(self):
         record = {"stage": "process-scan", "exception_type": "FileNotFoundError",

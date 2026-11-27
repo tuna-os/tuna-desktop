@@ -28,7 +28,7 @@ use tuna_auth_prompt::{AuthMachine, Effect, Host, MessageKind, View};
 use tuna_shell_control::{AuthEvent, AuthService};
 
 use crate::lock_curtain::{self, Curtain, Page, Source};
-use crate::lock_notifications::{LockEntry, NotificationsBox};
+use crate::lock_notifications::{LockEntry, MediaActions, MediaEntry, NotificationsBox};
 use crate::lock_wiggle::Wiggle;
 use crate::logic;
 
@@ -42,6 +42,8 @@ fn touchpad_settings() -> Option<gio::Settings> {
 }
 /// What the lock screen's notifications show now.
 pub type LockNotifications = Rc<dyn Fn() -> Vec<LockEntry>>;
+/// The media players the lock screen shows now.
+pub type LockMedia = Rc<dyn Fn() -> Vec<MediaEntry>>;
 
 /// Sends a password with the single-password `Unlock`; returns the
 /// request id.
@@ -93,6 +95,9 @@ struct Screen {
     /// application would otherwise keep it, and with it a stale prompt in
     /// the accessibility tree.
     window: gtk::Window,
+    /// The monitor the window covers (`None` only for unassigned test
+    /// windows).
+    monitor: Option<gtk::gdk::Monitor>,
     curtain: Curtain,
     clock: gtk::Label,
     date: gtk::Label,
@@ -194,8 +199,18 @@ pub struct LockUi {
     osk: RefCell<Option<Rc<crate::osk::Osk>>>,
     /// What the clocks' hints follow (idle time, power save, touch-mode).
     hints: Rc<lock_curtain::HintWatch>,
+    /// The display's monitor list while the lock screens are up, with
+    /// the `items-changed` handler that keeps one screen per monitor.
+    monitors_watch: RefCell<Option<(gtk::gio::ListModel, glib::SignalHandlerId)>>,
+    /// A [`LockUi::follow_monitors`] pass is under way, and the monitor
+    /// list changed again during it.
+    following: Cell<bool>,
+    refollow: Cell<bool>,
     /// Where the notifications box reads what to show (#348).
     notifications: RefCell<Option<LockNotifications>>,
+    /// Where the notifications box reads its media players, and how its
+    /// controls reach them (#348).
+    media: RefCell<Option<(LockMedia, MediaActions)>>,
 }
 
 impl LockUi {
@@ -223,7 +238,11 @@ impl LockUi {
             wall_clock: RefCell::new(None),
             osk: RefCell::new(None),
             hints: lock_curtain::HintWatch::new(),
+            monitors_watch: RefCell::new(None),
+            following: Cell::new(false),
+            refollow: Cell::new(false),
             notifications: RefCell::new(None),
+            media: RefCell::new(None),
         });
         {
             // A refused request (ext_session_lock_v1.finished) leaves the
@@ -291,6 +310,28 @@ impl LockUi {
         }
     }
 
+    /// Read the lock screen's media players from `source`; `act` drives
+    /// one by its bus name.
+    pub fn set_media(&self, source: LockMedia, act: MediaActions) {
+        *self.media.borrow_mut() = Some((source, act));
+    }
+
+    /// Bring every lock screen's media players up to date (GNOME's
+    /// `MediaMessage` follows its player and its policy live).
+    pub fn refresh_media(&self) {
+        let screens = self.screens.borrow();
+        if screens.is_empty() {
+            return;
+        }
+        let Some((source, act)) = self.media.borrow().clone() else {
+            return;
+        };
+        let players = source();
+        for screen in screens.iter() {
+            screen.notifications.show_media(&players, &act);
+        }
+    }
+
     /// Drop every lock window. Their entries are wiped at once, which is
     /// no input; the windows are destroyed from the main loop afterwards.
     /// gtk4-session-lock emits `::unlocked` (and `::failed`) before it
@@ -298,6 +339,9 @@ impl LockUi {
     /// (`gtk_session_lock_instance_unlock`), so destroying them here would
     /// tear the lock surfaces down while the session is still locked.
     fn release_screens(&self) {
+        if let Some((monitors, handler)) = self.monitors_watch.take() {
+            monitors.disconnect(handler);
+        }
         let screens = std::mem::take(&mut *self.screens.borrow_mut());
         let windows: Vec<gtk::Window> = screens.iter().map(|s| s.window.clone()).collect();
         let was_applying = self.applying.replace(true);
@@ -326,25 +370,26 @@ impl LockUi {
                 return;
             }
             // One lock window per monitor, assigned right after lock()
-            // (gtk4-layer-shell 1.1's contract).
+            // (gtk4-layer-shell 1.1's contract), and for each monitor
+            // plugged in while locked: GNOME's unlock dialog follows
+            // `monitors-changed` (unlockDialog.js `_updateBackgrounds`),
+            // and ext-session-lock-v1 wants a lock surface on every output.
             let Some(display) = gtk::gdk::Display::default() else {
                 return;
             };
             let monitors = display.monitors();
-            for i in 0..monitors.n_items() {
-                let Some(monitor) = monitors
-                    .item(i)
-                    .and_then(|m| m.downcast::<gtk::gdk::Monitor>().ok())
-                else {
-                    continue;
-                };
-                let window = self.screen(Some(&self.app.clone()));
-                self.instance.assign_window_to_monitor(&window, &monitor);
-                window.present();
-            }
+            let weak = Rc::downgrade(self);
+            let handler = monitors.connect_items_changed(move |_, _, _, _| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.follow_monitors();
+                }
+            });
+            *self.monitors_watch.borrow_mut() = Some((monitors, handler));
+            self.follow_monitors();
             self.refresh_clock();
             self.hints.arm();
             self.refresh_notifications();
+            self.refresh_media();
             let weak = Rc::downgrade(self);
             *self.wall_clock.borrow_mut() =
                 Some(crate::wall_clock::WallClock::new(false, move || {
@@ -355,6 +400,99 @@ impl LockUi {
         } else if !locked && self.requested.get() {
             self.requested.set(false);
             self.instance.unlock();
+        }
+    }
+
+    /// One lock window per monitor in the display's list: a window for
+    /// each monitor without one, and the window of each monitor gone
+    /// dropped (its lock surface with it), the way GNOME's unlock dialog
+    /// rebuilds its per-monitor backgrounds on `monitors-changed`
+    /// (unlockDialog.js `_updateBackgrounds`). Windows whose monitor
+    /// stays are left alone, so the prompt being answered keeps its text
+    /// and focus.
+    fn follow_monitors(self: &Rc<Self>) {
+        // Mapping a lock window round-trips the display
+        // (gtk4-layer-shell's `lock_surface_map`), which can add or remove
+        // a monitor under us: that change is followed once this pass ends,
+        // never by a nested pass that would cover a monitor twice.
+        if self.following.replace(true) {
+            self.refollow.set(true);
+            return;
+        }
+        loop {
+            self.refollow.set(false);
+            self.follow_monitors_once();
+            if !self.refollow.get() {
+                break;
+            }
+        }
+        self.following.set(false);
+    }
+
+    fn follow_monitors_once(self: &Rc<Self>) {
+        // Released (the lock failed or ended) since the change came in.
+        let released = || self.monitors_watch.borrow().is_none();
+        let Some(display) = gtk::gdk::Display::default().filter(|_| !released()) else {
+            return;
+        };
+        let list = display.monitors();
+        let monitors: Vec<gtk::gdk::Monitor> = (0..list.n_items())
+            .filter_map(|i| list.item(i).and_then(|m| m.downcast().ok()))
+            .collect();
+        let covered: Vec<Option<gtk::gdk::Monitor>> = self
+            .screens
+            .borrow()
+            .iter()
+            .map(|s| s.monitor.clone())
+            .collect();
+        let (gone, added) = logic::lock_monitors_changed(&covered, &monitors);
+        if !gone.is_empty() {
+            let dropped: Vec<Screen> = {
+                let mut screens = self.screens.borrow_mut();
+                gone.iter().rev().map(|&i| screens.remove(i)).collect()
+            };
+            let windows: Vec<gtk::Window> = dropped.iter().map(|s| s.window.clone()).collect();
+            let was_applying = self.applying.replace(true);
+            drop(dropped);
+            self.applying.set(was_applying);
+            // Out of the display's own signal emission.
+            glib::idle_add_local_once(move || {
+                for window in windows {
+                    window.destroy();
+                }
+            });
+        }
+        for monitor in &added {
+            if released() {
+                return;
+            }
+            // Unplugged while an earlier window of this pass mapped.
+            if !monitor.is_valid() {
+                continue;
+            }
+            let window = self.screen(Some(&self.app.clone()), Some(monitor));
+            self.instance.assign_window_to_monitor(&window, monitor);
+            window.present();
+        }
+        if !added.is_empty() {
+            self.refresh_clock();
+        }
+        if !gone.is_empty() || !added.is_empty() {
+            let connectors = |list: &[gtk::gdk::Monitor]| {
+                list.iter()
+                    .map(|m| {
+                        m.connector()
+                            .map_or_else(|| "?".to_owned(), |c| c.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            trace(&format!(
+                "lock screens follow monitors: added [{}], removed {}, now {}",
+                connectors(&added),
+                gone.len(),
+                self.screens.borrow().len()
+            ));
         }
     }
 
@@ -548,7 +686,11 @@ impl LockUi {
 
     /// Build one monitor's lock window: GNOME's unlock-screen top bar
     /// over the clock curtain and the prompt.
-    fn screen(self: &Rc<Self>, app: Option<&gtk::Application>) -> gtk::Window {
+    fn screen(
+        self: &Rc<Self>,
+        app: Option<&gtk::Application>,
+        monitor: Option<&gtk::gdk::Monitor>,
+    ) -> gtk::Window {
         let window = gtk::Window::new();
         if let Some(app) = app {
             window.set_application(Some(app));
@@ -705,7 +847,7 @@ impl LockUi {
         bar.set_valign(gtk::Align::Start);
         overlay.add_overlay(&bar);
         // GNOME's NotificationsBox: the bottom of the column under the
-        // clock and the prompt.
+        // clock and the prompt, raising them when it is taller.
         let notifications = NotificationsBox::new();
         overlay.add_overlay(notifications.widget());
         // GNOME's keyboard box sits over the lock screen too: it opens
@@ -746,18 +888,21 @@ impl LockUi {
         // Vertical placement: GNOME puts the stack a third of the way
         // down (UnlockDialogLayout), which lands the 1280x800 clock at
         // y 275 and the prompt at y 205. The notifications take the
-        // bottom, never reaching up into the clock. Followed on every
-        // surface layout, never on a tick callback: one that never ends
-        // keeps the frame clock (and the session's frame callbacks)
-        // running at the refresh rate for as long as the lock screen is
-        // up, blanked or not (#1122). GTK's own layout handler, connected
-        // while the window realizes, runs first, so the window is already
-        // allocated; a widget queueing a resize (the clock's text) lays
-        // the surface out again.
+        // bottom; taller than the room below the stack, they raise the
+        // stack up to a tenth of the height from the top, and only the
+        // rest of them scrolls. Followed on every surface layout, never
+        // on a tick callback: one that never ends keeps the frame clock
+        // (and the session's frame callbacks) running at the refresh
+        // rate for as long as the lock screen is up, blanked or not
+        // (#1122). GTK's own layout handler, connected while the window
+        // realizes, runs first, so the window is already allocated; a
+        // widget queueing a resize (the clock's text) lays the surface
+        // out again.
         {
             let (clock_box, prompt) = (clock_box.clone(), prompt.clone());
             let scroller = notifications.widget().clone();
-            let last = Rc::new(Cell::new(-1));
+            let notes_height = Rc::new(notifications.natural_height());
+            let last = Rc::new(Cell::new((-1, -1)));
             window.connect_realize(move |w| {
                 let Some(surface) = w.surface() else {
                     return;
@@ -769,22 +914,32 @@ impl LockUi {
                     scroller.clone(),
                     last.clone(),
                 );
+                let notes_height = notes_height.clone();
                 surface.connect_layout(move |_, _, _| {
                     let Some(height) = window.upgrade().map(|w| w.height()) else {
                         return;
                     };
                     let (clock_top, prompt_top) = logic::lock_offsets(height);
-                    if height != last.replace(height) {
-                        clock_box.set_margin_top(clock_top);
-                        prompt.set_margin_top(prompt_top);
+                    let stack_top = clock_top - logic::LOCK_CLOCK_MARGIN;
+                    // GNOME's stack is as tall as the taller of the clock
+                    // (with its top margin) and the prompt. Measures
+                    // include margins, and may still hold the old ones
+                    // for a layout: take each one's own height.
+                    let own = |w: &gtk::Box| {
+                        let (_, natural, _, _) = w.measure(gtk::Orientation::Vertical, -1);
+                        natural - w.margin_top() - w.margin_bottom()
+                    };
+                    let stack = (logic::LOCK_CLOCK_MARGIN + own(&clock_box))
+                        .max(prompt_top - stack_top + own(&prompt));
+                    let (rise, shown) =
+                        logic::lock_notifications_layout(height, stack_top, stack, notes_height());
+                    if (height, rise) != last.get() {
+                        last.set((height, rise));
+                        clock_box.set_margin_top(clock_top - rise);
+                        prompt.set_margin_top(prompt_top - rise);
                     }
-                    // The measure includes margins, and may still hold the
-                    // old ones for a layout: take the clock's own height.
-                    let (_, natural, _, _) = clock_box.measure(gtk::Orientation::Vertical, -1);
-                    let clock = natural - clock_box.margin_top() - clock_box.margin_bottom();
-                    let room = (height - clock_top - clock).max(0);
-                    if scroller.max_content_height() != room {
-                        scroller.set_max_content_height(room);
+                    if scroller.max_content_height() != shown {
+                        scroller.set_max_content_height(shown);
                     }
                 });
             });
@@ -1149,6 +1304,7 @@ impl LockUi {
 
         let screen = Screen {
             window: window.clone(),
+            monitor: monitor.cloned(),
             curtain,
             clock,
             date,
@@ -1252,7 +1408,7 @@ mod auth_transport_ui_tests {
             Box::new(|| logic::ClockFormat::TwentyFourHour),
         );
         ui.sync_connection_generation(Some(0));
-        let window = ui.screen(None);
+        let window = ui.screen(None, None);
         window.present();
         (ui, window)
     }
@@ -1600,7 +1756,7 @@ mod auth_transport_ui_tests {
             Box::new(|| logic::ClockFormat::TwentyFourHour),
         );
         ui.sync_connection_generation(Some(0));
-        let window = ui.screen(None);
+        let window = ui.screen(None, None);
         window.set_default_size(1280, 800);
         window.present();
         assert!(pump_until(Duration::from_secs(5), || window.is_mapped()

@@ -12,6 +12,14 @@
 //! expands on click); Do Not Disturb keeps banners away (critical ones
 //! still show) while history keeps filling.
 //!
+//! Above the groups sit the media players (GNOME 51's `MessageView`
+//! `_setupMpris`: one `MediaMessage` per player that can play, newest
+//! first, see [`crate::mpris`]). They follow their player live, hide while
+//! their app's `enable` is off, raise the player when clicked, and leave
+//! when it leaves the bus. Like GNOME's, they count toward the list's
+//! `empty` (the placeholder) but cannot be closed, so they never make
+//! Clear sensitive (see [`list_state`]).
+//!
 //! Nothing here runs on a period: wire arrivals wake the main loop
 //! through the bus's change callback, the banner's expiry is a one-shot
 //! timeout re-armed after every update, and a banner waiting for an away
@@ -32,7 +40,7 @@ use tuna_shell_host::notifications::{
     Notification, NotificationAction, NotificationCenter, Urgency,
 };
 
-use crate::lock_notifications::LockEntry;
+use crate::lock_notifications::{LockEntry, MediaActions, MediaEntry, MediaMessage};
 
 /// Told when what the lock screen shows may have changed.
 type LockListener = Box<dyn Fn()>;
@@ -44,6 +52,9 @@ pub const BANNER_TIMEOUT: Duration = Duration::from_secs(4);
 pub const AWAY_AFTER: Duration = Duration::from_secs(1);
 /// How long a banner stays once an away user comes back.
 pub const BACK_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the pointer may be off a banner it held before the banner
+/// goes (messageTray.js `HIDE_TIMEOUT`).
+const BANNER_HIDE_TIMEOUT: Duration = Duration::from_millis(200);
 /// While the notifications name is not ours, how often to try again.
 const BUS_RETRY: Duration = Duration::from_secs(2);
 /// Without a user-active watch, how often to look for an away user's
@@ -91,6 +102,12 @@ impl BannerTimer {
     /// When the banner goes; `None` while it waits for an away user.
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    /// Go at `at` instead (GNOME's `_updateNotificationTimeout(0)` once
+    /// the pointer has left the banner).
+    pub fn expire_at(&mut self, at: Instant) {
+        self.deadline = Some(at);
     }
 }
 
@@ -290,6 +307,73 @@ fn group_key(n: &Notification) -> String {
     }
 }
 
+/// One message of the calendar's list, in [`message_order`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListItem<P, G> {
+    /// A player's `MediaMessage`.
+    Media(P),
+    /// A notification group.
+    Group(G),
+}
+
+/// `MessageView`'s order: the players' messages on top, as given (newest
+/// first: `_addPlayer` inserts each at index 0), then the notification
+/// groups, which GNOME inserts at `_playerToMessage.size` or further
+/// down, never above a player.
+pub fn message_order<P, G>(
+    players: impl IntoIterator<Item = P>,
+    groups: impl IntoIterator<Item = G>,
+) -> Vec<ListItem<P, G>> {
+    players
+        .into_iter()
+        .map(ListItem::Media)
+        .chain(groups.into_iter().map(ListItem::Group))
+        .collect()
+}
+
+/// What `CalendarMessageList` shows around the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListState {
+    /// `MessageView.empty`: the placeholder shows (and Clear hides).
+    pub empty: bool,
+    /// `MessageView.canClear`: Clear is sensitive.
+    pub can_clear: bool,
+}
+
+/// The list's `empty` and `can-clear` from its `players` (every player
+/// that can play, its policy-hidden messages included: GNOME keeps them
+/// in `messages`, only invisible) and its `notifications`. A
+/// `MediaMessage` cannot close (`canClose()` is false), so players alone
+/// keep the placeholder away and Clear on screen, insensitive.
+pub fn list_state(players: usize, notifications: usize) -> ListState {
+    ListState {
+        empty: players == 0 && notifications == 0,
+        can_clear: notifications > 0,
+    }
+}
+
+/// The calendar's media players now, newest first, each with whether its
+/// policy shows it ([`crate::mpris::media_visible`]).
+pub type CalendarMedia = Rc<dyn Fn() -> Vec<(MediaEntry, bool)>>;
+/// Raises a player, by its bus name, from its message.
+pub type MediaRaise = Rc<dyn Fn(&str)>;
+
+/// What the calendar's media section reads and drives.
+struct MediaHooks {
+    players: CalendarMedia,
+    act: MediaActions,
+    raise: MediaRaise,
+}
+
+/// One player's message in the calendar's list.
+struct MediaRow {
+    /// What it shows now.
+    entry: MediaEntry,
+    /// The list item, zoomed in and out as GNOME's items are.
+    item: crate::transient::MotionBin,
+    message: MediaMessage,
+}
+
 /// Snapshot of what the list shows, to rebuild only on change.
 #[derive(Default, PartialEq)]
 struct Shown {
@@ -389,13 +473,23 @@ pub struct NotifyUi {
     expired: Cell<Option<u64>>,
     /// The calendar popover's left pane.
     pane: gtk::Box,
+    /// The message view: the players' messages on top, then the
+    /// notification groups ([`message_order`]).
     list: gtk::Box,
+    /// Where the media players come from, once the shell connects them.
+    media_hooks: RefCell<Option<MediaHooks>>,
+    /// The players' messages, newest first.
+    media_rows: RefCell<Vec<MediaRow>>,
     empty: gtk::Box,
     clear: gtk::Button,
     /// GNOME binds Clear's visibility to the placeholder without
     /// SYNC_CREATE, so Clear shows (insensitive) until the list first
     /// changes; after that it hides whenever the list is empty.
     clear_bound: std::cell::Cell<bool>,
+    /// Whether the placeholder is showing, as last set. Kept here: a
+    /// widget's `is_visible` also reads its ancestors, which are hidden
+    /// until the calendar opens.
+    placeholder_shown: std::cell::Cell<bool>,
     /// The banner on screen's expiry, from when it has dropped in.
     timer: RefCell<Option<BannerTimer>>,
     /// GNOME's `_userActiveWhileNotificationShown`: the user was active
@@ -403,6 +497,15 @@ pub struct NotifyUi {
     /// across an in-place update, which then times out like any banner
     /// shown to an active user.
     user_active: Cell<bool>,
+    /// The banner the user expanded (its expand button, the pointer or
+    /// Super+N): it stays expanded when an update shows it again, as
+    /// GNOME updates the banner in place.
+    banner_expanded: Cell<Option<u64>>,
+    /// Expands (or collapses) the banner on screen, animated or not.
+    banner_expander: RefCell<Option<BannerExpander>>,
+    /// The pointer is on the banner (`_pointerInNotification`): it holds
+    /// the banner on screen.
+    pointer_in: Cell<bool>,
     /// The groups the user expanded, by source key.
     expanded: RefCell<HashSet<String>>,
     group_widgets: RefCell<HashMap<String, Rc<crate::group_animation::Group>>>,
@@ -441,14 +544,30 @@ pub struct NotifyUi {
 /// Told when Do Not Disturb turns on or off.
 type DndListener = Box<dyn Fn(bool)>;
 
+/// Sets the banner on screen expanded or not; the second argument
+/// animates it.
+type BannerExpander = Rc<dyn Fn(bool, bool)>;
+
+/// How many body lines an expanded message shows (messageList.js
+/// `DEFAULT_EXPAND_LINES`).
+const BANNER_EXPANDED_LINES: i32 = 6;
+
+/// A notification card's widgets.
+struct Card {
+    widget: gtk::Box,
+    close: gtk::Button,
+    summary: gtk::Label,
+    /// The body line, absent for an empty body.
+    body: Option<gtk::Label>,
+}
+
 /// One notification as GNOME 51 draws it (messageList.js
 /// NotificationMessage): a header with the source icon, app name, time
-/// and close button, then the title and body. Returns the card and its
-/// close button. Banner and list cards alike carry GNOME's message role
-/// (`Atk.Role.NOTIFICATION`, GTK's alert).
-/// close button. Delete or BackSpace with the keyboard focus on the card
+/// and close button, then the title and body. Banner and list cards
+/// alike carry GNOME's message role (`Atk.Role.NOTIFICATION`, GTK's
+/// alert). Delete or BackSpace with the keyboard focus on the card
 /// presses Close, as GNOME's Message binds them (`_closeIfAllowed`).
-fn card(n: &Notification) -> (gtk::Box, gtk::Button) {
+fn card(n: &Notification) -> Card {
     let card = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .accessible_role(gtk::AccessibleRole::Alert)
@@ -494,7 +613,7 @@ fn card(n: &Notification) -> (gtk::Box, gtk::Button) {
     summary.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     summary.set_max_width_chars(48);
     content.append(&summary);
-    if !n.body().is_empty() {
+    let body = (!n.body().is_empty()).then(|| {
         let body = gtk::Label::new(Some(n.body()));
         body.add_css_class("message-body");
         body.set_xalign(0.0);
@@ -502,7 +621,8 @@ fn card(n: &Notification) -> (gtk::Box, gtk::Button) {
         body.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         body.set_max_width_chars(48);
         content.append(&body);
-    }
+        body
+    });
     card.append(&content);
     card.update_property(&[gtk::accessible::Property::Label(n.summary())]);
     if !n.body().is_empty() {
@@ -522,7 +642,12 @@ fn card(n: &Notification) -> (gtk::Box, gtk::Button) {
         });
     }
     card.add_controller(keys);
-    (card, close)
+    Card {
+        widget: card,
+        close,
+        summary,
+        body,
+    }
 }
 
 /// What a screen reader says when a banner arrives. GNOME's banner is an
@@ -564,7 +689,8 @@ fn source_of(n: &Notification) -> (String, Option<gio::Icon>) {
     }
 }
 
-/// The installed app a `desktop-entry` hint names, if any.
+/// The installed app a desktop id names, if any (a `desktop-entry` hint,
+/// a media player's `DesktopEntry`).
 pub(crate) fn desktop_app(id: &str) -> Option<tuna_shell_host::apps::AppEntry> {
     tuna_shell_host::apps::default_app_dirs()
         .into_iter()
@@ -694,8 +820,12 @@ impl NotifyUi {
             empty,
             clear,
             clear_bound: std::cell::Cell::new(false),
+            placeholder_shown: std::cell::Cell::new(true),
             timer: RefCell::new(None),
             user_active: Cell::new(false),
+            banner_expanded: Cell::new(None),
+            banner_expander: RefCell::new(None),
+            pointer_in: Cell::new(false),
             expanded: RefCell::new(HashSet::new()),
             group_widgets: RefCell::new(HashMap::new()),
             history_stale: Cell::new(false),
@@ -712,6 +842,8 @@ impl NotifyUi {
             lock_cache: RefCell::default(),
             policy_watch: RefCell::new(None),
             policy_idle: Cell::new(false),
+            media_hooks: RefCell::new(None),
+            media_rows: RefCell::default(),
         });
         {
             let weak = Rc::downgrade(&ui);
@@ -900,12 +1032,16 @@ impl NotifyUi {
         self.dnd_changed.borrow_mut().push(Box::new(f));
     }
 
-    /// GNOME's Super+N gives the current banner keyboard focus: the
-    /// banner itself (messageList.js's focusable message), not its first
-    /// button.
+    /// GNOME's Super+N expands the current banner and gives it keyboard
+    /// focus (`_expandActiveNotification`): the banner itself
+    /// (messageList.js's focusable message), not its first button.
     pub fn focus_active(&self) {
         if !self.banner_window.is_visible() {
             return;
+        }
+        let expander = self.banner_expander.borrow().clone();
+        if let Some(expand) = expander {
+            expand(true, true);
         }
         self.banner_window
             .set_keyboard_mode(KeyboardMode::Exclusive);
@@ -1125,6 +1261,10 @@ impl NotifyUi {
             *timer = None;
             return Due::default();
         };
+        // The pointer on the banner holds it (`!_pointerInNotification`).
+        if self.pointer_in.get() {
+            return Due::default();
+        }
         // Ask for the idle time only while it decides: when the banner
         // has just dropped in to a user not yet seen active, or while it
         // waits for an away user.
@@ -1290,15 +1430,7 @@ impl NotifyUi {
         } else {
             self.history_stale.set(true);
         }
-        let any = !now.history.is_empty();
-        self.list.set_visible(any);
-        if self.empty.is_visible() == any {
-            // The placeholder changes: from here on Clear follows it.
-            self.clear_bound.set(true);
-        }
-        self.empty.set_visible(!any);
-        self.clear.set_visible(!self.clear_bound.get() || any);
-        self.clear.set_sensitive(any);
+        self.sync_placeholder(now.history.len());
         drop(center);
         *self.shown.borrow_mut() = Some(now);
         // Showing the list above maps it while the store was held.
@@ -1347,7 +1479,9 @@ impl NotifyUi {
             let card = match step {
                 TrayStep::Show(id) => center.banners().into_iter().find(|n| n.id == id).map(|n| {
                     let spoken = announcement(&source_of(n).0, n.summary(), n.body());
-                    (self.banner_card(n), spoken)
+                    let expanded =
+                        center.banner_opens_expanded(id) || self.banner_expanded.get() == Some(id);
+                    (self.banner_card(n, expanded), spoken)
                 }),
                 _ => None,
             };
@@ -1397,12 +1531,38 @@ impl NotifyUi {
         }
     }
 
-    /// One banner card, its buttons wired to the bus.
-    fn banner_card(self: &Rc<Self>, n: &Notification) -> gtk::Box {
-        let (c, close) = card(n);
+    /// One banner card, its buttons wired to the bus. Like GNOME's
+    /// `Message`, it is collapsed (a one-line title and body, no action
+    /// buttons) until expanded (the body up to six lines, the actions
+    /// below) by its expand button, the pointer coming onto it, Super+N,
+    /// or opening `expanded`.
+    fn banner_card(self: &Rc<Self>, n: &Notification, expanded: bool) -> gtk::Box {
+        let Card {
+            widget: c,
+            close,
+            summary,
+            body,
+        } = card(n);
         c.add_css_class("banner");
+        summary.set_wrap(false);
+        summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        summary.set_max_width_chars(48);
+        if let Some(body) = &body {
+            body.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        }
+        let expand = gtk::Button::from_icon_name("notification-expand-symbolic");
+        expand.add_css_class("message-expand-button");
+        expand.set_valign(gtk::Align::Center);
+        expand.update_property(&[gtk::accessible::Property::Label("Expand")]);
+        // An St.Button takes no keyboard focus (messageList.js builds the
+        // expand button without `can_focus`): Super+N then Tab still
+        // reaches Close, and Super+N itself expands.
+        expand.set_focusable(false);
+        if let Some(header) = close.parent() {
+            expand.insert_before(&header, Some(&close));
+        }
         let has_default = n.actions().iter().any(|a| a.id == "default");
-        if n.actions().iter().any(|a| a.id != "default") {
+        let actions = n.actions().iter().any(|a| a.id != "default").then(|| {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             for action in n.actions().iter().filter(|a| a.id != "default") {
                 let button = gtk::Button::with_label(&action.label);
@@ -1422,8 +1582,121 @@ impl NotifyUi {
                 });
                 row.append(&button);
             }
-            c.append(&row);
+            // GNOME's action bin scales in under the body as it expands.
+            let revealer = gtk::Revealer::builder()
+                .transition_type(gtk::RevealerTransitionType::SlideDown)
+                .child(&row)
+                .build();
+            c.append(&revealer);
+            revealer
+        });
+        let set_expanded: Rc<dyn Fn(bool, bool)> = {
+            let (me, id, c, expand, body, actions) = (
+                Rc::downgrade(self),
+                n.id,
+                c.downgrade(),
+                expand.downgrade(),
+                body.as_ref().map(|b| b.downgrade()),
+                actions.as_ref().map(|r| r.downgrade()),
+            );
+            Rc::new(move |on, animate| {
+                let (Some(c), Some(expand)) = (c.upgrade(), expand.upgrade()) else {
+                    return;
+                };
+                if on {
+                    c.add_css_class("expanded");
+                } else {
+                    c.remove_css_class("expanded");
+                }
+                let body = body.as_ref().and_then(|b| b.upgrade());
+                if let Some(body) = &body {
+                    // LabelExpanderLayout: one line, or up to six.
+                    body.set_lines(if on { BANNER_EXPANDED_LINES } else { 1 });
+                }
+                let actions = actions.as_ref().and_then(|r| r.upgrade());
+                if let Some(actions) = &actions {
+                    let ms = if animate && crate::transient::motion_allowed() {
+                        crate::transient::BANNER_MS as u32
+                    } else {
+                        0
+                    };
+                    actions.set_transition_duration(ms);
+                    actions.set_reveal_child(on);
+                }
+                expand.update_state(&[gtk::accessible::State::Expanded(Some(on))]);
+                // `_updateExpandButton`: shown while there is more to see
+                // (an ellipsized body or actions) or it is expanded; it
+                // keeps its place either way. The body's layout is known
+                // once laid out, on the next frame.
+                let has_actions = actions.is_some();
+                expand.add_tick_callback(move |expand, _| {
+                    if body.as_ref().is_some_and(|b| b.width() == 0) {
+                        return glib::ControlFlow::Continue;
+                    }
+                    let ellipsized = body.as_ref().is_some_and(|b| b.layout().is_ellipsized());
+                    let can = has_actions || on || ellipsized;
+                    expand.set_opacity(if can { 1.0 } else { 0.0 });
+                    glib::ControlFlow::Break
+                });
+                if let Some(me) = me.upgrade() {
+                    me.banner_expanded.set(on.then_some(id));
+                }
+            })
+        };
+        set_expanded(expanded, false);
+        {
+            let (set_expanded, c) = (set_expanded.clone(), c.downgrade());
+            expand.connect_clicked(move |_| {
+                let on = c.upgrade().is_some_and(|c| c.has_css_class("expanded"));
+                set_expanded(!on, true);
+            });
         }
+        {
+            // `_onNotificationHoverChanged` and `_updateState`: the
+            // pointer on a shown banner holds it and expands it. One
+            // already under the pointer as it drops in waits for the
+            // pointer to come back onto it. The pointer gone for
+            // `HIDE_TIMEOUT`, the banner goes at once.
+            let motion = gtk::EventControllerMotion::new();
+            let (me, set_expanded, c_weak) =
+                (Rc::downgrade(self), set_expanded.clone(), c.downgrade());
+            motion.connect_enter(move |_, _, _| {
+                let Some(me) = me.upgrade() else {
+                    return;
+                };
+                if !matches!(me.tray.get(), TrayState::Shown) {
+                    return;
+                }
+                me.pointer_in.set(true);
+                if c_weak
+                    .upgrade()
+                    .is_some_and(|c| !c.has_css_class("expanded"))
+                {
+                    set_expanded(true, true);
+                }
+            });
+            let me = Rc::downgrade(self);
+            motion.connect_leave(move |motion| {
+                let (me, motion) = (me.clone(), motion.downgrade());
+                glib::timeout_add_local_once(BANNER_HIDE_TIMEOUT, move || {
+                    let Some(me) = me.upgrade() else {
+                        return;
+                    };
+                    let back = motion.upgrade().is_some_and(|m| m.contains_pointer());
+                    if back || !me.pointer_in.replace(false) {
+                        return;
+                    }
+                    let now = Instant::now();
+                    me.timer
+                        .borrow_mut()
+                        .get_or_insert_with(|| BannerTimer::new(now, None))
+                        .expire_at(now);
+                    me.update();
+                });
+            });
+            c.add_controller(motion);
+        }
+        *self.banner_expander.borrow_mut() = Some(set_expanded);
         {
             let (me, id) = (self.clone(), n.id);
             close.connect_clicked(move |_| {
@@ -1511,8 +1784,15 @@ impl NotifyUi {
     ) {
         self.history_stale.set(false);
         self.group_widgets.borrow_mut().clear();
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
+        // Only the notification groups are rebuilt: the players' messages
+        // stay on top, in place.
+        let media = self.media_items();
+        let mut child = self.list.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if !media.contains(&widget) {
+                self.list.remove(&widget);
+            }
         }
         let by_id: HashMap<u64, &Notification> =
             center.history().iter().map(|n| (n.id, n)).collect();
@@ -1523,7 +1803,9 @@ impl NotifyUi {
                 [] => {}
                 // A group of one is just its card.
                 [n] => {
-                    let (c, close) = card(n);
+                    let Card {
+                        widget: c, close, ..
+                    } = card(n);
                     let item = crate::transient::MotionBin::new(&c);
                     let (me, id, weak) = (self.clone(), n.id, item.downgrade());
                     close.connect_clicked(move |_| {
@@ -1565,11 +1847,19 @@ impl NotifyUi {
         }
     }
 
-    /// Append a list item, zooming it in when it is new and the list is
-    /// on screen (`_addMessage`).
+    /// Append a list item, below every player's message, zooming it in
+    /// when it is new (`_addMessage`).
     fn add_item(&self, item: &crate::transient::MotionBin, new: bool) {
         self.list.append(item);
-        if new && self.list.is_mapped() {
+        if new {
+            self.zoom_in(item);
+        }
+    }
+
+    /// Zoom a new item in while the list is on screen
+    /// (`_addMessageAtIndex`).
+    fn zoom_in(&self, item: &crate::transient::MotionBin) {
+        if self.list.is_mapped() {
             item.animate(
                 &crate::transient::Player::new("message"),
                 crate::transient::MESSAGE_MS,
@@ -1577,6 +1867,194 @@ impl NotifyUi {
                 || {},
             );
         }
+    }
+
+    /// The players' list items, newest first.
+    fn media_items(&self) -> Vec<gtk::Widget> {
+        self.media_rows
+            .borrow()
+            .iter()
+            .map(|row| row.item.clone().upcast())
+            .collect()
+    }
+
+    /// Read the calendar's media players from `players`; `act` drives one
+    /// by its bus name and `raise` raises it (`MediaMessage`).
+    pub fn set_media(
+        self: &Rc<Self>,
+        players: CalendarMedia,
+        act: MediaActions,
+        raise: MediaRaise,
+    ) {
+        *self.media_hooks.borrow_mut() = Some(MediaHooks {
+            players,
+            act,
+            raise,
+        });
+        self.refresh_media();
+    }
+
+    /// Bring the media players up to date, live (`_addPlayer`,
+    /// `_removePlayer`, each `MediaMessage`'s `_update` and
+    /// `_applyPolicy`): a new player's message zooms in on top, one that
+    /// left the bus (or can no longer play) zooms out, and the others
+    /// update in place, so a pressed control keeps its focus.
+    pub fn refresh_media(self: &Rc<Self>) {
+        let Some((players, act, raise)) = self
+            .media_hooks
+            .borrow()
+            .as_ref()
+            .map(|h| (h.players.clone(), h.act.clone(), h.raise.clone()))
+        else {
+            return;
+        };
+        let now = players();
+        let mut rows = std::mem::take(&mut *self.media_rows.borrow_mut());
+        let mut gone = Vec::new();
+        rows.retain(|row| {
+            let stays = now.iter().any(|(e, _)| e.bus_name == row.entry.bus_name);
+            if !stays {
+                gone.push(row.item.clone());
+            }
+            stays
+        });
+        let mut added = Vec::new();
+        let mut next = Vec::with_capacity(now.len());
+        for (entry, visible) in now {
+            let row = match rows.iter().position(|r| r.entry.bus_name == entry.bus_name) {
+                Some(i) => {
+                    let mut row = rows.swap_remove(i);
+                    if row.entry != entry {
+                        row.message.update(&entry);
+                        row.entry = entry;
+                    }
+                    row
+                }
+                None => {
+                    let row = self.media_row(entry, &act, &raise);
+                    added.push(row.item.clone());
+                    row
+                }
+            };
+            // `_applyPolicy`: hidden, yet still one of the list's messages.
+            row.item.set_visible(visible);
+            next.push(row);
+        }
+        *self.media_rows.borrow_mut() = next;
+        for item in &gone {
+            self.remove_media_item(item);
+        }
+        self.arrange(&self.media_items());
+        let notifications = self.shown.borrow().as_ref().map_or(0, |s| s.history.len());
+        // The first player shows the list: its message zooms in on it.
+        self.sync_placeholder(notifications);
+        for item in &added {
+            self.zoom_in(item);
+        }
+    }
+
+    /// One player's message (`MediaMessage`): focusable, and a click,
+    /// Enter or Space on it raises the player, which also closes the
+    /// calendar (`vfunc_clicked`). Its controls take their own clicks; an
+    /// insensitive one, like GNOME's unreactive button, leaves the click
+    /// to the message.
+    fn media_row(&self, entry: MediaEntry, act: &MediaActions, raise: &MediaRaise) -> MediaRow {
+        // GNOME's message role (`Atk.Role.NOTIFICATION`), as `card` gives.
+        let message = MediaMessage::new(&entry, act, gtk::AccessibleRole::Alert);
+        message.widget.set_focusable(true);
+        let activate: Rc<dyn Fn()> = {
+            let (raise, bus_name) = (raise.clone(), entry.bus_name.clone());
+            Rc::new(move || raise(&bus_name))
+        };
+        let click = gtk::GestureClick::new();
+        {
+            let activate = activate.clone();
+            click.connect_released(move |_, _, _, _| activate());
+        }
+        message.widget.add_controller(click);
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |keys, key, _, _| {
+            use gtk::gdk::Key;
+            // Only the message's own focus: its controls handle their keys.
+            let on_message = keys.widget().is_some_and(|message| message.has_focus());
+            match key {
+                Key::Return | Key::KP_Enter | Key::space if on_message => {
+                    activate();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        message.widget.add_controller(keys);
+        let item = crate::transient::MotionBin::new(&message.widget);
+        MediaRow {
+            entry,
+            item,
+            message,
+        }
+    }
+
+    /// `_removePlayer`: the message zooms out, then leaves the list.
+    fn remove_media_item(&self, item: &crate::transient::MotionBin) {
+        let detach = {
+            let (list, item) = (self.list.clone(), item.clone());
+            move || {
+                if item.parent().as_ref() == Some(list.upcast_ref::<gtk::Widget>()) {
+                    list.remove(&item);
+                }
+            }
+        };
+        if !item.is_mapped() {
+            detach();
+            return;
+        }
+        item.set_can_target(false);
+        item.animate(
+            &crate::transient::Player::new("message"),
+            crate::transient::MESSAGE_MS,
+            |_, t| crate::transient::message(t, false),
+            detach,
+        );
+    }
+
+    /// Lay the list out in [`message_order`]: `media` on top, everything
+    /// else (the groups, a departing player's message) below. Widgets
+    /// already listed move in place, keeping their focus.
+    fn arrange(&self, media: &[gtk::Widget]) {
+        let mut groups = Vec::new();
+        let mut child = self.list.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if !media.contains(&widget) {
+                groups.push(widget);
+            }
+        }
+        let mut previous: Option<gtk::Widget> = None;
+        for item in message_order(media.iter().cloned(), groups) {
+            let (ListItem::Media(widget) | ListItem::Group(widget)) = item;
+            if widget.parent().as_ref() != Some(self.list.upcast_ref::<gtk::Widget>()) {
+                self.list.insert_child_after(&widget, previous.as_ref());
+            } else if widget.prev_sibling() != previous {
+                self.list.reorder_child_after(&widget, previous.as_ref());
+            }
+            previous = Some(widget);
+        }
+    }
+
+    /// The placeholder and Clear, from the list's `empty` and `can-clear`
+    /// ([`list_state`]) given its `notifications`. GNOME binds Clear's
+    /// visibility to the placeholder's without SYNC_CREATE.
+    fn sync_placeholder(&self, notifications: usize) {
+        let state = list_state(self.media_rows.borrow().len(), notifications);
+        self.list.set_visible(!state.empty);
+        if self.placeholder_shown.replace(state.empty) != state.empty {
+            // The placeholder changes: from here on Clear follows it.
+            self.clear_bound.set(true);
+        }
+        self.empty.set_visible(state.empty);
+        self.clear
+            .set_visible(!self.clear_bound.get() || !state.empty);
+        self.clear.set_sensitive(state.can_clear);
     }
 
     /// Drop the banner in: fade, slide down and grow from 90%. `again`
@@ -1625,6 +2103,8 @@ impl NotifyUi {
             me.banner_bin.set_frame(crate::transient::Frame::REST);
             me.banner_bin.set_can_target(true);
             me.showing.set(None);
+            me.banner_expander.borrow_mut().take();
+            me.pointer_in.set(false);
             me.tray.set(TrayState::Hidden);
             me.update();
         };
@@ -1681,7 +2161,9 @@ impl NotifyUi {
     /// inset more and darker. Clicking expands it; closing the top card
     /// closes the whole group.
     fn collapsed_group(self: &Rc<Self>, key: &str, members: &[&Notification]) -> gtk::Button {
-        let (top, close) = card(members[0]);
+        let Card {
+            widget: top, close, ..
+        } = card(members[0]);
         let layout = stack_layout(members.len());
         let reveal = layout.last().map_or(0, |&(_, reach)| reach);
         top.set_margin_bottom(reveal);
@@ -1777,12 +2259,77 @@ impl NotifyUi {
         header.append(&collapse);
         group.append(&header);
         for n in members {
-            let (c, close) = card(n);
+            let Card {
+                widget: c, close, ..
+            } = card(n);
             let (me, id) = (self.clone(), n.id);
             close.connect_clicked(move |_| me.remove(&[id]));
             group.append(&c);
         }
         group
+    }
+}
+
+#[cfg(test)]
+mod media_list_tests {
+    use super::*;
+
+    #[test]
+    fn media_messages_sit_above_notifications_like_gnome() {
+        // Players come newest first (mpris::listed); every group, urgent
+        // or not, goes below the last player.
+        let players = crate::mpris::listed([(1, true, "older"), (2, true, "newer")]);
+        assert_eq!(
+            message_order(players, ["mail", "chat"]),
+            vec![
+                ListItem::Media("newer"),
+                ListItem::Media("older"),
+                ListItem::Group("mail"),
+                ListItem::Group("chat"),
+            ]
+        );
+        assert_eq!(
+            message_order(Vec::<&str>::new(), ["mail"]),
+            vec![ListItem::Group("mail")]
+        );
+        assert_eq!(
+            message_order(["player"], Vec::<&str>::new()),
+            vec![ListItem::<&str, &str>::Media("player")]
+        );
+    }
+
+    #[test]
+    fn players_keep_the_placeholder_away_but_never_make_clear_sensitive() {
+        assert_eq!(
+            list_state(0, 0),
+            ListState {
+                empty: true,
+                can_clear: false
+            }
+        );
+        // A player alone: no placeholder, Clear on screen but insensitive
+        // (a MediaMessage cannot close).
+        assert_eq!(
+            list_state(1, 0),
+            ListState {
+                empty: false,
+                can_clear: false
+            }
+        );
+        assert_eq!(
+            list_state(0, 2),
+            ListState {
+                empty: false,
+                can_clear: true
+            }
+        );
+        assert_eq!(
+            list_state(2, 1),
+            ListState {
+                empty: false,
+                can_clear: true
+            }
+        );
     }
 }
 
@@ -2041,6 +2588,23 @@ mod timer_tests {
     }
 
     #[test]
+    fn a_banner_the_pointer_left_goes_at_once() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        // An away user's banner waits; the pointer leaving it after
+        // holding it (`_updateNotificationTimeout(0)`) sends it now.
+        let mut t = BannerTimer::new(t0, Some(s(30)));
+        t.expire_at(t0 + s(1));
+        assert_eq!(t.deadline(), Some(t0 + s(1)));
+        assert!(t.expired(t0 + s(1), Some(s(31))));
+        // An active user's four seconds are cut short the same way.
+        let mut t = BannerTimer::new(t0, None);
+        t.expire_at(t0 + Duration::from_millis(1500));
+        assert!(!t.expired(t0 + s(1), None));
+        assert!(t.expired(t0 + Duration::from_millis(1500), None));
+    }
+
+    #[test]
     fn due_collects_expiries_the_next_deadline_and_away_banners() {
         let t0 = Instant::now();
         let s = Duration::from_secs;
@@ -2164,6 +2728,7 @@ mod gtk_action_lifecycle_tests {
             if let Some(button) = widget.downcast_ref::<gtk::Button>() {
                 if button.label().as_deref() == Some(wanted)
                     || (wanted == "close" && button.has_css_class("message-close-button"))
+                    || (wanted == "expand" && button.has_css_class("message-expand-button"))
                 {
                     found.push(button.clone());
                 }
@@ -2274,6 +2839,10 @@ mod gtk_action_lifecycle_tests {
         let ui = NotifyUi::build(&app, center.clone(), false);
         // Real clicked callbacks, retained even after their widgets leave the UI.
         let (id, take, delay, fired) = post(&ui);
+        // Tab from the focused banner skips the expand arrow, as St's
+        // focus chain does, and lands on Close.
+        assert!(!button(&ui.banner_box, "expand").is_focusable());
+        assert!(button(&ui.banner_box, "close").is_focusable());
         take.emit_clicked();
         take.emit_clicked();
         delay.emit_clicked();

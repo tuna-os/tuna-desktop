@@ -58,7 +58,10 @@ class FakeTimedate1:
 
     Every command run is logged. The panel clock shows the wall time of
     `panel_zone` at `panel_shift` from the true clock; `follows` makes it
-    track zone and clock changes the way GnomeWallClock does.
+    track zone and clock changes the way GnomeWallClock does. `timers` maps
+    a calendar timer to its next elapse (realtime seconds); as in systemd,
+    the elapse is fixed (from the last trigger or activation, never from a
+    jumped clock) and the timer fires once the clock reaches it.
     """
 
     def __init__(self, zone="Etc/UTC", zones=("Etc/UTC", "Pacific/Auckland",
@@ -69,7 +72,7 @@ class FakeTimedate1:
                  revert_fail=False, accept_invalid=False, epoch=FIXTURE_EPOCH,
                  groups=("tuna-test",), settime_with_ntp=False,
                  settime_ignored=False, stop_ignored=False, mask_ignored=False,
-                 follows=True):
+                 follows=True, timers=None):
         self.zone = zone
         self.zones = zones
         self.ntp_override = None if ntp == "yes" else ntp
@@ -98,6 +101,8 @@ class FakeTimedate1:
         self.panel_zone = zone
         self.panel_shift = 0
         self.log = []
+        self.timers = {unit: {"next": elapse, "last": None}
+                       for unit, elapse in (timers or {}).items()}
 
     def now(self):
         return self.epoch + self.clock_offset
@@ -156,8 +161,14 @@ class FakeTimedate1:
                 return 1, "", "Call failed: Automatic time synchronization is enabled"
             if not self.settime_ignored:
                 self.clock_offset = int(args[0]) // 1_000_000 - self.epoch
+                self.elapse_timers()
             return 0, "", ""
         raise AssertionError(f"unexpected timedate1 call: {argv}")
+
+    def elapse_timers(self):
+        for timer in self.timers.values():
+            if timer["next"] is not None and self.now() >= timer["next"]:
+                timer["last"], timer["next"] = self.now(), None
 
     def __call__(self, argv, timeout=30):
         self.log.append(list(argv))
@@ -190,6 +201,11 @@ class FakeTimedate1:
             return 0, "".join(zone + "\n" for zone in self.zones), ""
         if argv[0] == "timedatectl" and argv[1:] == ["timesync-status"]:
             return 0, "Server: 9.9.9.9 (ntp.example)\n", ""
+        if argv[0] == "systemctl" and argv[1:] == ["list-timers", "--all", "--output=json"]:
+            return 0, json.dumps([
+                {"unit": unit, "next": (timer["next"] or 0) * 1_000_000,
+                 "last": (timer["last"] or 0) * 1_000_000}
+                for unit, timer in self.timers.items()]), ""
         if argv[0] == "systemctl":
             verb, unit = argv[1], argv[-1]
             if verb == "is-active":
@@ -530,12 +546,44 @@ class ManualTime(unittest.TestCase):
         record = M.collect_manual_time(FakeTimedate1(), monotonic=frozen)
         for key, value, why in (("ntp_restored", "no", "NTP restored"),
                                 ("restored_delta", 3600, "real time written back"),
-                                ("enabled_after", "disabled", "provider enablement restored")):
+                                ("enabled_after", "disabled", "provider enablement restored"),
+                                ("timers_after", None, "no timer fired ahead of real time")):
             _, passed, detail = gate({"manual_time": dict(record, **{key: value})},
                                      "G-DATETIME-MANUAL")
             self.assertFalse(passed, key)
             self.assertIn(why, detail)
         self.assertFalse(gate({}, "G-DATETIME-MANUAL")[1])
+
+    def test_a_calendar_timer_inside_the_jump_span_does_not_fire(self):
+        """marlin-vm 44851515855: the old +2h07m jump at 03:14 UTC passed
+        uupd.timer's 04:00 elapse. Going back, no elapse is reached."""
+        due = FIXTURE_EPOCH + 3600
+        transport = FakeTimedate1(timers={"uupd.timer": due})
+        record = M.collect_manual_time(transport, monotonic=frozen)
+        _, passed, detail = gate({"manual_time": record}, "G-DATETIME-MANUAL")
+        self.assertTrue(passed, detail)
+        self.assertIn("-7620s observed", detail)
+        self.assertEqual(transport.timers["uupd.timer"], {"next": due, "last": None})
+        targets = [int(argv[7]) // 1_000_000 for argv in transport.busctl_calls()
+                   if argv[5] == "SetTime"]
+        self.assertLessEqual(max(targets), FIXTURE_EPOCH, "clock never set ahead of real time")
+
+    def test_a_forward_jump_that_fires_a_timer_fails_the_gate(self):
+        """The old forward jump fired uupd.timer early; its failing update
+        queued "Some System Updates Failed" banners over V-STRIP-INSTALLED."""
+        transport = FakeTimedate1(timers={"uupd.timer": FIXTURE_EPOCH + 3600})
+        record = M.collect_manual_time(transport, offset=2 * 3600 + 7 * 60, monotonic=frozen)
+        _, passed, detail = gate({"manual_time": record}, "G-DATETIME-MANUAL")
+        self.assertFalse(passed)
+        self.assertIn("fired by the set clock: uupd.timer", detail)
+        self.assertIn("failed: no timer fired ahead of real time", detail)
+
+    def test_a_timer_that_real_time_reaches_is_not_blamed_on_the_jump(self):
+        transport = FakeTimedate1(timers={"due-now.timer": FIXTURE_EPOCH})
+        record = M.collect_manual_time(transport, monotonic=frozen)
+        self.assertEqual(transport.timers["due-now.timer"]["last"], FIXTURE_EPOCH)
+        _, passed, detail = gate({"manual_time": record}, "G-DATETIME-MANUAL")
+        self.assertTrue(passed, detail)
 
     def test_a_failed_set_still_restores_ntp(self):
         transport = FakeTimedate1()
