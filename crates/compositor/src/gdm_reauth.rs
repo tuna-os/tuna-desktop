@@ -23,7 +23,6 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, LazyLock, Mutex, Weak};
@@ -483,7 +482,7 @@ async fn logind_service() -> Result<String, glib::Error> {
             "org.freedesktop.login1.Manager",
             method,
             Some(&args),
-            Some(glib::VariantTy::new("(o)").unwrap()),
+            glib::VariantTy::new("(o)").ok(),
             gio::DBusCallFlags::NONE,
             timeout,
         )
@@ -496,7 +495,7 @@ async fn logind_service() -> Result<String, glib::Error> {
             "org.freedesktop.DBus.Properties",
             "Get",
             Some(&("org.freedesktop.login1.Session", "Service").to_variant()),
-            Some(glib::VariantTy::new("(v)").unwrap()),
+            glib::VariantTy::new("(v)").ok(),
             gio::DBusCallFlags::NONE,
             timeout,
         )
@@ -670,7 +669,7 @@ fn wait_event(
     shutdown: &AtomicBool,
     deadline: Instant,
 ) -> Option<Event> {
-    let cancel_fd = cancel.fd()?;
+    let cancel_fd = cancel.wake_fd()?;
     loop {
         let mut buffer = [0; 64];
         while (&*wake).read(&mut buffer).is_ok_and(|count| count > 0) {}
@@ -685,20 +684,10 @@ fn wait_event(
         }
         let wait = deadline.checked_duration_since(Instant::now())?;
         let mut fds = [
-            libc::pollfd {
-                fd: wake.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: cancel_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
+            rustix::event::PollFd::new(wake, rustix::event::PollFlags::IN),
+            rustix::event::PollFd::new(&cancel_fd, rustix::event::PollFlags::IN),
         ];
-        let millis = wait.as_millis().clamp(1, i32::MAX as u128) as i32;
-        // SAFETY: both fds stay open across this bounded poll.
-        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, millis) };
+        let _ = crate::wake::poll_fds(&mut fds, Some(wait.max(Duration::from_millis(1))));
     }
 }
 
