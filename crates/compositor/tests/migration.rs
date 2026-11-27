@@ -12,7 +12,7 @@
 use std::os::unix::net::UnixStream;
 
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
-use tuna_compositor::windows::{WindowLayout, WindowManager};
+use tuna_compositor::windows::{TileSide, WindowLayout, WindowManager};
 use tuna_compositor::{State, TestCompositor};
 use wayland_client::{
     protocol::{
@@ -696,6 +696,201 @@ fn window_larger_than_the_survivor_keeps_its_centre_relative() {
     // (400) into the survivor.
     assert_eq!((moved.loc.x, moved.loc.y), (746 - 800, 400 - 500));
     assert_eq!(moved.size, geo.size);
+}
+
+/// Every connector unplugged in one hotplug, as the runtime's output
+/// sync handles it: the layout before, every entry dropped, windows
+/// re-homed once and derived layouts re-applied.
+fn unplug_all(manager: &mut WindowManager, state: &mut State) {
+    let before = state.output_slices();
+    for (name, _) in &before {
+        assert!(state.remove_output(name));
+    }
+    manager.relocate_for_monitors_changed(state, &before);
+    manager.reapply_derived_layouts(state);
+}
+
+/// Outputs `(name, x, width, height)` plugged back in one hotplug, the
+/// first primary, as the runtime's output sync does.
+fn replug_all(manager: &mut WindowManager, state: &mut State, outputs: &[(&str, i32, i32, i32)]) {
+    let before = state.output_slices();
+    for (name, x, width, height) in outputs {
+        state.add_output(name, None, *width, *height);
+        state.set_output_location(name, (*x, 0));
+    }
+    assert!(state.set_primary(outputs[0].0));
+    manager.relocate_for_monitors_changed(state, &before);
+    manager.reapply_derived_layouts(state);
+}
+
+/// Mutter's `meta_window_update_for_monitors_changed` with no logical
+/// monitor left does nothing destructive: floating, maximized and tiled
+/// windows keep their geometry, layout and monitor while every output is
+/// unplugged (never 0x0), and each is back on its output with the same
+/// geometry once the outputs return.
+#[test]
+fn all_outputs_unplugged_then_replugged_restores_every_window() {
+    let mut comp = TestCompositor::new();
+    comp.state.add_output("left", None, 1280, 800);
+    comp.state.add_output("right", None, 1920, 1080);
+    let mut manager = comp.window_manager();
+    let mut clients = Vec::new();
+    for title in ["floating-left", "floating-right", "maximized", "tiled"] {
+        let (conn, mut queue, mut client) = connect(&mut comp);
+        map_toplevel(&mut comp, &conn, &mut queue, &mut client, title);
+        clients.push((conn, queue, client));
+    }
+    manager.reconcile(&mut comp.state);
+    for (conn, queue, client) in &mut clients {
+        sync_client(&mut comp, conn, queue, client);
+    }
+    let id = |manager: &WindowManager, title: &str| {
+        manager
+            .model()
+            .windows()
+            .find(|w| w.title == title)
+            .unwrap()
+            .id
+    };
+    let ids = [
+        id(&manager, "floating-left"),
+        id(&manager, "floating-right"),
+        id(&manager, "maximized"),
+        id(&manager, "tiled"),
+    ];
+    // Floating on the primary at (40, 60), on the second output at
+    // (1480, 100); one maximized and one tiled on the primary.
+    for (window, (x, y)) in [(ids[0], (40, 60)), (ids[1], (1480, 100))] {
+        let geo = manager.geometry(window).unwrap();
+        assert!(manager.move_window(window, x - geo.loc.x, y - geo.loc.y));
+    }
+    let floating_maximized = manager.geometry(ids[2]).unwrap();
+    assert!(manager.set_maximized(&mut comp.state, ids[2], true));
+    assert!(manager.set_tiled(&mut comp.state, ids[3], TileSide::Right));
+    manager.reconcile(&mut comp.state);
+    let layouts = [
+        WindowLayout::Floating,
+        WindowLayout::Floating,
+        WindowLayout::Maximized,
+        WindowLayout::Tiled(TileSide::Right),
+    ];
+    // The output each window is on, which it keeps while unplugged.
+    let homes = ["left", "right", "left", "left"];
+    let before: Vec<_> = ids
+        .iter()
+        .map(|&window| manager.geometry(window).unwrap())
+        .collect();
+    assert_eq!(
+        before[2],
+        smithay::utils::Rectangle::new((0, 32).into(), (1280, 768).into())
+    );
+    assert_eq!(
+        before[3],
+        smithay::utils::Rectangle::new((640, 32).into(), (640, 768).into())
+    );
+    let assert_kept = |manager: &WindowManager, when: &str| {
+        for (index, &window) in ids.iter().enumerate() {
+            let geo = manager.geometry(window).unwrap();
+            assert!(
+                geo.size.w > 0 && geo.size.h > 0,
+                "{when}: window {index} is {geo:?}"
+            );
+            assert_eq!(geo, before[index], "{when}: window {index} geometry");
+            assert_eq!(
+                manager.window_layout(window),
+                Some(layouts[index]),
+                "{when}: window {index} layout"
+            );
+            assert_eq!(
+                manager.preferred_output(window),
+                Some(homes[index]),
+                "{when}: window {index} output"
+            );
+        }
+        assert_eq!(
+            manager.model().windows().count(),
+            4,
+            "{when}: no window lost"
+        );
+    };
+
+    unplug_all(&mut manager, &mut comp.state);
+    assert!(comp.state.output_slices().is_empty());
+    assert_kept(&manager, "unplugged");
+    // The next tick's workarea pass keeps them too.
+    manager.reconcile(&mut comp.state);
+    assert_kept(&manager, "unplugged, next tick");
+
+    replug_all(
+        &mut manager,
+        &mut comp.state,
+        &[("left", 0, 1280, 800), ("right", 1280, 1920, 1080)],
+    );
+    assert_kept(&manager, "replugged");
+    manager.reconcile(&mut comp.state);
+    assert_kept(&manager, "replugged, next tick");
+    // The maximized window still unmaximizes to where it was floating.
+    assert!(manager.set_maximized(&mut comp.state, ids[2], false));
+    assert_eq!(manager.geometry(ids[2]).unwrap(), floating_maximized);
+}
+
+/// Outputs returning in another arrangement after a full unplug: each
+/// floating window goes home to its own output
+/// (`meta_window_find_monitor_from_id`: the preferred monitor) from the
+/// one it was on when the last output went away, keeping its relative
+/// place (`meta_window_move_between_rects`).
+#[test]
+fn outputs_returning_rearranged_after_a_full_unplug_take_their_windows_home() {
+    let mut f = two_windows_dual();
+    for (window, (x, y)) in [(f.id_a, (100, 60)), (f.id_b, (1280 + 300, 90))] {
+        let geo = f.manager.geometry(window).unwrap();
+        assert!(f.manager.move_window(window, x - geo.loc.x, y - geo.loc.y));
+    }
+    unplug_all(&mut f.manager, &mut f.comp.state);
+    // "right" comes back first and primary, "left" after it.
+    replug_all(
+        &mut f.manager,
+        &mut f.comp.state,
+        &[("right", 0, 1920, 1080), ("left", 1920, 1280, 800)],
+    );
+    let alpha = f.manager.geometry(f.id_a).unwrap();
+    let beta = f.manager.geometry(f.id_b).unwrap();
+    assert_eq!(
+        (alpha.loc.x, alpha.loc.y),
+        (1920 + 100, 60),
+        "alpha back on left"
+    );
+    assert_eq!((beta.loc.x, beta.loc.y), (300, 90), "beta back on right");
+    assert_eq!((alpha.size.w, alpha.size.h), (800, 600));
+    assert_eq!(f.manager.preferred_output(f.id_a), Some("left"));
+    assert_eq!(f.manager.preferred_output(f.id_b), Some("right"));
+}
+
+/// A window maximized while no output is connected keeps its geometry
+/// (there is no work area to fill) and fills the work area once an
+/// output returns.
+#[test]
+fn maximizing_without_outputs_waits_for_an_output() {
+    let mut f = two_windows_dual();
+    let floating = f.manager.geometry(f.id_a).unwrap();
+    unplug_all(&mut f.manager, &mut f.comp.state);
+    assert!(f.manager.set_maximized(&mut f.comp.state, f.id_a, true));
+    assert_eq!(
+        f.manager.window_layout(f.id_a),
+        Some(WindowLayout::Maximized)
+    );
+    assert_eq!(f.manager.geometry(f.id_a).unwrap(), floating);
+    replug_all(
+        &mut f.manager,
+        &mut f.comp.state,
+        &[("left", 0, 1280, 800), ("right", 1280, 1920, 1080)],
+    );
+    assert_eq!(
+        f.manager.geometry(f.id_a).unwrap(),
+        smithay::utils::Rectangle::new((0, 32).into(), (1280, 768).into())
+    );
+    assert!(f.manager.set_maximized(&mut f.comp.state, f.id_a, false));
+    assert_eq!(f.manager.geometry(f.id_a).unwrap(), floating);
 }
 
 #[test]

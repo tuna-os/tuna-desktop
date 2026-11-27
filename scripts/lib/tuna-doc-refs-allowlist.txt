@@ -1,0 +1,8 @@
+# Intended exceptions for scripts/tuna-doc-refs (#1219).
+# Format: REFERENCE | one-line reason. REFERENCE is the link target or
+# backticked token exactly as written. Blank lines and # comments are ignored.
+.spektacular/tmp/ | scratch directory spektacular creates at run time; never committed
+docs/reviews/vX.Y.Z.md | release-runbook placeholder for the next release's visual review
+docs/reviews/vX.Y.Z-beta.N.md | release-runbook placeholder for the next beta's visual review
+scripts/install.sh | Corral's installer in the Corral repository, not this one
+docs/shots | named as the destination that no longer exists (docs/visual-capture-refresh.md)

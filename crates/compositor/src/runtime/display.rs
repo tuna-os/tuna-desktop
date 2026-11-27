@@ -216,12 +216,23 @@ impl Runtime {
     #[cfg(feature = "drm")]
     pub(super) fn on_drm_hotplug(&mut self) {
         let live = self.display_state().live_config();
+        let leased = self
+            .state
+            .protocols
+            .drm_lease
+            .as_ref()
+            .map(|lease| lease.leased_crtcs())
+            .unwrap_or_default();
         let Backend::Drm(drm) = &mut self.backend else {
             return;
         };
-        let changes = drm.rescan_connectors();
+        let changes = drm.rescan_connectors(&leased);
         if changes.is_empty() {
             return;
+        }
+        if let Some(lease) = self.state.protocols.drm_lease.as_mut() {
+            let (crtcs, planes) = drm.desktop_resources();
+            lease.set_desktop(crtcs, planes);
         }
         eprintln!(
             "tuna-compositor: drm: hotplug: connected [{}], disconnected [{}]",
@@ -276,6 +287,11 @@ impl Runtime {
         }
         drm.log_outputs();
         self.color.set_gamma_sizes(drm.gamma_sizes());
+        // meta_monitor_manager_notify_monitors_changed →
+        // meta_color_manager_monitors_changed: colord devices follow.
+        if let Some(colord) = &self.colord {
+            colord.monitors_changed(drm.colord_monitors());
+        }
         let primary_scale = drm.outputs.first().map(|o| o.scale);
         self.sync_drm_outputs();
         if let Some(scale) = primary_scale {

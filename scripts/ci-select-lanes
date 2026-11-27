@@ -2,11 +2,13 @@
 """ci-select-lanes — choose which ci.yml proof lanes a run executes.
 
 Usage:
-  scripts/ci-select-lanes [--event NAME] [--run-number N] [--size K] [--changed FILE|-]
+  scripts/ci-select-lanes [--event NAME] [--run-number N] [--size K] [--changed FILE|-] [--draft]
 
-Prints `lanes=<JSON array>` for $GITHUB_OUTPUT; the reason goes to
+Prints `lanes=<JSON array>` and the marlin-vm legs as `vm_matrix=<JSON>`
+(VM_PRIMARY etc. below) for $GITHUB_OUTPUT; the reason goes to
 stderr and, when set, $GITHUB_STEP_SUMMARY. The `select-lanes` and `check`
-jobs always run and are not proof lanes.
+jobs always run and are not proof lanes. A draft pull request (--draft)
+runs no proof lane until it is marked ready for review.
 
 push, schedule and workflow_dispatch run every lane. A pull_request runs
 what its changed files (`git diff --name-only HEAD^1 HEAD` on the merge
@@ -27,7 +29,8 @@ commit, or --changed) can affect:
 - anything else (crates, share/, other scripts) runs gtk-shell plus a
   round-robin slice of ROTATION: K lanes starting at
   (run_number * K) mod len(ROTATION), K from --size, $CI_ROUND_ROBIN_SIZE
-  or 2. Every rotated lane runs on main after merge either way.
+  or 2. Every rotated lane runs on main after merge either way. Code a lane
+  is the only end-to-end proof of (CODE_OWNED) also runs that lane.
 
 Lanes that consume another lane's artifacts pull in their producers.
 """
@@ -41,7 +44,7 @@ import sys
 
 # Selectable ci.yml proof jobs, in workflow order.
 LANES = [
-    "journey", "app-content", "scroll-proof", "drm-smoke",
+    "journey", "app-content", "scroll-proof", "drm-smoke", "hotplug",
     "grid-cancel-comparison", "gtk-shell", "orca-speech",
     "portal-security", "remote-security", "niri-parity", "arch-package",
     "marlin-image", "marlin-vm", "parity-ledger", "docs-shots",
@@ -59,7 +62,7 @@ CORE = ["grid-cancel-comparison", "gtk-shell"]
 # only (it rebuilds what marlin-vm builds), so a pull request rotating it
 # would pay for arch-package and run nothing.
 ROTATION = [
-    "journey", "app-content", "scroll-proof", "drm-smoke", "orca-speech",
+    "journey", "app-content", "scroll-proof", "drm-smoke", "hotplug", "orca-speech",
     "portal-security", "remote-security", "niri-parity", "marlin-vm",
 ]
 
@@ -70,10 +73,49 @@ NEEDS = {
     "niri-parity": ["arch-package"],
     "marlin-image": ["arch-package"],
     "marlin-vm": ["arch-package"],
-    "parity-ledger": ["journey", "gtk-shell", "orca-speech", "drm-smoke", "marlin-vm",
+    "parity-ledger": ["journey", "gtk-shell", "orca-speech", "drm-smoke", "hotplug", "marlin-vm",
                       "remote-security"],
     "docs-shots": ["journey", "app-content", "scroll-proof"],
 }
+
+# marlin-vm matrix legs; ci.yml names each leg's job and artifact after
+# `artifact`. A marlin-vm run always has the primary lifecycle leg and the
+# required native automatic-timezone leg. The Orca 51 leg runs on push, schedule and
+# dispatch, and on a pull request that runs parity-ledger: the ledger cites its
+# V-ORCA-* gates from `marlin-vm-orca51/assertions.txt`, as it cites V-AUTOTZ
+# from `marlin-vm-autotz/assertions.txt`. The paired GNOME/Tuna references run
+# off pull requests only (each leg rebuilds the image and boots a VM for ~30
+# hosted minutes).
+VM_PRIMARY = [
+    {"profile": "lifecycle", "orca": "distribution", "artifact": "marlin-vm"},
+    {"profile": "autotz", "orca": "distribution", "artifact": "marlin-vm-autotz"},
+]
+VM_ORCA51 = {"profile": "lifecycle", "orca": "upstream51", "artifact": "marlin-vm-orca51"}
+VM_REFERENCES = [
+    {"profile": "gnome-reference", "session": "gnome", "orca": "distribution",
+     "artifact": "native-gnome51-reference"},
+    {"profile": "tuna-reference", "session": "tuna", "orca": "distribution",
+     "artifact": "native-tuna-reference"},
+]
+
+# Code (still CORE plus the rotation) whose only end-to-end proof is one
+# lane, which it therefore always runs. The nested backend has one fixed
+# output, so connector hotplug and what follows it (window re-homing, lock
+# surfaces on new outputs, colord devices, monitor and area casts,
+# DisplayConfig) is proven only on vkms by the hotplug lane (#203).
+CODE_OWNED = [
+    ("crates/compositor/src/drm.rs", ["hotplug"]),
+    ("crates/compositor/src/drm/*", ["hotplug"]),
+    ("crates/compositor/src/windows.rs", ["hotplug"]),
+    ("crates/compositor/src/color_manager.rs", ["hotplug"]),
+    ("crates/compositor/src/color_manager/*", ["hotplug"]),
+    ("crates/compositor/src/session_lock.rs", ["hotplug"]),
+    ("crates/compositor/src/screencast.rs", ["hotplug"]),
+    ("crates/compositor/src/mutter.rs", ["hotplug"]),
+    ("crates/compositor/src/mutter/*", ["hotplug"]),
+    ("crates/compositor/src/runtime/display.rs", ["hotplug"]),
+    ("crates/shell-gtk/src/lock.rs", ["hotplug"]),
+]
 
 # fnmatch patterns: `*` also matches `/`. First matching rule wins.
 FULL = [
@@ -94,9 +136,19 @@ PACKAGE_CONSUMERS = ["arch-package", "portal-security", "remote-security",
 
 OWNED = [
     ("scripts/tuna-gtk-shell-proof", ["gtk-shell", "journey"]),
+    # Sourced by it (journey's installed run included): the sound-alert
+    # gates (#353) and their bell pixel reader.
+    ("scripts/lib/tuna-sound-alerts-proof.sh", ["gtk-shell", "journey"]),
+    ("scripts/lib/tuna-bell-pixels.py", ["gtk-shell", "journey"]),
     ("scripts/tuna-scale-proof", ["gtk-shell"]),
     ("scripts/tuna-slow-portal-proof", ["gtk-shell"]),
     ("scripts/tuna-session-restore-proof", ["gtk-shell"]),
+    # The login screen (#1164): tuna-compositor --greeter and tuna-greeter
+    # against a GDM 51 and AccountsService mock, with GDM's own
+    # org.gnome.login-screen schema.
+    ("scripts/tuna-greeter-proof", ["gtk-shell"]),
+    ("scripts/lib/tuna-gdm-mock.py", ["gtk-shell"]),
+    ("scripts/lib/org.gnome.login-screen.gschema.xml", ["gtk-shell"]),
     # Window motion paired with GNOME 51 (#493-#498): the gtk-shell job runs
     # these proofs on its frozen minimize build, against the distilled
     # capture.
@@ -127,12 +179,16 @@ OWNED = [
     ("scripts/tests/test_ci_install_vkms.py", ["drm-smoke"]),
     ("scripts/tests/test_colord_startup.py", ["drm-smoke"]),
     ("scripts/tests/test_drm_dual.py", ["drm-smoke"]),
+    ("scripts/tests/test_drm_input_startup.py", ["drm-smoke"]),
     ("scripts/tests/test_native_product.py", ["marlin-vm"]),
     ("scripts/tests/test_remote_security_failure_report.py", ["remote-security"]),
     ("scripts/tuna-gtk-accessibility-proof", ["gtk-shell"]),
     ("scripts/tuna-a11y-golden", ["gtk-shell"]),
     ("scripts/tuna-wayland-info-compare", ["gtk-shell"]),
     ("scripts/lib/tuna-a11y-proof-guard.py", ["gtk-shell"]),
+    # Sourced by every GTK proof run, journey's installed run included.
+    ("scripts/lib/tuna-panel-dash-proof.sh", ["gtk-shell", "journey"]),
+    ("scripts/lib/tuna-panel-dash-check.py", ["gtk-shell"]),
     ("docs/walkthrough*", ["gtk-shell"]),
     ("scripts/tuna-journey", ["journey"]),
     ("scripts/tuna-release", ["journey"]),
@@ -154,18 +210,25 @@ OWNED = [
     ("scripts/tuna-drm-dual", ["drm-smoke"]),
     ("scripts/lib/drm_dual.py", ["drm-smoke"]),
     ("scripts/lib/drm_kms_readback.py", ["drm-smoke"]),
+    ("scripts/lib/drm_input_startup.py", ["drm-smoke"]),
     ("scripts/lib/colord-startup.sh", ["drm-smoke"]),
     # Sourced by the GTK shell (and journey's installed run), DRM and Orca proofs.
     ("scripts/lib/tuna-state-snapshot.sh", ["gtk-shell", "journey", "drm-smoke", "orca-speech"]),
+    # The uinput keyboard, touchpad and tablet emulators tuna-drm-smoke drives.
+    ("scripts/lib/tuna-uinput-*.py", ["drm-smoke"]),
     ("scripts/tuna-orca-speech-proof", ["orca-speech"]),
     ("scripts/lib/tuna-orca-speech.py", ["orca-speech"]),
     ("scripts/tuna-frame-pacer-build", ["drm-smoke"]),
     ("scripts/lib/tuna-frame-pacer.c", ["drm-smoke"]),
+    ("scripts/lib/tuna-drm-lease-probe.c", ["drm-smoke"]),
     ("scripts/tuna-portal-security", ["portal-security"]),
     ("scripts/lib/tuna-portal-artifact*", ["portal-security"]),
     ("tests/portal-reference/*", ["portal-security"]),
     ("scripts/tuna-remote-security", ["remote-security"]),
     ("tests/remote-desktop-reference/*", ["remote-security"]),
+    ("scripts/tuna-hotplug-stress", ["hotplug"]),
+    # Also the churn lane's (scripts/tuna-stress, nested stress workflow).
+    ("scripts/lib/tuna_process_metrics.py", ["hotplug"]),
     # Helpers only the remote desktop reference harness runs.
     ("scripts/lib/tuna-portal-remote-client.py", ["remote-security"]),
     ("scripts/lib/tuna-remote-*", ["remote-security"]),
@@ -204,6 +267,10 @@ NO_LANE = [
     # ones a lane job runs first.
     "scripts/tests/*",
     "scripts/lib/*-tests.py",
+    # The changed-Markdown resolver and its allowlist: the check job runs
+    # them (#1219).
+    "scripts/tuna-doc-refs",
+    "scripts/lib/tuna-doc-refs-allowlist.txt",
     # Products and workflows of their own, never run by a ci.yml lane
     # (WorkflowSync.test_no_lane_scripts_are_not_run_by_a_lane keeps this
     # true): corral installed-image tooling, variant qualification, hero
@@ -218,8 +285,6 @@ NO_LANE = [
     "scripts/tuna-hero-media",
     "scripts/tuna-coverage-report",
     "scripts/tuna-stress",
-    "scripts/tuna-hotplug-stress",
-    "scripts/lib/tuna_process_metrics.py",
     "scripts/lib/vm_release*",
     "scripts/lib/vm_firstboot_diagnosis.py",
 ]
@@ -361,6 +426,11 @@ def select(event, run_number, size, changed, wf_lanes=None):
             reasons.append(f"{path} -> {', '.join(owned)}")
         elif not matches(path, NO_LANE):
             code.append(path)
+            also = [lane for pattern, lanes in CODE_OWNED
+                    if fnmatch.fnmatchcase(path, pattern) for lane in lanes]
+            if also:
+                chosen.update(also)
+                reasons.append(f"{path} -> {', '.join(also)}")
     if code:
         rotated = rotation(run_number, size)
         chosen.update(CORE + rotated)
@@ -376,6 +446,16 @@ def select(event, run_number, size, changed, wf_lanes=None):
     if not reasons:
         reasons.append("docs/non-runtime changes only: check job only")
     return [lane for lane in LANES if lane in chosen], "; ".join(reasons)
+
+
+def vm_matrix(event, lanes):
+    """The marlin-vm strategy matrix for this event and lane selection."""
+    legs = list(VM_PRIMARY)
+    if event != "pull_request" or "parity-ledger" in lanes:
+        legs.append(VM_ORCA51)
+    if event != "pull_request":
+        legs += VM_REFERENCES
+    return {"include": legs}
 
 
 def changed_files(source):
@@ -399,13 +479,19 @@ def main():
                         "(default: git diff HEAD^1 HEAD on pull_request)")
     parser.add_argument("--base", help="pull request base revision; with it, an edit to "
                         "ci.yml selects only the lanes whose job definition changed")
+    parser.add_argument("--draft", action="store_true",
+                        help="a draft pull request: no proof lane until it is ready for review")
     args = parser.parse_args()
-    changed = changed_files(args.changed) if args.event == "pull_request" else []
-    wf_lanes = None
-    if args.event == "pull_request" and args.base and WORKFLOW in changed:
-        wf_lanes = workflow_lanes(*workflow_texts(args.base))
-    lanes, reason = select(args.event, args.run_number, args.size, changed, wf_lanes)
+    if args.draft:
+        lanes, reason = [], "draft pull request: check job only"
+    else:
+        changed = changed_files(args.changed) if args.event == "pull_request" else []
+        wf_lanes = None
+        if args.event == "pull_request" and args.base and WORKFLOW in changed:
+            wf_lanes = workflow_lanes(*workflow_texts(args.base))
+        lanes, reason = select(args.event, args.run_number, args.size, changed, wf_lanes)
     print("lanes=" + json.dumps(lanes, separators=(",", ":")))
+    print("vm_matrix=" + json.dumps(vm_matrix(args.event, lanes), separators=(",", ":")))
     message = f"ci lanes: {', '.join(lanes) or 'none'}\nreason: {reason}\n"
     sys.stderr.write(message)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
