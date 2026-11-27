@@ -371,7 +371,9 @@ def check():
     # Services the private session bus activated carry its address as
     # DBUS_STARTER_ADDRESS (dbus-daemon's activation helper forks them and
     # may exit, so they need not stay below the bus); they end with the bus,
-    # which the session stops last.
+    # which the session stops last, and so do the helpers they start. A
+    # helper's own environment need not say so: xdg-document-portal's
+    # setuid fusermount3 (auto_unmount) is unreadable to us.
     address = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
     started = f"\0DBUS_STARTER_ADDRESS={address}\0".encode()
     below_bus = {}
@@ -382,8 +384,10 @@ def check():
         if bus is None or bus not in table:
             return False
         if below_bus.get("table") is not table:
-            below_bus.update(table=table, pids=descendants(table, [bus]) | {bus})
-        return pid in below_bus["pids"] or (bool(address) and environ_has(pid, [started]))
+            services = [bus] + [service for service, fields in table.items()
+                                if address and fields[4] == os.getuid() and environ_has(service, [started])]
+            below_bus.update(table=table, pids=descendants(table, services) | set(services))
+        return pid in below_bus["pids"]
 
     deadline = time.monotonic() + run.grace
     alive = run.members(exempt)

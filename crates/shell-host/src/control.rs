@@ -857,6 +857,18 @@ impl ControlClient {
         Ok(id)
     }
 
+    /// Wake the locked, blanked screen for a lock-screen notification
+    /// (screenShield.js `_wakeUpScreen`, #348; 0.55). The compositor
+    /// denies it unless the session is locked.
+    pub fn wake_up_screen(&mut self) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::WakeUpScreen,
+        })?;
+        Ok(id)
+    }
+
     /// Name this shell's session-bus connection (its unique name, `:1.N`)
     /// to the compositor, which then admits D-Bus calls as the shell from
     /// that connection only (0.52, ADR 0010). Kept and declared again
@@ -2337,6 +2349,19 @@ mod tests {
                     kind: RemoteAccessKind::ScreenCast,
                     id: 3
                 },
+            }
+        );
+    }
+
+    #[test]
+    fn wake_up_screen_is_one_command() {
+        let (mut client, mut peer) = handshook();
+        let id = client.wake_up_screen().expect("wake");
+        assert_eq!(
+            server_read(&mut peer),
+            Message::Command {
+                id,
+                kind: CommandKind::WakeUpScreen,
             }
         );
     }

@@ -3119,6 +3119,28 @@ fn build(app: &adw::Application) {
             })
         },
     );
+    // A notification reaching the lock screen's list wakes the blanked
+    // screen unless banners are off (unlockDialog.js
+    // `_wakeUpScreenForSource`; screenShield.js `_wakeUpScreen`, #348).
+    {
+        let shell = shell.clone();
+        let screensaver = Rc::downgrade(&screensaver);
+        let banners = settings("org.gnome.desktop.notifications");
+        lock_ui.set_wake(Rc::new(move || {
+            if banners.as_ref().is_some_and(|s| !s.boolean("show-banners")) {
+                return;
+            }
+            let woke = shell
+                .borrow_mut()
+                .control
+                .as_mut()
+                .filter(|c| c.locked())
+                .is_some_and(|c| c.wake_up_screen().is_ok());
+            if let Some(screensaver) = woke.then(|| screensaver.upgrade()).flatten() {
+                screensaver.wake_up_screen();
+            }
+        }));
+    }
     // Wellbeing (#354): screen-time history/limits and break reminders.
     // The module owns its timers and settings watches; the shell only
     // lends it the message list, the OSD countdown and the lock action.
@@ -3469,6 +3491,8 @@ fn build(app: &adw::Application) {
                     | Action::Unmaximize
                     | Action::Maximize
                     | Action::Minimize
+                    | Action::ToggleAbove
+                    | Action::ToggleSticky
                     | Action::TileLeft
                     | Action::TileRight
                     | Action::BeginMove
@@ -3480,6 +3504,8 @@ fn build(app: &adw::Application) {
                             Action::Unmaximize => W::Unmaximize,
                             Action::Maximize => W::Maximize,
                             Action::Minimize => W::Minimize,
+                            Action::ToggleAbove => W::ToggleAbove,
+                            Action::ToggleSticky => W::ToggleSticky,
                             Action::TileLeft => W::ToggleTiledLeft,
                             Action::TileRight => W::ToggleTiledRight,
                             Action::BeginMove => W::Move,

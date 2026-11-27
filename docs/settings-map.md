@@ -14,7 +14,7 @@ This page records that decision for R9 (knowledge entry
 `learnings/dconf-settings-interop.md`).
 
 Pointer custom acceleration curves and the touchpad typing timeout travel in
-shell-control wire 0.55. The shell and compositor must ship together because
+shell-control wire 0.56. The shell and compositor must ship together because
 `InputSettings` uses positional postcard encoding.
 
 **Status words.**

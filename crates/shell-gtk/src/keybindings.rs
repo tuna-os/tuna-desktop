@@ -92,6 +92,10 @@ pub enum Action {
     Maximize,
     Minimize,
     Close,
+    /// Always on Top, on or off (`toggle-above`).
+    ToggleAbove,
+    /// Always on Visible Workspace, on or off (`toggle-on-all-workspaces`).
+    ToggleSticky,
     /// Mutter's half tiling (toggles back).
     TileLeft,
     TileRight,
@@ -111,6 +115,9 @@ pub enum Target {
     Last,
     Left,
     Right,
+    /// The nth workspace by index (0-based): `switch-to-workspace-N` is
+    /// N - 1. Mutter ignores an index past the last workspace.
+    Index(u32),
 }
 
 impl Target {
@@ -132,6 +139,7 @@ impl Target {
             Target::Last => Some(last),
             Target::Left => (active > first).then(|| active - 1),
             Target::Right => Some(active + 1),
+            Target::Index(index) => (index <= last).then_some(index),
         }
     }
 
@@ -513,6 +521,10 @@ fn specs() -> Vec<Spec> {
                 "<Control><Alt>Right",
             ],
         ),
+        // GNOME 51 binds only workspace 1 by default; 2-12 exist for
+        // the user's own accelerators.
+        wm("toggle-above", Action::ToggleAbove, vec![]),
+        wm("toggle-on-all-workspaces", Action::ToggleSticky, vec![]),
         wm(
             "move-to-workspace-1",
             Action::MoveToWorkspace(Target::First),
@@ -542,6 +554,22 @@ fn specs() -> Vec<Spec> {
             ],
         ),
     ]);
+    for n in 2..=12u32 {
+        specs.push(Spec {
+            schema: Schema::Wm,
+            key: format!("switch-to-workspace-{n}"),
+            action: Action::Workspace(Target::Index(n - 1)),
+            defaults: vec![],
+            modes: NORMAL_OVERVIEW,
+        });
+        specs.push(Spec {
+            schema: Schema::Wm,
+            key: format!("move-to-workspace-{n}"),
+            action: Action::MoveToWorkspace(Target::Index(n - 1)),
+            defaults: vec![],
+            modes: NORMAL_OVERVIEW,
+        });
+    }
     for n in 1..=9u8 {
         specs.push(Spec {
             schema: Schema::Shell,
@@ -757,6 +785,40 @@ pub fn volume_step(media: Option<&gio::Settings>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numbered_workspaces_2_to_12_register_unbound_and_resolve_by_index() {
+        let specs = specs();
+        for n in 2..=12u32 {
+            for (prefix, move_) in [
+                ("switch-to-workspace-", false),
+                ("move-to-workspace-", true),
+            ] {
+                let spec = specs
+                    .iter()
+                    .find(|s| s.key == format!("{prefix}{n}"))
+                    .unwrap();
+                let target = Target::Index(n - 1);
+                assert_eq!(
+                    spec.action,
+                    if move_ {
+                        Action::MoveToWorkspace(target)
+                    } else {
+                        Action::Workspace(target)
+                    }
+                );
+                assert!(spec.defaults.is_empty());
+            }
+        }
+        // Occupied 0,1 -> workspaces 0..=2 exist (one trailing empty).
+        let ws = [0, 1, 2];
+        assert_eq!(Target::Index(2).resolve(0, &ws, &[0, 1]), Some(2));
+        assert_eq!(Target::Index(3).resolve(0, &ws, &[0, 1]), None);
+        assert_eq!(Target::Index(3).destination(1, &ws, &[0, 1], None), 1);
+        assert_eq!(Target::Index(3).destination(0, &ws, &[], Some(3)), 0);
+        assert!(specs.iter().any(|s| s.key == "toggle-above"));
+        assert!(specs.iter().any(|s| s.key == "toggle-on-all-workspaces"));
+    }
 
     #[test]
     fn workspace_targets_resolve_like_mutter() {

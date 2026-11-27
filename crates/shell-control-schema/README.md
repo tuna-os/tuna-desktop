@@ -85,6 +85,10 @@ before decoding.
   `CommandKind::StopRemoteAccess { kind, id }`, which revokes that grant
   permanently. Bounded by `MAX_REMOTE_ACCESS_HANDLES`,
   `MAX_REMOTE_ACCESS_TARGETS` and `MAX_TITLE_LEN`.
+- Screen wake (0.55): `CommandKind::WakeUpScreen` lifts the idle fade off
+  the locked, blanked screen when a notification reaches the lock screen's
+  list (screenShield.js `_wakeUpScreen`); it is `Denied` while unlocked,
+  never unlocks and does not count as user activity.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
   `ErrorKind`.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,
@@ -96,7 +100,7 @@ before decoding.
   `PointingStickSettings`) carry GNOME 51's per-device-class peripherals
   keys. Every acceleration key uses `PointerAccelProfile`: default, flat,
   adaptive, and custom.
-- Custom acceleration and typing timeout (0.55): `InputSettings::custom_accel`
+- Custom acceleration and typing timeout (0.56): `InputSettings::custom_accel`
   (`CustomAccelConfigs`, one `CustomAccelCurve { step, speeds }` per pointer
   class, GNOME's `custom-accel-config`) and
   `InputSettings::disable_while_typing_timeout_ms` are appended after
@@ -112,7 +116,8 @@ Its dependencies are `postcard`, `serde` and `tuna-output`. Schema tests
 are inline in `src/lib.rs` and in
 `crates/shell-control-schema/tests/protocol_schema_tests.rs`; the
 envelope's tests, including the check that `src/framing.rs` stays
-message-agnostic, are in `crates/shell-control-schema/tests/framing_tests.rs`.
+message-agnostic, are in
+`crates/shell-control-schema/tests/framing_tests.rs`.
 
 ## Dependents
 
