@@ -11574,10 +11574,10 @@ PORTAL_BACKEND=/usr/libexec/xdg-desktop-portal-gnome
 [ -x "$PORTAL_BACKEND" ] || PORTAL_BACKEND=/usr/lib/xdg-desktop-portal-gnome
 [ -x "$PORTAL_BACKEND" ] || fail G-SCREENSHOT-WINDOWS-DENY "installed GNOME portal backend missing"
 probe_gio_flags="$(pkg-config --cflags --libs gio-2.0)" || fail G-SCREENSHOT-WINDOWS-DENY "gio-2.0 development files are required"
-# pkg-config returns separate compiler arguments; split them into an array, not a bare word list.
-read -r -a probe_gio <<<"$probe_gio_flags"
-cc -Wall -Wextra -Werror -shared -fPIC -o "$ARTIFACTS/identity-probe.so" \
-    "$ROOT/scripts/lib/tuna-service-identity-probe.c" "${probe_gio[@]}" ||
+# pkg-config returns separate compiler arguments. This script is POSIX sh
+# (no arrays), so xargs splits them onto the compiler command line.
+printf '%s\n' "$probe_gio_flags" | xargs cc -Wall -Wextra -Werror -shared -fPIC -o "$ARTIFACTS/identity-probe.so" \
+    "$ROOT/scripts/lib/tuna-service-identity-probe.c" ||
     fail G-SCREENSHOT-WINDOWS-DENY "could not build the identity probe"
 portal_probe() {
     rm -f "$ARTIFACTS/portal-probe-$1.txt"
