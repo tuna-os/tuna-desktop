@@ -448,7 +448,7 @@ pub fn current_exe_dir() -> Option<std::path::PathBuf> {
 }
 
 /// `GL_RENDERER` of the compositor's own context.
-fn gl_renderer_name(renderer: &mut GlesRenderer) -> Option<String> {
+pub(crate) fn gl_renderer_name(renderer: &mut GlesRenderer) -> Option<String> {
     use smithay::backend::renderer::gles::ffi;
     renderer
         .with_context(|gl| {
@@ -6961,7 +6961,9 @@ impl Runtime {
         self.manager.update_suspended(&shown, Instant::now());
         // The pointer is the compositor's to draw (#342): hidden while
         // locked or blanked, as the software pointer always was.
-        let cursor_shown = !locked && blank_alpha < 1.0;
+        // While an InputCapture session holds the input the pointer is on
+        // the other machine, so it is hidden here too (#1040).
+        let cursor_shown = !locked && blank_alpha < 1.0 && !self.input_capture.is_capturing();
         // A pending app launch shows the busy cursor (#1193).
         let busy = self.state.startup.pending(Instant::now());
         // A tablet tool in proximity draws its own cursor where it is, and
