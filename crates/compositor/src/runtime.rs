@@ -4175,7 +4175,7 @@ impl Runtime {
         let path =
             crate::screenshot::target_path(requested, &crate::screenshot::jiff_like::Stamp::now())?;
         let (w, h, rgba) =
-            self.render_pixels(None, smithay::backend::allocator::Fourcc::Abgr8888)?;
+            self.render_pixels(None, smithay::backend::allocator::Fourcc::Abgr8888, false)?;
         crate::screenshot::save_png(&path, w as u32, h as u32, &rgba).ok()?;
         eprintln!("tuna-compositor: screenshot saved to {}", path.display());
         Some(path)
@@ -4439,10 +4439,17 @@ impl Runtime {
     /// screen magnifier is on (#349), the frame goes through the same
     /// zoom passes as the display, so screenshots and casts show the
     /// zoom region as seen (without the pointer sprite).
+    ///
+    /// `with_pointer` draws the pointer image into the frame, as a
+    /// screen cast asking for `cursor-mode` embedded gets it (mutter's
+    /// `META_SCREEN_CAST_CURSOR_MODE_EMBEDDED`); screenshots and the
+    /// default hidden mode leave it out. The magnifier's own frame keeps
+    /// its pointer handling.
     fn render_pixels(
         &mut self,
         connector: Option<&str>,
         fourcc: smithay::backend::allocator::Fourcc,
+        with_pointer: bool,
     ) -> Option<(i32, i32, Vec<u8>)> {
         use smithay::backend::renderer::{ExportMem, Offscreen};
         #[cfg(not(feature = "drm"))]
@@ -4474,6 +4481,16 @@ impl Runtime {
         let wellbeing = self.wellbeing_effects.sample(self.animation_clock.now());
         let zoom_inputs = self.magnifier_inputs();
         let zoom_now = self.animation_clock.now();
+        let pointer = with_pointer.then(|| {
+            let busy = self.state.startup.pending(Instant::now());
+            let what = crate::cursor::Pointer::resolve(
+                &self.state.cursor_image,
+                self.manager.grab_cursor(),
+                self.state.pointer_focused(),
+            )
+            .busy(busy);
+            (what, self.manager.pointer_pos())
+        });
         let (renderer, size, view, output_name) = match &mut self.backend {
             Backend::Winit(backend) => {
                 let size = backend.window_size();
@@ -4601,6 +4618,14 @@ impl Runtime {
             }
             None => None,
         };
+        let pointer_sprite = pointer.as_ref().map(|(what, at)| {
+            let hotspot = (
+                (at.x - f64::from(view.offset.0)) * view.scale,
+                (at.y - f64::from(view.offset.1)) * view.scale,
+            );
+            self.cursor
+                .sprite_at(renderer, what, hotspot.into(), view.scale, zoom_now)
+        });
         let mut target = renderer.bind(&mut texture).ok()?;
         {
             let mut frame = renderer.render(&mut target, size, Transform::Normal).ok()?;
@@ -4634,6 +4659,9 @@ impl Runtime {
                     &previews,
                 )
                 .ok()?;
+                if let Some(sprite) = pointer_sprite.as_ref() {
+                    crate::cursor::draw_sprite(&mut frame, sprite, view.scale, &[full]).ok()?;
+                }
             }
             let _ = frame.finish().ok()?;
         }
@@ -4799,18 +4827,18 @@ impl Runtime {
         }
         // An area cast with no output under it gets no frames
         // (meta-stream-source-area.c watches only the views over it).
-        let wanted: Vec<(usize, CastTarget, (i32, i32))> = self
+        let wanted: Vec<(usize, CastTarget, (i32, i32), bool)> = self
             .casts
             .iter()
             .enumerate()
             .filter_map(|(i, cast)| {
                 cast.wants_frame()
-                    .map(|size| (i, cast.target.clone(), size))
+                    .map(|size| (i, cast.target.clone(), size, cast.embed_cursor))
             })
             .collect();
         drop(guard);
         let xrgb = smithay::backend::allocator::Fourcc::Xrgb8888;
-        for (index, target, size) in wanted {
+        for (index, target, size, embed) in wanted {
             let frame = match &target {
                 CastTarget::Window(id) => self.render_window_pixels(*id, Some(size), xrgb),
                 CastTarget::Monitor(connector) => {
@@ -4821,7 +4849,7 @@ impl Runtime {
                         #[cfg(feature = "drm")]
                         Backend::Drm(_) => Some(connector.as_str()),
                     };
-                    self.render_pixels(output, xrgb)
+                    self.render_pixels(output, xrgb, embed)
                 }
                 CastTarget::Area(logical) => {
                     // Like meta-stream-source-area.c on_monitors_changed,
@@ -4844,7 +4872,7 @@ impl Runtime {
                     };
                     #[cfg(not(feature = "drm"))]
                     let _ = snapshot;
-                    self.render_pixels(output, xrgb).and_then(|(w, h, pixels)| {
+                    self.render_pixels(output, xrgb, embed).and_then(|(w, h, pixels)| {
                         let cropped = crate::screencast::crop(&pixels, (w, h), area);
                         if cropped.is_none() {
                             eprintln!(
@@ -5106,6 +5134,7 @@ impl Runtime {
                 stream_id,
                 grant,
                 target,
+                embed_cursor,
                 monitor,
                 signal,
             } => {
@@ -5158,7 +5187,10 @@ impl Runtime {
                     return;
                 };
                 match pw.start_cast(session_id, stream_id, target, monitor, size, signal) {
-                    Some(cast) => self.casts.push(cast),
+                    Some(mut cast) => {
+                        cast.embed_cursor = embed_cursor;
+                        self.casts.push(cast);
+                    }
                     None => eprintln!("tuna-compositor: screen cast: stream failed to start"),
                 }
             }
@@ -5405,7 +5437,8 @@ impl Runtime {
         names
             .into_iter()
             .filter_map(|name| {
-                let (w, h, pixels) = self.render_pixels(name.as_deref(), Fourcc::Xrgb8888)?;
+                let (w, h, pixels) =
+                    self.render_pixels(name.as_deref(), Fourcc::Xrgb8888, false)?;
                 Some((name, w, h, pixels))
             })
             .collect()
