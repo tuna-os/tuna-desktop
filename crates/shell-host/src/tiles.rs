@@ -796,7 +796,7 @@ fn clock_text(tz: &str, format: ClockFormat, show_weekday: bool) -> String {
     } else {
         jiff::tz::TimeZone::get(tz).unwrap_or(jiff::tz::TimeZone::UTC)
     };
-    let zoned = jiff::Zoned::now().with_time_zone(zone);
+    let zoned = jiff::ZonedDateTime::now().with_time_zone(zone);
     let time = match format {
         ClockFormat::TwentyFour => zoned.strftime("%H:%M").to_string(),
         ClockFormat::Twelve => zoned.strftime("%-I:%M").to_string(),

@@ -94,9 +94,19 @@ PACKAGE_CONSUMERS = ["arch-package", "portal-security", "remote-security",
 
 OWNED = [
     ("scripts/tuna-gtk-shell-proof", ["gtk-shell", "journey"]),
+    # Sourced by it (journey's installed run included): the sound-alert
+    # gates (#353) and their bell pixel reader.
+    ("scripts/lib/tuna-sound-alerts-proof.sh", ["gtk-shell", "journey"]),
+    ("scripts/lib/tuna-bell-pixels.py", ["gtk-shell", "journey"]),
     ("scripts/tuna-scale-proof", ["gtk-shell"]),
     ("scripts/tuna-slow-portal-proof", ["gtk-shell"]),
     ("scripts/tuna-session-restore-proof", ["gtk-shell"]),
+    # The login screen (#1164): tuna-compositor --greeter and tuna-greeter
+    # against a GDM 51 and AccountsService mock, with GDM's own
+    # org.gnome.login-screen schema.
+    ("scripts/tuna-greeter-proof", ["gtk-shell"]),
+    ("scripts/lib/tuna-gdm-mock.py", ["gtk-shell"]),
+    ("scripts/lib/org.gnome.login-screen.gschema.xml", ["gtk-shell"]),
     # Window motion paired with GNOME 51 (#493-#498): the gtk-shell job runs
     # these proofs on its frozen minimize build, against the distilled
     # capture.
@@ -127,6 +137,7 @@ OWNED = [
     ("scripts/tests/test_ci_install_vkms.py", ["drm-smoke"]),
     ("scripts/tests/test_colord_startup.py", ["drm-smoke"]),
     ("scripts/tests/test_drm_dual.py", ["drm-smoke"]),
+    ("scripts/tests/test_drm_input_startup.py", ["drm-smoke"]),
     ("scripts/tests/test_native_product.py", ["marlin-vm"]),
     ("scripts/tests/test_remote_security_failure_report.py", ["remote-security"]),
     ("scripts/tuna-gtk-accessibility-proof", ["gtk-shell"]),
@@ -154,6 +165,7 @@ OWNED = [
     ("scripts/tuna-drm-dual", ["drm-smoke"]),
     ("scripts/lib/drm_dual.py", ["drm-smoke"]),
     ("scripts/lib/drm_kms_readback.py", ["drm-smoke"]),
+    ("scripts/lib/drm_input_startup.py", ["drm-smoke"]),
     ("scripts/lib/colord-startup.sh", ["drm-smoke"]),
     # D-TOUCH, D-ORIENT and G-AUTOROTATE's emulated touchscreen, GTK touch
     # client, mock iio-sensor-proxy and GNOME touchscreen schema (P-DS-04).
@@ -167,6 +179,7 @@ OWNED = [
     ("scripts/lib/tuna-orca-speech.py", ["orca-speech"]),
     ("scripts/tuna-frame-pacer-build", ["drm-smoke"]),
     ("scripts/lib/tuna-frame-pacer.c", ["drm-smoke"]),
+    ("scripts/lib/tuna-drm-lease-probe.c", ["drm-smoke"]),
     ("scripts/tuna-portal-security", ["portal-security"]),
     ("scripts/lib/tuna-portal-artifact*", ["portal-security"]),
     ("tests/portal-reference/*", ["portal-security"]),

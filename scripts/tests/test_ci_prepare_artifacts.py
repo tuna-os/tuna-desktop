@@ -231,6 +231,7 @@ class GtkShellBinaryCollection(unittest.TestCase):
 
     BINARIES = ("tuna-compositor", "tuna-shell-gtk", "tuna-wallpaper-svg")
     LIBRARIES = ("libgtk4-layer-shell.so", "libgtk4-layer-shell.so.0")
+    EXAMPLE = "examples/tuna-bell-client"
 
     def setUp(self):
         steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["gtk-shell"]["steps"]
@@ -246,11 +247,14 @@ class GtkShellBinaryCollection(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def build(self, *names, libraries=LIBRARIES):
+    def build(self, *names, libraries=LIBRARIES, example=False):
         for name in names:
             (self.root / "target/debug" / name).write_text(name)
         for name in libraries:
             (self.lib / "x86_64-linux-gnu" / name).write_text(name)
+        if example:
+            (self.root / "target/debug/examples").mkdir()
+            (self.root / "target/debug/examples/tuna-bell-client").write_text("bell")
 
     def collect(self, job_status):
         script = self.step["run"].replace("/usr/local/lib", str(self.lib))
@@ -259,25 +263,28 @@ class GtkShellBinaryCollection(unittest.TestCase):
                               text=True, capture_output=True, timeout=30)
 
     def collected(self):
-        return sorted(path.name for path in (self.root / "gtk-shell-artifacts/bin").iterdir())
+        # Files only: the step always creates bin/examples, even when it is empty.
+        bin_dir = self.root / "gtk-shell-artifacts/bin"
+        return sorted(path.relative_to(bin_dir).as_posix() for path in bin_dir.rglob("*") if path.is_file())
 
     def test_step_always_runs_and_reads_the_job_status(self):
         self.assertEqual(self.step["if"], "always()")
         self.assertEqual(self.step["env"]["JOB_STATUS"], "${{ job.status }}")
 
     def test_everything_built_collects_every_binary_and_library(self):
-        self.build(*self.BINARIES)
+        self.build(*self.BINARIES, example=True)
         result = self.collect("success")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.collected(), sorted(self.BINARIES + self.LIBRARIES))
+        self.assertEqual(self.collected(), sorted(self.BINARIES + self.LIBRARIES + (self.EXAMPLE,)))
         self.assertNotIn("::warning::", result.stdout)
 
     def test_unversioned_library_directory_is_the_fallback(self):
-        self.build(*self.BINARIES, libraries=())
+        self.build(*self.BINARIES, libraries=(), example=True)
         (self.lib / "libgtk4-layer-shell.so.0").write_text("flat")
         result = self.collect("success")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.collected(), sorted(self.BINARIES + ("libgtk4-layer-shell.so.0",)))
+        self.assertEqual(self.collected(),
+                         sorted(self.BINARIES + ("libgtk4-layer-shell.so.0", self.EXAMPLE)))
 
     def test_after_an_earlier_failure_what_exists_is_collected_without_a_new_failure(self):
         self.build("tuna-compositor", "tuna-shell-gtk")
@@ -286,13 +293,16 @@ class GtkShellBinaryCollection(unittest.TestCase):
         self.assertEqual(self.collected(), sorted(("tuna-compositor", "tuna-shell-gtk") + self.LIBRARIES))
         self.assertIn("::warning::not collected, never built or installed: target/debug/tuna-wallpaper-svg",
                       result.stdout)
+        self.assertIn("::warning::not collected, never built or installed: target/debug/examples/tuna-bell-client",
+                      result.stdout)
 
     def test_failure_before_any_build_or_install_still_succeeds(self):
         self.build(libraries=())
         result = self.collect("failure")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.collected(), [])
-        self.assertEqual(result.stdout.count("::warning::"), 4)
+        # Three binaries, the layer-shell library's literal fallback path, and the bell example.
+        self.assertEqual(result.stdout.count("::warning::"), 5)
 
     def test_a_missing_binary_fails_the_step_when_nothing_failed_before(self):
         self.build("tuna-compositor", "tuna-shell-gtk")
