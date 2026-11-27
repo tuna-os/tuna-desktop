@@ -1,3 +1,9 @@
 /target
 /.spektacular/repos/
 *.swp
+
+# Python bytecode: running a script test or py_compile writes it next to the
+# source, and `git add -A` then commits it (scripts/__pycache__ reached main
+# through a merge commit on 2026-11-26).
+__pycache__/
+*.pyc

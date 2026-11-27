@@ -37,7 +37,7 @@ schedule, dispatch or a pull request whose head repository is
 | --- | --- |
 | `tuna-ci-24.04` | select-lanes, check, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, native-core-apps (the join of the Core legs), native-reference-context, parity-ledger, docs-shots, ci-gate |
 | `tuna-ci-26.04` | journey, orca-speech, portal-security, remote-security, niri-parity |
-| GitHub-hosted, always | arch-package, drm-smoke, marlin-vm (pull requests: the primary lifecycle leg only; push, schedule and dispatch add the Orca 51 leg and both paired reference members), core-apps-image and core-apps-leg (the native Core image and its five parallel boots, when selected), marlin-image (push, schedule and dispatch only), gdm51-native-package |
+| GitHub-hosted, always | arch-package, drm-smoke, hotplug (`ubuntu-26.04`), marlin-vm (pull requests: the primary lifecycle leg only; push, schedule and dispatch add the Orca 51 leg and both paired reference members), core-apps-image and core-apps-leg (the native Core image and its five parallel boots, when selected), marlin-image (push, schedule and dispatch only), gdm51-native-package |
 
 Why the always-hosted lanes stay hosted:
 
@@ -47,6 +47,8 @@ Why the always-hosted lanes stay hosted:
   runner's kernel. On karnataka that is the shared host kernel under punjab
   and KubeVirt, a Fedora kernel the Ubuntu module install cannot target, and
   the module would expose a DRM device to the whole node.
+- **hotplug** loads `vkms` the same way and needs vkms configfs (Linux
+  6.19+), so it runs on the hosted `ubuntu-26.04` image's 7.0 kernel.
 - **marlin-vm**, and the native Core `core-apps-leg` boots with it, need more
   than `/dev/kvm`: they run
   `podman run --privileged --pid=host -v /dev:/dev … bootc install to-disk
