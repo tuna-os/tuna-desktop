@@ -1247,18 +1247,24 @@ impl DrmBackend {
     }
 
     /// The monitors Mutter's colour manager registers with colord: every
-    /// connector with its EDID identity and CRTC gamma size; the first
-    /// output is primary.
+    /// connector with its EDID identity and CRTC gamma size. The primary
+    /// is the primary leader (`meta_monitor_is_primary`), the first lit
+    /// leader as in [`Self::display_state`], not whichever output is
+    /// first: a switched-off or mirroring output is never primary.
     pub fn colord_monitors(&self) -> Vec<crate::color_manager::ColordMonitor> {
         let atomic = self.drm.is_atomic();
+        let primary = self
+            .outputs
+            .iter()
+            .find(|o| o.is_leader())
+            .map(|o| o.name.as_str());
         self.outputs
             .iter()
-            .enumerate()
-            .map(|(i, out)| crate::color_manager::ColordMonitor {
+            .map(|out| crate::color_manager::ColordMonitor {
                 identity: crate::edid::MonitorIdentity::new(
                     &out.name,
                     out.edid.as_deref(),
-                    i == 0,
+                    primary == Some(out.name.as_str()),
                     out.size_mm,
                     color::pnp_vendor_name,
                 ),
@@ -1621,7 +1627,11 @@ impl DrmBackend {
                     self.input_settings.right_to_left,
                     self.active && self.hot_corner_active && self.input_settings.hot_corners,
                 );
-                self.pointer = clamp_to_outputs(attempt, &rects);
+                // No output to move on: the pointer stays where it was
+                // instead of wandering off into space no output covers.
+                if !rects.is_empty() {
+                    self.pointer = clamp_to_outputs(attempt, &rects);
+                }
                 let mut inputs = vec![
                     ManagerInput::Motion {
                         pos: self.pointer,
@@ -1787,13 +1797,32 @@ impl DrmBackend {
                     event.y_transformed(h.round() as i32),
                 )
                     .into();
+                // With no output lit there is nowhere to point: the pointer
+                // holds, as for relative motion.
+                if self.output_rects().is_empty() {
+                    return Vec::new();
+                }
                 self.observe_motion(pos);
                 vec![ManagerInput::Motion {
                     pos,
                     time: (event.time() / 1000) as u32,
                 }]
             }
-            other => crate::windows::translate_input(other, self.primary_size()),
+            other => {
+                let mut inputs = crate::windows::translate_input(other, self.primary_size());
+                // An absolute device (a tablet in mouse mode) maps onto an
+                // output: with none lit there is nowhere to point, so the
+                // pointer holds as for relative motion.
+                if self.output_rects().is_empty() {
+                    inputs.retain(|input| !matches!(input, ManagerInput::Motion { .. }));
+                }
+                for input in &inputs {
+                    if let ManagerInput::Motion { pos, .. } = input {
+                        self.observe_motion(*pos);
+                    }
+                }
+                inputs
+            }
         }
     }
 

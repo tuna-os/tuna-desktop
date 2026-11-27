@@ -27,7 +27,8 @@ commit, or --changed) can affect:
 - anything else (crates, share/, other scripts) runs gtk-shell plus a
   round-robin slice of ROTATION: K lanes starting at
   (run_number * K) mod len(ROTATION), K from --size, $CI_ROUND_ROBIN_SIZE
-  or 2. Every rotated lane runs on main after merge either way.
+  or 2. Every rotated lane runs on main after merge either way. Code a lane
+  is the only end-to-end proof of (CODE_OWNED) also runs that lane.
 
 Lanes that consume another lane's artifacts pull in their producers.
 """
@@ -41,7 +42,7 @@ import sys
 
 # Selectable ci.yml proof jobs, in workflow order.
 LANES = [
-    "journey", "app-content", "scroll-proof", "drm-smoke",
+    "journey", "app-content", "scroll-proof", "drm-smoke", "hotplug",
     "grid-cancel-comparison", "gtk-shell", "orca-speech",
     "portal-security", "remote-security", "niri-parity", "arch-package",
     "marlin-image", "marlin-vm", "parity-ledger", "docs-shots",
@@ -59,7 +60,7 @@ CORE = ["grid-cancel-comparison", "gtk-shell"]
 # only (it rebuilds what marlin-vm builds), so a pull request rotating it
 # would pay for arch-package and run nothing.
 ROTATION = [
-    "journey", "app-content", "scroll-proof", "drm-smoke", "orca-speech",
+    "journey", "app-content", "scroll-proof", "drm-smoke", "hotplug", "orca-speech",
     "portal-security", "remote-security", "niri-parity", "marlin-vm",
 ]
 
@@ -70,10 +71,29 @@ NEEDS = {
     "niri-parity": ["arch-package"],
     "marlin-image": ["arch-package"],
     "marlin-vm": ["arch-package"],
-    "parity-ledger": ["journey", "gtk-shell", "orca-speech", "drm-smoke", "marlin-vm",
+    "parity-ledger": ["journey", "gtk-shell", "orca-speech", "drm-smoke", "hotplug", "marlin-vm",
                       "remote-security"],
     "docs-shots": ["journey", "app-content", "scroll-proof"],
 }
+
+# Code (still CORE plus the rotation) whose only end-to-end proof is one
+# lane, which it therefore always runs. The nested backend has one fixed
+# output, so connector hotplug and what follows it (window re-homing, lock
+# surfaces on new outputs, colord devices, monitor and area casts,
+# DisplayConfig) is proven only on vkms by the hotplug lane (#203).
+CODE_OWNED = [
+    ("crates/compositor/src/drm.rs", ["hotplug"]),
+    ("crates/compositor/src/drm/*", ["hotplug"]),
+    ("crates/compositor/src/windows.rs", ["hotplug"]),
+    ("crates/compositor/src/color_manager.rs", ["hotplug"]),
+    ("crates/compositor/src/color_manager/*", ["hotplug"]),
+    ("crates/compositor/src/session_lock.rs", ["hotplug"]),
+    ("crates/compositor/src/screencast.rs", ["hotplug"]),
+    ("crates/compositor/src/mutter.rs", ["hotplug"]),
+    ("crates/compositor/src/mutter/*", ["hotplug"]),
+    ("crates/compositor/src/runtime/display.rs", ["hotplug"]),
+    ("crates/shell-gtk/src/lock.rs", ["hotplug"]),
+]
 
 # fnmatch patterns: `*` also matches `/`. First matching rule wins.
 FULL = [
@@ -185,6 +205,9 @@ OWNED = [
     ("tests/portal-reference/*", ["portal-security"]),
     ("scripts/tuna-remote-security", ["remote-security"]),
     ("tests/remote-desktop-reference/*", ["remote-security"]),
+    ("scripts/tuna-hotplug-stress", ["hotplug"]),
+    # Also the churn lane's (scripts/tuna-stress, nested stress workflow).
+    ("scripts/lib/tuna_process_metrics.py", ["hotplug"]),
     # Helpers only the remote desktop reference harness runs.
     ("scripts/lib/tuna-portal-remote-client.py", ["remote-security"]),
     ("scripts/lib/tuna-remote-*", ["remote-security"]),
@@ -237,8 +260,6 @@ NO_LANE = [
     "scripts/tuna-hero-media",
     "scripts/tuna-coverage-report",
     "scripts/tuna-stress",
-    "scripts/tuna-hotplug-stress",
-    "scripts/lib/tuna_process_metrics.py",
     "scripts/lib/vm_release*",
     "scripts/lib/vm_firstboot_diagnosis.py",
 ]
@@ -380,6 +401,11 @@ def select(event, run_number, size, changed, wf_lanes=None):
             reasons.append(f"{path} -> {', '.join(owned)}")
         elif not matches(path, NO_LANE):
             code.append(path)
+            also = [lane for pattern, lanes in CODE_OWNED
+                    if fnmatch.fnmatchcase(path, pattern) for lane in lanes]
+            if also:
+                chosen.update(also)
+                reasons.append(f"{path} -> {', '.join(also)}")
     if code:
         rotated = rotation(run_number, size)
         chosen.update(CORE + rotated)

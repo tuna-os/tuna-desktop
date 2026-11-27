@@ -79,8 +79,8 @@ qualification evidence, not in this repository.
 Open items from these runs:
 
 - sailfin's logout gate: [#1235](https://github.com/tuna-os/tuna-desktop/pull/1235)
-  gives the session's `ibus-daemon` one owner. It is open, and the fix
-  then needs a release and a sailfin rerun.
+  gives the session's `ibus-daemon` one owner. It is merged on main
+  (2026-11-21), and the fix needs a release and a sailfin rerun.
 - A beta.3 image does not contain fixes merged after the tag. The navy
   lock frame seen in visual review on most variants (not a gate) is fixed
   on main by [#1194](https://github.com/tuna-os/tuna-desktop/pull/1194)
