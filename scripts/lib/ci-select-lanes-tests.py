@@ -638,11 +638,11 @@ class WorkflowSync(unittest.TestCase):
         workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
         triggers = workflow.get("on", workflow.get(True))
         self.assertIn("merge_group", triggers)
-        # The gate must not be skipped for the event, and the self-hosted
-        # runner choice (anchored on check) must not send the merge group to
-        # the fork (hosted) path.
+        # The gate must not be skipped for the event, and a merge group's
+        # jobs take GitHub-hosted ubuntu-24.04 (never a self-hosted slot).
         self.assertEqual(self.jobs["ci-gate"]["if"], "${{ !cancelled() }}")
-        self.assertIn("github.event_name != 'pull_request'", self.jobs["check"]["runs-on"])
+        self.assertIn("github.event_name != 'merge_group'", self.jobs["check"]["runs-on"])
+        self.assertTrue(self.jobs["check"]["runs-on"].endswith("|| 'ubuntu-24.04' }}"))
         # Canonical media is compared with the group's base, not with a
         # pull request base or a push's previous head, neither of which a
         # merge group has.

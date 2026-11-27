@@ -104,11 +104,15 @@ jobs:
     # Typically 10 min, slowest seen 16; a hung test must not hold a runner 6 h.
     timeout-minutes: 45
     # Runner choice (docs/ci-runners.md): this repository's own pushes,
-    # schedules, dispatches, merge groups and branch pull requests run on the
-    # self-hosted karnataka scale sets; fork pull requests, and every job
-    # while the CI_RUNNERS repository variable is `hosted`, use GitHub-hosted
-    # runners.
-    runs-on: &runner-24 ${{ vars.CI_RUNNERS != 'hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-24.04' || 'ubuntu-latest' }}
+    # schedules, dispatches and branch pull requests run on the self-hosted
+    # karnataka scale sets. Everything else uses GitHub-hosted ubuntu-24.04,
+    # the OS of tuna-ci-24.04 (ubuntu-latest became 26.04, where pinned
+    # 24.04 dependencies such as the GTK AT-SPI regression build refuse to
+    # run): fork pull requests, every job while the CI_RUNNERS repository
+    # variable is `hosted`, and a merge group's two jobs (check,
+    # gtk-shell-smoke), so the queue never waits behind pull request runs
+    # for a self-hosted slot.
+    runs-on: &runner-24 ${{ vars.CI_RUNNERS != 'hosted' && github.event_name != 'merge_group' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'tuna-ci-24.04' || 'ubuntu-24.04' }}
     permissions:
       contents: read
       actions: read
@@ -223,6 +227,20 @@ jobs:
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
       - run: python3 scripts/tests/test_vm_strip_image.py
       - run: python3 scripts/tests/test_vm_strip_stationary_edge.py
+      # The image policy is checked with sudo's own visudo and cvtsudoers,
+      # as on the Fedora image. Ubuntu 26.04 (hosted runners for fork pull
+      # requests) defaults to sudo-rs, which has no cvtsudoers and owns the
+      # visudo alternative; sudo's tools there are the *.ws binaries.
+      - name: Use sudo's own sudoers tools
+        run: |
+          if ! command -v cvtsudoers >/dev/null; then
+            [ -x /usr/bin/cvtsudoers.ws ] || sudo apt-get install -y sudo
+            tools="$RUNNER_TEMP/sudoers-tools"
+            mkdir -p "$tools"
+            ln -sf /usr/bin/cvtsudoers.ws "$tools/cvtsudoers"
+            ln -sf /usr/sbin/visudo.ws "$tools/visudo"
+            echo "$tools" >> "$GITHUB_PATH"
+          fi
       - run: python3 scripts/tests/test_fresh_accounts.py
       - run: python3 scripts/tests/test_try_tuna_signature_gate.py
       - run: python3 scripts/lib/keyring-owner-proof-tests.py
@@ -323,12 +341,13 @@ jobs:
         run: |
           cargo fmt --manifest-path third-party/reis/Cargo.toml --all -- --check
           cargo test --manifest-path third-party/reis/Cargo.toml --lib roost_transport_bounds
-      - run: rustfmt --edition 2021 --check third-party/smithay/src/xwayland/xserver.rs third-party/smithay/src/backend/drm/surface/gbm.rs third-party/smithay/src/wayland/selection/data_device/dnd_grab.rs third-party/smithay/src/wayland/selection/data_device/mod.rs third-party/smithay/src/backend/renderer/gles/mod.rs third-party/smithay/src/backend/renderer/gles/texture.rs
+      - run: rustfmt --edition 2021 --check third-party/smithay/src/xwayland/xserver.rs third-party/smithay/src/backend/drm/surface/gbm.rs third-party/smithay/src/wayland/selection/data_device/dnd_grab.rs third-party/smithay/src/wayland/selection/data_device/mod.rs third-party/smithay/src/backend/renderer/gles/mod.rs third-party/smithay/src/backend/renderer/gles/texture.rs third-party/smithay/src/backend/allocator/gbm.rs
       - run: cargo test --locked --manifest-path third-party/smithay/Cargo.toml --no-default-features --features xwayland,wayland_frontend prepared_socket
       - run: cargo test --locked --manifest-path third-party/smithay/Cargo.toml --no-default-features --features xwayland,wayland_frontend --lib cancellation_tests
       # GL tests on surfaceless Mesa (llvmpipe); libegl1/libgl1-mesa-dri above.
       - run: cargo test --locked --manifest-path third-party/smithay/Cargo.toml --no-default-features --features renderer_gl --lib per_frame_read_fence
       - run: cargo test --locked --manifest-path third-party/smithay/Cargo.toml --no-default-features --features renderer_gl --lib unscaled_nearest
+      - run: cargo test --locked --manifest-path third-party/smithay/Cargo.toml --no-default-features --features renderer_gl --lib instanced_rect
       - name: Check nested compositor without default features
         run: cargo check --locked -p tuna-compositor --no-default-features
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -910,8 +929,15 @@ jobs:
       - name: Prove source-matched native minimize and restore in LTR and RTL
         id: native_minimize
         run: scripts/tuna-minimize-ci-proof "$RUNNER_TEMP/native-minimize"
+      # The large raw evidence uploads (here, native-wellbeing-proof,
+      # window-motion-proofs, gtk-shell-binaries: ~1.4 GB together) run when
+      # the job failed, and always on push, schedule and dispatch. A passing
+      # pull request keeps only the gtk-shell artifact (assertions and
+      # manifests the parity ledger reads); no job downloads these. Uploaded
+      # from karnataka at ~0.5 MB/s they took 30+ minutes and pushed
+      # gtk-shell past its timeout (run 46062401641, 27 Nov 2026).
       - uses: actions/upload-artifact@v7.0.2
-        if: always()
+        if: ${{ failure() || github.event_name != 'pull_request' }}
         with:
           name: native-minimize-proof
           path: ${{ runner.temp }}/native-minimize/
@@ -936,7 +962,7 @@ jobs:
       - name: Prove live wellbeing framebuffer and screenshot pixels
         run: /usr/bin/python3 scripts/tuna-wellbeing-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --build-receipt "$RUNNER_TEMP/native-minimize/build.json" --artifacts "$RUNNER_TEMP/native-wellbeing" --display :111
       - uses: actions/upload-artifact@v7.0.2
-        if: always()
+        if: ${{ failure() || github.event_name != 'pull_request' }}
         with:
           name: native-wellbeing-proof
           path: ${{ runner.temp }}/native-wellbeing/
@@ -960,7 +986,7 @@ jobs:
           done
           cp "$RUNNER_TEMP/motion-pairing/comparison.json" gtk-shell-artifacts/motion-pairing/
       - uses: actions/upload-artifact@v7.0.2
-        if: always()
+        if: ${{ failure() || github.event_name != 'pull_request' }}
         with:
           name: window-motion-proofs
           path: |
@@ -1363,7 +1389,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - uses: actions/upload-artifact@v7.0.2
-        if: always()
+        if: ${{ failure() || github.event_name != 'pull_request' }}
         timeout-minutes: 10
         with:
           name: gtk-shell-binaries
