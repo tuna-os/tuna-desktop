@@ -199,6 +199,7 @@ settings local builds need (`just` lists the recipes):
 | `just check` | `fmt-check`, `clippy` and `test`, like the `check` job's core |
 | `just test [cargo args]` | `cargo test --workspace`, or e.g. `just test -p tuna-compositor --lib orca::` |
 | `just clippy` / `just fmt` / `just build [args]` | the matching cargo command |
+| `just doc-refs [base]` | `scripts/tuna-doc-refs --base <base>` (default `origin/main`): relative links and backticked repository paths in the Markdown changed since `base` must resolve, as in the `check` job |
 | `just proof <name> [args]` | `scripts/tuna-<name> --artifacts <tmp>`, e.g. `just proof gtk-shell-proof` |
 | `just ci-artifacts <run> [name]` | downloads a CI run's artifacts and prints the directory |
 | `just clean` / `just gc` | deletes this worktree's target / frees disk (below) |
@@ -302,6 +303,27 @@ menu's gates alone, the same functions the full GTK proof calls
 `G-SHELL-STABLE`. It takes about two minutes, one of them waiting for the
 wall clock's next minute to see the world clocks tick. The Weather card is
 fed from `TUNA_WEATHER_FIXTURE`, so the slice needs no network.
+
+`scripts/tuna-gtk-shell-proof --panel-dash-only --artifacts DIR` runs
+GNOME 51's top bar and dash checks (`scripts/lib/tuna-panel-dash-proof.sh`,
+measured by `scripts/lib/tuna-panel-dash-check.py`). G-PANEL-LAYOUT (#1199)
+reads Activities, Date and Time and System from the bar's accessible tree,
+in the reading direction, with the clock's centre within one physical pixel
+of the output's; then it hovers each control and measures its drawn pill:
+Activities starts and the system menu ends within GNOME's 3px panel-button
+border of the output's edges, and the clock's pill is centred to a physical
+pixel. GTK reports a padded button's accessible origin at its content box, so
+the edges come from pixels. G-DASH-FAVORITES-RUNNING (#1198) sets
+`org.gnome.shell favorite-apps` (two apps and a missing one between them)
+before the shell starts, with no Tuna pins, runs one favourite and one other
+app, and opens the overview: the dash's accessible tree must list the
+favourites in schema order, then the running app after a separator, then
+Show Apps, along the reading direction, with the running dot (in the tree
+and as near-white pixels under the tile) under exactly the two running apps.
+The slice runs at `TUNA_SCALE` in the proof's locale: a scale other than 1
+adds `-FRACTIONAL` and a right-to-left locale `-RTL` to both gate names. CI
+runs it at 100%, at 125% and under `he_IL.UTF-8`, mirrored as GNOME mirrors
+it; the locale must be generated, or the slice fails.
 
 `scripts/tuna-gtk-shell-proof --search-leak-only --artifacts DIR` runs
 G-SEARCH-LEAK (#1084): after five warm-up searches, 50 overview searches
@@ -800,13 +822,13 @@ TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-ar
 
 `--notify-lock-only` stops after panel readiness and runs just the
 lock-screen notification, media player, notification sound,
-disabled-app restore and banner expansion gates (G-NOTIFY-LOCK,
-G-NOTIFY-LOCK-PIXELS, G-NOTIFY-LOCK-PUSH, G-NOTIFY-LOCK-LIVE,
-G-NOTIFY-LOCK-MEDIA, G-NOTIFY-SOUND, G-NOTIFY-RESTORE,
-G-NOTIFY-EXPANDED); it needs pam_wrapper to unlock. The proof's
-`canberra-gtk-play` stand-in records every event sound the shell asks
-for in `canberra-calls`, and `tuna-mpris-player-stub.py` is the media
-player.
+disabled-app restore, banner expansion and date-menu media gates
+(G-NOTIFY-LOCK, G-NOTIFY-LOCK-PIXELS, G-NOTIFY-LOCK-PUSH,
+G-NOTIFY-LOCK-LIVE, G-NOTIFY-LOCK-MEDIA, G-NOTIFY-SOUND,
+G-NOTIFY-RESTORE, G-NOTIFY-EXPANDED, G-NOTIFY-CALENDAR-MEDIA); it needs
+pam_wrapper to unlock. The proof's `canberra-gtk-play` stand-in records
+every event sound the shell asks for in `canberra-calls`, and
+`tuna-mpris-player-stub.py` is the media player.
 The restore gate opens the real message-tray binding after retaining the
 long-word redaction-test notifications in history. Card text must wrap at
 character boundaries when needed, and collapsed groups must measure only
@@ -987,6 +1009,20 @@ negative control and remaining pressure gates are retained. A shell-route
 regression covers this mirrored/clamped arithmetic without timing sleeps.
 Fresh native evidence is still required for that RTL route correction and
 the remainder of the DRM lane.
+
+`D-OVERVIEW-EXIT` starts a session in the overview, as a GDM login does,
+and presses Escape once on an emulated USB keyboard
+(`scripts/lib/tuna-uinput-keyboard.py`, `tap KEY...` on stdin). After
+that it sends no input. `GNOME_SHELL_SLOWDOWN_FACTOR=4` stretches the
+250 ms exit to one second, past the 500 ms that display-rate ticks
+outlive an input event. The exit must therefore draw its own frames until
+it settles. The frame counter must then hold still, and the kernel's
+scanout, read with ffmpeg `kmsgrab`, must be the settled desktop: one
+colour below the top bar, with no workspace card and no overview
+backdrop. This rules out a DRM-side stall behind the part-way card in the
+VM journeys' frame 06. Those frames come from the QEMU VNC console, which
+can keep stale pixels for page-flipping virtio-gpu guests (QEMU's
+"ui/vnc: recover a job dropped by vnc_abort_display_jobs()").
 
 `scripts/tuna-drm-dual` is the two-output leg the `drm-smoke` job runs
 after the smoke test. It creates a vkms configfs device (`tuna-dual`,
@@ -1501,8 +1537,13 @@ which the parity-ledger job reads.
 ## Parity ledger check
 
 The `parity-ledger` job runs `scripts/tuna-ledger` against the test list
-from `check` and the `assertions.txt` files from the proofs. Reproduce it
-after running the proofs above:
+from `check` and the `assertions.txt` files from the proofs, including all
+three marlin-vm legs it cites: `marlin-vm` (with `app-integration/`),
+`marlin-vm-autotz` (V-AUTOTZ) and `marlin-vm-orca51` (V-ORCA-* with upstream
+Orca 51). A pull request that runs `parity-ledger` therefore also runs the
+Orca 51 leg (`vm_matrix` in `scripts/ci-select-lanes`). The `nested stress`
+workflow's `hotplug` H-* results are a separate workflow and not a ledger
+input. Reproduce it after running the proofs above:
 
 ```sh
 cargo test --workspace -q -- --list --format terse > test-list.txt
