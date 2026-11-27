@@ -11,14 +11,15 @@ The installed-image proof of rows the nested session already passes:
                                 client dismisses it; that press is consumed
   V-WINDOW-BUTTONS     P-WM-05  GTK's own maximize, restore, minimize and
                                 close title buttons; Alt+Tab restores
-  V-MINIMIZE-ANIMATION P-AN-03  GNOME's 400 ms minimize (times the
-                                session's GNOME_SHELL_SLOWDOWN_FACTOR), frame
-                                by frame, to GNOME 51's target: Super+H with
-                                the dash hidden goes to the monitor's leading
-                                corner, not the dash icon published earlier;
-                                the window's own minimize request with the
-                                overview's dash on screen goes to its dash
-                                icon; activation runs each restore
+  V-MINIMIZE-ANIMATION P-AN-03  GNOME 51's minimize: with the overview
+                                closed, Super+H runs the 400 ms minimize
+                                (times the session's
+                                GNOME_SHELL_SLOWDOWN_FACTOR) frame by frame to
+                                the monitor's leading corner, not the dash
+                                icon published earlier; with the overview open
+                                the window's own minimize request completes at
+                                once with no frame (GNOME's _shouldAnimate);
+                                activation runs each restore
   V-TRAY               P-TR-01  a StatusNotifierItem shows in the top bar with
                                 its tooltip, a click opens its menu, and it
                                 leaves when the item exits
@@ -188,6 +189,33 @@ def transition_problems(watch, window, effect):
             problems.append(f"no partially faded frame: alphas {alphas[:6]}")
     elif window in (scene.get("minimized") or []):
         problems.append("the window is still minimized afterwards")
+    return problems
+
+
+def instant_problems(watch, window):
+    """GNOME 51's minimize with the overview open: windowManager.js 51.1
+    `_shouldAnimate()` is false while `Main.overview.visible &&
+    !Main.overview.closing`, so `_minimizeWindow` calls
+    `shellwm.completed_minimize` at once. The window ends minimized with no
+    minimize started and no frame drawn, toward its dash icon or anywhere."""
+    problems = []
+    scene = watch.get("scene") or {}
+    life = scene.get("window_lifecycle") or {}
+    since = watch.get("baseline_at_ms")
+    started = [h for h in life.get("history") or [] if h.get("window") == window
+               and h.get("effect") == "minimize" and (h.get("at_ms") or 0) > since
+               and str(h.get("outcome", "")).startswith("started")]
+    if started:
+        problems.append(f"a minimize animation started with the overview open: {started}")
+    samples = watch.get("samples") or []
+    if samples:
+        problems.append(f"{len(samples)} minimize frame(s) drawn with the overview open, not none")
+    if any(run.get("window") == window for run in life.get("minimizing") or []):
+        problems.append("a minimize is still running with the overview open")
+    if not scene.get("overview_open"):
+        problems.append("the overview was not open")
+    if window not in (scene.get("minimized") or []):
+        problems.append("the window is not minimized afterwards")
     return problems
 
 
@@ -370,9 +398,38 @@ class Gates:
             self.record(name, False, f"{type(error).__name__}: {error}"[:900])
             self.recorded.add(name)
             return False
+        finally:
+            self.settle()
         self.record(name, True, detail)
         self.recorded.add(name)
         return True
+
+    def settle(self):
+        """Put the desktop back the way every gate starts from, whatever the
+        last one left: the overview closed and no fixture window minimized.
+        Then one failing gate (say, one that stops with the overview open and
+        the main window minimized) cannot fail the gates after it. Never
+        raises: a desktop it cannot settle is logged in steps.json, and the
+        next gate reports what it finds."""
+        try:
+            value = self.state()
+            if value["scene"].get("overview_open"):
+                self.qmp.keys("esc")
+                value = self.wait(lambda v: not v["scene"]["overview_open"], 10,
+                                  "settle: Escape did not close the overview")
+            for role in ("main", "bystander"):
+                fixture = value["fixtures"].get(role)
+                window = fixture and fixture_window(value["scene"], fixture)
+                if not window or window["id"] not in (value["scene"].get("minimized") or []):
+                    continue
+                ident = window["id"]
+                # Alt+Tab activates the most recent other window, minimized
+                # ones included, and so restores it.
+                self.qmp.keys("alt", "tab")
+                value = self.wait(lambda v, ident=ident: ident not in (v["scene"].get("minimized") or []), 10,
+                                  f"settle: Alt+Tab did not restore the minimized {role} fixture")
+        except (GateError, RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
+            self.log.append({"action": "settle", "error": f"{type(error).__name__}: {error}", "t": time.time()})
 
     # Window lookups on one gates-state result.
     def main(self, value):
@@ -550,9 +607,11 @@ class Gates:
         return problems
 
     def minimize(self):
-        """GNOME 51's minimize target rule for a Wayland window (#894): the
-        monitor's leading corner, unless the dash is on screen, when it is
-        the window's dash icon. Both cases, each with its own restore."""
+        """GNOME 51's minimize for a Wayland window (#894), in both states of
+        the overview, each with its own restore. Overview closed: the 400 ms
+        animation to the monitor's leading corner (GNOME never sets icon
+        geometry on Wayland). Overview open, its dash on screen: no animation
+        at all, as windowManager.js 51.1 `_shouldAnimate()` is false there."""
         value = self.state()
         if value["scene"].get("animations_enabled") is not True:
             raise GateError("animations are off in the installed session")
@@ -584,7 +643,11 @@ class Gates:
         if problems:
             raise GateError("; ".join(problems))
 
-        # Dash on screen: the window's own minimize request goes to its icon.
+        # Overview open, its dash on screen with the window's icon: GNOME 51
+        # animates nothing. windowManager.js 51.1 `_shouldAnimate()` is false
+        # while `Main.overview.visible && !Main.overview.closing`, so
+        # `_minimizeWindow` completes the window's own minimize request at once,
+        # with no frame toward the dash icon or anywhere else.
         value = self.open_dash(ident)
         icon = published_dash_icon(value["scene"], ident, output)
         if icon is None:
@@ -592,30 +655,30 @@ class Gates:
         requests = value["fixtures"]["main"]["minimize_requests"]
         docked = self.watched("minimize", ident, lambda: None, request="main")
         self.save("minimize-dash.json", docked)
-        problems = transition_problems(docked, ident, "minimize")
-        problems += target_problems(docked["samples"], icon, "its dash icon, the dash on screen:")
+        problems = instant_problems(docked, ident)
         if docked["fixtures"]["main"]["minimize_requests"] != requests + 1:
             problems.append("the window never asked to be minimized")
         if problems:
             raise GateError("; ".join(problems))
-        # Its preview in the open overview brings it back (as G-WINDOW-MENU).
+        # Its preview in the open overview brings it back (as G-WINDOW-MENU)
+        # and the overview closes onto it.
         settled = self.wait(lambda v: v["scene"]["overview_open"] and (v["scene"]["overview_progress"] or 0) >= 1
                             and any(p.get("id") == ident for p in v["scene"]["previews"] or []), 10,
                             "the overview did not show the minimized window's preview")
         x, y, w, h = next(p["rect"] for p in settled["scene"]["previews"] if p.get("id") == ident)
         picked = self.watched("unminimize", ident, lambda: self.qmp.click(x + w // 2, y + h // 2))
         self.save("unminimize-dash.json", picked)
-        problems = self.restore_problems(picked, ident, original)
-        if problems:
-            raise GateError("; ".join(problems))
-        self.wait(lambda v: not v["scene"]["overview_open"] and v["scene"]["focused"] == ident, 10,
-                  "picking the restored window did not close the overview onto it")
-        return (f"GNOME 51's 400 ms minimize runs frame by frame to its target: Super+H with the dash hidden goes "
-                f"to the leading corner {corner}, not the published dash icon {hidden_icon} "
-                f"({len(gone['samples'])} frames), and Alt+Tab restores it over {len(back['samples'])} frames; the "
-                f"window's own minimize request with the dash on screen goes to its dash icon {icon} "
-                f"({len(docked['samples'])} frames), and its overview preview restores it over "
-                f"{len(picked['samples'])} frames (desktop-gates/minimize*.json, unminimize*.json)")
+        closed = self.wait(lambda v: not v["scene"]["overview_open"] and v["scene"]["focused"] == ident, 10,
+                           "picking the minimized window's preview did not close the overview onto it")
+        final = self.main(closed)[1]
+        if ident in (closed["scene"].get("minimized") or []) or final["rect"] != original:
+            raise GateError(f"the preview left the window minimized or at {final['rect']}, not {original}")
+        return (f"GNOME 51's minimize: with the overview closed, Super+H runs the 400 ms minimize frame by frame to "
+                f"the leading corner {corner}, not the published dash icon {hidden_icon} "
+                f"({len(gone['samples'])} frames), and Alt+Tab restores it over {len(back['samples'])} frames; with "
+                f"the overview open (dash icon {icon} on screen), the window's own minimize request minimizes it at "
+                "once with no frame drawn (_shouldAnimate), and its overview preview restores it to its rectangle "
+                f"({len(picked['samples'])} restore frames) (desktop-gates/minimize*.json, unminimize*.json)")
 
     # ---- V-TRAY ---------------------------------------------------------
     def tray(self):
@@ -680,11 +743,15 @@ def run(qmp, agent, out, record, read_ppm):
             original_rect, area = gates.buttons()
         except (GateError, RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
             buttons_error = f"{type(error).__name__}: {error}"
+        finally:
+            gates.settle()
         gates.gate("V-MINIMIZE-ANIMATION", gates.minimize)
         try:
             gates.close()
         except (GateError, RuntimeError, ValueError, KeyError, TypeError, OSError) as error:
             buttons_error = buttons_error or f"close: {type(error).__name__}: {error}"
+        finally:
+            gates.settle()
         if buttons_error:
             record("V-WINDOW-BUTTONS", False, buttons_error[:900])
         else:
