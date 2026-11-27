@@ -224,7 +224,12 @@ fn x11_window(surface: &WlSurface) -> Option<X11Surface> {
         states
             .data_map
             .get::<Mutex<Option<X11Surface>>>()
-            .and_then(|window| window.lock().unwrap().clone())
+            .and_then(|window| {
+                window
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            })
     })
 }
 
@@ -238,7 +243,7 @@ impl State {
                 .data_map
                 .get_or_insert_threadsafe(|| Mutex::new(None::<X11Surface>))
                 .lock()
-                .unwrap() = Some(window.clone());
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(window.clone());
         });
         let grabs = &mut self.protocols.xwayland_grabs;
         grabs.grabs.retain(Grab::live);

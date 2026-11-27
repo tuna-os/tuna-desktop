@@ -446,7 +446,7 @@ impl NativeReader for GioReader {
         if let Some(wayland) = &self.wayland {
             wayland
                 .set_strv(KEY_XWAYLAND_GRAB_ACCESS_RULES, ["!remote-viewer", "spicy"])
-                .unwrap();
+                .expect("set the Xwayland grab rules fixture");
         }
     }
     fn read(&mut self) -> Result<RawWmPreferences, ReadError> {
