@@ -800,13 +800,13 @@ TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-ar
 
 `--notify-lock-only` stops after panel readiness and runs just the
 lock-screen notification, media player, notification sound,
-disabled-app restore and banner expansion gates (G-NOTIFY-LOCK,
-G-NOTIFY-LOCK-PIXELS, G-NOTIFY-LOCK-PUSH, G-NOTIFY-LOCK-LIVE,
-G-NOTIFY-LOCK-MEDIA, G-NOTIFY-SOUND, G-NOTIFY-RESTORE,
-G-NOTIFY-EXPANDED); it needs pam_wrapper to unlock. The proof's
-`canberra-gtk-play` stand-in records every event sound the shell asks
-for in `canberra-calls`, and `tuna-mpris-player-stub.py` is the media
-player.
+disabled-app restore, banner expansion and date-menu media gates
+(G-NOTIFY-LOCK, G-NOTIFY-LOCK-PIXELS, G-NOTIFY-LOCK-PUSH,
+G-NOTIFY-LOCK-LIVE, G-NOTIFY-LOCK-MEDIA, G-NOTIFY-SOUND,
+G-NOTIFY-RESTORE, G-NOTIFY-EXPANDED, G-NOTIFY-CALENDAR-MEDIA); it needs
+pam_wrapper to unlock. The proof's `canberra-gtk-play` stand-in records
+every event sound the shell asks for in `canberra-calls`, and
+`tuna-mpris-player-stub.py` is the media player.
 The restore gate opens the real message-tray binding after retaining the
 long-word redaction-test notifications in history. Card text must wrap at
 character boundaries when needed, and collapsed groups must measure only
