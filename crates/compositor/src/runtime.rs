@@ -4294,7 +4294,7 @@ impl Runtime {
             .collect();
         let mut shots = Vec::new();
         for (index, (name, loc, size)) in entries.into_iter().enumerate() {
-            let (connector, scale) = match &self.backend {
+            let (connector, scale): (Option<String>, f64) = match &self.backend {
                 // The nested window is the one output.
                 Backend::Winit(_) if index > 0 => continue,
                 Backend::Winit(_) => (None, self.scale),
