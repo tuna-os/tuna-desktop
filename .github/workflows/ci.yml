@@ -918,8 +918,15 @@ jobs:
       - name: Prove source-matched native minimize and restore in LTR and RTL
         id: native_minimize
         run: scripts/tuna-minimize-ci-proof "$RUNNER_TEMP/native-minimize"
+      # The large raw evidence uploads (here, native-wellbeing-proof,
+      # window-motion-proofs, gtk-shell-binaries: ~1.4 GB together) run when
+      # the job failed, and always on push, schedule and dispatch. A passing
+      # pull request keeps only the gtk-shell artifact (assertions and
+      # manifests the parity ledger reads); no job downloads these. Uploaded
+      # from karnataka at ~0.5 MB/s they took 30+ minutes and pushed
+      # gtk-shell past its timeout (run 46062401641, 27 Nov 2026).
       - uses: actions/upload-artifact@v7.0.2
-        if: always()
+        if: ${{ failure() || github.event_name != 'pull_request' }}
         with:
           name: native-minimize-proof
           path: ${{ runner.temp }}/native-minimize/
@@ -944,7 +951,7 @@ jobs:
       - name: Prove live wellbeing framebuffer and screenshot pixels
         run: /usr/bin/python3 scripts/tuna-wellbeing-proof --bin-dir "$RUNNER_TEMP/native-minimize/frozen" --build-receipt "$RUNNER_TEMP/native-minimize/build.json" --artifacts "$RUNNER_TEMP/native-wellbeing" --display :111
       - uses: actions/upload-artifact@v7.0.2
-        if: always()
+        if: ${{ failure() || github.event_name != 'pull_request' }}
         with:
           name: native-wellbeing-proof
           path: ${{ runner.temp }}/native-wellbeing/
@@ -968,7 +975,7 @@ jobs:
           done
           cp "$RUNNER_TEMP/motion-pairing/comparison.json" gtk-shell-artifacts/motion-pairing/
       - uses: actions/upload-artifact@v7.0.2
-        if: always()
+        if: ${{ failure() || github.event_name != 'pull_request' }}
         with:
           name: window-motion-proofs
           path: |
@@ -1371,7 +1378,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - uses: actions/upload-artifact@v7.0.2
-        if: always()
+        if: ${{ failure() || github.event_name != 'pull_request' }}
         timeout-minutes: 10
         with:
           name: gtk-shell-binaries
