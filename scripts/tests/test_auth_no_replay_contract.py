@@ -30,8 +30,12 @@ class Contract(unittest.TestCase):
   self.assertLess(text.index('CommandKind::Unlock'),text.index('encode_frame'))
  def test_actual_consumer_clears_fields_and_waits_for_authoritative_lock(self):
   lock=(ROOT/'crates/shell-gtk/src/lock.rs').read_text()
-  self.assertIn('self.password.set_text("")',lock)
-  self.assertIn('self.text.set_text("")',lock)
+  self.assertIn('use tuna_auth_prompt::entry::PromptEntry;',lock)
+  self.assertIn('self.entry.clear();',lock)
+  entry=(ROOT/'crates/auth-prompt/src/entry.rs').read_text()
+  clear=entry.split('pub fn clear(&self) {',1)[1].split('\n    }',1)[0]
+  self.assertIn('self.password.set_text("")',clear)
+  self.assertIn('self.text.set_text("")',clear)
   main=(ROOT/'crates/shell-gtk/src/main.rs').read_text()
   self.assertIn('sync_connection_generation(auth_generation)',main)
   self.assertIn('filter(|c| !c.needs_snapshot())',main)

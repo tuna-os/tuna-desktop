@@ -113,7 +113,12 @@ except GLib.Error:
     pass
 else:
     raise RuntimeError("another unique caller closed the granted session")
-if mode in ("revoke", "backend-disconnect"):
+# The user's Stop in the shell's screen sharing indicator (#1162 F2): the
+# runner presses it, then says so; the app must hear its session close.
+closed = []
+if mode == "indicator-stop":
+    bus.signal_subscribe("org.freedesktop.portal.Desktop", "org.freedesktop.portal.Session", "Closed", session, None, Gio.DBusSignalFlags.NONE, lambda *args: closed.append(time.monotonic()), None)
+if mode in ("revoke", "backend-disconnect", "indicator-stop"):
     out.with_suffix(".active").write_text(str(node))
     deadline = time.monotonic() + 30
     while not out.with_suffix(".revoke").exists() and time.monotonic() < deadline:
@@ -150,7 +155,14 @@ while time.monotonic() < deadline:
         raise RuntimeError("PipeWire withdrawal exceeded two seconds")
     if not present:
         out.with_suffix(".revoked.json").write_text(json.dumps(evidence, indent=2))
-        print("grant consumed frame from node " + str(node) + "; " + ("lock" if mode == "revoke" else "backend disconnect" if mode == "backend-disconnect" else "client disconnect" if mode == "disconnect" else "Close") + " removed PipeWire node in " + str(round(time.monotonic() - revoked_at, 3)) + "s")
+        print("grant consumed frame from node " + str(node) + "; " + ("lock" if mode == "revoke" else "backend disconnect" if mode == "backend-disconnect" else "client disconnect" if mode == "disconnect" else "Stop Screen Sharing" if mode == "indicator-stop" else "Close") + " removed PipeWire node in " + str(round(time.monotonic() - revoked_at, 3)) + "s")
         break
     time.sleep(.05)
 else: raise RuntimeError("Close retained PipeWire capture node")
+if mode == "indicator-stop":
+    deadline = time.monotonic() + 5
+    while not closed and time.monotonic() < deadline:
+        GLib.MainContext.default().iteration(False)
+        time.sleep(.01)
+    if not closed: raise RuntimeError("the app was not told Stop Screen Sharing closed its session")
+    print("the portal closed the app's session " + str(round(closed[0] - revoked_at, 3)) + "s after Stop")

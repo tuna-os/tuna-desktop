@@ -16,7 +16,7 @@
 # Compare with scripts/lib/tuna-parity-compare.py.
 set -eu
 if [ -z "${TUNA_PARITY_PRIVATE_BUS:-}" ]; then
-    TUNA_PARITY_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+    TUNA_PARITY_PRIVATE_BUS=1 exec "$(dirname -- "$0")/lib/tuna-proof-session" --bus -- "$0" "$@"
 fi
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 OUT="$ROOT/target/tuna-parity"
