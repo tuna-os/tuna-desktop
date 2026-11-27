@@ -786,11 +786,75 @@ pub enum Bus {
 enum Event {
     DeviceChanged(String),
     ColordOwner(bool),
+    /// The monitor set changed (`meta_color_manager_monitors_changed`).
+    MonitorsChanged(Vec<ColordMonitor>),
     /// Something in the ICC store was written, renamed, touched or removed.
     StoreChanged,
     /// The store's directory went away: its changes no longer arrive.
     StoreUnwatched,
     Shutdown,
+}
+
+/// `generate_monitor_id`: the key Mutter's colour manager keeps a
+/// monitor's device under across monitor changes (PNP vendor, product,
+/// serial and connector that exist).
+pub fn monitor_id(identity: &MonitorIdentity) -> String {
+    let mut id = String::new();
+    for (key, value) in [
+        ("v", identity.vendor.as_deref()),
+        ("p", identity.product.as_deref()),
+        ("s", identity.serial.as_deref()),
+        ("c", Some(identity.connector.as_str())),
+    ] {
+        let Some(value) = value else { continue };
+        if !id.is_empty() {
+            id.push(';');
+        }
+        id.push_str(key);
+        id.push(':');
+        id.push_str(value);
+    }
+    id
+}
+
+/// What `update_devices` does with the colour devices when the monitors
+/// change: indices into the current devices and the new monitors.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DeviceUpdate {
+    /// (current device, new monitor): the monitor is still present, its
+    /// device stays (`meta_color_device_update_monitor`).
+    pub kept: Vec<(usize, usize)>,
+    /// New monitors that get a device (`meta_color_device_new`).
+    pub added: Vec<usize>,
+    /// Devices of monitors that left (`meta_color_device_dispose`).
+    pub removed: Vec<usize>,
+}
+
+/// `update_devices`: steal each new monitor's device from the current
+/// set by [`monitor_id`], create the missing ones, and dispose of what
+/// is left over.
+pub fn update_devices(current: &[&MonitorIdentity], monitors: &[ColordMonitor]) -> DeviceUpdate {
+    let mut left: Vec<Option<String>> = current.iter().map(|i| Some(monitor_id(i))).collect();
+    let mut update = DeviceUpdate::default();
+    for (new, monitor) in monitors.iter().enumerate() {
+        let id = monitor_id(&monitor.identity);
+        match left
+            .iter()
+            .position(|old| old.as_deref() == Some(id.as_str()))
+        {
+            Some(old) => {
+                left[old] = None;
+                update.kept.push((old, new));
+            }
+            None => update.added.push(new),
+        }
+    }
+    update.removed = left
+        .iter()
+        .enumerate()
+        .filter_map(|(i, id)| id.is_some().then_some(i))
+        .collect();
+    update
 }
 
 /// How often the colord thread looks at an ICC store whose changes do not
@@ -947,6 +1011,13 @@ impl ColordClient {
         Self { events, thread }
     }
 
+    /// The monitors changed (hotplug): the thread keeps the devices of
+    /// monitors still present, creates devices for new ones and deletes
+    /// those of monitors that left (`meta_color_manager_monitors_changed`).
+    pub fn monitors_changed(&self, monitors: Vec<ColordMonitor>) {
+        let _ = self.events.send(Event::MonitorsChanged(monitors));
+    }
+
     /// Stop the thread, deleting what it registered (`meta_color_device_dispose`).
     pub fn shutdown(mut self) {
         let _ = self.events.send(Event::Shutdown);
@@ -1061,6 +1132,7 @@ fn run(
         };
         match event {
             Ok(Event::DeviceChanged(path)) => colord.device_changed(&path),
+            Ok(Event::MonitorsChanged(monitors)) => colord.monitors_changed(monitors),
             Ok(Event::ColordOwner(true)) => {
                 // colord restarted: every temp-scope object is gone.
                 eprintln!("tuna-compositor: colour: colord restarted, registering again");
@@ -1486,13 +1558,77 @@ impl Colord {
         }
     }
 
+    /// `meta_color_manager_monitors_changed` → `update_devices`: a
+    /// monitor still present keeps its device, a new monitor gets one
+    /// (`meta_color_device_new` → `create_cd_device`, with its EDID
+    /// device profile), and a monitor that left has its device deleted
+    /// from colord (`meta_color_device_dispose`). A replugged monitor
+    /// is created again under the same colord device id.
+    fn monitors_changed(&mut self, monitors: Vec<ColordMonitor>) {
+        let current: Vec<&MonitorIdentity> =
+            self.devices.iter().map(|r| &r.monitor.identity).collect();
+        let update = update_devices(&current, &monitors);
+        for &old in &update.removed {
+            let r = &self.devices[old];
+            eprintln!(
+                "tuna-compositor: colour: removing device {} ({})",
+                r.monitor.identity.colord_device_id(),
+                r.monitor.identity.connector
+            );
+            if let Some(path) = &r.device_path {
+                if let Err(e) = self.delete_device(path) {
+                    eprintln!(
+                        "tuna-compositor: colour: Failed to delete colord device {path}: {e}"
+                    );
+                }
+            }
+        }
+        let mut old: Vec<Option<Registered>> = std::mem::take(&mut self.devices)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let snapshots = self.share.devices();
+        let mut devices = Vec::with_capacity(monitors.len());
+        let mut published = Vec::with_capacity(monitors.len());
+        for (new, monitor) in monitors.into_iter().enumerate() {
+            let kept = update
+                .kept
+                .iter()
+                .find(|&&(_, n)| n == new)
+                .and_then(|&(o, _)| old[o].take());
+            let connector = monitor.identity.connector.clone();
+            let snapshot = kept
+                .as_ref()
+                .and_then(|_| snapshots.iter().find(|d| d.connector == connector).cloned())
+                .unwrap_or_else(|| DeviceSnapshot {
+                    connector,
+                    device_id: monitor.identity.colord_device_id(),
+                    ..Default::default()
+                });
+            published.push(snapshot);
+            devices.push(Registered {
+                device_path: kept.and_then(|r| r.device_path),
+                monitor,
+            });
+        }
+        self.devices = devices;
+        self.share.set_devices(published);
+        for new in update.added {
+            self.register(new);
+        }
+    }
+
+    /// `cd_client_delete_device`.
+    fn delete_device(&self, path: &str) -> zbus::Result<()> {
+        let object = zbus::ObjectPath::try_from(path)?;
+        self.call(CD_PATH, CD_SERVICE, "DeleteDevice", &(object,))
+            .map(drop)
+    }
+
     fn delete_all(&mut self) {
         for r in &self.devices {
             if let Some(path) = &r.device_path {
-                let object = zbus::ObjectPath::try_from(path.as_str());
-                if let Ok(object) = object {
-                    let _ = self.call(CD_PATH, CD_SERVICE, "DeleteDevice", &(object,));
-                }
+                let _ = self.delete_device(path);
             }
         }
         for path in self.owned_profiles.values() {
