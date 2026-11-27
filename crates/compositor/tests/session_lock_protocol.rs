@@ -1,4 +1,8 @@
 //! Real ext-session-lock clients; runtime PID/PAM policy is tested separately.
+//!
+//! `connect` attaches the supervised shell's pinned connection, the only
+//! client whose lock request is considered; `connect_foreign` attaches an
+//! ordinary client of this same process, so with the shell's very PID.
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::wayland_server::Resource;
 use std::collections::HashMap;
@@ -24,7 +28,7 @@ use wayland_protocols::wp::presentation_time::client::{
 #[derive(Default)]
 struct Client {
     globals: HashMap<String, (u32, u32)>,
-    /// Every wl_output global name, in announcement order.
+    /// Advertised wl_output global names, oldest first; a removal drops one.
     outputs: Vec<u32>,
     events: Vec<(u32, bool)>,
     configured: Vec<(u32, u32)>,
@@ -40,16 +44,19 @@ impl Dispatch<WlRegistry, ()> for Client {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
-            if interface == "wl_output" {
-                state.outputs.push(name);
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => {
+                if interface == "wl_output" {
+                    state.outputs.push(name);
+                }
+                state.globals.insert(interface, (name, version));
             }
-            state.globals.insert(interface, (name, version));
+            wl_registry::Event::GlobalRemove { name } => state.outputs.retain(|n| *n != name),
+            _ => (),
         }
     }
 }
@@ -143,9 +150,20 @@ fn pump(comp: &mut TestCompositor, peer: &mut Peer) {
         peer.queue.dispatch_pending(&mut peer.client).unwrap();
     }
 }
+/// The supervised shell's connection, pinned to this process.
 fn connect(comp: &mut TestCompositor) -> Peer {
     let (server, stream) = UnixStream::pair().unwrap();
+    comp.add_shell_client(server);
+    peer(comp, stream)
+}
+/// An ordinary client. It runs in this process, so its `SO_PEERCRED` PID
+/// is the shell's: the PID number alone must not make it the shell.
+fn connect_foreign(comp: &mut TestCompositor) -> Peer {
+    let (server, stream) = UnixStream::pair().unwrap();
     comp.add_client(server);
+    peer(comp, stream)
+}
+fn peer(comp: &mut TestCompositor, stream: UnixStream) -> Peer {
     let conn = Connection::from_socket(stream).unwrap();
     let queue = conn.new_event_queue();
     let registry = conn.display().get_registry(&queue.handle(), ());
@@ -200,8 +218,8 @@ fn pending_lock_is_not_granted_and_denial_reports_finished() {
         .expect("actual protocol request");
     assert_eq!(
         pid,
-        Some(std::process::id() as i32),
-        "SO_PEERCRED sender PID"
+        Some(std::process::id()),
+        "SO_PEERPIDFD-pinned shell PID"
     );
     assert!(comp.state.take_lock_request().is_none());
     drop(pending);
@@ -210,6 +228,78 @@ fn pending_lock_is_not_granted_and_denial_reports_finished() {
     assert!(!comp.state.has_lock_surfaces());
     assert!(!comp.state.take_client_unlock());
     lock.destroy();
+}
+
+/// PID reuse, as Wayland sees it: an ordinary connection whose
+/// `SO_PEERCRED` PID is the held shell's is refused on arrival. Before,
+/// its request was pending with the shell's PID and the runtime approved
+/// it.
+#[test]
+fn a_foreign_lock_with_the_shells_pid_is_refused_on_arrival() {
+    let mut comp = compositor();
+    let mut peer = connect_foreign(&mut comp);
+    let manager: ExtSessionLockManagerV1 = peer.bind(1);
+    let lock = manager.lock(&peer.queue.handle(), 1);
+    pump(&mut comp, &mut peer);
+    assert!(
+        comp.state.take_lock_request().is_none(),
+        "nothing for the runtime to approve"
+    );
+    assert_eq!(peer.client.events, vec![(1, false)]);
+    assert!(!comp.state.has_lock_surfaces());
+    lock.destroy();
+}
+
+/// A hostile client spamming `lock` around the shell's request can neither
+/// replace nor cancel it, nor drop the shell's early lock surface; the
+/// shell's lock is still granted with its surface. The shell locks because
+/// the compositor's flag is already set, and it asks once: if another
+/// client's request could finish the shell's before the runtime judged
+/// it, the session would stay locked with no curtain and no prompt.
+#[test]
+fn a_hostile_client_spamming_lock_cannot_cancel_the_shells_lock() {
+    use tuna_compositor::session_lock::{lock_request_verdict, LockVerdict};
+    let mut comp = compositor();
+    let mut shell = connect(&mut comp);
+    let mut hostile = connect_foreign(&mut comp);
+    let hostile_manager: ExtSessionLockManagerV1 = hostile.bind(1);
+    let mut spam: Vec<_> = (100..132)
+        .map(|tag| hostile_manager.lock(&hostile.queue.handle(), tag))
+        .collect();
+    hostile.queue.flush().unwrap();
+    let (_shell_lock, _role, _surface) = pending_surface(&mut comp, &mut shell, 1);
+    // More requests after the shell's, before the runtime's next tick.
+    spam.extend((200..232).map(|tag| hostile_manager.lock(&hostile.queue.handle(), tag)));
+    pump(&mut comp, &mut hostile);
+    pump(&mut comp, &mut shell);
+    assert!(
+        shell.client.events.is_empty(),
+        "the shell's request was not finished"
+    );
+    assert_eq!(hostile.client.events.len(), 64);
+    assert!(hostile.client.events.iter().all(|(_, granted)| !granted));
+    let (locker, pid) = comp
+        .state
+        .take_lock_request()
+        .expect("the shell's request is still pending");
+    assert!(
+        comp.state.take_lock_request().is_none(),
+        "nothing else waits for a verdict"
+    );
+    let verdict = lock_request_verdict(pid, Some(std::process::id()), true);
+    assert_eq!(verdict, LockVerdict::Approved);
+    comp.state.resolve_lock_request(locker, true);
+    pump(&mut comp, &mut shell);
+    assert_eq!(shell.client.events, vec![(1, true)]);
+    assert_eq!(
+        comp.state.lock_surfaces().len(),
+        1,
+        "the shell's early surface survived the spam"
+    );
+    for lock in spam {
+        lock.destroy();
+    }
+    hostile.conn.flush().unwrap();
 }
 
 #[test]
@@ -365,12 +455,14 @@ fn rejected_second_client_preserves_the_approved_output_surface() {
     comp.state.resolve_lock_request(pending, true);
     pump(&mut comp, &mut owner);
     let original = comp.state.lock_surface_for("fixture").unwrap();
-    let mut other = connect(&mut comp);
+    let mut other = connect_foreign(&mut comp);
     let (_other_lock, _other_role, _other_surface) = pending_surface(&mut comp, &mut other, 23);
     assert_eq!(comp.state.lock_surface_for("fixture").unwrap(), original);
     assert_eq!(comp.state.lock_surfaces(), vec![original.clone()]);
-    let pending = comp.state.take_lock_request().unwrap().0;
-    comp.state.resolve_lock_request(pending, false);
+    assert!(
+        comp.state.take_lock_request().is_none(),
+        "refused on arrival, never pending"
+    );
     pump(&mut comp, &mut other);
     assert_eq!(other.client.events, vec![(23, false)]);
     assert_eq!(comp.state.lock_surface_for("fixture").unwrap(), original);
@@ -387,12 +479,11 @@ fn unapproved_release_is_a_protocol_error_without_clearing_the_owner() {
     comp.state.resolve_lock_request(pending, true);
     pump(&mut comp, &mut owner);
     let original = comp.state.lock_surface_for("fixture").unwrap();
-    let mut other = connect(&mut comp);
+    let mut other = connect_foreign(&mut comp);
     let manager: ExtSessionLockManagerV1 = other.bind(1);
     let unapproved = manager.lock(&other.queue.handle(), 25);
     pump(&mut comp, &mut other);
-    let pending = comp.state.take_lock_request().unwrap().0;
-    comp.state.resolve_lock_request(pending, false);
+    assert!(comp.state.take_lock_request().is_none());
     pump(&mut comp, &mut other);
     unapproved.unlock_and_destroy();
     other.queue.flush().unwrap();
@@ -405,6 +496,127 @@ fn unapproved_release_is_a_protocol_error_without_clearing_the_owner() {
     assert_eq!(comp.state.lock_surface_for("fixture").unwrap(), original);
     assert_eq!(comp.state.lock_surfaces(), vec![original]);
     assert!(!comp.state.take_client_unlock());
+}
+
+/// A connector plugged in as the DRM runtime does (`sync_drm_outputs`):
+/// a new `Output` with its own wl_output global, in the inventory.
+fn plug(comp: &mut TestCompositor, name: &str, size: (i32, i32)) {
+    let output = Output::new(
+        name.into(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Tuna Desktop".into(),
+            model: "Hotplug".into(),
+        },
+    );
+    output.change_current_state(
+        Some(Mode {
+            size: size.into(),
+            refresh: 60_000,
+        }),
+        None,
+        Some(Scale::Integer(1)),
+        Some((1000, 0).into()),
+    );
+    let global = output.create_global::<tuna_compositor::State>(&comp.display.handle());
+    comp.state.add_output(name, Some(output), size.0, size.1);
+    comp.state.note_output_global(name, global);
+}
+
+/// ext-session-lock-v1: the locker makes a lock surface for each new
+/// output; until it does the output shows nothing of the session, and a
+/// connector plugged in again is a new output that never shows the
+/// surface made for the one that left (Mutter's `make_output_inert`).
+#[test]
+fn output_plugged_while_locked_shows_only_its_own_lock_surface() {
+    let mut comp = compositor();
+    let mut peer = connect(&mut comp);
+    let qh = peer.queue.handle();
+    let manager: ExtSessionLockManagerV1 = peer.bind(1);
+    let lock = manager.lock(&qh, 30);
+    pump(&mut comp, &mut peer);
+    let pending = comp.state.take_lock_request().unwrap().0;
+    comp.state.resolve_lock_request(pending, true);
+    pump(&mut comp, &mut peer);
+    assert_eq!(peer.client.events, vec![(30, true)]);
+    let wl_compositor: WlCompositor = peer.bind(6);
+    let fixture: WlOutput = peer.bind(4);
+    let fixture_surface = wl_compositor.create_surface(&qh, ());
+    let _fixture_role = lock.get_lock_surface(&fixture_surface, &fixture, &qh, ());
+    pump(&mut comp, &mut peer);
+    assert_eq!(comp.state.lock_surface_outputs(), vec!["fixture"]);
+
+    // Plugged while locked: nothing until the locker covers it.
+    plug(&mut comp, "hot", (1280, 720));
+    pump(&mut comp, &mut peer);
+    assert!(comp.state.lock_surface_for("hot").is_none());
+    assert_eq!(comp.state.lock_surface_outputs(), vec!["fixture"]);
+    let first_global = *peer.client.outputs.last().unwrap();
+    let first: WlOutput = peer.registry.bind(first_global, 4, &qh, ());
+    let first_surface = wl_compositor.create_surface(&qh, ());
+    let first_role = lock.get_lock_surface(&first_surface, &first, &qh, ());
+    pump(&mut comp, &mut peer);
+    assert_eq!(peer.client.configured.last(), Some(&(1280, 720)));
+    assert_eq!(
+        comp.state
+            .lock_surface_for("hot")
+            .map(|s| s.id().protocol_id()),
+        Some(first_surface.id().protocol_id())
+    );
+    assert_eq!(comp.state.lock_surface_outputs(), vec!["fixture", "hot"]);
+
+    // Unplugged: its lock surface goes with it, though the locker has
+    // not destroyed it yet.
+    assert!(comp.state.remove_output("hot"));
+    pump(&mut comp, &mut peer);
+    assert!(!peer.client.outputs.contains(&first_global));
+    assert!(
+        comp.state.lock_surface_for("hot").is_none(),
+        "the removed output's lock surface stays registered"
+    );
+    assert_eq!(comp.state.lock_surface_outputs(), vec!["fixture"]);
+    first_role.destroy();
+    first_surface.destroy();
+    // A locker that has not yet heard of the removal covers the gone
+    // output again (its global is withdrawn, still bindable).
+    let stale_output: WlOutput = peer.registry.bind(first_global, 4, &qh, ());
+    let stale_surface = wl_compositor.create_surface(&qh, ());
+    let _stale_role = lock.get_lock_surface(&stale_surface, &stale_output, &qh, ());
+    pump(&mut comp, &mut peer);
+
+    // The same connector plugged in again, at another mode: a new
+    // output, shown with neither surface made for the old one.
+    plug(&mut comp, "hot", (1920, 1080));
+    pump(&mut comp, &mut peer);
+    assert!(
+        comp.state.lock_surface_for("hot").is_none(),
+        "a surface made for the removed output covers its replacement"
+    );
+    let second_global = *peer.client.outputs.last().unwrap();
+    assert_ne!(second_global, first_global);
+    let second: WlOutput = peer.registry.bind(second_global, 4, &qh, ());
+    let second_surface = wl_compositor.create_surface(&qh, ());
+    let _second_role = lock.get_lock_surface(&second_surface, &second, &qh, ());
+    pump(&mut comp, &mut peer);
+    assert_eq!(peer.client.configured.last(), Some(&(1920, 1080)));
+    assert_eq!(
+        comp.state
+            .lock_surface_for("hot")
+            .map(|s| s.id().protocol_id()),
+        Some(second_surface.id().protocol_id())
+    );
+    assert_eq!(comp.state.lock_surface_outputs(), vec!["fixture", "hot"]);
+    assert_eq!(comp.state.lock_surfaces().len(), 2);
+    assert!(peer.conn.protocol_error().is_none());
+
+    // Unlock still works afterwards.
+    assert!(!comp.state.take_client_unlock());
+    lock.unlock_and_destroy();
+    pump(&mut comp, &mut peer);
+    assert!(comp.state.take_client_unlock());
+    assert!(!comp.state.has_lock_surfaces());
+    assert!(comp.state.lock_surface_outputs().is_empty());
 }
 
 fn read_errors(peer: &mut Peer) -> Option<wayland_client::backend::protocol::ProtocolError> {

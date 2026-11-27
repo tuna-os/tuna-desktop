@@ -1,12 +1,106 @@
 # Tuna Desktop
 
-Formerly **Roost**. Binaries, packages, crates and environment variables were renamed in [#505](https://github.com/tuna-os/tuna-desktop/issues/505); the old `roost-*` names keep working for one release (see [packaging/README.md](packaging/README.md)).  <!-- tuna-rename: keep -->
+Tuna Desktop is a Wayland desktop session for
+[TunaOS](https://github.com/tuna-os/tunaOS). A Rust compositor built on
+[Smithay](https://github.com/Smithay/smithay) supervises a GTK4/libadwaita
+shell: overview, app grid and search, quick settings, notifications,
+calendar, lock screen, portals and accessibility. The goal is to do
+everything GNOME 51 does and respond faster at the same CPU and memory
+cost. It is an independent implementation, not a GNOME Shell fork: it does
+not run GNOME Shell extensions or use private Mutter APIs. The project was
+formerly named **Roost**; [packaging/README.md](packaging/README.md#upgrading-from-the-former-name)
+covers upgrading from the old packages.
 
-A new, independent Wayland desktop session with a GNOME-inspired everyday workflow. This project is not a GNOME Shell rewrite and does not promise compatibility with GNOME Shell extensions or private Mutter APIs.
+![Tuna Desktop overview with Disks, System Monitor and Files open on the Marlin wallpaper](docs/walkthrough/hero-overview.png)
 
-The compositor is a long-lived Rust process built with Smithay. The shell UI runs as a supervised Wayland client. The first delivery target is a nested developer preview that can map ordinary applications and recover its shell UI after a shell crash.
+| App grid | Quick settings |
+| --- | --- |
+| ![Tuna Desktop app grid with the apps the Marlin image ships](docs/walkthrough/hero-app-grid.png) | ![Tuna Desktop quick settings with volume, wired network, Night Light, Dark Style and Do Not Disturb](docs/walkthrough/hero-quick-settings.png) |
 
-Our v1 goal is [GNOME 51 parity plus better responsiveness at matching CPU](docs/v1.md) — the checklist stays public and current there.
+| Calendar | Alt+Tab |
+| --- | --- |
+| ![Tuna Desktop calendar beside the empty message list](docs/walkthrough/hero-calendar.png) | ![Tuna Desktop Alt+Tab switcher with live window thumbnails](docs/walkthrough/hero-switcher.png) |
+
+![Tuna Desktop lock screen clock over the blurred wallpaper](docs/walkthrough/hero-lock.png)
+
+Frames from the TunaOS Marlin image booted in a CI virtual machine. The
+[overview demo](docs/walkthrough/overview-demo.mp4)
+([GIF](docs/walkthrough/overview-demo.gif), [provenance](docs/walkthrough/README-media.md))
+and the [walkthrough](docs/walkthrough.md) show every feature as it looks
+today.
+
+## Status
+
+**Beta, not yet a daily driver.** The latest prerelease is
+[v1.0.0-beta.3](https://github.com/tuna-os/tuna-desktop/releases/tag/v1.0.0-beta.3)
+([release notes](docs/releases/v1.0.0-beta.3.md)). v1 has not been declared:
+[docs/v1.md](docs/v1.md) is the public v1 checklist with the current
+evidence for each item, and the [parity ledger](docs/parity-ledger.md)
+records, capability by capability, how Tuna Desktop measures against
+GNOME 51.
+
+Tuna Desktop ships as the `tuna` flavor of the TunaOS bootc images. Marlin
+(Arch-based) is the GNOME 51 comparison platform
+([ADR 0008](docs/adr/0008-v1-beta-track-and-release-scope.md)). A
+Debian-format package exists for development hosts. Hardware sessions are
+tested on virtual KMS in CI; physical GPU qualification is still open.
+
+## Try it
+
+- **In a virtual machine**, without installing anything but Corral, on Linux
+  or macOS with QEMU, Podman and cosign v3
+  ([prerequisites](docs/install.md#test-drive-in-a-vm-one-command)):
+
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/tuna-os/tuna-desktop/main/scripts/try-tuna-desktop | bash
+  ```
+
+  It verifies the image signature before downloading and refuses an
+  unsigned build; the current `marlin:tuna` build is unsigned, so until a
+  signed one publishes use one of the routes below
+  ([details](docs/install.md#test-drive-in-a-vm-one-command)).
+
+- **Installed**: [docs/install.md](docs/install.md) covers the TunaOS image,
+  the Debian-format package, building from source and logging in through
+  GDM.
+- **In a window** inside your current desktop, from a checkout with the
+  [build prerequisites](docs/development.md#prerequisites):
+
+  ```sh
+  git clone https://github.com/tuna-os/tuna-desktop.git
+  cd tuna-desktop
+  ./scripts/tuna-nested run
+  ```
+
+  [docs/nested-session.md](docs/nested-session.md) covers options, the
+  shell crash-recovery journey and troubleshooting.
+
+## Build and test
+
+Rust stable plus the system libraries listed in the
+[development guide](docs/development.md#prerequisites). With
+[`just`](https://github.com/casey/just) installed:
+
+```sh
+just check                  # cargo fmt --check, clippy -D warnings, cargo test
+just proof gtk-shell-proof  # one nested graphical proof, as CI runs it
+```
+
+[docs/testing.md](docs/testing.md) explains every local check, the proof
+lanes and which lanes CI runs for a pull request.
+
+## Documentation
+
+[docs/README.md](docs/README.md) is the map of all documentation: guides,
+v1 qualification, performance, security, design decisions and dated
+evidence. If something breaks, start with
+[docs/troubleshooting.md](docs/troubleshooting.md).
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md). Every commit needs a DCO
+`Signed-off-by:` line. AI agents also follow [AGENTS.md](AGENTS.md).
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 <!-- hive-contribute-plea: donated-compute appeal, keep in sync across repos -->
 ## Contribute compute — no code needed
@@ -21,135 +115,6 @@ The guide covers prerequisites, verified `just` setup, credentials, provider
 costs, and how to stop with Ctrl+C. Your subscription quota or API charges apply.
 Never post account credentials or API keys in issues or pull requests.
 
-## Quickstart
-
-- **Test-drive in a VM (one command):**
-  On Linux or macOS, evaluate Tuna Desktop without building it or installing Tuna Desktop packages. The script needs these host tools first; it checks for them and stops with install hints if any is missing:
-
-  - QEMU (`qemu-system-x86_64` or `qemu-system-aarch64`, matching the host architecture, plus `qemu-img`). On Linux, `/dev/kvm` is strongly recommended; without it QEMU falls back to very slow TCG emulation.
-  - Podman with working rootless user namespaces (on macOS, an initialized and running `podman machine`).
-  - cosign, to verify the image signature.
-  - About 10 GiB free in `$HOME` and `/var/tmp`, and network access to GitHub, `ghcr.io` and the Sigstore verification services.
-
-  The guest architecture follows the host (x86_64 or aarch64). Corral and its bootc plugin are the only components the script installs for you.
-
-  ```sh
-  curl -fsSL https://raw.githubusercontent.com/tuna-os/tuna-desktop/main/scripts/try-tuna-desktop | bash
-  ```
-
-  Downloads Corral (checksum-verified), pulls and cosign-verifies the published TunaOS image, and launches Tuna Desktop in local QEMU with a local-only browser console over noVNC. Stop anytime with Ctrl-C. See `scripts/try-tuna-desktop` for options.
-- **Install:** [docs/install.md](docs/install.md) covers the Debian-format
-  package, building from source and logging in through GDM. The experimental TunaOS
-  Marlin image is in [packaging/README.md](packaging/README.md).
-- **Try it in a window** inside your current GNOME, Wayland or X11 session,
-  from a checkout with the [build prerequisites](docs/development.md#prerequisites):
-
-  ```sh
-  git clone https://github.com/tuna-os/tuna-desktop.git
-  cd tuna-desktop
-  ./scripts/tuna-nested run
-  ```
-
-  See [the nested session guide](docs/nested-session.md) for options and
-  troubleshooting.
-
-See the [walkthrough](docs/walkthrough.md) for every feature as it looks
-today, in frames the GTK shell proof takes on each change.
-
-## Screenshots and overview demo
-
-![Tuna Desktop overview with Disks, System Monitor and Files open on the Marlin wallpaper](docs/walkthrough/hero-overview.png)
-
-| App grid | Quick settings |
-| --- | --- |
-| ![Tuna Desktop app grid with the apps the Marlin image ships](docs/walkthrough/hero-app-grid.png) | ![Tuna Desktop quick settings with volume, wired network, Night Light, Dark Style and Do Not Disturb](docs/walkthrough/hero-quick-settings.png) |
-
-| Calendar | Alt+Tab |
-| --- | --- |
-| ![Tuna Desktop calendar beside the empty message list](docs/walkthrough/hero-calendar.png) | ![Tuna Desktop Alt+Tab switcher with live window thumbnails](docs/walkthrough/hero-switcher.png) |
-
-![Tuna Desktop lock screen clock over the blurred wallpaper](docs/walkthrough/hero-lock.png)
-
-These are frames from the real TunaOS Marlin image booted in a QEMU VM by
-CI, on its hardware (DRM/KMS) session with the apps the image ships and its
-default wallpaper.
-
-![Overview demo: open the overview, select a window, and return to the desktop](docs/walkthrough/overview-demo.gif)
-
-[Play or download the overview video (MP4, 12 seconds)](docs/walkthrough/overview-demo.mp4).
-The demo shows an actual nested Tuna Desktop session with three libadwaita test windows.
-See [capture details](docs/walkthrough/README-media.md) for source revisions and reproduction.
-
-## Project status
-
-**Beta prerelease ([v1.0.0-beta.3](docs/releases/v1.0.0-beta.3.md)), not yet a daily driver.** A Smithay compositor supervises a GTK4/libadwaita
-shell with overview window previews, app grid and search, quick settings,
-notifications, calendar, keyboard navigation and AT-SPI accessibility. Tuna Desktop
-also includes its session supervisor, shell host and versioned
-control protocol. Floating windows, workspaces, Alt-Tab, half tiling, scrollable
-tiling and XWayland are covered by graphical CI journeys.
-
-The DRM/KMS backend starts hardware sessions and is tested with virtual KMS
-in CI. Physical GPU, VT, suspend and long-running release qualification remain
-open. See [the parity ledger](docs/parity-ledger.md) for measured behavior and
-remaining gaps.
-
-**Parity target:** GNOME 51. Native GNOME 51 captures provide the visual
-reference. The published Marlin image was verified as GNOME Shell 50.5 on
-2026-10-04; a GNOME 51 Marlin benchmark image is being validated separately.
-
-**Target platform:** Tuna Desktop is being tested as a TunaOS Marlin flavor (Arch
-base, bootc image). The Debian package remains for local development hosts.
-
-**Roadmap:** tracked as GitHub issues on the Tuna Desktop roadmap project board;
-[docs/roadmap.md](docs/roadmap.md) keeps the program structure, gates, and
-requirement traceability.
-
-## Prerequisites
-
-- **Rust stable** with `rustfmt` and `clippy` (CI uses the current stable
-  toolchain; no MSRV is declared, crates use edition 2021; see the
-  [API stability and MSRV policy](docs/api-stability.md)).
-- **System libraries**: libseat, libinput, libudev, GBM, libdrm,
-  libxkbcommon, GTK 4, libadwaita, libgweather 4, PipeWire, Wayland and
-  gtk4-layer-shell development files, plus EGL (Mesa llvmpipe is enough)
-  to run a nested session. The
-  [development guide](docs/development.md#prerequisites) has the exact
-  Ubuntu and Arch package lists CI uses.
-- **Spektacular CLI** is needed only for spec and plan work, not for
-  building or running Tuna Desktop; see the
-  [development guide](docs/development.md#spektacular-cli-planning-work-only).
-
-## Contributing and Development
-
-**Want to contribute?** Start with the [development guide](docs/development.md). It covers:
-- Setting up your build environment
-- Understanding the project structure
-- Running a nested Tuna Desktop session locally ([troubleshooting](docs/nested-session.md#troubleshooting))
-- [Running tests locally](docs/testing.md), the same checks CI runs
-- [Spektacular workflows](docs/development.md#understanding-spektacular-workflows) for planning and tracking
-
-## Documentation
-
-- [Program architecture](docs/architecture.md)
-- [Program roadmap and requirement traceability](docs/roadmap.md)
-- [Parent requirement register](docs/requirements.md)
-- [Verification and test strategy](docs/test-strategy.md)
-- [Performance profiling guide](docs/performance-profiling.md)
-- [Troubleshooting](docs/troubleshooting.md)
-- [Session operations and diagnostics](docs/session-operations.md)
-- [Environment variables](docs/environment.md)
-- [Parity ledger](docs/parity-ledger.md)
-- [Research intake rules](docs/research/README.md)
-- [Architecture decisions](docs/adr/README.md)
-- [Security model and threat model](docs/security-model.md)
-- [Portal and D-Bus service integration](docs/portal-service-integration.md)
-- [Extensions: current Rhai host and target architecture](docs/extensions.md)
-- [Crate API stability, wire versioning and MSRV](docs/api-stability.md)
-- [Contributing](CONTRIBUTING.md)
-
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
-
-The [public roadmap](docs/roadmap.md#public-roadmap) records priorities through October 2027, current release limits and contribution opportunities.

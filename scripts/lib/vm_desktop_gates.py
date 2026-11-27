@@ -11,11 +11,14 @@ The installed-image proof of rows the nested session already passes:
                                 client dismisses it; that press is consumed
   V-WINDOW-BUTTONS     P-WM-05  GTK's own maximize, restore, minimize and
                                 close title buttons; Alt+Tab restores
-  V-MINIMIZE-ANIMATION P-AN-03  Super+H runs GNOME's 400 ms minimize (times
-                                the session's GNOME_SHELL_SLOWDOWN_FACTOR)
-                                toward the window's dash icon, frame by
-                                frame, and it finishes; activation runs the
-                                restore
+  V-MINIMIZE-ANIMATION P-AN-03  GNOME's 400 ms minimize (times the
+                                session's GNOME_SHELL_SLOWDOWN_FACTOR), frame
+                                by frame, to GNOME 51's target: Super+H with
+                                the dash hidden goes to the monitor's leading
+                                corner, not the dash icon published earlier;
+                                the window's own minimize request with the
+                                overview's dash on screen goes to its dash
+                                icon; activation runs each restore
   V-TRAY               P-TR-01  a StatusNotifierItem shows in the top bar with
                                 its tooltip, a click opens its menu, and it
                                 leaves when the item exits
@@ -188,21 +191,56 @@ def transition_problems(watch, window, effect):
     return problems
 
 
-def dash_target(samples, output):
-    """The minimize target the shell published: the window's dash icon, a
-    real rectangle in the bottom half of the output (GNOME's dash), not the
-    missing-icon fallback (a zero-size point at the monitor's corner)."""
-    icons = {tuple(s.get("icon") or ()) for s in samples}
-    if len(icons) != 1:
+def minimize_target(samples):
+    """The one destination this minimize's frames were drawn toward, or None."""
+    targets = {tuple(s.get("icon") or ()) for s in samples}
+    if len(targets) != 1:
         return None
-    icon = list(icons.pop())
-    if len(icon) != 4 or icon[2] <= 0 or icon[3] <= 0:
+    target = list(targets.pop())
+    return target if len(target) == 4 else None
+
+
+def window_output(scene, rect):
+    """The one output holding the window's centre."""
+    centre = (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2)
+    outputs = [o for o in scene.get("outputs") or [] if inside(centre, o["rect"])]
+    if len(outputs) != 1:
+        raise GateError(f"the window {rect} is not on one output: {scene.get('outputs')}")
+    return outputs[0]
+
+
+def leading_corner(output):
+    """GNOME 51's destination for a window without icon geometry, which is
+    every Wayland window (windowManager.js _minimizeWindow, 1183-1201: Mutter
+    sets icon geometry only from X11 _NET_WM_ICON_GEOMETRY): the monitor's
+    upper leading corner at scale 0. The lane's session runs C.UTF-8, left
+    to right."""
+    x, y = output["rect"][:2]
+    return [x, y, 0, 0]
+
+
+def published_dash_icon(scene, window, output):
+    """The window's icon rectangle the overview's dash published
+    (`dash_icon_targets`): a real rectangle in the bottom half of the output,
+    or None."""
+    rows = [list(row[1:]) for row in scene.get("dash_icon_targets") or [] if row and row[0] == window]
+    if len(rows) != 1 or len(rows[0]) != 4 or rows[0][2] <= 0 or rows[0][3] <= 0:
         return None
+    icon = rows[0]
     centre = (icon[0] + icon[2] / 2, icon[1] + icon[3] / 2)
     rect = output["rect"]
     if not inside(centre, rect) or centre[1] < rect[1] + rect[3] / 2:
         return None
     return icon
+
+
+def target_problems(samples, expected, what):
+    """The minimize went to `expected` and only there."""
+    target = minimize_target(samples)
+    if target != expected:
+        drawn = sorted({tuple(s.get("icon") or ()) for s in samples})[:3]
+        return [f"the minimize went toward {drawn}, not {what} {expected}"]
+    return []
 
 
 def changed_pixels(left, right, rect):
@@ -286,13 +324,16 @@ class Gates:
         self.save(f"timeout-{len(self.log):03d}.json", {"message": message, "last": last})
         raise GateError(message)
 
-    def watched(self, effect, target, act, seconds=6):
-        """Arm the guest's state-file watcher, then send `act`'s real input."""
+    def watched(self, effect, target, act, seconds=6, request=None):
+        """Arm the guest's state-file watcher, then send `act`'s real input.
+        With `request`, the watcher itself triggers that fixture's own
+        minimize request once armed (`act` then sends nothing)."""
         box = {}
 
         def watch():
             try:
-                box["value"] = self.guest("gates-watch", self.key, effect, target, seconds, timeout=seconds + 20)
+                box["value"] = self.guest("gates-watch", self.key, effect, target, seconds,
+                                          *([request] if request else []), timeout=seconds + 20)
             except Exception as error:  # re-raised on the lane's thread below
                 box["error"] = error
         thread = threading.Thread(target=watch, daemon=True)
@@ -485,40 +526,96 @@ class Gates:
         self.save("window-buttons.json", gone)
 
     # ---- V-MINIMIZE-ANIMATION --------------------------------------------
-    def minimize(self):
-        value = self.state()
-        if value["scene"].get("animations_enabled") is not True:
-            raise GateError("animations are off in the installed session")
-        # The overview's dash publishes each window's icon rectangle, the
-        # minimize target (GNOME's Dash._updateIconGeometry).
+    def open_dash(self, ident):
+        """Super, until the overview's dash is on screen and has published
+        the window's icon rectangle (GNOME's Dash._updateIconGeometry)."""
         self.qmp.keys("meta_l")
-        self.wait(lambda v: v["scene"]["overview_open"], 10, "Super did not open the overview")
+
+        def shown(v):
+            scene = v["scene"]
+            if not scene["overview_open"] or not any(layer.get("namespace") == "tuna-shell-dash"
+                                                     for layer in scene["layers"] or []):
+                return False
+            rect = self.main(v)[1]["rect"]
+            return published_dash_icon(scene, ident, window_output(scene, rect)) is not None
+        self.wait(shown, 10, "Super did not show the overview's dash with the window's icon")
         time.sleep(1.5)
-        self.qmp.keys("esc")
-        self.wait(lambda v: not v["scene"]["overview_open"], 10, "Escape did not close the overview")
-        time.sleep(0.6)
-        value = self.focus_main()
-        _, window = self.main(value)
-        ident, original = window["id"], window["rect"]
-        gone = self.watched("minimize", ident, lambda: self.qmp.keys("meta_l", "h"))
-        self.save("minimize.json", gone)
-        problems = transition_problems(gone, ident, "minimize")
-        icon = dash_target(gone["samples"], primary_output(value["scene"]))
-        if icon is None:
-            problems.append(f"the minimize target {[s.get('icon') for s in gone['samples']][:1]} is not a dash icon")
-        if problems:
-            raise GateError("; ".join(problems))
-        back = self.watched("unminimize", ident, lambda: self.qmp.keys("alt", "tab"))
-        self.save("unminimize.json", back)
+        return self.state()
+
+    def restore_problems(self, back, ident, original):
         problems = transition_problems(back, ident, "unminimize")
         final = self.main(back)[1] if back["fixtures"].get("main") else None
         if final is None or final["rect"] != original:
             problems.append(f"the restored window is at {final and final['rect']}, not {original}")
+        return problems
+
+    def minimize(self):
+        """GNOME 51's minimize target rule for a Wayland window (#894): the
+        monitor's leading corner, unless the dash is on screen, when it is
+        the window's dash icon. Both cases, each with its own restore."""
+        value = self.state()
+        if value["scene"].get("animations_enabled") is not True:
+            raise GateError("animations are off in the installed session")
+        value = self.focus_main()
+        _, window = self.main(value)
+        ident, original = window["id"], window["rect"]
+        output = window_output(value["scene"], original)
+        corner = leading_corner(output)
+
+        # Dash hidden: the icon it published while shown must not be used.
+        self.open_dash(ident)
+        self.qmp.keys("esc")
+        self.wait(lambda v: not v["scene"]["overview_open"], 10, "Escape did not close the overview")
+        time.sleep(0.6)
+        value = self.focus_main()
+        hidden_icon = published_dash_icon(value["scene"], ident, output)
+        if hidden_icon is None:
+            raise GateError("the window's dash icon was not published once the dash was hidden")
+        gone = self.watched("minimize", ident, lambda: self.qmp.keys("meta_l", "h"))
+        self.save("minimize.json", gone)
+        problems = transition_problems(gone, ident, "minimize")
+        problems += target_problems(gone["samples"], corner, "the leading corner, the dash hidden (not its icon "
+                                    f"{hidden_icon}):")
         if problems:
             raise GateError("; ".join(problems))
-        return (f"Super+H minimizes toward the window's dash icon {icon} over {len(gone['samples'])} observed "
-                f"frames and the {MINIMIZE_MS} ms run completes; Alt+Tab restores it over "
-                f"{len(back['samples'])} frames to its rectangle (desktop-gates/minimize.json, unminimize.json)")
+        back = self.watched("unminimize", ident, lambda: self.qmp.keys("alt", "tab"))
+        self.save("unminimize.json", back)
+        problems = self.restore_problems(back, ident, original)
+        if problems:
+            raise GateError("; ".join(problems))
+
+        # Dash on screen: the window's own minimize request goes to its icon.
+        value = self.open_dash(ident)
+        icon = published_dash_icon(value["scene"], ident, output)
+        if icon is None:
+            raise GateError("the window's dash icon is not published with the dash on screen")
+        requests = value["fixtures"]["main"]["minimize_requests"]
+        docked = self.watched("minimize", ident, lambda: None, request="main")
+        self.save("minimize-dash.json", docked)
+        problems = transition_problems(docked, ident, "minimize")
+        problems += target_problems(docked["samples"], icon, "its dash icon, the dash on screen:")
+        if docked["fixtures"]["main"]["minimize_requests"] != requests + 1:
+            problems.append("the window never asked to be minimized")
+        if problems:
+            raise GateError("; ".join(problems))
+        # Its preview in the open overview brings it back (as G-WINDOW-MENU).
+        settled = self.wait(lambda v: v["scene"]["overview_open"] and (v["scene"]["overview_progress"] or 0) >= 1
+                            and any(p.get("id") == ident for p in v["scene"]["previews"] or []), 10,
+                            "the overview did not show the minimized window's preview")
+        x, y, w, h = next(p["rect"] for p in settled["scene"]["previews"] if p.get("id") == ident)
+        picked = self.watched("unminimize", ident, lambda: self.qmp.click(x + w // 2, y + h // 2))
+        self.save("unminimize-dash.json", picked)
+        problems = self.restore_problems(picked, ident, original)
+        if problems:
+            raise GateError("; ".join(problems))
+        self.wait(lambda v: not v["scene"]["overview_open"] and v["scene"]["focused"] == ident, 10,
+                  "picking the restored window did not close the overview onto it")
+        return (f"GNOME 51's 400 ms minimize runs frame by frame to its target: Super+H with the dash hidden goes "
+                f"to the leading corner {corner}, not the published dash icon {hidden_icon} "
+                f"({len(gone['samples'])} frames), and Alt+Tab restores it over {len(back['samples'])} frames; the "
+                f"window's own minimize request with the dash on screen goes to its dash icon {icon} "
+                f"({len(docked['samples'])} frames), and its overview preview restores it over "
+                f"{len(picked['samples'])} frames (desktop-gates/minimize*.json, unminimize*.json)")
 
     # ---- V-TRAY ---------------------------------------------------------
     def tray(self):

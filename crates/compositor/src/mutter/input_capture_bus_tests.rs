@@ -165,7 +165,7 @@ fn only_the_installed_portal_may_create_input_capture_sessions() {
     // Owning the portal backend's name is not being the installed portal.
     zbus::block_on(caller.request_name("org.freedesktop.impl.portal.desktop.gnome")).unwrap();
     assert_error(create(), "AccessDenied");
-    authority.publish(true, None);
+    authority.publish(true, std::iter::empty());
     assert_error(create(), "AccessDenied");
     assert!(sessions.lock().unwrap().is_empty());
 }
@@ -336,9 +336,9 @@ fn an_input_capture_session_follows_mutter_from_barrier_to_release() {
     assert_error(session(&owner, "Disable", &()), "Failed");
     assert_error(session(&foreign, "Enable", &()), "AccessDenied");
     // Locked: nothing, not even for the owner.
-    authority.publish(true, None);
+    authority.publish(true, std::iter::empty());
     assert_error(session(&owner, "Enable", &()), "AccessDenied");
-    authority.publish(false, None);
+    authority.publish(false, std::iter::empty());
     session(&owner, "Enable", &()).unwrap();
     assert_error(session(&owner, "Enable", &()), "Failed");
 

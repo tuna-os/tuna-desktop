@@ -4,6 +4,9 @@
 //! a PAM transaction against the `tuna-lock` service (`/etc/pam.d/tuna-lock`,
 //! shipped with the package, which includes `login`). Checking one's own
 //! password needs no privilege: pam_unix hands it to its setuid helper.
+//! Fingerprint unlock is its own transaction against `tuna-lock-fingerprint`
+//! (`pam_fprintd` plus `login`'s account stack), as GDM runs
+//! `gdm-fingerprint` (#1162 F5).
 //!
 //! libpam is loaded at run time, so builds need no PAM headers and a
 //! system without libpam fails closed. [`PamClient`] answers the
@@ -21,6 +24,10 @@ use crate::unlock::{AuthReply, Unreachable};
 pub const DEFAULT_SERVICE: &str = "tuna-lock";
 /// Environment override for the service name (tests, distributions).
 pub const SERVICE_ENV: &str = "TUNA_PAM_SERVICE";
+/// PAM service the lock screen's fingerprint conversation runs.
+pub const DEFAULT_FINGERPRINT_SERVICE: &str = "tuna-lock-fingerprint";
+/// Environment override for the fingerprint service name.
+pub const FINGERPRINT_SERVICE_ENV: &str = "TUNA_PAM_FINGERPRINT_SERVICE";
 /// Longest the compositor waits for one PAM transaction.
 pub const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -246,10 +253,20 @@ pub fn authenticate_with_deadline(service: &str, user: &str, password: &str) -> 
 
 /// The service to use: [`SERVICE_ENV`] when set, else [`DEFAULT_SERVICE`].
 pub fn service() -> String {
-    std::env::var(SERVICE_ENV)
+    service_from(SERVICE_ENV, DEFAULT_SERVICE)
+}
+
+/// The fingerprint service: [`FINGERPRINT_SERVICE_ENV`] when set, else
+/// [`DEFAULT_FINGERPRINT_SERVICE`].
+pub fn fingerprint_service() -> String {
+    service_from(FINGERPRINT_SERVICE_ENV, DEFAULT_FINGERPRINT_SERVICE)
+}
+
+fn service_from(variable: &str, default: &str) -> String {
+    std::env::var(variable)
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_SERVICE.to_owned())
+        .unwrap_or_else(|| default.to_owned())
 }
 
 /// [`UnlockClient`](crate::unlock::UnlockClient) over PAM: one hidden

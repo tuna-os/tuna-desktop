@@ -2,7 +2,7 @@
 
 For contributor-facing profiling (local `perf`/Sysprof, `frame_cost`, RSS/PSS, and the CI gates), start with the [performance profiling guide](../performance-profiling.md).
 
-Issue #73 requires comparable measured evidence before any performance claim. The `Marlin performance samples` workflow (manual dispatch or a pull request changing its measurement code) uses one runner, one shared Marlin GNOME image plus Tuna Desktop payload, and the same 6 GiB / four-vCPU / 1280×800 virtio QEMU/KVM profile for both sessions. GNOME runs first, then Tuna Desktop; one boot per session does not establish cold/warm variance. The input package must come from a successful trusted main CI run. The workflow records package SHA256, package source/run, base digest, shared image ID, observer revision, host CPU/kernel and QEMU version.
+No performance claim is made without comparable measured evidence (the rule of #73, closed 2026-10-11). The `Marlin performance samples` workflow (manual dispatch or a pull request changing its measurement code) uses one runner, one shared Marlin GNOME image plus Tuna Desktop payload, and the same 6 GiB / four-vCPU / 1280×800 virtio QEMU/KVM profile for both sessions. GNOME runs first, then Tuna Desktop; one boot per session does not establish cold/warm variance. The input package must come from a successful trusted main CI run. The workflow records package SHA256, package source/run, base digest, shared image ID, observer revision, host CPU/kernel and QEMU version.
 
 The published Marlin tag was measured as GNOME Shell 50.5 at digest `sha256:3311d7784a0b0e7cd5486d8b69d974f4a34c3436b9812599470d00f80f805f1b` in [run 37176268295](https://github.com/tuna-os/tuna-desktop/actions/runs/37176268295). It is not the GNOME 51 baseline claimed by older roadmap prose. This benchmark derives a CI-only GNOME 51.0 baseline by resolving every Arch repository, with core-testing and extra-testing enabled together, from one dated [Arch Linux Archive](https://archive.archlinux.org/repos/) snapshot (`ARCH_ARCHIVE_SNAPSHOT` in `packaging/marlin/perf/Containerfile.baseline`), performing one full upgrade/downgrade to that snapshot, and requiring GNOME Shell 51.0 with Mutter 51.0. The snapshot is pinned because Arch and the published Marlin tag moved to the 51.1 point release on 2026-10-14; changing it changes the baseline and requires an ADR. Both sessions use that same derived payload; its package versions and shared image ID are retained. This does not change the shipping Marlin image. The first successful paired guest run is recorded in the dated report below.
 
@@ -16,11 +16,13 @@ The host waits for an actual rendered black panel, allows an equal 30-second pos
 
 The CI-only guest agent runs only the fixed `/usr/libexec/tuna-perf-phase` helper. It marks the idle boundaries with the guest's CLOCK_BOOTTIME, matching the observer's own clock. Idle CPU excludes any interval crossing either boundary, and fewer than 20 complete intervals fail the measurement. Host phase timestamps remain separate provenance. The fixture sends notifications to the actual interactive user's Notifications service and requires forty distinct nonzero uint32 IDs (warm-up and measured rounds); the service's acceptance and first frame are retained. Acceptance is a workload record, not a claim of notification input-to-frame latency. Guest-agent packages, helper and service are fixture-only and installed identically in both sessions.
 
-Input timings bound the response observed through QMP captures. Each observation records a conservative lower bound, upper bound and capture duration. QMP key injection, capture/poll overhead and host scheduling affect these measurements; they are **not** compositor input-to-frame tracing or a frame-pacing measurement. The software/guest path, only one boot, potentially unavailable DRM memory counters, and missing 24-hour soak remain limitations. The regression budgets below are GNOME-relative ratchets ([ADR 0009](../adr/0009-performance-regression-budgets.md)), not a release claim of parity.
+Input timings bound the response observed through QMP captures. Each observation records a conservative lower bound, upper bound and capture duration. QMP key injection, capture/poll overhead and host scheduling affect these measurements; they are **not** compositor input-to-frame tracing or a frame-pacing measurement. The software/guest path, only one boot and potentially unavailable DRM memory counters remain limitations; this lane measures no endurance, which the separate [24-hour soak](../soak.md) covers. The regression budgets below are GNOME-relative ratchets ([ADR 0009](../adr/0009-performance-regression-budgets.md)), not a release claim of parity.
 
 Run a fixture disk with `scripts/tuna-vm-perf --disk disk.raw --desktop gnome --out /tmp/gnome-perf-fresh`, or select `tuna` for the candidate. Each artifact directory must be new. Build `packaging/marlin/perf/Containerfile` with `DESKTOP=gnome` or `DESKTOP=tuna` on the same shared preview image; it adds the test user, autologin, serial logging, observer and fixed guest probes. The fixture never ships in a desktop image.
 
-The [2026-10-04 paired report](2026-10-04-marlin-gnome51/README.md) records the first successful run, including the higher sampled Tuna Desktop CPU and slower median observed overview response. Its package predates the latest roadmap work. Issue #73 remains open.
+The [2026-10-04 paired report](2026-10-04-marlin-gnome51/README.md) records the first successful run, including the higher sampled Tuna Desktop CPU and slower median observed overview response. Its package predates the latest roadmap work.
+
+The latest paired run recorded on [#503](https://github.com/tuna-os/tuna-desktop/issues/503#issuecomment-7028378405), [44598171676](https://github.com/tuna-os/tuna-desktop/actions/runs/44598171676) on main `8a93bd8cb` (three stock pairs), passes every enforced budget. Every metric's ratio is at or below 1.0 except `cpu.overview.desktop.mean` (1.05, 90% interval 0.85–1.15); `overview.response_ms.p95` is 0.43 but marked unstable (interval 0.36–1.14), and `cpu.idle.total.mean` passes its budget while missing its target. Replaying the run through the PSS gate that [#1075](https://github.com/tuna-os/tuna-desktop/pull/1075) added gives PSS ratios of 0.76–0.84 ([#503 comment](https://github.com/tuna-os/tuna-desktop/issues/503#issuecomment-7028511849)); the gate reports memory but does not enforce it yet.
 
 The paired lane also captures `wayland-info` from each actual interactive
 Marlin session. The root observer invokes the tool as the fixture user and
@@ -74,14 +76,20 @@ The run's summary page and `perf-artifacts/perf-gate.json` in the `marlin-perfor
   - `fail`: over the ratio or the ceiling.
   - `missing`: fewer than three stock-profile pairs measured an enforced metric, which also fails.
   - `warn`: a provisional budget (`enforced: false`) is over its ratio or ceiling, or has too few pairs.
+  - `unenforced`: a provisional budget is within its ratio and ceiling. This is not a pass.
+
+  The summary prints both provisional statuses with `not enforced`, names every such budget above the table, and `check` repeats them on stderr. `perf-gate.json` lists them under `unenforced`. They never change the exit status.
+- **Memory against the v1 criterion.** A statement of whether the criterion (below) is enforced, the four criterion metrics with `met` or `not met` against the target ratio, PSS in MiB by process role for GNOME, Tuna and their difference (idle, settle and the whole run), and each desktop's largest processes. The JSON has every phase under `memory.by_role_mib` and every process under `memory.by_process_mib`.
 - **Per-role attribution, for each desktop.** The mean CPU of each phase, split into compositor, shell, xwayland, portals, services and apps. GNOME's compositor and shell are one process (`gnome-shell`), so compare Tuna's "desktop" role (compositor plus shell) against it.
-- **A 90% confidence interval for every ratio.** A seeded block bootstrap (1000 replicates, blocks of three 1 s intervals) resamples the pairs and, inside each session, the phase's intervals or observations, and recomputes the gated statistic. The same artifact always gives the same interval. `unstable` marks a decision whose interval straddles the budget: the run cannot tell that metric's pass from its fail. The status still follows the point estimate, so the interval loosens nothing.
+- **A 90% confidence interval for every ratio.** A seeded block bootstrap (1000 replicates, blocks of three 1 s intervals) resamples the pairs and, inside each session, the phase's intervals or observations, and recomputes the gated statistic. The same artifact always gives the same interval. Memory metrics draw from a separate stream with the same seed, so budgeting them moved no other interval. `unstable` marks a decision whose interval straddles the budget: the run cannot tell that metric's pass from its fail. The status still follows the point estimate, so the interval loosens nothing.
 - **The host CPU model and refused sessions.** GitHub's KVM runners vary (EPYC 7763, EPYC 9V74, EPYC 9V45, Xeon 8370C), and some ratios move by host class; compare runs on the same class. A session whose observer wrote records over 32 KiB, or ran with per-thread diagnostics, is refused with its reason: such an observer perturbs what it measures (#782). Its pair then counts as unmeasured.
 - **Diagnostic kernel vblank attribution.** The diagnostic GNOME session runs the `tuna-kernel-trace` ftrace observer ([probe misses](gnome-overview-sysprof.md#kernel-vblank-observer-probe-misses)). When that observer refuses its own acquisition (a kprobe miss such as the vblank-hrtimer re-entry race, buffer loss or a cleanup error), the diagnostic pair still completes, with `kernel_attribution: unavailable` in its `gnome_overview_sysprof` report. The summary names the pair, the refusal's reasons and its receipt, `kernel-vblank-acquisition-rejection.json`. The whole refused acquisition is kept beside the receipt (`kernel-vblank-source.json`, `kernel-vblank-trace.txt`) as evidence. JSON field: `diagnostic_kernel_attribution`. The rules are unchanged otherwise. A transport or artifact fault, or any other diagnostic rejection, still fails the diagnostic step. Diagnostic pairs are never budget inputs. A stock session that reports a refused kernel observer is refused like any other perturbed session.
 
 The JSON's `meets_target` separately compares the median paired ratio against the target without a denominator floor. Passing a floor-stabilized idle CPU budget does not establish parity. Two measured zero values meet the target; positive Tuna usage against measured zero GNOME usage does not.
 
-Metric names are `cpu.<phase>.<role>.<stat>`, `overview.response_ms.<stat>` and `frame_pacing.interval_ms.<stat>`. CPU is in percent of one core, summed over the role's processes. Only intervals wholly inside a phase count. A process's first interval after it starts is not counted.
+Metric names are `cpu.<phase>.<role>.<stat>`, `pss.<scope>.<role>.<stat>`, `overview.response_ms.<stat>` and `frame_pacing.interval_ms.<stat>`. CPU is in percent of one core, summed over the role's processes. Only intervals wholly inside a phase count. A process's first interval after it starts is not counted.
+
+Memory is PSS in MiB, summed over the role's processes in each one-second sample. `<scope>` is a phase or `whole`. A phase takes the samples whose collection lies wholly inside it, the rule the session report uses for `idle_user_pss_kib`, and needs at least three. `whole` takes every sample of the run, like `whole_user_pss_kib`. `<stat>` is `p50` (budgeted) or `p95` (the near-peak). A process counts in the samples that see it: one that exits stops counting, and nothing is carried forward. A sample with an unreadable process or a row without a whole `pss_kib` makes its phase and the whole run unmeasured for that session, never smaller.
 
 | Phase | Workload |
 |---|---|
@@ -95,6 +103,23 @@ Metric names are `cpu.<phase>.<role>.<stat>`, `overview.response_ms.<stat>` and 
 | `settle` | 30 s without input, three apps open |
 
 `cpu.whole.total.p50` matches the whole-run figure in older reports. Frame pacing uses the frame-pacer probe's presentation intervals. Overview response is the QMP-observed upper bound described above.
+
+### Memory criterion
+
+v1 requires memory no worse than GNOME 51 ([v1 checklist](../v1.md)). The gate expresses that as four metrics at a ratio of 1.00 or below: `pss.idle.desktop.p50`, `pss.idle.total.p50`, `pss.whole.desktop.p50` and `pss.whole.total.p50`. `desktop` is compositor plus shell, as for CPU. `total` is every process of the session user, so it also contains the workload's three apps and the session services.
+
+**The criterion is not enforced yet.** The four budgets are provisional: `enforced: false`, with `max_ratio` at the target ratio because no budget has been calibrated. ADR 0009 enforces a budget only after a paired run measured it in three stock pairs, and enforcing it is a ratchet step that cites that run. Until then a green gate says nothing about memory, and the report says so in its memory section and on stderr.
+
+The budgets cite [run 42807208426](https://github.com/tuna-os/tuna-desktop/actions/runs/42807208426) (2026-11-10, package `dea433d0`, EPYC 7763). That run predates these metrics; its three stock pairs were replayed through `tuna-perf-gate check` locally:
+
+| Metric | GNOME MiB | Tuna MiB | Median ratio | Pair ratios |
+|---|---:|---:|---:|---|
+| `pss.idle.desktop.p50` | 254.5 | 257.4 | 1.01 | 1.014, 1.010, 1.005 |
+| `pss.idle.total.p50` | 472.5 | 435.3 | 0.92 | 0.921, 0.919, 0.961 |
+| `pss.whole.desktop.p50` | 253.8 | 275.9 | 1.09 | 1.090, 1.090, 1.085 |
+| `pss.whole.total.p50` | 880.5 | 737.0 | 0.83 | 0.834, 0.823, 0.857 |
+
+The session total is below GNOME mostly outside the desktop: `gnome-system-monitor` held 171.5 MiB in the GNOME sessions and 42.9 MiB in the Tuna sessions, and the services role was 42.5 MiB smaller. The desktop role was above GNOME: `tuna-compositor` 175.1 MiB plus the shell role's 100.9 MiB against `gnome-shell` 225.7 MiB plus 27.7 MiB. One run on one host class is not a calibration.
 
 ### How budgets ratchet
 
@@ -120,7 +145,7 @@ The first budgets are the median ratios over the three stock pairs of [paired ru
   This lowers each budget to the measured ratio plus the margin, never below 1.0, and never raises one. When the run's 90% interval reaches above the point ratio, its upper bound is used instead, so one quiet run cannot set a budget inside its own noise. Commit the result with the run linked in the PR. Enforcing a provisional budget is also a tightening.
 - **Loosening** (a higher ratio, ceiling or floor, dropping `enforced`, or removing a budget) needs a new ADR under `docs/adr/`, referenced from the budget's `adr` field, as the roadmap's change control requires. CI's ratchet check (`scripts/tuna-perf-gate ratchet --base <main's budgets.json>`) refuses any change that is not backed by new run evidence, and any loosening without that ADR.
 
-Every budget in the baseline is enforced, since that run measured each one in three pairs. A budget added later without three measured pairs starts provisional (`enforced: false`) and is enforced from the first run that measures it.
+Every budget in the baseline is enforced, since that run measured each one in three pairs. A budget added later without three measured pairs starts provisional (`enforced: false`) and is enforced from the first run that measures it. The memory budgets are in that state. A provisional budget's `max_ratio` is ratcheted like any other: enforcing it needs a newer run as `evidence`, and raising it needs an ADR.
 
 ### Running it locally
 
@@ -175,7 +200,12 @@ Identities also retain unsigned 32-bit `stat_flags`, nonnegative signed 32-bit
 `stat_num_threads`, and numeric `status_vmrss_present`/`status_vmsize_present`
 (1 for an exact field label, 0 for absent). Malformed/out-of-range stat metadata
 is null; status presence is null for records exceeding 16,384 characters.
-These reuse the existing proc reads without changing their input limits.
+These reuse the existing proc reads without changing their input limits. Sample
+process rows leave the three exit-race fields out, carry `drm_clients` only for
+processes that hold DRM clients, and list DRM read errors once in `drm_memory`
+with their PID. GNOME's ~90 session processes, with the PSS breakdown, then fit
+the host's 32 KiB observer-record bound (`perf_budget.OBSERVER_RECORD_BYTES`).
+Stock run 43449826443 refused every GNOME session at 33,149 bytes.
 Presence does not validate field values, and no memory fallback is derived
 from them. One combination does classify an exit: when `smaps_rollup` fails
 with ESRCH and the re-read shows the same UID and start ticks with `PF_EXITING`

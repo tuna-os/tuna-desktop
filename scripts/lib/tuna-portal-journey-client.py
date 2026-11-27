@@ -107,9 +107,13 @@ def launch(values):
     argv = [sys.executable, str(root / script), str(p['frame.png']), mode]
     # The worker survives this SSH exchange, records the exact native exit,
     # and owns a separate process group so failure cleanup cannot hit peers.
+    # The exit file appears by rename, never empty: readers poll for it to
+    # exist and then read it at once.
+    exit_tmp = p['requester.exit'].with_name('requester.exit.tmp')
     worker_code = ('import pathlib,subprocess; '
                    f'r=subprocess.run({argv!r}); '
-                   f'pathlib.Path({str(p["requester.exit"])!r}).write_text(str(r.returncode))')
+                   f't=pathlib.Path({str(exit_tmp)!r}); t.write_text(str(r.returncode)); '
+                   f't.rename({str(p["requester.exit"])!r})')
     with p['requester.log'].open('wb') as log:
         worker = subprocess.Popen([sys.executable, '-c', worker_code], stdin=subprocess.DEVNULL,
                                   stdout=log, stderr=subprocess.STDOUT, start_new_session=True)

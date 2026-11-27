@@ -5,7 +5,7 @@ use std::io::Read;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
-use tuna_shell_control::NativeOutputInfo;
+use tuna_output::NativeOutputInfo;
 
 fn text(path: &Path) -> Result<String, String> {
     let mut file = OpenOptions::new()

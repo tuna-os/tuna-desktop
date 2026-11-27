@@ -8,7 +8,7 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use tuna_shell_control::NativeOutputInfo;
+use tuna_output::NativeOutputInfo;
 
 const MAX_DEVICES: usize = 64;
 const MAX_SCALAR_BYTES: u64 = 64;

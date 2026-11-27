@@ -1,7 +1,15 @@
 //! GNOME's screen-saver API, backed by the compositor's confirmed lock state.
 //! A bus caller can request a lock, but cannot bypass password authentication.
+//!
+//! As in gnome-shell (`screenShield.js` `_lockScreenShown`, `shellDBus.js`
+//! `LockAsync`), the screen saver is active, and `Lock` returns, only once
+//! the lock screen is shown: the compositor's curtain has landed.
+//! gnome-settings-daemon blanks the screen on `ActiveChanged(true)`, and
+//! wakes it only on input or `WakeUpScreen`, which every unlock emits
+//! (`_continueDeactivate`): an unlock without input, such as
+//! `loginctl unlock-session`, must not leave the session blanked.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +23,7 @@ const XML: &str = r#"<node><interface name="org.gnome.ScreenSaver">
   <method name="SetActive"><arg type="b" direction="in"/></method>
   <method name="GetActiveTime"><arg type="u" direction="out"/></method>
   <signal name="ActiveChanged"><arg type="b"/></signal>
+  <signal name="WakeUpScreen"/>
 </interface></node>"#;
 
 type Lock = Rc<dyn Fn() -> Result<(), &'static str>>;
@@ -23,17 +32,50 @@ type Active = Rc<dyn Fn() -> bool>;
 pub struct Service {
     conn: RefCell<Option<gio::DBusConnection>>,
     since: RefCell<Option<Instant>>,
+    locked: Cell<bool>,
+}
+
+/// What one [`Service::sync`] publishes, in order.
+#[derive(Debug, PartialEq, Eq)]
+struct Signals {
+    /// `WakeUpScreen`: the compositor confirmed an unlock.
+    wake: bool,
+    /// `ActiveChanged` with the new value.
+    active: Option<bool>,
+}
+
+/// The signals for a sync from `was_locked`/`was_active` to the
+/// compositor's confirmed `locked` (`None` while unknown) and `shown`.
+/// gnome-shell's `deactivate` emits `wake-up-screen` before it lifts the
+/// curtain and only then `active-changed`, so the wake comes first.
+fn signals(was_locked: bool, was_active: bool, locked: Option<bool>, shown: bool) -> Signals {
+    Signals {
+        wake: was_locked && locked == Some(false),
+        active: (shown != was_active).then_some(shown),
+    }
 }
 
 impl Service {
-    /// Publish transitions after the control client has received lock state.
-    pub fn sync(&self, active: bool) {
+    /// Publish transitions after the control client has received lock state;
+    /// `locked` is the compositor's confirmed lock (`None` without a current
+    /// snapshot), `shown` whether the lock screen is shown.
+    pub fn sync(&self, locked: Option<bool>, shown: bool) {
         let mut since = self.since.borrow_mut();
-        if active == since.is_some() {
-            return;
+        let signals = signals(self.locked.get(), since.is_some(), locked, shown);
+        if let Some(locked) = locked {
+            self.locked.set(locked);
         }
-        *since = active.then(Instant::now);
-        if let Some(conn) = self.conn.borrow().as_ref() {
+        if let Some(active) = signals.active {
+            *since = active.then(Instant::now);
+        }
+        let conn = self.conn.borrow();
+        let Some(conn) = conn.as_ref() else {
+            return;
+        };
+        if signals.wake {
+            let _ = conn.emit_signal(None, PATH, NAME, "WakeUpScreen", None);
+        }
+        if let Some(active) = signals.active {
             let _ = conn.emit_signal(
                 None,
                 PATH,
@@ -49,6 +91,7 @@ pub fn start(lock: Lock, active: Active) -> Rc<Service> {
     let service = Rc::new(Service {
         conn: RefCell::new(None),
         since: RefCell::new(None),
+        locked: Cell::new(false),
     });
     let info = gio::DBusNodeInfo::for_xml(XML)
         .expect("screen-saver interface XML")
@@ -122,4 +165,53 @@ pub fn start(lock: Lock, active: Active) -> Rc<Service> {
         |_, _| eprintln!("tuna-shell-gtk: screen-saver name owned elsewhere"),
     );
     service
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{signals, Signals};
+
+    /// Locking publishes nothing until the curtain lands; then the screen
+    /// saver goes active (gnome-settings-daemon blanks on it).
+    #[test]
+    fn active_follows_the_shown_lock_screen() {
+        let quiet = Signals {
+            wake: false,
+            active: None,
+        };
+        assert_eq!(signals(false, false, Some(true), false), quiet);
+        assert_eq!(
+            signals(true, false, Some(true), true),
+            Signals {
+                wake: false,
+                active: Some(true)
+            }
+        );
+        assert_eq!(signals(true, true, Some(true), true), quiet);
+    }
+
+    /// Every confirmed unlock wakes the screen before the screen saver goes
+    /// inactive (`_continueDeactivate`), whether or not the lock screen was
+    /// shown; without it `loginctl unlock-session` after the blank left the
+    /// unlocked session dark until the next input.
+    #[test]
+    fn every_confirmed_unlock_wakes_the_screen_first() {
+        assert_eq!(
+            signals(true, true, Some(false), false),
+            Signals {
+                wake: true,
+                active: Some(false)
+            }
+        );
+        assert_eq!(
+            signals(true, false, Some(false), false),
+            Signals {
+                wake: true,
+                active: None
+            }
+        );
+        // Already unlocked, or no current snapshot: nothing to wake.
+        assert!(!signals(false, false, Some(false), false).wake);
+        assert!(!signals(true, true, None, false).wake);
+    }
 }

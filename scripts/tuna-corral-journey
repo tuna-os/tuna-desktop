@@ -23,6 +23,8 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import os
+import shutil
 import re
 import secrets
 import shlex
@@ -50,15 +52,31 @@ POINTS = {
     'dialog-log-out': (731, 457),       # end-session dialog "Log Out"
     'gdm-user': (640, 349),             # GDM user list, the only row
 }
-CROSSCHECK = {'greeter-user-list', 'session-is-tuna', 'lock'}
+# desktop and portal-screencast: the overview-exit frame (06) that noVNC shows
+# frozen mid-transition; both VNC views and the guest scanout are compared.
+CROSSCHECK = {'greeter-user-list', 'session-is-tuna', 'desktop', 'portal-screencast', 'lock'}
+# The guest's own scanout, read from KMS as root: the primary plane of each
+# card, XRGB8888 (bgr0) or ARGB8888 (bgra), printed base64 after "@@ok CARD FMT".
+SCANOUT = (
+    'command -v ffmpeg >/dev/null || { echo "@@skip ffmpeg is not on the image"; exit 0; }; '
+    'for card in /dev/dri/card*; do for fmt in bgra bgr0; do '
+    'if ffmpeg -hide_banner -loglevel error -device "$card" -f kmsgrab -i - -frames:v 1 '
+    '-vf "hwdownload,format=$fmt" -f image2 -c:v png -y /run/tuna-scanout.png 2>/run/tuna-scanout.err; then '
+    'echo "@@ok $card $fmt"; base64 -w0 /run/tuna-scanout.png; echo; rm -f /run/tuna-scanout.png /run/tuna-scanout.err; exit 0; fi; '
+    'echo "@@try $card $fmt $(tail -c 300 /run/tuna-scanout.err | tr "\\n" " ")"; done; done; '
+    'rm -f /run/tuna-scanout.png /run/tuna-scanout.err; exit 3')
 QUALIFICATION_CORE = {
     'greeter-user-list', 'greeter-password', 'session-is-tuna', 'portal-availability', 'portal-screenshot',
     'portal-screencast',
     'desktop', 'lock', 'unlock-refused', 'unlock', 'power-menu', 'logout-dialog', 'logout',
 }
 # Ready means: boot finished, GDM active, its greeter session on seat0, and
-# something painted on the console.
-GREETER = 'loginctl list-sessions --no-legend | awk \'$6=="greeter" && $4=="seat0"\' | grep -q .'
+# something painted on the console. The greeter is found by its Class
+# property: `loginctl list-sessions` has a CLASS column only from systemd 256
+# (255, as on Ubuntu 24.04, prints TTY STATE IDLE SINCE after SEAT).
+GREETER_SID = ('for s in $(loginctl list-sessions --no-legend | awk \'$4=="seat0"{print $1}\'); do '
+               '[ "$(loginctl show-session "$s" -p Class --value)" != greeter ] || echo "$s"; done')
+GREETER = f'{GREETER_SID} | grep -q .'
 
 
 class NotExercised(Exception):
@@ -83,6 +101,50 @@ def corral_json(argv, timeout=120, check=True, input=None):
     return json.loads(r.stdout) if r.stdout.strip() else None
 
 
+def compare_frames(frame, other):
+    """Pixel comparison of two captures: identical, or the bounding box and
+    share of pixels that differ in any channel."""
+    a, b = Image.open(frame).convert('RGB'), Image.open(other).convert('RGB')
+    if a.size != b.size:
+        return {'identical': False, 'sizes': [list(a.size), list(b.size)]}
+    diff = ImageChops.difference(a, b)
+    box = diff.getbbox()
+    if box is None:
+        return {'identical': True}
+    red, green, blue = diff.split()
+    changed = a.width * a.height - ImageChops.lighter(ImageChops.lighter(red, green), blue).histogram()[0]
+    return {'identical': False, 'diff_bbox': box, 'diff_fraction': round(changed / (a.width * a.height), 5)}
+
+
+def bootc_plugin():
+    """The corral-bootc plugin `corral bootc create` runs, resolved as Corral
+    resolves it (CORRAL_PLUGIN_DIR, else the XDG plugin dir, else PATH). It,
+    not the corral binary, writes the disk and provisions the account."""
+    plugins = os.environ.get('CORRAL_PLUGIN_DIR') or str(
+        Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local' / 'share') / 'corral' / 'plugins')
+    path = Path(plugins) / 'corral-bootc'
+    if not os.access(path, os.X_OK):
+        found = shutil.which('corral-bootc')
+        path = Path(found) if found else None
+    if path is None:
+        return {'path': None}
+    return {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def qemu_version(identity, vm):
+    """The QEMU in the VM's virt-launcher pod, which serves its VNC."""
+    kubectl = ['kubectl', '--context', identity.scope['kubernetes_context'], '-n', identity.scope['namespace']]
+    pods = run(kubectl + ['get', 'pods', '-l', f'vm.kubevirt.io/name={vm}', '-o', 'name'], check=False)
+    pod = pods.stdout.split()[0] if pods.stdout.split() else None
+    if pod is None:
+        return {'pod': None, 'exit': pods.returncode, 'stderr': pods.stderr.strip()}
+    r = run(kubectl + ['exec', pod, '-c', 'compute', '--', 'sh', '-c',
+                       'for q in /usr/libexec/qemu-kvm /usr/bin/qemu-system-x86_64; do '
+                       '[ -x "$q" ] && exec "$q" --version; done; exit 3'], check=False)
+    return {'pod': pod, 'exit': r.returncode,
+            'version': r.stdout.strip().splitlines()[0] if r.stdout.strip() else None, 'stderr': r.stderr.strip()}
+
+
 def ini_values(text, section, key):
     """Every `key=` value inside `[section]` of a GDM/AccountsService key file."""
     values, current = [], None
@@ -105,6 +167,7 @@ def fresh_account_session(sections):
     major = int(version.group(1)) if version else None
     fallback = ini_values(sections.get('custom.conf'), 'daemon', 'FallbackSession')
     result = {'gdm_version': sections.get('version', '').strip(), 'gdm_major': major,
+              'gdm_config': (sections.get('custom.conf-path') or '').strip() or None,
               'fallback_session': fallback, 'templates': {}}
     for kind in ('standard', 'administrator'):
         text = sections.get(f'template-{kind}')
@@ -159,14 +222,18 @@ class Guest:
         return dict(line.split('=', 1) for line in props.splitlines())
 
     def greeter_session(self):
-        return self.out("loginctl list-sessions --no-legend | awk '$6==\"greeter\" && $4==\"seat0\"{print $1}'")
+        return self.out(GREETER_SID)
 
     def session_defaults(self):
         """GDM's version and `[daemon]`, the AccountsService templates and the
-        test account's own record, read in one exchange."""
+        test account's own record, read in one exchange. GDM reads one
+        compiled-in config file: Debian's gdm3 /etc/gdm3/daemon.conf (it never
+        reads custom.conf there), Ubuntu's /etc/gdm3/custom.conf, others
+        /etc/gdm/custom.conf."""
         raw = self.out(
             'gdm=$(command -v gdm || command -v gdm3); echo "@@version"; "$gdm" --version 2>&1 || true; '
-            'echo "@@custom.conf"; cat /etc/gdm3/custom.conf 2>/dev/null || cat /etc/gdm/custom.conf 2>/dev/null || true; '
+            'for f in /etc/gdm3/daemon.conf /etc/gdm3/custom.conf /etc/gdm/custom.conf; do if [ -f "$f" ]; then '
+            'echo "@@custom.conf-path"; echo "$f"; echo "@@custom.conf"; cat "$f"; break; fi; done; '
             f'if [ -f /var/lib/AccountsService/users/{USER} ]; then echo "@@user"; cat /var/lib/AccountsService/users/{USER}; fi; '
             'for t in standard administrator; do for d in /run /etc /usr/local/share /usr/share; do '
             'f=$d/accountsservice/user-templates/$t; if [ -f "$f" ]; then echo "@@template-$t-path"; echo "$f"; '
@@ -187,6 +254,26 @@ class Guest:
         lines = self.out(f'journalctl -b --after-cursor={shlex.quote(cursor)} _UID=$(id -u {USER}) -o cat --no-pager'
                          ' | grep -E "^tuna-" | grep -v "modifier super" || true').splitlines()
         return lines[-limit:]
+
+    def diagnostics(self, cursor, limit=600):
+        """A failed step's whole journal since the step began, the user's
+        processes with their cgroups, each user session's state and process
+        tree, and crashes, so the cause survives VM deletion."""
+        code, out, err = self.sh(
+            f'echo "@@journal"; journalctl -b --after-cursor={shlex.quote(cursor)} -o short-monotonic --no-pager'
+            f' | tail -n {limit}; echo "@@sessions"; loginctl list-sessions --no-legend; '
+            f'echo "@@session-status"; for s in $(loginctl list-sessions --no-legend | awk \'$3=="{USER}"{{print $1}}\'); do '
+            'loginctl session-status "$s" --no-pager --lines=0; done; '
+            f'echo "@@processes"; ps -u {USER} -o pid=,etimes=,comm=,cgroup= 2>/dev/null; '
+            'echo "@@coredumps"; coredumpctl list --no-pager --no-legend 2>/dev/null | tail -n 10', timeout=180)
+        sections, name = {'exit': code, 'stderr': err[-400:]}, None
+        for line in out.splitlines():
+            if line.startswith('@@'):
+                name = line[2:]
+                sections[name] = []
+            elif name is not None:
+                sections[name].append(line)
+        return sections
 
 
 class Console:
@@ -332,14 +419,15 @@ def provision(args, guest, receipt, identity):
                 '--context', identity.scope['corral_context_alias'],
                 '--user', USER, '--password-stdin', '--tag', 'purpose=tuna-corral-journey']
         argv += ['--node', args.node] if args.node else []
+        plugin = bootc_plugin()
         try:
             result = run(argv, timeout=3600, input=PASSWORD + '\n', check=False)
         except subprocess.TimeoutExpired as error:
-            receipt['provision'] = {'argv': argv, 'timeout': 3600,
+            receipt['provision'] = {'argv': argv, 'bootc_plugin': plugin, 'timeout': 3600,
                                     'stdout': error.stdout.decode() if isinstance(error.stdout, bytes) else error.stdout,
                                     'stderr': error.stderr.decode() if isinstance(error.stderr, bytes) else error.stderr}
             raise
-        receipt['provision'] = {'argv': argv, 'exit': result.returncode,
+        receipt['provision'] = {'argv': argv, 'bootc_plugin': plugin, 'exit': result.returncode,
                                 'stdout': result.stdout, 'stderr': result.stderr}
         # Resolve immediately after create, including failures which left a VM.
         # Never replace failed resolution with a bare-name selector.
@@ -375,6 +463,7 @@ def provision(args, guest, receipt, identity):
         raise RuntimeError(f'post-wait VM identity/placement mismatch: {json.dumps(info)}')
     receipt['vm'].update({k: info.get(k) for k in ('node', 'cpu', 'memory', 'firmware', 'inputs', 'disks',
                                                    'tagValues', 'image')})
+    receipt['vm']['qemu'] = qemu_version(identity, args.vm)
     if not any(i.get('type') == 'tablet' for i in info.get('inputs') or []):
         raise RuntimeError(f"no absolute pointer on the VM (inputs: {info.get('inputs')})")
     booted = json.loads(guest.out('bootc status --format json'))['status']['booted']['image']
@@ -446,14 +535,18 @@ class Journey:
             record['result'] = 'not-exercised'
         else:
             record['result'] = 'pass' if checks and all(c['ok'] for c in checks) else 'fail'
+        if record['result'] == 'fail':
+            record['diagnostics'] = self.guest.diagnostics(cursor)
         record['finished'] = now()
         print(f"{record['result']:4}  {sid}: {title}", flush=True)
         (self.out / 'manifest.json').write_text(json.dumps(self.receipt, indent=2) + '\n')
 
     def crosscheck(self, frame):
-        """Same frame through `corral screenshot`, independent of noVNC.
+        """Same frame through `corral screenshot` (a fresh VNC session,
+        independent of noVNC), then the guest's own KMS scanout.
 
-        The capture is kept only when its pixels differ from the frame."""
+        The corral capture is kept only when its pixels differ from the frame;
+        the scanout is always kept."""
         other = self.out / 'crosscheck' / f'{frame.stem}-corral.png'
         other.parent.mkdir(exist_ok=True)
         argv = ['corral', 'screenshot', self.guest.vm, '-o', str(other)]
@@ -461,15 +554,35 @@ class Journey:
         # KubeVirt keeps one VNC session; the screenshot's session ends the
         # page's, and the page reconnects by itself.
         self.console.connected()
+        scanout = self.scanout(frame)
         if r.returncode:
             return {'identical': False, 'argv': argv, 'exit': r.returncode,
-                    'stdout': r.stdout, 'stderr': r.stderr, 'observed': r.stderr.strip()}
+                    'stdout': r.stdout, 'stderr': r.stderr, 'observed': r.stderr.strip(), 'scanout': scanout}
         digest = hashlib.sha256(other.read_bytes()).hexdigest()
-        box = ImageChops.difference(Image.open(frame).convert('RGB'), Image.open(other).convert('RGB')).getbbox()
-        if box is None:
+        result = compare_frames(frame, other)
+        if result['identical']:
             other.unlink()
-            return {'identical': True, 'corral_png_sha256': digest}
-        return {'identical': False, 'diff_bbox': box, 'file': f'crosscheck/{other.name}'}
+            return {**result, 'corral_png_sha256': digest, 'scanout': scanout}
+        return {**result, 'file': f'crosscheck/{other.name}', 'scanout': scanout}
+
+    def scanout(self, frame):
+        """The guest's KMS scanout read as root with ffmpeg kmsgrab, past
+        QEMU's VNC, compared with the noVNC frame."""
+        code, out, err = self.guest.sh(SCANOUT, timeout=120)
+        lines = out.splitlines()
+        tries = [line[6:] for line in lines if line.startswith('@@try ')]
+        skip = next((line[7:] for line in lines if line.startswith('@@skip ')), None)
+        if skip:
+            return {'captured': False, 'skipped': skip}
+        ok = next((i for i, line in enumerate(lines) if line.startswith('@@ok ')), None)
+        if code or ok is None or ok + 1 >= len(lines):
+            return {'captured': False, 'exit': code, 'tries': tries, 'stderr': err[-400:]}
+        _, card, fmt = lines[ok].split()
+        path = self.out / 'crosscheck' / f'{frame.stem}-scanout.png'
+        path.write_bytes(base64.b64decode(lines[ok + 1]))
+        return {'captured': True, 'card': card, 'pix_fmt': fmt, 'tries': tries,
+                'file': f'crosscheck/{path.name}', 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                **compare_frames(frame, path)}
 
     def gsetting(self, schema, key):
         return self.guest.out(f'gsettings get {schema} {key}', user=True)

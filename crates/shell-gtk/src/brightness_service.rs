@@ -19,7 +19,7 @@ const XML: &str = r#"<node><interface name="org.gnome.Shell.Brightness">
 type Done = Box<dyn FnOnce(Result<f64, String>)>;
 pub struct Controller {
     model: RefCell<Model>,
-    outputs: Rc<dyn Fn() -> Vec<tuna_shell_control::NativeOutputInfo>>,
+    outputs: Rc<dyn Fn() -> Vec<tuna_output::NativeOutputInfo>>,
     root: PathBuf,
     fixture_manifest: Option<PathBuf>,
     session: RefCell<Option<gio::DBusConnection>>,
@@ -30,7 +30,7 @@ pub struct Controller {
     settings: RefCell<Option<gio::Settings>>,
 }
 impl Controller {
-    fn output_inventory(&self) -> Result<Vec<tuna_shell_control::NativeOutputInfo>, String> {
+    fn output_inventory(&self) -> Result<Vec<tuna_output::NativeOutputInfo>, String> {
         if let Some(path) = &self.fixture_manifest {
             return brightness::controlled_outputs(path);
         }
@@ -346,7 +346,7 @@ impl Controller {
 }
 
 pub fn start(
-    outputs: Rc<dyn Fn() -> Vec<tuna_shell_control::NativeOutputInfo>>,
+    outputs: Rc<dyn Fn() -> Vec<tuna_output::NativeOutputInfo>>,
     idle: f64,
 ) -> Rc<Controller> {
     let mut model = Model::default();

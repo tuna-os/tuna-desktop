@@ -16,7 +16,8 @@ A session is one long-lived compositor and a shell it supervises:
 | `tuna-compositor` | The Smithay compositor. It owns outputs, input, focus, windows, workspaces, the lock state and the GNOME D-Bus services it serves. Its exit ends the session. | `tuna-session`, or you |
 | `tuna-shell-gtk` (or the legacy `tuna-shell-host`) | The panel, overview, app grid, quick settings, notifications and the lock screen's drawing and password entry. An ordinary Wayland client of the compositor. | the compositor, as a supervised child |
 | `tuna-compositor --internal-pam-conversation` | A private, short-lived helper that runs one PAM conversation for the lock screen. | the compositor, at each unlock attempt |
-| `tuna-ibus-bridge`, `ibus-daemon`, `ibus-x11` | Input methods, when IBus is installed. | the compositor |
+| `tuna-ibus-bridge`, `ibus-x11` | Input methods, when IBus is installed. | the compositor |
+| `ibus-daemon` | The IBus daemon, with `--panel disable` (the shell is IBus's panel). Exactly one runs. | in a hardware session, GNOME's `IBus Daemon for GNOME` user unit (`org.freedesktop.IBus.session.GNOME.service`), which systemd stops with the session; only where that unit does not exist, and in nested sessions, the IBus bridge, as its own child, which the compositor retires at session end |
 | `Xwayland` | X11 applications, when it is installed. | the compositor |
 | `orca` | The screen reader, when it is turned on. | the compositor |
 
@@ -226,7 +227,9 @@ The session locks after five minutes without input, on Super+L, on
 password with the PAM service `tuna-lock`, installed as `/etc/pam.d/tuna-lock`
 (`share/pam.d/tuna-lock`), which includes your distribution's `login` stack.
 Fingerprint unlock goes through fprintd when a reader and an enrolled finger
-are present.
+are present, with its own PAM service `tuna-lock-fingerprint`, installed as
+`/etc/pam.d/tuna-lock-fingerprint`: `pam_fprintd` plus the `login` account
+stack, like GDM's `gdm-fingerprint`.
 
 ### When the password is not accepted
 
@@ -242,13 +245,22 @@ are present.
 2. The lock screen authenticates `$LOGNAME` (else `$USER`) from the
    compositor's environment (`crates/compositor/src/unlock.rs:70-77`).
 3. Each attempt has 10 seconds; a PAM stack that hangs longer is treated as a
-   failure (`crates/compositor/src/pam.rs:24-25`).
+   failure (`crates/compositor/src/pam.rs:31-32`).
 4. For more detail, reproduce with `TUNA_LOCK_TRACE=1` in the compositor's
    environment. It logs each authentication attempt's lifecycle, never the
    password.
 
 To test a different PAM stack without touching `tuna-lock`, set
 `TUNA_PAM_SERVICE` to another service name.
+
+### When the fingerprint is not accepted
+
+Check `/etc/pam.d/tuna-lock-fingerprint` exists (a source install copies it
+from `share/pam.d/tuna-lock-fingerprint`) and that `pam_fprintd.so` is
+installed (`libpam-fprintd` on Debian and Ubuntu, `fprintd` on Arch). Without
+either, the finger is refused and the password still unlocks.
+`TUNA_PAM_FINGERPRINT_SERVICE` names a different service for fingerprint
+unlock.
 
 ### Getting out of a stuck lock screen
 

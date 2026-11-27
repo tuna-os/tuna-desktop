@@ -1,0 +1,13 @@
+[package]
+name = "tuna-output"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Compositor-owned native DRM output identity shared by the Tuna Desktop compositor, shells and backlight reader"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+postcard.workspace = true
+serde_json.workspace = true

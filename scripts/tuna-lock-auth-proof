@@ -12,19 +12,26 @@
 # TUNA_LOCK_TRACE=1, a private session bus, AT-SPI bus and XDG dirs. The
 # compositor's tuna-lock PAM service is a pam_wrapper stack: pam_matrix
 # (password) then scripts/lib/tuna-pam-otp.c (an info message and a
-# visible "Verification code:" question). fprintd is
-# scripts/lib/tuna-fprintd-mock.py on a private bus handed to the
-# compositor only as DBUS_SYSTEM_BUS_ADDRESS. GNOME 51's behaviour:
+# visible "Verification code:" question). Its tuna-lock-fingerprint
+# service (#1162 F5) is scripts/lib/tuna-pam-fprint.c, pam_fprintd's loop
+# over fprintd's D-Bus API, then an account stack the proof can expire.
+# fprintd is scripts/lib/tuna-fprintd-mock.py on a private bus handed to
+# the compositor only as DBUS_SYSTEM_BUS_ADDRESS. GNOME 51's behaviour:
 # https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/gdm/authPrompt.js
 # https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/gdm/authServicesLegacy.js
 # https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/ui/unlockDialog.js
 # https://gitlab.gnome.org/GNOME/gdm/-/blob/51.0/daemon/gdm-session-worker.c
+# https://gitlab.freedesktop.org/libfprint/fprintd/-/blob/master/pam/pam_fprintd.c
 # https://gitlab.freedesktop.org/libfprint/fprintd/-/blob/master/pam/fingerprint-strings.h
 # Cases (assertions.txt carries the parity-ledger ID, then the case):
 #   G-LOCK-AUTH-MULTISTEP
 #     A-MULTI-STEP  password, then the OTP info and a visible "Verification
 #                   code" step with Back; the code unlocks; the concurrent
-#                   fingerprint claim is stopped and released
+#                   fingerprint conversation is cancelled and fprintd released
+#   G-LOCK-AUTH-FPRINT-EXPIRED
+#     X-EXPIRED     a fingerprint match on an expired account (pam_acct_mgmt
+#                   PAM_ACCT_EXPIRED) shows GDM's account message and stays
+#                   locked; the password then unlocks
 #   G-LOCK-AUTH-WRONG-CODE
 #     B-WRONG-CODE  a wrong code shows GDM's generic failure, stays locked
 #                   and restarts at "Password"
@@ -34,7 +41,8 @@
 #     C-CANCEL      Escape to the clock stays locked and fprintd is released
 #   G-LOCK-AUTH-FPRINT
 #     D-FINGERPRINT the reader hint shows; a no-match is reported, a match
-#                   unlocks; Claim/VerifyStart/VerifyStop/Release in order
+#                   unlocks through PAM; pam_fprintd's Claim, VerifyStart,
+#                   VerifyStop, VerifyStart, then its disconnect
 #   G-LOCK-AUTH-FPRINT-MAXTRIES
 #     E-MAX-TRIES   three no-matches show the max-attempts message and end
 #                   fingerprint unavailable; the prompt stays (no clock, no
@@ -52,10 +60,12 @@
 set -eu
 
 if [ -z "${TUNA_PROOF_PRIVATE_BUS:-}" ]; then
-    TUNA_PROOF_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+    TUNA_PROOF_PRIVATE_BUS=1 exec "$(dirname -- "$0")/lib/tuna-proof-session" --bus -- "$0" "$@"
 fi
 unset CDPATH
 ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+# shellcheck source=scripts/lib/tuna-state-snapshot.sh
+. "$ROOT/scripts/lib/tuna-state-snapshot.sh"
 DISPLAY_ARG=""
 ARTIFACTS="$ROOT/lock-auth-artifacts"
 WIDTH=1280
@@ -64,7 +74,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --display) DISPLAY_ARG="$2"; shift 2 ;;
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
-        --help|-h) sed -n '2,50p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,59p' "$0"; exit 0 ;;
         *) echo "tuna-lock-auth-proof: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -77,7 +87,7 @@ FP_LOG="$ARTIFACTS/fprintd-calls.jsonl"
 : >"$ASSERTIONS"
 : >"$LOG"
 : >"$FP_LOG"
-rm -f "$ARTIFACTS/receipt.json" "$CSTATE" "$ARTIFACTS/pam-otp-sha256.txt" "$ARTIFACTS"/*.png "$ARTIFACTS"/a11y-*.json
+rm -f "$ARTIFACTS/receipt.json" "$CSTATE" "$ARTIFACTS/pam-otp-sha256.txt" "$ARTIFACTS/pam-fprint-sha256.txt" "$ARTIFACTS"/*.png "$ARTIFACTS"/a11y-*.json
 PY=/usr/bin/python3
 [ -x "$PY" ] || PY=python3
 PAM_WRAPPER_LIB=/usr/lib/x86_64-linux-gnu/libpam_wrapper.so
@@ -86,7 +96,7 @@ ORIG_HOME="$HOME"
 BIN_DIR="${TUNA_PROOF_BIN_DIR:-${CARGO_TARGET_DIR:-$ROOT/target}/debug}"
 
 # Private runtime (AF_UNIX paths stay short) and XDG/HOME directories.
-RUN_PRIV="$(mktemp -d /tmp/tuna-lap.XXXXXX)"
+RUN_PRIV="$(mktemp -d "${TMPDIR:-/tmp}/tuna-lap.XXXXXX")"
 chmod 700 "$RUN_PRIV"
 HOME="$ARTIFACTS/home"
 XDG_RUNTIME_DIR="$RUN_PRIV"
@@ -125,6 +135,7 @@ ledger_id() {
         B-*) echo G-LOCK-AUTH-WRONG-CODE ;;
         C-*) echo G-LOCK-AUTH-CANCEL ;;
         D-*) echo G-LOCK-AUTH-FPRINT ;;
+        X-*) echo G-LOCK-AUTH-FPRINT-EXPIRED ;;
         E-*) echo G-LOCK-AUTH-FPRINT-MAXTRIES ;;
         F-*) echo G-LOCK-AUTH-NO-PRINTS ;;
         Z-*) echo G-LOCK-AUTH-HYGIENE ;;
@@ -172,7 +183,7 @@ finish() {
         FAILED_CASE="$CURRENT_CASE"
         echo "$(ledger_id "$CURRENT_CASE") fail [$CURRENT_CASE] exited with status $status" >>"$ASSERTIONS"
     fi
-    [ -s "$CSTATE" ] && cp "$CSTATE" "$ARTIFACTS/final-state.json"
+    [ -s "$CSTATE" ] && snapshot_state "$CSTATE" "$ARTIFACTS/final-state.json"
     # The compositor first, so its shell and conversations retire while
     # their buses are still there; then the buses and services.
     stop_pid "$COMPOSITOR_PID"
@@ -228,18 +239,22 @@ receipt = {
     'binaries': {name: sha(bins / name) for name in ('tuna-compositor', 'tuna-shell-gtk')},
     'pam_otp_so_sha256': ((out / 'pam-otp-sha256.txt').read_text().strip()
                           if (out / 'pam-otp-sha256.txt').exists() else None),
+    'pam_fprint_so_sha256': ((out / 'pam-fprint-sha256.txt').read_text().strip()
+                             if (out / 'pam-fprint-sha256.txt').exists() else None),
     'fixtures': {name: sha(root / name) for name in (
         'scripts/tuna-lock-auth-proof', 'scripts/lib/tuna-fprintd-mock.py',
-        'scripts/lib/tuna-pam-otp.c', 'scripts/lib/tuna-proof-session-launch')},
+        'scripts/lib/tuna-pam-otp.c', 'scripts/lib/tuna-pam-fprint.c',
+        'scripts/lib/tuna-proof-session-launch')},
     'bin_dir': str(bins), 'cases': cases,
     'cleanup': {'swept_pids': swept,
                 'leftover_pids': (out / 'leftover-pids.txt').read_text().split()},
-    'scope': 'nested winit session on Xvfb; PAM via pam_wrapper (pam_matrix + tuna-pam-otp), '
-             'fprintd via a D-Bus mock on a private bus; real compositor, shell, GTK widgets, '
-             'X11 input and AT-SPI',
+    'scope': 'nested winit session on Xvfb; PAM via pam_wrapper (tuna-lock: pam_matrix + '
+             'tuna-pam-otp; tuna-lock-fingerprint: tuna-pam-fprint + an expirable account '
+             'stack), fprintd via a D-Bus mock on a private bus; real compositor, private '
+             'PAM helpers, shell, GTK widgets, X11 input and AT-SPI',
     'not_covered': ['the legacy single-password fallback (password service Unavailable)',
                     'real fprintd/libfprint hardware and polkit',
-                    'installed PAM stacks (pam_unix, pam_fprintd, OTP modules)',
+                    'installed PAM stacks (pam_unix, pam_fprintd itself, OTP modules)',
                     'smartcard and web login'],
 }
 (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
@@ -397,6 +412,7 @@ OTP_INFO="A verification code was sent to your device"
 GENERIC_FAILURE="Sorry, password authentication didn’t work. Please try again."
 NO_MATCH="Failed to match fingerprint"
 MAX_TRIES="You reached the maximum fingerprint authentication attempts, please try another method"
+ACCOUNT_EXPIRED="Your account was given a time limit that’s now passed."
 
 # The password service's newest event is an unanswered step-1 Password
 # question (after any reset or restart the prompt went through).
@@ -532,6 +548,20 @@ printf 'auth requisite %s passdb=%s\nauth required %s code=%s\naccount required 
     "$PAM_MATRIX" "$RUN_PRIV/pam/passdb" "$RUN_PRIV/pam/tuna-pam-otp.so" "$CODE" \
     "$PAM_MATRIX" "$RUN_PRIV/pam/passdb" >"$RUN_PRIV/pam/services/tuna-lock"
 chmod 600 "$RUN_PRIV/pam/services/tuna-lock"
+# The tuna-lock-fingerprint stack: pam_fprintd's loop over the mock, then
+# an account stack (pam_matrix, and an expiry the X case switches on).
+read -ra GIO_FLAGS <<<"$(pkg-config --cflags --libs gio-2.0)" || fail SETUP "gio-2.0 development files are required"
+cc -Wall -Wextra -Werror -shared -fPIC -o "$RUN_PRIV/pam/tuna-pam-fprint.so" \
+    "$ROOT/scripts/lib/tuna-pam-fprint.c" "${GIO_FLAGS[@]}" -lpam \
+    2>"$ARTIFACTS/pam-fprint-build.log" || fail SETUP "tuna-pam-fprint.c did not build"
+sha256sum "$RUN_PRIV/pam/tuna-pam-fprint.so" | cut -d' ' -f1 >"$ARTIFACTS/pam-fprint-sha256.txt"
+printf '%s:unused-%s:tuna-lock-fingerprint\n' "$(id -un)" "$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')" \
+    >"$RUN_PRIV/pam/fprint-passdb"
+chmod 600 "$RUN_PRIV/pam/fprint-passdb"
+printf 'auth required %s\naccount required %s expired=%s\naccount required %s passdb=%s\n' \
+    "$RUN_PRIV/pam/tuna-pam-fprint.so" "$RUN_PRIV/pam/tuna-pam-fprint.so" "$RUN_PRIV/pam/expired" \
+    "$PAM_MATRIX" "$RUN_PRIV/pam/fprint-passdb" >"$RUN_PRIV/pam/services/tuna-lock-fingerprint"
+chmod 600 "$RUN_PRIV/pam/services/tuna-lock-fingerprint"
 
 {
     echo "source $(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -608,6 +638,38 @@ cwait "$m" ".event == \"retired\" and .service == \"fingerprint\" and .request =
     fail A-MULTI-STEP "the losing fingerprint conversation was not retired unauthenticated"
 release_delay="$(awk -v r="$released_at" -v u="$unlocked_at" 'BEGIN { printf "%+.2f", r - u }')"
 pass A-MULTI-STEP "Password (secret), then '$OTP_INFO' and a visible 'Verification code' step with Back; the code unlocked; fprintd Claim/VerifyStart/VerifyStop/Release ($(fp_calls "$f")), release $release_delay s relative to the observed unlock"
+
+# --- X: a fingerprint match on an expired account -----------------------
+# pam_acct_mgmt runs after pam_fprintd (#1162 F5). GDM 51 reports
+# PAM_ACCT_EXPIRED with its account message (gdm-session-worker.c
+# get_friendly_error_message) and the prompt resets; nothing unlocks.
+CURRENT_CASE=X-EXPIRED
+: >"$RUN_PRIV/pam/expired"
+lock_session
+m="$(mark)"; f="$(fp_mark)"
+lift
+twait "$m" "message type=hint text=$HINT_PRESS" 20 >/dev/null || fail X-EXPIRED "no press-reader hint"
+fp_until '.claimed and .action == "verify" and (.verify_done | not)' 15 || fail X-EXPIRED "fprintd is not verifying"
+m2="$(mark)"
+press verify-match true
+p="$(twait "$m2" "message type=problem text=$ACCOUNT_EXPIRED" 15)" ||
+    fail X-EXPIRED "GDM's expired-account message was not shown after a match"
+twaitre "$m2" "result service=fingerprint request=[0-9]+ applied=false$" 15 >/dev/null ||
+    fail X-EXPIRED "the fingerprint service did not end Denied"
+still_locked 1 || fail X-EXPIRED "a fingerprint match unlocked an expired account"
+dump X-1-expired
+shot X-1-expired
+showing X-1-expired "$ACCOUNT_EXPIRED" || fail X-EXPIRED "the expired-account message is not on screen"
+cwait "$m" '.event == "retired" and .service == "fingerprint" and .refusal == "Expired" and (.authenticated | not)' 10 ||
+    fail X-EXPIRED "the conversation did not retire with PAM's expired-account refusal"
+rm -f "$RUN_PRIV/pam/expired"
+twaitre "$p" "begin service=password request=[0-9]+$" 15 >/dev/null ||
+    fail X-EXPIRED "the prompt did not restart after the failure"
+twait "$p" "query service=password step=1 secret=true question=Password" 15 >/dev/null ||
+    fail X-EXPIRED "the restarted prompt is not asking for the Password"
+to_code_step
+unlock_with_code
+pass X-EXPIRED "a match on an expired account shows '$ACCOUNT_EXPIRED' and stays locked (pam_acct_mgmt PAM_ACCT_EXPIRED); the password then unlocks"
 
 # --- B: wrong code, then Back -------------------------------------------
 CURRENT_CASE=B-WRONG-CODE
@@ -717,7 +779,10 @@ twaitre "$m" "result service=fingerprint request=[0-9]+ applied=true$" 15 >/dev/
 cstate '.locked == false' 20 || fail D-FINGERPRINT "a fingerprint match did not unlock"
 shot D-3-unlocked
 fp_until '(.claimed | not) and .action == null' 5 || fail D-FINGERPRINT "fprintd still claimed after unlock"
-fp_order "$f" Claim VerifyStart VerifyStop Release || fail D-FINGERPRINT "fprintd order: $(fp_calls "$f")"
+# pam_fprintd stops the no-matching scan, then simply disconnects on the
+# match (fprintd releases the vanished client's claim).
+fp_order "$f" Claim VerifyStart VerifyStop VerifyStart ClientVanished ||
+    fail D-FINGERPRINT "fprintd order: $(fp_calls "$f")"
 cwait "$m" ".event == \"retired\" and .service == \"password\" and .request == $(begin_id "$m" password) and (.authenticated | not)" 10 ||
     fail D-FINGERPRINT "the losing password conversation was not retired unauthenticated"
 pass D-FINGERPRINT "hint '$HINT_PRESS'; a no-match shows '$NO_MATCH'; a match unlocks; fprintd $(fp_calls "$f")"

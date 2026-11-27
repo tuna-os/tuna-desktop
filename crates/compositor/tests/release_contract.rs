@@ -60,6 +60,7 @@ fn release_script_stages_layout_and_metadata_from_the_stamp() {
         "tuna-ibus-bridge",
         "tuna.desktop",
         "pam.d/tuna-lock",
+        "share/pam.d/tuna-lock-fingerprint",
         "DEBIAN/control",
         "Version:",
         "Depends:",
@@ -69,6 +70,45 @@ fn release_script_stages_layout_and_metadata_from_the_stamp() {
         assert!(
             body.contains(token),
             "release script must derive the package from the stamp ({token})"
+        );
+    }
+}
+
+#[test]
+fn both_lock_pam_services_ship_as_preserved_configuration() {
+    // #1162 F5: fingerprint unlock runs its own `tuna-lock-fingerprint`
+    // service, shipped exactly like `tuna-lock`: a dpkg conffile and an
+    // Arch backup entry, so local edits or removals survive upgrades.
+    let release = read_workspace("scripts/tuna-release");
+    let conffiles = release
+        .lines()
+        .find(|line| line.contains("DEBIAN/conffiles\"") && line.starts_with("printf"))
+        .expect("release script writes DEBIAN/conffiles");
+    let pkgbuild = read_workspace("packaging/arch/PKGBUILD");
+    let backup = pkgbuild
+        .lines()
+        .find(|line| line.starts_with("backup=("))
+        .expect("PKGBUILD declares backup files");
+    for service in ["tuna-lock", "tuna-lock-fingerprint"] {
+        assert!(
+            release.contains(&format!(
+                "install -m0644 share/pam.d/{service} \"$STAGE/etc/pam.d/{service}\""
+            )),
+            "release script stages {service} 0644"
+        );
+        assert!(
+            conffiles.contains(&format!("/etc/pam.d/{service} ")),
+            "{service} is a dpkg conffile"
+        );
+        assert!(
+            pkgbuild.contains(&format!(
+                "install -Dm0644 \"$root/share/pam.d/{service}\" \"$pkgdir/etc/pam.d/{service}\""
+            )),
+            "PKGBUILD installs {service} 0644"
+        );
+        assert!(
+            backup.contains(&format!("'etc/pam.d/{service}'")),
+            "{service} is an Arch backup file"
         );
     }
 }
@@ -176,6 +216,7 @@ fn arch_package_stamps_and_checks_the_version() {
         "tuna-ibus-bridge",
         "gtk4-layer-shell",
         "pam.d/tuna-lock",
+        "pam.d/tuna-lock-fingerprint",
         "tuna.desktop",
         "check()",
         "--locked",
@@ -188,6 +229,7 @@ fn arch_package_stamps_and_checks_the_version() {
     // under GDM (#62): the session and its PAM service must both ship.
     assert!(containerfile.contains("Name=Tuna Desktop (preview)"));
     assert!(containerfile.contains("test -f /etc/pam.d/tuna-lock"));
+    assert!(containerfile.contains("test -f /etc/pam.d/tuna-lock-fingerprint"));
     assert!(!containerfile.contains("mv /usr/share/wayland-sessions/tuna.desktop"));
     // Both installed executables are checked through the bounded diagnostic
     // loop; a missing executable or failed version command aborts the build.

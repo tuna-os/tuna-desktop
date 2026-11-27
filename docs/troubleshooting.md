@@ -94,9 +94,10 @@ qualified yet.
   dependency resolution fails because the package needs gtk4-layer-shell 1.1
   or later ([install guide](install.md#from-the-debian-format-package)).
   Build from source there instead.
-- `/etc/pam.d/tuna-lock` is a configuration file. If you changed or deleted
-  it, dpkg can stop and ask what to do during an upgrade; an unattended
-  upgrade then leaves the package unconfigured. Answer the prompt, then run
+- `/etc/pam.d/tuna-lock` and `/etc/pam.d/tuna-lock-fingerprint` (fingerprint
+  unlock) are configuration files. If you changed or deleted one, dpkg can
+  stop and ask what to do during an upgrade; an unattended upgrade then leaves
+  the package unconfigured. Answer the prompt, then run
   `sudo dpkg --configure -a`.
 - Upgrading from a package with the project's former name is covered in the
   [upgrade and recovery guide](legacy-upgrade.md).
@@ -115,7 +116,7 @@ Build it from a checkout with:
 TUNA_LOCAL_SRC="$PWD" makepkg -f --dir packaging/arch
 ```
 
-Both PAM files are in the package's `backup` array, so pacman keeps a file you
+Every PAM file is in the package's `backup` array, so pacman keeps a file you
 changed and writes the new one as `.pacnew` beside it. Compare the two and
 merge by hand ([legacy upgrade](legacy-upgrade.md#arch-replacement)).
 
@@ -126,7 +127,8 @@ merge by hand ([legacy upgrade](legacy-upgrade.md#arch-replacement)).
   binaries into the same directory
   ([install guide](install.md#installing)).
 - Install `share/pam.d/tuna-lock` as `/etc/pam.d/tuna-lock`, or the lock
-  screen cannot be unlocked.
+  screen cannot be unlocked, and `share/pam.d/tuna-lock-fingerprint` as
+  `/etc/pam.d/tuna-lock-fingerprint`, or fingerprint unlock fails.
 
 ### TunaOS Marlin
 
@@ -231,6 +233,14 @@ just ci-artifacts <run-id>
 - The `parity-ledger` job fails when a test that a row of
   `docs/parity-ledger.md` cites is renamed or removed. Update the row in the
   same PR ([parity ledger check](testing.md#parity-ledger-check)).
+- A `gtk-shell` job uploads its evidence (logs, frames, receipts) as the
+  `gtk-shell` artifact and its executables as `gtk-shell-binaries`, at the
+  same relative paths, with their SHA-256 sums in the evidence's
+  `ci-detached-entries.txt`. Both uploads run after a failure too. The step
+  that collects the executables copies only what was built: after an
+  earlier failure, a `not collected, never built or installed` warning is a
+  consequence, and the first failed step is the cause. A missing executable
+  fails that step only when nothing failed before it (#1124).
 - Do not re-run a deterministic test until it passes. `gh run rerun <run-id>
   --failed` tells you whether a failure is intermittent; it does not fix one.
   The [timing rule](development.md#writing-a-test) explains how to remove the

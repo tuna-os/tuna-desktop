@@ -34,6 +34,17 @@ use crate::notification_policy::{self, LockSource, PolicyStore, SourcePolicy};
 pub const MAX_BANNERS: usize = 3;
 /// How many notifications history retains (oldest drop first).
 pub const MAX_HISTORY: usize = 50;
+/// Longest display text kept (app name, summary, action label), in
+/// bytes. Longer text is cut at a character boundary.
+pub const MAX_TEXT_BYTES: usize = 1024;
+/// Longest body kept, in bytes, cut the same way.
+pub const MAX_BODY_BYTES: usize = 16 * 1024;
+/// Longest identifier or path kept (icon, desktop entry, action key,
+/// sound). A longer one is dropped whole: cut short it would name
+/// something else.
+pub const MAX_NAME_BYTES: usize = 4096;
+/// Most actions kept per notification.
+pub const MAX_ACTIONS: usize = 8;
 /// Shell state dir name under `$XDG_STATE_HOME`.
 pub const STATE_DIR_NAME: &str = "tuna-shell";
 /// Versioned notification queue file name.
@@ -133,6 +144,10 @@ pub struct Notification {
     /// `PrivacyScope.SYSTEM`): a source of only these shows its details
     /// on the lock screen.
     system_scope: bool,
+    /// Filed by the shell itself, not over the bus: its action keys run
+    /// the shell's own callbacks. Not kept across restarts, since those
+    /// callbacks are not either.
+    shell_owned: bool,
 }
 
 impl Notification {
@@ -252,6 +267,38 @@ fn now_secs() -> u64 {
         .unwrap_or_default()
 }
 
+/// `text` cut to at most `max` bytes, at a character boundary.
+fn clip(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Empty `name` when it is longer than [`MAX_NAME_BYTES`].
+fn bound_name(name: &mut String) {
+    if name.len() > MAX_NAME_BYTES {
+        name.clear();
+    }
+}
+
+/// The first [`MAX_ACTIONS`] actions whose key fits, labels cut.
+fn bound_actions(actions: Vec<NotificationAction>) -> Vec<NotificationAction> {
+    actions
+        .into_iter()
+        .filter(|action| action.id.len() <= MAX_NAME_BYTES)
+        .take(MAX_ACTIONS)
+        .map(|action| NotificationAction {
+            label: clip(&action.label, MAX_TEXT_BYTES).to_owned(),
+            id: action.id,
+        })
+        .collect()
+}
+
 /// Put `entry` among `store`'s in id order, which is arrival order (an
 /// update keeps its id and its place).
 fn insert_by_id(store: &mut VecDeque<Notification>, entry: Notification) {
@@ -280,20 +327,27 @@ fn decode_notification(item: &serde_json::Value) -> Option<Notification> {
                 .collect()
         })
         .unwrap_or_default();
+    // A file written before the bounds existed may hold more.
+    let actions = bound_actions(actions);
     let consumed = item
         .get("consumed")
         .and_then(|v| v.as_array())
         .map(|keys| {
             keys.iter()
-                .filter_map(|key| key.as_str().map(str::to_owned))
+                .filter_map(serde_json::Value::as_str)
+                .filter(|key| actions.iter().any(|a| a.id == *key))
+                .map(str::to_owned)
                 .collect()
         })
         .unwrap_or_default();
     let text = |key: &str| {
-        item.get(key)
+        let mut name = item
+            .get(key)
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
-            .to_owned()
+            .to_owned();
+        bound_name(&mut name);
+        name
     };
     Some(Notification {
         id,
@@ -309,17 +363,17 @@ fn decode_notification(item: &serde_json::Value) -> Option<Notification> {
             .get("received")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_default(),
-        app: item.get("app")?.as_str()?.to_owned(),
-        title: item
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned(),
-        body: item
-            .get("body")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned(),
+        app: clip(item.get("app")?.as_str()?, MAX_TEXT_BYTES).to_owned(),
+        title: clip(
+            item.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+            MAX_TEXT_BYTES,
+        )
+        .to_owned(),
+        body: clip(
+            item.get("body").and_then(|v| v.as_str()).unwrap_or(""),
+            MAX_BODY_BYTES,
+        )
+        .to_owned(),
         actions,
         urgency: Urgency::from_str(item.get("urgency").and_then(|v| v.as_str()).unwrap_or("")),
         expanded: item
@@ -332,6 +386,7 @@ fn decode_notification(item: &serde_json::Value) -> Option<Notification> {
             .get("privacy_scope")
             .and_then(serde_json::Value::as_str)
             == Some("system"),
+        shell_owned: false,
     })
 }
 
@@ -648,6 +703,9 @@ impl NotificationCenter {
         replaces_id: Option<u64>,
     ) -> u64 {
         let id = self.file(false, app, title, body, actions, urgency, replaces_id);
+        if let Some(entry) = self.history.iter_mut().find(|n| n.id == id) {
+            entry.shell_owned = true;
+        }
         self.queue_banner(id, urgency);
         self.persist();
         id
@@ -667,6 +725,12 @@ impl NotificationCenter {
         urgency: Urgency,
         replaces_id: Option<u64>,
     ) -> u64 {
+        let (app, title, body) = (
+            clip(app, MAX_TEXT_BYTES),
+            clip(title, MAX_TEXT_BYTES),
+            clip(body, MAX_BODY_BYTES),
+        );
+        let actions = bound_actions(actions);
         let store = if hidden {
             &mut self.hidden
         } else {
@@ -721,6 +785,7 @@ impl NotificationCenter {
             consumed: HashSet::new(),
             sound: Sound::default(),
             system_scope: false,
+            shell_owned: false,
         };
         if hidden {
             self.hidden.push_back(entry);
@@ -789,7 +854,26 @@ impl NotificationCenter {
     /// enabled again (see [`apply_policy`](Self::apply_policy)). Otherwise
     /// the policy decides the banner, its sound and whether it opens
     /// expanded.
-    pub fn deliver(&mut self, n: Incoming) -> u64 {
+    pub fn deliver(&mut self, mut n: Incoming) -> u64 {
+        let app_len = clip(&n.app, MAX_TEXT_BYTES).len();
+        n.app.truncate(app_len);
+        for name in [
+            &mut n.icon,
+            &mut n.desktop_entry,
+            &mut n.sound.name,
+            &mut n.sound.file,
+        ] {
+            bound_name(name);
+        }
+        // A sender never rewrites a notice the shell filed itself: its
+        // action keys run shell callbacks, which would stay armed under
+        // the sender's text. Such an update is filed as a new arrival.
+        n.replaces_id = n.replaces_id.filter(|replaces| {
+            !self
+                .history
+                .iter()
+                .any(|e| e.id == *replaces && e.shell_owned)
+        });
         let app_id = self
             .policy
             .0
@@ -908,6 +992,19 @@ impl NotificationCenter {
         let n = self.history.iter().find(|n| n.id == id)?;
         let policy = self.policy_for((!n.app_id.is_empty()).then_some(n.app_id.as_str()));
         notification_policy::plays_sound(&policy, &n.sound).then(|| n.sound.clone())
+    }
+
+    /// Whether `id`'s banner opens expanded as it comes on screen:
+    /// critical, or its source's `force-expanded` at that moment
+    /// (messageTray.js `_updateShowingNotification` auto-expands both).
+    pub fn banner_opens_expanded(&self, id: u64) -> bool {
+        let Some(n) = self.history.iter().find(|n| n.id == id) else {
+            return false;
+        };
+        n.urgency == Urgency::Critical
+            || self
+                .policy_for((!n.app_id.is_empty()).then_some(n.app_id.as_str()))
+                .force_expanded
     }
 
     /// Mark notifications seen (a banner shown, the list opened).
@@ -1152,6 +1249,23 @@ mod tests {
         let expanded = |id| c.history().iter().find(|n| n.id == id).unwrap().expanded;
         assert!(expanded(mail));
         assert!(!expanded(chat));
+    }
+
+    #[test]
+    fn force_expanded_is_read_as_the_banner_shows() {
+        let (mut c, store) = policed();
+        let mail = c.deliver(incoming("org.example.Mail", "Mail", Urgency::Normal));
+        let alarm = c.deliver(incoming("org.example.Chat", "Alarm", Urgency::Critical));
+        let generic = c.deliver(incoming("", "Generic", Urgency::Normal));
+        assert!(!c.banner_opens_expanded(mail));
+        // Critical always opens expanded.
+        assert!(c.banner_opens_expanded(alarm));
+        // The key switched on while the banner waits reaches it.
+        store.set("org.example.Mail", |a| a.force_expanded = true);
+        assert!(c.banner_opens_expanded(mail));
+        // The generic policy never forces it; unknown ids open collapsed.
+        assert!(!c.banner_opens_expanded(generic));
+        assert!(!c.banner_opens_expanded(9999));
     }
 
     #[test]
@@ -1718,5 +1832,175 @@ mod tests {
         c.set_dnd(true);
         // No banner, action, dismiss, or DND path selects anything.
         assert_eq!(model.selected(), Some(1));
+    }
+
+    #[test]
+    fn a_senders_oversized_fields_are_bounded_before_they_are_kept() {
+        let mut c = center();
+        let mut actions: Vec<NotificationAction> = (0..MAX_ACTIONS + 1)
+            .map(|i| NotificationAction {
+                id: format!("key-{i}"),
+                label: "l".repeat(MAX_TEXT_BYTES + 1),
+            })
+            .collect();
+        actions.insert(
+            0,
+            NotificationAction {
+                id: "k".repeat(MAX_NAME_BYTES + 1),
+                label: "a key too long to keep".to_owned(),
+            },
+        );
+        let id = c.deliver(Incoming {
+            app: "a".repeat(MAX_TEXT_BYTES + 1),
+            // The cut would fall inside the last two-byte character.
+            title: format!("t{}", "\u{e9}".repeat(MAX_TEXT_BYTES)),
+            body: "b".repeat(MAX_BODY_BYTES + 1),
+            icon: "i".repeat(MAX_NAME_BYTES + 1),
+            desktop_entry: "d".repeat(MAX_NAME_BYTES + 1),
+            sound: Sound {
+                name: "n".repeat(MAX_NAME_BYTES + 1),
+                file: "f".repeat(MAX_NAME_BYTES + 1),
+            },
+            actions,
+            ..Incoming::default()
+        });
+        let n = &c.history()[0];
+        assert_eq!(n.id, id);
+        assert_eq!(n.app().len(), MAX_TEXT_BYTES);
+        assert_eq!(n.summary().len(), MAX_TEXT_BYTES - 1, "whole characters");
+        assert_eq!(n.body().len(), MAX_BODY_BYTES);
+        assert_eq!(n.icon(), "", "a cut path would name another file");
+        assert_eq!(n.desktop_entry(), "");
+        assert!(n.sound().is_empty());
+        assert_eq!(n.actions().len(), MAX_ACTIONS);
+        assert_eq!(n.actions()[0].id, "key-0", "the oversized key is dropped");
+        assert!(n.actions().iter().all(|a| a.label.len() == MAX_TEXT_BYTES));
+        // What fits is kept as sent.
+        let id = c.deliver(incoming("org.example.Mail", "Hello", Urgency::Normal));
+        let n = c.history().iter().find(|n| n.id == id).expect("filed");
+        assert_eq!(
+            (n.summary(), n.body(), n.desktop_entry()),
+            ("Hello", "Hello body", "org.example.Mail")
+        );
+    }
+
+    #[test]
+    fn the_shells_own_notices_are_bounded_too() {
+        let mut c = center();
+        let id = c.notify(
+            "app",
+            &"t".repeat(MAX_TEXT_BYTES + 1),
+            &"b".repeat(MAX_BODY_BYTES + 1),
+            vec![],
+            Urgency::Normal,
+            None,
+        );
+        let again = c.notify(
+            &"a".repeat(MAX_TEXT_BYTES + 1),
+            "t",
+            &"b".repeat(MAX_BODY_BYTES + 1),
+            vec![],
+            Urgency::Normal,
+            Some(id),
+        );
+        assert_eq!(again, id);
+        let n = &c.history()[0];
+        assert_eq!(
+            (n.app().len(), n.summary(), n.body().len()),
+            (MAX_TEXT_BYTES, "t", MAX_BODY_BYTES)
+        );
+    }
+
+    #[test]
+    fn a_queue_file_from_before_the_bounds_loads_bounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(QUEUE_FILE);
+        let long_key = "k".repeat(MAX_NAME_BYTES + 1);
+        let doc = serde_json::json!({
+            "version": 1,
+            "next_id": 1,
+            "dnd": false,
+            "banners": [1],
+            "notifications": [{
+                "id": 1,
+                "app": "a".repeat(MAX_TEXT_BYTES + 1),
+                "title": "t".repeat(MAX_TEXT_BYTES + 1),
+                "body": "b".repeat(MAX_BODY_BYTES + 1),
+                "icon": "i".repeat(MAX_NAME_BYTES + 1),
+                "desktop_entry": "d".repeat(MAX_NAME_BYTES + 1),
+                "app_id": "p".repeat(MAX_NAME_BYTES + 1),
+                "actions": [
+                    {"id": long_key, "label": "dropped"},
+                    {"id": "open", "label": "l".repeat(MAX_TEXT_BYTES + 1)},
+                ],
+                "urgency": "normal",
+                "expanded": false,
+                "consumed": [long_key, "open", "never-an-action"],
+            }],
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).expect("write");
+        let mut c = NotificationCenter::load(&path);
+        let n = &c.history()[0];
+        assert_eq!(n.app().len(), MAX_TEXT_BYTES);
+        assert_eq!(n.summary().len(), MAX_TEXT_BYTES);
+        assert_eq!(n.body().len(), MAX_BODY_BYTES);
+        assert_eq!((n.icon(), n.desktop_entry(), n.app_id()), ("", "", ""));
+        assert_eq!(n.actions().len(), 1);
+        assert_eq!(n.actions()[0].label.len(), MAX_TEXT_BYTES);
+        assert_eq!(
+            c.invoke_action(1, "open"),
+            Err(NotificationError::ActionReplayed),
+            "a kept action's replay guard survives"
+        );
+        // The next save writes the bounded queue back.
+        c.set_dnd(true);
+        let saved = std::fs::metadata(&path).expect("saved").len();
+        assert!(saved < 2 * MAX_BODY_BYTES as u64, "{saved} bytes");
+    }
+
+    #[test]
+    fn a_sender_cannot_rewrite_a_notice_the_shell_filed() {
+        let mut c = center();
+        let own = c.notify(
+            "Wellbeing",
+            "Time for a break",
+            "",
+            vec![action("take")],
+            Urgency::Normal,
+            None,
+        );
+        let sent = c.deliver(Incoming {
+            app: "Sender".to_owned(),
+            title: "Claim your prize".to_owned(),
+            actions: vec![action("take")],
+            replaces_id: Some(own),
+            ..Incoming::default()
+        });
+        assert_ne!(sent, own, "filed as a new notification");
+        assert_eq!(c.replacements(), 0);
+        let kept = c.history().iter().find(|n| n.id == own).expect("kept");
+        assert_eq!(
+            (kept.app(), kept.summary()),
+            ("Wellbeing", "Time for a break")
+        );
+        // A sender still updates what it sent, and the shell its own.
+        let again = c.deliver(Incoming {
+            app: "Sender".to_owned(),
+            title: "Second".to_owned(),
+            replaces_id: Some(sent),
+            ..Incoming::default()
+        });
+        assert_eq!(again, sent);
+        let updated = c.notify(
+            "Wellbeing",
+            "Break over",
+            "",
+            vec![],
+            Urgency::Normal,
+            Some(own),
+        );
+        assert_eq!(updated, own);
+        assert_eq!(c.replacements(), 2);
+        assert_eq!(c.history().len(), 2);
     }
 }

@@ -51,7 +51,8 @@ impl Peer {
             .ok()?
             .socket();
         let credentials = socket.credentials().ok()?;
-        if credentials.unix_user().ok()? != unsafe { libc::geteuid() } {
+        // GCredentials of this process carry geteuid() (gcredentials.c).
+        if credentials.unix_user().ok()? != gio::Credentials::new().unix_user().ok()? {
             return None;
         }
         let pid = credentials.unix_pid().ok()?;
@@ -985,6 +986,13 @@ pub(crate) fn expose_toggle_action(button: &gtk::CheckButton) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn own_credentials_carry_the_effective_uid_peer_bind_compares() {
+        // SAFETY: geteuid(2) has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        assert_eq!(gio::Credentials::new().unix_user().ok(), Some(euid));
+    }
+
     #[test]
     fn own_panel_signal_after_ibus_resent_graph_keeps_it_and_loss_clears_it() {
         let mut model = Properties::default();

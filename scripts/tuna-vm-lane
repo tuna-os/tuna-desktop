@@ -157,6 +157,55 @@ def auth_uint(value):
     return type(value) is int and 0 < value <= (1 << 64) - 1
 
 
+# The compositor's logind sleep delay inhibitor (G3), as GNOME 51's screen
+# shield holds "GNOME Shell"'s while the session is unlocked.
+SLEEP_DELAY_WHO = "Tuna Desktop"
+SLEEP_DELAY_COUNTS = ("prepared", "released_locked", "released_unlocked", "overrun")
+
+
+def sleep_delay_inhibitor(rows, compositor_pid, uid):
+    """The compositor's own `delay` inhibitor on sleep among logind's
+    ListInhibitors rows (what `systemd-inhibit --list` prints), or None."""
+    for row in rows if type(rows) is list else ():
+        if (type(row) is dict and row.get("who") == SLEEP_DELAY_WHO and row.get("mode") == "delay"
+                and "sleep" in str(row.get("what", "")).split(":")
+                and row.get("pid") == compositor_pid and row.get("uid") == uid):
+            return row
+    return None
+
+
+def sleep_delay_record(value):
+    """A compositor `sleep_delay` snapshot record, or None if malformed."""
+    if (type(value) is not dict or type(value.get("held")) is not bool
+            or not all(type(value.get(key)) is int and value[key] >= 0 for key in SLEEP_DELAY_COUNTS)):
+        return None
+    return value
+
+
+def sleep_delay_held(snapshot, rows):
+    """Before suspending: an unlocked desktop whose compositor records its
+    delay inhibitor held, and logind lists it for that compositor's PID."""
+    state = snapshot.get("state") if type(snapshot) is dict else None
+    if type(state) is not dict or state.get("locked") is not False:
+        return False
+    record = sleep_delay_record(state.get("sleep_delay"))
+    compositors = [p.get("pid") for p in snapshot.get("processes") or () if p.get("executable") == "tuna-compositor"]
+    return (record is not None and record["held"] and len(compositors) == 1
+            and sleep_delay_inhibitor(rows, compositors[0], snapshot.get("session_uid")) is not None)
+
+
+def sleep_delay_released_locked(before, after):
+    """One sleep from an unlocked desktop whose delay inhibitor, held before
+    it, was released only once every lit output showed a locked frame, with
+    logind never giving up first; taken again after the wake."""
+    before, after = sleep_delay_record(before), sleep_delay_record(after)
+    if before is None or after is None:
+        return False
+    delta = {key: after[key] - before[key] for key in SLEEP_DELAY_COUNTS}
+    return (before["held"] and after["held"]
+            and delta == {"prepared": 1, "released_locked": 1, "released_unlocked": 0, "overrun": 0})
+
+
 def sleep_auth_attempt(snapshot):
     """Bind a pending original password attempt before real S3; no secret data."""
     state = snapshot.get('state', {})
@@ -645,6 +694,29 @@ def read_ppm(path):
     return w, h, data[pos + 1:pos + 1 + w * h * 3]
 
 
+def difference(left, right):
+    """Fraction of body pixels (below the 64 px panel) changed by more than 24 in any channel."""
+    if left[:2] != right[:2]:
+        raise RuntimeError("lifecycle frame dimensions changed")
+    width, height = left[:2]
+    first = width * 64 * 3  # Clock/panel changes are outside the repaint comparison.
+    changed = sum(max(abs(a - b) for a, b in zip(left[2][i:i+3], right[2][i:i+3])) > 24
+                  for i in range(first, width * height * 3, 3))
+    return changed / (width * (height - 64))
+
+
+def greeter_colors(image):
+    """Quantized colors on an 8 px grid; a black scanout or uniform fill has one."""
+    width, height, pixels = image
+    return len({tuple(value >> 4 for value in pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+                for y in range(0, height, 8) for x in range(0, width, 8)})
+
+
+# The repainted greeter after logout must match the pre-login greeter frame
+# within this body fraction; the pre-login frame is settled within it too.
+GREETER_REPAINT_TOLERANCE = 0.05
+
+
 def check_panel(path):
     """Black panel strip at y=5 over a non-uniform desktop."""
     w, h, px = read_ppm(path)
@@ -955,15 +1027,6 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         ppm = os.path.join(evidence, f"{label}.ppm")
         qmp.cmd("screendump", filename=ppm, format="ppm")
         return read_ppm(ppm)
-
-    def difference(left, right):
-        if left[:2] != right[:2]:
-            raise RuntimeError("lifecycle frame dimensions changed")
-        width, height = left[:2]
-        first = width * 64 * 3  # Clock/panel changes are outside the repaint comparison.
-        changed = sum(max(abs(a - b) for a, b in zip(left[2][i:i+3], right[2][i:i+3])) > 24
-                      for i in range(first, width * height * 3, 3))
-        return changed / (width * (height - 64))
 
     def varied_mask(image):
         # The inactive QEMU placeholder has only two quantized colors.
@@ -1361,6 +1424,18 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     record("V-LOCKED-HINT", True,
            "logind LockedHint no, then loginctl lock-session locks with yes, the password unlocks with no, "
            "Super+L locks with yes and loginctl unlock-session unlocks with no (lifecycle/locked-hint.json)")
+
+    # An unlock without input wakes the screen gsd-power blanked: every
+    # unlock emits WakeUpScreen, as GNOME 51's screenShield.js does (#1194).
+    from vm_unlock_wake import run as prove_unlock_wake
+
+    def password_unlock():
+        qmp.keys("ret")
+        time.sleep(0.3)
+        qmp.keys("ctrl", "a")
+        qmp.type_text("tuna")
+        qmp.keys("ret")
+    prove_unlock_wake(qmp, agent, evidence, record, password_unlock)
 
     # Real distribution Orca owns a credential-verified bus name under the ordinary
     # session user. Settings writes trigger Tuna Desktop's consumer, not test start/stop.
@@ -2342,6 +2417,10 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
             record(test_id, False, "logind suspend never reached QEMU SUSPENDED; no pause substitute")
             raise RuntimeError("real suspend did not occur")
         suspended_frame = frame(f"{label}suspended")
+        # What QEMU's display holds while the guest sleeps (non-gating:
+        # virtio-gpu may show a placeholder rather than the last scanout).
+        log(f"{test_id}-SUSPENDED-FRAME observation (non-gating): varied lock mask="
+            f"{varied_mask(suspended_frame)}, desktop difference {difference(base_frame, suspended_frame):.2%}")
         wake_trace_offset = os.path.getsize(gpu_log) if os.path.exists(gpu_log) else 0
         with open(os.path.join(evidence, f"{label}gpu-trace-wake.json"), "w") as stream:
             json.dump({"log": os.path.basename(gpu_log), "offset": wake_trace_offset}, stream, indent=2)
@@ -2402,10 +2481,57 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
 
         return resumed
 
-    # Preserve the authorized single-S3 contract for this performance lane.
-    # It combines plain and stale-auth wake checks with a prelocked session;
-    # the main lifecycle lane separately qualified prepare-for-sleep locking
-    # from an unlocked desktop. Keep fresh GPU upload and client repaint gates.
+    # Suspend the UNLOCKED desktop (G3). As GNOME 51's screen shield, the
+    # compositor holds a logind sleep delay inhibitor while unlocked; on
+    # PrepareForSleep it locks and releases the inhibitor only once every lit
+    # output scanned out a locked frame, so the frame left at suspend is the
+    # lock. Its own record of that release is read back after the wake.
+    unlocked_state = inventory("sleep-delay-before")
+    delay_before = unlocked_state["state"].get("sleep_delay")
+    delay_listed = agent.run("sleep-inhibitors")
+    with open(os.path.join(evidence, "sleep-delay-before.json"), "w") as stream:
+        json.dump({"sleep_delay": delay_before, "logind": delay_listed}, stream, indent=2)
+    delay_held = (same_apps(before, unlocked_state)
+                  and sleep_delay_held(unlocked_state, delay_listed["inhibitors"]))
+    record("V-SLEEP-DELAY-INHIBITOR", delay_held,
+           "unlocked desktop: the compositor holds logind's 'Tuna Desktop' delay inhibitor on sleep, "
+           "listed by systemd-inhibit for the session user's compositor PID")
+    if not delay_held:
+        raise RuntimeError("no compositor sleep delay inhibitor on the unlocked desktop")
+    suspend_and_check("unlocked-", "V-SUSPEND-UNLOCKED")
+    delay_after = None
+    try:
+        retaken = await_state(lambda value: (sleep_delay_record(value["state"].get("sleep_delay")) or {}).get("held") is True,
+                              timeout=15, label="sleep-delay-retaken")
+        delay_after = retaken["state"]["sleep_delay"]
+    finally:
+        with open(os.path.join(evidence, "sleep-delay-after.json"), "w") as stream:
+            json.dump({"before": delay_before, "after": delay_after}, stream, indent=2)
+    locked_frame = sleep_delay_released_locked(delay_before, delay_after)
+    record("V-SUSPEND-LOCKED-FRAME", locked_frame,
+           "real S3 from the unlocked desktop: the compositor released its delay inhibitor only after every lit "
+           "output scanned out a locked frame, logind never overran InhibitDelayMaxUSec, and it was taken again on wake")
+    if not locked_frame:
+        raise RuntimeError(f"sleep delay not released on a presented lock: {delay_before} -> {delay_after}")
+    # The wake leaves the password prompt already open (lifecycle
+    # unlocked-first-resume.png), not the curtain, so a bare Enter submitted an
+    # empty password: PAM refused it and the typed answer landed while that
+    # attempt was pending (V-LIFECYCLE red since #1170). Escape returns an
+    # open prompt to the clock, as the prelocked path below does, so the Enter
+    # always raises the curtain and the typed password is the first answer.
+    qmp.keys("esc")
+    qmp.keys("ret")
+    time.sleep(1)
+    qmp.keys("ctrl", "a")
+    qmp.type_text("tuna")
+    qmp.keys("ret")
+    unlocked_again = await_state(lambda state: not state["state"]["locked"], timeout=15)
+    if not same_apps(before, unlocked_again):
+        raise RuntimeError("unlock after the unlocked-desktop suspend replaced the session")
+
+    # The second S3 keeps the stale-auth contract: it combines plain and
+    # stale-auth wake checks with a prelocked session. Keep fresh GPU upload
+    # and client repaint gates.
     # Admit an actual helper with a real delayed PAM stack before sleep.
     # Sleep must cancel and physically retire it without unlocking. The separate
     # controlled late-success epoch proof still tests queued accepted results.
@@ -2873,12 +2999,10 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         greeter = agent.run("greeter")
         if greeter_ready(greeter):
             image = frame("logout-greeter")
-            width, height, pixels = image
-            colors = {tuple(value >> 4 for value in pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
-                      for y in range(0, height, 8) for x in range(0, width, 8)}
+            colors = greeter_colors(image)
             changed = difference(reference, image)
-            greeter["paint"] = {"changed_from_pre_login_greeter": changed, "colors": len(colors)}
-            greeter_visible = changed < 0.05 and len(colors) >= 8
+            greeter["paint"] = {"changed_from_pre_login_greeter": changed, "colors": colors}
+            greeter_visible = changed < GREETER_REPAINT_TOLERANCE and colors >= 8
             if greeter_visible:
                 break
         time.sleep(0.5)
@@ -2999,10 +3123,20 @@ def await_login(agent, deadline):
     runs the Tuna Desktop compositor, and the last observed login session
     with the desktop processes it runs (None before any appears)."""
     login = None
+    unadmitted = None
     while time.monotonic() < deadline:
         try:
             login = agent.run("login-session")
-            owner = agent.run("inventory")
+            # The compositor publishes TUNA_COMPOSITOR_STATE asynchronously
+            # after it starts, so early polls fail at inventory's state-read
+            # with FileNotFoundError. That expected retry is not a failure;
+            # only the last unadmitted record is logged, at the deadline.
+            try:
+                owner = agent.run("inventory", log_failure=False)
+            except RuntimeError as error:
+                unadmitted = error
+                raise
+            unadmitted = None
             if (owner["session_uid"] != 0 and owner["session"]["Service"] == LOGIN_SERVICE
                     and owner["session"]["User"] == str(owner["session_uid"])
                     and any(p["executable"] == "tuna-compositor" for p in owner["processes"])):
@@ -3010,6 +3144,8 @@ def await_login(agent, deadline):
         except (OSError, RuntimeError, ValueError, KeyError):
             pass
         time.sleep(1)
+    if unadmitted is not None:
+        log(f"login deadline: last {unadmitted}")
     return False, login
 
 
@@ -3069,10 +3205,30 @@ def gdm_login(qmp, agent_path, out, record, *, reference_profile=None):
             json.dump(provenance, stream, indent=2)
         with open(os.path.join(out, "greeter-before-login.json"), "w") as stream:
             json.dump(greeter, stream, indent=2)
-        time.sleep(5)
-        qmp.frame(os.path.join(out, "V-GDM-GREETER.png"))
         # The logout check compares the repainted greeter with this frame.
-        qmp.cmd("screendump", filename=os.path.join(out, "greeter-before-login.ppm"), format="ppm")
+        # greeter_ready sees GDM's gnome-shell process and active greeter
+        # session before that shell registers its display and paints; a slow
+        # start outlasted the fixed settle and left the scanout black (run
+        # 44611328331: display registered 6.5-7 s after readiness on all five
+        # boots), so logout later waited out its deadline against black. Keep
+        # the first painted frame that the next frame confirms settled, within
+        # the unchanged greeter deadline.
+        time.sleep(5)
+        reference = os.path.join(out, "greeter-before-login.ppm")
+        previous = None
+        while True:
+            qmp.cmd("screendump", filename=reference, format="ppm")
+            image = read_ppm(reference)
+            painted = greeter_colors(image) >= 8
+            settled = (painted and previous is not None
+                       and difference(previous, image) < GREETER_REPAINT_TOLERANCE)
+            if settled or time.monotonic() >= deadline:
+                break
+            previous = image if painted else None
+            time.sleep(1)
+        qmp.frame(os.path.join(out, "V-GDM-GREETER.png"))
+        if not settled:
+            raise RuntimeError("shipped GDM greeter did not paint a settled frame before its deadline")
         if reference_profile is not None:
             record("V-REFERENCE-STOCK-GDM", greeter["gdm"]["ready"],
                    "original packaged stock GDM greeter admitted by the independent reference observer")

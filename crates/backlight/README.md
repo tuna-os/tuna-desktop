@@ -9,7 +9,7 @@ authority; callers decide what an observation admits.
 
 - `inventory(root, outputs)`: raw backlights whose canonical device
   ancestry is exactly one owned connector in `outputs`
-  (`tuna_shell_control::NativeOutputInfo`). No first-device fallback;
+  (`tuna_output::NativeOutputInfo`). No first-device fallback;
   duplicate interfaces on one connector withhold capability; more than 64
   entries rejects the whole inventory.
 - `readback(device)`: actual value after a write; fails when the connector,

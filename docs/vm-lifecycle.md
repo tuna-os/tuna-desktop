@@ -47,6 +47,42 @@ and 120-second phase deadlines remain unchanged. No updater service,
 notification policy or failure log is disabled; acknowledging a banner does
 not qualify the update operation that produced it.
 
+Banners queue, as in GNOME's message tray: the shell shows one at a time and
+never times out a critical one, so closing it drops the next into the same
+layer. The probe closes each in turn, as a user would. The observer reports
+each Close control's accessible object path, which names that widget
+instance and not its content; the shell builds a new card for every banner
+it shows. A Close instance receives Return at most once. When the banner
+layer is still there 0.6 s after Return, the probe observes it again. A new
+Close instance gets the same Super+N, Tab and focused-Return sequence. The
+one it already activated is never activated again, and the capture deadline
+then fails the case. In marlin-vm run 44442598008, uupd failed three times
+and queued three critical "Some System Updates Failed" banners. The probe
+closed only the first, and the next one covered the frame until
+`V-STRIP-INSTALLED` timed out.
+
+A banner can also drop in while a strip step holds a button. No key reaches
+the shell then, so the probe acts as a user who lets the drag go first. The
+stationary edge hold stops at the first observation that shows a banner. The
+probe then cancels the held titlebar move with the actual VT round trip of the
+`07-vt-cancel` step. That cancel restores the strip viewport, and every
+original rectangle must match the pre-drag ones before the button comes up.
+With no button held, the probe closes each banner with the same focused Close
+sequence and records it as `released-12-stationary-delta-revealed`. It then
+runs the edge hold again from the banner-free sample, and
+`held_step_interruptions` counts each restart. The 120-second phase deadline
+bounds the retries. In marlin-vm run 44656894802, uupd's fourth start hit
+its start limit. Its `OnFailure` banner arrived 7 s into the edge hold, and
+the capture refused to send keys while the button was held.
+
+Those uupd runs were the lane's own doing. The G-DATETIME-MANUAL probe that
+runs just before the strip used to set the guest clock 2 h 7 min ahead, and
+a jump forward fires every calendar timer it skips: uupd.timer
+(`OnCalendar=*-*-* 04:00:00`) started uupd whenever the probe ran between
+about 01:53 and 04:15 UTC. The probe now sets the clock back, and its gate
+fails if any timer fires ahead of the real time (docs/datetime-proof.md).
+The banner handling stays for banners the image raises on its own.
+
 The column-height capture also submits a real critical notification through
 the session's public notification service. It cannot pass until the original
 shell shows the fixed public fixture title, its sensitive Close button receives
@@ -93,8 +129,15 @@ The root `autotz DOMAIN OPERATION JSON` route delegates to the installed
 standalone observer. QGA acquisition and nested commands share finite
 absolute deadlines; reconnecting cannot renew them. Failure diagnostics
 contain only bounded domain/operation/type/sites and optional numeric codes,
-never raw arguments or exception text. Unconfirmed guest-child retirement
-remains fatal. `V-AUTOTZ` requires the consumer's explicit complete qualified
+never raw arguments or exception text. An operation that misses its deadline
+still fails; afterwards the agent polls only the timed-out child's
+`guest-exec-status` for a bounded 10 s grace (on a fresh connection if the
+old one was cut mid-reply) and clears it once the child is seen exiting.
+Unconfirmed guest-child retirement remains fatal. A readiness wait whose
+poll the readiness deadline cut short, with the child retired, fails with its
+own `actual readiness absolute deadline expired` verdict and last
+observation; a timeout with budget left propagates unchanged (#1013).
+`V-AUTOTZ` requires the consumer's explicit complete qualified
 result; an exception, missing native session or missing result fails the
 row and therefore the existing aggregate CI gate. The consumer retains its
 actual original-shell AddAgent, source/provider, daemon location/timezone
@@ -481,7 +524,16 @@ The final `gdm51` overlay runs after every `pacman -Syu` and Orca step.
 It checks both archive hashes and package metadata.
 It installs both packages in one transaction.
 It checks their versions, owners and installed bytes.
-It checks the existing shipped-payload manifest without changes.
+It checks the existing shipped-payload manifest without changes,
+with one narrow exception.
+The receipt is taken from the repository's own `gdm`, while the candidate is a
+fixed native build, so their `gdm.service` units can differ for benign upstream
+reasons (`gdm` 51.2-1 added `After=accounts-daemon.service`).
+A mismatch on that one unit is accepted only when the installed bytes are the
+candidate archive's own copy.
+The receipt's entry is then updated, and the old and new digests and a unified
+diff are kept in `install-provenance.json` and `gdm.service.diff`.
+Any other mismatch, including every PAM and session file, still fails the build.
 No package upgrade follows.
 
 CI retains this evidence in `vm-lane-artifacts/gdm51/`.
@@ -685,7 +737,9 @@ That control must belong to the original shell process and its AT-SPI bus.
 It must report `FOCUSED`.
 A layer namespace alone is not proof of that owner.
 
-After the normal Close action, the banner must be absent and all keys released.
+After the normal Close action, the banner must be absent and all keys released;
+a queued banner that drops in instead gets its own focused Close (see
+"Installed strip captures").
 Original windows, focus, workspace and session mode must remain unchanged.
 Both PNG and PPM still need all original 25 color checks.
 No pointer coordinates or empirical offsets select the control.
@@ -955,7 +1009,7 @@ feature tour:
 | V-CURSOR | After the strip proof, on the HID tablet: hovering a GTK entry of the main `tuna-vm-desktop-gates` fixture draws the client's cursor-shape `text` from the theme, another client's body its `default`; `cursor-size` 48 redraws the text shape at 48 px live; with `locate-pointer` on, a lone QMP Ctrl tap ripples once at the pointer over observed frames and finishes (a guest watcher polls the state file). Settings restored (desktop-gates/cursor-*.json) |
 | V-APP-POPOVER | A click on the fixture's GTK menu button shows its popover (an xdg_popup with a grab; a painted swatch changes the screendump below the button); a click on a maximized bystander client outside it dismisses it, the press never reaches the bystander and the app window is unchanged; the next click there does reach it (desktop-gates/popover.json, popover-*.png) |
 | V-WINDOW-BUTTONS | GTK's own title buttons (decoration layout `:minimize,maximize,close`, bounds from GTK on the compositor's window geometry): maximize fills the work area below the top bar, restore returns the original rectangle, minimize hides the window and Alt+Tab restores and focuses it there, close ends the app (desktop-gates/window-buttons.json) |
-| V-MINIMIZE-ANIMATION | After the overview's dash publishes icon rectangles: Super+H runs GNOME's 400 ms minimize toward the window's dash icon (a real rectangle in the output's bottom half, not the zero-size fallback) over at least two observed frames with partial fade, and it completes; Alt+Tab runs the restore over observed frames back to the original rectangle (desktop-gates/minimize.json, unminimize.json) |
+| V-MINIMIZE-ANIMATION | GNOME 51's target rule for a Wayland window (#894; windowManager.js `_minimizeWindow` 1183-1201, Mutter sets icon geometry only from X11 `_NET_WM_ICON_GEOMETRY`), both cases, each run over at least two observed frames with partial fade at the session's 400 ms × slow-down duration and completed. Dash hidden: after the overview's dash has published the window's icon (`dash_icon_targets`, a real rectangle in the output's bottom half), Escape, then Super+H minimizes to the output's leading corner at scale 0 (`[x, y, 0, 0]`, the session is left to right), not that icon; Alt+Tab restores it over observed frames to its rectangle. Dash on screen: with the overview's dash showing that icon, the GTK window's own minimize request (`gtk_window_minimize` on SIGUSR1, sent by the armed guest watcher) minimizes to exactly that icon; a click on its overview preview restores it over observed frames to its rectangle and closes the overview onto it. A minimize toward nowhere, more than one target or the other case's target fails (desktop-gates/minimize*.json, unminimize*.json) |
 | V-TRAY | The nested proof's StatusNotifierItem stub (`scripts/lib/tuna-tray-item-stub.py`) as the session user: the item shows in the top bar's AT-SPI tree with its tooltip; a QMP click at the bar's origin plus its window-relative extents opens its menu (row showing, pixels drawn); Escape closes it; it leaves the bar when the item exits (desktop-gates/tray.json, tray-*.png) |
 | V-A11Y-TREE | After the desktop gates, `scripts/lib/vm_shell_gates.py` with its own main and bystander fixtures: the shell's showing, named AT-SPI nodes (role, name, top-level frame, in tree order) at the panel, the overview with a window preview hovered and quick settings (Super+S) carry every frame and control of the nested goldens `tests/a11y/{panel,overview,quick-settings}.txt` in the golden's order. The dash's app buttons and the hovered preview's Close depend on what is installed; the audio, brightness, Wi-Fi, wired, Bluetooth, printer, mobile and power-mode tiles depend on the machine's services and must be whole (tile and its menu) or absent (shell-gates/a11y-*.json) |
 | V-NOTIFY | `notify-send -a "Tuna VM Gates"` as the session user, a session-bus monitor recording `ActionInvoked` and `NotificationClosed`: the banner (layer `tuna-shell-banners`) shows top centre under the bar with its action button; a second notification waits while it shows (one banner at a time); a QMP click on the action reaches the app (`ActionInvoked open`) and the queued banner shows; Super+N focuses it and Delete closes it (reason 2); Super+N then Escape expires the next (reason 1); a low-urgency one never banners (shell-gates/notify-*.json) |
@@ -967,8 +1021,11 @@ feature tour:
 | V-OVERVIEW-PICKER | Super+Shift+Page Down puts the main window on the next workspace and Super+Page Up comes back; the overview previews every shown window of the workspace scaled down; the strip is three 43x26 thumbnails 49 px apart at y 102 ending in an empty workspace, the active card 849x509 at y 152, with a vivid accent pixel 2 px left of the active thumbnail in the screendump; a thumbnail click switches with the overview open; the window's preview dragged onto the first workspace's thumbnail moves the window there (shell-gates/overview-*.json, overview-*.png) |
 | V-APP-GRID | Thirty `.desktop` entries and one launch fixture in the session user's `~/.local/share/applications`: a QMP click on Show Apps (the dash layer's origin plus the toggle's AT-SPI extents) opens the grid (`overview_state` 2, the `tuna-shell-appgrid` layer); it shows Page 1 and Page 2 and Next Page but no Previous Page; a click on Next Page turns it; a click on the launch fixture's tile, on whatever page it is on screen, launches it (a focused, mapped GTK window) and closes the overview. The entries are removed at cleanup (shell-gates/app-grid.json, app-grid.png) |
 | V-VT | VT away/back, DRM pause/activate events, unchanged process identities and app rectangles, matching body plus a fresh visible count update from the real GTK client |
-| V-SUSPEND | Real logind suspend reaches QEMU `suspended`; the first guest snapshot after `system_wakeup` must already be locked, with all application identities intact; the real varied lock mask must repaint within five seconds, matching the pre-suspend mask; QEMU inactive-output placeholders fail |
-| V-SLEEP-AUTH-FAIL-CLOSED / V-SLEEP-FRESH-AUTH | The single real suspend interrupts a correct password attempt delayed by actual pam_exec; the real PAM success from the old generation is refused, then fresh correct authentication succeeds |
+| V-SLEEP-DELAY-INHIBITOR | On the unlocked desktop the compositor's snapshot records its logind sleep delay inhibitor held, and logind's inhibitor list (`systemd-inhibit --list`) shows a `delay` inhibitor on `sleep` from "Tuna Desktop" for the session user's compositor PID, as GNOME 51's screen shield holds one while unlocked (lifecycle/sleep-delay-before.json) |
+| V-SUSPEND-UNLOCKED (with -GPU-PM / -GPU-UPLOAD) | The first real suspend starts from the unlocked desktop; the same checks as V-SUSPEND, so the first snapshot after wake must already be locked |
+| V-SUSPEND-LOCKED-FRAME | Across that suspend the compositor's `sleep_delay` record shows exactly one sleep whose inhibitor it released only once every lit output had scanned out a frame drawn locked, no release without that, no overrun of logind's `InhibitDelayMaxUSec`, and the inhibitor taken again after wake (lifecycle/sleep-delay-after.json). QEMU's display while suspended is logged as a non-gating observation |
+| V-SUSPEND | The second real suspend, from a locked session: real logind suspend reaches QEMU `suspended`; the first guest snapshot after `system_wakeup` must already be locked, with all application identities intact; the real varied lock mask must repaint within five seconds, matching the pre-suspend mask; QEMU inactive-output placeholders fail |
+| V-SLEEP-AUTH-FAIL-CLOSED / V-SLEEP-FRESH-AUTH | The second real suspend interrupts a correct password attempt delayed by actual pam_exec; the real PAM success from the old generation is refused, then fresh correct authentication succeeds |
 | V-SLEEP-CLIENT-REPAINT | The same GTK client receives a fresh key and visibly repaints after wake/unlock |
 | V-VT-FAIL-CLOSED | VT away/back while locked keeps the mask and original application processes |
 | V-AUTH-FAIL-CLOSED | Real PAM service temporarily uses `pam_deny`; fresh submitted/refused milestones prove the correct test password was attempted and denied; original service restored afterward |
@@ -977,10 +1034,11 @@ feature tour:
 | V-GSD-PLUGINS | Each of the thirteen gnome-settings-daemon plugins the session target wants, MediaKeys included, is the packaged `gsd-*` binary, running as the session user as its unit's main PID and owning its bus name; `org.gnome.SettingsDaemon.Color` belongs to the compositor; A11ySettings has no owner; the session targets are active and the compositor holds `gnome-session-leader-fifo` (lifecycle/gsd-plugins.json, #355, #589) |
 | V-GSD-POWER-IDLE | With `idle-delay` set to 20 s and no input, dbus-monitor records gsd-power's own `SetDimming(true)` before its `PowerSaveMode=3`; the compositor snapshot reports locked and `power_save_mode` 3; Return wakes it to 0 and gsd-power undims; the original delay is restored (lifecycle/gsd-power-idle.json, #355) |
 | V-LOCKED-HINT | logind's `LockedHint` for the login session reads `no`; the session user's `loginctl lock-session` locks the compositor and the hint turns `yes`; the real password unlocks and it reads `no`; Super+L locks with `yes`; `loginctl unlock-session` unlocks with `no`, as GNOME 51's `screenShield.js` does (lifecycle/locked-hint.json, #846). Required on both acquisitions |
+| V-UNLOCK-WAKE | After V-LOCKED-HINT: Super+L locks (the gate's last input) and gsd-power blanks the output once the shield is active (PowerSaveMode 3 in the compositor snapshot); the session user's `loginctl unlock-session`, with no input, unlocks and gsd-power's answer to the shell's `WakeUpScreen` brings PowerSaveMode back to 0 within 15 s, and the snapshot's rendered frame count advances past the blanked output's, as GNOME 51's `screenShield.js` `_continueDeactivate` wakes the screen on every unlock (lifecycle/unlock-wake.json, #1194; `scripts/lib/vm_unlock_wake.py`). Whatever the verdict, the session is then unlocked by password or woken by a key so the tour goes on |
 | V-POWER-BUTTON | gsd-media-keys (its unit's main PID, the session user) holds logind's `block` inhibitor on `handle-power-key:handle-suspend-key:handle-hibernate-key` with Why "GNOME handling keypresses". On a fixture desktop chassis, after each gsd restart a new gsd-media-keys must own its name, hold that inhibitor, have `XF86PowerOff` granted by `GrabAccelerators` and the shell must log that it yielded the bindings. QMP `system_powerdown` (ACPI power button) with `power-button-action` `interactive`: `AcceleratorActivated` reaches gsd, gsd calls `org.gnome.SessionManager.Shutdown`, the compositor calls `EndSessionDialog.Open(1, …)` and the `tuna-shell-end-session` layer shows within 15 s; 5 s after the press QEMU is `running` with the same compositor process and logind session and no logind power request; Escape (always sent, far inside the 60 s countdown) removes the layer, the shell emits `Canceled` and logs its D-Bus Power Off dialog. `nothing`: gsd receives the key, and for at least 8 s no Shutdown, dialog call, layer or logind request follows. On the image's `vm` chassis with a fixture `shutdown` block inhibitor held by root: the key reaches gsd and gsd's own process calls logind `PowerOffWithFlags(0)`; gsd sends it without a reply callback (NO_REPLY_EXPECTED), so logind's refusal has no bus reply, and 5 s later logind has emitted no `PrepareForShutdown`/`PrepareForSleep`, `PreparingForShutdown` is still false with the fixture inhibitor held, no other logind request or non-error reply followed, no dialog opened and QEMU, compositor and session are unchanged. Setting, chassis and `/etc/machine-info` are restored (lifecycle/power-button.json, #353, #589) |
 | V-RESTART-DIALOG | Both current-build and published guests must exercise the shell's own power menu by physical keys on the unlocked desktop after V-POWER-BUTTON (#589): Super+S opens quick settings; physical Tab moves until the shell's AT-SPI tree (`tuna-vm-shell-focus` end-session mode, observation only) reports Power Off Menu focused, Return opens the menu with Suspend, Restart…, Power Off… and Log Out… showing, and Tab/Return chooses Restart…. Within 15 s the shell (the `org.gnome.Shell` owner, not the compositor) has called `org.gnome.SessionManager.Reboot` and the compositor's manager has answered with the shell's `EndSessionDialog.Open(2, 0, 60, …)`, with the `tuna-shell-end-session` layer up; the dialog reads "The system will restart automatically in 60 seconds" with Cancel focused, as GNOME 51's endSessionDialog.js. It steps to 50 seconds with QEMU running, the session and compositor identity unchanged, no logind power request, `PrepareFor*` signal or `PreparingForShutdown`, and the request still unanswered; Return on the focused Cancel then emits the shell's `Canceled`, fails `Reboot` with gnome-session's `G_IO_ERROR_CANCELLED` and takes the layer down, still with logind untouched. Any failure presses Escape so no countdown is left running (lifecycle/end-session-menu.json). An older published shell does not waive the gate |
 | V-POWER-OFF-DIALOG | As V-RESTART-DIALOG for Power Off…: `org.gnome.SessionManager.Shutdown`, `Open(1, 0, 60, …)`, "The system will power off automatically in 60 seconds" stepping to 50, Cancel by Return, `Shutdown` failed as cancelled, logind untouched |
-| V-LOGOUT | Both lanes use the shell's power menu by physical keys (#589), as V-RESTART-DIALOG runs Restart…: the shell must ask `org.gnome.SessionManager.Logout(0)`, the compositor's manager must answer it once its `Open(0, 0, 60, …)` has put the dialog up, counting down from 60 with Cancel focused, and the session must outlive that countdown, whose expiry confirms the logout (the greeter may only return at least 55 s after the dialog opened). Within 30 s of the logout taking effect (90 s from the menu dialog's opening) GDM's non-root gnome-shell greeter in its active gdm-launch-environment session repaints the greeter frame captured before login and no original compositor survives. A logind `Session.Terminate` substitute or historical published build does not pass |
+| V-LOGOUT | Both lanes use the shell's power menu by physical keys (#589), as V-RESTART-DIALOG runs Restart…: the shell must ask `org.gnome.SessionManager.Logout(0)`, the compositor's manager must answer it once its `Open(0, 0, 60, …)` has put the dialog up, counting down from 60 with Cancel focused, and the session must outlive that countdown, whose expiry confirms the logout (the greeter may only return at least 55 s after the dialog opened). Within 30 s of the logout taking effect (90 s from the menu dialog's opening) GDM's non-root gnome-shell greeter in its active gdm-launch-environment session repaints the greeter frame captured before login and no original compositor survives. That pre-login frame is the first painted one (at least 8 quantized colors) that the next frame confirms settled within the same 5% tolerance, inside the unchanged greeter deadline; a greeter that never paints fails the login rather than leaving a black reference. A logind `Session.Terminate` substitute or historical published build does not pass |
 
 The original tour's `V-LOCK` still requires exactly unlocked → locked →
 unlocked. Its observations end before lifecycle operations add their own
@@ -1017,8 +1075,17 @@ can carry the preceding vblank's timestamp, so timestamps alone do not
 identify abandoned frames. A failed reset or drain keeps scanout blocked
 until recovery succeeds. Wake
 recovery does not depend on a VT change; an off-seat wake waits for seat
-activation. This does not establish a delay inhibitor or physical masked
-frame acknowledgement before sleep.
+activation.
+
+While the session is active and the lock screen is allowed, the compositor
+holds a logind `delay` inhibitor on `sleep`, as GNOME 51's `screenShield.js`
+`_syncInhibitor` does. On `PrepareForSleep(true)` it locks and closes the
+inhibitor only once every lit output has completed the page flip of a frame
+drawn locked, so the frame left on screen through sleep is the lock. It takes
+the inhibitor again on `PrepareForSleep(false)`. When logind's
+`InhibitDelayMaxUSec` runs out first, logind sleeps anyway and the session is
+still locked; the record counts an overrun. A lockdown that disables the lock
+screen, or a session off its VT, releases the inhibitor at once.
 
 These new gates require their own actual CI results before acceptance.
 Output hotplug and loss of every compositor-adjacent service remain

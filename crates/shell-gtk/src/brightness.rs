@@ -9,7 +9,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use tuna_backlight::owner_current;
 pub use tuna_backlight::{inventory, readback, BacklightKind, Device};
-use tuna_shell_control::NativeOutputInfo;
+use tuna_output::NativeOutputInfo;
 
 /// Explicit controlled fixture ONLY. Caller must also have an overridden
 /// backlight root. This never supplies native hardware evidence.

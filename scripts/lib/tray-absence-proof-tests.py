@@ -57,6 +57,88 @@ class Absence(unittest.TestCase):
             with self.subTest(identities=identities), self.assertRaisesRegex(ValueError, 'lifetime changed'):
                 self.observe(identities=identities)
 
+# The tree the grid-cancel comparison's G-TRAY refused (run 44793641609):
+# the killed item still showing while the walk met its unexported child.
+RACE = 'atspi_error: No such interface “org.a11y.atspi.Accessible” on object at path /org/tuna/Shell/a11y/88cef3b2 (1)'
+ITEM_TREE = [dict(TREE[0], depth=0), dict(TREE[1], depth=3),
+             {'role': 'push button', 'name': 'Tuna Desktop Tray Probe', 'depth': 5, 'showing': True}]
+
+class Teardown(unittest.TestCase):
+    observe = Absence.observe
+
+    def test_unexported_child_of_departing_item_is_a_retry(self):
+        with self.assertRaisesRegex(M.TearingDown, 'No such interface'):
+            self.observe(ITEM_TREE + [{'role': 'error', 'name': RACE, 'depth': 6, 'showing': False}])
+
+    def test_other_errors_stay_refusals(self):
+        trees = {
+            'outside the item': ITEM_TREE[:2] + [{'role': 'error', 'name': RACE, 'depth': 4, 'showing': False}] + ITEM_TREE[2:],
+            'after the item subtree': ITEM_TREE + [{'role': 'error', 'name': RACE, 'depth': 5, 'showing': False}],
+            'another kind inside the item': ITEM_TREE + [{'role': 'error', 'name': 'childCount drifted 2 -> 1 at depth 6', 'depth': 6}],
+            'no depth': ITEM_TREE + [{'role': 'error', 'name': RACE}],
+        }
+        for case, tree in trees.items():
+            with self.subTest(case), self.assertRaisesRegex(ValueError, 'partial accessibility tree'):
+                self.observe(tree)
+
+    def test_race_still_requires_owner_and_panel_anchor(self):
+        tree = [dict(ITEM_TREE[0], process_id=8)] + ITEM_TREE[1:] + [
+            {'role': 'error', 'name': RACE, 'depth': 6, 'showing': False}]
+        with self.assertRaisesRegex(ValueError, 'admitted shell identity'):
+            self.observe(tree)
+
+class Deadline(unittest.TestCase):
+    def run_await(self, outcomes):
+        calls, sleeps = [], []
+        def observe():
+            outcome = outcomes[min(len(calls), len(outcomes) - 1)]
+            calls.append(outcome)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        return M.await_absence(observe, sleep=sleeps.append), calls, sleeps
+
+    def test_deadline_is_unchanged(self):
+        self.assertEqual((M.ATTEMPTS, M.INTERVAL_S), (30, 0.5))
+
+    def test_teardown_then_absence_passes(self):
+        reason, calls, sleeps = self.run_await([M.TearingDown(RACE), False, True])
+        self.assertIsNone(reason)
+        self.assertEqual((len(calls), sleeps), (3, [0.5, 0.5]))
+
+    def test_persistent_teardown_fails_at_the_deadline(self):
+        reason, calls, sleeps = self.run_await([M.TearingDown(RACE)])
+        self.assertRegex(reason, 'still being torn down: .*No such interface')
+        self.assertEqual((len(calls), sleeps), (30, [0.5] * 30))
+
+    def test_item_still_showing_fails_at_the_deadline(self):
+        reason, calls, _ = self.run_await([False])
+        self.assertEqual((reason, len(calls)), ('the item is still showing', 30))
+
+    def test_refusal_is_not_retried(self):
+        calls = []
+        def observe():
+            calls.append(1)
+            raise ValueError('missing, empty or partial accessibility tree')
+        with self.assertRaises(ValueError):
+            M.await_absence(observe, sleep=lambda _: None)
+        self.assertEqual(len(calls), 1)
+
+    def test_exit_codes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = Path(directory) / 'receipt.json'
+            receipt.write_text(json.dumps({'complete': True, 'publisher': OWNER}))
+            argv = ['tuna_tray_absence.py', str(receipt), str(Path(directory) / 'tree.json'), 'dump.py']
+            for outcome, code in ((True, 0), (M.TearingDown(RACE), 2)):
+                def observe(*_, outcome=outcome):
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+                with self.subTest(outcome=outcome), patch.object(sys, 'argv', argv), \
+                        patch.object(M, 'observe_absence', side_effect=observe), \
+                        patch.object(M.time, 'sleep'), patch('sys.stderr'):
+                    self.assertEqual(M.main(), code)
+
 class OwnerBoundDump(unittest.TestCase):
     def run_dump(self, include_owner):
         class App:

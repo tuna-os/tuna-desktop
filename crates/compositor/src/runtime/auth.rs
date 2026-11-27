@@ -3,23 +3,25 @@
 //! (`js/gdm/authPrompt.js`, `authServicesLegacy.js`). The shell starts a
 //! password and a fingerprint conversation side by side; this module
 //! relays each PAM prompt and message of the password conversation
-//! (private helper, `pam_backend::begin_conversation`) one question at a
-//! time, runs `pam_fprintd`'s fingerprint loop over fprintd
-//! (`unlock::run_fingerprint`), and unlocks only through the shared
-//! [`apply_verified_unlock`](Runtime::apply_verified_unlock) grant.
+//! (private helper on `tuna-lock`, `pam_backend::begin_conversation`) one
+//! question at a time, relays `pam_fprintd`'s messages of the fingerprint
+//! conversation (its own private helper on `tuna-lock-fingerprint`, as GDM
+//! runs `gdm-fingerprint`), and unlocks only through the shared
+//! [`apply_verified_unlock`](Runtime::apply_verified_unlock) grant. Both
+//! services run PAM's auth and account stacks; nothing unlocks on a
+//! fingerprint match alone (#1162 F5).
 //!
 //! Ownership rules (docs/security/lock-conversations.md): each
 //! conversation holds its own Slot attempt — the password one the common
 //! unlock Slot, the fingerprint one its own — and answers its
 //! `BeginVerification` only when that attempt has retired (helper reaped,
-//! or fingerprint worker joined). Every prompt and every grant rechecks
-//! the original connection, request and lock epoch; a lock-epoch change,
-//! origin loss or unlock cancels. The winner grants only once the common
-//! Slot is free, so a fingerprint match waits for the cancelled password
-//! helper to retire.
+//! or a refused start's probe joined). Every prompt and every grant
+//! rechecks the original connection, request and lock epoch; a lock-epoch
+//! change, origin loss or unlock cancels. The winner grants only once the
+//! common Slot is free, so a fingerprint success waits for the cancelled
+//! password helper to retire.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use tuna_shell_control::{AuthEvent, AuthService, Secret};
@@ -28,14 +30,28 @@ use super::Runtime;
 use crate::auth_owner::{Attempt, MethodKind, Origin, Slot};
 use crate::pam_backend::{ConversationTicket, Verification};
 use crate::pam_conversation::{Binding, Policy, ResponseHandle};
-use crate::pam_helper::{Answer, AnswerText, Message, Style};
-use crate::unlock::{FingerprintEnd, FingerprintStep};
+use crate::pam_helper::{Answer, AnswerText, Message, Refusal, Style};
 
 /// GDM 51's `get_generic_error_message` for `gdm-password`
 /// (`daemon/gdm-session-worker.c`): what GNOME's lock screen shows after
 /// a failed password conversation.
 pub(crate) const PASSWORD_FAILED: &str =
     "Sorry, password authentication didn’t work. Please try again.";
+/// GDM 51's `get_generic_error_message` for `gdm-fingerprint`.
+pub(crate) const FINGERPRINT_FAILED: &str =
+    "Sorry, fingerprint authentication didn’t work. Please try again.";
+/// GDM 51's `get_max_retries_error_message` for `gdm-fingerprint`, after
+/// `PAM_MAXTRIES`.
+pub(crate) const FINGERPRINT_MAX_TRIES: &str =
+    "You reached the maximum fingerprint authentication attempts, please try another method";
+/// GDM 51's `get_friendly_error_message` for `PAM_ACCT_EXPIRED` and
+/// `PAM_AUTHTOK_EXPIRED`.
+pub(crate) const ACCOUNT_EXPIRED: &str = "Your account was given a time limit that’s now passed.";
+
+/// GNOME's login-screen settings (shipped with GDM).
+const LOGIN_SCREEN_SCHEMA: &str = "org.gnome.login-screen";
+/// Whether the fingerprint service may run at all.
+const FINGERPRINT_KEY: &str = "enable-fingerprint-authentication";
 
 /// The admitted interactive policy for the lock service. A backend phase
 /// (one PAM module step between two answers) gets 30 s: pam_unix's fail
@@ -46,6 +62,24 @@ const POLICY: Policy = Policy {
     backend_phase: Duration::from_secs(30),
     total: Duration::from_secs(900),
 };
+
+/// The fingerprint service's policy. `pam_fprintd` waits up to its
+/// `timeout=` (30 s by default) for one scan between two messages, so a
+/// backend phase gets 60 s. Nothing in this conversation is user input
+/// to the relay, so its 120 s inactivity watch bounds the whole of it:
+/// `pam_fprintd`'s three default scans fit inside.
+const FINGERPRINT_POLICY: Policy = Policy {
+    backend_phase: Duration::from_secs(60),
+    total: Duration::from_secs(300),
+};
+
+/// Failed fingerprint conversations admitted per lock epoch.
+/// `pam_fprintd`'s `max-tries` bounds the scans of one conversation; this
+/// bounds how often the shell may start another one, so a lock offers at
+/// most this many times `max-tries` rejected scans before fingerprint is
+/// unavailable until the next lock. A conversation counts when PAM
+/// reported a rejected scan (an error message) or refused it.
+const FINGERPRINT_FAILURES_PER_LOCK: u32 = 3;
 
 /// The PAM batch being answered, one question at a time.
 struct Batch {
@@ -79,26 +113,47 @@ impl PasswordConversation {
     }
 }
 
+/// What the fingerprint service's start found off the loop: the
+/// login-screen setting, then fprintd's reader, prints and scan type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Probe {
+    /// `enable-fingerprint-authentication` is off.
+    Disabled,
+    /// No fprintd, reader or enrolled print: GDM's service-unavailable
+    /// (`pam_fprintd` returns `PAM_AUTHINFO_UNAVAIL` without prints).
+    NotOffered,
+    /// Run `pam_fprintd`; `swipe` picks GNOME's hint.
+    Offered { swipe: bool },
+}
+
+enum FingerprintStage {
+    /// The probe worker; joined before anything else happens.
+    Probe(Option<std::thread::JoinHandle<Probe>>),
+    /// `pam_fprintd`'s conversation in the private helper.
+    Pam {
+        binding: Binding,
+        ticket: ConversationTicket,
+        source: Option<calloop::RegistrationToken>,
+        swipe: bool,
+    },
+}
+
 struct FingerprintConversation {
     attempt: Attempt,
     origin: Origin,
-    cancel: Arc<AtomicBool>,
-    steps: mpsc::Receiver<FingerprintStep>,
-    worker: Option<std::thread::JoinHandle<FingerprintEnd>>,
+    stage: FingerprintStage,
+    /// PAM reported a rejected scan (an error message): the conversation
+    /// counts against [`FINGERPRINT_FAILURES_PER_LOCK`] however it ends.
+    rejected: bool,
     canceled: bool,
 }
 
 impl FingerprintConversation {
     fn cancel(&mut self) {
         self.canceled = true;
-        self.cancel.store(true, Ordering::Release);
-    }
-}
-
-impl Drop for FingerprintConversation {
-    fn drop(&mut self) {
-        // Never join here: the reader worker winds down on its own.
-        self.cancel.store(true, Ordering::Release);
+        if let FingerprintStage::Pam { ticket, .. } = &mut self.stage {
+            ticket.cancel();
+        }
     }
 }
 
@@ -116,6 +171,10 @@ pub(super) struct Conversations {
     password: Option<PasswordConversation>,
     fingerprint: Option<FingerprintConversation>,
     fingerprint_slot: Slot,
+    /// A fingerprint helper did not retire: the service stays refused.
+    fingerprint_quarantined: bool,
+    /// Failed fingerprint conversations: (lock epoch, count).
+    fingerprint_failures: (u64, u32),
     winner: Option<Winner>,
 }
 
@@ -126,6 +185,7 @@ impl Conversations {
             "password": self.password.is_some(),
             "fingerprint": self.fingerprint.is_some(),
             "fingerprint_slot": self.fingerprint_slot.active(),
+            "fingerprint_failures": self.fingerprint_failures.1,
             "winner": self.winner.is_some(),
         })
     }
@@ -137,11 +197,35 @@ impl Conversations {
             .map(|conversation| conversation.attempt)
     }
 
-    /// The password conversation's shared idle/total deadline.
+    /// The earliest idle/total deadline of a running PAM conversation.
     pub(super) fn next_deadline(&self) -> Option<Instant> {
-        self.password
+        let password = self
+            .password
             .as_ref()
-            .and_then(|conversation| conversation.ticket.next_deadline())
+            .and_then(|conversation| conversation.ticket.next_deadline());
+        let fingerprint =
+            self.fingerprint
+                .as_ref()
+                .and_then(|conversation| match &conversation.stage {
+                    FingerprintStage::Pam { ticket, .. } => ticket.next_deadline(),
+                    FingerprintStage::Probe(_) => None,
+                });
+        password.into_iter().chain(fingerprint).min()
+    }
+
+    /// Whether this lock epoch used up its failed fingerprint conversations.
+    fn fingerprint_exhausted(&self, epoch: u64) -> bool {
+        let (counted, failures) = self.fingerprint_failures;
+        counted == epoch && failures >= FINGERPRINT_FAILURES_PER_LOCK
+    }
+
+    fn note_fingerprint_failure(&mut self, epoch: u64) {
+        let (counted, failures) = self.fingerprint_failures;
+        self.fingerprint_failures = if counted == epoch {
+            (epoch, failures.saturating_add(1))
+        } else {
+            (epoch, 1)
+        };
     }
 
     /// Real seat input reached the lock surface: GNOME's unlock dialog
@@ -169,6 +253,48 @@ fn service_name(service: AuthService) -> &'static str {
         AuthService::Password => "password",
         AuthService::Fingerprint => "fingerprint",
     }
+}
+
+/// The fingerprint service's start, off the loop: GNOME's
+/// `enable-fingerprint-authentication` first (`authServicesLegacy.js`
+/// offers `gdm-fingerprint` only when it is set; the compositor enforces
+/// it as well, the shell's choice is not trusted), then fprintd's reader,
+/// the user's prints and the scan type for GNOME's hint.
+fn probe_fingerprint(user: &str) -> Probe {
+    if !fingerprint_enabled() {
+        return Probe::Disabled;
+    }
+    match crate::fprintd::Fprintd::connect().map(|client| client.capability(user)) {
+        Some(capability) if capability.offered() => Probe::Offered {
+            swipe: capability.swipe,
+        },
+        _ => Probe::NotOffered,
+    }
+}
+
+/// `org.gnome.login-screen enable-fingerprint-authentication`, read
+/// afresh for each conversation. Without GDM's schema (or the key)
+/// fingerprint stays on, the key's default, as in the shell; a read that
+/// cannot run refuses.
+fn fingerprint_enabled() -> bool {
+    use gio::prelude::*;
+    let context = gio::glib::MainContext::new();
+    context
+        .with_thread_default(|| {
+            let Some(schema) = gio::SettingsSchemaSource::default()
+                .and_then(|source| source.lookup(LOGIN_SCREEN_SCHEMA, true))
+            else {
+                return true;
+            };
+            if !schema.has_key(FINGERPRINT_KEY)
+                || schema.key(FINGERPRINT_KEY).value_type().as_str() != "b"
+            {
+                return true;
+            }
+            gio::Settings::new_full(&schema, None::<&gio::SettingsBackend>, None)
+                .boolean(FINGERPRINT_KEY)
+        })
+        .unwrap_or(false)
 }
 
 impl Runtime {
@@ -309,7 +435,13 @@ impl Runtime {
     }
 
     fn begin_fingerprint(&mut self, origin: Origin) {
-        if crate::fprintd::Fprintd::disabled_by_env() {
+        let epoch = self.unlock_generation.load(Ordering::Acquire);
+        // Permanent refusals: pinned off, a helper that never retired, or
+        // this lock's failed conversations used up.
+        if crate::fprintd::Fprintd::disabled_by_env()
+            || self.auth.fingerprint_quarantined
+            || self.auth.fingerprint_exhausted(epoch)
+        {
             self.refuse_verification(origin, AuthService::Fingerprint);
             return;
         }
@@ -321,7 +453,6 @@ impl Runtime {
             self.refuse_verification(origin, AuthService::Fingerprint);
             return;
         };
-        let epoch = self.unlock_generation.load(Ordering::Acquire);
         let Some(attempt) =
             self.auth
                 .fingerprint_slot
@@ -330,46 +461,108 @@ impl Runtime {
             self.control.finish_unlock(origin, false);
             return;
         };
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (send, steps) = mpsc::channel();
-        let wake = self.wake.clone();
-        let step: Arc<dyn Fn(FingerprintStep) + Send + Sync> = Arc::new(move |step| {
-            if send.send(step).is_ok() {
-                wake.signal();
-            }
-        });
-        let worker_cancel = cancel.clone();
         let completion = self.wake.completion();
         let worker = std::thread::Builder::new()
             .name("tuna-fingerprint".into())
             .spawn(move || {
                 let _completion = completion;
-                match crate::fprintd::Fprintd::connect() {
-                    Some(mut client) => {
-                        crate::unlock::run_fingerprint(&mut client, &user, &worker_cancel, step)
-                    }
-                    None => FingerprintEnd::Unavailable,
-                }
+                probe_fingerprint(&user)
             });
         match worker {
             Ok(worker) => {
                 self.auth.fingerprint = Some(FingerprintConversation {
                     attempt,
                     origin,
-                    cancel,
-                    steps,
-                    worker: Some(worker),
+                    stage: FingerprintStage::Probe(Some(worker)),
+                    rejected: false,
                     canceled: false,
                 });
             }
             Err(_) => {
                 // Nothing ran: the attempt retires on the spot.
-                self.auth
-                    .fingerprint_slot
-                    .retire_fingerprint(attempt, &FingerprintEnd::Unavailable);
+                self.auth.fingerprint_slot.retire_pam_method(
+                    attempt,
+                    MethodKind::Fingerprint,
+                    Verification::RejectedBeforeSpawn,
+                );
                 self.refuse_verification(origin, AuthService::Fingerprint);
             }
         }
+    }
+
+    /// The probe offered fingerprint: start `pam_fprintd`'s conversation
+    /// on the fingerprint helper owner, or end the attempt refused.
+    fn start_fingerprint_pam(&mut self, swipe: bool) {
+        let conversation = self.auth.fingerprint.as_ref().expect("checked");
+        let (attempt, origin) = (conversation.attempt, conversation.origin);
+        let (Some(user), Some(backend)) = (
+            crate::unlock::session_user(),
+            crate::pam_backend::Backend::live_fingerprint(),
+        ) else {
+            return self.end_unstarted_fingerprint(Verification::RejectedBeforeSpawn, true);
+        };
+        let binding = Binding {
+            origin,
+            attempt: attempt.serial,
+            epoch: attempt.epoch,
+        };
+        let cancel = crate::pam_cancel::Cancellation::default();
+        match backend.begin_conversation(
+            crate::pam::fingerprint_service(),
+            user,
+            binding,
+            FINGERPRINT_POLICY,
+            cancel,
+        ) {
+            Ok(mut ticket) => {
+                let source = ticket.take_notice_source().and_then(|ping| {
+                    self.loop_handle
+                        .insert_source(ping, |_, _, _: &mut Runtime| {})
+                        .ok()
+                });
+                self.auth.fingerprint.as_mut().expect("checked").stage = FingerprintStage::Pam {
+                    binding,
+                    ticket,
+                    source,
+                    swipe,
+                };
+            }
+            Err(result) => self.end_unstarted_fingerprint(result, true),
+        }
+    }
+
+    /// End a fingerprint conversation whose helper never ran: retire its
+    /// attempt (or quarantine the service when the start cannot prove
+    /// that), then answer the begin, as unavailable when `refuse`.
+    fn end_unstarted_fingerprint(&mut self, result: Verification, refuse: bool) {
+        let conversation = self.auth.fingerprint.take().expect("checked");
+        if !self.auth.fingerprint_slot.retire_pam_method(
+            conversation.attempt,
+            MethodKind::Fingerprint,
+            result,
+        ) {
+            self.auth.fingerprint_quarantined = true;
+        }
+        self.trace_conversation(
+            "retired",
+            AuthService::Fingerprint,
+            conversation.origin,
+            serde_json::json!({
+                "retired": result.may_retire(),
+                "authenticated": false,
+                "canceled": conversation.canceled,
+                "started": false,
+            }),
+        );
+        let live = self.control.origin_pending_live(conversation.origin);
+        if refuse && live && !conversation.canceled {
+            self.send_auth(
+                conversation.origin,
+                AuthService::Fingerprint,
+                AuthEvent::Unavailable,
+            );
+        }
+        self.control.finish_unlock(conversation.origin, false);
     }
 
     /// The shell's answer to the outstanding question `sequence`. Any
@@ -657,40 +850,100 @@ impl Runtime {
         if !canceled && !self.conversation_live(attempt, origin) {
             self.auth.fingerprint.as_mut().expect("checked").cancel();
         }
-        let finished = self
-            .auth
-            .fingerprint
+        let conversation = self.auth.fingerprint.as_mut().expect("checked");
+        let FingerprintStage::Probe(worker) = &mut conversation.stage else {
+            return self.poll_fingerprint_pam(attempt, origin);
+        };
+        if !worker
             .as_ref()
-            .and_then(|conversation| conversation.worker.as_ref())
-            .is_none_or(std::thread::JoinHandle::is_finished);
-        let end = finished.then(|| {
-            let worker = self
-                .auth
-                .fingerprint
-                .as_mut()
-                .and_then(|conversation| conversation.worker.take());
-            // A panicked worker is joined too: nothing can report later.
-            worker.map_or(FingerprintEnd::Unavailable, |worker| {
-                worker.join().unwrap_or(FingerprintEnd::Unavailable)
-            })
+            .is_none_or(std::thread::JoinHandle::is_finished)
+        {
+            return;
+        }
+        // A panicked probe is joined too, and offers nothing.
+        let probe = worker.take().map_or(Probe::NotOffered, |worker| {
+            worker.join().unwrap_or(Probe::NotOffered)
         });
-        // Steps sent before the end are drained after the join as well.
-        let conversation = self.auth.fingerprint.as_ref().expect("checked");
-        let steps: Vec<_> = conversation.steps.try_iter().collect();
         let canceled = conversation.canceled;
-        for step in steps {
-            if canceled {
-                break;
+        match probe {
+            _ if canceled => {
+                self.end_unstarted_fingerprint(Verification::RejectedBeforeSpawn, false);
             }
-            let event = match step {
-                FingerprintStep::Scan { swipe } => AuthEvent::FingerprintScan { swipe },
-                FingerprintStep::Info(text) => AuthEvent::Info {
-                    text: text.to_owned(),
-                },
-                FingerprintStep::Problem(text) => AuthEvent::Problem {
-                    text: text.to_owned(),
-                },
-            };
+            Probe::Offered { swipe } => {
+                self.start_fingerprint_pam(swipe);
+            }
+            Probe::Disabled | Probe::NotOffered => {
+                self.end_unstarted_fingerprint(Verification::RejectedBeforeSpawn, true);
+            }
+        }
+    }
+
+    /// Relay `pam_fprintd`'s messages the way GNOME's
+    /// `authServicesLegacy.js` shows them (an info message is only the cue
+    /// for GNOME's own reader hint, an error message is shown), then act
+    /// on the retired PAM result.
+    fn poll_fingerprint_pam(&mut self, attempt: Attempt, origin: Origin) {
+        let mut events = Vec::new();
+        {
+            let conversation = self.auth.fingerprint.as_mut().expect("checked");
+            let mut cancel = false;
+            if let FingerprintStage::Pam {
+                binding,
+                ticket,
+                swipe,
+                ..
+            } = &mut conversation.stage
+            {
+                if !conversation.canceled {
+                    match ticket.try_challenge() {
+                        Ok(challenge) if challenge.binding == *binding => {
+                            // pam_fprintd only informs; a question has no
+                            // place in this conversation and ends it.
+                            if challenge.messages.iter().any(|message| {
+                                matches!(message.style, Style::Visible | Style::Secret)
+                            }) {
+                                cancel = true;
+                            } else {
+                                for message in &challenge.messages {
+                                    match message.style {
+                                        Style::Info => events
+                                            .push(AuthEvent::FingerprintScan { swipe: *swipe }),
+                                        Style::Error if !message.text.is_empty() => {
+                                            conversation.rejected = true;
+                                            events.push(AuthEvent::Problem {
+                                                text: message.text.clone(),
+                                            });
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                let answers = challenge
+                                    .messages
+                                    .iter()
+                                    .map(|message| Answer {
+                                        index: message.index,
+                                        text: None,
+                                    })
+                                    .collect();
+                                cancel = challenge
+                                    .response
+                                    .submit(challenge.binding, challenge.sequence, answers)
+                                    .is_err();
+                            }
+                        }
+                        // A challenge for another binding: never shown.
+                        Ok(_) => cancel = true,
+                        Err(_) => {}
+                    }
+                }
+            }
+            if cancel {
+                events.clear();
+                conversation.cancel();
+            }
+        }
+        for event in events {
+            // Recheck before every message: never show a stale one.
             if !self.conversation_live(attempt, origin)
                 || !self.send_auth(origin, AuthService::Fingerprint, event)
             {
@@ -698,18 +951,50 @@ impl Runtime {
                 break;
             }
         }
-        let Some(end) = end else {
+        // The result: only an actual retirement frees the fingerprint Slot.
+        let conversation = self.auth.fingerprint.as_mut().expect("checked");
+        let FingerprintStage::Pam { ticket, .. } = &mut conversation.stage else {
             return;
         };
+        let Some(result) = ticket.try_outcome() else {
+            return;
+        };
+        let refusal = ticket.refusal();
         let conversation = self.auth.fingerprint.take().expect("checked");
+        if let FingerprintStage::Pam {
+            source: Some(source),
+            ..
+        } = conversation.stage
+        {
+            self.loop_handle.remove(source);
+        }
         let live = self.control.origin_pending_live(origin);
+        if !result.may_retire() {
+            // A helper that did not retire keeps its attempt: fingerprint
+            // stays refused for the life of this compositor.
+            self.auth.fingerprint_quarantined = true;
+            self.trace_conversation(
+                "retired",
+                AuthService::Fingerprint,
+                origin,
+                serde_json::json!({ "retired": false }),
+            );
+            if live && !conversation.canceled {
+                self.send_auth(origin, AuthService::Fingerprint, AuthEvent::Unavailable);
+            }
+            self.control.finish_unlock(origin, false);
+            return;
+        }
         let completion_live =
             self.auth
                 .fingerprint_slot
                 .completion_live(attempt, &self.unlock_generation, live);
-        let retired = self.auth.fingerprint_slot.retire_fingerprint(attempt, &end);
-        let matched = retired
-            && end == FingerprintEnd::Matched
+        let retired =
+            self.auth
+                .fingerprint_slot
+                .retire_pam_method(attempt, MethodKind::Fingerprint, result);
+        let authenticated = retired
+            && result.authenticated()
             && completion_live
             && !conversation.canceled
             && self.auth.winner.is_none();
@@ -719,12 +1004,12 @@ impl Runtime {
             origin,
             serde_json::json!({
                 "retired": retired,
-                "authenticated": matched,
-                "end": format!("{end:?}"),
+                "authenticated": authenticated,
                 "canceled": conversation.canceled,
+                "refusal": refusal.map(|refusal| format!("{refusal:?}")),
             }),
         );
-        if matched {
+        if authenticated {
             self.auth.winner = Some(Winner {
                 origin,
                 service: AuthService::Fingerprint,
@@ -732,15 +1017,40 @@ impl Runtime {
             });
             return;
         }
-        // GDM 51 reports PAM_MAXTRIES like an unavailable service, with
-        // the max-tries message (gdm-session.c `report_and_stop_conversation`,
-        // GDM_SESSION_WORKER_ERROR_TOO_MANY_RETRIES): GNOME keeps the
-        // password prompt and leaves fingerprint off until the next reset.
-        if matches!(end, FingerprintEnd::Unavailable | FingerprintEnd::Failed)
-            && !conversation.canceled
-            && live
+        if conversation.rejected
+            || matches!(
+                refusal,
+                Some(Refusal::MaxTries | Refusal::Expired | Refusal::Failed)
+            )
         {
-            self.send_auth(origin, AuthService::Fingerprint, AuthEvent::Unavailable);
+            self.auth.note_fingerprint_failure(attempt.epoch);
+        }
+        // GDM 51 (`gdm-session-worker.c`): PAM_MAXTRIES is reported like an
+        // unavailable service with the max-tries message (TOO_MANY_RETRIES;
+        // GNOME keeps the password prompt and leaves fingerprint off until
+        // the next reset); PAM_AUTHINFO_UNAVAIL (a timed-out scan, no
+        // prints) is service-unavailable; an account refusal or any other
+        // failure is a problem with its friendly message, then the stop.
+        if !conversation.canceled && live && self.auth.winner.is_none() {
+            let (problem, unavailable) = match refusal {
+                Some(Refusal::MaxTries) => (Some(FINGERPRINT_MAX_TRIES), true),
+                Some(Refusal::Expired) => (Some(ACCOUNT_EXPIRED), false),
+                Some(Refusal::Failed) => (Some(FINGERPRINT_FAILED), false),
+                // No PAM result in time (the relay's watch ended it).
+                Some(Refusal::Unavailable) | None => (None, true),
+            };
+            if let Some(text) = problem {
+                self.send_auth(
+                    origin,
+                    AuthService::Fingerprint,
+                    AuthEvent::Problem {
+                        text: text.to_owned(),
+                    },
+                );
+            }
+            if unavailable {
+                self.send_auth(origin, AuthService::Fingerprint, AuthEvent::Unavailable);
+            }
         }
         self.control.finish_unlock(origin, false);
     }

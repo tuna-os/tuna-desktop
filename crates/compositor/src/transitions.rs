@@ -177,6 +177,14 @@ impl Curtain {
             .is_some_and(|leg| !leg.done(now) && leg.duration > 0.0)
     }
 
+    /// Whether the lock screen is shown at `now`: the session is locked
+    /// and the curtain has landed over the screen (`screenShield.js`
+    /// `_lockScreenShown`, the lowering's `onComplete`). Never while it
+    /// waits for the lock surface or is still lowering.
+    pub fn shown(&self, now: Duration) -> bool {
+        self.locked && self.waiting.is_none() && !self.moving(now) && self.value(now) <= 0.0
+    }
+
     /// The curtain at `now`, or `None` when it is fully lifted off an
     /// unlocked session (nothing to draw).
     pub fn frame(&self, now: Duration) -> Option<CurtainFrame> {
@@ -436,6 +444,12 @@ impl Transitions {
         self.curtain.frame(self.now)
     }
 
+    /// Whether the lock screen is shown this frame (see
+    /// [`Curtain::shown`]).
+    pub fn lock_shown(&self) -> bool {
+        self.curtain.shown(self.now)
+    }
+
     /// Whether an effect still needs frames (as of the last
     /// [`advance`](Self::advance)): a slide, its wait for the lock
     /// surface, the startup cover, ripples or the old screen. The frame
@@ -672,6 +686,62 @@ mod tests {
         assert!(!curtain.observe(true, true, at(t, 290), policy(MotionLevel::Full)));
         assert_eq!(curtain.frame(at(t, 290)).unwrap().lift, 0.0);
         assert!(!curtain.moving(at(t, 290)));
+    }
+
+    /// The shell reports the screen saver active, and gnome-settings-daemon
+    /// blanks the screen, only from here (#1050 guppy lock frame: a blank
+    /// right after locking froze the curtain on its first frame, the clock
+    /// off screen).
+    #[test]
+    fn the_lock_screen_is_shown_only_once_the_curtain_lands() {
+        let t = Duration::ZERO;
+        let mut fx = Transitions::new(t);
+        fx.set_policy(policy(MotionLevel::Full));
+        fx.advance(t, false, false, true);
+        assert!(!fx.lock_shown(), "unlocked");
+        fx.advance(at(t, 10), true, false, true);
+        assert!(!fx.lock_shown(), "waiting for the lock surface");
+        fx.advance(at(t, 20), true, true, true);
+        fx.advance(at(t, 27), true, true, true);
+        let first = fx.curtain().unwrap().lift;
+        assert!(first > 0.9, "the first frame is still almost off: {first}");
+        assert!(!fx.lock_shown(), "the first frame of the lowering");
+        fx.advance(at(t, 145), true, true, true);
+        assert!(!fx.lock_shown(), "half way down");
+        fx.advance(at(t, 270), true, true, true);
+        assert_eq!(fx.curtain().unwrap().lift, 0.0);
+        assert!(fx.lock_shown(), "landed");
+        fx.advance(at(t, 400), true, true, true);
+        assert!(fx.lock_shown(), "stays shown while locked");
+        fx.advance(at(t, 1000), false, true, true);
+        assert!(!fx.lock_shown(), "unlocking hides it at once");
+        // Locked again mid-lift: shown once it has settled back down.
+        fx.advance(at(t, 1100), true, true, true);
+        assert!(!fx.lock_shown(), "settling back down");
+        fx.advance(at(t, 1350), true, true, true);
+        assert!(fx.lock_shown());
+
+        // A missing lock surface: shown once the bare background lands.
+        let mut fx = Transitions::new(t);
+        fx.set_policy(policy(MotionLevel::Full));
+        fx.advance(t, true, false, true);
+        fx.advance(at(t, 500), true, false, true);
+        assert!(!fx.lock_shown());
+        fx.advance(at(t, 750), true, false, true);
+        assert!(fx.lock_shown());
+
+        // With animations off at once; under reduced motion after the fade.
+        let mut fx = Transitions::new(t);
+        fx.set_policy(policy(MotionLevel::Off));
+        fx.advance(t, true, true, true);
+        assert!(fx.lock_shown(), "animations off: no lowering to wait for");
+        let mut fx = Transitions::new(t);
+        fx.set_policy(policy(MotionLevel::FadeOnly));
+        fx.advance(t, true, true, true);
+        fx.advance(at(t, 125), true, true, true);
+        assert!(!fx.lock_shown(), "mid fade");
+        fx.advance(at(t, 250), true, true, true);
+        assert!(fx.lock_shown());
     }
 
     #[test]

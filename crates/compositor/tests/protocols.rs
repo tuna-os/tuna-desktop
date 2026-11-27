@@ -38,6 +38,10 @@ use wayland_protocols::xdg::{
     },
 };
 
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_dmabuf_feedback_v1::{self, ZwpLinuxDmabufFeedbackV1},
+    zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+};
 use wayland_protocols::xdg::toplevel_icon::v1::client::{
     xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1, xdg_toplevel_icon_v1::XdgToplevelIconV1,
 };
@@ -86,10 +90,12 @@ const ROUNDS: usize = 200;
 /// version. linux-dmabuf joins once a renderer reports formats (see
 /// below), and wl_output once an output is connected.
 const EXPECTED: &[(&str, u32)] = &[
+    ("ext_background_effect_manager_v1", 1),
     ("ext_idle_notifier_v1", 2),
     ("ext_session_lock_manager_v1", 1),
     ("wl_compositor", 6),
     ("wl_data_device_manager", 3),
+    ("wl_fixes", 1),
     ("wl_seat", 9),
     ("wl_shm", 2),
     ("wl_subcompositor", 1),
@@ -109,7 +115,7 @@ const EXPECTED: &[(&str, u32)] = &[
     ("xdg_system_bell_v1", 1),
     ("xdg_toplevel_icon_manager_v1", 1),
     ("xdg_toplevel_tag_manager_v1", 1),
-    ("xdg_wm_base", 6),
+    ("xdg_wm_base", 7),
     ("xdg_wm_dialog_v1", 1),
     ("zwp_idle_inhibit_manager_v1", 1),
     ("zwp_keyboard_shortcuts_inhibit_manager_v1", 1),
@@ -119,7 +125,9 @@ const EXPECTED: &[(&str, u32)] = &[
     ("zwp_relative_pointer_manager_v1", 1),
     ("zwp_tablet_manager_v2", 2),
     ("zwp_text_input_manager_v3", 1),
+    ("zxdg_exporter_v1", 1),
     ("zxdg_exporter_v2", 1),
+    ("zxdg_importer_v1", 1),
     ("zxdg_importer_v2", 1),
     ("zxdg_output_manager_v1", 3),
 ];
@@ -158,6 +166,8 @@ struct Client {
     icons: Option<XdgToplevelIconManagerV1>,
     shm: Option<wayland_client::protocol::wl_shm::WlShm>,
     keyboard_serial: Option<u32>,
+    /// Interfaces each tagged registry announced.
+    tagged: BTreeMap<u32, Vec<String>>,
     token: Option<String>,
     /// ext-idle-notify events by notification tag: `true` for idled.
     idle_events: Vec<(u32, bool)>,
@@ -282,6 +292,23 @@ wayland_client::delegate_noop!(Client: ignore WlCompositor);
 wayland_client::delegate_noop!(Client: ignore WlSurface);
 wayland_client::delegate_noop!(Client: ignore XdgToplevel);
 wayland_client::delegate_noop!(Client: ignore XdgActivationV1);
+wayland_client::delegate_noop!(Client: ignore wayland_client::protocol::wl_fixes::WlFixes);
+
+/// A second registry, tagged: the interfaces each one announced.
+impl Dispatch<WlRegistry, u32> for Client {
+    fn event(
+        state: &mut Self,
+        _: &WlRegistry,
+        event: wl_registry::Event,
+        tag: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global { interface, .. } = event {
+            state.tagged.entry(*tag).or_default().push(interface);
+        }
+    }
+}
 
 impl Dispatch<ExtIdleNotificationV1, u32> for Client {
     fn event(
@@ -517,22 +544,222 @@ fn layer_shell_is_visible_and_bindable_only_by_the_supervised_shell() {
 fn dmabuf_is_advertised_only_with_renderer_formats() {
     let mut comp = TestCompositor::new();
     let mut manager = comp.window_manager();
-    comp.state.enable_dmabuf(Vec::new());
+    comp.state.enable_dmabuf(Vec::new(), Some(RENDER_NODE));
     let mut peer = connect(&mut comp);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert!(!peer.client.globals.contains_key("zwp_linux_dmabuf_v1"));
 
-    comp.state
-        .enable_dmabuf(vec![smithay::backend::allocator::Format {
+    // No renderer device: version 3, as Mutter without
+    // EGL_EXT_device_drm(_render_node).
+    comp.state.enable_dmabuf(
+        vec![smithay::backend::allocator::Format {
             code: Fourcc::Argb8888,
             modifier: Modifier::Linear,
-        }]);
+        }],
+        None,
+    );
     let mut late = connect(&mut comp);
     pump(&mut comp, &mut manager, &mut [&mut late]);
     assert_eq!(
         late.client.globals.get("zwp_linux_dmabuf_v1").map(|g| g.1),
         Some(3)
     );
+}
+
+/// renderD128's device number (major 226, minor 128).
+const RENDER_NODE: u64 = (226 << 8) | 128;
+
+#[derive(Default)]
+struct Feedback {
+    main_device: Option<Vec<u8>>,
+    table: Option<(std::os::fd::OwnedFd, u32)>,
+    target_device: Option<Vec<u8>>,
+    indices: Vec<u16>,
+    tranche_flags: Option<u32>,
+    tranches: usize,
+    done: bool,
+}
+
+#[derive(Default)]
+struct DmabufClient {
+    globals: BTreeMap<String, (u32, u32)>,
+    feedback: Feedback,
+}
+
+impl Dispatch<WlRegistry, ()> for DmabufClient {
+    fn event(
+        state: &mut Self,
+        _: &WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
+            state.globals.insert(interface, (name, version));
+        }
+    }
+}
+
+impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for DmabufClient {
+    fn event(
+        state: &mut Self,
+        _: &ZwpLinuxDmabufFeedbackV1,
+        event: zwp_linux_dmabuf_feedback_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use zwp_linux_dmabuf_feedback_v1::Event;
+        let feedback = &mut state.feedback;
+        match event {
+            Event::MainDevice { device } => feedback.main_device = Some(device),
+            Event::FormatTable { fd, size } => feedback.table = Some((fd, size)),
+            Event::TrancheTargetDevice { device } => feedback.target_device = Some(device),
+            Event::TrancheFormats { indices } => feedback.indices.extend(
+                indices
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|i| u16::from_ne_bytes(*i)),
+            ),
+            Event::TrancheFlags { flags } => {
+                feedback.tranche_flags = Some(match flags {
+                    wayland_client::WEnum::Value(flags) => flags.bits(),
+                    wayland_client::WEnum::Unknown(bits) => bits,
+                })
+            }
+            Event::TrancheDone => feedback.tranches += 1,
+            Event::Done => feedback.done = true,
+            _ => {}
+        }
+    }
+}
+
+wayland_client::delegate_noop!(DmabufClient: ignore ZwpLinuxDmabufV1);
+
+#[test]
+fn dmabuf_feedback_names_the_renderer_device_like_mutter() {
+    // Mutter 51 (meta-wayland-dma-buf.c): with the EGL device's node the
+    // global is version 5 and the default feedback names that device
+    // with one tranche of the renderer's formats.
+    let mut comp = TestCompositor::new();
+    let formats = [
+        (Fourcc::Argb8888, Modifier::Linear),
+        (Fourcc::Xrgb8888, Modifier::Invalid),
+    ];
+    comp.state.enable_dmabuf(
+        formats
+            .iter()
+            .map(|&(code, modifier)| smithay::backend::allocator::Format { code, modifier })
+            .collect(),
+        Some(RENDER_NODE),
+    );
+    let (server, stream) = UnixStream::pair().unwrap();
+    comp.add_client(server);
+    let conn = Connection::from_socket(stream).unwrap();
+    let mut queue = conn.new_event_queue();
+    let qh = queue.handle();
+    let registry = conn.display().get_registry(&qh, ());
+    let mut client = DmabufClient::default();
+    let mut pump = |client: &mut DmabufClient, comp: &mut TestCompositor| {
+        for _ in 0..10 {
+            queue.flush().unwrap();
+            comp.pump();
+            if let Some(guard) = queue.prepare_read() {
+                let _ = guard.read();
+            }
+            queue.dispatch_pending(client).unwrap();
+        }
+    };
+    pump(&mut client, &mut comp);
+    let (name, version) = client.globals["zwp_linux_dmabuf_v1"];
+    assert_eq!(version, 5);
+    let dmabuf: ZwpLinuxDmabufV1 = registry.bind(name, 5, &qh, ());
+    let _feedback = dmabuf.get_default_feedback(&qh, ());
+    pump(&mut client, &mut comp);
+
+    let feedback = &client.feedback;
+    assert!(feedback.done);
+    let device = RENDER_NODE.to_ne_bytes().to_vec();
+    assert_eq!(feedback.main_device.as_ref(), Some(&device));
+    assert_eq!(feedback.target_device.as_ref(), Some(&device));
+    assert_eq!(feedback.tranches, 1);
+    assert_eq!(feedback.tranche_flags, Some(0), "no scanout tranche");
+
+    // The format table: 16-byte (format, padding, modifier) entries the
+    // tranche indexes.
+    let (fd, size) = feedback.table.as_ref().expect("format table");
+    let mut table = vec![0u8; *size as usize];
+    let mut file = std::fs::File::from(fd.try_clone().unwrap());
+    std::io::Read::read_exact(&mut file, &mut table).unwrap();
+    let mut offered: Vec<(u32, u64)> = feedback
+        .indices
+        .iter()
+        .map(|&i| {
+            let entry = &table[usize::from(i) * 16..usize::from(i) * 16 + 16];
+            (
+                u32::from_ne_bytes(entry[0..4].try_into().unwrap()),
+                u64::from_ne_bytes(entry[8..16].try_into().unwrap()),
+            )
+        })
+        .collect();
+    offered.sort();
+    let mut expected: Vec<(u32, u64)> = formats
+        .iter()
+        .map(|&(code, modifier)| (code as u32, u64::from(modifier)))
+        .collect();
+    expected.sort();
+    assert_eq!(offered, expected);
+}
+
+#[test]
+fn wl_fixes_destroys_a_registry_and_its_announcements_stop() {
+    // Mutter 51 (meta-wayland-fixes.c): destroy_registry destroys the
+    // registry resource; later globals are announced to live registries
+    // only.
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    let mut peer = connect(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let qh = peer.queue.handle();
+    let (name, version) = peer.client.globals["wl_fixes"];
+    assert_eq!(version, 1);
+    let kept = peer._conn.display().get_registry(&qh, 1u32);
+    let dropped = peer._conn.display().get_registry(&qh, 2u32);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let fixes: wayland_client::protocol::wl_fixes::WlFixes = kept.bind(name, 1, &qh, ());
+    assert!(peer.client.tagged[&2].iter().any(|i| i == "wl_compositor"));
+    fixes.destroy_registry(&dropped);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+
+    // A new global: the renderer reports dmabuf formats.
+    let dmabuf = "zwp_linux_dmabuf_v1";
+    assert!(!peer.client.tagged[&1].iter().any(|i| i == dmabuf));
+    comp.state.enable_dmabuf(
+        vec![smithay::backend::allocator::Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::Linear,
+        }],
+        None,
+    );
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(
+        peer.client.tagged[&1].iter().any(|i| i == dmabuf),
+        "a live registry hears the new global"
+    );
+    assert!(
+        !peer.client.tagged[&2].iter().any(|i| i == dmabuf),
+        "a destroyed registry hears nothing more"
+    );
+    fixes.destroy();
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(peer.queue.dispatch_pending(&mut peer.client).is_ok());
 }
 
 fn mint(peer: &mut Peer, with_serial: bool) -> XdgActivationTokenV1 {
@@ -824,17 +1051,17 @@ fn idle_notifications_fire_after_their_timeout_and_resume_on_input() {
     let _input = notifier.get_input_idle_notification(10_000, &seat, &qh, INPUT_ONLY);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
 
-    comp.idle_tick(at(5));
+    comp.idle_tick(&manager, at(5));
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert!(peer.client.idle_events.is_empty(), "not idle yet");
 
-    comp.idle_tick(at(60));
+    comp.idle_tick(&manager, at(60));
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(
         std::mem::take(&mut peer.client.idle_events),
         [(PLAIN, true), (INPUT_ONLY, true)]
     );
-    comp.idle_tick(at(61));
+    comp.idle_tick(&manager, at(61));
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert!(peer.client.idle_events.is_empty(), "idled once per stretch");
 
@@ -845,10 +1072,10 @@ fn idle_notifications_fire_after_their_timeout_and_resume_on_input() {
         std::mem::take(&mut peer.client.idle_events),
         [(PLAIN, false), (INPUT_ONLY, false)]
     );
-    comp.idle_tick(at(70));
+    comp.idle_tick(&manager, at(70));
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert!(peer.client.idle_events.is_empty(), "the timeout restarted");
-    comp.idle_tick(at(72));
+    comp.idle_tick(&manager, at(72));
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(
         std::mem::take(&mut peer.client.idle_events),
@@ -856,10 +1083,37 @@ fn idle_notifications_fire_after_their_timeout_and_resume_on_input() {
     );
 }
 
+/// Give `surface` a 1×1 buffer: a toplevel's window shows.
+fn attach_pixel(peer: &mut Peer, surface: &WlSurface) {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    let qh = peer.queue.handle();
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(&0xff123456u32.to_ne_bytes()).unwrap();
+    let pool = peer
+        .client
+        .shm
+        .as_ref()
+        .unwrap()
+        .create_pool(file.as_fd(), 4, &qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        1,
+        1,
+        4,
+        wayland_client::protocol::wl_shm::Format::Argb8888,
+        &qh,
+        (),
+    );
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+}
+
 #[test]
 fn idle_inhibitors_hold_back_only_ordinary_idle_notifications() {
     let mut comp = TestCompositor::new();
     let mut manager = comp.window_manager();
+    comp.state.set_output_size(800, 600);
     let mut peer = connect(&mut comp);
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     let qh = peer.queue.handle();
@@ -867,12 +1121,10 @@ fn idle_inhibitors_hold_back_only_ordinary_idle_notifications() {
     let seat = peer.client.seat.clone().unwrap();
     let (name, _) = peer.client.globals["zwp_idle_inhibit_manager_v1"];
     let inhibit: ZwpIdleInhibitManagerV1 = peer.registry.bind(name, 1, &qh, ());
-    let surface = peer
-        .client
-        .compositor
-        .as_ref()
-        .unwrap()
-        .create_surface(&qh, ());
+    let surface = window(&mut peer, "Player");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    attach_pixel(&mut peer, &surface);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
     let inhibitor = inhibit.create_inhibitor(&surface, &qh, ());
     let start = Instant::now();
     let at = |secs| start + Duration::from_secs(secs);
@@ -881,7 +1133,7 @@ fn idle_inhibitors_hold_back_only_ordinary_idle_notifications() {
     pump(&mut comp, &mut manager, &mut [&mut peer]);
 
     // get_input_idle_notification ignores the inhibitor; the other waits.
-    comp.idle_tick(at(60));
+    comp.idle_tick(&manager, at(60));
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(
         std::mem::take(&mut peer.client.idle_events),
@@ -891,10 +1143,10 @@ fn idle_inhibitors_hold_back_only_ordinary_idle_notifications() {
     // Once the inhibitor goes, the held notification's timeout starts.
     inhibitor.destroy();
     pump(&mut comp, &mut manager, &mut [&mut peer]);
-    comp.idle_tick(at(65));
+    comp.idle_tick(&manager, at(65));
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert!(peer.client.idle_events.is_empty());
-    comp.idle_tick(at(76));
+    comp.idle_tick(&manager, at(76));
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(
         std::mem::take(&mut peer.client.idle_events),
@@ -904,7 +1156,58 @@ fn idle_inhibitors_hold_back_only_ordinary_idle_notifications() {
     // A new inhibitor ends the ordinary notification's idleness only.
     let _again = inhibit.create_inhibitor(&surface, &qh, ());
     pump(&mut comp, &mut manager, &mut [&mut peer]);
-    comp.idle_tick(at(77));
+    comp.idle_tick(&manager, at(77));
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        std::mem::take(&mut peer.client.idle_events),
+        [(PLAIN, false)]
+    );
+}
+
+#[test]
+fn an_inhibitor_on_a_surface_nobody_sees_holds_back_no_idleness() {
+    // A background client's never-mapped surface, or a window that never
+    // drew, must not keep the session from idling and locking:
+    // zwp_idle_inhibit_v1 inhibitors lapse while their surface is
+    // unmapped or not visible.
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    comp.state.set_output_size(800, 600);
+    let mut peer = connect(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let qh = peer.queue.handle();
+    let notifier = idle_notifier(&peer);
+    let seat = peer.client.seat.clone().unwrap();
+    let (name, _) = peer.client.globals["zwp_idle_inhibit_manager_v1"];
+    let inhibit: ZwpIdleInhibitManagerV1 = peer.registry.bind(name, 1, &qh, ());
+    let unmapped = peer
+        .client
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_surface(&qh, ());
+    let _unmapped = inhibit.create_inhibitor(&unmapped, &qh, ());
+    let undrawn = window(&mut peer, "Undrawn");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let _undrawn = inhibit.create_inhibitor(&undrawn, &qh, ());
+    let start = Instant::now();
+    let at = |secs| start + Duration::from_secs(secs);
+    let _plain = notifier.get_idle_notification(10_000, &seat, &qh, PLAIN);
+    let _input = notifier.get_input_idle_notification(10_000, &seat, &qh, INPUT_ONLY);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+
+    comp.idle_tick(&manager, at(60));
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert_eq!(
+        std::mem::take(&mut peer.client.idle_events),
+        [(PLAIN, true), (INPUT_ONLY, true)],
+        "the idle lock's notification fires through both inhibitors"
+    );
+
+    // Once the window draws, the user sees it and its inhibitor holds.
+    attach_pixel(&mut peer, &undrawn);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    comp.idle_tick(&manager, at(61));
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(
         std::mem::take(&mut peer.client.idle_events),
@@ -1005,4 +1308,50 @@ fn content_type_hint_is_recorded_per_surface_on_commit() {
     surface.commit();
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert_eq!(surface_content_type(&mapped), Type::Video);
+}
+
+/// #1193, mutter 51 `token_commit` / `maybe_activate`: a minted
+/// activation token is a pending startup sequence (the busy cursor) until
+/// a window activates with it; one that never does times out after
+/// `STARTUP_TIMEOUT_MS`. A refused mint starts nothing.
+#[test]
+fn activation_tokens_are_startup_sequences_until_used() {
+    let mut comp = TestCompositor::new();
+    let mut manager = comp.window_manager();
+    let mut peer = connect(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let first = window(&mut peer, "first");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let _second = window(&mut peer, "second");
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let _refused = mint(&mut peer, false);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(
+        !comp.state.startup.pending(Instant::now()),
+        "no serial, no sequence"
+    );
+    peer.client.token = None;
+    let _token = mint(&mut peer, true);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    let token = peer.client.token.take().expect("token issued");
+    assert!(
+        comp.state.startup.pending(Instant::now()),
+        "busy while pending"
+    );
+    assert!(
+        !comp.state.startup.pending(
+            Instant::now() + tuna_compositor::startup::STARTUP_TIMEOUT + Duration::from_millis(1)
+        ),
+        "a sequence never used times out"
+    );
+    peer.client
+        .activation
+        .as_ref()
+        .unwrap()
+        .activate(token, &first);
+    pump(&mut comp, &mut manager, &mut [&mut peer]);
+    assert!(
+        !comp.state.startup.pending(Instant::now()),
+        "used: complete"
+    );
 }

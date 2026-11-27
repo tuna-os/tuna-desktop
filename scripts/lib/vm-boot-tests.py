@@ -454,6 +454,14 @@ class DeviceInventoryProjection(unittest.TestCase):
         self.assertIn("input_devices", projected)
         self.assertIsNone(projected["input_devices"])
 
+    def test_power_save_mode_and_rendered_frames_reach_v_unlock_wake(self):
+        # V-UNLOCK-WAKE reads the blank and the frames after the wake from
+        # the inventory alone.
+        state = self.state() | {"power_save_mode": 3, "rendered_frames": 1234}
+        projected = self.inventory(state)["state"]
+        self.assertEqual((projected["power_save_mode"], projected["rendered_frames"]), (3, 1234))
+        self.assertIsNone(self.inventory(self.state())["state"]["rendered_frames"])
+
 
 class OrcaCommandWindow(unittest.TestCase):
     def check(self, started=10.0, ready=10.5, before=11.0, after=11.1, samples=96000):
@@ -1536,6 +1544,7 @@ class PublicOrcaNavigation(unittest.TestCase):
         class Node:
             def __init__(self, key, role, name, children=()):
                 self.key, self.role, self.name, self.children = key, role, name, children
+                self.path = f"/org/gtk/a11y/{key}"
             def clear_cache(self):
                 pass
             def get_state_set(self):
@@ -1569,7 +1578,7 @@ class PublicOrcaNavigation(unittest.TestCase):
                  "notification_frames": [], "notification_closes": [], "search_entries": [],
                  "target": {"showing": 0, "focused": 0, "present": 0}, "focused_roles": [],
                  "controlled": False, "end_session": mode == "end-session", "logout_name": None,
-                 "notification": mode == "notification-banner", "deadline": 8,
+                 "notification": mode == "notification-banner", "fixture_control": False, "deadline": 8,
                  "time": SimpleNamespace(monotonic=lambda: 0), "unlocked": lambda: None,
                  "accessibility_query": lambda method, *args: method(*args),
                  "Atspi": SimpleNamespace(
@@ -1599,6 +1608,16 @@ class PublicOrcaNavigation(unittest.TestCase):
         self.assertEqual(scope["notification_closes"], [])
         for private in ("private", "Notifications", "Close"):
             self.assertNotIn(private, json.dumps(scope["nodes"]))
+        # Injected-tree policy coverage only, not native AT-SPI or VM qualification.
+
+    def test_notification_traversal_names_the_close_instance_never_the_content(self):
+        # The strip gate tells queued banners apart by the Close widget's
+        # accessible path (marlin-vm run 44442598008), never by their text.
+        scope, calls, _ = self.focus_mode_tree("notification-banner")
+        self.assertEqual(scope["notification_frames"], [[10, 20, 30, 40]])
+        self.assertEqual(scope["notification_closes"],
+                         [{"rect": [10, 20, 30, 40], "focused": True, "path": "/org/gtk/a11y/close"}])
+        self.assertNotIn("private", json.dumps(scope["notification_closes"]))
         # Injected-tree policy coverage only, not native AT-SPI or VM qualification.
 
     def test_public_speech_tokens_never_retain_arbitrary_presenter_text(self):
@@ -3820,6 +3839,134 @@ class S3AbsoluteDeadline(unittest.TestCase):
         self.assertIn("no guest-exec", receipt["scope"])
 
 
+class SleepDelayGate(unittest.TestCase):
+    """G3: the unlocked desktop's logind sleep delay inhibitor, released
+    only once the lock showed on every output."""
+    UID = 1000
+    RECORD = {"held": True, "prepared": 0, "released_locked": 0,
+              "released_unlocked": 0, "overrun": 0}
+
+    def row(self, **changes):
+        return {"what": "sleep", "who": "Tuna Desktop", "why": "Tuna Desktop needs to lock the screen",
+                "mode": "delay", "uid": self.UID, "pid": 4242, **changes}
+
+    def snapshot(self, **state):
+        return {"session_uid": self.UID,
+                "state": {"locked": False, "sleep_delay": dict(self.RECORD), **state},
+                "processes": [{"pid": 4242, "executable": "tuna-compositor"},
+                              {"pid": 4300, "executable": "tuna-shell-gtk"}]}
+
+    def test_held_needs_the_unlocked_record_and_the_compositor_delay_row(self):
+        rows = [self.row(what="handle-power-key", mode="block", pid=77), self.row()]
+        self.assertTrue(lane.sleep_delay_held(self.snapshot(), rows))
+        self.assertTrue(lane.sleep_delay_held(self.snapshot(), [self.row(what="shutdown:sleep")]))
+        for name, snapshot, listed in (
+            ("locked", self.snapshot(locked=True), rows),
+            ("record released", self.snapshot(sleep_delay={**self.RECORD, "held": False}), rows),
+            ("published build without the record", self.snapshot(sleep_delay=None), rows),
+            ("malformed count", self.snapshot(sleep_delay={**self.RECORD, "overrun": True}), rows),
+            ("block mode", self.snapshot(), [self.row(mode="block")]),
+            ("not sleep", self.snapshot(), [self.row(what="shutdown")]),
+            ("other holder", self.snapshot(), [self.row(who="GNOME Shell")]),
+            ("other pid", self.snapshot(), [self.row(pid=4300)]),
+            ("other uid", self.snapshot(), [self.row(uid=0)]),
+            ("nothing listed", self.snapshot(), []),
+        ):
+            with self.subTest(name):
+                self.assertFalse(lane.sleep_delay_held(snapshot, listed))
+
+    def test_released_locked_needs_one_release_on_a_shown_lock_and_a_retaken_inhibitor(self):
+        after = {**self.RECORD, "prepared": 1, "released_locked": 1}
+        self.assertTrue(lane.sleep_delay_released_locked(self.RECORD, after))
+        for name, before, changed in (
+            ("logind overran the delay", self.RECORD, {**after, "overrun": 1}),
+            ("released unlocked", self.RECORD, {**after, "released_locked": 0, "released_unlocked": 1}),
+            ("never released", self.RECORD, {**after, "released_locked": 0}),
+            ("no sleep seen", self.RECORD, {**after, "prepared": 0}),
+            ("two sleeps", self.RECORD, {**after, "prepared": 2, "released_locked": 2}),
+            ("not taken again", self.RECORD, {**after, "held": False}),
+            ("not held before", {**self.RECORD, "held": False}, after),
+            ("missing record", self.RECORD, None),
+        ):
+            with self.subTest(name):
+                self.assertFalse(lane.sleep_delay_released_locked(before, changed))
+
+    def lifecycle_block(self):
+        source = Path(__file__).resolve().parents[1] / "tuna-vm-lane"
+        lifecycle = next(n for n in ast.parse(source.read_text()).body
+                         if isinstance(n, ast.FunctionDef) and n.name == "run_lifecycle")
+        body = lifecycle.body
+        start = next(i for i, n in enumerate(body) if "sleep-delay-before" in ast.dump(n))
+        end = next(i for i, n in enumerate(body) if i > start and "unlocked_again" in ast.dump(n)
+                   and isinstance(n, ast.If))
+        return source, body, start, end
+
+    def test_the_unlocked_desktop_suspends_before_the_prelocked_stale_auth_sleep(self):
+        _, body, start, end = self.lifecycle_block()
+        unlocked = next(i for i, n in enumerate(body) if "V-SUSPEND-UNLOCKED" in ast.dump(n))
+        prelocked = next(i for i, n in enumerate(body) if "delay-unlock" in ast.dump(n))
+        self.assertLess(start, unlocked)
+        self.assertLess(end, prelocked)
+
+    def run_block(self, before_state, after_state):
+        source, body, start, end = self.lifecycle_block()
+        events, records = [], {}
+        before = self.snapshot()
+        unlocked = {**before, "state": {**before["state"], "locked": False}}
+        def inventory(label):
+            events.append(("inventory", label))
+            return {**before, "state": {**before["state"], "sleep_delay": before_state}}
+        def await_state(predicate, timeout=15, label=None):
+            for state in ({**before, "state": {**before["state"], "locked": True, "sleep_delay": after_state}},
+                          unlocked):
+                if predicate(state):
+                    events.append(("await", label))
+                    return state
+            raise RuntimeError("state never observed")
+        agent = SimpleNamespace(run=lambda action: events.append(("agent", action))
+                                or {"inhibitors": [self.row()], "listing": "Tuna Desktop sleep delay"})
+        with tempfile.TemporaryDirectory() as tmp:
+            scope = dict(inventory=inventory, await_state=await_state, agent=agent, evidence=tmp,
+                         os=lane.os, json=json, before=before,
+                         same_apps=lambda old, new: old["processes"] == new["processes"],
+                         sleep_delay_held=lane.sleep_delay_held,
+                         sleep_delay_record=lane.sleep_delay_record,
+                         sleep_delay_released_locked=lane.sleep_delay_released_locked,
+                         record=lambda name, ok, detail: events.append(("record", name))
+                         or records.__setitem__(name, ok),
+                         suspend_and_check=lambda label, test_id: events.append(("suspend", test_id)),
+                         qmp=SimpleNamespace(keys=lambda *keys: events.append(("keys", keys)),
+                                             type_text=lambda text: events.append(("type", text))),
+                         time=SimpleNamespace(sleep=lambda _: None))
+            try:
+                exec(compile(ast.Module(body=body[start:end + 1], type_ignores=[]), str(source), "exec"), scope)
+            finally:
+                with open(os.path.join(tmp, "sleep-delay-before.json")) as stream:
+                    self.assertEqual(json.load(stream)["sleep_delay"], before_state)
+        return events, records
+
+    def test_lifecycle_gates_the_unlocked_suspend_on_the_delay_record(self):
+        after = {**self.RECORD, "prepared": 1, "released_locked": 1}
+        events, records = self.run_block(dict(self.RECORD), after)
+        self.assertEqual(records, {"V-SLEEP-DELAY-INHIBITOR": True, "V-SUSPEND-LOCKED-FRAME": True})
+        self.assertEqual(events[:4], [("inventory", "sleep-delay-before"), ("agent", "sleep-inhibitors"),
+                                      ("record", "V-SLEEP-DELAY-INHIBITOR"), ("suspend", "V-SUSPEND-UNLOCKED")])
+        self.assertIn(("type", "tuna"), events)
+        # The wake can leave the prompt open: Escape before the Enter that
+        # raises the curtain, or that Enter submits an empty password.
+        keys = [event for event in events if event[0] == "keys"]
+        self.assertEqual(keys[:2], [("keys", ("esc",)), ("keys", ("ret",))])
+
+    def test_no_inhibitor_means_no_suspend(self):
+        with self.assertRaisesRegex(RuntimeError, "no compositor sleep delay inhibitor"):
+            self.run_block({**self.RECORD, "held": False}, None)
+
+    def test_overrun_fails_the_locked_frame_gate(self):
+        after = {**self.RECORD, "prepared": 1, "overrun": 1}
+        with self.assertRaisesRegex(RuntimeError, "sleep delay not released on a presented lock"):
+            self.run_block(dict(self.RECORD), after)
+
+
 class ShippedSnapshotInventory(unittest.TestCase):
     # Run 37696030597: the graphical PAM login produced a real login
     # session, yet every inventory() probe failed because the published
@@ -3886,6 +4033,16 @@ class ShippedSnapshotInventory(unittest.TestCase):
         self.assertTrue(result["state"]["overview_open"])
         self.assertIsNone(result["state"]["pointer_position"])
         self.assertIsNone(result["state"]["native_relative_motion_count"])
+        self.assertIsNone(result["state"]["sleep_delay"])
+
+    def test_inventory_reports_the_compositor_sleep_delay_record(self):
+        uid = os.getuid()
+        record = {"held": True, "prepared": 0, "released_locked": 0,
+                  "released_unlocked": 0, "overrun": 0}
+        result = self.run_inventory({**self.SHIPPED_STATE, "sleep_delay": record}, [
+            ("3", f"{uid} tuna-test seat0 tty1"),
+        ])
+        self.assertEqual(result["state"]["sleep_delay"], record)
 
     def test_historical_archive_inventory_reports_actual_retired_executable(self):
         # Inventory reports archival identities verbatim; it does not qualify them.
@@ -4160,6 +4317,9 @@ class FixtureLoginSession(unittest.TestCase):
                              "display-manager.service)\" = /usr/lib/systemd/system/gdm.service"):
                     self.assertIn(path, containerfile)
                 self.assertNotIn("AutomaticLogin", containerfile.replace("AutomaticLoginEnable|TimedLoginEnable", ""))
+        # Fingerprint unlock's PAM service (#1162 F5) postdates the published
+        # images, so only the current-build fixture hashes it.
+        self.assertIn("/etc/pam.d/tuna-lock /etc/pam.d/tuna-lock-fingerprint", self.fixture("Containerfile"))
 
     def test_both_fixtures_install_the_guest_helpers_the_lifecycle_runs(self):
         # The strict published lifecycle (#994) runs the current build's probes:
@@ -4944,6 +5104,59 @@ class InventoryProcessRaces(unittest.TestCase):
         message, log = self.transport(output)
         self.assertEqual(message, "guest lifecycle inventory failed (exit=1): " + json.dumps(record))
         self.assertEqual(log, "tuna-vm-lane: inventory failure " + json.dumps(record) + "\n")
+
+    STATE_READ_RECORD = {"stage": "state-read", "exception_type": "FileNotFoundError",
+                         "code": "observation-exception", "errno": 2,
+                         "frames": [["main", 2752], ["inventory", 458]]}
+
+    def await_login(self, failures):
+        """lane.await_login over a real GuestAgent whose first `failures`
+        inventory polls fail at state-read (None: every poll). Returns
+        ((started, login), host log, the guest's login-session reply)."""
+        import contextlib
+        actor = lane.guest_agent.GuestAgent.__new__(lane.guest_agent.GuestAgent)
+        login = {"probe_uid": 0, "session_uid": 1000, "desktop": ["tuna-compositor"],
+                 "session": {"Service": lane.LOGIN_SERVICE, "User": "1000"}}
+        owner = {"probe_uid": 0, "session_uid": 1000, "session": login["session"],
+                 "processes": [{"executable": "tuna-compositor"}]}
+        actions = []
+
+        def command(name, **arguments):
+            if name == "guest-exec":
+                actions.append(arguments["arg"][0])
+                return {"pid": len(actions)}
+            if actions[-1] == "login-session":
+                exitcode, output = 0, login
+            elif failures is None or actions.count("inventory") <= failures:
+                exitcode, output = 1, {"inventory_error": self.STATE_READ_RECORD}
+            else:
+                exitcode, output = 0, owner
+            return {"exited": True, "exitcode": exitcode,
+                    "out-data": base64.b64encode(json.dumps(output).encode()).decode()}
+        clock = [1000.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log), patch.object(actor, "command", side_effect=command), \
+                patch.object(lane.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(lane.time, "sleep", side_effect=sleep):
+            result = lane.await_login(actor, 1060.0)
+        return result, log.getvalue(), login
+
+    def test_login_poll_before_first_state_snapshot_is_not_a_logged_failure(self):
+        # PR #1004 job 135799032962 and PR #1090's autotz run: the login poll
+        # read the state file before the compositor's first snapshot, and the
+        # retried state-read FileNotFoundError was logged as a failure.
+        result, log, login = self.await_login(failures=2)
+        self.assertEqual(result, (True, login))
+        self.assertEqual(log, "")
+
+    def test_login_deadline_logs_only_the_last_unadmitted_inventory_record(self):
+        result, log, login = self.await_login(failures=None)
+        self.assertEqual(result, (False, login))
+        self.assertEqual(log, "tuna-vm-lane: login deadline: last guest lifecycle inventory failed (exit=1): "
+                         + json.dumps(self.STATE_READ_RECORD) + "\n")
 
     def test_host_rejects_unknown_textual_or_unbounded_records(self):
         record = {"stage": "process-scan", "exception_type": "FileNotFoundError",

@@ -143,13 +143,47 @@ class Minimize(unittest.TestCase):
         self.assertTrue(gates.transition_problems({**good, "samples": good["samples"][:1]}, 7, "unminimize"))
         self.assertTrue(gates.transition_problems(self.watch("unminimize", history=("started",)), 7, "unminimize"))
 
-    def test_the_target_is_the_dash_icon_not_the_fallback(self):
-        samples = self.watch()["samples"]
-        self.assertEqual(gates.dash_target(samples, PRIMARY), self.ICON)
-        # GNOME's missing-icon fallback: a zero-size point at the corner.
-        self.assertIsNone(gates.dash_target(self.watch(icon=[0, 0, 0, 0])["samples"], PRIMARY))
-        self.assertIsNone(gates.dash_target(self.watch(icon=[600, 40, 48, 48])["samples"], PRIMARY))
-        self.assertIsNone(gates.dash_target([], PRIMARY))
+    CORNER = [0, 0, 0, 0]
+
+    def test_one_drawn_target(self):
+        self.assertEqual(gates.minimize_target(self.watch()["samples"]), self.ICON)
+        mixed = self.watch()["samples"] + self.watch(icon=self.CORNER)["samples"]
+        self.assertIsNone(gates.minimize_target(mixed))
+        self.assertIsNone(gates.minimize_target([]))
+
+    def test_gnome_51_leading_corner_of_the_windows_output(self):
+        self.assertEqual(gates.leading_corner(PRIMARY), self.CORNER)
+        self.assertEqual(gates.leading_corner(SECOND), [1280, 0, 0, 0])
+        self.assertEqual(gates.window_output(scene(outputs=[PRIMARY, SECOND]), [1400, 100, 300, 200]), SECOND)
+        with self.assertRaises(gates.GateError):
+            gates.window_output(scene(outputs=[PRIMARY, SECOND]), [2400, 900, 300, 200])
+
+    def test_the_published_dash_icon(self):
+        published = scene(dash_icon_targets=[[3, 100, 740, 48, 48], [7] + self.ICON])
+        self.assertEqual(gates.published_dash_icon(published, 7, PRIMARY), self.ICON)
+        self.assertIsNone(gates.published_dash_icon(published, 9, PRIMARY))
+        for rows in ([[7, 600, 40, 48, 48]], [[7, 600, 740, 0, 0]], [[7] + self.ICON, [7] + self.ICON], []):
+            with self.subTest(rows):
+                self.assertIsNone(gates.published_dash_icon(scene(dash_icon_targets=rows), 7, PRIMARY))
+
+    def test_dash_hidden_goes_to_the_corner_not_the_published_icon(self):
+        self.assertEqual(gates.target_problems(self.watch(icon=self.CORNER)["samples"], self.CORNER, "corner"), [])
+        cases = {
+            # Before #894 Tuna went to the hidden dash's icon; GNOME 51 never does on Wayland.
+            "hidden dash icon": self.watch()["samples"],
+            "the trailing corner": self.watch(icon=[1280, 0, 0, 0])["samples"],
+            "nowhere": [],
+            "two targets": self.watch(icon=self.CORNER)["samples"] + self.watch()["samples"],
+        }
+        for name, samples in cases.items():
+            with self.subTest(name):
+                self.assertTrue(gates.target_problems(samples, self.CORNER, "corner"))
+
+    def test_dash_on_screen_goes_to_its_icon(self):
+        self.assertEqual(gates.target_problems(self.watch()["samples"], self.ICON, "icon"), [])
+        for name, icon in {"corner despite the dash": self.CORNER, "another icon": [100, 740, 48, 48]}.items():
+            with self.subTest(name):
+                self.assertTrue(gates.target_problems(self.watch(icon=icon)["samples"], self.ICON, "icon"))
 
 
 class Pixels(unittest.TestCase):
@@ -324,6 +358,28 @@ class GuestWatch(unittest.TestCase):
         self.assertEqual([s["frames"] for s in result["samples"]], [11, 12])
         with self.assertRaises(ValueError):
             self.watch([locate(2, False, 10)], "maximize")
+
+    def test_a_requested_minimize_is_sent_by_the_armed_watch(self):
+        # The guest agent runs one action at a time, so the watch itself sends
+        # the main fixture's own minimize request (SIGUSR1) once armed.
+        scope = guest_scope("in_flight", "watch")
+        sent = []
+        scope["os"] = type("Os", (), {"kill": staticmethod(lambda pid, sig: sent.append((pid, sig)))})
+        scope["signal"] = type("Signal", (), {"SIGUSR1": 10})
+        scope["fixtures"] = lambda key: {"main": {"pid": 4242, "alive": True}}
+        done = {"window": 7, "effect": "minimize", "outcome": "completed", "at_ms": 900}
+        scope["SCENE"] = Scripted([self.life(), self.life([{"window": 7, "alpha": 0.5, "icon": [1, 2, 3, 4]}]),
+                                   self.life(history=[done])])
+        result = scope["watch"]("k", "minimize", 7, 3, "main")
+        self.assertEqual(sent, [(4242, 10)])
+        self.assertEqual(len(result["samples"]), 1)
+        for args in (("unminimize", 7, 3, "main"), ("minimize", 7, 3, "bystander")):
+            with self.assertRaises(ValueError):
+                scope["watch"]("k", *args)
+        scope["fixtures"] = lambda key: {"main": {"pid": 4242, "alive": False}}
+        with self.assertRaises(RuntimeError):
+            scope["watch"]("k", "minimize", 7, 3, "main")
+        self.assertEqual(len(sent), 1)
 
 
 if __name__ == "__main__":

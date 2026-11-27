@@ -53,7 +53,7 @@ class PortalSessionTests(unittest.TestCase):
                 guest.sh.return_value = (1, json.dumps({
                     'ready': False, 'error': 'requires an unlocked session',
                     'session_state': [{'phase': 'before-request', 'exit': 0, 'stdout': '(true,)'}]}), '')
-                run = journey.Journey(SimpleNamespace(), guest, console, receipt, Path(tmp))
+                run = journey.Journey(SimpleNamespace(qualification_only=True), guest, console, receipt, Path(tmp))
                 run.step = lambda sid, title, action: action(lambda name, ok, observed: ok) if sid == target else None
                 run.run()
                 console.activity.assert_called_once()
@@ -73,33 +73,41 @@ class PortalSessionTests(unittest.TestCase):
         console.page.keyboard.press.assert_not_called()
 
     def test_active_grant_uses_two_exchanges_then_immediate_real_lock(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            events, receipt = [], {}
-            guest, console = Mock(), Mock()
-            reports = [
-                {'ready': True, 'finished': False, 'root': '/run/user/1000/owned',
-                 'session_state': [{'phase': 'before-request', 'exit': 0, 'stdout': '(false,)'}]},
-                {'input': {'exit': 0}, 'active': True, 'observer_armed': True, 'armed_at': 'recorded',
-                 'session_state': [{'phase': 'after-response', 'exit': 0, 'stdout': '(false,)'}]}]
-            def shell(cmd, **kw):
-                events.append(('ssh', cmd))
-                return 0, json.dumps(reports.pop(0)), ''
-            guest.sh.side_effect = shell
-            console.grab.side_effect = lambda path: path.write_bytes(b'prompt-frame')
-            console.key.side_effect = lambda chord, **kw: events.append(('key', chord))
-            run = journey.Journey(SimpleNamespace(), guest, console, receipt, Path(tmp))
-            def step(sid, title, action):
-                if sid == 'portal-screencast':
-                    action(lambda name, ok, observed: ok)
-                    events.append(('collect', 'step screenshot/journal'))
-            run.step = step
-            run.run()
-            self.assertEqual(guest.sh.call_count, 2)
-            self.assertEqual(events[-2:], [('key', 'Meta+l'), ('collect', 'step screenshot/journal')])
-            self.assertIn(' consent ', events[1][1])
-            guest.out.assert_not_called()
-            self.assertTrue(receipt['portal_screencast']['lock_input']['observer_armed'])
-            self.assertFalse(receipt['portal_screencast']['frame_validated'])
+        # The full tour reaches the screencast from the open date menu and closes
+        # it with Escape first; qualification-core mode arrives with nothing open.
+        for qualification_only, leading_keys in ((True, []), (False, [('key', 'Escape')])):
+            with self.subTest(qualification_only=qualification_only), tempfile.TemporaryDirectory() as tmp:
+                events, receipt = [], {}
+                guest, console = Mock(), Mock()
+                reports = [
+                    {'ready': True, 'finished': False, 'root': '/run/user/1000/owned',
+                     'session_state': [{'phase': 'before-request', 'exit': 0, 'stdout': '(false,)'}]},
+                    {'input': {'exit': 0}, 'active': True, 'observer_armed': True, 'armed_at': 'recorded',
+                     'session_state': [{'phase': 'after-response', 'exit': 0, 'stdout': '(false,)'}]}]
+                def shell(cmd, **kw):
+                    events.append(('ssh', cmd))
+                    return 0, json.dumps(reports.pop(0)), ''
+                guest.sh.side_effect = shell
+                console.grab.side_effect = lambda path: path.write_bytes(b'prompt-frame')
+                console.key.side_effect = lambda chord, **kw: events.append(('key', chord))
+                run = journey.Journey(SimpleNamespace(qualification_only=qualification_only),
+                                      guest, console, receipt, Path(tmp))
+                def step(sid, title, action):
+                    if sid == 'portal-screencast':
+                        action(lambda name, ok, observed: ok)
+                        events.append(('collect', 'step screenshot/journal'))
+                run.step = step
+                run.run()
+                self.assertEqual(guest.sh.call_count, 2)
+                prefix = len(leading_keys)
+                self.assertEqual(events[:prefix], leading_keys)
+                self.assertEqual([kind for kind, _ in events[prefix:]], ['ssh', 'ssh', 'key', 'collect'])
+                self.assertIn(' launch ', events[prefix][1])
+                self.assertIn(' consent ', events[prefix + 1][1])
+                self.assertEqual(events[-2:], [('key', 'Meta+l'), ('collect', 'step screenshot/journal')])
+                guest.out.assert_not_called()
+                self.assertTrue(receipt['portal_screencast']['lock_input']['observer_armed'])
+                self.assertFalse(receipt['portal_screencast']['frame_validated'])
 
     def test_screenshot_retains_native_failure_before_locked_response_precondition(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -111,7 +119,7 @@ class PortalSessionTests(unittest.TestCase):
                     'response': {'response': 2, 'results': {}}, 'input': {'exit': 0},
                     'session_state': [{'phase': 'after-response', 'exit': 0, 'stdout': '(true,)'}]}), '')]
             console.grab.side_effect = lambda path: path.write_bytes(b'prompt-frame')
-            run = journey.Journey(SimpleNamespace(), guest, console, receipt, Path(tmp))
+            run = journey.Journey(SimpleNamespace(qualification_only=True), guest, console, receipt, Path(tmp))
             run.step = lambda sid, title, action: action(lambda name, ok, observed: ok) if sid == 'portal-screenshot' else None
             with self.assertRaisesRegex(RuntimeError, 'after-response requires an unlocked session'):
                 run.run()

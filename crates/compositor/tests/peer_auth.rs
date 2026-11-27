@@ -13,10 +13,12 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use tuna_compositor::control::{
-    is_private_dir, our_uid, ControlHub, PeerCred, PeerGate, MAX_PENDING_PEERS,
+    is_private_dir, our_uid, AuthOwner, ControlHub, PeerCred, PeerGate, MAX_PENDING_PEERS,
 };
 use tuna_compositor::state::{StateModel, TokenStore};
-use tuna_shell_control::{encode_frame, Message, ProtocolVersion};
+use tuna_shell_control::{
+    decode_frame, encode_frame, CommandKind, CommandStatus, Message, ProtocolVersion,
+};
 
 const SEAT: &str = "seat0";
 
@@ -81,10 +83,18 @@ fn refused(stream: &mut UnixStream) -> bool {
     }
 }
 
+/// A pidfd pinned to `pid`, as `SO_PEERPIDFD` reports a peer.
+fn pin(pid: u32) -> Option<std::sync::Arc<std::os::fd::OwnedFd>> {
+    let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
+    let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).unwrap();
+    Some(std::sync::Arc::new(pidfd))
+}
+
 fn me() -> PeerCred {
     PeerCred {
         pid: std::process::id(),
         uid: our_uid(),
+        pidfd: pin(std::process::id()),
     }
 }
 
@@ -94,23 +104,154 @@ fn gate_decisions_fail_closed() {
     let other_user = PeerCred {
         pid: 42,
         uid: uid.wrapping_add(1),
+        pidfd: None,
     };
     assert!(
-        !PeerGate::SameUser.admits(Some(other_user), uid),
+        !PeerGate::SameUser.admits(Some(&other_user), uid),
         "other uid"
     );
     assert!(!PeerGate::SameUser.admits(None, uid), "unknown creds");
-    assert!(PeerGate::SameUser.admits(Some(me()), uid));
-    assert!(PeerGate::Pid(me().pid).admits(Some(me()), uid));
+    assert!(PeerGate::SameUser.admits(Some(&me()), uid));
+    assert!(PeerGate::Pid(me().pid).admits(Some(&me()), uid));
     assert!(
-        !PeerGate::Pid(me().pid + 1).admits(Some(me()), uid),
+        !PeerGate::Pid(me().pid + 1).admits(Some(&me()), uid),
         "forged shell"
     );
     assert!(
-        !PeerGate::Pid(42).admits(Some(other_user), uid),
+        !PeerGate::Pid(42).admits(Some(&other_user), uid),
         "pid match, wrong uid"
     );
-    assert!(!PeerGate::Closed.admits(Some(me()), uid));
+    assert!(!PeerGate::Closed.admits(Some(&me()), uid));
+}
+
+/// Without `SO_PEERPIDFD` (kernels before 6.5) the shell's gate admits
+/// nobody: a bare `SO_PEERCRED` PID was recorded at connect time and may
+/// since have been recycled onto the shell.
+#[test]
+fn the_shell_gate_requires_a_pin() {
+    let uid = our_uid();
+    let numeric = PeerCred {
+        pidfd: None,
+        ..me()
+    };
+    assert!(!PeerGate::Pid(numeric.pid).admits(Some(&numeric), uid));
+    assert!(
+        PeerGate::SameUser.admits(Some(&numeric), uid),
+        "an unsupervised hub still checks only the user"
+    );
+}
+
+/// PID reuse: the peer connected as a process that has since exited, and
+/// its PID number now belongs to the shell. A numeric match admitted it
+/// before the gate read the pin.
+#[test]
+fn a_recycled_shell_pid_is_refused() {
+    let mut gone = std::process::Command::new("/bin/sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let pidfd = pin(gone.id());
+    gone.kill().unwrap();
+    gone.wait().unwrap();
+    // The recorded PID is the shell's (this process), the pin another's.
+    let recycled = PeerCred { pidfd, ..me() };
+    assert_eq!(recycled.pinned_pid(), None);
+    assert!(!PeerGate::Pid(std::process::id()).admits(Some(&recycled), our_uid()));
+}
+
+fn read_message(stream: &mut UnixStream) -> Message {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut prefix = [0u8; 4];
+    stream.read_exact(&mut prefix).unwrap();
+    let mut frame = prefix.to_vec();
+    frame.resize(4 + u32::from_le_bytes(prefix) as usize, 0);
+    stream.read_exact(&mut frame[4..]).unwrap();
+    decode_frame(&frame).unwrap()
+}
+
+/// Send `DeclareBusName` and return the compositor's answer to it.
+fn declare(
+    hub: &mut ControlHub,
+    model: &mut StateModel,
+    stream: &mut UnixStream,
+    name: &str,
+) -> CommandStatus {
+    use std::io::Write;
+    let frame = encode_frame(&Message::Command {
+        id: 77,
+        kind: CommandKind::DeclareBusName {
+            unique_name: name.into(),
+        },
+    });
+    stream.write_all(&frame).unwrap();
+    rounds(hub, model, 3);
+    loop {
+        if let Message::CommandResult { id: 77, status } = read_message(stream) {
+            return status;
+        }
+    }
+}
+
+/// The supervised shell names its session-bus connection over its pinned
+/// control session; the hub reports that name only while the session
+/// lives, and refuses a declaration from any session that is not the
+/// supervised shell's.
+#[test]
+fn only_the_supervised_shell_declares_its_bus_name() {
+    let (_dir, mut hub, path) = bind();
+    let mut model = StateModel::new();
+    // Unsupervised hub: a same-user peer holds a session but is not the
+    // shell, so it cannot name the shell on D-Bus.
+    let mut other = UnixStream::connect(&path).unwrap();
+    hello(&mut other);
+    rounds(&mut hub, &mut model, 3);
+    assert_eq!(hub.session_count(), 1);
+    assert!(matches!(
+        declare(&mut hub, &mut model, &mut other, ":1.5"),
+        CommandStatus::Denied { .. }
+    ));
+    assert_eq!(hub.shell_bus_names().count(), 0);
+    drop(other);
+
+    // Supervised: this process is the held shell child.
+    hub.set_auth_owner(Some(AuthOwner {
+        pid: std::process::id(),
+        generation: 1,
+    }));
+    hub.set_peer_gate(PeerGate::Pid(std::process::id()));
+    let mut shell = UnixStream::connect(&path).unwrap();
+    hello(&mut shell);
+    rounds(&mut hub, &mut model, 3);
+    assert_eq!(hub.session_count(), 1);
+    assert!(matches!(
+        declare(&mut hub, &mut model, &mut shell, "org.gnome.Shell"),
+        CommandStatus::Denied { .. }
+    ));
+    assert_eq!(
+        declare(&mut hub, &mut model, &mut shell, ":1.9"),
+        CommandStatus::Applied
+    );
+    assert_eq!(hub.shell_bus_names().collect::<Vec<_>>(), [":1.9"]);
+    assert_eq!(
+        declare(&mut hub, &mut model, &mut shell, ":1.10"),
+        CommandStatus::Applied
+    );
+    assert_eq!(
+        hub.shell_bus_names().collect::<Vec<_>>(),
+        [":1.10"],
+        "a later declaration replaces the earlier one"
+    );
+    // A narrowed gate (the shell restarted elsewhere) drops the name at once.
+    hub.set_peer_gate(PeerGate::Pid(std::process::id() + 1));
+    assert_eq!(hub.shell_bus_names().count(), 0);
+    hub.set_peer_gate(PeerGate::Pid(std::process::id()));
+    assert_eq!(hub.shell_bus_names().collect::<Vec<_>>(), [":1.10"]);
+    // The session ending drops it.
+    drop(shell);
+    wait_for_session_retirement(&mut hub, &mut model, Duration::from_secs(1)).unwrap();
+    assert_eq!(hub.shell_bus_names().count(), 0);
 }
 
 #[test]

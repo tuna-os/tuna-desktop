@@ -7,11 +7,14 @@
 //! gio) against the compositor's actual Introspect service and capture
 //! `Authority` on a private dbus-daemon.
 //!
-//! The admitted caller is the supervised shell's own process (this test
-//! process is published as the shell): the installed-portal identity needs
-//! a root-owned `/usr/libexec/xdg-desktop-portal-gnome` and is qualified in
-//! the VM. The impostor is a separate process that owns the portal's bus
-//! name without being the installed binary.
+//! The admitted callers are the supervised shell's own connections: the
+//! fixture declares their unique names as the shell's, as the shell does
+//! over its pidfd-pinned control session. The installed-portal identity
+//! needs a root-owned `/usr/libexec/xdg-desktop-portal-gnome` and is
+//! qualified in the VM. The impostor is a separate process that owns the
+//! portal's bus name without being the installed binary; another
+//! connection of this very process (the shell's PID) is not the shell
+//! either.
 
 #[path = "../../shell-gtk/src/introspect_forward.rs"]
 mod introspect_forward;
@@ -62,6 +65,8 @@ fn window(id: u64, app: &str, sandboxed: Option<&str>, focused: bool) -> WindowS
 /// sets it up.
 struct Shell {
     main_loop: glib::MainLoop,
+    /// The relay connection's unique name.
+    name: String,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -97,17 +102,19 @@ impl Shell {
                         .expect("shell requests its name");
                     assert_eq!(reply.get::<(u32,)>(), Some((1,)), "primary owner");
                     let main_loop = glib::MainLoop::new(Some(&context), false);
-                    ready.send(main_loop.clone()).unwrap();
+                    let name = connection.unique_name().expect("unique name").to_string();
+                    ready.send((main_loop.clone(), name)).unwrap();
                     main_loop.run();
                     drop(relay);
                 })
                 .unwrap();
         });
-        let main_loop = started
+        let (main_loop, name) = started
             .recv_timeout(Duration::from_secs(10))
             .expect("shell owns org.gnome.Shell");
         Self {
             main_loop,
+            name,
             thread: Some(thread),
         }
     }
@@ -128,6 +135,8 @@ struct Session {
     address: String,
     handle: introspect::Handle,
     authority: Authority,
+    /// The unique names declared as the shell's.
+    shell_names: [String; 2],
     shell: Option<Shell>,
     client: zbus::Connection,
 }
@@ -161,18 +170,23 @@ fn session(windows: Vec<WindowSnapshot>) -> Session {
         .unwrap();
     let address = address.trim().to_owned();
     let authority = Authority::default();
-    authority.publish(false, Some(std::process::id()));
     let handle = introspect::Handle::default();
     handle.publish(windows);
     let builder = zbus::connection::Builder::address(address.as_str());
     assert!(introspect::serve(builder, &handle, authority.clone()).unwrap());
     let shell = Shell::start(&address);
     let client = connect(&address);
+    let shell_names = [
+        shell.name.clone(),
+        client.unique_name().unwrap().to_string(),
+    ];
+    authority.publish(false, shell_names.iter().map(String::as_str));
     Session {
         daemon,
         address,
         handle,
         authority,
+        shell_names,
         shell: Some(shell),
         client,
     }
@@ -323,7 +337,9 @@ fn a_locked_session_denies_the_list_through_org_gnome_shell() {
         Some("org.gnome.TextEditor"),
         true,
     )]);
-    session.authority.publish(true, Some(std::process::id()));
+    session
+        .authority
+        .publish(true, session.shell_names.iter().map(String::as_str));
     for method in ["GetRunningApplications", "GetWindows"] {
         assert_eq!(
             error_name(call_shell(&session.client, method)),
@@ -331,7 +347,44 @@ fn a_locked_session_denies_the_list_through_org_gnome_shell() {
             "{method}"
         );
     }
-    session.authority.publish(false, Some(std::process::id()));
+    session
+        .authority
+        .publish(false, session.shell_names.iter().map(String::as_str));
+    assert!(call_shell(&session.client, "GetRunningApplications").is_ok());
+}
+
+/// PID reuse, as the bus sees it: another connection with the very PID the
+/// shell runs as (this process) but a unique name the shell never declared
+/// is no shell, through the relay or directly. Before the shell was
+/// recognised by name, a PID match admitted it.
+#[test]
+fn a_caller_with_the_shell_pid_but_an_undeclared_name_is_denied() {
+    let session = session(vec![window(
+        1,
+        "org.gnome.TextEditor",
+        Some("org.gnome.TextEditor"),
+        true,
+    )]);
+    let same_pid = connect(&session.address);
+    for method in ["GetRunningApplications", "GetWindows"] {
+        assert_eq!(
+            error_name(call_shell(&same_pid, method)),
+            ACCESS_DENIED,
+            "relayed {method}"
+        );
+        assert_eq!(
+            error_name(zbus::block_on(same_pid.call_method(
+                Some(tuna_shell_control::introspect::NAME),
+                PATH,
+                Some(INTERFACE),
+                method,
+                &(),
+            ))),
+            ACCESS_DENIED,
+            "direct {method}"
+        );
+    }
+    // The declared names are still the shell.
     assert!(call_shell(&session.client, "GetRunningApplications").is_ok());
 }
 

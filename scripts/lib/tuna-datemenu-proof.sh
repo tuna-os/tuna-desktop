@@ -3,8 +3,28 @@
 # --datemenu-only run (P-PN-04, #1036). Requires that harness's private
 # bus, nested window, GTK shell, AT-SPI and assertion helpers (pass,
 # fail, showing, hidden, cstate, kr_focus_until, datemenu_mask,
-# weather_fixture, $PY, $ROOT, $ARTIFACTS, $WID, $WIDTH, $HEIGHT) and
-# its calendar-server stub.
+# weather_fixture, $PY, $ROOT, $ARTIFACTS, $CSTATE, $WID, $WIDTH,
+# $HEIGHT) and its calendar-server stub.
+
+# G-CLOCK-DAMAGE (#1154): a clock tick repaints the clock, not the
+# output. Seconds change the label every second while nothing else
+# moves; a frame whose whole damage lies in the bar and is more than
+# the one-pixel timing repaint can only be the clock's. It must stay
+# under 2% of the output: before #1154 the nested output lost its
+# buffer age on every client commit and repainted all of it.
+clock_damage_proof() {
+clock_frames="$(jq '.rendered_frames' "$CSTATE")"
+gsettings set org.gnome.desktop.interface clock-show-seconds true
+# shellcheck disable=SC2016 # $bar and $b are jq variables
+cstate '(first(.layers[] | select(.namespace == "tuna-panel") | .rect[3]) // 0) as $bar
+    | .rendered_frames > '"$clock_frames"' and any(.frame_cost[]; .damage_bounds as $b
+    | $b != null and $b[1] + $b[3] <= $bar and .damage_area > 1 and .damage_area * 50 <= .output_area)' \
+    "clock tick repaints the clock" 10 ||
+    fail G-CLOCK-DAMAGE "a clock tick repainted more than the clock (frame_cost above)"
+snapshot_state "$CSTATE" "$ARTIFACTS/clock-damage-state.json"
+gsettings reset org.gnome.desktop.interface clock-show-seconds
+pass G-CLOCK-DAMAGE "a clock tick repaints the clock's rectangle in the bar, under 2% of the output"
+}
 
 # The date menu's own gates: G-CAL-OPEN, G-CAL-EVENTS, G-CAL-PREFS and
 # G-CAL-LAUNCH. They leave the menu closed and its first tree in

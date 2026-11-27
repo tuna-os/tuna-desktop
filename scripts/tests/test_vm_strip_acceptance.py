@@ -605,6 +605,74 @@ class NotificationPreparation(unittest.TestCase):
         self.assertEqual(self.keys, [('meta_l', 'n'), ('tab',), ('ret',)])
         self.assertFalse(self.evidence['confirmed_absent'])
 
+    def queue(self, paths, *, closes=True, focused_path=None, deadline=10.0):
+        """The shell's tray: one banner on screen, critical ones never expire,
+        the next queued one drops in when Return reaches the focused Close.
+        Guest calls cost what run 44442598008 recorded: a state read about
+        0.25 s, a Close observation about 0.5 s, a key chord about 0.1 s."""
+        from unittest.mock import patch
+        queue = list(paths)
+        keys, evidence, clock = [], {}, [0.0]
+        def banner(focused):
+            value = copy.deepcopy(self.focused if focused else self.value)
+            close = value['notification_ui']['control']['notification_banner']['close_controls'][0]
+            close['path'] = (focused_path or queue[0]) if focused else queue[0]
+            return value
+        def read(_deadline):
+            clock[0] += .25
+            return banner(False) if queue else self.after
+        def observe(_deadline):
+            clock[0] += .5
+            return banner(bool(keys) and keys[-1] == ('tab',)) if queue else self.after
+        def send(*key):
+            clock[0] += .1
+            keys.append(key)
+            if key == ('ret',) and closes:
+                queue.pop(0)
+        with patch.object(proof.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(proof.time, 'sleep', side_effect=lambda d: clock.__setitem__(0, clock[0] + d)):
+            try:
+                return proof.dismiss_notification_banner(
+                    read, observe, send, banner(False), self.original, self.sha, deadline=deadline,
+                    input_idle=True, evidence=evidence), keys, evidence, clock[0]
+            except BaseException as error:
+                error.keys, error.evidence = keys, evidence
+                raise
+
+    def test_queued_banners_each_receive_one_focused_close_within_the_capture_deadline(self):
+        # Run 44442598008: three critical updater banners queued; one Close
+        # only revealed the next. Each distinct Close instance gets its own
+        # focused Return, and all three leave time for both frames.
+        paths = ['/org/gtk/a11y/close%d' % index for index in range(3)]
+        after, keys, evidence, elapsed = self.queue(paths)
+        self.assertIs(after, self.after)
+        self.assertEqual(keys, [('meta_l', 'n'), ('tab',), ('ret',)] * 3)
+        self.assertEqual(evidence['activations'], 3)
+        self.assertTrue(evidence['confirmed_absent'])
+        self.assertLess(elapsed, 8.5)
+        self.assertLess(len(json.dumps(evidence)), 2048)
+
+    def test_a_named_banner_its_close_does_not_remove_is_never_activated_twice(self):
+        with self.assertRaises(TimeoutError) as caught:
+            self.queue(['/org/gtk/a11y/close0'], closes=False)
+        self.assertEqual(caught.exception.keys, [('meta_l', 'n'), ('tab',), ('ret',)])
+        self.assertEqual(caught.exception.evidence['activations'], 1)
+        self.assertFalse(caught.exception.evidence['confirmed_absent'])
+
+    def test_a_close_instance_change_before_return_never_receives_it(self):
+        with self.assertRaisesRegex(RuntimeError, 'changed before focused activation') as caught:
+            self.queue(['/org/gtk/a11y/close0'], focused_path='/org/gtk/a11y/other')
+        self.assertEqual(caught.exception.keys, [('meta_l', 'n'), ('tab',)])
+        self.assertFalse(caught.exception.evidence['activated'])
+
+    def test_malformed_close_path_never_receives_input(self):
+        for path in ('relative/path', '/a//b', '/' + 'a' * 255, '/private notification title', 7):
+            value = copy.deepcopy(self.value)
+            value['notification_ui']['control']['notification_banner']['close_controls'][0]['path'] = path
+            with self.subTest(path=path), self.assertRaisesRegex(RuntimeError, 'path is malformed'):
+                self.dismiss(observed=value)
+            self.assertEqual(self.keys, [])
+
     def test_wrong_button_or_unfocused_close_never_receives_return(self):
         with self.assertRaisesRegex(RuntimeError, 'Close focused'):
             self.dismiss(observed=self.value)
@@ -667,6 +735,79 @@ class NotificationPreparation(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             scope['strip_notification_ui']({'layers': []} | {'locked': True}, self.original, observe_control=True)
 
+
+class HeldStepBanner(unittest.TestCase):
+    """Run 44656894802: uupd's start-limit failure banner dropped in 7 s into
+    the stationary edge hold, and the capture refused keys with the button
+    held. A user lets the drag go, closes the banner, then drags again."""
+
+    def setUp(self):
+        self.notes = NotificationPreparation()
+        self.notes.setUp()
+        self.banner = self.notes.value
+        self.clean = copy.deepcopy(self.notes.after)
+        self.down = False
+        self.events = []
+
+    def hold_step(self, helds, *, step=0.0, deadline=100.0):
+        from unittest.mock import patch
+        helds = iter(helds)
+        clock = [0.0]
+        def hold(before):
+            clock[0] += step
+            self.events.append(('press', before))
+            self.down = True
+            return next(helds)
+        def let_go(before, held):
+            self.assertTrue(self.down)
+            self.events.append(('let go', before, held))
+            self.down = False
+            return held
+        def dismiss(idle):
+            self.events.append(('dismiss', idle))
+            # The real dismissal, told whether a button is held right now.
+            return self.notes.dismiss(before=idle, idle=not self.down)
+        with patch.object(proof.time, 'monotonic', side_effect=lambda: clock[0]):
+            return proof.hold_clear_of_banners('start', hold, let_go, dismiss, deadline=deadline)
+
+    def test_banner_arriving_mid_hold_is_closed_with_the_button_up_then_the_step_is_redone(self):
+        held = self.hold_step([self.banner, self.clean])
+        self.assertIs(held, self.clean)
+        self.assertEqual([event[0] for event in self.events], ['press', 'let go', 'dismiss', 'press'])
+        self.assertEqual(self.events[0][1], 'start')
+        self.assertEqual(self.events[1][1:], ('start', self.banner))
+        self.assertIs(self.events[2][1], self.banner)
+        # The redo starts from the observed banner-free sample, not the old one.
+        self.assertIs(self.events[3][1], self.notes.after)
+        self.assertEqual(self.notes.keys, [('meta_l', 'n'), ('tab',), ('ret',)])
+        self.assertTrue(self.notes.evidence['confirmed_absent'])
+        # The clean held state stays held for its capture and matching release.
+        self.assertTrue(self.down)
+
+    def test_clear_hold_sends_no_release_or_key(self):
+        self.assertIs(self.hold_step([self.clean]), self.clean)
+        self.assertEqual(self.events, [('press', 'start')])
+        self.assertFalse(hasattr(self.notes, 'keys'))
+
+    def test_banners_until_the_deadline_end_released_without_another_dismissal(self):
+        with self.assertRaisesRegex(TimeoutError, 'absolute deadline'):
+            self.hold_step([self.banner] * 8, step=30.0)
+        self.assertEqual([event[0] for event in self.events],
+                         ['press', 'let go', 'dismiss'] * 3 + ['press', 'let go'])
+        self.assertFalse(self.down)
+
+    def test_installed_edge_hold_lets_go_before_any_notification_key(self):
+        import inspect
+        source = inspect.getsource(proof.prove_installed_strip)
+        self.assertIn('interrupted=banner_shown', source)
+        self.assertIn('hold_clear_of_banners(before_edge, edge_hold, edge_let_go, edge_dismiss, deadline=deadline)',
+                      source)
+        self.assertLess(source.index('hold_clear_of_banners(before_edge'),
+                        source.index("capture(label, terminal, 'delta')"))
+        # Step 07's VT cancel lets go of both held titlebar moves.
+        self.assertIn('returned = cancel_held_move(held, before_cancel)', source)
+        self.assertIn('return cancel_held_move(held, windows(before, original, edge=True))', source)
+        self.assertIn('input_idle=not button_down', source)
 
 
 class CaptureFailureEvidence(unittest.TestCase):

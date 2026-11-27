@@ -71,6 +71,7 @@ pub(crate) struct SharedSurfaceState {
     instance: String,
     startup_id: Option<String>,
     pid: Option<u32>,
+    icon_geometry: Option<Rectangle<i32, Client>>,
     protocols: Protocols,
     hints: Option<WmHints>,
     normal_hints: Option<WmSizeHints>,
@@ -151,6 +152,7 @@ pub enum WmWindowProperty {
     MotifHints,
     StartupId,
     Pid,
+    IconGeometry,
 }
 
 impl X11Surface {
@@ -190,6 +192,7 @@ impl X11Surface {
                 instance: String::from(""),
                 startup_id: None,
                 pid: None,
+                icon_geometry: None,
                 protocols: Vec::new(),
                 hints: None,
                 normal_hints: None,
@@ -377,6 +380,25 @@ impl X11Surface {
         self.state.lock().unwrap().pid
     }
 
+    /// Returns the `_NET_WM_ICON_GEOMETRY` of the underlying X11 window, in
+    /// logical root coordinates.
+    ///
+    /// As in Mutter (`reload_icon_geometry`), a missing or non-`CARDINAL`
+    /// property unsets it, and a value without exactly four cardinals keeps
+    /// the previous one.
+    pub fn icon_geometry(&self) -> Option<Rectangle<i32, Logical>> {
+        let client_scale = self
+            .client_scale
+            .as_ref()
+            .map(|s| s.load(Ordering::Acquire))
+            .unwrap_or(1.);
+        self.state
+            .lock()
+            .unwrap()
+            .icon_geometry
+            .map(|r| r.to_f64().to_logical(client_scale).to_i32_round())
+    }
+
     /// Returns if the window is considered to be a popup.
     ///
     /// Corresponds to the internal `_NET_WM_STATE_MODAL` state of the underlying X11 window.
@@ -543,6 +565,36 @@ impl X11Surface {
         Ok(())
     }
 
+    /// Sets the window iconic (minimized) or normal while it stays mapped,
+    /// as Mutter's `meta_window_x11_set_wm_state` and `set_net_wm_state` do
+    /// for a minimized window: `WM_STATE` becomes `IconicState` and
+    /// `_NET_WM_STATE` gains `_NET_WM_STATE_HIDDEN`, and restoring reverses
+    /// both. Unlike [`X11Surface::set_mapped`] the frame is not unmapped, so
+    /// the compositor keeps the window's contents for its animations; the
+    /// client learns it is hidden and may stop rendering.
+    ///
+    /// It is an error to call this function on override redirect windows
+    pub fn set_iconic(&self, iconic: bool) -> Result<(), X11SurfaceError> {
+        if self.is_override_redirect() {
+            return Err(X11SurfaceError::UnsupportedForOverrideRedirect);
+        }
+        let Some(conn) = self.conn.upgrade() else {
+            return Ok(());
+        };
+        // IconicState 3, NormalState 1.
+        let state = if iconic { 3u32 } else { 1 };
+        conn.change_property32(
+            PropMode::REPLACE,
+            self.window,
+            self.atoms.WM_STATE,
+            self.atoms.WM_STATE,
+            &[state, 0 /*WINDOW_NONE*/],
+        )?;
+        self.set_suspended(iconic)?;
+        conn.flush()?;
+        Ok(())
+    }
+
     /// Sets the window as activated or not.
     ///
     /// Allows the client to reflect this state in their UI.
@@ -678,6 +730,7 @@ impl X11Surface {
         self.update_motif_hints()?;
         self.update_startup_id()?;
         self.update_pid()?;
+        self.update_icon_geometry()?;
         Ok(())
     }
 
@@ -722,6 +775,10 @@ impl X11Surface {
             atom if atom == self.atoms._NET_WM_PID => {
                 self.update_pid()?;
                 Ok(Some(WmWindowProperty::Pid))
+            }
+            atom if atom == self.atoms._NET_WM_ICON_GEOMETRY => {
+                self.update_icon_geometry()?;
+                Ok(Some(WmWindowProperty::IconGeometry))
             }
 
             _ => Ok(None), // unknown
@@ -809,6 +866,40 @@ impl X11Surface {
         if let Some(pid) = self.read_window_property_u32(self.atoms._NET_WM_PID)? {
             let mut state = self.state.lock().unwrap();
             state.pid = Some(pid);
+        }
+        Ok(())
+    }
+
+    fn update_icon_geometry(&self) -> Result<(), ConnectionError> {
+        let conn = self.conn.upgrade().ok_or(ConnectionError::UnknownError)?;
+        let reply = match conn
+            .get_property(
+                false,
+                self.window,
+                self.atoms._NET_WM_ICON_GEOMETRY,
+                AtomEnum::CARDINAL,
+                0,
+                2048,
+            )?
+            .reply_unchecked()
+        {
+            Ok(reply) => reply,
+            Err(ConnectionError::ParseError(_)) => None,
+            Err(err) => return Err(err),
+        };
+        let values = reply
+            .filter(|reply| reply.type_ == u32::from(AtomEnum::CARDINAL) && reply.format == 32)
+            .and_then(|reply| reply.value32().map(|vals| vals.collect::<Vec<_>>()));
+        let mut state = self.state.lock().unwrap();
+        match values.as_deref() {
+            None => state.icon_geometry = None,
+            Some(&[x, y, w, h]) => {
+                state.icon_geometry = Some(Rectangle::new(
+                    (x as i32, y as i32).into(),
+                    (w as i32, h as i32).into(),
+                ))
+            }
+            Some(_) => {}
         }
         Ok(())
     }

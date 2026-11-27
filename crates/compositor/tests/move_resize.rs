@@ -974,3 +974,88 @@ fn edge_tiling_off_shows_no_preview_and_drops_floating() {
         "dropped at its floating size"
     );
 }
+
+/// #1192, mutter 51 `edge-resistance.c:330-335`: a pointer move pushing
+/// the window's left edge past the screen edge holds there for 32 px,
+/// then lets go; Shift (`META_EDGE_RESISTANCE_SNAP`) snaps a move flush
+/// to the nearest edge and shows no tile preview.
+#[test]
+fn moves_resist_screen_edges_and_shift_snaps() {
+    let mut f = fixture();
+    let start = geometry(&f);
+    let at = press_inside(&mut f);
+    f.toplevel
+        ._move(f.client.seat.as_ref().unwrap(), f.client.press_serial);
+    sync(&mut f);
+    let to_x = |f: &mut Fixture, x: i32, y: f64, time: u32| {
+        let dx = f64::from(x - start.loc.x);
+        f.manager
+            .pointer_motion(&mut f.comp.state, Point::from((at.x + dx, at.y + y)), time);
+        geometry(f).loc
+    };
+    assert_eq!(to_x(&mut f, -20, 100.0, 3).x, 0, "held at the screen edge");
+    assert_eq!(to_x(&mut f, -31, 100.0, 4).x, 0, "still within 32 px");
+    assert_eq!(to_x(&mut f, -40, 100.0, 5).x, -40, "pushed through");
+    assert_eq!(to_x(&mut f, 10, 100.0, 6).x, 10, "moving away is free");
+    key(
+        &mut f,
+        tuna_compositor::windows::SHIFT_LEFT_KEYCODE,
+        true,
+        7,
+    );
+    assert_eq!(to_x(&mut f, 60, 100.0, 8).x, 0, "Shift snaps to the edge");
+    f.manager
+        .pointer_motion(&mut f.comp.state, Point::from((1.0, at.y + 100.0)), 9);
+    assert_eq!(
+        f.manager.tile_preview(&f.comp.state),
+        None,
+        "no tiling while snapping"
+    );
+    f.manager
+        .pointer_button(&mut f.comp.state, BTN_LEFT, false, 10);
+    key(
+        &mut f,
+        tuna_compositor::windows::SHIFT_LEFT_KEYCODE,
+        false,
+        11,
+    );
+    assert_eq!(
+        f.manager.window_layout(id(&f)),
+        Some(WindowLayout::Floating)
+    );
+}
+
+/// #1192, mutter 51 `process_keyboard_move_grab` (meta-window-drag.c:
+/// 618-751): a keyboard move (Alt+F7) steps 10 px per arrow and stops at
+/// the first edge it crosses; Escape puts the window back.
+#[test]
+fn keyboard_moves_step_and_stop_at_edges() {
+    use tuna_compositor::windows::{ARROW_LEFT_KEYCODE, ESCAPE_KEYCODE};
+    let mut f = fixture();
+    let start = geometry(&f);
+    let window = id(&f);
+    assert!(f.manager.window_action(
+        &mut f.comp.state,
+        window,
+        tuna_shell_control::WindowAction::Move
+    ));
+    key(&mut f, ARROW_LEFT_KEYCODE, true, 2);
+    key(&mut f, ARROW_LEFT_KEYCODE, false, 3);
+    assert_eq!(geometry(&f).loc.x, start.loc.x - 10);
+    let mut time = 4;
+    while geometry(&f).loc.x > 0 {
+        key(&mut f, ARROW_LEFT_KEYCODE, true, time);
+        key(&mut f, ARROW_LEFT_KEYCODE, false, time + 1);
+        time += 2;
+        assert!(time < 1000);
+    }
+    assert_eq!(
+        geometry(&f).loc.x,
+        0,
+        "stopped on the screen edge, not past it"
+    );
+    key(&mut f, ESCAPE_KEYCODE, true, time);
+    key(&mut f, ESCAPE_KEYCODE, false, time + 1);
+    assert!(!f.manager.grab_active(), "Escape ends the move");
+    assert_eq!(geometry(&f).loc, start.loc, "and restores where it began");
+}

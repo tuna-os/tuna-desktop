@@ -1,0 +1,7 @@
+#%PAM-1.0
+# Tuna Desktop lock screen: unlocks the running session with its own user's
+# fingerprint, as GDM's gdm-fingerprint service does. pam_fprintd reads the
+# finger; login's account stack still decides (expired or locked accounts
+# stay locked).
+auth      required  pam_fprintd.so
+account   include   login

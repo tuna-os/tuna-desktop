@@ -19,7 +19,8 @@ parity baseline. The preview image layers the Tuna Desktop package on
 
 The preview image offers "Tuna Desktop (preview)" on the GDM login screen
 beside GNOME: the DRM/KMS backend runs the hardware session (#52), the
-lock screen unlocks through PAM (`/etc/pam.d/tuna-lock`, #62), and the
+lock screen unlocks through PAM (`/etc/pam.d/tuna-lock`, #62; fingerprint
+through `/etc/pam.d/tuna-lock-fingerprint`), and the
 power menu logs out back to GDM. A "Tuna Desktop (nested preview)" launcher
 also opens Tuna Desktop in a window inside GNOME. Upstreaming a `marlin:tuna`
 flavor to `tuna-os/tunaOS` (#69) follows once hardware runs in the VM
@@ -31,6 +32,16 @@ beside it and falls back to the legacy `tuna-shell-host`; set
 `TUNA_SHELL_BIN=tuna-shell-host` to choose the legacy shell. The
 `.deb` targets Ubuntu 26.04; Debian 13 requires a separate packaged
 backport and installed-session qualification (see `docs/install.md`).
+
+The `.deb` requires `libgtk-4-1 (>= 4.14)` (`tuna-shell-gtk` builds with
+`gtk4`'s `v4_14` feature). Both packages require Python 3, the interpreter of the shipped
+`/usr/libexec/tuna-geoclue-agent-policy` image-construction helper. GeoClue
+is optional: the `.deb` recommends `geoclue-2.0` and the PKGBUILD lists
+`geoclue` in `optdepends`. Without the service the shell's location agent
+hides its panel indicator and the session otherwise runs normally. An image
+that runs the helper must install GeoClue itself, because the helper reads
+GeoClue's packaged `/etc/geoclue/geoclue.conf`; the Marlin `Containerfile`
+does so explicitly.
 
 The release builder uses `dpkg-deb --root-owner-group`. CI verifies original
 archive ownership with `scripts/check-release-package`, then runs

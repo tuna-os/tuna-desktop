@@ -20,6 +20,8 @@ LEGACY_SESSION = 'usr/share/wayland-sessions/roost.desktop'  # tuna-rename: keep
 LEGACY_PAM = 'etc/pam.d/roost-lock'  # tuna-rename: keep
 SESSION = 'usr/share/wayland-sessions/tuna.desktop'
 PAM = 'etc/pam.d/tuna-lock'
+FINGERPRINT_PAM = 'etc/pam.d/tuna-lock-fingerprint'
+PAM_FILES = (PAM, FINGERPRINT_PAM, LEGACY_PAM)
 BRIDGES = frozenset((LEGACY_SESSION, LEGACY_PAM))
 MAX_TEXT = 16 * 1024
 MAX_MEMBERS = 4096
@@ -78,7 +80,7 @@ def archive_index(raw, kind):
                 raise ValueError('forbidden-legacy-path')
             if kind == 'control' and name in ('preinst', 'postinst', 'prerm', 'postrm', 'config', 'triggers'):
                 raise ValueError('transition-lifecycle-hook')
-            if name in (SESSION, LEGACY_SESSION, PAM, LEGACY_PAM, 'conffiles'):
+            if name in (SESSION, LEGACY_SESSION, *PAM_FILES, 'conffiles'):
                 if not member.isfile() or member.mode != 0o644:
                     raise ValueError('transition-regular-mode')
                 if not 0 < member.size <= MAX_TEXT:
@@ -96,7 +98,7 @@ def archive_index(raw, kind):
             ancestor = entries.get(str(parent))
             if ancestor is not None and not ancestor.isdir():
                 raise ValueError('archive-parent-not-directory')
-            if (kind == 'data' and name in (SESSION, LEGACY_SESSION, PAM, LEGACY_PAM)
+            if (kind == 'data' and name in (SESSION, LEGACY_SESSION, *PAM_FILES)
                     and ancestor is not None and ancestor.mode & 0o022):
                 raise ValueError('transition-parent-writable')
     # Asset symlinks are allowed only when they resolve inside this archive.
@@ -142,7 +144,7 @@ def pam_rules(text):
 def validate(data, control):
     _, payload = archive_index(data, 'data')
     _, metadata = archive_index(control, 'control')
-    if not {SESSION, LEGACY_SESSION, PAM, LEGACY_PAM}.issubset(payload):
+    if not {SESSION, LEGACY_SESSION, *PAM_FILES}.issubset(payload):
         raise ValueError('transition-file-missing')
     if desktop_fields(payload[SESSION]) != DESKTOP:
         raise ValueError('transition-current-desktop-content')
@@ -151,8 +153,10 @@ def validate(data, control):
     for path in (PAM, LEGACY_PAM):
         if pam_rules(payload[path]) != [['auth', 'include', 'login'], ['account', 'include', 'login']]:
             raise ValueError('transition-pam-content')
+    if pam_rules(payload[FINGERPRINT_PAM]) != [['auth', 'required', 'pam_fprintd.so'], ['account', 'include', 'login']]:
+        raise ValueError('transition-pam-content')
     conffiles = metadata.get('conffiles', '').splitlines()
-    if len(conffiles) != 2 or set(conffiles) != {'/' + PAM, '/' + LEGACY_PAM}:
+    if len(conffiles) != len(PAM_FILES) or set(conffiles) != {'/' + path for path in PAM_FILES}:
         raise ValueError('transition-conffiles')
 
 

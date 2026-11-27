@@ -25,6 +25,10 @@ MAX_TAR = 512 * 1024 * 1024
 BINS = tuple(f"usr/bin/{name}" for name in (
     "tuna-compositor", "tuna-session", "tuna-shell-host",
     "tuna-shell-gtk", "tuna-ibus-bridge"))
+# The lane measures the latest trusted MAIN package unless a candidate is
+# dispatched, so this list may name only members main's package already
+# ships; a new packaged file joins it after it reaches main (for example
+# etc/pam.d/tuna-lock-fingerprint, #1162 F5).
 REQUIRED = BINS + ("usr/share/wayland-sessions/tuna.desktop",
                   "usr/lib/systemd/user/tuna-session.target", "etc/pam.d/tuna-lock")
 

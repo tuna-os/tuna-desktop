@@ -38,7 +38,9 @@ for path in \
     usr/bin/tuna-wallpaper-svg \
     usr/share/wayland-sessions/tuna.desktop \
     usr/lib/systemd/user/tuna-session.target \
-    etc/pam.d/tuna-lock; do
+    usr/libexec/tuna-geoclue-agent-policy \
+    etc/pam.d/tuna-lock \
+    etc/pam.d/tuna-lock-fingerprint; do
     printf '%s' "$CONTENTS" | grep -q "$path" || fail "missing $path"
 done
 
@@ -55,7 +57,7 @@ trap 'rm -rf "$DIR"' EXIT INT TERM
 dpkg-deb -x "$PKG" "$DIR"
 python3 "$ROOT/scripts/tuna-cursor-assets-check" "$DIR/usr/share/tuna-desktop/icons/Adwaita" \
     || fail "bundled cursor assets rejected"
-for path in usr/share/wayland-sessions/tuna.desktop usr/lib/systemd/user/tuna-session.target etc/pam.d/tuna-lock; do
+for path in usr/share/wayland-sessions/tuna.desktop usr/lib/systemd/user/tuna-session.target etc/pam.d/tuna-lock etc/pam.d/tuna-lock-fingerprint; do
     [ -f "$DIR/$path" ] && [ ! -L "$DIR/$path" ] || fail "invalid required file $path"
 done
 for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus-bridge tuna-wallpaper-svg; do
@@ -66,12 +68,19 @@ for bin in tuna-compositor tuna-session tuna-shell-gtk tuna-shell-host tuna-ibus
     ldd "$DIR/usr/bin/$bin" >"$DIR/ldd.txt" || fail "$bin ELF loader check failed"
     if grep -q 'not found' "$DIR/ldd.txt"; then fail "$bin missing ELF library"; fi
 done
+HELPER="$DIR/usr/libexec/tuna-geoclue-agent-policy"
+[ -f "$HELPER" ] && [ ! -L "$HELPER" ] && [ -x "$HELPER" ] || fail "invalid executable tuna-geoclue-agent-policy"
+[ "$(head -n 1 "$HELPER")" = '#!/usr/bin/python3' ] || fail "tuna-geoclue-agent-policy interpreter is not the declared python3"
 
 DEPENDS="$(dpkg-deb -f "$PKG" Depends)"
-for required in 'libgtk4-layer-shell0 (>= 1.1)' 'libgtk-4-1 (>= 4.12)' 'libadwaita-1-0 (>= 1.0)' 'libgweather-4-0t64 (>= 4.4) | libgweather-4-0 (>= 4.4)' 'libpam0g' 'gsettings-desktop-schemas' 'gnome-settings-daemon-common'; do
+for required in 'libgtk4-layer-shell0 (>= 1.1)' 'libgtk-4-1 (>= 4.14)' 'libadwaita-1-0 (>= 1.0)' 'libgweather-4-0t64 (>= 4.4) | libgweather-4-0 (>= 4.4)' 'libpam0g' 'gsettings-desktop-schemas' 'gnome-settings-daemon-common' 'python3'; do
     printf '%s\n' "$DEPENDS" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -Fxq "$required" || fail "missing runtime floor $required"
 done
-# Both PAM conffiles and exact bridge contents/modes were checked in the
+# GeoClue is optional for the session (the location indicator hides without
+# it), so it is recommended rather than required.
+RECOMMENDS="$(dpkg-deb -f "$PKG" Recommends)"
+printf '%s\n' "$RECOMMENDS" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -Fxq 'geoclue-2.0' || fail "missing recommendation geoclue-2.0"
+# Every PAM conffile and exact bridge contents/modes were checked in the
 # original archives before extraction; no lifecycle hooks are permitted.
 
 # Former-package relations remain alongside the two retained regular files.

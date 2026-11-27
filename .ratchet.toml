@@ -1,0 +1,55 @@
+# Counted metrics that only go down. Checked by .github/workflows/ratchet.yml
+# with tuna-os/.github's count-ratchet action (see its README for the format).
+#
+# A count over budget fails. A count under budget also fails, with the new
+# number to write here, so an improvement stays locked in. Raising a budget
+# needs the `ratchet-raise` label on the pull request.
+#
+# Local count: python3 <tuna-os/.github>/.github/actions/count-ratchet/ratchet.py check
+# Seeded 2026-11-20 from main.
+
+# Non-test code: vendored trees, test directories and #[cfg(test)] modules
+# are out of scope.
+[defaults]
+exclude = [
+  "third-party/**", "**/vendor/**", ".spektacular/**", "**/fixtures/**", "**/corpus/**",
+  "**/tests/**", "**/test/**", "**/benches/**", "**/examples/**", "**/testdata/**",
+  "**/e2e/**", "**/fuzz/**", "**/*_test.rs", "**/*_tests.rs", "**/tests.rs", "**/test_*",
+]
+exclude-rust-tests = true
+
+[metrics.unsafe]
+description = "unsafe blocks, fns and impls in non-test Rust"
+pattern = '\bunsafe\s*(\{|fn|impl)'
+include = ["**/*.rs"]
+budget = 164
+
+[metrics.unwrap]
+description = ".unwrap() in non-test Rust"
+pattern = '\.unwrap\(\)'
+include = ["**/*.rs"]
+budget = 117
+
+[metrics.allow]
+description = "#[allow(...)] / #![allow(...)] in non-test Rust"
+pattern = '#!?\[allow\('
+include = ["**/*.rs"]
+budget = 76
+
+[metrics.ignored-tests]
+description = "#[ignore] tests, anywhere outside vendored trees"
+pattern = '#\[ignore'
+include = ["**/*.rs"]
+exclude = ["third-party/**", "**/vendor/**"]
+exclude-rust-tests = false
+budget = 16
+
+[metrics.shellcheck-disable]
+description = "shellcheck disable directives in any non-test, non-doc file"
+pattern = 'shellcheck\s+disable'
+exclude = [
+  "third-party/**", "**/vendor/**", ".spektacular/**", "**/fixtures/**", "docs/**", "**/*.md",
+  "**/tests/**", "**/test/**", "**/*.bats", "**/test_*",
+]
+exclude-rust-tests = false
+budget = 155

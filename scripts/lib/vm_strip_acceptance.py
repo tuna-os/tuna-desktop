@@ -100,8 +100,11 @@ def endpoint(sample, original, *, mode, previous=None, edge=False):
     return actual
 
 
-def await_stationary_edge(read, original, before, *, deadline):
-    """Observe genuine ongoing demand, then a settled terminal; sends NO input."""
+def await_stationary_edge(read, original, before, *, deadline, interrupted=None):
+    """Observe genuine ongoing demand, then a settled terminal; sends NO input.
+
+    The first sample `interrupted` accepts is returned at once, terminal or
+    not: the caller ends the hold rather than wait out the scroll."""
     import math
     initial = windows(before, original, edge=True)
     target = initial['delta']['rect']
@@ -142,6 +145,8 @@ def await_stationary_edge(read, original, before, *, deadline):
         if len(observations) >= 128 or len(json.dumps(sample).encode()) > 65536:
             raise RuntimeError('stationary evidence count/byte bound exceeded')
         observations.append(sample)
+        if interrupted is not None and interrupted(sample):
+            return sample, observations
         try:
             found = windows(sample, original, edge=True, live_edge=True)
             state = sample['inventory']['state']
@@ -499,6 +504,10 @@ def notification_close_control(sample, original, observer_sha256, *, require_foc
             or min(rect[:2]) < 0 or min(rect[2:]) <= 0
             or rect[0] + rect[2] > width or rect[1] + rect[3] > height):
         raise RuntimeError('notification Close control lies outside its actual banner')
+    path = close.get('path')
+    if path is not None and (type(path) is not str or len(path) > 255
+                             or re.fullmatch(r'/[A-Za-z0-9_]+(/[A-Za-z0-9_]+)*', path) is None):
+        raise RuntimeError('notification Close control accessible path is malformed')
     # WINDOW extents establish membership/size, not Wayland screen coordinates:
     # GTK CSS/surface offsets need not appear in AT-SPI extents. Never infer a
     # pointer target from them. Only normal keys reaching this focused Close
@@ -512,9 +521,24 @@ def notification_close_control(sample, original, observer_sha256, *, require_foc
     return control
 
 
+# After Return, a banner layer still there this long is not the closed one
+# leaving: the shell takes a closed banner away at once (notify.rs
+# sync_banner), and the next queued one drops in within 200 ms.
+NOTIFICATION_NEXT_BANNER_S = 0.6
+
+
 def dismiss_notification_banner(read, observe, send_key, sample, original, observer_sha256, *,
                                 deadline, input_idle, evidence, fixture_control=False, edge=False):
-    """Normal keyboard Close, only after original focused-control observation."""
+    """Normal keyboard Close, only after original focused-control observation.
+
+    Like GNOME's message tray, the shell shows one banner at a time and never
+    times out a critical one; closing it drops the next queued banner into
+    the same layer (marlin-vm run 44442598008: three critical updater
+    failures). A user closes each in turn, and so does this. Each Close
+    widget instance, named by its accessible path, receives Return at most
+    once: a banner its Close does not remove is never activated again, and
+    the unchanged capture deadline decides.
+    """
     layers, banners = notification_layers(sample)
     if not banners:
         return sample
@@ -548,39 +572,93 @@ def dismiss_notification_banner(read, observe, send_key, sample, original, obser
             time.sleep(min(.05, max(0, deadline - time.monotonic())))
         raise TimeoutError('notification key release exceeded capture deadline')
 
+    def close_path(control):
+        return control['notification_banner']['close_controls'][0].get('path')
+
+    activated = []
+
+    def unactivated(control):
+        # An unnamed Close is never told apart from one already activated.
+        path = close_path(control)
+        return not activated or (path is not None and None not in activated and path not in activated)
+
     if time.monotonic() >= deadline:
         raise TimeoutError('notification preparation exceeded capture deadline')
     actual = observe(deadline)
     checked(actual, layers)
-    notification_close_control(actual, original, observer_sha256, fixture_control=fixture_control, edge=edge)
+    control = notification_close_control(actual, original, observer_sha256, fixture_control=fixture_control, edge=edge)
     evidence.update(activation='normal-keyboard-focused-Close', focus_input_sent=False,
                     activated=False, confirmed_absent=False)
-    send_key('meta_l', 'n')
-    evidence['focus_input_sent'] = True
-    release_observed()
-    send_key('tab')
-    release_observed()
-    focused = observe(deadline)
-    checked(focused, layers)
-    evidence['control'] = notification_close_control(
-        focused, original, observer_sha256, require_focused=True, fixture_control=fixture_control, edge=edge)
-    if time.monotonic() >= deadline:
-        raise TimeoutError('notification focus validation exceeded capture deadline')
-    send_key('ret')
-    evidence['activated'] = True
-    while time.monotonic() < deadline:
-        after = read(deadline)
-        after_layers, remaining = checked(after)
-        if not remaining:
-            if after_layers != [layer for layer in layers if layer not in banners]:
-                raise RuntimeError('unexpected layer change across notification input')
-            if after['inventory']['state'].get('seat_pressed_key_count') == 0:
-                evidence.update(confirmed_absent=True, confirmed_absent_monotonic_ns=time.monotonic_ns())
-                return after
-        elif after_layers != layers:
-            raise RuntimeError('notification layer changed ambiguously after input')
-        time.sleep(min(.05, max(0, deadline - time.monotonic())))
-    raise TimeoutError('normal notification Close did not remove actual banner')
+    while True:
+        send_key('meta_l', 'n')
+        evidence['focus_input_sent'] = True
+        release_observed()
+        send_key('tab')
+        release_observed()
+        focused = observe(deadline)
+        checked(focused, layers)
+        evidence['control'] = notification_close_control(
+            focused, original, observer_sha256, require_focused=True, fixture_control=fixture_control, edge=edge)
+        if close_path(evidence['control']) != close_path(control):
+            raise RuntimeError('notification Close control changed before focused activation')
+        if time.monotonic() >= deadline:
+            raise TimeoutError('notification focus validation exceeded capture deadline')
+        send_key('ret')
+        evidence['activated'] = True
+        activated.append(close_path(control))
+        evidence['activations'] = len(activated)
+        control = None
+        next_check = time.monotonic() + NOTIFICATION_NEXT_BANNER_S
+        while control is None:
+            if time.monotonic() >= deadline:
+                raise TimeoutError('normal notification Close did not remove actual banner')
+            after = read(deadline)
+            after_layers, remaining = checked(after)
+            if not remaining:
+                if after_layers != [layer for layer in layers if layer not in banners]:
+                    raise RuntimeError('unexpected layer change across notification input')
+                if after['inventory']['state'].get('seat_pressed_key_count') == 0:
+                    evidence.update(confirmed_absent=True, confirmed_absent_monotonic_ns=time.monotonic_ns())
+                    return after
+            elif after_layers != layers:
+                raise RuntimeError('notification layer changed ambiguously after input')
+            elif time.monotonic() >= next_check:
+                # The banner layer stayed: the same banner, or the next queued one.
+                observed = observe(deadline)
+                checked(observed, layers)
+                candidate = notification_close_control(observed, original, observer_sha256,
+                                                       fixture_control=fixture_control, edge=edge)
+                if unactivated(candidate):
+                    control = candidate
+                    continue
+                next_check = time.monotonic() + NOTIFICATION_NEXT_BANNER_S
+            time.sleep(min(.05, max(0, deadline - time.monotonic())))
+
+
+def banner_shown(sample):
+    return bool(notification_layers(sample)[1])
+
+
+def hold_clear_of_banners(before, hold, let_go, dismiss, *, deadline):
+    """Run a held-button step until its held state shows no notification banner.
+
+    A critical banner can drop in while the button is down: marlin-vm run
+    44656894802 got uupd's start-limit failure banner 7 s into the stationary
+    edge hold, and no key may reach the shell while a button is held. So a
+    user lets the drag go first: hold(before) presses and performs the step
+    from `before`, returning the held sample; let_go(before, held) ends it by
+    the step's own cancel and returns the idle sample, the button up;
+    dismiss(idle) closes the banners and returns the sample the step starts
+    over from. The unchanged deadline bounds every retry.
+    """
+    while True:
+        held = hold(before)
+        if not banner_shown(held):
+            return held
+        idle = let_go(before, held)
+        if time.monotonic() >= deadline:
+            raise TimeoutError('notification banners interrupted a held step until the absolute deadline')
+        before = dismiss(idle)
 
 
 def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *, edge=False):
@@ -673,6 +751,42 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
     def chord(*keys, input_transport=transport):
         input_transport.command('send-key', keys=[{'type': 'qcode', 'data': key} for key in keys], **{'hold-time': 80})
 
+    def observe_notification(sample_deadline, *, fixture=False):
+        remaining = min(12, sample_deadline - time.monotonic(), deadline - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError('installed notification observation absolute deadline')
+        action = 'strip-notification-fixture' if fixture else 'strip-notification-control'
+        return agent.run(action, nonce, timeout=remaining)
+
+    def dismiss_banners(label, sample, local_deadline, key_transport, *, fixture=False):
+        """Close the banners as a user does; the dismissal joins the receipt even on failure."""
+        dismissal = {}
+        try:
+            sample = dismiss_notification_banner(
+                read, lambda sample_deadline: observe_notification(sample_deadline, fixture=fixture),
+                lambda *keys: chord(*keys, input_transport=key_transport),
+                sample, original, notification_observer_sha256,
+                deadline=local_deadline, input_idle=not button_down, evidence=dismissal,
+                fixture_control=fixture, edge=edge)
+        finally:
+            if dismissal:
+                receipt.setdefault('notification_dismissals', []).append({'label': label, **dismissal})
+        return sample, dismissal
+
+    def cancel_held_move(held, before):
+        """The libseat PauseSession of an actual VT round trip cancels, never
+        commits, a held strip move; only then does the button come up."""
+        vt = int(held['inventory']['session']['VTNr'])
+        away = 2 if vt != 2 else 3
+        if guest('vt', away)['active_vt'] != f'tty{away}':
+            raise RuntimeError('actual VT did not leave original session')
+        if guest('vt', vt)['active_vt'] != f'tty{vt}':
+            raise RuntimeError('actual VT did not return to original session')
+        returned = ready('scroll', extra=lambda sample, found: sample['inventory']['state']['tile_preview'] is None)
+        if {role: item['rect'] for role, item in windows(returned, original, edge=edge).items()} != {role: item['rect'] for role, item in before.items()}:
+            raise RuntimeError('VT cancellation committed a column move')
+        button(False)
+        return returned
 
     def capture(label, sample, role='alpha', *, notification_control=False):
         found = windows(sample, original, edge=edge)
@@ -697,18 +811,9 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
             'ppm_rgb_verified': None, 'png_rgb_verified': None,
         }
         attempts = 0
-        dismissal = {}
         last_error = None
         try:
             diagnostic['stage'] = 'post-frame-read'
-            def observe_notification(sample_deadline):
-                remaining = min(12, sample_deadline - time.monotonic(), deadline - time.monotonic())
-                if remaining <= 0:
-                    raise TimeoutError('installed notification observation absolute deadline')
-                action = 'strip-notification-fixture' if notification_control else 'strip-notification-control'
-                return agent.run(action, nonce, timeout=remaining)
-            def notification_key(*keys):
-                chord(*keys, input_transport=capture_transport)
             if notification_control:
                 control = guest('strip-notification-create', nonce,
                                 budget=min(4, capture_deadline - time.monotonic()))
@@ -722,7 +827,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
                         raise RuntimeError('actual fixture changed while awaiting controlled notification')
                     _, banners = notification_layers(sample)
                     if banners:
-                        observed = observe_notification(capture_deadline)
+                        observed = observe_notification(capture_deadline, fixture=True)
                         notification_close_control(observed, original, notification_observer_sha256,
                                                    fixture_control=True, edge=edge)
                         sample = observed
@@ -730,10 +835,8 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
                     time.sleep(min(.05, max(0, capture_deadline - time.monotonic())))
                 else:
                     raise TimeoutError('controlled notification did not become visible within capture deadline')
-            sample = dismiss_notification_banner(
-                read, observe_notification, notification_key, sample, original, notification_observer_sha256,
-                deadline=capture_deadline, input_idle=not button_down, evidence=dismissal,
-                fixture_control=notification_control, edge=edge)
+            sample, dismissal = dismiss_banners(label, sample, capture_deadline, capture_transport,
+                                                fixture=notification_control)
             if notification_control:
                 if dismissal.get('activated') is not True or dismissal.get('confirmed_absent') is not True:
                     raise RuntimeError('controlled notification did not reach its actual public Close endpoint')
@@ -804,9 +907,6 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
             diagnostic['failure_monotonic_ns'] = time.monotonic_ns()
             receipt['capture_failure'] = diagnostic
             raise
-        finally:
-            if dismissal:
-                receipt.setdefault('notification_dismissals', []).append({'label': label, **dismissal})
         entry = {'label': label, 'sample': sample, 'after': after,
                  'png_sha256': hashlib.sha256(png.read_bytes()).hexdigest(),
                  'ppm_sha256': hashlib.sha256(ppm.read_bytes()).hexdigest(),
@@ -959,16 +1059,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         # Cancellation must instead preserve every original canonical rectangle.
         if before_cancel['alpha']['rect'][0] <= before_cancel['beta']['rect'][0]:
             raise RuntimeError('cancel control did not start after Beta')
-        vt = int(held['inventory']['session']['VTNr'])
-        away = 2 if vt != 2 else 3
-        if guest('vt', away)['active_vt'] != f'tty{away}':
-            raise RuntimeError('actual VT did not leave original session')
-        if guest('vt', vt)['active_vt'] != f'tty{vt}':
-            raise RuntimeError('actual VT did not return to original session')
-        returned = ready('scroll', extra=lambda sample, found: sample['inventory']['state']['tile_preview'] is None)
-        if {role: item['rect'] for role, item in windows(returned, original, edge=edge).items()} != {role: item['rect'] for role, item in before_cancel.items()}:
-            raise RuntimeError('VT cancellation committed a column move')
-        button(False)
+        returned = cancel_held_move(held, before_cancel)
         capture('07-vt-cancel', returned)
         # Compositor-owned Super+drag (GNOME's and niri's modifier move): the
         # press lands in Alpha's body, where the client starts no move, so
@@ -1119,29 +1210,47 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
         capture('11-column-expel', returned, 'beta')
         if edge:
             before_edge = returned
-            before_found = windows(before_edge, original, edge=True)
-            rect = before_found['alpha']['rect']
-            move(rect[0] + 24, rect[1] + 20)
-            button(True)
-            move(rect[0] + 36, rect[1] + 20)
-            # The virtual tablet reports position and buttons together: a
-            # motion queued behind a press the guest has not read yet carries
-            # the press along. Run 40891830621 pressed at x=1278.9, past every
-            # window, so no drag began. See Alpha's titlebar drag own the
-            # pointer before the edge motion.
-            ready('scroll', extra=lambda sample, found: (
-                sample['fixture']['windows']['alpha']['move_requests']
-                > before_edge['fixture']['windows']['alpha']['move_requests']
-                and (sample['inventory']['state']['tile_preview'] or {}).get('window') == found['alpha']['id']))
-            # ONE movement into the band; the following observer has no input
-            # capability and cannot repeatedly drive the viewport itself.
-            move(1279, rect[1] + 20)
-            terminal, observations = await_stationary_edge(
-                read, original, before_edge, deadline=min(deadline, time.monotonic() + 60))
-            receipt['stationary_edge'] = {'observations': observations,
-                'stationary_input_verified': True, 'sampled_not_every_frame': True,
-                'presented_latency_qualified': False}
-            capture('12-stationary-delta-revealed', terminal, 'delta')
+            label = '12-stationary-delta-revealed'
+
+            def edge_hold(before):
+                rect = windows(before, original, edge=True)['alpha']['rect']
+                move(rect[0] + 24, rect[1] + 20)
+                button(True)
+                move(rect[0] + 36, rect[1] + 20)
+                # The virtual tablet reports position and buttons together: a
+                # motion queued behind a press the guest has not read yet carries
+                # the press along. Run 40891830621 pressed at x=1278.9, past every
+                # window, so no drag began. See Alpha's titlebar drag own the
+                # pointer before the edge motion.
+                ready('scroll', extra=lambda sample, found: (
+                    sample['fixture']['windows']['alpha']['move_requests']
+                    > before['fixture']['windows']['alpha']['move_requests']
+                    and (sample['inventory']['state']['tile_preview'] or {}).get('window') == found['alpha']['id']))
+                # ONE movement into the band; the following observer has no input
+                # capability and cannot repeatedly drive the viewport itself.
+                move(1279, rect[1] + 20)
+                held, observations = await_stationary_edge(
+                    read, original, before, deadline=min(deadline, time.monotonic() + 60),
+                    interrupted=banner_shown)
+                if banner_shown(held):
+                    receipt.setdefault('held_step_interruptions', []).append(
+                        {'label': label, 'observations': len(observations)})
+                else:
+                    receipt['stationary_edge'] = {'observations': observations,
+                        'stationary_input_verified': True, 'sampled_not_every_frame': True,
+                        'presented_latency_qualified': False}
+                return held
+
+            def edge_let_go(before, held):
+                return cancel_held_move(held, windows(before, original, edge=True))
+
+            def edge_dismiss(idle):
+                local_deadline = min(deadline, time.monotonic() + 10.0)
+                return dismiss_banners('released-' + label, idle, local_deadline,
+                                       QmpDeadline(qmp, local_deadline))[0]
+
+            terminal = hold_clear_of_banners(before_edge, edge_hold, edge_let_go, edge_dismiss, deadline=deadline)
+            capture(label, terminal, 'delta')
             final = windows(terminal, original, edge=True)
             bar = terminal['inventory']['state']['tile_preview']['rect']
             delta_rect = final['delta']['rect']

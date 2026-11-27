@@ -1,7 +1,7 @@
 //! Stable creator ownership for live private PAM helpers; deadlines never retire.
 use crate::pam_cancel::{Cancellation, WakeFd};
 use crate::pam_helper::{
-    Answer, AnswerText, Event, Identity, Retirement, SelfImage, Style, Supervisor,
+    Answer, AnswerText, Event, Identity, Refusal, Retirement, SelfImage, Style, Supervisor,
 };
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -15,6 +15,7 @@ const BUSY: u8 = 1;
 const POISONED: u8 = 2;
 const TEXT_LIMIT: usize = 4096;
 static LIVE: OnceLock<Option<Backend>> = OnceLock::new();
+static LIVE_FINGERPRINT: OnceLock<Option<Backend>> = OnceLock::new();
 
 type Factory = Arc<
     dyn Fn(Identity, String, String, Duration, Cancellation) -> io::Result<Supervisor>
@@ -46,6 +47,8 @@ impl Verification {
 enum Reply {
     Pending,
     Retired(bool),
+    /// Retired unauthenticated, with the PAM class of the failure.
+    Refused(Refusal),
     Poisoned,
 }
 /// Private owned credential buffer. Schema Secret only redacts Debug and has
@@ -154,6 +157,7 @@ pub struct ConversationTicket {
     ticket: Ticket,
     receiver: crate::pam_conversation::Receiver,
     outcome: Option<Verification>,
+    refusal: Option<Refusal>,
 }
 impl ConversationTicket {
     /// Register this owned source once in the runtime loop. Queue publication
@@ -182,11 +186,17 @@ impl ConversationTicket {
     pub fn cancel(&mut self) {
         self.ticket.denied = true;
         self.ticket.cancel.cancel();
+        self.refusal = None;
         if matches!(self.outcome, Some(Verification::Retired { .. })) {
             self.outcome = Some(Verification::Retired {
                 authenticated: false,
             });
         }
+    }
+    /// The PAM class of a timely, uncancelled unauthenticated result, once
+    /// [`try_outcome`](Self::try_outcome) returned it; `None` otherwise.
+    pub fn refusal(&self) -> Option<Refusal> {
+        self.refusal
     }
     /// Cancellation or deadline expiry is denial, never a retirement receipt.
     pub fn try_outcome(&mut self) -> Option<Verification> {
@@ -204,10 +214,17 @@ impl ConversationTicket {
         // bounded poll rather than sleeping with Retired already queued.
         for _ in 0..2 {
             let outcome = match self.ticket.reply.try_recv() {
-                Ok(Reply::Retired(authenticated)) => {
+                Ok(reply @ (Reply::Retired(_) | Reply::Refused(_))) => {
+                    let (authenticated, refusal) = match reply {
+                        Reply::Refused(refusal) => (false, Some(refusal)),
+                        _ => (matches!(reply, Reply::Retired(true)), None),
+                    };
                     let observed = Instant::now();
                     self.ticket.denied |=
                         self.ticket.cancel.is_canceled() || !self.receiver.timely_at(observed);
+                    if !self.ticket.denied {
+                        self.refusal = refusal;
+                    }
                     match self.ticket.retired_at(authenticated, observed) {
                         Initial::Finished(result) => Some(result),
                         Initial::Pending => None,
@@ -242,6 +259,7 @@ impl Ticket {
         };
         match self.reply.recv_timeout(remaining) {
             Ok(Reply::Retired(authenticated)) => self.retired_at(authenticated, Instant::now()),
+            Ok(Reply::Refused(_)) => self.retired_at(false, Instant::now()),
             Ok(Reply::Pending) | Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.denied = true;
                 self.cancel.cancel();
@@ -274,7 +292,7 @@ impl Ticket {
         }
         loop {
             match self.reply.recv() {
-                Ok(Reply::Retired(_)) => {
+                Ok(Reply::Retired(_) | Reply::Refused(_)) => {
                     return Verification::Retired {
                         authenticated: false,
                     };
@@ -299,12 +317,25 @@ impl Drop for OwnerGuard {
 }
 impl Backend {
     pub fn shutdown_live() {
-        if let Some(Some(backend)) = LIVE.get() {
-            backend.shutdown();
+        for live in [&LIVE, &LIVE_FINGERPRINT] {
+            if let Some(Some(backend)) = live.get() {
+                backend.shutdown();
+            }
         }
     }
+    /// The password owner: the `tuna-lock` conversation and the legacy
+    /// single-password `Unlock` share it, one helper at a time.
     pub fn live() -> Option<Self> {
-        LIVE.get_or_init(|| {
+        Self::live_in(&LIVE)
+    }
+    /// The fingerprint owner: the `tuna-lock-fingerprint` conversation runs
+    /// beside the password one, as GDM runs `gdm-fingerprint` beside
+    /// `gdm-password`, so it has its own stable creator and admission.
+    pub fn live_fingerprint() -> Option<Self> {
+        Self::live_in(&LIVE_FINGERPRINT)
+    }
+    fn live_in(cell: &'static OnceLock<Option<Backend>>) -> Option<Self> {
+        cell.get_or_init(|| {
             let image = SelfImage::capture().ok()?;
             Self::from_factory(Arc::new(move |identity, service, user, budget, cancel| {
                 if budget <= crate::pam::DEADLINE {
@@ -403,6 +434,7 @@ impl Backend {
             ticket,
             receiver,
             outcome: None,
+            refusal: None,
         })
     }
     fn begin_mode(
@@ -497,7 +529,7 @@ fn run_job(mut job: Job, factory: &Factory, shutdown: &AtomicBool, state: &Atomi
         nonce: rand::random(),
         request: job.serial,
         generation: job.serial,
-        uid: unsafe { libc::getuid() },
+        uid: rustix::process::getuid().as_raw(),
     };
     let mut supervisor = match factory(
         identity,
@@ -536,7 +568,10 @@ fn run_job(mut job: Job, factory: &Factory, shutdown: &AtomicBool, state: &Atomi
             None
         };
         match supervisor.next_event() {
-            Ok(Event::Finished { authenticated }) => {
+            Ok(Event::Finished {
+                authenticated,
+                refusal,
+            }) => {
                 if supervisor.retirement() != Retirement::Retired {
                     break;
                 }
@@ -548,7 +583,10 @@ fn run_job(mut job: Job, factory: &Factory, shutdown: &AtomicBool, state: &Atomi
                 drop(secret);
                 // Release only after actual Retired, before telling the caller.
                 state.store(FREE, Ordering::Release);
-                let _ = job.reply.send(Reply::Retired(accepted));
+                let _ = job.reply.send(match refusal {
+                    Some(refusal) if !accepted => Reply::Refused(refusal),
+                    _ => Reply::Retired(accepted),
+                });
                 return true;
             }
             Ok(Event::Challenge { sequence, messages }) => {
@@ -731,6 +769,7 @@ mod tests {
                 },
                 receiver,
                 outcome: None,
+                refusal: None,
             };
             let source = ticket.take_notice_source().unwrap();
             let mut event_loop =
@@ -887,6 +926,7 @@ mod tests {
                 },
                 receiver,
                 outcome: None,
+                refusal: None,
             };
             reply.send(Reply::Retired(true)).unwrap();
             if cancel_before_result {
@@ -973,6 +1013,7 @@ mod tests {
                 },
                 receiver,
                 outcome: None,
+                refusal: None,
             };
             reply.send(Reply::Retired(true)).unwrap();
             if !expire_before_first_poll {
@@ -1029,6 +1070,7 @@ mod tests {
             },
             receiver,
             outcome: None,
+            refusal: None,
         };
         assert_eq!(ticket.try_outcome(), None);
         reply.send(Reply::Pending).unwrap();

@@ -30,7 +30,8 @@ release.
 
 | Crate | Kind | In-repo dependents | Tier |
 |---|---|---|---|
-| `tuna-shell-control` (`crates/shell-control-schema`) | library | compositor, shell-host, shell-gtk, backlight | internal; its wire format is a cross-process contract |
+| `tuna-shell-control` (`crates/shell-control-schema`) | library | compositor, shell-host, shell-gtk, wallpaper | internal; its wire format is a cross-process contract |
+| `tuna-output` (`crates/output`) | library | shell-control, backlight, compositor, shell-host, shell-gtk | internal; its field order is part of the shell-control wire format |
 | `tuna-wallpaper` | library | compositor | internal |
 | `tuna-backlight` | library | shell-gtk | internal |
 | `tuna-magnifier` | library | compositor, shell-gtk | internal; its session JSON file is a cross-process contract |
@@ -90,13 +91,13 @@ and its doc comment lists what each minor added.
 
 - The compositor refuses a `Hello` with a different major, sending a typed
   `IncompatibleVersion` error. Otherwise it records the peer's minor
-  (`crates/compositor/src/control.rs:509-522`).
+  (`crates/compositor/src/control.rs:518-532`).
 - The shell accepts a compositor whose major matches and whose minor is
   not newer than its own (`ProtocolVersion::is_compatible_with`,
-  `crates/shell-control-schema/src/lib.rs:211-217`;
-  `crates/shell-host/src/control.rs:452-467`).
+  `crates/shell-control-schema/src/lib.rs:254-256`;
+  `crates/shell-host/src/control.rs:494-511`).
 - Decoding rejects a foreign major before any other `Hello` handling
-  (`lib.rs:2006-2013`).
+  (`lib.rs:2162-2169`).
 
 **Postcard is positional.** Enum variants are encoded by index and struct
 fields in order. Appending a variant or field therefore changes the bytes,

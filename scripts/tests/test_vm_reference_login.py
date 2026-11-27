@@ -69,5 +69,54 @@ class ReferenceLoginAdmission(unittest.TestCase):
                                    "last_error": "original observer disconnected"})
 
 
+class _Admitted(Exception):
+    pass
+
+
+def _ppm(painted):
+    width, height = 16, 80
+    pixels = bytes(value for y in range(height) for x in range(width)
+                   for value in ((x * 16, y * 3, 0) if painted else (0, 0, 0)))
+    return f"P6\n{width} {height}\n255\n".encode() + pixels
+
+
+class GreeterReferenceFrame(unittest.TestCase):
+    """The logout check compares against this frame, so it must be the painted greeter."""
+
+    def capture(self, frames, monotonic):
+        dumps = iter(frames)
+        screendumps = []
+
+        def cmd(command, **args):
+            self.assertEqual(command, "screendump")
+            screendumps.append(args["filename"])
+            Path(args["filename"]).write_bytes(_ppm(next(dumps)))
+
+        qmp = SimpleNamespace(cmd=cmd, frame=Mock())
+        observer = SimpleNamespace(session_status=Mock(return_value={"gdm": {"ready": True}}))
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        with patch.dict(sys.modules, {"vm_gnome_reference": observer}), \
+                patch.object(lane.guest_agent, "GuestAgent", return_value=Mock()), \
+                patch.object(lane.time, "monotonic", side_effect=monotonic), \
+                patch.object(lane.time, "sleep"):
+            try:
+                lane.gdm_login(qmp, "unused.sock", directory, Mock(side_effect=_Admitted()),
+                               reference_profile="gnome")
+            except _Admitted:
+                pass
+        return Path(directory, "greeter-before-login.ppm").read_bytes(), screendumps, qmp.frame
+
+    def test_black_scanout_after_readiness_is_not_the_reference(self):
+        reference, screendumps, frame = self.capture([False, False, True, True], lambda: 0)
+        self.assertEqual(reference, _ppm(True))
+        self.assertEqual(len(screendumps), 4)
+        frame.assert_called_once()
+
+    def test_greeter_that_never_paints_fails_at_the_unchanged_deadline(self):
+        clock = iter(range(0, 1000, 30))
+        with self.assertRaisesRegex(RuntimeError, "did not paint a settled frame"):
+            self.capture([False] * 10, lambda: next(clock))
+
+
 if __name__ == "__main__":
     unittest.main()

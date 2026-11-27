@@ -15,6 +15,7 @@
 //! `docs/api-stability.md` in the repository.
 
 pub mod background;
+pub mod framing;
 pub mod gl;
 pub mod introspect;
 pub mod motion;
@@ -22,11 +23,13 @@ pub use motion::{MotionLevel, MotionPolicy};
 
 use serde::{Deserialize, Serialize};
 
+use framing::FrameError;
 /// Maximum accepted frame body size in bytes (1 MiB, per ADR 0002).
 ///
-/// Enforced in [`decode_frame`] before postcard decoding, so a hostile or
-/// buggy peer cannot force a large allocation.
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// Defined by the message-agnostic [`framing`] codec and enforced in
+/// [`decode_frame`] before postcard decoding, so a hostile or buggy peer
+/// cannot force a large allocation.
+pub use framing::MAX_FRAME_BYTES;
 
 /// Maximum window title length in bytes.
 ///
@@ -227,9 +230,27 @@ impl ProtocolVersion {
     /// `HideCloseDialog`, and the shell-to-compositor `RespondCloseDialog`
     /// (gnome-shell's Force Quit / Wait). Positional postcard peers must
     /// ship together.
+    /// `0.51` appends the compositor-to-shell `LockScreenShown` message
+    /// (the lock curtain has landed, screenShield.js `_lockScreenShown`):
+    /// the shell reports the screen saver active only then, because
+    /// gnome-settings-daemon blanks the screen on `ActiveChanged(true)`.
+    /// Positional postcard peers must ship together.
+    /// `0.52` appends the shell-to-compositor `DeclareBusName` command: the
+    /// supervised shell names its session-bus connection over this
+    /// pidfd-pinned socket, and the compositor recognises the shell on
+    /// D-Bus by that unique name only (ADR 0010). Positional postcard peers
+    /// must ship together.
+    /// `0.53` appends mutter's `auto-maximize` and `overlay-key` to
+    /// InputSettings and the shell-to-compositor `BeginStartupSequence`
+    /// (an app launch's startup sequence: the busy cursor until its window
+    /// maps). Positional postcard peers must ship together.
+    /// `0.54` appends the active remote access grants (GNOME 51
+    /// `status/remoteAccess.js` over mutter's `MetaRemoteAccessHandle`s):
+    /// compositor-to-shell `RemoteAccess` and the shell-to-compositor
+    /// `StopRemoteAccess` (#1162 F2). Positional postcard peers must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 50,
+        minor: 54,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -302,20 +323,10 @@ pub struct OutputInfo {
     pub primary: bool,
 }
 
-/// Actual selected native DRM output authority. Missing inventory means no
-/// authority, including nested sessions; connector text alone is insufficient.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeOutputInfo {
-    pub name: String,
-    /// Actual char-device rdev from the compositor-owned KMS FD.
-    pub drm_device: u64,
-    /// Actual DRM connector object ID, checked against kernel sysfs.
-    pub connector_id: u32,
-    /// Canonical sysfs DRM connector directory under that owned device.
-    pub connector_sysfs: String,
-    pub connector_device: u64,
-    pub connector_inode: u64,
-}
+/// Actual selected native DRM output authority, owned by `tuna-output` so
+/// hardware-facing crates need not depend on this wire protocol (#784).
+/// Re-exported here because `Message::NativeOutputInventory` carries it.
+pub use tuna_output::NativeOutputInfo;
 
 /// One ordered state mutation between two snapshot revisions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,7 +541,102 @@ pub enum CommandKind {
         window: WindowId,
         response: CloseDialogResponse,
     },
+    /// Since 0.52: the unique name (`:1.N`) of the shell's session-bus
+    /// connection. The compositor admits D-Bus calls as the shell only
+    /// from the names its supervised, pidfd-pinned control session
+    /// declared, and forgets them when that session or process ends. A
+    /// session that is not the supervised shell is denied. A later
+    /// declaration replaces the earlier one.
+    DeclareBusName { unique_name: String },
+    /// Since 0.53: the shell launched an app (mutter's `MetaLaunchContext`
+    /// startup sequence, `meta-launch-context.c:129-189`). The compositor
+    /// shows the busy cursor until a window of `app_id` (the desktop id
+    /// without `.desktop`) or of `wm_class` (its `StartupWMClass`) maps, or
+    /// the sequence times out (`STARTUP_TIMEOUT_MS`, 15 s). Both strings are
+    /// at most [`MAX_TITLE_LEN`] bytes; longer ones are denied.
+    BeginStartupSequence {
+        app_id: String,
+        wm_class: Option<String>,
+    },
+    /// Since 0.54: the user stopped this remote access grant
+    /// (`meta_remote_access_handle_stop`, from GNOME 51
+    /// `ScreenSharingIndicator._stopSharing`). The compositor revokes the
+    /// grant permanently: its owner can use it no further and must ask
+    /// anew. Denied for a grant the compositor does not publish (already
+    /// gone, or never active).
+    StopRemoteAccess { kind: RemoteAccessKind, id: u64 },
 }
+
+/// Since 0.54: what a remote access grant is: the subclass of mutter 51's
+/// `MetaRemoteAccessHandle` its session announces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RemoteAccessKind {
+    /// `MetaScreenCastSessionHandle`: a started ScreenCast session, plain
+    /// or linked to a RemoteDesktop session.
+    ScreenCast,
+    /// `MetaRemoteDesktopSessionHandle`: a started RemoteDesktop session
+    /// (keyboard and pointer input).
+    RemoteDesktop,
+    /// `MetaInputCaptureSessionHandle`: an InputCapture session while it
+    /// captures the seat's input.
+    InputCapture,
+}
+
+/// Since 0.54: the authenticated desktop service holding a grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteAccessOwner {
+    /// The supervised shell (GNOME Shell's in-process screen recorder).
+    Shell,
+    /// The installed xdg-desktop-portal-gnome backend, for an app the
+    /// user consented to.
+    Portal,
+    /// The installed gnome-remote-desktop daemon.
+    RemoteDesktopDaemon,
+}
+
+/// Since 0.54: what a grant reaches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteAccessTarget {
+    /// A whole monitor's stream.
+    Monitor { connector: String },
+    /// One window's stream (the compositor's window id).
+    Window { window: WindowId },
+    /// Part of the screen, in global logical pixels.
+    Area {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+    /// The seat's input: a RemoteDesktop session's keyboard and pointer,
+    /// or the input an InputCapture session captures.
+    Input,
+}
+
+/// Since 0.54: one active remote access grant (mutter 51's
+/// `MetaRemoteAccessHandle`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteAccessHandle {
+    pub kind: RemoteAccessKind,
+    /// The session's id, unique within `kind`; `StopRemoteAccess` names
+    /// the grant by both.
+    pub id: u64,
+    pub owner: RemoteAccessOwner,
+    /// The owner's unique D-Bus name.
+    pub owner_name: String,
+    /// The handle's `is-recording`: every stream of the ScreenCast
+    /// session was recorded with `is-recording` (screen recordings, which
+    /// GNOME shows with its record icon rather than the sharing button).
+    pub recording: bool,
+    /// At most [`MAX_REMOTE_ACCESS_TARGETS`].
+    pub targets: Vec<RemoteAccessTarget>,
+}
+
+/// Most handles one [`Message::RemoteAccess`] carries.
+pub const MAX_REMOTE_ACCESS_HANDLES: usize = 1024;
+/// Most targets one [`RemoteAccessHandle`] carries (mutter's per-session
+/// stream bound).
+pub const MAX_REMOTE_ACCESS_TARGETS: usize = 64;
 
 /// mutter 51 `MetaCloseDialogResponse`: what the user chose in the dialog
 /// shown for a window that stopped answering pings.
@@ -1191,6 +1297,23 @@ pub enum Message {
     /// (`meta_window_set_alive (TRUE)`), went away, left the screen, or
     /// the session locked. Sent only to peers advertising minor >= 50.
     HideCloseDialog { window: WindowId },
+    /// Since 0.51: whether the lock screen is shown: the session is
+    /// locked and the lock curtain has landed over it (GNOME 51
+    /// `screenShield.js` `_lockScreenShown`, after the
+    /// `Overview.ANIMATION_TIME` lowering). The shell reports the screen
+    /// saver active (`GetActive`, `ActiveChanged(true)`) only from here,
+    /// as gnome-shell does: gnome-settings-daemon blanks the screen on
+    /// `ActiveChanged(true)`, and blanking mid-slide freezes the curtain
+    /// off screen. `false` once the session unlocks. Sent on change and in
+    /// each handshake snapshot while shown, only to peers advertising
+    /// minor >= 51.
+    LockScreenShown { shown: bool },
+    /// Since 0.54: every active remote access grant, whole, whenever the
+    /// set changes (mutter 51's remote access controller `new-handle` and
+    /// each handle's `stopped`); an empty list says none is left. Sent in
+    /// each handshake while any is active, only to peers advertising
+    /// minor >= 54. At most [`MAX_REMOTE_ACCESS_HANDLES`].
+    RemoteAccess { handles: Vec<RemoteAccessHandle> },
 }
 
 /// [`Message::WorkspaceProgress`] positions are workspace indices times
@@ -1393,6 +1516,15 @@ pub struct InputSettings {
     /// placement, else mutter's first-fit from the work area's corner.
     #[serde(default = "default_center_new_windows")]
     pub center_new_windows: bool,
+    /// `org.gnome.mutter auto-maximize` (0.53): a window first mapping
+    /// larger than 80% of the work area opens maximized.
+    #[serde(default = "default_auto_maximize")]
+    pub auto_maximize: bool,
+    /// `org.gnome.mutter overlay-key` (0.53): the lone key that toggles the
+    /// overview, as mutter parses it (`Super` means `Super_L` and
+    /// `Super_R`; empty disables it).
+    #[serde(default = "default_overlay_key")]
+    pub overlay_key: String,
 }
 
 /// GNOME's `GDesktopPointerAccelProfile`, shared by the mouse, touchpad,
@@ -1686,6 +1818,16 @@ fn default_center_new_windows() -> bool {
     true
 }
 
+/// Mutter 51's `auto-maximize` default.
+fn default_auto_maximize() -> bool {
+    true
+}
+
+/// Mutter 51's `overlay-key` default.
+fn default_overlay_key() -> String {
+    "Super".into()
+}
+
 impl Default for InputSettings {
     /// GNOME 51's defaults.
     fn default() -> Self {
@@ -1726,6 +1868,8 @@ impl Default for InputSettings {
             trackball: TrackballSettings::default(),
             pointing_stick: PointingStickSettings::default(),
             center_new_windows: true,
+            auto_maximize: true,
+            overlay_key: default_overlay_key(),
         }
     }
 }
@@ -1956,6 +2100,16 @@ impl From<postcard::Error> for DecodeError {
     }
 }
 
+impl From<FrameError> for DecodeError {
+    fn from(e: FrameError) -> Self {
+        match e {
+            FrameError::Truncated { expected, actual } => Self::Truncated { expected, actual },
+            FrameError::Oversize { len, max } => Self::Oversize { len, max },
+            FrameError::Malformed(e) => Self::Malformed(e),
+        }
+    }
+}
+
 /// Encode one message as a length-prefixed frame: u32-LE body length
 /// followed by the postcard body.
 ///
@@ -1963,30 +2117,7 @@ impl From<postcard::Error> for DecodeError {
 /// [`MAX_FRAME_BYTES`]; both indicate a local programming error, since the
 /// cap bounds every message this crate can legally emit.
 pub fn encode_frame(msg: &Message) -> Vec<u8> {
-    // Grow-on-demand so small control messages avoid the 1 MiB buffer.
-    // postcard::to_slice reports SerializeBufferFull when the buffer is
-    // too small; that is the only recoverable encode error here.
-    let mut cap = 1024usize;
-    loop {
-        let mut buf = vec![0u8; cap];
-        match postcard::to_slice(msg, &mut buf) {
-            Ok(used) => {
-                let body_len = used.len();
-                let mut frame = Vec::with_capacity(4 + body_len);
-                frame.extend_from_slice(&(body_len as u32).to_le_bytes());
-                frame.extend_from_slice(used);
-                return frame;
-            }
-            Err(postcard::Error::SerializeBufferFull) => {
-                cap *= 4;
-                assert!(
-                    cap <= MAX_FRAME_BYTES,
-                    "encoded message exceeds {MAX_FRAME_BYTES}-byte frame cap"
-                );
-            }
-            Err(e) => panic!("shell control encode failed: {e}"),
-        }
-    }
+    framing::encode(msg)
 }
 
 /// Owned credential frame. Drop wipes this encoder's sole allocation; this is
@@ -2107,39 +2238,7 @@ pub fn encode_answer_frame(
 /// well-formed with no trailing bytes, titles within [`MAX_TITLE_LEN`],
 /// and `Hello` major matching [`CURRENT_VERSION`].major.
 pub fn decode_frame(bytes: &[u8]) -> Result<Message, DecodeError> {
-    if bytes.len() < 4 {
-        return Err(DecodeError::Truncated {
-            expected: 4,
-            actual: bytes.len(),
-        });
-    }
-    let mut prefix = [0u8; 4];
-    prefix.copy_from_slice(&bytes[..4]);
-    let len = u32::from_le_bytes(prefix) as usize;
-    if len > MAX_FRAME_BYTES {
-        return Err(DecodeError::Oversize {
-            len,
-            max: MAX_FRAME_BYTES,
-        });
-    }
-    let body = &bytes[4..];
-    if body.len() < len {
-        return Err(DecodeError::Truncated {
-            expected: len,
-            actual: body.len(),
-        });
-    }
-    if body.len() > len {
-        return Err(DecodeError::Malformed(
-            postcard::Error::DeserializeBadEncoding,
-        ));
-    }
-    let (msg, trailing): (Message, &[u8]) = postcard::take_from_bytes(&body[..len])?;
-    if !trailing.is_empty() {
-        return Err(DecodeError::Malformed(
-            postcard::Error::DeserializeBadEncoding,
-        ));
-    }
+    let msg: Message = framing::decode(bytes)?;
     validate_titles(&msg)?;
     if let Message::Hello { version } = &msg {
         if version.major != CURRENT_VERSION.major {
@@ -2428,7 +2527,29 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
                 ));
             }
         }
-        Message::HideCloseDialog { .. } => {}
+        Message::HideCloseDialog { .. } | Message::LockScreenShown { .. } => {}
+        Message::RemoteAccess { handles } => {
+            if handles.len() > MAX_REMOTE_ACCESS_HANDLES {
+                return Err(DecodeError::CollectionTooLong {
+                    len: handles.len(),
+                    max: MAX_REMOTE_ACCESS_HANDLES,
+                });
+            }
+            for handle in handles {
+                check_title(&handle.owner_name)?;
+                if handle.targets.len() > MAX_REMOTE_ACCESS_TARGETS {
+                    return Err(DecodeError::CollectionTooLong {
+                        len: handle.targets.len(),
+                        max: MAX_REMOTE_ACCESS_TARGETS,
+                    });
+                }
+                for target in &handle.targets {
+                    if let RemoteAccessTarget::Monitor { connector } = target {
+                        check_title(connector)?;
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2636,6 +2757,34 @@ mod tests {
         }
         assert!(InputSettings::default().center_new_windows);
     }
+
+    /// mutter 51 `prefs.c:380,423`: `auto-maximize` defaults on and
+    /// `overlay-key` to `Super`; both survive the positional wire, and the
+    /// startup-sequence command round-trips.
+    #[test]
+    fn auto_maximize_overlay_key_and_startup_sequence_survive_the_wire() {
+        let defaults = InputSettings::default();
+        assert!(defaults.auto_maximize);
+        assert_eq!(defaults.overlay_key, "Super");
+        for (auto_maximize, overlay_key) in [(false, "Super_R"), (true, "")] {
+            let settings = InputSettings {
+                auto_maximize,
+                overlay_key: overlay_key.into(),
+                ..Default::default()
+            };
+            let mut buffer = [0u8; 512];
+            let body = postcard::to_slice(&settings, &mut buffer).unwrap();
+            let decoded: InputSettings = postcard::from_bytes(body).unwrap();
+            assert_eq!(decoded, settings);
+        }
+        let kind = CommandKind::BeginStartupSequence {
+            app_id: "org.gnome.TextEditor".into(),
+            wm_class: Some("gnome-text-editor".into()),
+        };
+        let mut buffer = [0u8; 256];
+        let body = postcard::to_slice(&kind, &mut buffer).unwrap();
+        assert_eq!(postcard::from_bytes::<CommandKind>(body).unwrap(), kind);
+    }
     #[test]
     fn secrets_never_reach_debug_output() {
         let kind = CommandKind::Unlock {
@@ -2647,11 +2796,140 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_50() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 50));
-        // A 0.49 shell still negotiates; a newer minor does not.
-        assert!(ProtocolVersion::new(0, 49).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 51).is_compatible_with(&CURRENT_VERSION));
+    fn current_version_is_0_54() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 54));
+        // A 0.53 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 53).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 55).is_compatible_with(&CURRENT_VERSION));
+    }
+
+    fn remote_access_handle(targets: Vec<RemoteAccessTarget>) -> RemoteAccessHandle {
+        RemoteAccessHandle {
+            kind: RemoteAccessKind::ScreenCast,
+            id: 4,
+            owner: RemoteAccessOwner::Portal,
+            owner_name: ":1.42".into(),
+            recording: false,
+            targets,
+        }
+    }
+
+    #[test]
+    fn remote_access_follows_lock_screen_shown_and_is_bounded() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 512];
+        let lock = tag(
+            postcard::to_slice(&Message::LockScreenShown { shown: true }, &mut buffer).unwrap(),
+        );
+        let message = Message::RemoteAccess {
+            handles: vec![
+                remote_access_handle(vec![
+                    RemoteAccessTarget::Monitor {
+                        connector: "Virtual-1".into(),
+                    },
+                    RemoteAccessTarget::Window { window: 9 },
+                    RemoteAccessTarget::Area {
+                        x: 1,
+                        y: 2,
+                        width: 3,
+                        height: 4,
+                    },
+                ]),
+                RemoteAccessHandle {
+                    kind: RemoteAccessKind::RemoteDesktop,
+                    owner: RemoteAccessOwner::RemoteDesktopDaemon,
+                    targets: vec![RemoteAccessTarget::Input],
+                    ..remote_access_handle(Vec::new())
+                },
+            ],
+        };
+        assert_eq!(
+            tag(postcard::to_slice(&message, &mut buffer).unwrap()),
+            lock + 1
+        );
+        assert_eq!(decode_frame(&encode_frame(&message)).unwrap(), message);
+        let empty = Message::RemoteAccess {
+            handles: Vec::new(),
+        };
+        assert_eq!(decode_frame(&encode_frame(&empty)).unwrap(), empty);
+        let too_many = Message::RemoteAccess {
+            handles: vec![remote_access_handle(Vec::new()); MAX_REMOTE_ACCESS_HANDLES + 1],
+        };
+        assert!(matches!(
+            decode_frame(&encode_frame(&too_many)),
+            Err(DecodeError::CollectionTooLong { .. })
+        ));
+        let streams = Message::RemoteAccess {
+            handles: vec![remote_access_handle(vec![
+                RemoteAccessTarget::Input;
+                MAX_REMOTE_ACCESS_TARGETS + 1
+            ])],
+        };
+        assert!(matches!(
+            decode_frame(&encode_frame(&streams)),
+            Err(DecodeError::CollectionTooLong { .. })
+        ));
+        for long in [
+            RemoteAccessHandle {
+                owner_name: "n".repeat(MAX_TITLE_LEN + 1),
+                ..remote_access_handle(Vec::new())
+            },
+            remote_access_handle(vec![RemoteAccessTarget::Monitor {
+                connector: "c".repeat(MAX_TITLE_LEN + 1),
+            }]),
+        ] {
+            let message = Message::RemoteAccess {
+                handles: vec![long],
+            };
+            assert!(matches!(
+                decode_frame(&encode_frame(&message)),
+                Err(DecodeError::TitleTooLong { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn stop_remote_access_follows_begin_startup_sequence() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 64];
+        let respond = tag(postcard::to_slice(
+            &CommandKind::RespondCloseDialog {
+                window: 3,
+                response: CloseDialogResponse::Wait,
+            },
+            &mut buffer,
+        )
+        .unwrap());
+        let declare = tag(postcard::to_slice(
+            &CommandKind::DeclareBusName {
+                unique_name: ":1.2".into(),
+            },
+            &mut buffer,
+        )
+        .unwrap());
+        assert_eq!(declare, respond + 1);
+        let startup = tag(postcard::to_slice(
+            &CommandKind::BeginStartupSequence {
+                app_id: "org.gnome.TextEditor".into(),
+                wm_class: None,
+            },
+            &mut buffer,
+        )
+        .unwrap());
+        assert_eq!(startup, declare + 1);
+        for kind in [
+            RemoteAccessKind::ScreenCast,
+            RemoteAccessKind::RemoteDesktop,
+            RemoteAccessKind::InputCapture,
+        ] {
+            let stop = CommandKind::StopRemoteAccess { kind, id: 12 };
+            assert_eq!(
+                tag(postcard::to_slice(&stop, &mut buffer).unwrap()),
+                startup + 1
+            );
+            let command = Message::Command { id: 5, kind: stop };
+            assert_eq!(decode_frame(&encode_frame(&command)).unwrap(), command);
+        }
     }
 
     #[test]
@@ -4212,6 +4490,70 @@ mod close_dialog_wire_tests {
                 menu + 1
             );
             let command = Message::Command { id: 11, kind };
+            assert_eq!(decode_frame(&encode_frame(&command)).unwrap(), command);
+        }
+    }
+
+    #[test]
+    fn lock_screen_shown_follows_hide_close_dialog() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 64];
+        let hide =
+            tag(postcard::to_slice(&Message::HideCloseDialog { window: 7 }, &mut buffer).unwrap());
+        for shown in [true, false] {
+            let message = Message::LockScreenShown { shown };
+            assert_eq!(
+                tag(postcard::to_slice(&message, &mut buffer).unwrap()),
+                hide + 1
+            );
+            assert_eq!(decode_frame(&encode_frame(&message)).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn declare_bus_name_follows_respond_close_dialog() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 64];
+        let respond = tag(postcard::to_slice(
+            &CommandKind::RespondCloseDialog {
+                window: 3,
+                response: CloseDialogResponse::Wait,
+            },
+            &mut buffer,
+        )
+        .unwrap());
+        let kind = CommandKind::DeclareBusName {
+            unique_name: ":1.42".into(),
+        };
+        assert_eq!(
+            tag(postcard::to_slice(&kind, &mut buffer).unwrap()),
+            respond + 1
+        );
+        let command = Message::Command { id: 12, kind };
+        assert_eq!(decode_frame(&encode_frame(&command)).unwrap(), command);
+    }
+
+    #[test]
+    fn begin_startup_sequence_follows_declare_bus_name() {
+        let tag = |bytes: &[u8]| bytes[0];
+        let mut buffer = [0_u8; 64];
+        let declare = tag(postcard::to_slice(
+            &CommandKind::DeclareBusName {
+                unique_name: ":1.42".into(),
+            },
+            &mut buffer,
+        )
+        .unwrap());
+        for wm_class in [None, Some("gnome-text-editor".to_owned())] {
+            let kind = CommandKind::BeginStartupSequence {
+                app_id: "org.gnome.TextEditor".into(),
+                wm_class,
+            };
+            assert_eq!(
+                tag(postcard::to_slice(&kind, &mut buffer).unwrap()),
+                declare + 1
+            );
+            let command = Message::Command { id: 13, kind };
             assert_eq!(decode_frame(&encode_frame(&command)).unwrap(), command);
         }
     }

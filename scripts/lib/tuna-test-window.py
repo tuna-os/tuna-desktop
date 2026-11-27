@@ -7,7 +7,11 @@ Maps one Adw.ApplicationWindow titled TITLE with a header bar, a big
 label, a menu button whose popover proves xdg popups, and a scrollable
 list that proves wheel scrolling. Exits when the window closes. With
 TUNA_TEST_POPOVER=1 the popover opens by itself once the window shows
-(parity captures cannot rely on headless input).
+(parity captures cannot rely on headless input). TUNA_TEST_SIZE=WxH
+replaces the 640x420 default size, and TUNA_TEST_APP_ID the app id
+(tuna-test-<lowercased TITLE>). With TUNA_TEST_DRAG=LOG
+the big label starts a real GTK drag of its text and takes a drop of it,
+each step (drag-begin, drag-end, drag-cancel, drop) appended to LOG.
 """
 import os
 import sys
@@ -24,7 +28,8 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, GLib, Gtk  # noqa: E402
+gi.require_version("Gdk", "4.0")
+from gi.repository import Adw, Gdk, GLib, GObject, Gtk  # noqa: E402
 
 TITLE = sys.argv[1] if len(sys.argv) > 1 else "Tuna Desktop Test"
 COLOR = sys.argv[2] if len(sys.argv) > 2 else "#3584e4"
@@ -34,7 +39,8 @@ def build(loop):
     # No Gtk.Application: harness windows must not need a session bus.
     win = Adw.Window(title=TITLE)
     win.connect("close-request", lambda *_: loop.quit() or False)
-    win.set_default_size(640, 420)
+    width, height = (int(n) for n in os.environ.get("TUNA_TEST_SIZE", "640x420").split("x"))
+    win.set_default_size(width, height)
     css = Gtk.CssProvider()
     css.load_from_string(f".tuna-test {{ background: {COLOR}; color: white; }}")
     Gtk.StyleContext.add_provider_for_display(
@@ -54,6 +60,20 @@ def build(loop):
     label.add_css_class("tuna-test")
     label.set_vexpand(True)
     box.append(label)
+    if drag_log := os.environ.get("TUNA_TEST_DRAG"):
+        def note(line):
+            with open(drag_log, "a") as log:
+                log.write(line + "\n")
+
+        source = Gtk.DragSource(actions=Gdk.DragAction.COPY)
+        source.set_content(Gdk.ContentProvider.new_for_value(GObject.Value(str, TITLE)))
+        source.connect("drag-begin", lambda *_: note("drag-begin"))
+        source.connect("drag-end", lambda *_: note("drag-end"))
+        source.connect("drag-cancel", lambda _s, _d, reason: note(f"drag-cancel {reason.value_nick}") or False)
+        label.add_controller(source)
+        target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.COPY)
+        target.connect("drop", lambda _t, value, _x, _y: note(f"drop {value}") or True)
+        label.add_controller(target)
     rows = Gtk.ListBox()
     for i in range(60):
         rows.append(Gtk.Label(label=f"Row {i}"))
@@ -89,7 +109,7 @@ def build(loop):
 
 
 # Distinct app ids let journeys target each window (xdg_toplevel app_id).
-GLib.set_prgname("tuna-test-" + TITLE.lower())
+GLib.set_prgname(os.environ.get("TUNA_TEST_APP_ID") or "tuna-test-" + TITLE.lower())
 Adw.init()
 main_loop = GLib.MainLoop()
 build(main_loop)
