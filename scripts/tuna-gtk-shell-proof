@@ -39,6 +39,10 @@
 #   cancel and drop, #1189) and G-SHELL-STABLE only.
 #   --lock-menu-only runs panel readiness, G-LOCK-WITH-MENU-OPEN and
 #   G-SHELL-STABLE only (needs pam_wrapper).
+#   --panel-dash-only runs panel readiness, G-PANEL-LAYOUT and
+#   G-DASH-FAVORITES-RUNNING (#1198, #1199) and G-SHELL-STABLE only, at
+#   TUNA_SCALE in the proof's locale; a scale other than 1 adds
+#   -FRACTIONAL and a right-to-left locale -RTL to the gate names.
 #   --remote-access-only runs panel readiness, G-REMOTE-ACCESS-INDICATOR
 #   (a portal share's Stop Screen Sharing button, #1162 F2) and
 #   G-SHELL-STABLE only (needs pipewire, wireplumber and the portal).
@@ -51,6 +55,13 @@
 # on a private session bus with the AT-SPI accessibility bus, then:
 #   G-PANEL     the panel maps (frame differs from the bare session)
 #   A11Y-PANEL  the panel controls are exposed to screen readers by name
+#   G-PANEL-LAYOUT (--panel-dash-only) Activities at the leading edge, the
+#               clock centred on the output to a physical pixel, the system
+#               menu at the trailing edge, from the bar's accessible tree
+#               and each control's hover fill (#1199)
+#   G-DASH-FAVORITES-RUNNING (--panel-dash-only) the dash lists
+#               favorite-apps in order, then the running non-favourite,
+#               with running dots under exactly the running apps (#1198)
 #   G-SHELL-CAIRO on software GL the compositor starts the shell with
 #               GSK_RENDERER=cairo and the shell loads no Mesa rasterizer (#503)
 #   G-CLOCK-DAMAGE a clock tick repaints the clock's rectangle in the bar,
@@ -612,6 +623,7 @@ SEARCH_LEAK_ONLY=0
 WINDOW_LEAK_ONLY=0
 DND_OVERVIEW_ONLY=0
 LOCK_MENU_ONLY=0
+PANEL_DASH_ONLY=0
 SOUND_ALERTS_ONLY=0
 REMOTE_ACCESS_ONLY=0
 GRID_CANCEL_ONLY=0
@@ -661,6 +673,7 @@ while [ $# -gt 0 ]; do
         --window-leak-only) WINDOW_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --lock-menu-only) LOCK_MENU_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --folder-dnd-only) FOLDER_DND_ONLY=1; only_mode "$1" no-examples; shift ;;
+        --panel-dash-only) PANEL_DASH_ONLY=1; only_mode "$1" source-build no-media-source no-examples no-camera-policy; shift ;;
         --dnd-overview-only) DND_OVERVIEW_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --x11-iconic-only) X11_ICONIC_ONLY=1; only_mode "$1"; shift ;;
         --protocols-only) PROTOCOLS_ONLY=1; only_mode "$1" no-media-source no-camera-policy; shift ;;
@@ -1176,6 +1189,7 @@ pass G-GRID-ON-DEMAND "no grid tiles on the window picker or after close; a held
 . "$ROOT/scripts/lib/tuna-datemenu-proof.sh"
 . "$ROOT/scripts/lib/tuna-search-leak-proof.sh"
 . "$ROOT/scripts/lib/tuna-window-leak-proof.sh"
+. "$ROOT/scripts/lib/tuna-panel-dash-proof.sh"
 . "$ROOT/scripts/lib/tuna-sound-alerts-proof.sh"
 . "$ROOT/scripts/lib/tuna-dnd-overview-proof.sh"
 
@@ -1709,6 +1723,9 @@ fi
 # interleave whole pieces, never overwrite bytes (tuna-fade-match tolerates
 # the interleaved pieces).
 : >"$LOG"
+if [ "$PANEL_DASH_ONLY" = 1 ]; then
+    panel_dash_setup
+fi
 # Persist the disabled policy before the GTK publisher starts. The portal
 # probe must observe it on first acquisition, before testing live toggles.
 if [ "$ONLY_NO_CAMERA_POLICY" = 0 ]; then
@@ -2573,6 +2590,17 @@ if [ "$GRID_HOVER_ONLY" = 1 ]; then
     sleep 3
     grid_hover_proof
     grid_on_demand_proof
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
+if [ "$PANEL_DASH_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "panel and dash desktop ready" ||
+        fail "G-PANEL-LAYOUT$PANEL_DASH_SUFFIX" "desktop never became ready"
+    # The startup cover must be gone before frames are read.
+    sleep 3
+    panel_layout_gate
+    dash_favorites_running_gate
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
     exit 0
