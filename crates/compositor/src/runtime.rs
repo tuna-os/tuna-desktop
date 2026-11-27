@@ -348,6 +348,13 @@ pub struct NestedSession {
     /// session normally runs inside a desktop that already has its own
     /// reader and accessibility manager (`--screen-reader`).
     pub screen_reader: bool,
+    /// Greeter mode (#1164): the login screen on GDM's daemon. The
+    /// supervised client is `tuna-greeter` (see [`resolve_greeter_bin`])
+    /// instead of the shell; there is no user session, so no lock screen,
+    /// no overview, no shell gestures and no Tuna session target, as
+    /// GNOME Shell's `gdm` session mode has none. Outputs, input and
+    /// accessibility are the same as in a user session.
+    pub greeter: bool,
 }
 
 /// Which display backend a session runs on.
@@ -411,6 +418,7 @@ impl NestedSession {
             backend: BackendChoice::Auto,
             startup_overview: false,
             screen_reader: false,
+            greeter: false,
         }
     }
 
@@ -567,13 +575,80 @@ pub fn resolve_shell_bin_in(
     exe_dir: Option<std::path::PathBuf>,
     path_var: Option<std::ffi::OsString>,
 ) -> std::path::PathBuf {
+    resolve_bin_in(&SHELL_BINARIES, configured, env_bin, exe_dir, path_var)
+}
+
+/// The login screen's client in greeter mode (#1164).
+pub const GREETER_BINARY: &str = "tuna-greeter";
+
+/// Greeter binary for a greeter session: explicit config, then
+/// `TUNA_GREETER_BIN`, then the sibling of this binary, then `PATH`, else
+/// the bare name for a spawn-time lookup.
+pub fn resolve_greeter_bin(configured: Option<&std::path::Path>) -> std::path::PathBuf {
+    resolve_greeter_bin_in(
+        configured,
+        std::env::var_os("TUNA_GREETER_BIN"),
+        current_exe_dir(),
+        std::env::var_os("PATH"),
+    )
+}
+
+/// [`resolve_greeter_bin`] with its inputs explicit, for tests.
+pub fn resolve_greeter_bin_in(
+    configured: Option<&std::path::Path>,
+    env_bin: Option<std::ffi::OsString>,
+    exe_dir: Option<std::path::PathBuf>,
+    path_var: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    resolve_bin_in(&[GREETER_BINARY], configured, env_bin, exe_dir, path_var)
+}
+
+/// Whether idle, suspend and logind's `Lock` lock the session. The login
+/// screen never locks: GDM 51's greeter profile sets
+/// `org.gnome.desktop.lockdown disable-lock-screen`
+/// (`data/dconf/defaults/00-upstream-settings`), so GNOME Shell's
+/// `screenShield.lock` refuses there, and the greeter has no lock surface
+/// to show.
+pub fn session_locks(greeter: bool) -> bool {
+    !greeter
+}
+
+/// Whether the session has the overview and workspaces: GNOME Shell's
+/// `gdm` mode has neither (`hasOverview`, `hasWorkspaces` false), so the
+/// login screen takes no Super, hot corner or shell swipe.
+pub fn session_has_overview(greeter: bool) -> bool {
+    !greeter
+}
+
+/// Whether the overview opens at start (`--startup-overview`, as GNOME
+/// greets a login): never on the login screen.
+pub fn startup_overview(requested: bool, greeter: bool) -> bool {
+    requested && session_has_overview(greeter)
+}
+
+/// Whether to send `READY=1` for `tuna-greeter.service` now: in greeter
+/// mode, once, when the greeter's layer first maps (a restarted greeter
+/// sends nothing more).
+pub fn greeter_ready_due(greeter: bool, layer_mapped: bool, sent: bool) -> bool {
+    greeter && layer_mapped && !sent
+}
+
+/// The first of `names` the inputs find, in [`resolve_shell_bin`]'s
+/// order; the last name, bare, when none is installed.
+fn resolve_bin_in(
+    names: &[&str],
+    configured: Option<&std::path::Path>,
+    env_bin: Option<std::ffi::OsString>,
+    exe_dir: Option<std::path::PathBuf>,
+    path_var: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
     if let Some(path) = configured {
         return path.to_owned();
     }
     if let Some(path) = env_bin.filter(|p| !p.is_empty()) {
         return std::path::PathBuf::from(path);
     }
-    for name in SHELL_BINARIES {
+    for name in names {
         if let Some(found) = exe_dir.as_deref().and_then(|dir| sibling_binary(dir, name)) {
             return found;
         }
@@ -581,12 +656,12 @@ pub fn resolve_shell_bin_in(
     let dirs: Vec<std::path::PathBuf> = path_var
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    for name in SHELL_BINARIES {
+    for name in names {
         if let Some(found) = dirs.iter().find_map(|dir| sibling_binary(dir, name)) {
             return found;
         }
     }
-    std::path::PathBuf::from(SHELL_BINARIES[1])
+    std::path::PathBuf::from(names[names.len() - 1])
 }
 
 #[cfg(test)]
@@ -685,6 +760,64 @@ mod shell_bin_tests {
             exe.path().join("tuna-shell-gtk")
         );
     }
+
+    #[test]
+    fn greeter_resolves_like_the_shell_under_its_own_name() {
+        let exe = tempfile::tempdir().unwrap();
+        let path = tempfile::tempdir().unwrap();
+        let exe_dir = Some(exe.path().to_owned());
+        let path_var = Some(path.path().as_os_str().to_owned());
+        let resolve = |env: Option<&str>| {
+            resolve_greeter_bin_in(None, env.map(Into::into), exe_dir.clone(), path_var.clone())
+        };
+        // A shell beside the compositor is never the greeter.
+        touch(exe.path(), "tuna-shell-gtk");
+        assert_eq!(resolve(None), std::path::PathBuf::from("tuna-greeter"));
+        touch(path.path(), "tuna-greeter");
+        assert_eq!(resolve(None), path.path().join("tuna-greeter"));
+        touch(exe.path(), "tuna-greeter");
+        assert_eq!(resolve(None), exe.path().join("tuna-greeter"));
+        assert_eq!(resolve(Some("")), exe.path().join("tuna-greeter"));
+        assert_eq!(
+            resolve(Some("/x/greeter")),
+            std::path::PathBuf::from("/x/greeter")
+        );
+    }
+
+    #[test]
+    fn the_login_screen_never_locks_and_has_no_overview() {
+        // A user session locks on idle, suspend and logind's Lock, and
+        // has the overview (Super, hot corner, swipes, startup overview).
+        assert!(session_locks(false));
+        assert!(session_has_overview(false));
+        assert!(startup_overview(true, false));
+        assert!(!startup_overview(false, false));
+        // GNOME Shell's gdm mode under GDM's greeter profile: none of it.
+        assert!(!session_locks(true));
+        assert!(!session_has_overview(true));
+        assert!(
+            !startup_overview(true, true),
+            "--startup-overview is ignored with --greeter"
+        );
+    }
+
+    #[test]
+    fn ready_is_sent_once_when_the_greeter_first_maps() {
+        assert!(!greeter_ready_due(true, false, false), "nothing mapped yet");
+        assert!(greeter_ready_due(true, true, false));
+        assert!(
+            !greeter_ready_due(true, true, true),
+            "a restarted greeter's map sends nothing more"
+        );
+        assert!(
+            !greeter_ready_due(true, false, true),
+            "between greeter restarts"
+        );
+        assert!(
+            !greeter_ready_due(false, true, false),
+            "a user session is no notify unit"
+        );
+    }
 }
 
 /// Summary of one nested run, for diagnostics (no sensitive content).
@@ -696,6 +829,9 @@ pub struct RunStats {
     pub clients: u64,
     /// Shell restarts consumed (initial spawn excluded).
     pub shell_restarts: u32,
+    /// Greeter mode only: the greeter's restart budget ran out, so the
+    /// session ended for GDM to restart the login screen.
+    pub greeter_exhausted: bool,
 }
 
 /// Ways the nested runtime can fail to start or run.
@@ -770,6 +906,10 @@ pub struct Runtime {
     manager: WindowManager,
     control: ControlHub,
     shell: ShellDriver,
+    /// [`NestedSession::greeter`]: the login screen, not a user session.
+    greeter: bool,
+    /// Greeter mode: `READY=1` went to systemd once the greeter mapped.
+    greeter_ready_sent: bool,
     orca: crate::orca::Reader,
     a11y_keyboard: Option<crate::a11y_keyboard::Monitor>,
     /// The IBus bridge, when IBus is installed.
@@ -1147,6 +1287,18 @@ impl Runtime {
                     state.set_output_location(&out.name, out.loc);
                     state.note_output_global(&out.name, global);
                 }
+                // One lease device global per DRM device, native backend
+                // only (meta_wayland_drm_lease_manager_new).
+                match drm.lease_device(&dh) {
+                    Ok(device) => {
+                        eprintln!(
+                            "tuna-compositor: drm-lease: wp_drm_lease_device_v1 advertised ({} connector(s) for lease)",
+                            device.connector_count()
+                        );
+                        state.protocols.drm_lease = Some(device);
+                    }
+                    Err(e) => eprintln!("tuna-compositor: drm-lease: no lease device: {e}"),
+                }
                 let handle = event_loop.handle();
                 handle
                     .insert_source(sources.session, |event, _, rt: &mut Runtime| {
@@ -1154,6 +1306,11 @@ impl Runtime {
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
                 flips = Some(FlipLoop::new(sources.drm, &handle)?);
+                // Connector hotplug and lessee changes (Mutter's
+                // resources-changed and lease-changed) arrive as udev
+                // changes of the device: the lease device updates its
+                // leases and connectors first, so the desktop rescan sees
+                // the CRTCs leases still hold.
                 if let Some(udev) = sources.udev {
                     handle
                         .insert_source(udev, |event, _, rt: &mut Runtime| {
@@ -1166,6 +1323,9 @@ impl Runtime {
                             }
                             if matches!(&rt.backend, Backend::Drm(drm) if drm.is_device(device_id))
                             {
+                                if let Some(lease) = rt.state.protocols.drm_lease.as_mut() {
+                                    lease.device_changed();
+                                }
                                 rt.on_drm_hotplug();
                             }
                         })
@@ -1321,7 +1481,11 @@ impl Runtime {
         let shell_policy = RestartPolicy::default();
         let mut shell = ShellDriver::new(
             shell_policy,
-            resolve_shell_bin(session.shell_bin.as_deref()),
+            if session.greeter {
+                resolve_greeter_bin(session.shell_bin.as_deref())
+            } else {
+                resolve_shell_bin(session.shell_bin.as_deref())
+            },
             session.socket_name.clone(),
             control_path,
         );
@@ -1392,17 +1556,27 @@ impl Runtime {
             );
         }
 
-        // linux-dmabuf lists exactly what this renderer imports (#89).
+        // linux-dmabuf lists exactly what this renderer imports (#89),
+        // with feedback naming the renderer's device as Mutter's does.
         let mut backend = backend;
         let mut state = state;
         {
             use smithay::backend::renderer::ImportDma;
-            let formats: Vec<_> = match &mut backend {
-                Backend::Winit(winit) => winit.renderer().dmabuf_formats().into_iter().collect(),
+            let (formats, main_device): (Vec<_>, _) = match &mut backend {
+                Backend::Winit(winit) => {
+                    let renderer = winit.renderer();
+                    (
+                        renderer.dmabuf_formats().into_iter().collect(),
+                        crate::protocols::renderer_main_device(renderer),
+                    )
+                }
                 #[cfg(feature = "drm")]
-                Backend::Drm(drm) => drm.renderer.dmabuf_formats().into_iter().collect(),
+                Backend::Drm(drm) => (
+                    drm.renderer.dmabuf_formats().into_iter().collect(),
+                    crate::protocols::renderer_main_device(&drm.renderer),
+                ),
             };
-            state.enable_dmabuf(formats);
+            state.enable_dmabuf(formats, main_device);
         }
         // On software GL the shell draws with cairo. Telling it here saves
         // it a GL context of its own made only to read GL_RENDERER, which
@@ -1606,6 +1780,8 @@ impl Runtime {
             manager,
             control,
             shell,
+            greeter: session.greeter,
+            greeter_ready_sent: false,
             ime: crate::ime::ImeBridge::configured(&session.socket_name),
             overlay,
             wallpaper: Wallpaper::new(),
@@ -1814,7 +1990,7 @@ impl Runtime {
             }
         }
         // GNOME Shell greets a login with the overview.
-        if session.startup_overview {
+        if startup_overview(session.startup_overview, session.greeter) {
             runtime.control.set_overview(true);
         }
         Ok((runtime, event_loop))
@@ -1996,6 +2172,13 @@ impl Runtime {
         if let Backend::Drm(drm) = &mut self.backend {
             drm.on_session_event(event);
         }
+        if let Some(lease) = self.state.protocols.drm_lease.as_mut() {
+            if activated {
+                lease.resume();
+            } else {
+                lease.pause();
+            }
+        }
         // Monitors may have come or gone while another VT
         // owned the device.
         if activated {
@@ -2007,6 +2190,12 @@ impl Runtime {
     /// snapshots), overview dismissed, and the exclusive lock surface
     /// up with an empty list — no window titles while locked.
     fn engage_lock(&mut self) {
+        // The login screen never locks ([`session_locks`]): idle, suspend
+        // and logind's Lock leave it as it is.
+        if !session_locks(self.greeter) {
+            self.lock.unlock(self.lock_now_ms());
+            return;
+        }
         // Motion that came before the lock is the session's, not the shield's.
         self.flush_motion();
         // Track lifecycle separately: idle check_timeout has already locked its flag.
@@ -2526,7 +2715,8 @@ impl Runtime {
         }
         // Swipes of three or more fingers are the shell's (GNOME 51):
         // consumed here. Other swipes reach the client.
-        if self.shell_swipe_input(&input) {
+        // The login screen has no workspaces or overview to swipe to.
+        if session_has_overview(self.greeter) && self.shell_swipe_input(&input) {
             self.publish_workspace_progress();
             return;
         }
@@ -2576,7 +2766,9 @@ impl Runtime {
             let inhibited =
                 matches!(input, ManagerInput::Key { .. }) && self.state.shortcuts_inhibited();
             let popup = crate::layer::exclusive_popup_keyboard_layer(&self.state).is_some();
-            let action = if inhibited || popup {
+            // The login screen has no overview (`gdm` mode's hasOverview
+            // is false): Super and the hot corner do nothing.
+            let action = if inhibited || popup || !session_has_overview(self.greeter) {
                 self.triggers.cancel();
                 TriggerAction::None
             } else {
@@ -2927,6 +3119,8 @@ impl Runtime {
             // Never emit key identities that could expose credential input.
             "seat_pressed_key_count": self.state.pressed_key_count(),
             "x11_ready": x11_ready,
+            "bell_rings": self.state.bell_rings(),
+            "bell_policy": self.state.protocols.bell.policy(),
             "idle_timeout_ms": self.lock.timeout_ms(),
             "idle_blank_alpha": self.blank_alpha(),
             "power_save_mode": self.power_save.mode(),
@@ -5362,7 +5556,7 @@ impl Runtime {
                 clock.saturating_sub(*start).as_secs_f64()
                     < 0.2 * self.input_settings.motion.slowdown()
             })
-            || self.state.protocols.bell.visual(now).is_some()
+            || self.state.protocols.bell.visual_active()
             || self.shell_swipe.active()
             || !self.casts.is_empty()
             // A running PAM worker publishes its terminal phase before
@@ -6035,6 +6229,19 @@ impl Runtime {
                         self.overlay.hide();
                     }
                 }
+                ShellStatus::Exhausted if self.greeter => {
+                    // No graphical login without the greeter: end the
+                    // session so GDM restarts the login screen (GDM's
+                    // own greeter-failure recovery) instead of leaving
+                    // an empty shield up.
+                    if !self.stats.greeter_exhausted {
+                        eprintln!(
+                            "tuna-compositor: greeter restart budget exhausted; ending the login screen"
+                        );
+                    }
+                    self.stats.greeter_exhausted = true;
+                    self.exit = true;
+                }
                 ShellStatus::Waiting { .. } | ShellStatus::Fault(_) | ShellStatus::Exhausted => {
                     self.refresh_overlay()
                 }
@@ -6657,6 +6864,12 @@ impl Runtime {
                 .and_then(|name| self.state.lock_surface_for(&name))
                 .is_some();
         let shell_ready = !crate::layer::layer_layout(&self.state).is_empty();
+        if greeter_ready_due(self.greeter, shell_ready, self.greeter_ready_sent) {
+            // The login screen is up: `tuna-greeter.service` is ready.
+            self.greeter_ready_sent = true;
+            crate::session_services::notify_ready();
+            eprintln!("tuna-compositor: greeter mapped; READY=1");
+        }
         // Animation time, so proofs can sample transitions at exact delays.
         let now = self.animation_clock.now();
         if self.animation_clock.is_manual() {
@@ -6980,7 +7193,15 @@ impl Runtime {
                     let passes = [
                         Tracked::pass(&paper, 1.0),
                         Tracked::pass(&previews, view.scale),
-                        Tracked::covered_pass(&elements.elements, view.scale, &cover),
+                        // A blur reads what lies under the windows in
+                        // front of it, so with one in the frame nothing is
+                        // culled (#503's cover only when no surface blurs).
+                        if elements.blur_markers.is_empty() {
+                            Tracked::covered_pass(&elements.elements, view.scale, &cover)
+                        } else {
+                            Tracked::pass(&elements.elements, view.scale)
+                        },
+                        Tracked::pass(&elements.blur_markers, 1.0),
                         Tracked::pass(&elements.tile, 1.0),
                         Tracked::pass(&elements.top, view.scale),
                         elements
@@ -7070,7 +7291,7 @@ impl Runtime {
                         let damage = if zoom_plan.is_some() {
                             vec![Rectangle::from_size(size)]
                         } else {
-                            damage
+                            elements.blur_damage(damage, Rectangle::from_size(size))
                         };
                         self.winit_signature = Some(signature);
                         let zoom_program = zoom_plan
@@ -7359,7 +7580,15 @@ impl Runtime {
                     let passes = [
                         Tracked::pass(&paper, 1.0),
                         Tracked::pass(&previews, view.scale),
-                        Tracked::covered_pass(&elements.elements, view.scale, &cover),
+                        // A blur reads what lies under the windows in
+                        // front of it, so with one in the frame nothing is
+                        // culled (#503's cover only when no surface blurs).
+                        if elements.blur_markers.is_empty() {
+                            Tracked::covered_pass(&elements.elements, view.scale, &cover)
+                        } else {
+                            Tracked::pass(&elements.elements, view.scale)
+                        },
+                        Tracked::pass(&elements.blur_markers, 1.0),
                         Tracked::pass(&elements.tile, 1.0),
                         Tracked::pass(&elements.top, view.scale),
                         elements
@@ -7461,7 +7690,7 @@ impl Runtime {
                     let damage = if zoom_plan.is_some() {
                         vec![Rectangle::from_size(logical)]
                     } else {
-                        damage
+                        elements.blur_damage(damage, Rectangle::from_size(logical))
                     };
                     let zoom_program = zoom_plan
                         .as_ref()
@@ -7975,6 +8204,11 @@ struct Scene {
     /// The window each of `elements` belongs to (popups included), for
     /// reporting which windows occlusion hid; `None` for layers.
     owners: Vec<Option<u64>>,
+    /// Surfaces with an ext-background-effect blur region, by element.
+    blur: Vec<crate::background_blur::Behind>,
+    /// Their sample areas, for damage tracking only (never drawn): a
+    /// region that changes or moves repaints old and new areas.
+    blur_markers: Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement>,
 }
 
 /// A size-change snapshot, drawn at scale 1.
@@ -8007,7 +8241,76 @@ impl Scene {
             brightness: vec![1.0; above],
             dim_program: None,
             owners: vec![None; above],
+            blur: Vec::new(),
+            blur_markers: Vec::new(),
         }
+    }
+
+    /// Find the surfaces among `elements` with a committed
+    /// ext-background-effect blur region (none: no work at all), in
+    /// frame pixels at the pass `scale`, clipped to the surface.
+    fn with_blur(mut self, state: &State, scale: f64) -> Self {
+        use smithay::backend::renderer::element::{solid::SolidColorRenderElement, Element};
+        let blurred = state.protocols.background_effects.blurred();
+        if blurred.is_empty() {
+            return self;
+        }
+        for (index, element) in self.elements.iter().enumerate() {
+            let Some(surface) = blurred.iter().find(|b| b.id == *element.id()) else {
+                continue;
+            };
+            if surface.size.w <= 0 || surface.size.h <= 0 {
+                continue;
+            }
+            // Logical surface pixels to frame pixels, rescaling included.
+            let geometry = element.geometry(scale.into());
+            let sx = f64::from(geometry.size.w) / f64::from(surface.size.w);
+            let sy = f64::from(geometry.size.h) / f64::from(surface.size.h);
+            let rects: Vec<_> = surface
+                .rects
+                .iter()
+                .filter_map(|r| {
+                    let x0 = geometry.loc.x + (f64::from(r.loc.x) * sx).round() as i32;
+                    let y0 = geometry.loc.y + (f64::from(r.loc.y) * sy).round() as i32;
+                    let x1 = geometry.loc.x + (f64::from(r.loc.x + r.size.w) * sx).round() as i32;
+                    let y1 = geometry.loc.y + (f64::from(r.loc.y + r.size.h) * sy).round() as i32;
+                    Rectangle::new((x0, y0).into(), (x1 - x0, y1 - y0).into())
+                        .intersection(geometry)
+                })
+                .collect();
+            let behind = crate::background_blur::Behind {
+                index,
+                rects,
+                radius: (crate::background_blur::BLUR_RADIUS * sx.max(sy)) as f32,
+                alpha: element.alpha(),
+            };
+            let Some(sample) = behind.sample() else {
+                continue;
+            };
+            self.blur_markers.push(SolidColorRenderElement::new(
+                surface.marker.clone(),
+                sample,
+                surface.commit,
+                Color32F::TRANSPARENT,
+                Kind::Unspecified,
+            ));
+            self.blur.push(behind);
+        }
+        self
+    }
+
+    /// The frame's damage with every blur sample area it touches.
+    fn blur_damage(
+        &self,
+        damage: Vec<Rectangle<i32, smithay::utils::Physical>>,
+        output: Rectangle<i32, smithay::utils::Physical>,
+    ) -> Vec<Rectangle<i32, smithay::utils::Physical>> {
+        if self.blur.is_empty() {
+            return damage;
+        }
+        crate::native_repaint::coalesce(crate::background_blur::expand_damage(
+            damage, &self.blur, output,
+        ))
     }
 
     /// How many surfaces draw beneath the tile preview. Only this changes
@@ -8275,7 +8578,8 @@ fn scene_elements(
                 )
             })
             .unwrap_or_default(),
-        );
+        )
+        .with_blur(state, view.scale);
     }
     if overview.is_some() {
         // Overview (#54): windows are drawn as rescaled previews in
@@ -8300,7 +8604,7 @@ fn scene_elements(
                 ));
             }
         }
-        return Scene::flat(crate::layer::front_to_back(elements));
+        return Scene::flat(crate::layer::front_to_back(elements)).with_blur(state, view.scale);
     }
     let mut elements: Vec<PreviewElement> = Vec::new();
     let mut owners: Vec<Option<u64>> = Vec::new();
@@ -8544,7 +8848,10 @@ fn scene_elements(
         bell: Vec::new(),
         snapshots,
         owners: crate::layer::front_to_back(owners),
+        blur: Vec::new(),
+        blur_markers: Vec::new(),
     }
+    .with_blur(state, view.scale)
 }
 
 fn background_geometry(
@@ -8755,9 +9062,19 @@ fn draw_scene(
     draw_planned::<GlesRenderer, _>(frame, scale, previews, &previews_plan, opaque)
         .map_err(error)?;
     frame.clear_tex_program_override();
-    draw_slots(frame, scale, scene, &under, &under_plan, tint, opaque).map_err(error)?;
+    draw_slots(
+        frame,
+        output,
+        scale,
+        scene,
+        &under,
+        &under_plan,
+        tint,
+        opaque,
+    )
+    .map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, tile, &tile_plan, opaque).map_err(error)?;
-    draw_slots(frame, scale, scene, &over, &over_plan, tint, opaque).map_err(error)?;
+    draw_slots(frame, output, scale, scene, &over, &over_plan, tint, opaque).map_err(error)?;
     set_tint(frame, 1.0);
     draw_planned::<GlesRenderer, _>(frame, scale, &scene.top, &top_plan, opaque).map_err(error)?;
     frame.clear_tex_program_override();
@@ -8911,9 +9228,21 @@ fn plan_slots(
         .iter()
         .map(|slot| {
             let plan = match *slot {
-                SceneSlot::Element(index) => occlusion
-                    .plan(scale, std::slice::from_ref(&scene.elements[index]))
-                    .remove(0),
+                SceneSlot::Element(index) => {
+                    let plan = occlusion
+                        .plan(scale, std::slice::from_ref(&scene.elements[index]))
+                        .remove(0);
+                    // What a background blur reads repaints beneath it.
+                    if let Some(sample) = scene
+                        .blur
+                        .iter()
+                        .find(|blur| blur.index == index)
+                        .and_then(crate::background_blur::Behind::sample)
+                    {
+                        occlusion.uncover(&[sample]);
+                    }
+                    plan
+                }
                 SceneSlot::Bell(k) => occlusion
                     .plan(1.0, std::slice::from_ref(&scene.bell[k].1))
                     .remove(0),
@@ -8926,8 +9255,12 @@ fn plan_slots(
         .unzip()
 }
 
+/// Draw the slots bottom to top; a surface with a background blur gets
+/// it painted under itself first, over what is already drawn.
+#[allow(clippy::too_many_arguments)]
 fn draw_slots(
     frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+    output: Rectangle<i32, smithay::utils::Physical>,
     scale: f64,
     scene: &Scene,
     slots: &[SceneSlot],
@@ -8937,6 +9270,22 @@ fn draw_slots(
 ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
     use crate::occlusion::draw_planned;
     for (slot, visible) in slots.iter().zip(plan).rev() {
+        if let SceneSlot::Element(index) = *slot {
+            if let Some(blur) = scene.blur.iter().find(|blur| blur.index == index) {
+                let under: Vec<_> = blur
+                    .rects
+                    .iter()
+                    .flat_map(|rect| visible.iter().filter_map(|v| v.intersection(*rect)))
+                    .collect();
+                crate::background_blur::draw_behind(
+                    frame,
+                    &under,
+                    blur.radius,
+                    blur.alpha,
+                    output,
+                )?;
+            }
+        }
         let visible = std::slice::from_ref(visible);
         let brightness = match *slot {
             SceneSlot::Element(index) => scene.brightness[index],
@@ -9292,7 +9641,10 @@ fn run_loop(
     let (mut runtime, mut event_loop) = Runtime::launch(session)?;
     #[cfg(feature = "drm")]
     let _session_services = if matches!(runtime.backend, Backend::Drm(_)) {
-        Some(crate::session_services::publish(&session.socket_name))
+        Some(crate::session_services::publish(
+            &session.socket_name,
+            session.greeter,
+        ))
     } else {
         None
     };

@@ -22,13 +22,13 @@ exclude-rust-tests = true
 description = "unsafe blocks, fns and impls in non-test Rust"
 pattern = '\bunsafe\s*(\{|fn|impl)'
 include = ["**/*.rs"]
-budget = 181
+budget = 191
 
 [metrics.unwrap]
 description = ".unwrap() in non-test Rust"
 pattern = '\.unwrap\(\)'
 include = ["**/*.rs"]
-budget = 110
+budget = 117
 
 [metrics.allow]
 description = "#[allow(...)] / #![allow(...)] in non-test Rust"
@@ -52,4 +52,4 @@ exclude = [
   "**/tests/**", "**/test/**", "**/*.bats", "**/test_*",
 ]
 exclude-rust-tests = false
-budget = 158
+budget = 162

@@ -386,11 +386,11 @@ pub fn start_of_today_in(tz: &jiff::tz::TimeZone, now_secs: i64) -> (i64, i64) {
     let now = jiff::Timestamp::from_second(now_secs).unwrap_or(jiff::Timestamp::UNIX_EPOCH);
     let at3 = |day: jiff::civil::Date| {
         day.at(DAY_START_HOUR, 0, 0, 0)
-            .to_zoned(tz.clone())
+            .to_zoned_datetime(tz.clone())
             .map(|z| z.timestamp())
             .unwrap_or(now)
     };
-    let mut day = now.to_zoned(tz.clone()).date();
+    let mut day = now.to_zoned_datetime(tz.clone()).date();
     if at3(day) > now {
         day = day.yesterday().unwrap_or(day);
     }
@@ -2565,20 +2565,20 @@ mod tests {
         // 2026-10-10 02:00 UTC belongs to the day starting 2026-10-09 03:00.
         let early = jiff::civil::date(2026, 10, 10)
             .at(2, 0, 0, 0)
-            .to_zoned(tz.clone())
+            .to_zoned_datetime(tz.clone())
             .unwrap()
             .timestamp()
             .as_second();
         let (today, tomorrow) = start_of_today_in(&tz, early);
         let expect_today = jiff::civil::date(2026, 10, 9)
             .at(3, 0, 0, 0)
-            .to_zoned(tz.clone())
+            .to_zoned_datetime(tz.clone())
             .unwrap()
             .timestamp()
             .as_second();
         let expect_tomorrow = jiff::civil::date(2026, 10, 10)
             .at(3, 0, 0, 0)
-            .to_zoned(tz.clone())
+            .to_zoned_datetime(tz.clone())
             .unwrap()
             .timestamp()
             .as_second();
@@ -2586,7 +2586,7 @@ mod tests {
         // Noon belongs to the same civil day's 03:00 start.
         let noon = jiff::civil::date(2026, 10, 10)
             .at(12, 0, 0, 0)
-            .to_zoned(tz.clone())
+            .to_zoned_datetime(tz.clone())
             .unwrap()
             .timestamp()
             .as_second();
@@ -2601,7 +2601,7 @@ mod tests {
         let at = |hour, minute, second| {
             jiff::civil::date(2026, 11, 21)
                 .at(hour, minute, second, 0)
-                .to_zoned(jiff::tz::TimeZone::UTC)
+                .to_zoned_datetime(jiff::tz::TimeZone::UTC)
                 .unwrap()
                 .timestamp()
                 .as_second()

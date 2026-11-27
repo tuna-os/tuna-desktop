@@ -128,7 +128,6 @@ mod keybindings;
 mod live_apps;
 mod location;
 mod lock;
-mod lock_auth;
 mod lock_curtain;
 mod lock_notifications;
 mod lock_wiggle;
