@@ -48,7 +48,7 @@ jobs:
     # Seconds of Python and git, but every other job waits on it: on the
     # self-hosted pool it sat queued 35 min on average (26-27 Nov 2026), so
     # it always runs on a GitHub-hosted runner (docs/ci-runners.md).
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       lanes: ${{ steps.lanes.outputs.lanes }}
       vm_matrix: ${{ steps.lanes.outputs.vm_matrix }}
@@ -2323,7 +2323,7 @@ jobs:
     # Artifact-only consumer of the two DEV members, not another VM producer.
     timeout-minutes: 10
     # Artifact-only; hosted so it never waits for a self-hosted slot.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: [select-lanes, marlin-vm]
     # The two reference members it downloads are not built on pull requests
     # (select-lanes' vm_matrix).
@@ -2362,7 +2362,7 @@ jobs:
     # matrix; selecting this lane adds the Orca 51 leg to a pull request's
     # matrix (scripts/ci-select-lanes vm_matrix), so its artifact always exists.
     # Artifact and Python only; hosted so it never waits for a self-hosted slot.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: [select-lanes, check, journey, gtk-shell, orca-speech, drm-smoke, hotplug, marlin-vm, remote-security]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'parity-ledger')
     steps:
@@ -2445,7 +2445,7 @@ jobs:
   docs-shots:
     timeout-minutes: 20
     # Artifact and shellcheck only; hosted so it never waits for a self-hosted slot.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: [select-lanes, journey, desktop-proofs]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'docs-shots')
     steps:
@@ -2487,7 +2487,7 @@ jobs:
     # for a slot, which held the required check (and the merge queue) open.
     if: ${{ !cancelled() }}
     needs: [select-lanes, check, journey, drm-smoke, hotplug, desktop-proofs, gtk-shell, gtk-shell-smoke, orca-speech, portal-security, remote-security, niri-parity, arch-package, marlin-image, gdm51-native-package, marlin-vm, native-reference-context, parity-ledger, docs-shots]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - env:
           RESULTS: ${{ toJSON(needs) }}
