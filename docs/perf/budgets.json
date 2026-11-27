@@ -188,6 +188,42 @@
       "unit": "ms",
       "enforced": true,
       "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/38910158684"
+    },
+    "pss.idle.desktop.p50": {
+      "max_ratio": 1.0,
+      "ceiling": null,
+      "floor": 0,
+      "unit": "MiB",
+      "enforced": false,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/42807208426",
+      "note": "Provisional (ADR 0009): reported, never a pass or a failure. max_ratio is the v1 target, not a calibrated budget; the evidence run is the first whose stock samples were replayed through this metric."
+    },
+    "pss.idle.total.p50": {
+      "max_ratio": 1.0,
+      "ceiling": null,
+      "floor": 0,
+      "unit": "MiB",
+      "enforced": false,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/42807208426",
+      "note": "Provisional (ADR 0009): reported, never a pass or a failure. max_ratio is the v1 target, not a calibrated budget; the evidence run is the first whose stock samples were replayed through this metric."
+    },
+    "pss.whole.desktop.p50": {
+      "max_ratio": 1.0,
+      "ceiling": null,
+      "floor": 0,
+      "unit": "MiB",
+      "enforced": false,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/42807208426",
+      "note": "Provisional (ADR 0009): reported, never a pass or a failure. max_ratio is the v1 target, not a calibrated budget; the evidence run is the first whose stock samples were replayed through this metric."
+    },
+    "pss.whole.total.p50": {
+      "max_ratio": 1.0,
+      "ceiling": null,
+      "floor": 0,
+      "unit": "MiB",
+      "enforced": false,
+      "evidence": "https://github.com/tuna-os/tuna-desktop/actions/runs/42807208426",
+      "note": "Provisional (ADR 0009): reported, never a pass or a failure. max_ratio is the v1 target, not a calibrated budget; the evidence run is the first whose stock samples were replayed through this metric."
     }
   },
   "profile": "stock"

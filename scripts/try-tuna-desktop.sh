@@ -98,7 +98,13 @@ for _dir in "$HOME" /var/tmp; do
 done
 
 # cosign verifies the image signature before anything boots from it.
-command -v cosign >/dev/null 2>&1 || die "cosign not found — install it with: brew install cosign (macOS, or any distro via linuxbrew) or: go install github.com/sigstore/cosign/v2/cmd/cosign@latest (Linux)"
+command -v cosign >/dev/null 2>&1 || die "cosign not found — install cosign v3 with: brew install cosign (macOS, or any distro via linuxbrew) or: go install github.com/sigstore/cosign/v3/cmd/cosign@latest (Linux)"
+# TunaOS signs with cosign v3's bundle format; cosign v2 reports a signed
+# image as "no signatures found", which would read as an unsigned build.
+_cosign_major="$(cosign version 2>/dev/null | sed -n 's/^GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9]*\)\..*/\1/p' | head -n 1)"
+if [[ -n "$_cosign_major" && "$_cosign_major" -lt 3 ]]; then
+  die "cosign ${_cosign_major}.x cannot read TunaOS image signatures (cosign v3 bundle format) — upgrade to cosign v3: brew upgrade cosign, or go install github.com/sigstore/cosign/v3/cmd/cosign@latest"
+fi
 
 # Corral itself, verified the same way scripts/install.sh does it.
 if ! command -v corral >/dev/null 2>&1; then

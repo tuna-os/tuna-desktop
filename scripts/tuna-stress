@@ -16,7 +16,9 @@ order (``--phases`` runs a subset; warmup and the growth gates always run):
             registration churn and search-provider query floods
   scale     a DisplayConfig scale storm while clients map windows and popups
   services  NetworkManager, BlueZ and power-profiles daemons vanish and
-            return; ibus-daemon is killed and restarted under a focused field
+            return; the IBus bridge's own ibus-daemon is killed (the bridge
+            restarts it) and quit under a focused field, then the bridge
+            itself is killed
   input     key and pointer floods counted at the client; a held key's
             repeat across focus changes
   swipe     touchpad swipes interrupted mid-gesture
@@ -275,6 +277,14 @@ def comm(pid):
         return Path(f"/proc/{pid}/comm").read_text().strip()
     except (FileNotFoundError, ProcessLookupError):
         return ""
+
+
+def parent(pid):
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    return int(stat.rsplit(")", 1)[1].split()[1])
 
 
 class Failure(Exception):
@@ -1003,38 +1013,94 @@ class Stress:
             conn.close_sync(None)
         return value if value and value != "/" else None
 
+    def nested_log(self):
+        return (self.out / "nested.log").read_text(errors="replace")
+
     def ibus_daemons(self):
         return [pid for pid in owned_pids(self.private) if comm(pid) == "ibus-daemon"]
 
+    def ibus_bridge(self):
+        bridges = [pid for pid in tree(self.compositor.pid) if comm(pid) == "tuna-ibus-bridg"]
+        return bridges[0] if len(bridges) == 1 else None
+
+    def bridge_daemon(self, bridge):
+        """This run's ibus-daemon, or None. There is never more than one, and
+        it is the bridge's own child: a nested session has no IBus unit, so
+        the bridge owns the daemon (#1014)."""
+        daemons = self.ibus_daemons()
+        if len(daemons) > 1:
+            raise Failure(f"more than one ibus-daemon: {daemons}")
+        if daemons and parent(daemons[0]) != bridge:
+            raise Failure(f"ibus-daemon {daemons[0]} is not the bridge's ({bridge}) child")
+        return daemons[0] if daemons else None
+
     def ibus_restarts(self):
-        if not any(comm(pid) == "tuna-ibus-bridg" for pid in tree(self.compositor.pid)):
+        bridge = self.ibus_bridge()
+        if bridge is None:
             raise Failure("the IBus bridge is not running (build tuna-shell-host's tuna-ibus-bridge)")
         process, path, read = self.input_client("tuna-stress-ime")
         self.focus_client("tuna-stress-ime", read)
         self.wait_for(self.ibus_focused_context, "IBus focused on the bridge's input context", 30)
         rounds = 5
         for round_ in range(rounds):
-            daemons = self.ibus_daemons()
-            if not daemons:
+            killed = self.bridge_daemon(bridge)
+            if killed is None:
                 raise Failure("no ibus-daemon to kill")
-            for pid in daemons:
-                os.kill(pid, signal.SIGKILL)
-            self.wait_for(lambda: not self.ibus_daemons(), "ibus-daemon gone", 10)
+            os.kill(killed, signal.SIGKILL)
             before = read()["text"]
             self.xdotool("type", "--delay", "20", "ab")
-            self.wait_for(lambda: read()["text"] == before + 2, f"typing without IBus (round {round_})", 15)
-            env = self.client_env.copy()
-            subprocess.run(["ibus-daemon", "--panel", "disable", "--daemonize"], env=env, check=True)
-            self.wait_for(self.ibus_focused_context,
+            self.wait_for(lambda: read()["text"] == before + 2,
+                          f"typing across the daemon's loss (round {round_})", 15)
+            # Like its unit's Restart=on-abnormal, the bridge replaces a
+            # daemon a signal ended.
+            self.wait_for(lambda: self.bridge_daemon(bridge) not in (None, killed),
+                          f"the bridge's replacement ibus-daemon (round {round_})", 30)
+            # The bridge's own context, not only the app's IM module's.
+            self.wait_for(lambda: self.nested_log().count("tuna-ibus-bridge: IBus returned\n") == round_ + 1,
                           f"the bridge back on the returned ibus-daemon (round {round_})", 30)
+            self.wait_for(self.ibus_focused_context,
+                          f"IBus focused on the bridge's input context (round {round_})", 30)
             before = read()["text"]
             self.xdotool("type", "--delay", "20", "cd")
             self.wait_for(lambda: read()["text"] == before + 2, f"typing through IBus (round {round_})", 15)
+        # A daemon that quits stays gone, as its unit's would.
+        env = self.client_env.copy()
+        env.pop("IBUS_ADDRESS", None)
+        subprocess.run(["ibus", "exit"], env=env, check=True, timeout=10)
+        self.wait_for(lambda: self.bridge_daemon(bridge) is None, "ibus-daemon gone after ibus exit", 10)
+        before = read()["text"]
+        self.xdotool("type", "--delay", "20", "ab")
+        self.wait_for(lambda: read()["text"] == before + 2, "typing without IBus", 15)
+        end = time.monotonic() + 3
+        while time.monotonic() < end:
+            if self.bridge_daemon(bridge) is not None:
+                raise Failure("the bridge restarted an ibus-daemon that quit")
+            self.pump()
+            time.sleep(0.1)
+        self.close_client(process, path)
+        self.windows_gone()
+        # The compositor restarts a bridge that dies; the new one owns a new
+        # daemon, and nothing of the old bridge's group is left.
+        os.kill(bridge, signal.SIGKILL)
+        self.wait_for(lambda: self.ibus_bridge() not in (None, bridge), "the compositor's replacement bridge", 15)
+        old, bridge = bridge, self.ibus_bridge()
+        self.wait_for(lambda: self.bridge_daemon(bridge) is not None, "the new bridge's own ibus-daemon", 30)
+        left = subprocess.run(["pgrep", "-g", str(old)], capture_output=True, text=True).stdout.split()
+        if left:
+            raise Failure(f"the dead bridge's group still holds {left}")
+        process, path, read = self.input_client("tuna-stress-ime-again")
+        self.focus_client("tuna-stress-ime-again", read)
+        self.wait_for(self.ibus_focused_context, "IBus focused on the new bridge's input context", 30)
+        before = read()["text"]
+        self.xdotool("type", "--delay", "20", "cd")
+        self.wait_for(lambda: read()["text"] == before + 2, "typing through the new bridge's IBus", 15)
         self.close_client(process, path)
         self.windows_gone()
         self.input_path()
-        self.record("S-IBUS", True, f"ibus-daemon killed {rounds} times under a focused field: typing "
-                    "continued without it and the bridge refocused each returned daemon")
+        self.record("S-IBUS", True, f"the bridge's own ibus-daemon killed {rounds} times under a focused "
+                    "field: typing continued, the bridge replaced each and refocused it, never two daemons; "
+                    "after `ibus exit` typing went on without IBus and no daemon returned; a killed bridge "
+                    "came back with its own daemon and left nothing in its old group")
 
     def wire_motions(self, name):
         """wl_pointer.motion events a WAYLAND_DEBUG client logged, with
@@ -1421,8 +1487,9 @@ def main():
         parser.error(f"unknown phases: {', '.join(unknown)}")
     args.phases = [p for p in PHASES if p in args.phases]
     if not os.environ.get("TUNA_STRESS_PRIVATE_BUS"):
-        os.execvpe("dbus-run-session", ["dbus-run-session", "--", sys.executable, SELF, *sys.argv[1:]],
-                   os.environ | {"TUNA_STRESS_PRIVATE_BUS": "1"})
+        session = str(Path(SELF).resolve().parent / "lib/tuna-proof-session")
+        os.execve(session, [session, "--bus", "--", sys.executable, SELF, *sys.argv[1:]],
+                  os.environ | {"TUNA_STRESS_PRIVATE_BUS": "1"})
     stress = Stress(args)
     stress.run()
     assertions = stress.assertions
