@@ -6,7 +6,7 @@
 //! view forwards to the compositor; [`Presence`] decides when the keyboard
 //! is shown on an explicit millisecond clock.
 
-use crate::osk_layout::{self, hints, Action, Key, Layout, Level, Purpose};
+use crate::layout::{self, hints, Action, Key, Layout, Level, Purpose};
 
 /// `KEYBOARD_REST_TIME` (`KEYBOARD_ANIMATION_TIME * 2`).
 pub const KEYBOARD_REST_TIME_MS: u64 = 300;
@@ -74,7 +74,7 @@ impl Keyboard {
     /// Load the layout for `group` and `purpose` (`_updateKeys`); `None`
     /// when no candidate layout loads.
     pub fn new(group: &str, purpose: Purpose, hints: u32) -> Option<Self> {
-        let layout = osk_layout::resolve(group, purpose)?;
+        let layout = layout::resolve(group, purpose)?;
         Some(Self::with_layout(layout, group, purpose, hints))
     }
 
@@ -131,7 +131,7 @@ impl Keyboard {
     }
 
     /// `_emojiVisible` (`_shouldShowEmoji` when the keys were last built):
-    /// pass it to [`osk_layout::place`].
+    /// pass it to [`layout::place`].
     pub fn emoji_visible(&self) -> bool {
         self.emoji_visible
     }
@@ -316,7 +316,7 @@ impl Keyboard {
     /// `_setActiveLevel('default')`. When nothing loads GNOME keeps the old
     /// keys; so does this. Returns whether the keys were rebuilt.
     fn update_keys(&mut self) -> bool {
-        let Some(layout) = osk_layout::resolve(&self.group, self.purpose) else {
+        let Some(layout) = layout::resolve(&self.group, self.purpose) else {
             self.set_active_level("default");
             return false;
         };
@@ -559,7 +559,7 @@ impl Presence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::osk_layout::parse;
+    use crate::layout::parse;
 
     fn us(hints: u32) -> Keyboard {
         let layout = parse(include_str!("../osk-layouts/us.json")).unwrap();
@@ -731,18 +731,18 @@ mod tests {
     fn no_emoji_hint_drops_emoji_key() {
         let mut kb = us(0);
         assert!(kb.emoji_visible());
-        let (placed, _) = osk_layout::place(kb.level(), kb.emoji_visible());
-        let has_emoji = |placed: &[osk_layout::PlacedKey], kb: &Keyboard| {
+        let (placed, _) = layout::place(kb.level(), kb.emoji_visible());
+        let has_emoji = |placed: &[layout::PlacedKey], kb: &Keyboard| {
             placed
                 .iter()
                 .any(|p| kb.level().rows[p.row][p.index].action == Some(Action::Emoji))
         };
         assert!(has_emoji(&placed, &kb));
 
-        crate::osk_layout::tests::register();
+        crate::layout::tests::register();
         assert!(kb.set_content(Purpose::Normal, hints::NO_EMOJI));
         assert!(!kb.emoji_visible());
-        let (placed, _) = osk_layout::place(kb.level(), kb.emoji_visible());
+        let (placed, _) = layout::place(kb.level(), kb.emoji_visible());
         assert!(!has_emoji(&placed, &kb));
     }
 
@@ -770,7 +770,7 @@ mod tests {
 
     #[test]
     fn group_change_reloads() {
-        crate::osk_layout::tests::register();
+        crate::layout::tests::register();
         let mut kb = Keyboard::new("us", Purpose::Normal, 0).unwrap();
         assert!(kb.set_group("de"));
         assert_eq!(kb.layout().locale, "de");

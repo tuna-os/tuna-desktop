@@ -4185,13 +4185,17 @@ dependencies = [
 name = "tuna-greeter"
 version = "0.1.0"
 dependencies = [
+ "gettext-rs",
  "gio",
  "glib",
+ "glib-build-tools",
  "gtk4",
  "gtk4-layer-shell",
  "libadwaita",
  "tempfile",
  "tuna-auth-prompt",
+ "tuna-magnifier",
+ "tuna-osk",
  "tuna-shell-control",
 ]
 
@@ -4199,10 +4203,23 @@ dependencies = [
 name = "tuna-magnifier"
 version = "0.1.0"
 dependencies = [
+ "gio",
  "rustix 1.1.6",
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "tuna-osk"
+version = "0.1.0"
+dependencies = [
+ "gio",
+ "glib",
+ "glib-build-tools",
+ "gtk4",
+ "roxmltree",
+ "serde_json",
 ]
 
 [[package]]
@@ -4218,6 +4235,7 @@ dependencies = [
 name = "tuna-shell-control"
 version = "0.1.0"
 dependencies = [
+ "gio",
  "postcard",
  "serde",
  "tuna-output",
@@ -4247,6 +4265,7 @@ dependencies = [
  "tuna-auth-prompt",
  "tuna-backlight",
  "tuna-magnifier",
+ "tuna-osk",
  "tuna-output",
  "tuna-shell-control",
  "tuna-shell-host",

@@ -12,48 +12,13 @@ use gio::prelude::*;
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use tuna_shell_control::{DwellClick, DwellDirection, PointerAids, PointerTimeoutKind};
-
-pub const SCHEMA: &str = "org.gnome.desktop.a11y.mouse";
+use tuna_shell_control::gsettings::MOUSE_A11Y_SCHEMA;
+use tuna_shell_control::{DwellClick, PointerTimeoutKind};
 
 /// GNOME's pie timer is 60 px across.
 const PIE_SIZE: i32 = 60;
 /// Its success zoom-out.
 const PIE_DONE_MS: u64 = 150;
-
-fn direction(name: &str) -> Option<DwellDirection> {
-    match name {
-        "left" => Some(DwellDirection::Left),
-        "right" => Some(DwellDirection::Right),
-        "up" => Some(DwellDirection::Up),
-        "down" => Some(DwellDirection::Down),
-        _ => None,
-    }
-}
-
-fn seconds_ms(seconds: f64) -> u32 {
-    (seconds * 1000.0).round().clamp(0.0, f64::from(u32::MAX)) as u32
-}
-
-/// GNOME's pointer accessibility settings, flattened for the compositor.
-/// Without the schema both aids stay off (GNOME's defaults).
-pub fn read(settings: Option<&gio::Settings>) -> PointerAids {
-    let Some(s) = settings else {
-        return PointerAids::default();
-    };
-    PointerAids {
-        secondary_click: s.boolean("secondary-click-enabled"),
-        secondary_click_ms: seconds_ms(s.double("secondary-click-time")),
-        dwell_click: s.boolean("dwell-click-enabled"),
-        dwell_ms: seconds_ms(s.double("dwell-time")),
-        dwell_threshold: s.int("dwell-threshold").max(0) as u32,
-        dwell_gesture: s.string("dwell-mode") == "gesture",
-        gesture_single: direction(&s.string("dwell-gesture-single")),
-        gesture_double: direction(&s.string("dwell-gesture-double")),
-        gesture_drag: direction(&s.string("dwell-gesture-drag")),
-        gesture_secondary: direction(&s.string("dwell-gesture-secondary")),
-    }
-}
 
 /// GNOME's chooser entries: label and icon, in its menu order.
 pub const CLICK_MODES: [(DwellClick, &str, &str); 4] = [
@@ -128,7 +93,7 @@ impl DwellChooser {
             list.append(&row);
         }
         popover.set_child(Some(&list));
-        let settings = crate::settings(SCHEMA);
+        let settings = crate::settings(MOUSE_A11Y_SCHEMA);
         let sync = {
             let button = button.clone();
             move |s: &gio::Settings| {
@@ -346,15 +311,6 @@ mod tests {
         assert!(chooser_visible(true, "window"));
         assert!(!chooser_visible(true, "gesture"));
         assert!(!chooser_visible(false, "window"));
-    }
-
-    #[test]
-    fn settings_convert_like_gnome() {
-        assert_eq!(seconds_ms(1.2), 1200);
-        assert_eq!(seconds_ms(-1.0), 0);
-        assert_eq!(direction("up"), Some(DwellDirection::Up));
-        assert_eq!(direction("none"), None);
-        assert_eq!(read(None), PointerAids::default());
     }
 
     #[test]

@@ -11,9 +11,17 @@
 //! `TUNA_GREETER_TRACE=1` prints the flow's markers to stderr (never an
 //! answer).
 
+mod a11y;
 mod accounts;
+mod branding;
+mod chrome;
+mod control;
 mod conversation;
 mod gdm;
+mod i18n;
+mod input;
+mod power;
+mod quick;
 mod sessions;
 
 use std::cell::{Cell, RefCell};
@@ -58,9 +66,6 @@ fn trace(line: &str) {
 struct Policy {
     allowed_failures: u32,
     disable_user_list: bool,
-    banner: Option<String>,
-    logo: Option<String>,
-    disable_restart_buttons: bool,
 }
 
 impl Default for Policy {
@@ -69,9 +74,6 @@ impl Default for Policy {
         Self {
             allowed_failures: 3,
             disable_user_list: false,
-            banner: None,
-            logo: None,
-            disable_restart_buttons: false,
         }
     }
 }
@@ -87,14 +89,13 @@ impl Policy {
         Self::parse(|key| s.value(key))
     }
 
-    /// The policy from the schema's keys (`value` reads one): the banner
-    /// only when enabled with text (loginDialog.js `_updateBanner`), the
-    /// logo only when named, and at least one try (`_canRetry` with a
-    /// fail count of one stops at any `allowed-failures` below 2).
+    /// The policy from the schema's keys (`value` reads one): at least one
+    /// try (`_canRetry` with a fail count of one stops at any
+    /// `allowed-failures` below 2). The banner, logo and
+    /// `disable-restart-buttons` are followed live (`branding.rs`,
+    /// `power.rs`).
     fn parse(value: impl Fn(&str) -> glib::Variant) -> Self {
         let boolean = |key: &str| value(key).get::<bool>().unwrap_or(false);
-        let string = |key: &str| value(key).get::<String>().unwrap_or_default();
-        let banner = boolean("banner-message-enable").then(|| string("banner-message-text"));
         Self {
             allowed_failures: value("allowed-failures")
                 .get::<i32>()
@@ -102,9 +103,6 @@ impl Policy {
                 .unwrap_or(0)
                 .max(1),
             disable_user_list: boolean("disable-user-list"),
-            banner: banner.filter(|text| !text.trim().is_empty()),
-            logo: Some(string("logo")).filter(|path| !path.is_empty()),
-            disable_restart_buttons: boolean("disable-restart-buttons"),
         }
     }
 }
@@ -138,6 +136,8 @@ struct Greeter {
     chosen_session: RefCell<Option<String>>,
     applying: Cell<bool>,
     registered: Cell<bool>,
+    /// The panel, banner, logo, accessibility menu and keyboard.
+    _chrome: chrome::Chrome,
 }
 
 impl Greeter {
@@ -167,15 +167,13 @@ impl Greeter {
         }
 
         // The login screen's panel (`panelStyle: 'login-screen'`): the
-        // clock in the middle, system actions at the right.
+        // clock in the middle, the keyboard indicator and quick settings
+        // at the right (the `gdm` mode's panel).
         let clock = gtk::Label::new(None);
         clock.add_css_class("clock");
         let panel = gtk::CenterBox::new();
         panel.add_css_class("login-screen-panel");
         panel.set_center_widget(Some(&clock));
-        if let Some(power) = power_menu(&policy) {
-            panel.set_end_widget(Some(&power));
-        }
         let tick = {
             let clock = clock.clone();
             move || {
@@ -192,13 +190,6 @@ impl Greeter {
             glib::ControlFlow::Continue
         });
 
-        // The banner (`banner-message-enable`/`-text`).
-        let banner = gtk::Label::new(policy.banner.as_deref());
-        banner.add_css_class("login-dialog-banner");
-        banner.set_wrap(true);
-        banner.set_justify(gtk::Justification::Center);
-        banner.set_visible(policy.banner.is_some());
-
         // The user list page (login-dialog-user-selection-box).
         let user_list = gtk::ListBox::new();
         user_list.add_css_class("login-dialog-user-list");
@@ -210,7 +201,7 @@ impl Greeter {
         scroller.set_propagate_natural_height(true);
         scroller.set_max_content_height(420);
         scroller.set_child(Some(&user_list));
-        let not_listed = gtk::Button::with_label("Not listed?");
+        let not_listed = gtk::Button::with_label(&i18n::tr("Not listed?"));
         not_listed.add_css_class("login-dialog-not-listed-button");
         not_listed.set_halign(gtk::Align::Start);
         let selection = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -230,7 +221,7 @@ impl Greeter {
         let cancel = gtk::Button::from_icon_name("go-previous-symbolic");
         cancel.add_css_class("cancel-button");
         cancel.set_valign(gtk::Align::Center);
-        cancel.update_property(&[gtk::accessible::Property::Label("Back")]);
+        cancel.update_property(&[gtk::accessible::Property::Label(&i18n::tr("Back"))]);
         let cancel_room = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         cancel_room.add_css_class("button-box-spacer");
         cancel_room.append(&cancel);
@@ -270,13 +261,13 @@ impl Greeter {
             });
             widget.add_controller(keys);
         }
-        entry.set_hint(tuna_auth_prompt::DEFAULT_QUESTION);
+        entry.set_hint(&i18n::tr(tuna_auth_prompt::DEFAULT_QUESTION));
         let next = gtk::Button::from_icon_name("go-next-symbolic");
         next.add_css_class("next-button");
         next.set_halign(gtk::Align::End);
         next.set_valign(gtk::Align::Center);
         next.set_can_focus(false);
-        next.update_property(&[gtk::accessible::Property::Label("Next")]);
+        next.update_property(&[gtk::accessible::Property::Label(&i18n::tr("Submit"))]);
         entry_area.add_overlay(&next);
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         spacer.add_css_class("button-box-spacer");
@@ -285,7 +276,7 @@ impl Greeter {
         button_box.append(&cancel_room);
         button_box.append(&entry_area);
         button_box.append(&spacer);
-        let caps = gtk::Label::new(Some(CAPS_LOCK_WARNING));
+        let caps = gtk::Label::new(Some(&i18n::tr(CAPS_LOCK_WARNING)));
         caps.add_css_class("caps-lock-warning-label");
         caps.set_visible(false);
         let message = gtk::Label::new(None);
@@ -311,10 +302,10 @@ impl Greeter {
         stack.add_named(&prompt, Some("prompt"));
 
         // The bottom button group: Login Options (the session type) and
-        // the logo.
+        // the accessibility menu; the logo at the bottom centre.
         let session_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
         session_box.add_css_class("login-dialog-auth-menu-item-section");
-        let heading = gtk::Label::new(Some("Session Type"));
+        let heading = gtk::Label::new(Some(&i18n::tr("Session Type")));
         heading.add_css_class("heading");
         heading.set_halign(gtk::Align::Start);
         session_box.append(&heading);
@@ -325,26 +316,30 @@ impl Greeter {
         options.set_icon_name("emblem-system-symbolic");
         options.add_css_class("login-dialog-auth-menu-button");
         options.add_css_class("login-dialog-button");
-        options.set_tooltip_text(Some("Login Options"));
-        options.update_property(&[gtk::accessible::Property::Label("Login Options")]);
+        let login_options = i18n::tr("Login Options");
+        options.set_tooltip_text(Some(&login_options));
+        options.update_property(&[gtk::accessible::Property::Label(&login_options)]);
         options.set_popover(Some(&popover));
         options.set_visible(false);
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let overlay = gtk::Overlay::new();
+        let chrome = chrome::Chrome::new(&window, &overlay, column.upcast_ref(), &entry);
+        panel.set_end_widget(Some(&chrome.panel_end()));
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        buttons.set_valign(gtk::Align::Center);
+        buttons.append(&options);
+        buttons.append(&chrome.a11y);
         let bottom = gtk::CenterBox::new();
         bottom.add_css_class("login-dialog-bottom-button-group");
-        bottom.set_end_widget(Some(&options));
-        if let Some(path) = &policy.logo {
-            let logo = gtk::Image::from_file(path);
-            logo.add_css_class("login-dialog-logo-bin");
-            logo.set_pixel_size(48);
-            bottom.set_center_widget(Some(&logo));
-        }
+        bottom.set_center_widget(Some(&chrome.branding.logo));
+        bottom.set_end_widget(Some(&buttons));
 
-        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         column.append(&panel);
-        column.append(&banner);
+        column.append(&chrome.branding.banner);
         column.append(&stack);
         column.append(&bottom);
-        window.set_child(Some(&column));
+        overlay.set_child(Some(&column));
+        window.set_child(Some(&overlay));
 
         let greeter = Rc::new(Self {
             window,
@@ -372,6 +367,7 @@ impl Greeter {
             chosen_session: RefCell::default(),
             applying: Cell::new(false),
             registered: Cell::new(false),
+            _chrome: chrome,
         });
         greeter.wire(&not_listed, &password, &text);
         greeter.fill_sessions();
@@ -661,13 +657,17 @@ impl Greeter {
 
     fn apply(&self, view: &View) {
         let asking = self.asking_username.get();
+        // The login dialog's own questions are gnome-shell's strings; a
+        // PAM question comes translated by PAM.
         let (secret, hint, sensitive) = if asking {
-            (false, USERNAME_QUESTION, true)
+            (false, i18n::tr(USERNAME_QUESTION), true)
+        } else if view.hint == tuna_auth_prompt::DEFAULT_QUESTION {
+            (view.secret, i18n::tr(&view.hint), view.sensitive)
         } else {
-            (view.secret, view.hint.as_str(), view.sensitive)
+            (view.secret, view.hint.clone(), view.sensitive)
         };
         self.entry.set_secret(secret);
-        self.entry.set_hint(hint);
+        self.entry.set_hint(&hint);
         if !sensitive && self.entry.has_focus() {
             GtkWindowExt::set_focus(&self.window, gtk::Widget::NONE);
         }
@@ -1022,60 +1022,6 @@ fn session_to_start(signal: &Signal) -> Option<&str> {
     }
 }
 
-/// Whether the panel offers the power actions: on hardware only (a nested
-/// login screen's logind seat is the host's, `TUNA_SESSION_KIND`) and not
-/// under `disable-restart-buttons`.
-fn offers_power(session_kind: Option<&str>, policy: &Policy) -> bool {
-    session_kind == Some("hardware") && !policy.disable_restart_buttons
-}
-
-/// The system menu's power actions, when [`offers_power`].
-fn power_menu(policy: &Policy) -> Option<gtk::MenuButton> {
-    if !offers_power(std::env::var("TUNA_SESSION_KIND").ok().as_deref(), policy) {
-        return None;
-    }
-    let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    for (label, method) in [
-        ("Suspend", "Suspend"),
-        ("Restart…", "Reboot"),
-        ("Power Off…", "PowerOff"),
-    ] {
-        let button = gtk::Button::with_label(label);
-        button.add_css_class("flat");
-        button.connect_clicked(move |_| {
-            glib::spawn_future_local(async move {
-                let Ok(system) = gio::bus_get_future(gio::BusType::System).await else {
-                    return;
-                };
-                if let Err(error) = system
-                    .call_future(
-                        Some("org.freedesktop.login1"),
-                        "/org/freedesktop/login1",
-                        "org.freedesktop.login1.Manager",
-                        method,
-                        Some(&(true,).to_variant()),
-                        None,
-                        gio::DBusCallFlags::ALLOW_INTERACTIVE_AUTHORIZATION,
-                        -1,
-                    )
-                    .await
-                {
-                    eprintln!("tuna-greeter: {method}: {}", error.message());
-                }
-            });
-        });
-        menu.append(&button);
-    }
-    let popover = gtk::Popover::new();
-    popover.set_child(Some(&menu));
-    let button = gtk::MenuButton::new();
-    button.set_icon_name("system-shutdown-symbolic");
-    button.add_css_class("flat");
-    button.update_property(&[gtk::accessible::Property::Label("Power Off / Log Out")]);
-    button.set_popover(Some(&popover));
-    Some(button)
-}
-
 /// Release version stamped at build time: `TUNA_VERSION` (a `vX.Y.Z` tag
 /// or plain `X.Y.Z`) wins, otherwise the crate version, as the other
 /// binaries do it.
@@ -1102,6 +1048,7 @@ fn main() -> glib::ExitCode {
         return glib::ExitCode::SUCCESS;
     }
     glib::set_prgname(Some("tuna-greeter"));
+    i18n::init();
     let app = adw::Application::builder()
         .application_id("org.tuna.Greeter")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1109,14 +1056,22 @@ fn main() -> glib::ExitCode {
     app.connect_activate(|app| {
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
         if let Some(display) = gtk::gdk::Display::default() {
+            // The login dialog's style and the on-screen keyboard's.
             let provider = gtk::CssProvider::new();
-            provider.load_from_string(include_str!("style.css"));
+            provider.load_from_string(&[include_str!("style.css"), tuna_osk::STYLE].concat());
             gtk::style_context_add_provider_for_display(
                 &display,
                 &provider,
                 gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
             );
+            // The login screen's own icons (build.rs).
+            if let Err(error) = gio::resources_register_include!("icons.gresource") {
+                eprintln!("tuna-greeter: icons: {error}");
+            }
+            gtk::IconTheme::for_display(&display).add_resource_path("/org/tuna/Greeter/icons");
         }
+        // GNOME Shell's on-screen keyboard layouts and emoji list.
+        tuna_osk::register_layouts();
         let greeter = Greeter::new(app);
         greeter.window.present();
         greeter.connect();
@@ -1134,10 +1089,6 @@ mod tests {
         let mut values: std::collections::HashMap<String, glib::Variant> = [
             ("allowed-failures", 3i32.to_variant()),
             ("disable-user-list", false.to_variant()),
-            ("banner-message-enable", false.to_variant()),
-            ("banner-message-text", "".to_variant()),
-            ("logo", "".to_variant()),
-            ("disable-restart-buttons", false.to_variant()),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v))
@@ -1154,38 +1105,18 @@ mod tests {
         let none = Policy::default();
         assert_eq!(defaults.allowed_failures, none.allowed_failures);
         assert_eq!(defaults.disable_user_list, none.disable_user_list);
-        assert_eq!(defaults.banner, none.banner);
-        assert_eq!(defaults.logo, none.logo);
-        assert_eq!(
-            defaults.disable_restart_buttons,
-            none.disable_restart_buttons
-        );
         assert_eq!(none.allowed_failures, 3, "the schema's default");
 
         let set = Policy::parse(keys(&[
             ("allowed-failures", 1i32.to_variant()),
             ("disable-user-list", true.to_variant()),
-            ("banner-message-enable", true.to_variant()),
-            ("banner-message-text", "Authorized use only.".to_variant()),
-            ("logo", "/usr/share/pixmaps/logo.png".to_variant()),
-            ("disable-restart-buttons", true.to_variant()),
         ]));
         assert_eq!(set.allowed_failures, 1);
         assert!(set.disable_user_list);
-        assert_eq!(set.banner.as_deref(), Some("Authorized use only."));
-        assert_eq!(set.logo.as_deref(), Some("/usr/share/pixmaps/logo.png"));
-        assert!(set.disable_restart_buttons);
     }
 
     #[test]
-    fn banner_needs_enable_and_text_and_failures_allow_one_try() {
-        let text_only = Policy::parse(keys(&[("banner-message-text", "Hi".to_variant())]));
-        assert_eq!(text_only.banner, None, "banner-message-enable is off");
-        let blank = Policy::parse(keys(&[
-            ("banner-message-enable", true.to_variant()),
-            ("banner-message-text", "  ".to_variant()),
-        ]));
-        assert_eq!(blank.banner, None);
+    fn failures_allow_one_try_and_mistyped_keys_read_as_zero() {
         for failures in [0, -4] {
             let policy = Policy::parse(keys(&[("allowed-failures", failures.to_variant())]));
             assert_eq!(
@@ -1196,20 +1127,6 @@ mod tests {
         // A mistyped value (not the schema's) reads as the key's zero.
         let wrong = Policy::parse(keys(&[("disable-user-list", "yes".to_variant())]));
         assert!(!wrong.disable_user_list);
-    }
-
-    #[test]
-    fn power_actions_need_hardware_and_restart_buttons() {
-        let allowed = Policy::default();
-        let disabled = Policy {
-            disable_restart_buttons: true,
-            ..Policy::default()
-        };
-        assert!(offers_power(Some("hardware"), &allowed));
-        assert!(!offers_power(Some("hardware"), &disabled));
-        assert!(!offers_power(Some("nested"), &allowed), "the host's logind");
-        assert!(!offers_power(None, &allowed));
-        assert!(!offers_power(Some("Hardware"), &allowed));
     }
 
     #[test]

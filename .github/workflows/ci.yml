@@ -873,7 +873,9 @@ jobs:
               sudo sed -i 's|https\?://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$source"
             fi
           done
-      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps x11-utils pipewire wireplumber pipewire-pulse gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good at-spi2-core python3-pyatspi python3-pil libnotify-bin libsecret-tools gnome-keyring gnome-settings-daemon-common gnome-settings-daemon fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libgweather-4-dev meson ninja-build libwayland-dev wayland-protocols libpam-wrapper libpam0g-dev ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 wayland-utils xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk
+      # gettext (msgfmt) and locales (localedef's sources) for the greeter
+      # proof's G-GREETER-I18N catalog and de_DE.UTF-8 locale.
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps x11-utils pipewire wireplumber pipewire-pulse gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good at-spi2-core python3-pyatspi python3-pil libnotify-bin libsecret-tools gnome-keyring gnome-settings-daemon-common gnome-settings-daemon fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libgweather-4-dev meson ninja-build libwayland-dev wayland-protocols libpam-wrapper libpam0g-dev ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 wayland-utils xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk gettext locales
       - name: Check out workflow-owned CI tooling
         uses: actions/checkout@v7.0.1
         with: *ci-tool-checkout
@@ -1269,7 +1271,10 @@ jobs:
       # The login screen (#1164, P-LK-03): tuna-compositor --greeter and
       # tuna-greeter against a GDM 51 and AccountsService mock on a private
       # system bus, driven through real X11 input and checked through
-      # AT-SPI. Independent of the proofs above, like the OSK proof.
+      # AT-SPI, then once more in de_DE.UTF-8 for its translations
+      # (G-GREETER-I18N). Independent of the proofs above, like the OSK
+      # proof. It skips G-GREETER-ORCA, which needs Orca 50: the
+      # orca-speech job runs it (--orca-only).
       - name: Prove the Tuna greeter on GDM's greeter API
         if: ${{ !cancelled() }}
         timeout-minutes: 10
@@ -1397,7 +1402,7 @@ jobs:
         with:
           key: ${{ steps.cache-platform.outputs.distro }}
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool jq dbus dbus-x11 libglib2.0-bin xwayland at-spi2-core python3-gi python3-yaml gir1.2-gtk-4.0 libnotify-bin fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libgweather-4-dev libwayland-dev wayland-protocols libpam-wrapper libpam0g-dev libgtk4-layer-shell-dev gsettings-desktop-schemas libclang-dev speech-dispatcher
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool jq dbus dbus-x11 libglib2.0-bin xwayland at-spi2-core python3-gi python3-pyatspi python3-yaml gir1.2-gtk-4.0 libnotify-bin fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libgweather-4-dev libwayland-dev wayland-protocols libpam-wrapper libpam0g-dev libgtk4-layer-shell-dev gsettings-desktop-schemas libclang-dev speech-dispatcher
       - name: Build and install pinned native Orca
         shell: bash
         run: |
@@ -1446,6 +1451,15 @@ jobs:
       - run: pkg-config --atleast-version=1.1 gtk4-layer-shell-0 && dpkg-query -W orca speech-dispatcher
       - run: shellcheck -x scripts/tuna-orca-speech-proof
       - run: scripts/tuna-orca-speech-proof --artifacts orca-speech-artifacts
+      # The login screen's Screen Reader (#1164, G-GREETER-ORCA): the
+      # greeter's toggle starts the compositor's Orca, which speaks through
+      # the same speech-dispatcher capture on this job's Orca 50 (the
+      # gtk-shell job's Orca 46 dies without DISPLAY). Independent of the
+      # shell's speech proof above.
+      - name: Prove the Tuna greeter's screen reader on Orca 50
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: shellcheck -x scripts/tuna-greeter-proof && scripts/tuna-greeter-proof --orca-only --artifacts orca-speech-artifacts/greeter
       - if: always()
         run: scripts/ci-prepare-artifacts orca-speech-artifacts
       - uses: actions/upload-artifact@v7.0.2
@@ -2389,6 +2403,7 @@ jobs:
           --assertions ledger-in/gtk-shell/ibus-owner/assertions.txt
           --assertions ledger-in/gtk-shell/lock-idle-frames/assertions.txt
           --assertions ledger-in/orca-speech/assertions.txt
+          --assertions ledger-in/orca-speech/greeter/assertions.txt
           --assertions ledger-in/drm-smoke/assertions.txt
           --assertions ledger-in/hotplug/assertions.txt
           --assertions ledger-in/marlin-vm/assertions.txt

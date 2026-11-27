@@ -1621,7 +1621,9 @@ impl Runtime {
                 ))
             }
         };
-        // org.gnome.Shell.Introspect: the portal's window picker.
+        // org.gnome.Shell.Introspect: the portal's window picker. The
+        // login screen serves only what GNOME's gdm mode has.
+        crate::login_services::report(session.greeter);
         let capture_authority = crate::capture_security::Authority::default();
         let introspect = crate::introspect::start(state.desktop_size(), capture_authority.clone());
         let input_capture = crate::mutter::input_capture::Router::default();
@@ -1641,6 +1643,7 @@ impl Runtime {
                     display_share.clone(),
                     color_share.clone(),
                     input_capture.sessions(),
+                    session.greeter,
                     remote_access_stops.clone(),
                 ),
                 |event, _, rt: &mut Runtime| {
@@ -1778,7 +1781,10 @@ impl Runtime {
             shell,
             greeter: session.greeter,
             greeter_ready_sent: false,
-            ime: crate::ime::ImeBridge::configured(&session.socket_name),
+            ime: crate::login_services::Service::IbusBridge
+                .runs(session.greeter)
+                .then(|| crate::ime::ImeBridge::configured(&session.socket_name))
+                .flatten(),
             overlay,
             wallpaper: Wallpaper::new(),
             cursor: crate::cursor::Cursor::new(),
@@ -1898,7 +1904,13 @@ impl Runtime {
             sleep_delay: crate::sleep::Delay::default(),
             auth: auth::Conversations::default(),
             idle_monitor: crate::idle_monitor::start(),
-            session_manager: crate::session_manager::start(),
+            // gnome-session owns the name at the login screen.
+            session_manager: if crate::login_services::Service::SessionManager.runs(session.greeter)
+            {
+                crate::session_manager::start()
+            } else {
+                crate::session_manager::Share::default()
+            },
             magnifier: crate::magnifier::MagnifierState::new(),
             zoom_targets: crate::magnifier::ZoomTargets::default(),
             focus_caret: crate::focus_caret::FocusCaretTracker::default(),

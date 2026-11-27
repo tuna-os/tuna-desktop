@@ -6,6 +6,7 @@ members = [
     "crates/backlight",
     "crates/compositor",
     "crates/greeter",
+    "crates/osk",
     "crates/output",
     "crates/shell-control-schema",
     "crates/shell-host",

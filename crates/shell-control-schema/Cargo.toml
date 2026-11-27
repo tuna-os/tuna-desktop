@@ -10,3 +10,9 @@ license.workspace = true
 postcard.workspace = true
 serde = { version = "1", features = ["derive"] }
 tuna-output = { path = "../output", version = "0.1.0" }
+# GNOME's input settings read from GSettings (`gsettings`), for the
+# shell and the login screen.
+gio = { workspace = true, optional = true }
+
+[features]
+gio = ["dep:gio"]

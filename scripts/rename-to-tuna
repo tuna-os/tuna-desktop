@@ -29,7 +29,7 @@ Never touched (the keep list):
   dated initial coverage baseline. (tests/a11y/gnome51/ is renamed: its
   comparison.md is generated from those trees by tuna-a11y-baseline,
   which CI checks, and nothing records their hashes);
-- third-party/ (vendored patches), crates/shell-gtk/osk-layouts/ (GNOME's
+- third-party/ (vendored patches), crates/osk/osk-layouts/ (GNOME's
   osk-layouts copied byte-for-byte; emoji.json names the rooster emoji),
   packaging/marlin/vm-lane/tunaos/ (tunaOS's vendored build steps) and
   .spektacular/;
@@ -60,7 +60,7 @@ KEEP_PREFIXES = (
     ".git/",
     ".spektacular/",
     "third-party/",
-    "crates/shell-gtk/osk-layouts/",
+    "crates/osk/osk-layouts/",
     # tunaOS's own build steps, vendored byte-for-byte for the VM lane.
     "packaging/marlin/vm-lane/tunaos/",
     "docs/niri-parity/",

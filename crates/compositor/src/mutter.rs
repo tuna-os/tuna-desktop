@@ -1825,7 +1825,10 @@ fn owners_alive(
 }
 
 /// Serve DisplayConfig and ScreenCast on the session bus from a thread.
-/// Returns the channel the event loop reads cast requests from.
+/// Returns the channel the event loop reads cast requests from. At the
+/// login screen (`greeter`) only what GNOME's gdm mode has is served
+/// ([`crate::login_services`]): no ScreenCast, RemoteDesktop, InputCapture
+/// or Night Light object exists on the bus.
 #[allow(clippy::too_many_arguments)] // one share per service the thread serves
 pub(crate) fn start(
     outputs: Outputs,
@@ -1838,6 +1841,7 @@ pub(crate) fn start(
     display_state: Arc<crate::display_config::DisplayShare>,
     color: Arc<crate::color_manager::ColorShare>,
     input_capture: input_capture::CaptureSessions,
+    greeter: bool,
     stops: Arc<RemoteAccessStops>,
 ) -> calloop::channel::Channel<ToLoop> {
     let (to_loop, from_dbus) = calloop::channel::channel();
@@ -1907,22 +1911,29 @@ pub(crate) fn start(
             let night_light_color = NightLightColor {
                 share: night_light.clone(),
             };
-            let conn = match zbus::block_on(
-                zbus::connection::Builder::session()
-                    .serve_at("/org/gnome/Mutter/ScreenCast", screencast)
-                    .serve_at("/org/gnome/Mutter/DisplayConfig", display_config)
-                    .serve_at("/org/gnome/Mutter/RemoteDesktop", remote_desktop)
-                    .serve_at("/org/gnome/Mutter/InputCapture", input_capture_service)
-                    .serve_at("/org/gnome/Mutter/ServiceChannel", service_channel)
-                    .serve_at("/org/gnome/SettingsDaemon/Color", night_light_color)
-                    .serve_at(
-                        "/org/gnome/Mutter/ColorManager",
-                        crate::color_manager::MutterColorManager {
-                            share: color.clone(),
-                        },
-                    )
-                    .build(),
-            ) {
+            use crate::login_services::Service;
+            let mut builder = zbus::connection::Builder::session()
+                .serve_at("/org/gnome/Mutter/DisplayConfig", display_config)
+                .serve_at("/org/gnome/Mutter/ServiceChannel", service_channel)
+                .serve_at(
+                    "/org/gnome/Mutter/ColorManager",
+                    crate::color_manager::MutterColorManager {
+                        share: color.clone(),
+                    },
+                );
+            if Service::ScreenCast.runs(greeter) {
+                builder = builder.serve_at("/org/gnome/Mutter/ScreenCast", screencast);
+            }
+            if Service::RemoteDesktop.runs(greeter) {
+                builder = builder.serve_at("/org/gnome/Mutter/RemoteDesktop", remote_desktop);
+            }
+            if Service::InputCapture.runs(greeter) {
+                builder = builder.serve_at("/org/gnome/Mutter/InputCapture", input_capture_service);
+            }
+            if Service::SettingsDaemonColor.runs(greeter) {
+                builder = builder.serve_at("/org/gnome/SettingsDaemon/Color", night_light_color);
+            }
+            let conn = match zbus::block_on(builder.build()) {
                 Ok(conn) => conn,
                 Err(e) => {
                     eprintln!("tuna-compositor: mutter D-Bus: no session bus: {e}");
@@ -1942,13 +1953,17 @@ pub(crate) fn start(
                     "tuna-compositor: org.gnome.Mutter.ColorManager is taken; calibration off"
                 ),
             }
-            for name in [
-                "org.gnome.Mutter.DisplayConfig",
-                "org.gnome.Mutter.ScreenCast",
-                "org.gnome.Mutter.RemoteDesktop",
-                "org.gnome.Mutter.InputCapture",
-                "org.gnome.Mutter.ServiceChannel",
+            for service in [
+                Service::DisplayConfig,
+                Service::ScreenCast,
+                Service::RemoteDesktop,
+                Service::InputCapture,
+                Service::ServiceChannel,
             ] {
+                if !service.runs(greeter) {
+                    continue;
+                }
+                let name = service.name();
                 match request_name(name) {
                     Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
                         eprintln!("tuna-compositor: serving {name}");
@@ -1966,19 +1981,20 @@ pub(crate) fn start(
             // portal names above. When a real settings daemon owns
             // this name its temp-disable wins and ours stays
             // local-only; the tint still follows the settings keys.
-            let color_owned = match request_name("org.gnome.SettingsDaemon.Color") {
-                Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
-                    eprintln!("tuna-compositor: serving org.gnome.SettingsDaemon.Color");
-                    true
-                }
-                _ => {
-                    eprintln!(
-                        "tuna-compositor: org.gnome.SettingsDaemon.Color is taken; \
+            let color_owned = Service::SettingsDaemonColor.runs(greeter)
+                && match request_name(Service::SettingsDaemonColor.name()) {
+                    Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
+                        eprintln!("tuna-compositor: serving org.gnome.SettingsDaemon.Color");
+                        true
+                    }
+                    _ => {
+                        eprintln!(
+                            "tuna-compositor: org.gnome.SettingsDaemon.Color is taken; \
                          night light D-Bus properties off"
-                    );
-                    false
-                }
-            };
+                        );
+                        false
+                    }
+                };
             if color_owned {
                 spawn_color_signals(conn.clone(), night_light.subscribe_changes());
             }

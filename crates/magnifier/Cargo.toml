@@ -9,6 +9,12 @@ description = "Screen magnifier settings shared by the GTK shell and the composi
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 rustix.workspace = true
+# The magnifier's GSettings published as the snapshot (`gsettings`), for
+# the shell and the login screen.
+gio = { workspace = true, optional = true }
+
+[features]
+gio = ["dep:gio"]
 
 [dev-dependencies]
 tempfile = "3"

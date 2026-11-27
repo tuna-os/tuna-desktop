@@ -15,6 +15,9 @@
 //! promise; its session JSON file is a cross-process contract between
 //! components built from one commit. See `docs/api-stability.md`.
 
+#[cfg(feature = "gio")]
+pub mod gsettings;
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

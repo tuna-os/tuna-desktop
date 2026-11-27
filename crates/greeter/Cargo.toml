@@ -18,7 +18,20 @@ gtk4-layer-shell.workspace = true
 glib.workspace = true
 gio.workspace = true
 tuna-auth-prompt = { path = "../auth-prompt", version = "0.1.0", features = ["gtk"] }
-tuna-shell-control = { path = "../shell-control-schema", version = "0.1.0" }
+# `gio`: GNOME's input settings, read for the greeter user as the shell
+# reads them for a user.
+tuna-shell-control = { path = "../shell-control-schema", version = "0.1.0", features = ["gio"] }
+# The prompt's on-screen keyboard and xkeyboard-config's source names.
+tuna-osk = { path = "../osk", version = "0.1.0" }
+# The magnifier's settings published for the compositor (Zoom).
+tuna-magnifier = { path = "../magnifier", version = "0.1.0", features = ["gio"] }
+# libintl's bindtextdomain for gnome-shell's catalogs (i18n.rs); the C
+# library's own gettext, as freedesktop-desktop-entry already uses it.
+gettext-rs = { version = "0.8", features = ["gettext-system"] }
+
+[build-dependencies]
+# The login screen's own icons, compiled in as a GResource (build.rs).
+glib-build-tools = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

@@ -15,38 +15,8 @@ use gio::prelude::*;
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use tuna_shell_control::{KeyboardAid, KeyboardAids};
-
-pub const SCHEMA: &str = "org.gnome.desktop.a11y.keyboard";
-
-/// GNOME's keyboard accessibility settings, flattened for the compositor.
-/// Without the schema every aid stays off (GNOME's defaults).
-pub fn read(settings: Option<&gio::Settings>) -> KeyboardAids {
-    let Some(s) = settings else {
-        return KeyboardAids::default();
-    };
-    let ms = |key: &str| s.int(key).max(0) as u32;
-    KeyboardAids {
-        shortcuts: s.boolean("enable"),
-        feature_beep: s.boolean("feature-state-change-beep"),
-        sticky: s.boolean("stickykeys-enable"),
-        sticky_two_key_off: s.boolean("stickykeys-two-key-off"),
-        sticky_beep: s.boolean("stickykeys-modifier-beep"),
-        slow: s.boolean("slowkeys-enable"),
-        slow_delay_ms: ms("slowkeys-delay"),
-        slow_beep_press: s.boolean("slowkeys-beep-press"),
-        slow_beep_accept: s.boolean("slowkeys-beep-accept"),
-        slow_beep_reject: s.boolean("slowkeys-beep-reject"),
-        bounce: s.boolean("bouncekeys-enable"),
-        bounce_delay_ms: ms("bouncekeys-delay"),
-        bounce_beep_reject: s.boolean("bouncekeys-beep-reject"),
-        toggle_beep: s.boolean("togglekeys-enable"),
-        mouse: s.boolean("mousekeys-enable"),
-        mouse_max_speed: ms("mousekeys-max-speed"),
-        mouse_accel_ms: ms("mousekeys-accel-time"),
-        mouse_init_delay_ms: ms("mousekeys-init-delay"),
-    }
-}
+use tuna_shell_control::gsettings::KEYBOARD_A11Y_SCHEMA;
+use tuna_shell_control::KeyboardAid;
 
 /// The setting an aid lives in.
 pub fn key_of(aid: KeyboardAid) -> &'static str {
@@ -146,7 +116,7 @@ impl KbdA11yDialog {
         card.append(&buttons);
         window.set_child(Some(&card));
         let ui = Rc::new(Self {
-            settings: crate::settings(SCHEMA),
+            settings: crate::settings(KEYBOARD_A11Y_SCHEMA),
             window,
             title,
             body,
@@ -255,6 +225,5 @@ mod tests {
     fn aids_map_to_gnome_keys() {
         assert_eq!(key_of(KeyboardAid::StickyKeys), "stickykeys-enable");
         assert_eq!(key_of(KeyboardAid::SlowKeys), "slowkeys-enable");
-        assert_eq!(read(None), KeyboardAids::default());
     }
 }
