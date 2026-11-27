@@ -1,0 +1,24 @@
+[package]
+name = "tuna-greeter"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Tuna Desktop's login screen: a GTK4/libadwaita client of GDM's greeter D-Bus API, run by tuna-compositor --greeter"
+
+[[bin]]
+name = "tuna-greeter"
+path = "src/main.rs"
+
+[dependencies]
+# v4_14: `Accessible::announce` for the prompt's messages, as the lock
+# screen announces them.
+gtk4 = { workspace = true, features = ["v4_14"] }
+libadwaita.workspace = true
+gtk4-layer-shell.workspace = true
+glib.workspace = true
+gio.workspace = true
+tuna-auth-prompt = { path = "../auth-prompt", version = "0.1.0", features = ["gtk"] }
+tuna-shell-control = { path = "../shell-control-schema", version = "0.1.0" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -70,6 +70,10 @@ its system packages.
   `docs/` changes with the code. A new architecture decision is an ADR in
   [docs/adr/](docs/adr/README.md). Add a new document to
   [docs/README.md](docs/README.md).
+  CI's `check` job fails when a Markdown file the PR changes has a relative
+  link or a backticked repository path that does not resolve; `just doc-refs`
+  runs the same check (`scripts/tuna-doc-refs`). Intended exceptions go in
+  `scripts/lib/tuna-doc-refs-allowlist.txt`, each with a reason.
 - **Wire changes** to the shell-control protocol follow
   [docs/api-stability.md](docs/api-stability.md#shell-control-protocol-tuna-shell-control):
   bump the minor once, append only, and renumber against main before merge.

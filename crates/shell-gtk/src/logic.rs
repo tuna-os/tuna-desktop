@@ -182,6 +182,30 @@ pub fn lock_offsets(height: i32) -> (i32, i32) {
     ((third + 9).max(0), (third - 61).max(0))
 }
 
+/// The lock screens to drop and the monitors to cover after the
+/// monitor list changed: the indices into `covered` (each lock screen's
+/// monitor, `None` for one assigned to none) of screens whose monitor is
+/// gone, ascending, and the monitors no screen covers yet, in list order.
+/// Screens on a monitor that stays are kept (GNOME's unlock dialog
+/// follows `monitors-changed` without rebuilding its prompt).
+pub fn lock_monitors_changed<M: PartialEq + Clone>(
+    covered: &[Option<M>],
+    monitors: &[M],
+) -> (Vec<usize>, Vec<M>) {
+    let gone = covered
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.as_ref().is_some_and(|m| !monitors.contains(m)))
+        .map(|(i, _)| i)
+        .collect();
+    let added = monitors
+        .iter()
+        .filter(|m| !covered.iter().any(|c| c.as_ref() == Some(*m)))
+        .cloned()
+        .collect();
+    (gone, added)
+}
+
 /// GNOME's `.unlock-dialog-clock` top margin: the clock and prompt stack
 /// starts this far above the clock's time.
 pub const LOCK_CLOCK_MARGIN: i32 = 150;
@@ -322,6 +346,33 @@ mod tests {
         assert_eq!(display_name("Ada Lovelace,,,", "ada"), "Ada Lovelace");
         assert_eq!(display_name("", "ada"), "ada");
         assert_eq!(display_name(",,,", "ada"), "ada");
+    }
+
+    #[test]
+    fn lock_screens_follow_monitors_changed() {
+        // Locked on A: B plugged in gets a screen, A's is untouched.
+        let (gone, added) = lock_monitors_changed(&[Some("A")], &["A", "B"]);
+        assert!(gone.is_empty());
+        assert_eq!(added, ["B"]);
+        // B and C swap: B's screen goes, C gets one, A's stays.
+        let (gone, added) = lock_monitors_changed(&[Some("A"), Some("B")], &["A", "C"]);
+        assert_eq!(gone, [1]);
+        assert_eq!(added, ["C"]);
+        // The primary unplugged: only its screen goes.
+        let (gone, added) = lock_monitors_changed(&[Some("A"), Some("B"), Some("C")], &["B", "C"]);
+        assert_eq!(gone, [0]);
+        assert!(added.is_empty());
+        // Every monitor gone, then one back: indices ascend.
+        let (gone, added) = lock_monitors_changed(&[Some("A"), Some("B")], &[]);
+        assert_eq!(gone, [0, 1]);
+        assert!(added.is_empty());
+        let (gone, added) = lock_monitors_changed::<&str>(&[], &["A"]);
+        assert!(gone.is_empty());
+        assert_eq!(added, ["A"]);
+        // A screen assigned to no monitor is never dropped for it.
+        let (gone, added) = lock_monitors_changed(&[None, Some("A")], &["A"]);
+        assert!(gone.is_empty());
+        assert!(added.is_empty());
     }
 
     #[test]
@@ -818,6 +869,52 @@ pub fn wpctl_volume_arg_with_limit(percent: f64, limit: f64) -> String {
     }
 }
 
+/// When the output slider sounds the volume-change feedback, as gnome-shell
+/// 51's `StreamSlider` does (js/ui/status/volume.js `_sliderChanged`,
+/// `drag-begin`/`drag-end`; js/ui/slider.js `_onPanBegin` emits
+/// `drag-begin` before the press moves the handle): never during a drag,
+/// once when the drag ends whether or not it moved, and after any other
+/// change that moved the level (scroll, keys). Volume writes are
+/// asynchronous here, so the drag-end sound waits for writes still in
+/// flight and plays at the final level.
+#[derive(Debug, Default)]
+pub struct VolumeFeedback {
+    dragging: bool,
+    writes: u32,
+    after_writes: bool,
+}
+
+impl VolumeFeedback {
+    pub fn drag_begin(&mut self) {
+        self.dragging = true;
+    }
+
+    /// A drag ended: true to sound now, else when the last write lands.
+    pub fn drag_end(&mut self) -> bool {
+        if !std::mem::take(&mut self.dragging) {
+            return false;
+        }
+        self.after_writes = self.writes > 0;
+        !self.after_writes
+    }
+
+    /// A volume write began; returns whether it belongs to a drag.
+    pub fn write_started(&mut self) -> bool {
+        self.writes += 1;
+        self.dragging
+    }
+
+    /// A write landed (`changed`: it moved the level); true to sound.
+    pub fn write_finished(&mut self, in_drag: bool, changed: bool) -> bool {
+        self.writes = self.writes.saturating_sub(1);
+        let drag_end = self.after_writes && self.writes == 0;
+        if drag_end {
+            self.after_writes = false;
+        }
+        drag_end || (changed && !in_drag)
+    }
+}
+
 /// Slider percentage for a backlight reading.
 pub fn brightness_percent(value: u32, max: u32) -> f64 {
     if max == 0 {
@@ -877,6 +974,33 @@ mod service_tests {
             .unwrap();
         assert!(capped > 1.52 && capped <= max / 100.0);
         assert_eq!(wpctl_volume_arg_with_limit(104.0, 100.0), "1.00");
+    }
+
+    #[test]
+    fn slider_feedback_sounds_once_at_drag_end_and_after_other_changes() {
+        // Scroll/keys: every change that moved the level sounds.
+        let mut feedback = VolumeFeedback::default();
+        let write = feedback.write_started();
+        assert!(feedback.write_finished(write, true));
+        let write = feedback.write_started();
+        assert!(!feedback.write_finished(write, false));
+        // A drag is silent while it moves, then sounds once when it ends,
+        // after the writes it started have landed.
+        feedback.drag_begin();
+        let first = feedback.write_started();
+        let last = feedback.write_started();
+        assert!(!feedback.write_finished(first, true));
+        assert!(!feedback.drag_end());
+        assert!(!feedback.dragging);
+        assert!(feedback.write_finished(last, true));
+        // A press and release that moved nothing still sounds (drag-end).
+        feedback.drag_begin();
+        assert!(feedback.drag_end());
+        // A release without a drag is nothing.
+        assert!(!feedback.drag_end());
+        // A write that starts after the drag is an ordinary change again.
+        let write = feedback.write_started();
+        assert!(feedback.write_finished(write, true));
     }
 
     #[test]
@@ -1093,7 +1217,7 @@ pub fn event_overlaps(e0: i64, e1: i64, i0: i64, i1: i64) -> bool {
 pub fn day_bounds(day: jiff::civil::Date, tz: &jiff::tz::TimeZone) -> (i64, i64) {
     let at = |d: jiff::civil::Date| {
         d.at(0, 0, 0, 0)
-            .to_zoned(tz.clone())
+            .to_zoned_datetime(tz.clone())
             .map(|z| z.timestamp().as_second())
             .unwrap_or(0)
     };
@@ -1188,7 +1312,7 @@ pub fn event_time_text(
     let local = |t: i64| {
         jiff::Timestamp::from_second(t)
             .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
-            .to_zoned(tz.clone())
+            .to_zoned_datetime(tz.clone())
             .datetime()
     };
     let time_only = |t: i64| {

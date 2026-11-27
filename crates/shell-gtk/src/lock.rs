@@ -7,7 +7,7 @@
 //! in once the session is idle) and the unlock prompt, moved between on
 //! GNOME's transition by keys, clicks, drags and touchpad swipes and
 //! scrolls (`lock_curtain.rs`), and drives GNOME's `AuthPrompt` flow over the
-//! control protocol (`lock_auth.rs`): password and fingerprint side by
+//! control protocol (`tuna-auth-prompt`, shared with the greeter): password and fingerprint side by
 //! side, each PAM question in turn, GNOME's messages and Back. When the
 //! password conversation is unavailable it falls back to one redacted
 //! `Unlock` command. It releases its lock surfaces once the compositor's
@@ -23,9 +23,10 @@ use gtk4 as gtk;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4_session_lock as session_lock;
+use tuna_auth_prompt::entry::PromptEntry;
+use tuna_auth_prompt::{AuthMachine, Effect, Host, MessageKind, View};
 use tuna_shell_control::{AuthEvent, AuthService};
 
-use crate::lock_auth::{AuthMachine, Effect, Host, MessageKind, View};
 use crate::lock_curtain::{self, Curtain, Page, Source};
 use crate::lock_notifications::{LockEntry, MediaActions, MediaEntry, NotificationsBox};
 use crate::lock_wiggle::Wiggle;
@@ -88,125 +89,15 @@ fn trace(line: &str) {
     }
 }
 
-/// GNOME's two prompt entries (authPrompt.js `_passwordEntry`,
-/// `_textEntry`): one at a time in the entry area, swapped with the text
-/// kept when a question changes between hidden and visible input
-/// (`updateEntry`).
-struct PromptEntry {
-    area: gtk::Overlay,
-    password: gtk::PasswordEntry,
-    text: gtk::Entry,
-    secret: Cell<bool>,
-}
-
-impl PromptEntry {
-    fn current(&self) -> gtk::Widget {
-        if self.secret.get() {
-            self.password.clone().upcast()
-        } else {
-            self.text.clone().upcast()
-        }
-    }
-
-    fn editable(&self) -> gtk::Editable {
-        if self.secret.get() {
-            self.password.clone().upcast()
-        } else {
-            self.text.clone().upcast()
-        }
-    }
-
-    fn has_focus(&self) -> bool {
-        let current = self.current();
-        current
-            .root()
-            .and_then(|root| root.focus())
-            .is_some_and(|focus| focus == current || focus.is_ancestor(&current))
-    }
-
-    /// Swap to the hidden or the visible entry (authPrompt.js
-    /// `updateEntry`). Visible text moves into the hidden entry with its
-    /// cursor and selection; hidden text is never revealed: going visible
-    /// empties both.
-    fn set_secret(&self, secret: bool) {
-        if self.secret.get() == secret {
-            return;
-        }
-        let (old, focused) = (self.editable(), self.has_focus());
-        let carried = secret.then(|| (old.text(), old.position(), old.selection_bounds()));
-        self.secret.set(secret);
-        let new = self.editable();
-        self.area.set_child(Some(&self.current()));
-        match carried {
-            Some((text, position, selection)) => {
-                new.set_text(&text);
-                new.set_position(position);
-                if let Some((start, end)) = selection {
-                    new.select_region(start, end);
-                }
-            }
-            None => new.set_text(""),
-        }
-        // The inactive entry keeps no copy of what was typed.
-        old.set_text("");
-        if focused {
-            self.focus();
-        }
-    }
-
-    /// Give the shown entry the keyboard focus without selecting what is
-    /// typed (Clutter's `grab_key_focus`). GtkText's `grab_focus` selects
-    /// all whenever the focus was not inside it, including when it was
-    /// the text itself, so a re-focus while typing would have the next
-    /// key replace the start of the answer (the wake character).
-    fn focus(&self) {
-        match self
-            .editable()
-            .delegate()
-            .and_then(|d| d.downcast::<gtk::Text>().ok())
-        {
-            Some(text) => {
-                text.grab_focus_without_selecting();
-            }
-            None => {
-                self.current().grab_focus();
-            }
-        }
-    }
-
-    /// The question as the hint and accessible label of both entries;
-    /// unchanged, nothing is touched (no accessibility churn).
-    fn set_hint(&self, hint: &str) {
-        let current = self.password.property::<Option<String>>("placeholder-text");
-        if current.as_deref() == Some(hint) && self.text.placeholder_text().as_deref() == Some(hint)
-        {
-            return;
-        }
-        self.password.set_property("placeholder-text", hint);
-        self.text.set_placeholder_text(Some(hint));
-        self.password
-            .update_property(&[gtk::accessible::Property::Label(hint)]);
-        self.text
-            .update_property(&[gtk::accessible::Property::Label(hint)]);
-    }
-
-    fn set_sensitive(&self, sensitive: bool) {
-        self.password.set_sensitive(sensitive);
-        self.text.set_sensitive(sensitive);
-    }
-
-    fn clear(&self) {
-        self.password.set_text("");
-        self.text.set_text("");
-    }
-}
-
 /// One monitor's lock window.
 struct Screen {
     /// Destroyed after the screen (see [`LockUi::release_screens`]): the
     /// application would otherwise keep it, and with it a stale prompt in
     /// the accessibility tree.
     window: gtk::Window,
+    /// The monitor the window covers (`None` only for unassigned test
+    /// windows).
+    monitor: Option<gtk::gdk::Monitor>,
     curtain: Curtain,
     clock: gtk::Label,
     date: gtk::Label,
@@ -308,6 +199,13 @@ pub struct LockUi {
     osk: RefCell<Option<Rc<crate::osk::Osk>>>,
     /// What the clocks' hints follow (idle time, power save, touch-mode).
     hints: Rc<lock_curtain::HintWatch>,
+    /// The display's monitor list while the lock screens are up, with
+    /// the `items-changed` handler that keeps one screen per monitor.
+    monitors_watch: RefCell<Option<(gtk::gio::ListModel, glib::SignalHandlerId)>>,
+    /// A [`LockUi::follow_monitors`] pass is under way, and the monitor
+    /// list changed again during it.
+    following: Cell<bool>,
+    refollow: Cell<bool>,
     /// Where the notifications box reads what to show (#348).
     notifications: RefCell<Option<LockNotifications>>,
     /// Where the notifications box reads its media players, and how its
@@ -321,7 +219,7 @@ impl LockUi {
         port: AuthPort,
         clock_format: Box<dyn Fn() -> logic::ClockFormat>,
     ) -> Rc<Self> {
-        let multiplier = crate::lock_auth::parse_message_multiplier(
+        let multiplier = tuna_auth_prompt::parse_message_multiplier(
             std::env::var("GDM_MESSAGE_TIME_MULTIPLIER").ok().as_deref(),
         );
         let ui = Rc::new(Self {
@@ -340,6 +238,9 @@ impl LockUi {
             wall_clock: RefCell::new(None),
             osk: RefCell::new(None),
             hints: lock_curtain::HintWatch::new(),
+            monitors_watch: RefCell::new(None),
+            following: Cell::new(false),
+            refollow: Cell::new(false),
             notifications: RefCell::new(None),
             media: RefCell::new(None),
         });
@@ -438,6 +339,9 @@ impl LockUi {
     /// (`gtk_session_lock_instance_unlock`), so destroying them here would
     /// tear the lock surfaces down while the session is still locked.
     fn release_screens(&self) {
+        if let Some((monitors, handler)) = self.monitors_watch.take() {
+            monitors.disconnect(handler);
+        }
         let screens = std::mem::take(&mut *self.screens.borrow_mut());
         let windows: Vec<gtk::Window> = screens.iter().map(|s| s.window.clone()).collect();
         let was_applying = self.applying.replace(true);
@@ -466,22 +370,22 @@ impl LockUi {
                 return;
             }
             // One lock window per monitor, assigned right after lock()
-            // (gtk4-layer-shell 1.1's contract).
+            // (gtk4-layer-shell 1.1's contract), and for each monitor
+            // plugged in while locked: GNOME's unlock dialog follows
+            // `monitors-changed` (unlockDialog.js `_updateBackgrounds`),
+            // and ext-session-lock-v1 wants a lock surface on every output.
             let Some(display) = gtk::gdk::Display::default() else {
                 return;
             };
             let monitors = display.monitors();
-            for i in 0..monitors.n_items() {
-                let Some(monitor) = monitors
-                    .item(i)
-                    .and_then(|m| m.downcast::<gtk::gdk::Monitor>().ok())
-                else {
-                    continue;
-                };
-                let window = self.screen(Some(&self.app.clone()));
-                self.instance.assign_window_to_monitor(&window, &monitor);
-                window.present();
-            }
+            let weak = Rc::downgrade(self);
+            let handler = monitors.connect_items_changed(move |_, _, _, _| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.follow_monitors();
+                }
+            });
+            *self.monitors_watch.borrow_mut() = Some((monitors, handler));
+            self.follow_monitors();
             self.refresh_clock();
             self.hints.arm();
             self.refresh_notifications();
@@ -496,6 +400,99 @@ impl LockUi {
         } else if !locked && self.requested.get() {
             self.requested.set(false);
             self.instance.unlock();
+        }
+    }
+
+    /// One lock window per monitor in the display's list: a window for
+    /// each monitor without one, and the window of each monitor gone
+    /// dropped (its lock surface with it), the way GNOME's unlock dialog
+    /// rebuilds its per-monitor backgrounds on `monitors-changed`
+    /// (unlockDialog.js `_updateBackgrounds`). Windows whose monitor
+    /// stays are left alone, so the prompt being answered keeps its text
+    /// and focus.
+    fn follow_monitors(self: &Rc<Self>) {
+        // Mapping a lock window round-trips the display
+        // (gtk4-layer-shell's `lock_surface_map`), which can add or remove
+        // a monitor under us: that change is followed once this pass ends,
+        // never by a nested pass that would cover a monitor twice.
+        if self.following.replace(true) {
+            self.refollow.set(true);
+            return;
+        }
+        loop {
+            self.refollow.set(false);
+            self.follow_monitors_once();
+            if !self.refollow.get() {
+                break;
+            }
+        }
+        self.following.set(false);
+    }
+
+    fn follow_monitors_once(self: &Rc<Self>) {
+        // Released (the lock failed or ended) since the change came in.
+        let released = || self.monitors_watch.borrow().is_none();
+        let Some(display) = gtk::gdk::Display::default().filter(|_| !released()) else {
+            return;
+        };
+        let list = display.monitors();
+        let monitors: Vec<gtk::gdk::Monitor> = (0..list.n_items())
+            .filter_map(|i| list.item(i).and_then(|m| m.downcast().ok()))
+            .collect();
+        let covered: Vec<Option<gtk::gdk::Monitor>> = self
+            .screens
+            .borrow()
+            .iter()
+            .map(|s| s.monitor.clone())
+            .collect();
+        let (gone, added) = logic::lock_monitors_changed(&covered, &monitors);
+        if !gone.is_empty() {
+            let dropped: Vec<Screen> = {
+                let mut screens = self.screens.borrow_mut();
+                gone.iter().rev().map(|&i| screens.remove(i)).collect()
+            };
+            let windows: Vec<gtk::Window> = dropped.iter().map(|s| s.window.clone()).collect();
+            let was_applying = self.applying.replace(true);
+            drop(dropped);
+            self.applying.set(was_applying);
+            // Out of the display's own signal emission.
+            glib::idle_add_local_once(move || {
+                for window in windows {
+                    window.destroy();
+                }
+            });
+        }
+        for monitor in &added {
+            if released() {
+                return;
+            }
+            // Unplugged while an earlier window of this pass mapped.
+            if !monitor.is_valid() {
+                continue;
+            }
+            let window = self.screen(Some(&self.app.clone()), Some(monitor));
+            self.instance.assign_window_to_monitor(&window, monitor);
+            window.present();
+        }
+        if !added.is_empty() {
+            self.refresh_clock();
+        }
+        if !gone.is_empty() || !added.is_empty() {
+            let connectors = |list: &[gtk::gdk::Monitor]| {
+                list.iter()
+                    .map(|m| {
+                        m.connector()
+                            .map_or_else(|| "?".to_owned(), |c| c.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            trace(&format!(
+                "lock screens follow monitors: added [{}], removed {}, now {}",
+                connectors(&added),
+                gone.len(),
+                self.screens.borrow().len()
+            ));
         }
     }
 
@@ -639,6 +636,9 @@ impl LockUi {
                         }
                     }
                     Effect::Trace(line) => trace(&line),
+                    // The unlock dialog always retries (`can_retry`'s
+                    // default), so it is never done trying.
+                    Effect::GiveUp => {}
                 }
             }
         }
@@ -686,7 +686,11 @@ impl LockUi {
 
     /// Build one monitor's lock window: GNOME's unlock-screen top bar
     /// over the clock curtain and the prompt.
-    fn screen(self: &Rc<Self>, app: Option<&gtk::Application>) -> gtk::Window {
+    fn screen(
+        self: &Rc<Self>,
+        app: Option<&gtk::Application>,
+        monitor: Option<&gtk::gdk::Monitor>,
+    ) -> gtk::Window {
         let window = gtk::Window::new();
         if let Some(app) = app {
             window.set_application(Some(app));
@@ -779,7 +783,7 @@ impl LockUi {
             }
             widget.add_controller(submit_keys);
         }
-        entry.set_hint(crate::lock_auth::DEFAULT_QUESTION);
+        entry.set_hint(tuna_auth_prompt::DEFAULT_QUESTION);
         // The Submit arrow sits inside the entry's right end.
         let next = gtk::Button::from_icon_name("go-next-symbolic");
         next.add_css_class("next-button");
@@ -1300,6 +1304,7 @@ impl LockUi {
 
         let screen = Screen {
             window: window.clone(),
+            monitor: monitor.cloned(),
             curtain,
             clock,
             date,
@@ -1403,7 +1408,7 @@ mod auth_transport_ui_tests {
             Box::new(|| logic::ClockFormat::TwentyFourHour),
         );
         ui.sync_connection_generation(Some(0));
-        let window = ui.screen(None);
+        let window = ui.screen(None, None);
         window.present();
         (ui, window)
     }
@@ -1751,7 +1756,7 @@ mod auth_transport_ui_tests {
             Box::new(|| logic::ClockFormat::TwentyFourHour),
         );
         ui.sync_connection_generation(Some(0));
-        let window = ui.screen(None);
+        let window = ui.screen(None, None);
         window.set_default_size(1280, 800);
         window.present();
         assert!(pump_until(Duration::from_secs(5), || window.is_mapped()

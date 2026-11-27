@@ -1413,7 +1413,7 @@ impl ShellHost {
     /// indicators, and popup state, so any content change repaints.
     fn panel_render_key(&self, width: i32, height: i32) -> PanelPaintKey {
         let tiles = self.tiles.tiles();
-        let today = jiff::Zoned::now().date();
+        let today = jiff::ZonedDateTime::now().date();
         let popup = self.popup.body().map(|body| match body {
             PopupBody::Calendar => (0u8, today.day() as u32),
             PopupBody::Menu(index) => (1u8, index as u32),
@@ -1474,7 +1474,7 @@ impl ShellHost {
     /// cached outputs paint.
     fn render_panel_pixels(&self, width: i32, height: i32) -> Vec<u8> {
         let strip_h = self.panel.height as i32;
-        let today = jiff::Zoned::now().date();
+        let today = jiff::ZonedDateTime::now().date();
         let unread = self
             .center
             .lock()

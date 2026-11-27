@@ -1,6 +1,7 @@
 """Memory and fd accounting of a process tree, for the stress harnesses
-(scripts/tuna-stress, scripts/tuna-hotplug-stress): totals a growth gate
-compares, and a per-process breakdown that names the owner of a rise."""
+(the nested stress churn lane and scripts/tuna-hotplug-stress): totals a
+growth gate compares, and a per-process breakdown that names the owner of
+a rise."""
 from pathlib import Path
 import subprocess
 import time

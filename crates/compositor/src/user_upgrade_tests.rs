@@ -900,11 +900,21 @@ fn startup_source_exits_for_help_version_and_pam_before_guard_and_run() {
         .find("return tuna_compositor::pam_helper::entry();")
         .unwrap();
     assert!(pam < guard);
+    // `parse_args` answers --version and --help; `main` returns its code
+    // before the guard.
     for arm in ["\"--version\" | \"-V\" =>", "\"--help\" | \"-h\" =>"] {
         let begin = source.find(arm).unwrap();
-        let exit = source[begin..].find("return ExitCode::SUCCESS;").unwrap() + begin;
+        let exit = source[begin..]
+            .find("return Some(ExitCode::SUCCESS);")
+            .unwrap()
+            + begin;
         assert!(begin < exit && exit < guard);
     }
+    let parsed = source
+        .find("if let Some(code) = parse_args(std::env::args().skip(1), &mut session) {")
+        .unwrap();
+    let exit = source[parsed..].find("return code;").unwrap() + parsed;
+    assert!(pam < parsed && parsed < exit && exit < guard);
     assert!(source[guard..run].contains("return ExitCode::FAILURE;"));
 }
 

@@ -524,7 +524,16 @@ The final `gdm51` overlay runs after every `pacman -Syu` and Orca step.
 It checks both archive hashes and package metadata.
 It installs both packages in one transaction.
 It checks their versions, owners and installed bytes.
-It checks the existing shipped-payload manifest without changes.
+It checks the existing shipped-payload manifest without changes,
+with one narrow exception.
+The receipt is taken from the repository's own `gdm`, while the candidate is a
+fixed native build, so their `gdm.service` units can differ for benign upstream
+reasons (`gdm` 51.2-1 added `After=accounts-daemon.service`).
+A mismatch on that one unit is accepted only when the installed bytes are the
+candidate archive's own copy.
+The receipt's entry is then updated, and the old and new digests and a unified
+diff are kept in `install-provenance.json` and `gdm.service.diff`.
+Any other mismatch, including every PAM and session file, still fails the build.
 No package upgrade follows.
 
 CI retains this evidence in `vm-lane-artifacts/gdm51/`.

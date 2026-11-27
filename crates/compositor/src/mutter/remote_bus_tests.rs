@@ -616,6 +616,7 @@ fn capture_session(
         streams: Default::default(),
         stopped: grant.map_or_else(|| Arc::new(AtomicBool::new(false)), |g| g.stopped.clone()),
         started: Arc::new(AtomicBool::new(false)),
+        closed: Arc::new(AtomicBool::new(false)),
         linked: grant.is_some(),
     }
 }

@@ -38,8 +38,8 @@ pub fn local_zone() -> TimeZone {
 }
 
 /// Now, in [`local_zone`].
-pub fn now() -> jiff::Zoned {
-    jiff::Zoned::now().with_time_zone(local_zone())
+pub fn now() -> jiff::ZonedDateTime {
+    jiff::ZonedDateTime::now().with_time_zone(local_zone())
 }
 
 fn forget_zone() {
