@@ -1,8 +1,12 @@
-//! GNOME 51's lock-screen authentication flow as a pure state machine.
+//! GNOME 51's `AuthPrompt` authentication flow as a pure state machine,
+//! shared by the lock screen (`tuna-shell-gtk`) and the login screen
+//! (`tuna-greeter`), as gnome-shell shares `authPrompt.js` between its
+//! unlock dialog and GDM's login dialog.
 //!
-//! The compositor runs the conversations (GDM's role: a PAM conversation
-//! for the password service, fprintd for the fingerprint service); this
-//! machine is GNOME Shell's side of them, combining:
+//! Something else runs the conversations (GDM's role: on the lock screen
+//! the compositor's PAM conversations, the fingerprint service's through
+//! `pam_fprintd` on `tuna-lock-fingerprint`; on the login screen GDM's own
+//! `UserVerifier`); this machine is GNOME Shell's side of them, combining:
 //!
 //! - `AuthPrompt` (<https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/gdm/authPrompt.js>):
 //!   `_onAskQuestion`, `_activateNext`, `updateEntry`, `setQuestion`,
@@ -18,11 +22,14 @@
 //! - `UnlockDialog` (<https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/ui/unlockDialog.js>):
 //!   `_ensureAuthPrompt`, `_maybeDestroyAuthPrompt` and `_onReset`.
 //!
-//! It never touches GTK: inputs are method calls, the compositor is a
-//! [`Host`], and what the widgets must show is a [`View`] plus one-shot
-//! [`Effect`]s.
+//! It never touches GTK: inputs are method calls, whoever runs the
+//! conversations is a [`Host`], and what the widgets must show is a
+//! [`View`] plus one-shot [`Effect`]s.
 
 use std::collections::VecDeque;
+
+#[cfg(feature = "gtk")]
+pub mod entry;
 
 use tuna_shell_control::{AuthEvent, AuthService};
 
@@ -123,6 +130,12 @@ pub trait Host {
     fn fingerprint_enabled(&self) -> bool;
     /// How long a wiggle runs now (0 with animations off).
     fn wiggle_ms(&self) -> u64;
+    /// authServices.js `_canRetry`: whether a failed verification may
+    /// begin again. The unlock dialog always may (`reauthOnly`); the login
+    /// screen allows `org.gnome.login-screen allowed-failures`.
+    fn can_retry(&self) -> bool {
+        true
+    }
 }
 
 /// What the prompt widgets show.
@@ -158,6 +171,11 @@ pub enum Effect {
     ShowPrompt,
     /// A `TUNA_LOCK_TRACE` line, without the program prefix.
     Trace(String),
+    /// Verification failed for good (authServices.js `_verificationFailed`
+    /// done trying: a `reset` that is not soft): the prompt has stopped,
+    /// and the login dialog goes back to its user list. Never sent while
+    /// [`Host::can_retry`] holds.
+    GiveUp,
 }
 
 /// authPrompt.js `AuthPromptStatus`, minus the states the unlock prompt
@@ -227,6 +245,8 @@ pub struct AuthMachine {
     reset_wait: Option<u64>,
     /// The soft reset is due once the current input is handled.
     ready_reset: bool,
+    /// The due reset is a hard one ([`Host::can_retry`] said no).
+    done_trying: bool,
     /// The backoff before restarting a prompt whose conversations all
     /// ended without a Problem, by timer token.
     restart_wait: Option<u64>,
@@ -266,6 +286,7 @@ impl AuthMachine {
             ready_answer: None,
             reset_wait: None,
             ready_reset: false,
+            done_trying: false,
             restart_wait: None,
             queue: VecDeque::new(),
             queue_timer: None,
@@ -295,19 +316,16 @@ impl AuthMachine {
     }
 
     /// authPrompt.js `promptStep`.
-    #[cfg(test)]
     pub fn prompt_step(&self) -> u32 {
         self.step
     }
 
     /// The single-password request in flight.
-    #[cfg(test)]
     pub fn legacy_pending(&self) -> Option<u64> {
         self.legacy_pending
     }
 
     /// Whether password verification fell back to single-password unlock.
-    #[cfg(test)]
     pub fn legacy(&self) -> bool {
         self.legacy
     }
@@ -893,20 +911,27 @@ impl AuthMachine {
         }
     }
 
-    /// authServices.js `_verificationFailed` with a retry (the unlock
-    /// screen always retries), then authPrompt.js `_onVerificationFailed`:
-    /// clear and reopen the entry, wiggle it if the password service was
-    /// asking, and soft-reset once queued messages are read.
+    /// authServices.js `_verificationFailed`, then authPrompt.js
+    /// `_onVerificationFailed`: clear the entry, reopen it if the host may
+    /// retry (the unlock screen always may), wiggle it if the password
+    /// service was asking, and reset once queued messages are read: soft
+    /// to begin again, or for good when the host is done trying.
     fn verification_failed(&mut self, host: &dyn Host, service: AuthService) {
         self.filter_service_messages(host, service, MessageKind::Error);
         let was_querying = service == AuthService::Password && self.queried;
         if was_querying {
             self.queried = false;
         }
+        let retry = host.can_retry();
+        self.done_trying = !retry;
         self.status = Status::Verifying;
         self.clear_entry();
-        self.preemptive_input = true;
-        self.set_sensitive(true);
+        self.preemptive_input = retry;
+        if retry {
+            self.set_sensitive(true);
+        } else {
+            self.sensitive = false;
+        }
         if was_querying {
             self.effects.push(Effect::WiggleEntry);
         }
@@ -933,6 +958,7 @@ impl AuthMachine {
         self.ready_answer = None;
         self.reset_wait = None;
         self.ready_reset = false;
+        self.done_trying = false;
         self.restart_wait = None;
     }
 
@@ -945,7 +971,12 @@ impl AuthMachine {
                 self.send_answer(host, request, sequence, answer);
             } else if std::mem::take(&mut self.ready_reset) {
                 if self.status != Status::Succeeded {
-                    self.soft_restart(host);
+                    if std::mem::take(&mut self.done_trying) {
+                        self.stop(host);
+                        self.effects.push(Effect::GiveUp);
+                    } else {
+                        self.soft_restart(host);
+                    }
                 }
             } else {
                 break;
@@ -1085,6 +1116,7 @@ mod tests {
         next: Cell<u64>,
         fingerprint: Cell<bool>,
         sendable: Cell<bool>,
+        retry: Cell<bool>,
     }
 
     impl Fake {
@@ -1094,6 +1126,7 @@ mod tests {
                 next: Cell::new(100),
                 fingerprint: Cell::new(true),
                 sendable: Cell::new(true),
+                retry: Cell::new(true),
             }
         }
         fn id(&self) -> Option<u64> {
@@ -1144,6 +1177,9 @@ mod tests {
         }
         fn wiggle_ms(&self) -> u64 {
             390
+        }
+        fn can_retry(&self) -> bool {
+            self.retry.get()
         }
     }
 
@@ -1540,6 +1576,37 @@ mod tests {
         host.take();
         m.timeout(&host, wait.0);
         assert_eq!(host.take(), vec![Call::Cancel]);
+    }
+
+    #[test]
+    fn a_host_done_trying_gives_up_once_the_problem_is_read() {
+        let host = Fake::new();
+        host.fingerprint.set(false);
+        let mut m = AuthMachine::new(1.0);
+        m.show_prompt(&host, false);
+        let pw = host.begins()[0].1;
+        host.take();
+        m.event(&host, pw, PW, &query(1, "Password:", true));
+        m.submit(&host, "wrong".into());
+        host.take();
+        m.take_effects();
+        m.event(&host, pw, PW, &problem("Sorry"));
+        let (problem_timer, _) = timers(&m.take_effects())[0];
+        host.retry.set(false);
+        assert!(m.result(&host, pw, false));
+        let e = m.take_effects();
+        assert!(e.contains(&Effect::WiggleEntry));
+        assert!(!e.contains(&Effect::GiveUp));
+        assert!(!m.view().sensitive, "no retry: the entry stays shut");
+        assert_eq!(m.view().message, Some(("Sorry".into(), MessageKind::Error)));
+        m.timeout(&host, problem_timer);
+        for (token, _) in timers(&m.take_effects()) {
+            m.timeout(&host, token);
+        }
+        let e = m.take_effects();
+        assert!(e.contains(&Effect::GiveUp), "{e:?}");
+        assert!(host.begins().is_empty(), "never begins again");
+        assert_eq!(m.view().message, None);
     }
 
     #[test]

@@ -56,6 +56,11 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("scripts/tuna-scroll-proof"), ["scroll-proof"])
         # The vkms gates (D-*) live in the DRM smoke.
         self.assertEqual(pr("scripts/tuna-drm-smoke"), ["drm-smoke"])
+        # D-INPUT-AT-STARTUP's helper and its tests run in the DRM smoke.
+        for path in ("scripts/lib/drm_input_startup.py", "scripts/tests/test_drm_input_startup.py"):
+            for run in (0, 4, 19):
+                with self.subTest(path=path, run=run):
+                    self.assertEqual(pr(path, run=run), ["drm-smoke"])
         # The two-output vkms leg (scripts/tuna-drm-dual) runs in drm-smoke.
         for path in ("scripts/tuna-drm-dual", "scripts/lib/drm_dual.py",
                      "scripts/lib/drm_kms_readback.py", "scripts/tests/test_drm_dual.py"):
@@ -63,10 +68,22 @@ class Selection(unittest.TestCase):
                 with self.subTest(path=path, run=run):
                     self.assertEqual(pr(path, run=run), ["drm-smoke"])
         self.assertEqual(pr("docs/walkthrough.tsv"), ["gtk-shell"])
+        self.assertEqual(pr("scripts/tuna-greeter-proof"), ["gtk-shell"])
+        self.assertEqual(pr("scripts/lib/tuna-gdm-mock.py"), ["gtk-shell"])
+        self.assertEqual(pr("scripts/lib/org.gnome.login-screen.gschema.xml"), ["gtk-shell"])
+        # The greeter's unit tests run in check; its proof in gtk-shell.
+        self.assertIn("gtk-shell", pr("crates/greeter/src/main.rs"))
         self.assertEqual(pr("packaging/marlin/vm-lane/Containerfile"),
                          ["arch-package", "marlin-image", "marlin-vm"])
         # The Marlin VM gates (V-*) live in the VM lane.
         self.assertEqual(pr("scripts/tuna-vm-lane"), ["arch-package", "marlin-vm"])
+        # The nested GTK gates (G-*) live in the GTK shell proof; journey
+        # runs it against the installed package.
+        self.assertEqual(pr("scripts/tuna-gtk-shell-proof"), ["journey", "gtk-shell"])
+        # G-VISUAL-BELL, G-X11-BELL, G-XSETTINGS-SOUNDS, G-QS-VOLUME-FEEDBACK
+        # (#353) are sourced into it, with their pixel reader.
+        for path in ("scripts/lib/tuna-sound-alerts-proof.sh", "scripts/lib/tuna-bell-pixels.py"):
+            self.assertEqual(pr(path), ["journey", "gtk-shell"], path)
         self.assertEqual(pr("scripts/lib/vm_unlock_wake.py"), ["arch-package", "marlin-vm"])
         # The nested GTK gates (G-*) live in the GTK shell proof; journey
         # runs it against the installed package.
@@ -84,6 +101,16 @@ class Selection(unittest.TestCase):
         # The guest's /usr/libexec/tuna-datetime-proof (G-DATETIME-*).
         self.assertEqual(pr("scripts/lib/tuna-datetime-proof.py"),
                          ["arch-package", "marlin-image", "marlin-vm"])
+
+    def test_protocol_gate_inputs_run_the_gtk_shell_proof(self):
+        # The Mutter 51 protocol gates (--protocols-only) and G-WAYLAND-INFO
+        # run in the gtk-shell job: their client and references select it.
+        for run in range(len(m.ROTATION)):
+            for path in ("crates/compositor/examples/protocol-probe.rs",
+                         "tests/protocols/gnome51-globals.tsv",
+                         "tests/protocols/marlin-gnome51-globals.tsv"):
+                self.assertIn("gtk-shell", pr(path, run=run), (path, run))
+        self.assertEqual(pr("scripts/tuna-wayland-info-compare"), ["gtk-shell"])
 
 
     def test_transition_policy_and_suite_always_run_journey(self):

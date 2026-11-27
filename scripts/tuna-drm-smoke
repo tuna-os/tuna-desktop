@@ -10,6 +10,9 @@
 # minus real hardware. Asserts on state, not pixels:
 #   D-OUTPUT   the backend lit the vkms connector
 #   D-SHELL    the shell connected over the control socket (introspection)
+#   D-INPUT-AT-STARTUP a uinput mouse that exists before the compositor
+#              starts is among its input devices within 10 s, with no input
+#              event sent (libinput's startup queue is drained at once)
 #   D-IDLE     an unchanged scene stops redundant scanout submissions
 #   D-FRAMES   a real active Wayland client receives 240 page-flip presentations
 #   D-SCALE    a GNOME monitors.xml giving the connector scale 2 is
@@ -50,6 +53,13 @@
 #              keybinding actions, strip keybindings, the pad OSD in the
 #              GTK shell (help button, org.gnome.Shell.Wacom.PadOsd),
 #              hotplug, and nothing reaching the client while locked
+#   D-LEASE    wp_drm_lease_device_v1 version 1 is advertised on the native
+#              session with a DRM fd and no connector: vkms' only connector
+#              is a desktop one. With TUNA_DEBUG_LEASE_CONNECTORS naming it
+#              (Mutter's MUTTER_DEBUG_LEASE_CONNECTORS), it stays off the
+#              desktop and is offered; a lease's fd holds it and one CRTC,
+#              it is withdrawn while leased, and it is offered again after
+#              the client destroys the lease or closes the lease fd
 #   D-POWER-SAVE gsd-power's blank of the locked session: DisplayConfig
 #              PowerSaveMode 3 turns the connector off and the main loop
 #              all but sleeps (#1122); 0 relights it with a full repaint
@@ -83,7 +93,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --seconds) SECONDS_UP="$2"; shift 2 ;;
-        --help|-h) sed -n '2,72p' "$0"; exit 0 ;;
+        --help|-h) sed -n '2,82p' "$0"; exit 0 ;;
         *) echo "tuna-drm-smoke: unknown argument $1" >&2; exit 1 ;;
     esac
 done
@@ -106,13 +116,17 @@ POINTER_EMU_PID=""
 POINTER_UDEV_RULE=/run/udev/rules.d/71-tuna-d-pointer-trackball.rules
 EMU_PID=""
 CLIENT_PID=""
+CARD_ACL=""
+CARD_RULE=""
 TOUCHPAD_EMU_PID=""
 TOUCHPAD_CLIENT_PID=""
+STARTUP_DEVICE_PID=""
 
 cleanup() {
     if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
     if [ -n "$TOUCHPAD_CLIENT_PID" ]; then kill "$TOUCHPAD_CLIENT_PID" 2>/dev/null || true; fi
     # The emulators (root) exit when their command pipes close.
+    exec 7>&- 2>/dev/null || true
     exec 8>&- 2>/dev/null || true
     exec 9>&- 2>/dev/null || true
     if [ -n "$EMU_PID" ]; then wait "$EMU_PID" 2>/dev/null || true; fi
@@ -125,6 +139,9 @@ cleanup() {
         fi
     fi
     if [ -n "$COMP_PID" ]; then kill "$COMP_PID" 2>/dev/null || true; fi
+    # After the compositor: should a process still hold the startup
+    # mouse's pipe open, the holder only sees end-of-file once it is gone.
+    if [ -n "$STARTUP_DEVICE_PID" ]; then wait "$STARTUP_DEVICE_PID" 2>/dev/null || true; fi
     if [ -n "$CALIBRATION_PID" ]; then kill "$CALIBRATION_PID" 2>/dev/null || true; fi
     colord_stop
     if [ -n "$SYSTEM_BUS_PID" ]; then kill "$SYSTEM_BUS_PID" 2>/dev/null || true; fi
@@ -140,6 +157,11 @@ cleanup() {
     fi
     # Put a stopped system seatd back exactly as we found it.
     if [ -n "$SYSTEM_SEATD" ]; then sudo systemctl start seatd 2>/dev/null || true; fi
+    if [ -n "$CARD_ACL" ]; then
+        sudo rm -f "$CARD_RULE"
+        sudo udevadm control --reload 2>/dev/null || true
+        sudo setfacl -x "u:$(id -un)" "$CARD_ACL" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT INT TERM
 
@@ -213,10 +235,34 @@ for dev in /sys/class/drm/card*; do
 done
 [ -n "$CARD" ] || { echo "tuna-drm-smoke: no vkms card appeared" >&2; exit 1; }
 echo "tuna-drm-smoke: vkms at $CARD"
+# A logind seat session gets read-write access to its card through udev's
+# uaccess ACL; seatd only hands the compositor its master fd. The lease
+# device opens its own non-master fd for clients, as Mutter does
+# (meta_kms_impl_device_open_non_privileged_fd), so grant the same ACL.
+# udev's uaccess builtin flushes foreign ACL entries on every change event
+# (each lease is one), so a runtime rule re-applies it after the builtin.
+CARD_RULE="/run/udev/rules.d/99-tuna-drm-smoke-$(basename "$CARD").rules"
+CARD_ACL="$CARD"
+sudo mkdir -p /run/udev/rules.d
+echo "SUBSYSTEM==\"drm\", KERNEL==\"$(basename "$CARD")\", RUN+=\"/usr/bin/setfacl -m u:$(id -un):rw \$devnode\"" |
+    sudo tee "$CARD_RULE" >/dev/null
+sudo udevadm control --reload 2>/dev/null || true
+sudo setfacl -m "u:$(id -un):rw" "$CARD"
 
 echo "tuna-drm-smoke: building"
 cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk
 "$ROOT/scripts/tuna-frame-pacer-build" "$ARTIFACTS/frame-pacer"
+# D-LEASE's client, built like the frame pacer from the system protocol XML.
+LEASE_PROBE="$ARTIFACTS/lease-probe/tuna-drm-lease-probe"
+mkdir -p "$ARTIFACTS/lease-probe"
+lease_xml="$(pkg-config --variable=pkgdatadir wayland-protocols)/staging/drm-lease/drm-lease-v1.xml"
+wayland-scanner client-header "$lease_xml" "$ARTIFACTS/lease-probe/drm-lease-v1-client-protocol.h"
+wayland-scanner private-code "$lease_xml" "$ARTIFACTS/lease-probe/drm-lease-v1-protocol.c"
+# pkg-config emits compiler and linker arguments, split on purpose.
+# shellcheck disable=SC2046
+cc -std=c11 -O2 -Wall -Wextra -Werror $(pkg-config --cflags wayland-client) -I "$ARTIFACTS/lease-probe" \
+    "$ROOT/scripts/lib/tuna-drm-lease-probe.c" "$ARTIFACTS/lease-probe/drm-lease-v1-protocol.c" \
+    $(pkg-config --libs wayland-client) -o "$LEASE_PROBE"
 
 # seatd always serves /run/seatd.sock (and removes a leftover one), so a
 # running system seatd is stopped for the test and restarted on exit.
@@ -234,13 +280,32 @@ for _ in $(seq 1 50); do [ -S "$SEATD_SOCK" ] && break; sleep 0.1; done
 
 RUNTIME="$(mktemp -d)"
 chmod 700 "$RUNTIME"
+# D-INPUT-AT-STARTUP: a mouse present before the compositor starts, as a
+# login's keyboard and mouse are; it never sends an event.
+STARTUP_DEVICE="Tuna startup mouse"
+mkfifo "$ARTIFACTS/startup-device.fifo"
+# The log stays user-owned on purpose.
+# shellcheck disable=SC2024
+sudo python3 "$ROOT/scripts/lib/drm_input_startup.py" hold "$STARTUP_DEVICE" \
+    <"$ARTIFACTS/startup-device.fifo" >"$ARTIFACTS/startup-device.log" 2>&1 &
+STARTUP_DEVICE_PID=$!
+exec 7>"$ARTIFACTS/startup-device.fifo"
+end=$(($(date +%s) + 10))
+until grep -q '^ready$' "$ARTIFACTS/startup-device.log" 2>/dev/null; do
+    kill -0 "$STARTUP_DEVICE_PID" 2>/dev/null ||
+        fail D-INPUT-AT-STARTUP "the uinput mouse did not start: $(cat "$ARTIFACTS/startup-device.log")"
+    [ "$(date +%s)" -le "$end" ] || fail D-INPUT-AT-STARTUP "the uinput mouse was not created within 10 s"
+    sleep 0.1
+done
+udevadm settle --timeout=10 || true
+started_ms=$(($(date +%s%N) / 1000000))
 env -u DISPLAY -u WAYLAND_DISPLAY \
     XDG_RUNTIME_DIR="$RUNTIME" \
     XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$ARTIFACTS/data" \
     LIBSEAT_BACKEND=seatd \
     TUNA_DRM_DEVICE="$CARD" TUNA_INTROSPECT_FILE="$STATE" TUNA_COMPOSITOR_STATE="$CSTATE" \
     "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-smoke \
-    --shell-bin "$ROOT/target/debug/tuna-shell-host" >"$LOG" 2>&1 &
+    --shell-bin "$ROOT/target/debug/tuna-shell-host" >"$LOG" 2>&1 7>&- &
 COMP_PID=$!
 
 end=$(($(date +%s) + 30))
@@ -258,6 +323,46 @@ until [ -s "$STATE" ] && jq -e '.revision != null' "$STATE" >/dev/null 2>&1; do
     sleep 0.2
 done
 pass D-SHELL "shell connected (revision $(jq .revision "$STATE"))"
+
+# Nothing produces input: the device must come from libinput's startup
+# queue, which a readiness-only loop left alone until the first event.
+until python3 "$ROOT/scripts/lib/drm_input_startup.py" check "$CSTATE" "$STARTUP_DEVICE" \
+    >"$ARTIFACTS/input-at-startup.txt" 2>&1; do
+    kill -0 "$COMP_PID" 2>/dev/null || fail D-INPUT-AT-STARTUP "compositor exited"
+    [ $(($(date +%s%N) / 1000000 - started_ms)) -le 10000 ] ||
+        fail D-INPUT-AT-STARTUP "no input device from before startup within 10 s: $(cat "$ARTIFACTS/input-at-startup.txt")"
+    sleep 0.2
+done
+listed_ms=$(($(date +%s%N) / 1000000 - started_ms))
+snapshot_state "$CSTATE" "$ARTIFACTS/input-at-startup.json"
+pass D-INPUT-AT-STARTUP "$(cat "$ARTIFACTS/input-at-startup.txt") ${listed_ms} ms after the compositor started, with no input event"
+# Unplug it now, before the idle measurement: closing the pipe is the
+# holder's end-of-file, so no process started while it was open may keep
+# a copy (the compositor and its shell did, and the job hung here until
+# it was cancelled).
+exec 7>&-
+end=$(($(date +%s) + 10))
+# The holder runs under sudo: read its /proc state (gone or a zombie once
+# it exits) rather than signal a root process.
+while [ -r "/proc/$STARTUP_DEVICE_PID/stat" ] &&
+    [ "$(sed 's/.*) \(.\).*/\1/' "/proc/$STARTUP_DEVICE_PID/stat" 2>/dev/null)" != Z ]; do
+    if [ "$(date +%s)" -gt "$end" ]; then
+        holders=""
+        for proc in /proc/[0-9]*; do
+            for fd in "$proc"/fd/*; do
+                case "$(readlink "$fd" 2>/dev/null || true)" in
+                    *startup-device.fifo)
+                        holders="$holders ${proc#/proc/}($(cat "$proc/comm" 2>/dev/null || true))"
+                        break ;;
+                esac
+            done
+        done
+        fail D-INPUT-AT-STARTUP "the startup mouse was not unplugged within 10 s of closing its pipe; still open in:${holders:- nothing visible}"
+    fi
+    sleep 0.1
+done
+wait "$STARTUP_DEVICE_PID" || true
+STARTUP_DEVICE_PID=""
 
 sleep 2
 [ -s "$CSTATE" ] || fail D-IDLE "missing compositor frame counter"
@@ -301,6 +406,15 @@ with open(sys.argv[2], "rb") as stream:
     print(result)
 PYCODE
 pass D-ENDURANCE "real feedback, batch rollover and requested 16-second completion"
+# DRM leasing (Mutter's native backend): one lease device global, offering
+# nothing here because the vkms connector drives the desktop.
+timeout 20s env -u WAYLAND_SOCKET XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY=tuna-drm-smoke \
+    "$LEASE_PROBE" >"$ARTIFACTS/lease-devices.json" 2>"$ARTIFACTS/lease-probe.stderr" ||
+    fail D-LEASE "lease device probe failed: $(cat "$ARTIFACTS/lease-probe.stderr")"
+jq -e '.devices | length == 1 and .[0].version == 1 and .[0].drm_fd and (.[0].released | not)
+        and (.[0].connectors | length == 0)' "$ARTIFACTS/lease-devices.json" >/dev/null ||
+    fail D-LEASE "expected one v1 lease device with a DRM fd and no connector: $(cat "$ARTIFACTS/lease-devices.json")"
+pass D-LEASE "wp_drm_lease_device_v1 v1 advertised with a DRM fd; no connector for lease (the vkms connector is a desktop one)"
 if command -v ffmpeg >/dev/null 2>&1; then
     sudo ffmpeg -loglevel error -y -device "$CARD" -f kmsgrab -i - -frames:v 1 \
         -vf 'hwdownload,format=bgr0' "$ARTIFACTS/scanout.png" 2>"$ARTIFACTS/kmsgrab.log" &&
@@ -1450,6 +1564,55 @@ wait "$COMP_PID" || true
 COMP_PID=""
 if grep -q panicked "$TABLET_LOG"; then fail D-NOPANIC "panic in the tablet session"; fi
 
+# DRM leasing of a named connector (Mutter's MUTTER_DEBUG_LEASE_CONNECTORS,
+# here TUNA_DEBUG_LEASE_CONNECTORS): the vkms connector leaves the desktop
+# (the session runs with no monitor, as Mutter does) and is offered for
+# lease; real leases end by destroy and by closing the lease fd.
+LEASE_LOG="$ARTIFACTS/compositor-lease.log"
+LOG="$LEASE_LOG"
+env -u DISPLAY -u WAYLAND_DISPLAY \
+    XDG_RUNTIME_DIR="$RUNTIME" XDG_STATE_HOME="$ARTIFACTS/state" XDG_DATA_HOME="$ARTIFACTS/data" \
+    LIBSEAT_BACKEND=seatd TUNA_DRM_DEVICE="$CARD" TUNA_DEBUG_LEASE_CONNECTORS="$CONNECTOR" \
+    "$ROOT/target/debug/tuna-compositor" --backend drm --socket tuna-drm-lease \
+    --shell-bin "$ROOT/target/debug/tuna-shell-host" >"$LEASE_LOG" 2>&1 &
+COMP_PID=$!
+end=$(($(date +%s) + 30))
+until grep -q 'drm-lease: wp_drm_lease_device_v1 advertised' "$LEASE_LOG" 2>/dev/null &&
+    [ -S "$RUNTIME/tuna-drm-lease" ]; do
+    kill -0 "$COMP_PID" 2>/dev/null || fail D-LEASE "the lease session exited during startup"
+    [ "$(date +%s)" -le "$end" ] || fail D-LEASE "the lease session never advertised its lease device"
+    sleep 0.2
+done
+grep -q "drm: connector $CONNECTOR is for lease, not the desktop" "$LEASE_LOG" ||
+    fail D-LEASE "$CONNECTOR was not kept off the desktop"
+if grep -q 'drm: output' "$LEASE_LOG"; then fail D-LEASE "$CONNECTOR still lit a desktop output"; fi
+lease_probe() {
+    timeout 30s env -u WAYLAND_SOCKET XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY=tuna-drm-lease \
+        "$LEASE_PROBE" "$@" 2>>"$ARTIFACTS/lease-probe.stderr"
+}
+lease_probe >"$ARTIFACTS/lease-offered.json" || fail D-LEASE "lease probe failed: $(tail -1 "$ARTIFACTS/lease-probe.stderr")"
+jq -e --arg name "$CONNECTOR" '.devices | length == 1 and .[0].drm_fd
+        and ([.[0].connectors[] | select(.name == $name and .id > 0 and .done)] | length == 1)' \
+    "$ARTIFACTS/lease-offered.json" >/dev/null ||
+    fail D-LEASE "$CONNECTOR not offered: $(cat "$ARTIFACTS/lease-offered.json")"
+lease_probe --lease "$CONNECTOR" >"$ARTIFACTS/lease-destroy.jsonl" ||
+    fail D-LEASE "lease, withdraw and re-offer by destroy failed: $(tail -1 "$ARTIFACTS/lease-probe.stderr")"
+jq -se '[.[].event] == ["devices", "leased", "withdrawn", "reoffered"]
+        and (.[2].devices[0].connectors | length == 0) and (.[3].devices[0].connectors | length == 1)' \
+    "$ARTIFACTS/lease-destroy.jsonl" >/dev/null ||
+    fail D-LEASE "unexpected lease sequence: $(cat "$ARTIFACTS/lease-destroy.jsonl")"
+lease_probe --lease "$CONNECTOR" --close-fd >"$ARTIFACTS/lease-close.jsonl" ||
+    fail D-LEASE "closing the lease fd did not end the lease: $(tail -1 "$ARTIFACTS/lease-probe.stderr")"
+jq -se '[.[].event] == ["devices", "leased", "withdrawn", "finished", "reoffered"]' \
+    "$ARTIFACTS/lease-close.jsonl" >/dev/null ||
+    fail D-LEASE "unexpected lease sequence: $(cat "$ARTIFACTS/lease-close.jsonl")"
+grep -q "drm-lease: lessee .* disappeared" "$LEASE_LOG" ||
+    fail D-LEASE "the compositor did not notice the lessee go"
+kill -TERM "$COMP_PID"
+wait "$COMP_PID" || true
+COMP_PID=""
+if grep -q panicked "$LEASE_LOG"; then fail D-NOPANIC "panic in the lease session"; fi
+pass D-LEASE "TUNA_DEBUG_LEASE_CONNECTORS=$CONNECTOR: off the desktop, offered, leased (lessee fd holds it and a CRTC), withdrawn, re-offered after destroy and after the lease fd closed"
 # Touchpad swipes (P-IN-02, #593) through real libinput: a uinput
 # clickpad as the rmi4 driver creates it (scripts/lib/tuna-uinput-touchpad.py)
 # whose finger motion the kernel timestamps and libinput turns into
