@@ -2752,11 +2752,26 @@ fn paged_grid(
                 carousel.step(-1);
                 gtk::glib::Propagation::Stop
             }
+            // Home / End: the first / last page (appDisplay.js).
+            gtk::gdk::Key::Home | gtk::gdk::Key::End => {
+                let last = carousel.n_pages().saturating_sub(1);
+                carousel.scroll_to(edge_page(key, last), true);
+                gtk::glib::Propagation::Stop
+            }
             _ => gtk::glib::Propagation::Proceed,
         });
     }
     column.add_controller(keys);
     column.upcast()
+}
+
+/// The page Home or End jumps to, given the index of the last page.
+fn edge_page(key: gtk::gdk::Key, last: u32) -> u32 {
+    if key == gtk::gdk::Key::Home {
+        0
+    } else {
+        last
+    }
 }
 
 /// GNOME's page switching during a drag (appDisplay.js): bumping the
@@ -3565,8 +3580,15 @@ mod app_activation_tests {
 
 #[cfg(test)]
 mod keynav_tests {
-    use super::{grid_step, typed_text, GridStep};
+    use super::{edge_page, grid_step, typed_text, GridStep};
     use gtk4::gdk::{Key, ModifierType};
+
+    #[test]
+    fn home_and_end_jump_to_the_first_and_last_page() {
+        assert_eq!(edge_page(Key::Home, 3), 0);
+        assert_eq!(edge_page(Key::End, 3), 3);
+        assert_eq!(edge_page(Key::End, 0), 0);
+    }
 
     /// Two pages of a 3-column grid: 7 tiles, then 2.
     fn step(at: (u32, u32), key: Key) -> GridStep {

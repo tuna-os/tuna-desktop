@@ -3435,6 +3435,8 @@ fn build(app: &adw::Application) {
                     | Action::Unmaximize
                     | Action::Maximize
                     | Action::Minimize
+                    | Action::ToggleAbove
+                    | Action::ToggleSticky
                     | Action::TileLeft
                     | Action::TileRight
                     | Action::BeginMove
@@ -3446,6 +3448,8 @@ fn build(app: &adw::Application) {
                             Action::Unmaximize => W::Unmaximize,
                             Action::Maximize => W::Maximize,
                             Action::Minimize => W::Minimize,
+                            Action::ToggleAbove => W::ToggleAbove,
+                            Action::ToggleSticky => W::ToggleSticky,
                             Action::TileLeft => W::ToggleTiledLeft,
                             Action::TileRight => W::ToggleTiledRight,
                             Action::BeginMove => W::Move,
