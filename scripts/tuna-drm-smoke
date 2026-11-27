@@ -1320,8 +1320,9 @@ lock_is() {
 # panel coordinates: see the emulator's docstring) and the tablet-mode
 # switch, off.
 mkfifo "$ARTIFACTS/touch-emulator.fifo"
-# shellcheck disable=SC2024
-sudo python3 "$ROOT/scripts/lib/tuna-uinput-touchscreen.py" <"$ARTIFACTS/touch-emulator.fifo" >"$EMU_OUT" 2>&1 &
+# The subshell takes the redirections, so they stay user-owned on purpose and
+# exec keeps $! the sudo process.
+( exec sudo python3 "$ROOT/scripts/lib/tuna-uinput-touchscreen.py" ) <"$ARTIFACTS/touch-emulator.fifo" >"$EMU_OUT" 2>&1 &
 EMU_PID=$!
 exec 8>"$ARTIFACTS/touch-emulator.fifo"
 emu_gate=D-TOUCH

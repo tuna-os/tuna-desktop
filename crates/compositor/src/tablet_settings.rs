@@ -586,7 +586,7 @@ impl NativeReader for GioReader {
                 Kind::Touchscreen => {
                     settings
                         .set_strv("output", ["BOE", "0x0a1c", "eDP-1"])
-                        .unwrap();
+                        .expect("the touchscreen schema has an output key");
                 }
             }
         }
