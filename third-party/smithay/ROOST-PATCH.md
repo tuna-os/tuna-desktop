@@ -195,6 +195,16 @@ drm-smoke's D-LEASE leases the vkms connector through it with a real
 client. The isolated diff is retained in DRM-LEASE-PATCH.diff; the pinned
 version stays 0.7.0.
 
+Issue #495 adds `_NET_WM_ICON_GEOMETRY` to src/xwayland/xwm/mod.rs and
+surface.rs. X11Surface reads it at map and on PropertyNotify (reported as
+the new WmWindowProperty::IconGeometry) and exposes it as
+`icon_geometry()` in logical coordinates, with Mutter's
+`reload_icon_geometry` semantics: a missing or non-CARDINAL property
+unsets it, a value of other than four cardinals keeps the previous one.
+Roost minimizes toward it as GNOME Shell 51's `_minimizeWindow` does. No
+match in the tree is exhaustive over WmWindowProperty. The isolated diff
+is retained in ICON-GEOMETRY-API-PATCH.diff; the pinned version stays 0.7.0.
+
 Issue #1078 changes src/xwayland/xwm/surface.rs. Upstream writes WM_STATE
 only from set_mapped, which also unmaps the frame, and set_suspended adds
 _NET_WM_STATE_HIDDEN alone, so a minimized window that stays mapped (its
@@ -422,3 +432,44 @@ crates/compositor/src/explicit_sync.rs cover every case; real socketpair
 tests in crates/compositor/tests/protocol_gaps.rs cover surface_exists,
 invalid_timeline, unsupported_buffer and no_acquire_point. The isolated
 diff is retained in DRM-SYNCOBJ-PATCH.diff; the pinned version stays 0.7.0.
+
+Issue #353 changes Cargo.toml (the xwayland feature enables x11rb's xkb
+protocol) and src/xwayland/xwm/mod.rs, additively. X11Wm::select_bell_events
+does what Mutter 51's init_x11_bell does (src/x11/meta-x11-display.c): select
+XkbBellNotify on the core keyboard and turn off its AudibleBell control, so
+X11 bells reach the new XwmHandler::bell callback (default: ignore) with the
+window the client named and the X server time, and Xwayland never rings them
+itself. X11Wm::release_xsettings_selection gives up the _XSETTINGS_S0
+selection start_wm takes: Mutter never owns XSETTINGS, and
+gnome-settings-daemon's xsettings plugin exits while another manager holds
+it. The isolated diff is retained in XKB-BELL-XSETTINGS-API-PATCH.diff; the
+pinned version stays 0.7.0.
+Issue #344 (P-IN-05) adds src/wayland/tablet_manager/tablet_pad.rs and
+changes the tablet manager's mod.rs, tablet.rs, tablet_seat.rs and
+tablet_tool.rs and src/backend/libinput/mod.rs for graphics tablets and
+their pads. Upstream 0.7.0 serves tablets and tools but not
+zwp_tablet_pad_v2 (upstream has only the unmerged drafts Smithay PR 1955
+and PR 1836), so a pad's buttons, rings and strips reached no client and
+GNOME's pad actions and pad OSD had nothing to follow. The additive
+TabletSeatHandle::add_pad, get_pad and remove_pad announce a
+TabletPadDescriptor (its buttons, and libinput's mode groups of buttons,
+rings and strips) to every bound tablet seat. The returned
+TabletPadHandle follows keyboard focus, paired with its tablet, and sends
+button, ring, strip and mode-switch events only to the focused client's
+objects, as Mutter 51 does (meta-wayland-tablet-pad*.c). The focused
+client's set_feedback labels for buttons, rings and strips are kept, but
+only when they quote the group's current mode-switch serial and never
+for a mode-switch button, and a focus change clears them;
+button_label, ring_label and strip_label give them to Roost's pad OSD
+(crates/compositor/src/runtime.rs). LibinputInputBackend's SpecialEvent
+becomes TabletPadEvent, so libinput pad events reach the compositor
+instead of being dropped. The manager offers version 2, as Mutter 51
+does, and sends zwp_tablet_v2.bustype; zwp_tablet_v2.path now names the
+/dev/input/eventN node instead of the sysfs path, and id sends the vendor
+before the product, as the protocol and Mutter do. Removing a tablet or
+a pad sends removed, so the clients' objects go inert. The tool's
+hardware_serial and hardware_id_wacom high halves are now the upper 32
+bits instead of bits 16 to 47. The emulated Wacom Cintiq 22HD pen and
+pad of D-TABLET (scripts/tuna-drm-smoke) cover it with a GTK 4 client
+and the shell's pad OSD. The isolated diff is retained in
+TABLET-PAD-API-PATCH.diff; the pinned version stays 0.7.0.

@@ -674,10 +674,21 @@ impl XdgActivationHandler for State {
 
     /// Mint only for the client holding keyboard focus, and only with
     /// an input serial: a background app cannot mint its way to focus.
-    fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
-        data.serial.is_some()
+    /// A minted token starts a startup sequence, as mutter's
+    /// `token_commit` does: the busy cursor until a window activates with
+    /// it or it times out (#1193).
+    fn token_created(&mut self, token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
+        let minted = data.serial.is_some()
             && data.client_id.is_some()
-            && data.client_id == self.keyboard_client()
+            && data.client_id == self.keyboard_client();
+        if minted {
+            self.startup.add_token(
+                token.to_string(),
+                data.app_id.clone(),
+                std::time::Instant::now(),
+            );
+        }
+        minted
     }
 
     fn request_activation(
@@ -688,6 +699,8 @@ impl XdgActivationHandler for State {
     ) {
         // One use per token (ADR 0002's policy, now on the protocol).
         self.protocols.activation_state.remove_token(&token);
+        // maybe_activate completes the sequence whether or not it focuses.
+        self.startup.complete_token(&token);
         if token_data.timestamp.elapsed() < ACTIVATION_TOKEN_TTL {
             self.window_requests
                 .push((surface, WindowRequest::Activate));

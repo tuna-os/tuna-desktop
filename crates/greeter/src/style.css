@@ -1,0 +1,172 @@
+/* GNOME 51's login dialog (gnome-shell data/theme/gnome-shell-sass/
+   widgets/_login-lock.scss, _common.scss, _default-colors.scss):
+   #lockDialogGroup is $system_base_color #222226, text $system_fg_color
+   #fafafb, the dialog 25em (30em for the prompt). */
+window.tuna-greeter {
+  background-color: #222226;
+  color: #fafafb;
+  font-family: "Adwaita Sans", "Cantarell", sans-serif;
+  font-size: 11pt;
+}
+
+/* #panel.login-screen: transparent, the clock in the middle. */
+window.tuna-greeter .login-screen-panel {
+  min-height: 32px;
+  padding: 0 8px;
+}
+window.tuna-greeter .login-screen-panel .clock {
+  font-weight: bold;
+  font-feature-settings: "tnum";
+}
+window.tuna-greeter .login-screen-panel button {
+  color: #fafafb;
+}
+
+/* .login-dialog-banner-view: 30em wide, the text 10% darker. */
+window.tuna-greeter .login-dialog-banner {
+  color: #dedee4;
+  margin-top: 24px;
+  min-width: 440px;
+}
+
+/* .login-dialog-user-selection-box: clear of the panel and the bottom
+   button group; the list view 25em. */
+window.tuna-greeter .login-dialog-user-selection-box {
+  padding-top: 4em;
+  padding-bottom: 8em;
+}
+window.tuna-greeter .login-dialog-user-list-view {
+  min-width: 366px;
+}
+window.tuna-greeter list.login-dialog-user-list {
+  background: none;
+  margin: 0 8px;
+}
+/* .login-dialog-user-list-item: login_dialog_item_button, 16px modal
+   radius, 9px padding, 12px apart. */
+window.tuna-greeter row.login-dialog-user-list-item {
+  border-radius: 16px;
+  padding: 9px;
+  margin-bottom: 12px;
+  background-color: transparent;
+  color: #fafafb;
+}
+window.tuna-greeter row.login-dialog-user-list-item:hover,
+window.tuna-greeter row.login-dialog-user-list-item:focus-visible,
+window.tuna-greeter row.login-dialog-user-list-item:focus {
+  background-color: rgba(250, 250, 251, 0.1);
+  outline: none;
+}
+window.tuna-greeter .login-dialog-user-list-item .user-widget-label {
+  font-size: 15pt;
+  font-weight: 700;
+}
+/* .login-dialog-not-listed-button: a flat button with the heading
+   label, 6px padding and margin. */
+window.tuna-greeter button.login-dialog-not-listed-button {
+  background: none;
+  box-shadow: none;
+  color: #fafafb;
+  font-weight: bold;
+  padding: 6px 12px;
+  margin: 6px;
+}
+window.tuna-greeter button.login-dialog-not-listed-button:hover {
+  background-color: rgba(250, 250, 251, 0.1);
+}
+
+/* .login-dialog-prompt-layout: 30em wide; the vertical user widget's
+   icon 160px (16px × 10 plus padding), its label 20pt. */
+window.tuna-greeter .login-dialog-prompt-layout {
+  min-width: 440px;
+}
+window.tuna-greeter .login-dialog-prompt-layout .user-icon {
+  margin-bottom: 24px;
+}
+window.tuna-greeter .login-dialog-prompt-layout .user-widget-label {
+  font-size: 20pt;
+  font-weight: 400;
+  margin-bottom: 0.75em;
+}
+window.tuna-greeter .login-dialog-button-box {
+  min-height: 4em;
+}
+window.tuna-greeter button.cancel-button {
+  min-width: 16px;
+  min-height: 16px;
+  padding: 12px;
+  margin: 0.5em 0;
+  border-radius: 999px;
+  background-color: #2e2e33;
+  color: #fafafb;
+  box-shadow: none;
+}
+window.tuna-greeter .button-box-spacer {
+  min-width: 40px;
+}
+window.tuna-greeter .login-dialog-prompt-entry-area {
+  margin: 0.5em 20px;
+}
+/* %system_entry: $system_bg_color (#222226 lightened 5%), 12px corners,
+   room for the next button at the end. */
+window.tuna-greeter entry.login-dialog-prompt-entry {
+  min-height: 45px;
+  padding: 0 2.5em 0 12px;
+  border-radius: 12px;
+  background-color: #2e2e33;
+  color: #fafafb;
+  box-shadow: none;
+  outline: none;
+}
+window.tuna-greeter entry.login-dialog-prompt-entry:focus-within {
+  box-shadow: inset 0 0 0 2px rgba(53, 132, 228, 0.5);
+}
+window.tuna-greeter entry.login-dialog-prompt-entry text placeholder {
+  color: rgba(250, 250, 251, 0.7);
+  opacity: 1;
+}
+window.tuna-greeter button.next-button {
+  background: none;
+  box-shadow: none;
+  min-width: 16px;
+  min-height: 16px;
+  padding: 0;
+  margin-right: 0.5em;
+  color: #fafafb;
+}
+window.tuna-greeter .caps-lock-warning-label {
+  color: #fafafb;
+  margin-top: 9px;
+}
+/* .login-dialog-message: centred, 2em under the entry, 10% darker text;
+   a problem (.login-dialog-message-warning) is the full foreground. */
+window.tuna-greeter .login-dialog-message {
+  color: #dedee4;
+  min-height: 2.75em;
+  margin-top: 2em;
+}
+window.tuna-greeter .login-dialog-message.login-dialog-message-warning {
+  color: #fafafb;
+}
+window.tuna-greeter .login-dialog-message.login-dialog-message-hint {
+  color: #dedee4;
+}
+
+/* .login-dialog-bottom-button-group: 32px padding; the icon buttons are
+   %system_button with 16px padding, round. */
+window.tuna-greeter .login-dialog-bottom-button-group {
+  padding: 32px;
+}
+window.tuna-greeter menubutton.login-dialog-button > button {
+  padding: 16px;
+  border-radius: 999px;
+  background-color: #2e2e33;
+  color: #fafafb;
+  box-shadow: none;
+}
+window.tuna-greeter menubutton.login-dialog-button > button:hover {
+  background-color: #38383e;
+}
+window.tuna-greeter .login-dialog-logo-bin {
+  margin: 3em 0;
+}
