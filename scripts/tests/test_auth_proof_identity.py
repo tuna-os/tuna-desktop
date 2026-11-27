@@ -56,6 +56,10 @@ class Identity(unittest.TestCase):
   r,j,c=self.fixtures()
   r['event']='schedule'
   self.assertEqual(i.validate_identity(r,j,c,'a'*40,17,2,'schedule','a'*40,'a'*40)['tree'],'b'*40)
+ def test_merge_group_event_admitted(self):
+  r,j,c=self.fixtures()
+  r['event']='merge_group'
+  self.assertEqual(i.validate_identity(r,j,c,'a'*40,17,2,'merge_group','a'*40,'a'*40)['tree'],'b'*40)
  def test_unsupported_event_rejected(self):
   r,j,c=self.fixtures()
   r['event']='fork'
