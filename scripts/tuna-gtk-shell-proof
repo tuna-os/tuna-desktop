@@ -149,6 +149,8 @@
 #                    the clock, at most to a tenth of the height from the top
 #   G-NOTIFY-LOCK-LIVE arrivals and policy keys reach the locked screen at
 #                    once; unlocking brings the queued banners and sounds
+#   G-NOTIFY-WAKE    a lock-screen notification wakes the blanked locked
+#                    screen (WakeUpScreen), not with show-banners off
 #   G-NOTIFY-LOCK-MEDIA an MPRIS player lists on the lock screen with its
 #                    track and controls that reach it, by its app's policy
 #   G-NOTIFY-SOUND   banners play sound-name / sound-file as they show,
