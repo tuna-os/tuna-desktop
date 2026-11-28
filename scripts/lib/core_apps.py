@@ -746,6 +746,33 @@ class Desktop(NativeDesktop):
                                 lambda value: not any(row['id'] == actor['window_id']
                                                       for row in value['windows']))
 
+    def dismiss_transient(self, actor, dismiss):
+        """Run `dismiss` on a transient dialog actor; return its parent window's actor.
+
+        start() binds the focused window, and Connections opens over its
+        main window a transient welcome dialog, which takes focus. No Thanks
+        closed it, its accessible frame departed with it, and every tree
+        read scoped to that frame failed (run 45936499585). The same
+        process is rebound to the window the dialog was transient for.
+        """
+        parent = self._window(actor, self.state())['parent_window_id']
+        if parent is None:
+            raise RuntimeError('original actor window is not a transient dialog')
+        dismiss()
+        self.await_state('transient-dismissed-' + actor['id'], self.state,
+                         lambda value: not any(row['id'] == actor['window_id'] for row in value['windows'])
+                         and any(row['id'] == parent for row in value['windows']))
+        replacement = self.await_state('native-owner-' + actor['id'],
+                                       lambda: self.guest('desktop', 'discover', app_id=actor['id'],
+                                                          window_id=parent),
+                                       lambda value: value.get('pid') is not None)
+        if (replacement['pid'], replacement['start_ticks']) != (actor['pid'], actor['start_ticks']):
+            raise RuntimeError('dismissing a transient dialog changed the original app process')
+        replacement['search_name'] = actor.get('search_name')
+        self._actors[actor['id']] = replacement
+        self.select(replacement)
+        return replacement
+
     def retire_frontends(self):
         """Failure cleanup only; never an operation, close or persistence receipt."""
         return self.guest('desktop', 'retire-frontends', actors=list(self._actors.values()))

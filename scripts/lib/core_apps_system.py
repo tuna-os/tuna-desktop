@@ -181,7 +181,10 @@ def _connections(desktop):
     actor = desktop.start("org.gnome.Connections", "Connections")
     evidence = {"endpoint": endpoint}
     if _shown(desktop, actor, "No Thanks"):
-        _click(desktop, actor, "No Thanks", roles=("push button", "button"))
+        # The welcome is a transient dialog over the main window; the
+        # journey continues in the window it was transient for.
+        actor = desktop.dismiss_transient(
+            actor, lambda: _click(desktop, actor, "No Thanks", roles=("push button", "button")))
     if _shown(desktop, actor, "Continue"):
         _click(desktop, actor, "Continue", roles=("push button", "button"))
     _click(desktop, actor, "New", "New Connection", "Add Connection", roles=("push button", "button", "toggle button"))

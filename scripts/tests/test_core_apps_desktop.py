@@ -1208,6 +1208,59 @@ class ShadowedSurfacePointer(unittest.TestCase):
                                     self.NO_THANKS, 0.5, 0.5)
 
 
+class TransientDialogDismissal(unittest.TestCase):
+    """Run 45936499585: start() bound Connections' focused welcome dialog
+    (window 2, transient for main window 1); No Thanks closed it and every
+    tree scoped to its departed frame failed."""
+    WELCOME = {'id': 2, 'parent_window_id': 1}
+    MAIN = {'id': 1, 'parent_window_id': None}
+    ACTOR = {'id': 'org.gnome.Connections', 'pid': 50, 'start_ticks': 7, 'window_id': 2,
+             'search_name': 'Connections'}
+
+    def rig(self, rebound_pid=50):
+        calls = []
+        model = {'windows': [self.MAIN, self.WELCOME]}
+        desktop = core_apps.Desktop.__new__(core_apps.Desktop)
+        desktop._actors = {self.ACTOR['id']: self.ACTOR}
+        desktop.state = lambda: {'windows': list(model['windows'])}
+        desktop.select = lambda actor: calls.append(('select', actor['window_id']))
+
+        def guest(domain, operation, **arguments):
+            calls.append((operation, arguments.get('window_id')))
+            return {'pid': rebound_pid, 'start_ticks': 7, 'window_id': arguments['window_id']}
+        desktop.guest = guest
+
+        def await_state(label, read, predicate, timeout=10):
+            value = read()
+            if not predicate(value):
+                raise TimeoutError(label)
+            return value
+        desktop.await_state = await_state
+
+        def dismiss():
+            calls.append('dismiss')
+            model['windows'] = [self.MAIN]
+        return desktop, calls, dismiss
+
+    def test_the_same_process_is_rebound_to_the_parent_window(self):
+        desktop, calls, dismiss = self.rig()
+        actor = desktop.dismiss_transient(self.ACTOR, dismiss)
+        self.assertEqual((actor['window_id'], actor['search_name']), (1, 'Connections'))
+        self.assertIs(desktop._actors['org.gnome.Connections'], actor)
+        self.assertEqual(calls, ['dismiss', ('discover', 1), ('select', 1)])
+
+    def test_a_dialog_still_mapped_or_another_process_is_refused(self):
+        desktop, calls, _ = self.rig()
+        with self.assertRaisesRegex(TimeoutError, 'transient-dismissed'):
+            desktop.dismiss_transient(self.ACTOR, lambda: None)
+        desktop, calls, dismiss = self.rig(rebound_pid=51)
+        with self.assertRaisesRegex(RuntimeError, 'changed the original app process'):
+            desktop.dismiss_transient(self.ACTOR, dismiss)
+        desktop, calls, dismiss = self.rig()
+        with self.assertRaisesRegex(RuntimeError, 'not a transient dialog'):
+            desktop.dismiss_transient(dict(self.ACTOR, window_id=1), dismiss)
+
+
 class PickerFilterDiagnostic(unittest.TestCase):
     """Only the chooser's filter toggle is opened for the empty-listing receipt.
 
