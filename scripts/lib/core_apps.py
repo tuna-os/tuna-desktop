@@ -848,9 +848,12 @@ class Desktop(NativeDesktop):
             self.keys('ctrl', 'shift', 'w')
         else:
             self.keys('ctrl', 'q')
+        # A D-Bus-activated GApplication outlives its last window by its
+        # inactivity timeout: Nautilus' is 12 s (nautilus-application.c),
+        # and run 46102176916 polled it for only 10 s after the unmap.
         self.await_state('actual-frontend-departed',
                          lambda: self.guest('desktop', 'departed', actor=actor),
-                         lambda value: value['original_process_departed'])
+                         lambda value: value['original_process_departed'], timeout=30)
         replacement = self.start(actor['id'], search_name)
         if (replacement['pid'], replacement['start_ticks']) == (actor['pid'], actor['start_ticks']):
             raise RuntimeError('restart reused original frontend process')
