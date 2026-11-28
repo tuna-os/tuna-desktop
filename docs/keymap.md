@@ -83,7 +83,7 @@ through its settings key (`org.gnome.shell.keybindings`,
 | Shift+F10 / Menu, quick settings | On a toggle with a menu (or its arrow), the volume slider, or Power Off: open that menu (St `popup-menu`) |
 | Delete / BackSpace, notification focused | Close it: a banner as dismissed, a list message or collapsed group from the list (messageList.js) |
 | Enter / Escape, date menu message list | Enter on a collapsed group expands it (focus moves into it); Escape collapses it back onto the group before the menu closes (calendar.js) |
-| Super+A | App grid: Tab or Down from the search entry focuses the first tile, arrows and Tab walk the tiles across pages, PgUp/PgDn turn pages, Enter launches, Escape leaves |
+| Super+A | App grid: Tab or Down from the search entry focuses the first tile, arrows and Tab walk the tiles across pages, PgUp/PgDn turn pages, Home/End jump to the first/last page, Enter launches, Escape leaves |
 | Tab / Down, overview entry, no search | Into the window previews (the app grid on Super+A), named by window title; arrows and Tab move between them, Enter activates the window, Up from the top row or Shift+Tab from the first returns to the entry, typing returns to it with the text (overviewControls.js focus chain) |
 | Super+1..9 / Super+Ctrl+1..9 | Dash app: switch-or-launch / open a new window |
 | Super+N | Focus the notification banner itself (Enter activates it, Tab reaches its buttons); Escape releases the keyboard and expires the banner (messageTray.js) |
@@ -131,7 +131,7 @@ focused control.
 | Overview | Drag a preview to another workspace | Super+Shift+PgUp/PgDn | none (drag only, dnd.js) | G-WM-KEYS | Parity |
 | Overview | Workspace thumbnail click | Super+PgUp/PgDn, Ctrl+Alt+arrows | none: thumbnails are not focusable (workspaceThumbnail.js) | G-WS-POPUP, J-WS-NEXT | Parity |
 | Overview | Dash item click / Show Apps | Super+1..9 / Super+Ctrl+1..9, Super+A | Dash Ctrl+Alt+Tab group (dash.js); `toggle-application-view` | G-KEYBINDINGS | Dash focus group: open (Ctrl+Alt+Tab group popup) |
-| App grid | Icon click, page arrows/dots | Super+A, Tab/Down from the search entry, arrows/Tab across pages, PgUp/PgDn turn pages, Enter launches, Escape leaves | arrows/Tab (St focus), PgUp/PgDn/Home/End (appDisplay.js AppDisplay bindings) | G-ORCA-SPEECH-GRID | Done; Home/End (first/last page) not bound |
+| App grid | Icon click, page arrows/dots | Super+A, Tab/Down from the search entry, arrows/Tab across pages, PgUp/PgDn turn pages, Enter launches, Escape leaves | arrows/Tab (St focus), PgUp/PgDn/Home/End (appDisplay.js AppDisplay bindings) | G-ORCA-SPEECH-GRID | Done |
 | App grid | Icon right-click / long press (context menu) | — | Shift+F10 / Menu (appDisplay.js AppIcon `popup-menu`) | — | Pointer action absent: Tuna has no app-icon context menu yet |
 | App grid | Folder click, rename, remove; drag to reorder, into/out of folders | Enter on the folder icon opens the dialog (Rename focused); Escape unwinds without saving; reorder: none | folder: Enter on the icon; reorder: none (dnd only) | Verified in source | Folder: done; reorder: parity |
 | Background | Right-click / long press background menu | — | none (backgroundMenu.js gestures only) | — | Parity (Tuna has no background menu) |
