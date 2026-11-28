@@ -2177,13 +2177,22 @@ impl Renderer for GlesRenderer {
     }
 }
 
-/// Vertices for instanced rendering.
-static INSTANCED_VERTS: [ffi::types::GLfloat; 8] = [
-    1.0, 0.0, // top right
+/// Vertices for instanced rendering: each instance's rectangle as two triangles that share its
+/// top-left to bottom-right diagonal, the same corners as [`TRIANGLE_VERTS`]. A software
+/// rasterizer recognises such a pair as one axis-aligned rectangle (llvmpipe's `lp_setup_rect`,
+/// which a triangle strip never reaches with GL's last-vertex convention) and shades it whole
+/// tile by tile, instead of testing every pixel along the diagonal against two triangle edges.
+static INSTANCED_VERTS: [ffi::types::GLfloat; 12] = [
+    0.0, 0.0, // top left
+    0.0, 1.0, // bottom left
+    1.0, 1.0, // bottom right
     0.0, 0.0, // top left
     1.0, 1.0, // bottom right
-    0.0, 1.0, // bottom left
+    1.0, 0.0, // top right
 ];
+
+/// Vertices per instance in [`INSTANCED_VERTS`].
+const INSTANCED_VERT_COUNT: i32 = INSTANCED_VERTS.len() as i32 / 2;
 
 /// Vertices for rendering individual triangles.
 const MAX_RECTS_PER_DRAW: usize = 10;
@@ -2494,7 +2503,7 @@ impl GlesFrame<'_, '_> {
 
                 gl.VertexAttribDivisor(self.renderer.solid_program.attrib_position as u32, 1);
 
-                gl.DrawArraysInstanced(ffi::TRIANGLE_STRIP, 0, 4, damage_len);
+                gl.DrawArraysInstanced(ffi::TRIANGLES, 0, INSTANCED_VERT_COUNT, damage_len);
             } else {
                 let count = damage_len * 6;
                 gl.DrawArrays(ffi::TRIANGLES, 0, count);
@@ -2820,7 +2829,7 @@ impl GlesFrame<'_, '_> {
                 gl.VertexAttribDivisor(program.attrib_vert as u32, 0);
                 gl.VertexAttribDivisor(program.attrib_vert_position as u32, 1);
 
-                gl.DrawArraysInstanced(ffi::TRIANGLE_STRIP, 0, 4, damage_len as i32);
+                gl.DrawArraysInstanced(ffi::TRIANGLES, 0, INSTANCED_VERT_COUNT, damage_len as i32);
             } else {
                 let count = damage_len * 6;
                 gl.DrawArrays(ffi::TRIANGLES, 0, count as i32);
@@ -2989,7 +2998,7 @@ impl GlesFrame<'_, '_> {
                 gl.VertexAttribDivisor(program.attrib_vert as u32, 0);
                 gl.VertexAttribDivisor(program.attrib_position as u32, 1);
 
-                gl.DrawArraysInstanced(ffi::TRIANGLE_STRIP, 0, 4, damage_len);
+                gl.DrawArraysInstanced(ffi::TRIANGLES, 0, INSTANCED_VERT_COUNT, damage_len);
             } else {
                 let count = damage_len * 6;
                 gl.DrawArrays(ffi::TRIANGLES, 0, count);
@@ -3595,5 +3604,102 @@ mod unscaled_nearest_tests {
         // A quarter turn without the sizes swapped is a stretch.
         let (_, filters) = draw(&mut renderer, &texture, whole, (8, 6).into(), Transform::_90);
         assert_eq!(filters, LINEAR);
+    }
+}
+
+#[cfg(test)]
+mod instanced_rect_tests {
+    use super::*;
+    use crate::backend::egl::{native::EGLSurfacelessDisplay, EGLDisplay};
+
+    fn renderer() -> GlesRenderer {
+        let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.expect("surfaceless EGL display");
+        let context = EGLContext::new(&display).expect("EGL context");
+        unsafe { GlesRenderer::new(context) }.expect("GLES renderer")
+    }
+
+    #[test]
+    fn instanced_rectangles_are_two_triangles_sharing_a_diagonal() {
+        assert_eq!(INSTANCED_VERT_COUNT, 6);
+        // The same corners as one rectangle of the non-instanced path.
+        assert_eq!(INSTANCED_VERTS[..], TRIANGLE_VERTS[..12]);
+        let corner = |i: usize| (INSTANCED_VERTS[2 * i], INSTANCED_VERTS[2 * i + 1]);
+        let twice_area = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| {
+            (b.0 - a.0) * (c.1 - a.1) - (c.0 - a.0) * (b.1 - a.1)
+        };
+        let first = twice_area(corner(0), corner(1), corner(2));
+        let second = twice_area(corner(3), corner(4), corner(5));
+        // Each half the unit square, wound alike, and together all of it.
+        assert_eq!((first.abs(), second.abs()), (1.0, 1.0));
+        assert_eq!(first.signum(), second.signum());
+        let shared: Vec<_> = (0..3)
+            .map(corner)
+            .filter(|v| (3..6).map(corner).any(|w| w == *v))
+            .collect();
+        assert_eq!(shared, vec![(0.0, 0.0), (1.0, 1.0)]);
+    }
+
+    /// Translucent rectangles drawn as instances over black cover their pixels exactly once:
+    /// a pixel along the shared diagonal blended twice, or skipped, would show.
+    #[test]
+    fn instanced_rectangles_cover_each_pixel_once() {
+        let mut renderer = renderer();
+        let size = Size::<i32, Physical>::from((48, 40));
+        let mut target: GlesTexture = renderer
+            .create_buffer(Fourcc::Abgr8888, (size.w, size.h).into())
+            .expect("render target");
+        let rects = [
+            Rectangle::<i32, Physical>::new((0, 0).into(), (48, 40).into()),
+            Rectangle::new((3, 5).into(), (29, 17).into()),
+            Rectangle::new((31, 1).into(), (7, 33).into()),
+        ];
+        {
+            let mut framebuffer = renderer.bind(&mut target).unwrap();
+            let mut frame = renderer
+                .render(&mut framebuffer, size, Transform::Normal)
+                .unwrap();
+            frame
+                .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[Rectangle::from_size(size)])
+                .unwrap();
+            // One instanced draw per rectangle, the first under the others.
+            for rect in rects {
+                frame
+                    .draw_solid(
+                        rect,
+                        &[Rectangle::from_size(rect.size)],
+                        Color32F::new(0.5, 0.0, 0.0, 0.5),
+                    )
+                    .unwrap();
+            }
+            frame.finish().unwrap().wait().unwrap();
+        }
+        let framebuffer = renderer.bind(&mut target).expect("bind");
+        let mapping = renderer
+            .copy_framebuffer(
+                &framebuffer,
+                Rectangle::from_size((size.w, size.h).into()),
+                Fourcc::Abgr8888,
+            )
+            .expect("read back");
+        let pixels = renderer.map_texture(&mapping).expect("map");
+        let mut expected = vec![0.0f32; (size.w * size.h) as usize];
+        for rect in rects {
+            for y in rect.loc.y..rect.loc.y + rect.size.h {
+                for x in rect.loc.x..rect.loc.x + rect.size.w {
+                    let v = &mut expected[(y * size.w + x) as usize];
+                    *v = 0.5 + *v * 0.5;
+                }
+            }
+        }
+        for (i, (pixel, want)) in pixels.chunks_exact(4).zip(&expected).enumerate() {
+            let want = (want * 255.0).round() as i32;
+            assert!(
+                (i32::from(pixel[0]) - want).abs() <= 1,
+                "pixel {} {}: red {} for {want}",
+                i as i32 % size.w,
+                i as i32 / size.w,
+                pixel[0]
+            );
+        }
     }
 }

@@ -3,7 +3,8 @@
 # The workflow `runs-on` expressions keep fork pull requests on GitHub-hosted
 # runners, but a fork can edit those expressions in its own pull request.
 # This hook lives in the runner image, out of reach of any workflow, and
-# fails the job unless it comes from tuna-os/tuna-desktop's own branches.
+# fails the job unless it comes from tuna-os/tuna-desktop's own branches or
+# the merge queue's temporary branches.
 set -euo pipefail
 
 repo=tuna-os/tuna-desktop
@@ -18,6 +19,12 @@ case "${GITHUB_EVENT_NAME:-}" in
   pull_request)
     head=$(jq -r '.pull_request.head.repo.full_name // empty' "$GITHUB_EVENT_PATH")
     [[ "$head" == "$repo" ]] || deny "pull request head repository '$head' is a fork"
+    ;;
+  merge_group)
+    # The merge queue builds this ref in the repository, from the base plus the
+    # pull requests a maintainer enqueued; nobody can start the event by hand.
+    ref=$(jq -r '.merge_group.head_ref // empty' "$GITHUB_EVENT_PATH")
+    [[ "$ref" == refs/heads/gh-readonly-queue/* ]] || deny "merge group ref '$ref' is not a merge queue branch"
     ;;
   *) deny "event '${GITHUB_EVENT_NAME:-}' is not allowed" ;;
 esac

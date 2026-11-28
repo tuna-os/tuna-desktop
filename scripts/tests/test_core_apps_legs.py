@@ -482,7 +482,10 @@ class Workflow(unittest.TestCase):
         self.assertFalse(any('core-apps' in str(step.get('if', '')) for step in vm['steps']))
 
     def test_whole_consumer_is_selected_together(self):
-        selected = "needs.select-lanes.outputs.core_apps == 'true'"
+        # Inside the marlin-vm lane, so a merge group (which never runs it)
+        # skips the whole consumer by its lane gate.
+        selected = ("contains(fromJSON(needs.select-lanes.outputs.lanes), 'marlin-vm') && "
+                    "needs.select-lanes.outputs.core_apps == 'true'")
         self.assertEqual(self.jobs['core-apps-image']['if'], selected)
         self.assertEqual(self.jobs['core-apps-leg']['if'], selected)
         self.assertEqual(self.jobs['native-core-apps']['if'], '${{ always() && ' + selected + ' }}')
