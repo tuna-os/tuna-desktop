@@ -65,10 +65,10 @@ fn limits(identity: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Bind the helper to its caller. Actual Glycin/bwrap binds its monitor
     // and PID-namespace child with --die-with-parent; other native paths use
     // PDEATHSIG. Killing our helper tears down those owned descendants too.
-    let parent = unsafe { libc::getppid() };
+    let parent = std::os::unix::process::parent_id();
     if parent == 1
         || unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0
-        || unsafe { libc::getppid() } != parent
+        || std::os::unix::process::parent_id() != parent
     {
         return Err("caller lifecycle unavailable".into());
     }

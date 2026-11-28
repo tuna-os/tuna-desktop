@@ -471,17 +471,17 @@ async fn manager_is_compositors(bus: &gio::DBusConnection) -> bool {
     let Ok(pid) = call("GetConnectionUnixProcessID", owner).await else {
         return false;
     };
-    pid.child_value(0).get::<u32>() == Some(unsafe { libc::getppid() } as u32)
+    pid.child_value(0).get::<u32>() == Some(std::os::unix::process::parent_id())
 }
 
 /// End the supervising compositor, this process's parent, which shuts
 /// down cleanly on SIGTERM. An adoptive parent is never signalled.
 fn end_compositor() {
-    let parent = unsafe { libc::getppid() };
+    let parent = std::os::unix::process::parent_id();
     let comm = std::fs::read_to_string(format!("/proc/{parent}/comm")).unwrap_or_default();
     if parent > 1 && is_compositor_comm(&comm) {
         unsafe {
-            libc::kill(parent, libc::SIGTERM);
+            libc::kill(parent as libc::pid_t, libc::SIGTERM);
         }
     } else {
         eprintln!("tuna-shell-gtk: parent {parent} is not the compositor; Log Out not sent");
