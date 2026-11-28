@@ -15,7 +15,8 @@
 #   X11 window is IconicState with _NET_WM_STATE_HIDDEN, #1078) only.
 #   --protocols-only runs panel readiness, G-WAYLAND-INFO and the Mutter 51
 #   protocol gates driven by a real client (G-XDG-WM-BASE-7,
-#   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR; #364, #588) only.
+#   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR, G-SYNCOBJ; #364, #588)
+#   only.
 #   --subsurface-only runs panel readiness and G-SUBSURFACE-STACKING (a
 #   window's subsurfaces stack where the client placed them) only.
 #   --grid-hover-only runs panel readiness, G-GRID-HOVER, G-GRID-REORDER,
@@ -23,6 +24,12 @@
 #   --keyboard-routes-only runs panel readiness and the P-A11Y-02 keyboard
 #   route gates (G-PANEL-MENU-KEYS, G-QS-MENU-KEY, G-NOTIFICATION-KEYS,
 #   G-SCREENSHOT-CTRL-C) only.
+#   --x11-frames-only runs panel readiness, the P-WM-10 X11 frame gates
+#   (G-X11-FRAME, G-X11-FRAME-ACTIONS, G-X11-FRAME-CSD,
+#   G-X11-FRAME-RECOVERY), the P-SY-04 gates for override-redirect X11
+#   windows (G-X11-MENU, G-X11-TOOLTIP), G-RESIZE-BORDER (P-WM-04: the
+#   invisible border a native window is resized from, as an X11 frame is)
+#   and G-SHELL-STABLE only.
 #   --datemenu-only runs panel readiness, G-CLOCK-DAMAGE, the date menu's
 #   gates (G-CAL-OPEN, G-CAL-EVENTS, G-CAL-PREFS, G-CAL-LAUNCH,
 #   G-DATEMENU-WORLD-CLOCKS, G-DATEMENU-WEATHER), its accessibility golden
@@ -216,6 +223,20 @@
 #   G-X11-APP      XWayland is on by default: an X11 app launched from
 #                  overview search gets DISPLAY and maps a window (#59)
 #   G-X11-INPUT-FOCUS the X server's input focus is the focused X11 window
+#   G-X11-FRAME    an X11 window is reparented into a tuna-x11-frames frame
+#                  by Mutter's handshake (_MUTTER_NEEDS_FRAME,
+#                  _MUTTER_FRAME_FOR): _NET_FRAME_EXTENTS, the title and
+#                  GNOME's button-layout in a GTK header bar drawn above
+#                  the client, focused and backdrop (P-WM-10, #1034)
+#   G-X11-FRAME-ACTIONS the frame's title bar moves the window with the
+#                  pointer, maximizes and restores on double click, resizes
+#                  from its edge, opens the window menu, and its Close
+#                  button closes the client
+#   G-X11-FRAME-CSD a client-decorated X11 window and its override-redirect
+#                  popover get no frame; its own shadow is not the window
+#   G-X11-FRAME-RECOVERY killing tuna-x11-frames leaves X11 windows mapped
+#                  bare and taking input; the restarted client frames them
+#                  again
 #   G-X11-ICONIC a minimized X11 window is WM_STATE IconicState with
 #                  _NET_WM_STATE_HIDDEN, and NormalState without once restored
 #   G-SUBSURFACE-STACKING a subsurface placed above its window shows over
@@ -638,6 +659,7 @@ PROTOCOLS_ONLY=0
 SUBSURFACE_ONLY=0
 GRID_HOVER_ONLY=0
 KEYBOARD_ROUTES_ONLY=0
+X11_FRAMES_ONLY=0
 DATEMENU_ONLY=0
 SEARCH_LEAK_ONLY=0
 WINDOW_LEAK_ONLY=0
@@ -690,6 +712,7 @@ while [ $# -gt 0 ]; do
         --tray-only) TRAY_ONLY=1; only_mode "$1"; shift ;;
         --grid-hover-only) GRID_HOVER_ONLY=1; only_mode "$1" no-examples; shift ;;
         --keyboard-routes-only) KEYBOARD_ROUTES_ONLY=1; only_mode "$1" no-media-source; shift ;;
+        --x11-frames-only) X11_FRAMES_ONLY=1; only_mode "$1" source-build no-media-source no-examples; shift ;;
         --datemenu-only) DATEMENU_ONLY=1; only_mode "$1" source-build no-media-source no-examples no-camera-policy; shift ;;
         --search-leak-only) SEARCH_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --window-leak-only) WINDOW_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
@@ -1209,6 +1232,9 @@ pass G-GRID-ON-DEMAND "no grid tiles on the window picker or after close; a held
 . "$ROOT/scripts/lib/tuna-a11y-focus-proof.sh"
 . "$ROOT/scripts/lib/tuna-notify-lock-proof.sh"
 . "$ROOT/scripts/lib/tuna-keyboard-routes-proof.sh"
+. "$ROOT/scripts/lib/tuna-x11-frames-proof.sh"
+. "$ROOT/scripts/lib/tuna-x11-unmanaged-proof.sh"
+. "$ROOT/scripts/lib/tuna-resize-border-proof.sh"
 . "$ROOT/scripts/lib/tuna-datemenu-proof.sh"
 . "$ROOT/scripts/lib/tuna-search-leak-proof.sh"
 . "$ROOT/scripts/lib/tuna-window-leak-proof.sh"
@@ -1741,7 +1767,9 @@ if [ "$INSTALLED_PACKAGE" = 0 ] && [ "$ONLY_NO_MEDIA_SOURCE" = 0 ] &&
     MEDIA_SOURCE=1
 fi
 if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
-    cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host
+    # tuna-x11-frames sits beside the compositor, which runs it for X11
+    # windows' title bars (G-X11-FRAME).
+    cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host -p tuna-x11-frames
     if [ "$ONLY_NO_EXAMPLES" = 0 ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example icon-probe
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example shortcut-inhibit-client
@@ -1752,6 +1780,9 @@ if [ "$INSTALLED_PACKAGE" = 0 ] && [ -z "${TUNA_PROOF_BIN_DIR:-}" ]; then
         cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor --example tuna-subsurface-client
     fi
 fi
+# The frames client starts through the proof's launcher, which
+# G-X11-FRAME-RECOVERY holds while it reads the windows bare.
+x11f_launcher
 # The compositor and the shell share this log from one file description.
 # Truncate first (a fresh log each run, as before), then append: O_APPEND
 # keeps each process's write() contiguous, so concurrent lines can only
@@ -2072,7 +2103,16 @@ x11_iconic_gate() {
     cstate ".focused != null and (.focused as \$f | $iconic_before | index(\$f) == null)" "X11 probe focused" ||
         fail G-X11-ICONIC "the X11 probe never took focus"
     iconic_id="$(jq -r .focused "$CSTATE")"
-    iconic_window="$(DISPLAY="$x11_display" xdotool search --name '^Tuna Iconic Probe$' | head -1)"
+    # Its frame (P-WM-10) carries the same title and has no WM_STATE: the
+    # client is the window of that name which is no frames-client frame.
+    iconic_window=""
+    for iconic_candidate in $(DISPLAY="$x11_display" xdotool search --name '^Tuna Iconic Probe$'); do
+        if DISPLAY="$x11_display" xprop -id "$iconic_candidate" _MUTTER_FRAME_FOR 2>/dev/null | grep -q 'window id'; then
+            continue
+        fi
+        iconic_window="$iconic_candidate"
+        break
+    done
     [ -n "$iconic_window" ] || fail G-X11-ICONIC "the X11 probe's window was not found"
     x11_iconic_state Normal mapped ||
         fail G-X11-ICONIC "the mapped X11 window is not NormalState without _NET_WM_STATE_HIDDEN"
@@ -2200,6 +2240,25 @@ BLUR
         fail G-BACKGROUND-BLUR "the probe's windows outlived it"
     pass G-BACKGROUND-BLUR "ext_background_effect_manager_v1 offers blur and a blur region smooths one-pixel stripes behind a clear window (mean step $1) while beside it they stay sharp ($2)"
 }
+# Explicit sync (P-SY-09): Mutter 51 creates wp_linux_drm_syncobj_manager_v1
+# only after its device checks pass (meta-wayland-linux-drm-syncobj.c). The
+# nested session's software renderer has no timeline syncobjs: the
+# compositor must give Mutter's reason, in Mutter's words, and no client
+# may find the global.
+syncobj_gate() {
+    syncobj_why="$(grep -m1 'tuna-compositor: explicit sync disabled: ' "$LOG" | sed 's/.*explicit sync disabled: //')"
+    case "$syncobj_why" in
+        "Missing 'EGL_ANDROID_native_fence_sync'" | \
+        "Failed to find EGL device to initialize linux-drm-syncobj-v1" | \
+        "Failed to open DRM device "* | \
+        "Failed to check DRM syncobj timeline capability" | \
+        "drmSyncobjEventfd failed: linux-drm-syncobj requires eventfd support") ;;
+        "") fail G-SYNCOBJ "the compositor gave no explicit-sync verdict" ;;
+        *) fail G-SYNCOBJ "explicit-sync verdict '$syncobj_why' is none of Mutter's" ;;
+    esac
+    protocol_probe G-SYNCOBJ syncobj-unoffered
+    pass G-SYNCOBJ "without timeline syncobjs the compositor refuses explicit sync as Mutter does ($syncobj_why) and no client finds wp_linux_drm_syncobj_manager_v1"
+}
 protocol_gaps_gates() {
     protocol_probe G-XDG-WM-BASE-7 xdg-wm-base-7
     pass G-XDG-WM-BASE-7 "xdg_wm_base 7: a maximized window is tiled and constrained on every edge; a version 6 bind gets the tiled states alone"
@@ -2208,6 +2267,7 @@ protocol_gaps_gates() {
     protocol_probe G-WL-FIXES wl-fixes
     pass G-WL-FIXES "wl_fixes 1 destroys a registry and the client's connection carries on"
     background_blur_gate
+    syncobj_gate
 }
 
 # G-SUBSURFACE-STACKING: a window's subsurfaces stack where the client
@@ -2708,6 +2768,19 @@ if [ "$GRID_HOVER_ONLY" = 1 ]; then
     shell_stable_gate
     exit 0
 fi
+if [ "$X11_FRAMES_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "X11 frames desktop ready" ||
+        fail G-X11-FRAME "desktop never became ready"
+    # Let the startup cover settle before frames are read.
+    sleep 3
+    x11_frames_proof
+    x11_unmanaged_proof
+    # The same invisible-border hit-test for a native window.
+    resize_border_proof
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
 if [ "$PANEL_DASH_ONLY" = 1 ]; then
     cstate '.active_workspace != null and .locked == false' "panel and dash desktop ready" ||
         fail "G-PANEL-LAYOUT$PANEL_DASH_SUFFIX" "desktop never became ready"
@@ -3002,7 +3075,12 @@ if command -v Xwayland >/dev/null 2>&1; then
             fail G-X11-DEMAND "XIM connected before an application needed X11"
         fi
     fi
-    pass G-X11-DEMAND "native GTK and IBus startup advertise sockets without an XWayland or XIM process"
+    # The frames client is an X11 client too: none before the first window,
+    # not even its launcher.
+    if pgrep -P "$COMPOSITOR_PID" -x "tuna-x11-frames|${X11F_LAUNCH##*/}" >/dev/null; then
+        fail G-X11-DEMAND "the X11 frames client started before an application needed X11"
+    fi
+    pass G-X11-DEMAND "native GTK and IBus startup advertise sockets without an XWayland, XIM or frames-client process"
 fi
 windows_overview_gates
 
@@ -3164,6 +3242,13 @@ xdotool mouseup 1
 cstate ".windows[] | select(.app_id == \"tuna-test-beta\") | .rect[2] == $bw" "untiled" ||
     fail G-TILE-PREVIEW "the window tiled after leaving the edge"
 pass G-TILE-PREVIEW "dragging to the left edge shows GNOME's tile preview; leaving the edge drops it"
+
+# The invisible border around a client-decorated window takes the pointer
+# (P-WM-04, #1079). The comparison slice runs old binaries that predate
+# it.
+if [ "$GRID_CANCEL_ONLY" != 1 ]; then
+    resize_border_proof
+fi
 
 # The comparison slice runs old binaries that predate these preferences.
 if [ "$GRID_CANCEL_ONLY" != 1 ]; then
@@ -6217,12 +6302,30 @@ if command -v Xwayland >/dev/null 2>&1 && command -v xeyes >/dev/null 2>&1; then
         done
         [ -n "$old_xim_pid" ] || fail G-X11-RESTART "XIM did not start after actual X11 readiness"
     fi
+    # The frames client (P-WM-10) is this server's client: it goes with
+    # the server and a fresh one serves the next.
+    old_frames_pid=""
+    for _ in $(seq 1 30); do
+        old_frames_pid="$(pgrep -P "$COMPOSITOR_PID" -x tuna-x11-frames || true)"
+        [ -n "$old_frames_pid" ] && break
+        sleep 0.2
+    done
+    [ -n "$old_frames_pid" ] || fail G-X11-RESTART "the X11 frames client did not start after actual X11 readiness"
     kill "$x11_pid"
     cstate 'all(.windows[]; .app_id != "XEyes")' "old X11 windows removed" 10 || fail G-X11-RESTART "stale X11 model survived server loss"
     cstate '.x11_ready' "bounded compatibility restart" 15 || fail G-X11-RESTART "server did not restart"
     [ "$(jq -c '[.windows[] | .id] | sort' "$CSTATE")" = "$native_ids" ] || fail G-X11-RESTART "native windows changed across restart"
     restarted_pid="$(pgrep -P "$COMPOSITOR_PID" -x Xwayland)"
     [ "$restarted_pid" != "$x11_pid" ] || fail G-X11-RESTART "old compatibility process remained"
+    for _ in $(seq 1 30); do
+        new_frames_pid="$(pgrep -P "$COMPOSITOR_PID" -x tuna-x11-frames || true)"
+        [ -n "$new_frames_pid" ] && [ "$new_frames_pid" != "$old_frames_pid" ] && break
+        sleep 0.2
+    done
+    if [ -z "$new_frames_pid" ] || [ "$new_frames_pid" = "$old_frames_pid" ]; then
+        fail G-X11-RESTART "the X11 frames client did not restart for the fresh X11 server"
+    fi
+    ! kill -0 "$old_frames_pid" 2>/dev/null || fail G-X11-RESTART "old X11 frames client survived server loss"
     if [ -n "$old_xim_pid" ]; then
         for _ in $(seq 1 30); do
             new_xim_pid="$(pgrep -P "$COMPOSITOR_PID" -x ibus-x11 || true)"
@@ -6236,7 +6339,8 @@ if command -v Xwayland >/dev/null 2>&1 && command -v xeyes >/dev/null 2>&1; then
     fi
     env DISPLAY="$x11_display" xeyes >/dev/null 2>&1 &
     cstate '.focused_app_id == "XEyes" and .x11_ready' "reconnected X11 client" 15 || fail G-X11-RESTART "client did not reconnect on the same reserved display"
-    pass G-X11-RESTART "server loss removes compatibility windows, preserves native IDs and accepts a new client on the same display"
+    cstate '.windows[] | select(.app_id == "XEyes") | .x11_framed' "reconnected X11 client framed" 15 || fail G-X11-RESTART "the fresh X11 frames client did not frame the reconnected client"
+    pass G-X11-RESTART "server loss removes compatibility windows, preserves native IDs, restarts the frames client and accepts a new client on the same display"
     pass G-X11-APP "the first X11 app launched from search gets DISPLAY $x11_display and maps"
     # An app without a matching desktop file supplies its window icon.
     x11_window="$(DISPLAY="$x11_display" xdotool search --class XEyes | head -1)"
@@ -6292,7 +6396,16 @@ EOF
     XEV_PID=$!
     cstate ".focused != null and (.focused as \$f | $x11_before | index(\$f) == null)" "xev focused" ||
         fail G-X11-INPUT-FOCUS "xev never took model focus"
-    xev_window="$(DISPLAY="$x11_display" xdotool search --name '^Event Tester$' | head -1)"
+    # Its frame (P-WM-10) carries the same title: the client is the window
+    # of that name which is no frames-client frame.
+    xev_window=""
+    for xev_candidate in $(DISPLAY="$x11_display" xdotool search --name '^Event Tester$'); do
+        if DISPLAY="$x11_display" xprop -id "$xev_candidate" _MUTTER_FRAME_FOR 2>/dev/null | grep -q 'window id'; then
+            continue
+        fi
+        xev_window="$xev_candidate"
+        break
+    done
     x_focus=""
     for _ in $(seq 1 25); do
         x_focus="$(DISPLAY="$x11_display" xdotool getwindowfocus 2>/dev/null || true)"
@@ -6305,6 +6418,12 @@ EOF
     kill "$XEV_PID" 2>/dev/null || true
     pass G-X11-INPUT-FOCUS "X input focus is the focused X11 window $xev_window"
     x11_iconic_gate
+    # Server-side frames for X11 windows (P-WM-10, #1034). They close their
+    # own probes and restore button-layout, so the tray gate after them
+    # starts from the same session.
+    x11_frames_proof
+    # Menus and tooltips: override-redirect X11 windows (P-SY-04, #1076).
+    x11_unmanaged_proof
     tray_x11_gate
 else
     echo "tuna-gtk-shell-proof: G-X11-APP skipped (no Xwayland or xeyes)"
@@ -11750,7 +11869,51 @@ reply="$(gdbus call --session --dest org.gnome.Shell.Screenshot \
     fail G-SCREENSHOT-DENY "untrusted Screenshot accepted: $reply"
 case "$reply" in *AccessDenied*) ;; *) fail G-SCREENSHOT-DENY "unexpected denial: $reply" ;; esac
 [ ! -f "$ARTIFACTS/untrusted.png" ] || fail G-SCREENSHOT-DENY "denied capture wrote a file"
-pass G-SCREENSHOT-DENY "direct Screenshot requires trusted desktop identity"
+# ScreenshotWindows (ADR 0011 L8) stands in for GNOME Shell's in-process
+# window selector: the shell alone may call it, even for the one private
+# directory it writes to.
+windows_dir="$XDG_RUNTIME_DIR/tuna-screenshot-windows"
+windows_before="$(find "$windows_dir" -type f 2>/dev/null | wc -l)"
+reply="$(gdbus call --session --dest org.gnome.Shell.Screenshot \
+    --object-path /org/gnome/Shell/Screenshot \
+    --method org.tuna.Screenshot.ScreenshotWindows "$windows_dir" 2>&1)" &&
+    fail G-SCREENSHOT-DENY "untrusted ScreenshotWindows accepted: $reply"
+case "$reply" in *AccessDenied*) ;; *) fail G-SCREENSHOT-DENY "unexpected ScreenshotWindows denial: $reply" ;; esac
+pass G-SCREENSHOT-DENY "direct Screenshot and ScreenshotWindows require trusted desktop identity"
+
+# G-SCREENSHOT-WINDOWS-DENY (ADR 0011 L8, #1169): the installed portal
+# backend, a trusted capture identity, may not take window screenshots
+# either. Code inside the genuine xdg-desktop-portal-gnome executable owning
+# the portal's bus name (ADR 0010 F1) is what the compositor authenticates
+# as the portal: the control shows that identity passes Screenshot, so the
+# refusal is ScreenshotWindows's own.
+PORTAL_BACKEND=/usr/libexec/xdg-desktop-portal-gnome
+[ -x "$PORTAL_BACKEND" ] || PORTAL_BACKEND=/usr/lib/xdg-desktop-portal-gnome
+[ -x "$PORTAL_BACKEND" ] || fail G-SCREENSHOT-WINDOWS-DENY "installed GNOME portal backend missing"
+probe_gio_flags="$(pkg-config --cflags --libs gio-2.0)" || fail G-SCREENSHOT-WINDOWS-DENY "gio-2.0 development files are required"
+# pkg-config returns separate compiler arguments. This script is POSIX sh
+# (no arrays), so xargs splits them onto the compiler command line.
+printf '%s\n' "$probe_gio_flags" | xargs cc -Wall -Wextra -Werror -shared -fPIC -o "$ARTIFACTS/identity-probe.so" \
+    "$ROOT/scripts/lib/tuna-service-identity-probe.c" ||
+    fail G-SCREENSHOT-WINDOWS-DENY "could not build the identity probe"
+portal_probe() {
+    rm -f "$ARTIFACTS/portal-probe-$1.txt"
+    TUNA_PROBE_OUT="$ARTIFACTS/portal-probe-$1.txt" TUNA_PROBE_NAME=org.freedesktop.impl.portal.desktop.gnome \
+        TUNA_PROBE_DEST=org.gnome.Shell.Screenshot TUNA_PROBE_PATH=/org/gnome/Shell/Screenshot \
+        TUNA_PROBE_METHOD="$2" TUNA_PROBE_ARGS="$3" LD_PRELOAD="$ARTIFACTS/identity-probe.so" \
+        "$PORTAL_BACKEND" >"$ARTIFACTS/portal-probe-$1.log" 2>&1 ||
+        fail G-SCREENSHOT-WINDOWS-DENY "the probe did not run inside $PORTAL_BACKEND: $(tail -3 "$ARTIFACTS/portal-probe-$1.log")"
+}
+portal_probe control org.gnome.Shell.Screenshot.Screenshot "(false, false, '$ARTIFACTS/portal-probe-control.png')"
+if ! { grep -q '^accepted (true, ' "$ARTIFACTS/portal-probe-control.txt" && [ -s "$ARTIFACTS/portal-probe-control.png" ]; }; then
+    fail G-SCREENSHOT-WINDOWS-DENY "the portal identity was not admitted to Screenshot: $(cat "$ARTIFACTS/portal-probe-control.txt")"
+fi
+portal_probe windows org.tuna.Screenshot.ScreenshotWindows "('$windows_dir',)"
+grep -q '^error org.freedesktop.DBus.Error.AccessDenied ' "$ARTIFACTS/portal-probe-windows.txt" ||
+    fail G-SCREENSHOT-WINDOWS-DENY "the portal identity took window screenshots: $(cat "$ARTIFACTS/portal-probe-windows.txt")"
+[ "$(find "$windows_dir" -type f 2>/dev/null | wc -l)" = "$windows_before" ] ||
+    fail G-SCREENSHOT-WINDOWS-DENY "a refused ScreenshotWindows wrote window pictures"
+pass G-SCREENSHOT-WINDOWS-DENY "the installed portal's identity takes a Screenshot but is refused ScreenshotWindows ($(cut -d' ' -f3- "$ARTIFACTS/portal-probe-windows.txt"))"
 
 open_qs
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-shot.json" 20 \

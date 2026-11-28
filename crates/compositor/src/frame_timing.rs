@@ -125,30 +125,50 @@ pub fn take_feedback(roots: &[WlSurface], output: &Output) -> OutputPresentation
 /// Include callbacks, presentation, FIFO barriers and deferred commit timers.
 #[doc(hidden)]
 pub fn pending_frame_work(roots: &[WlSurface]) -> bool {
-    pending_work(roots, true, true)
+    pending_work(roots, true, true, true)
 }
 
-/// Refresh obligations apply to all mapped surfaces, but only presentation
-/// requests belonging to this output's drawn surfaces can require scanout.
-/// A hidden request stays pending until that surface is actually drawn.
-/// Frame callbacks of `throttled` roots (hidden windows) are paid by the
-/// hidden-window beat, not by a scanout, also when the window is among
-/// `drawn` (an occluded window on the active workspace is): an unchanged
-/// output must not repaint at the display rate while one waits (#503).
-/// Their FIFO barriers and commit timers still advance on each refresh
-/// cycle.
+/// What clients are owed by the outputs' next refreshes, which an output
+/// with an unchanged image submits a frame for anyway
+/// ([`owed_by`](Self::owed_by)).
 #[doc(hidden)]
-pub fn pending_output_work(
-    roots: &[WlSurface],
-    drawn: &[WlSurface],
-    throttled: &[WlSurface],
-) -> bool {
-    roots
-        .iter()
-        .any(|root| pending_work(std::slice::from_ref(root), !throttled.contains(root), false))
-        || drawn
-            .iter()
-            .any(|root| pending_work(std::slice::from_ref(root), !throttled.contains(root), true))
+pub struct RefreshWork<'a> {
+    /// Every frame root ([`frame_roots`]); the pointer's surface may be
+    /// left to the `mine` of the output showing it.
+    pub roots: &'a [WlSurface],
+    /// The roots some output draws this frame, whichever output.
+    pub drawn: &'a [WlSurface],
+    /// Hidden windows: their frame callbacks are paid by the
+    /// hidden-window beat, not by a scanout, also when the window is
+    /// drawn (an occluded window on the active workspace is): an
+    /// unchanged output must not repaint at the display rate while one
+    /// waits (#503).
+    pub throttled: &'a [WlSurface],
+}
+
+impl RefreshWork<'_> {
+    /// Whether the output drawing `mine` owes a client a frame. A frame
+    /// callback or presentation request is owed by the output drawing
+    /// its surface, not by every output: Mutter 51 emits a surface's
+    /// callbacks after its primary view's update only
+    /// (`emit_frame_callbacks_for_stage_view`,
+    /// `meta_surface_actor_wayland_is_view_primary`), and an update of
+    /// another view without damage stays idle and flips nothing. A
+    /// hidden presentation request stays pending until its surface is
+    /// drawn. The `primary` output also owes what its page flip
+    /// releases ([`State::refresh_cycle`] runs there): every root's FIFO
+    /// barrier and commit timers, and the callbacks of roots no output
+    /// draws.
+    pub fn owed_by(&self, mine: &[WlSurface], primary: bool) -> bool {
+        let paid = |root: &WlSurface| !self.throttled.contains(root);
+        mine.iter()
+            .any(|root| pending_work(std::slice::from_ref(root), paid(root), true, primary))
+            || primary
+                && self.roots.iter().any(|root| {
+                    let callbacks = paid(root) && !self.drawn.contains(root);
+                    pending_work(std::slice::from_ref(root), callbacks, false, true)
+                })
+    }
 }
 
 /// Whether any surface tree in `roots` holds an unsent frame callback.
@@ -180,7 +200,14 @@ pub(crate) fn pending_callbacks(roots: &[WlSurface]) -> bool {
     false
 }
 
-fn pending_work(roots: &[WlSurface], include_callbacks: bool, include_presentation: bool) -> bool {
+/// Whether `roots` hold unsent frame callbacks, presentation requests or
+/// (`include_pacing`) FIFO barriers and commit timers a refresh releases.
+fn pending_work(
+    roots: &[WlSurface],
+    include_callbacks: bool,
+    include_presentation: bool,
+    include_pacing: bool,
+) -> bool {
     use smithay::wayland::compositor::SurfaceAttributes;
     use smithay::wayland::presentation::PresentationFeedbackCachedState;
     let mut pending = false;
@@ -204,16 +231,19 @@ fn pending_work(roots: &[WlSurface], include_callbacks: bool, include_presentati
                             .current()
                             .callbacks
                             .is_empty())
-                    || states
-                        .cached_state
-                        .get::<FifoBarrierCachedState>()
-                        .current()
-                        .barrier
-                        .is_some()
-                    || states
-                        .data_map
-                        .get::<CommitTimerBarrierStateUserData>()
-                        .is_some_and(|timers| timers.lock().unwrap().next_deadline().is_some());
+                    || include_pacing
+                        && (states
+                            .cached_state
+                            .get::<FifoBarrierCachedState>()
+                            .current()
+                            .barrier
+                            .is_some()
+                            || states
+                                .data_map
+                                .get::<CommitTimerBarrierStateUserData>()
+                                .is_some_and(|timers| {
+                                    timers.lock().unwrap().next_deadline().is_some()
+                                }));
             },
             |_, _, _| true,
         );
@@ -289,6 +319,11 @@ pub fn drawn_roots(
         for (popup, _) in smithay::desktop::PopupManager::popups_for_surface(&parent) {
             roots.push((popup.wl_surface().clone(), at));
         }
+    }
+    // Unmanaged X11 windows (menus, tooltips) are drawn on the desktop.
+    #[cfg(feature = "xwayland")]
+    for (surface, rect) in manager.x11_unmanaged_entries() {
+        roots.push((surface, rect.loc));
     }
     if let Some(icon) = state.dnd_icon() {
         roots.push((icon, manager.pointer_pos().to_i32_round()));

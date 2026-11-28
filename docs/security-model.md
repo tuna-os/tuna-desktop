@@ -207,7 +207,8 @@ bounded at 256 sessions and 64 streams per session. Revocation is
 permanent. A 100 ms scan on the D-Bus thread revokes a grant when its
 owner disconnects, the trusted portal name changes hands, the shell no
 longer declares the owner's name or the session locks (`mutter.rs`,
-`Authority::owner_alive`). Capture paths also
+`Authority::owner_alive`); a delivered libei client is then disconnected
+(R-EIS-REVOKE, remote-security lane). Capture paths also
 refuse locked frames. Full detail and the qualification evidence:
 [capture admission and revocation](capture-security.md),
 [remote desktop](remote-desktop.md),
@@ -280,8 +281,9 @@ Each interface checks its caller itself. The main policies:
 
 | Interface | Served by | Caller policy |
 |---|---|---|
-| `org.gnome.Mutter.ScreenCast`, `.RemoteDesktop`, `org.gnome.Shell.Screenshot`, `org.tuna.Screenshot` | compositor | Shell (its declared unique bus names) or authenticated installed portal. Denied while locked. |
+| `org.gnome.Mutter.ScreenCast`, `.RemoteDesktop`, `org.gnome.Shell.Screenshot` | compositor | Shell (its declared unique bus names) or authenticated installed portal. Denied while locked. |
 | `org.gnome.Mutter.InputCapture` | compositor | `CreateSession`: authenticated installed portal only (`Authority::admit_portal`), not the shell. Session methods: the unique owner, denied while locked. Lock closes every session at once; owner loss within the 100 ms scan. No input is captured while locked ([input capture](input-capture.md)). |
+| `org.tuna.Screenshot` (`ScreenshotWindows`, `ScreenshotOutputs`) | compositor | Shell only (its declared unique bus names): it stands in for GNOME Shell's in-process window selector and the stage screenshot its screenshot UI freezes, per monitor. The portal gets GNOME's "Saving to disk is disabled" under `disable-save-to-disk`, else AccessDenied. Pictures go only to `$XDG_RUNTIME_DIR/tuna-screenshot-windows` (windows) or `$XDG_RUNTIME_DIR/tuna-screenshot-outputs` (outputs), each a mode-0700 directory the compositor's user owns, never a symlink (`screenshot.rs`, `admit_shell`, `runtime_subdirectory`, `private_directory`). Denied while locked. Evidence: G-SCREENSHOT-DENY (a plain caller) and G-SCREENSHOT-WINDOWS-DENY (code inside the genuine portal backend owning its name) in `scripts/tuna-gtk-shell-proof`; `screenshot_outputs_over_the_bus_admits_only_the_shell_into_its_directory` for `ScreenshotOutputs`. |
 | `org.gnome.Mutter.ServiceChannel` | compositor | Same-user caller. Typed connections require the installed provider for that type. |
 | `org.gnome.Shell.Introspect` | compositor | Shell (its declared unique bus names) or authenticated installed portal (`capture_security::Authority::admit`). Denied while locked. `TUNA_INTROSPECT_UNRESTRICTED=1` (test/development "unsafe mode") allows metadata only while unlocked (`introspect.rs`). |
 | `/org/gnome/Shell/Introspect` on `org.gnome.Shell` | GTK shell relays to the compositor | The shell holds no window data and decides nothing: it forwards each call to the compositor's `org.tuna.Introspect` with the original caller's unique name. The compositor answers only when the relay is a unique name the supervised shell declared and the original caller passes the `org.gnome.Shell.Introspect` rule above (`Authority::admit_forwarded`; `shell-gtk/src/introspect_forward.rs`). |

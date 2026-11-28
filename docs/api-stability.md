@@ -39,6 +39,7 @@ release.
 | `tuna-compositor` | library + `tuna-compositor`, `tuna-session` binaries | shell-host (tests only) | internal |
 | `tuna-shell-gtk` | binary | none | internal |
 | `tuna-wallpaper-svg` | binary | none | internal |
+| `tuna-x11-frames` | binary | none | internal; speaks Mutter's X11 frames protocol with the compositor's window manager |
 
 The crates could not be published as they stand. For example,
 `tuna-compositor` depends on `tuna-wallpaper` by path with no version
@@ -133,7 +134,7 @@ commit. The rules for a wire change are:
   GNOME's, not ours. Deviations are bugs unless documented
   ([portal and D-Bus integration](portal-service-integration.md)).
 - **Private `org.tuna.*` interfaces**, such as `org.tuna.Screenshot`
-  (`crates/compositor/src/screenshot.rs:95`), are internal. Both sides
+  (`crates/compositor/src/screenshot.rs:99`), are internal. Both sides
   ship together and may change in any commit.
 
 ### Shared files and names
