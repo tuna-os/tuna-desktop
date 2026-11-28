@@ -1,9 +1,11 @@
-"""Host side of the marlin-vm app-integration boot (V-PICKER, V-INTROSPECT).
+"""Host side of the marlin-vm app-integration boot (V-PICKER, V-INTROSPECT,
+V-XWAYLAND, V-MULTI-OUTPUT).
 
 Drives real QEMU input and display changes against the guest fixtures in
 packaging/marlin/vm-lane (tuna-vm-picker, tuna-vm-introspect-watch,
 tuna-vm-sandbox-client and the root probe tuna-vm-app-integration, reached
-through tuna-vm-lifecycle's app-* actions). The guest never synthesizes
+through tuna-vm-lifecycle's app-* actions; the placed GTK window of
+tuna-vm-desktop-gates through its gates-* actions). The guest never synthesizes
 input; every click and key below is a QMP input event on the VM's own
 USB tablet and keyboard, and every output change is QEMU's own virtio-gpu
 scanout hotplug through its D-Bus display (org.qemu.Display1).
@@ -64,6 +66,36 @@ def exposed_point(parent, dialog, top=40):
     return None
 
 
+def contains(outer, inner):
+    return (outer[0] <= inner[0] and inner[0] + inner[2] <= outer[0] + outer[2]
+            and outer[1] <= inner[1] and inner[1] + inner[3] <= outer[1] + outer[3])
+
+
+def top_bar_problems(scene, outputs):
+    """GNOME 51's top bar on a multi-monitor desktop: one panel, across the top
+    of the primary output; other outputs get none (layout.js puts panelBox on
+    the primary monitor only)."""
+    rows = scene.get("outputs") or []
+    panels = [layer["rect"] for layer in scene.get("layers") or [] if layer.get("namespace") == "tuna-panel"]
+    primary = [o for o in rows if o.get("primary")]
+    if len(rows) != outputs or len(primary) != 1:
+        return [f"{len(rows)} outputs ({len(primary)} primary), not {outputs} with one primary"]
+    rect = primary[0]["rect"]
+    problems = []
+    if len(panels) != 1 or panels[0][:3] != rect[:3] or not 0 < panels[0][3] < rect[3]:
+        problems.append(f"top bar layers {panels} are not one bar across the primary output {rect}")
+    for output in rows:
+        if not output.get("primary") and any(contains(output["rect"], panel) for panel in panels):
+            problems.append(f"a top bar on the secondary output {output['name']}")
+    return problems
+
+
+def placed_window(scene, fixture):
+    """The one window carrying the placed fixture's nonce app ID."""
+    windows = [w for w in scene.get("windows") or [] if w.get("app_id") == fixture.get("app_id")]
+    return windows[0] if len(windows) == 1 else None
+
+
 class Lane:
     def __init__(self, qmp, connect, out, record, display_bus):
         self.qmp, self.connect, self.out, self.record = qmp, connect, out, record
@@ -91,8 +123,9 @@ class Lane:
             self.agent = self.connect()
             raise AppError(f"{action}: {error}") from error
         self.log.append({"action": action, "args": list(args), "result": value, "t": time.time()})
-        if isinstance(value, dict) and "app_error" in value:
-            raise AppError(f"{action}: {value['app_error']}")
+        for key in ("app_error", "gates_error"):
+            if isinstance(value, dict) and key in value:
+                raise AppError(f"{action}: {value[key]}")
         return value
 
     def save(self, name, value):
@@ -285,9 +318,12 @@ class Lane:
             return [0, 0]
         return [max(b[2] for b in boxes) - min(b[0] for b in boxes), max(b[3] for b in boxes) - min(b[1] for b in boxes)]
 
-    def run_screen_size(self):
+    def run_screen_size(self, multi):
+        """V-INTROSPECT-SCREEN failures; V-MULTI-OUTPUT's go to `multi`."""
         failures = []
         key = secrets.token_hex(8)
+        placed = {"key": secrets.token_hex(8)}
+        multi_steps = {}
         watch = self.app("app-introspect-start", key)
         initial = watch["initial"]
         steps = {"initial": initial}
@@ -315,6 +351,7 @@ class Lane:
             steps["drm_plugged"] = self.app("app-drm-state")
             steps["hotplug"] = plugged
             self.frame("introspect-hotplug.png")
+            placed = self.multi_output_plugged(multi, multi_steps, placed["key"])
             if plugged["size"] != self.layout_size(plugged["layout"]):
                 failures.append(f"hotplug ScreenSize {plugged['size']} vs union {self.layout_size(plugged['layout'])}")
             primary = [lm for lm in plugged["layout"]["logical"] if lm["primary"]]
@@ -334,6 +371,7 @@ class Lane:
             unplugged = change(lambda c: len(c["layout"]["logical"]) == 1,
                                "no ScreenSize change for unplugging the second output")
             steps["unplug"] = unplugged
+            self.multi_output_unplugged(multi, multi_steps, placed)
             if unplugged["size"] != list(TOPLEVEL):
                 failures.append(f"unplugged ScreenSize {unplugged['size']}")
             final = self.app("app-introspect-state", key)
@@ -363,7 +401,110 @@ class Lane:
                 self.app("app-introspect-stop", key)
             except AppError as error:
                 failures.append(f"watcher stop: {error}")
+            try:
+                multi_steps["stop"] = self.app("gates-stop", placed["key"])
+            except AppError as error:
+                multi.append(f"placed window stop: {error}")
             self.save("introspect-screen-size.json", steps)
+            self.save("multi-output.json", multi_steps)
+        if not multi_steps.get("unplugged"):
+            multi.append("the hotplug run never reached the unplugged desktop")
+        return failures
+
+    # ---- V-MULTI-OUTPUT -------------------------------------------------
+    def outputs_settled(self, key, outputs, extra=lambda value: [], timeout=20):
+        """Poll the compositor's snapshot until the top bar and `extra` hold;
+        the last observation and its problems on timeout."""
+        deadline = time.monotonic() + timeout
+        while True:
+            value = self.app("gates-state", key)
+            problems = top_bar_problems(value["scene"], outputs) + extra(value)
+            if not problems or time.monotonic() > deadline:
+                return value, problems
+            time.sleep(0.5)
+
+    def multi_output_plugged(self, failures, steps, key):
+        """The hotplugged desktop: GNOME's one top bar stays on the primary
+        output, and a GTK window fullscreened on the new output fills it."""
+        placed = {"key": key}
+        try:
+            value, problems = self.outputs_settled(key, 2)
+            steps["plugged"] = value["scene"]
+            failures.extend(f"hotplugged: {p}" for p in problems)
+            second = next(o for o in value["scene"]["outputs"] or [] if not o.get("primary"))
+            steps["placed_start"] = self.app("gates-start", "placed", key, second["name"], timeout=60)
+
+            def filled(current):
+                fixture = current["fixtures"].get("placed") or {}
+                window = placed_window(current["scene"], fixture)
+                if window is None or window["rect"] != second["rect"] or not fixture.get("fullscreen"):
+                    return [f"placed window {window and window['rect']} does not fill {second['name']} {second['rect']}"]
+                return []
+            value, problems = self.outputs_settled(key, 2, filled)
+            steps["placed"] = value
+            failures.extend(problems)
+            if not problems:
+                placed["window"] = placed_window(value["scene"], value["fixtures"]["placed"])["id"]
+        except (AppError, StopIteration, KeyError, TypeError) as error:
+            failures.append(f"hotplugged: {type(error).__name__}: {error}")
+        return placed
+
+    def multi_output_unplugged(self, failures, steps, placed):
+        """After the unplug the top bar is on the remaining output, and the
+        window that was on the unplugged one survives on it."""
+        def rehomed(current):
+            if "window" not in placed:
+                return []
+            window = placed_window(current["scene"], current["fixtures"].get("placed") or {})
+            primary = [o["rect"] for o in current["scene"]["outputs"] or [] if o.get("primary")]
+            if window is None or window["id"] != placed["window"] or not current["fixtures"]["placed"]["alive"]:
+                return ["the window on the unplugged output did not survive"]
+            if not primary or not contains(primary[0], window["rect"]):
+                return [f"the window from the unplugged output is at {window['rect']}, off the remaining output"]
+            return []
+        try:
+            value, problems = self.outputs_settled(placed["key"], 1, rehomed)
+            steps["unplugged"] = value
+            failures.extend(f"unplugged: {p}" for p in problems)
+        except (AppError, KeyError, TypeError) as error:
+            failures.append(f"unplugged: {type(error).__name__}: {error}")
+
+    # ---- V-XWAYLAND -----------------------------------------------------
+    def run_xwayland(self):
+        """The first X11 client starts Xwayland on demand, the session then
+        publishes DISPLAY, and the X11 window maps, takes focus and input."""
+        failures = []
+        key = secrets.token_hex(8)
+        steps = {"before": self.app("app-x11-state")}
+        before = steps["before"]
+        try:
+            if before["xwayland"] or before["x11_ready"]:
+                failures.append(f"Xwayland ran before any X11 client: {before}")
+            if not before["x11_display"]:
+                failures.append("the compositor reserved no X11 display")
+            # Waits for the X11 window to map and take focus.
+            started = steps["started"] = self.app("app-picker-start", "x11", key, timeout=90)
+            after = steps["after"] = self.app("app-x11-state")
+            if not after["xwayland"] or after["x11_ready"] is not True:
+                failures.append(f"no ready Xwayland after the X11 client mapped: {after}")
+            if after["env_display"] != before["x11_display"]:
+                failures.append(f"session DISPLAY {after['env_display']} is not the reserved {before['x11_display']}")
+            window, client = started["window"], started["client"]
+            if window.get("x11_window_id") != client["xid"]:
+                failures.append(f"the focused window is not the client's X11 window {client['xid']}")
+            self.qmp.keys("a")
+            self.qmp.click(*(int(v) for v in center(window["rect"])))
+            steps["input"] = wait_for(lambda: (lambda s: s if s["client"]["keys"] == client["keys"] + 1
+                                               and s["client"]["clicks"] == client["clicks"] + 1 else None)(
+                self.picker_state("x11", key)), 10, "a key and a click never reached the X11 client")
+        except (AppError, KeyError, TypeError) as error:
+            failures.append(f"{type(error).__name__}: {error}")
+        finally:
+            try:
+                self.app("app-picker-stop", "x11", key)
+            except AppError as error:
+                failures.append(f"x11 client stop: {error}")
+            self.save("xwayland.json", steps)
         return failures
 
     # ---- V-INTROSPECT sandbox identity --------------------------------
@@ -407,10 +548,20 @@ class Lane:
         return failures
 
 
+GATES = ("V-XWAYLAND", "V-PICKER", "V-INTROSPECT-SCREEN", "V-MULTI-OUTPUT", "V-INTROSPECT-SANDBOX")
+
+
 def run(qmp, connect, out, record, display_bus):
     lane = Lane(qmp, connect, out, record, display_bus)
     try:
         lane.save("env.json", lane.app("app-env"))
+        # First: no X11 client may have run before it.
+        xwayland = lane.run_xwayland()
+        record("V-XWAYLAND", not xwayland,
+               "; ".join(xwayland)[:900] if xwayland else
+               "no Xwayland before the first X11 client; a GDK_BACKEND=x11 GTK app starts it on demand, the "
+               "session publishes the reserved DISPLAY, and its X11 window maps, takes focus and receives a key "
+               "and a click (app-integration/xwayland.json)")
         failures = []
         for role in ("x11", "wayland"):
             try:
@@ -422,12 +573,18 @@ def run(qmp, connect, out, record, display_bus):
                "X11 and native Wayland GTK callers: 1100x700 allocation, Nautilus OpenFile/SaveFile "
                "cancel/accept centred modal children, exposed-parent clicks blocked, focus and input "
                "returned to the caller, bystander untouched (app-integration/picker-*.json)")
-        size = lane.run_screen_size()
+        multi = []
+        size = lane.run_screen_size(multi)
         sandbox = lane.run_sandbox()
         record("V-INTROSPECT-SCREEN", not size,
                "; ".join(size)[:900] if size else
                "Introspect ScreenSize equals the union of Mutter logical monitors and notifies once per "
                "change across virtio-gpu hotplug, rotation and unplug (app-integration/introspect-screen-size.json)")
+        record("V-MULTI-OUTPUT", not multi,
+               "; ".join(multi)[:900] if multi else
+               "virtio-gpu hotplug: GNOME's one top bar stays across the primary output and none on the new one; "
+               "a GTK window fullscreened on the new output fills it and survives its unplug on the remaining "
+               "output, where the top bar is (app-integration/multi-output.json)")
         record("V-INTROSPECT-SANDBOX", not sandbox,
                "; ".join(sandbox)[:900] if sandbox else
                "xdg-desktop-portal-gnome Background.GetAppState reports the Flatpak-sandboxed app, not an "
