@@ -33,7 +33,7 @@ IMAGE_IDENTITY = "https://github.com/tuna-os/tunaOS/.github/workflows/reusable-b
 IDENTITY = f"https://github.com/{DESKTOP}/.github/workflows/vm-release.yml@refs/heads/main"
 PACKAGE_FINGERPRINT = "4E5CC9F8B3B521793D95266E629BE6EA45188366"
 PLATFORMS = ("linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64")
-BINS = ("tuna-compositor", "tuna-session", "tuna-shell-gtk", "tuna-shell-host", "tuna-ibus-bridge", "tuna-wallpaper-svg")
+BINS = ("tuna-compositor", "tuna-session", "tuna-shell-gtk", "tuna-shell-host", "tuna-ibus-bridge", "tuna-wallpaper-svg", "tuna-x11-frames")
 SCHEMA = "org.tunaos.desktop.vm/v1"
 HERE = Path(__file__).resolve().parent
 

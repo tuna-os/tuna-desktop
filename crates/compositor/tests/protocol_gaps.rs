@@ -476,6 +476,19 @@ fn chord(manager: &mut WindowManager, comp: &mut TestCompositor, keycode: u32) {
     key(manager, comp, SUPER_LEFT_KEYCODE, false);
 }
 
+/// What the outputs' next refreshes owe the clients among `roots`.
+fn refresh_work<'a>(
+    roots: &'a [smithay::reexports::wayland_server::protocol::wl_surface::WlSurface],
+    drawn: &'a [smithay::reexports::wayland_server::protocol::wl_surface::WlSurface],
+    throttled: &'a [smithay::reexports::wayland_server::protocol::wl_surface::WlSurface],
+) -> tuna_compositor::frame_timing::RefreshWork<'a> {
+    tuna_compositor::frame_timing::RefreshWork {
+        roots,
+        drawn,
+        throttled,
+    }
+}
+
 #[test]
 fn a_frame_request_without_pixel_damage_keeps_native_refresh_work_pending() {
     let (mut comp, mut manager) = compositor();
@@ -489,17 +502,36 @@ fn a_frame_request_without_pixel_damage_keeps_native_refresh_work_pending() {
     surface.commit();
     pump(&mut comp, &mut manager, &mut [&mut peer]);
     assert!(tuna_compositor::frame_timing::pending_frame_work(&roots));
+    let work = |drawn, throttled| refresh_work(&roots, drawn, throttled);
     assert!(
-        tuna_compositor::frame_timing::pending_output_work(&roots, &[], &[]),
+        work(&[], &[]).owed_by(&[], true),
         "callback-only pacing remains owed even without visible presentation"
     );
     assert!(
-        !tuna_compositor::frame_timing::pending_output_work(&roots, &[], &roots),
+        !work(&[], &[]).owed_by(&[], false),
+        "a window no output draws is the primary's to pace, not every output's"
+    );
+    assert!(
+        !work(&[], &roots).owed_by(&[], true),
         "a hidden window's callback waits for its beat, not a scanout"
     );
     assert!(
-        !tuna_compositor::frame_timing::pending_output_work(&roots, &roots, &roots),
+        !work(&roots, &roots).owed_by(&roots, true),
         "an occluded window on the active workspace is drawn yet waits for its beat"
+    );
+    // Drawn on one output of two (Mutter 51 emits its callbacks for its
+    // primary stage view only): that output repaints, the other sleeps.
+    assert!(
+        work(&roots, &[]).owed_by(&roots, false),
+        "the secondary drawing the window owes its frame"
+    );
+    assert!(
+        !work(&roots, &[]).owed_by(&[], true),
+        "the primary does not repaint for a window the secondary draws"
+    );
+    assert!(
+        !work(&roots, &[]).owed_by(&[], false),
+        "an output not drawing the window does not repaint for its frame request"
     );
     assert_eq!(peer.client.frames, 0);
     let output = comp.state.primary_output().unwrap();
@@ -566,8 +598,9 @@ fn a_hidden_window_keeps_its_feedback_until_drawn() {
     assert_eq!(peer.client.fates.get(&7), None);
     let roots = tuna_compositor::frame_timing::frame_roots(&comp.state, &manager);
     assert!(tuna_compositor::frame_timing::pending_frame_work(&roots));
+    let work = |drawn| refresh_work(&roots, drawn, &[]);
     assert!(
-        !tuna_compositor::frame_timing::pending_output_work(&roots, &[], &[]),
+        !work(&[]).owed_by(&[], true),
         "hidden presentation must not keep an unchanged output repainting"
     );
     let drawn: Vec<_> = tuna_compositor::frame_timing::drawn_roots(&comp.state, &manager, false)
@@ -575,7 +608,7 @@ fn a_hidden_window_keeps_its_feedback_until_drawn() {
         .map(|(surface, _)| surface)
         .collect();
     assert!(
-        tuna_compositor::frame_timing::pending_output_work(&roots, &drawn, &[]),
+        work(&drawn).owed_by(&drawn, true),
         "revealing the actual window owes a real submission"
     );
     assert_eq!(
@@ -615,9 +648,14 @@ fn fifo_holds_a_waiting_commit_until_the_next_refresh() {
     // then releases the barrier.
     let roots = tuna_compositor::frame_timing::frame_roots(&comp.state, &manager);
     assert!(tuna_compositor::frame_timing::pending_frame_work(&roots));
+    let work = refresh_work(&roots, &[], &roots);
     assert!(
-        tuna_compositor::frame_timing::pending_output_work(&roots, &[], &roots),
+        work.owed_by(&[], true),
         "a hidden window's FIFO barrier still advances on each refresh"
+    );
+    assert!(
+        !work.owed_by(&roots, false),
+        "only the primary's page flip runs the refresh cycle that releases it"
     );
     tuna_compositor::frame_timing::present_nested_frame(&mut comp.state, &manager, false, 1);
     pump(&mut comp, &mut manager, &mut [&mut peer]);

@@ -233,7 +233,7 @@ class GtkShellBinaryCollection(unittest.TestCase):
     shell options, with /usr/local/lib pointed at a temporary tree.
     """
 
-    BINARIES = ("tuna-compositor", "tuna-shell-gtk", "tuna-wallpaper-svg")
+    BINARIES = ("tuna-compositor", "tuna-shell-gtk", "tuna-wallpaper-svg", "tuna-x11-frames")
     LIBRARIES = ("libgtk4-layer-shell.so", "libgtk4-layer-shell.so.0")
     EXAMPLE = "examples/tuna-bell-client"
 
@@ -305,8 +305,8 @@ class GtkShellBinaryCollection(unittest.TestCase):
         result = self.collect("failure")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.collected(), [])
-        # Three binaries, the layer-shell library's literal fallback path, and the bell example.
-        self.assertEqual(result.stdout.count("::warning::"), 5)
+        # Four binaries, the layer-shell library's literal fallback path, and the bell example.
+        self.assertEqual(result.stdout.count("::warning::"), 6)
 
     def test_a_missing_binary_fails_the_step_when_nothing_failed_before(self):
         self.build("tuna-compositor", "tuna-shell-gtk")
