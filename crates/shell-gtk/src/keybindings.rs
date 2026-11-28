@@ -124,7 +124,8 @@ impl Target {
     /// The workspace id for this target, from `active` among `workspaces`
     /// with windows on `occupied`. GNOME's workspaces are dynamic: one
     /// empty workspace always follows the last occupied one, and that is
-    /// where Last goes; Right past the end is the next new one.
+    /// where Last goes. Right on that last workspace has nowhere to go:
+    /// mutter clamps (workspace.c:1312-1321), so it never opens another.
     pub fn resolve(self, active: u32, workspaces: &[u32], occupied: &[u32]) -> Option<u32> {
         let first = workspaces.iter().copied().min().unwrap_or(0);
         let trailing = occupied.iter().copied().max().map_or(0, |m| m + 1);
@@ -138,7 +139,7 @@ impl Target {
             Target::First => Some(first),
             Target::Last => Some(last),
             Target::Left => (active > first).then(|| active - 1),
-            Target::Right => Some(active + 1),
+            Target::Right => (active < last).then(|| active + 1),
             Target::Index(index) => (index <= last).then_some(index),
         }
     }
@@ -827,7 +828,12 @@ mod tests {
         assert_eq!(Target::Last.resolve(0, &ws, &[0, 1]), Some(2));
         assert_eq!(Target::Left.resolve(0, &ws, &[0]), None);
         assert_eq!(Target::Left.resolve(2, &ws, &[0]), Some(1));
-        assert_eq!(Target::Right.resolve(2, &ws, &[0]), Some(3));
+        assert_eq!(Target::Right.resolve(1, &ws, &[0]), Some(2));
+        // Right on the last workspace does not open a new one.
+        assert_eq!(Target::Right.resolve(2, &ws, &[0]), None);
+        // Occupied last workspace: the trailing empty one is still reachable.
+        assert_eq!(Target::Right.resolve(1, &[0, 1], &[0, 1]), Some(2));
+        assert_eq!(Target::Right.resolve(2, &[0, 1], &[0, 1]), None);
         // Everything on the first workspace: Last is the empty one after.
         assert_eq!(Target::Last.resolve(0, &[0], &[0]), Some(1));
     }
@@ -842,6 +848,8 @@ mod tests {
         assert_eq!(Target::Last.destination(0, &[0, 1, 2, 3], &[], Some(4)), 3);
         assert_eq!(Target::First.destination(2, &[0, 1, 2, 3], &[], Some(4)), 0);
         assert_eq!(Target::Left.destination(2, &[0, 1, 2], &[0], None), 1);
+        // Dynamic workspaces: Right past the trailing empty one stays put.
+        assert_eq!(Target::Right.destination(2, &[0, 1, 2], &[0, 1], None), 2);
     }
 
     #[test]

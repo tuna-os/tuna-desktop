@@ -243,7 +243,7 @@ stack, like GDM's `gdm-fingerprint`.
    A source install must copy it from `share/pam.d/tuna-lock`
    ([install guide](install.md#logging-in-through-gdm)).
 2. The lock screen authenticates `$LOGNAME` (else `$USER`) from the
-   compositor's environment (`crates/compositor/src/unlock.rs:70-77`).
+   compositor's environment (`crates/compositor/src/unlock.rs:67-74`).
 3. Each attempt has 10 seconds; a PAM stack that hangs longer is treated as a
    failure (`crates/compositor/src/pam.rs:31-32`).
 4. For more detail, reproduce with `TUNA_LOCK_TRACE=1` in the compositor's
