@@ -271,6 +271,15 @@ impl Relay {
         sequence: u32,
         messages: Vec<Message>,
     ) -> io::Result<()> {
+        let answers = self.ask(sequence, messages)?;
+        // Fresh input authorizes only this response; it cannot extend the total
+        // ceiling or bypass the separate bounded backend IPC phase.
+        supervisor.set_phase_deadline(self.phase()?)?;
+        supervisor.answer(sequence, answers)
+    }
+    /// Publish one batch to the runtime and wait for its fresh answers, on the
+    /// creator thread that owns the backend (the private helper's or GDM's).
+    pub(crate) fn ask(&mut self, sequence: u32, messages: Vec<Message>) -> io::Result<Vec<Answer>> {
         let styles: Vec<_> = messages.iter().map(|message| message.style).collect();
         let (read, write) = UnixStream::pair()?;
         read.set_nonblocking(true)?;
@@ -296,18 +305,14 @@ impl Relay {
             })
             .map_err(|_| io::ErrorKind::BrokenPipe)?;
         self.notice.signal();
-        let answers = self.wait_answers(
+        self.wait_answers(
             &read,
             &receive,
             sequence,
             &styles,
             &activity_pending,
             &answers_taken,
-        )?;
-        // Fresh input authorizes only this response; it cannot extend the total
-        // ceiling or bypass the separate bounded backend IPC phase.
-        supervisor.set_phase_deadline(self.phase()?)?;
-        supervisor.answer(sequence, answers)
+        )
     }
     fn wait_answers(
         &mut self,

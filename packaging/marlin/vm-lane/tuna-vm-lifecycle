@@ -60,6 +60,131 @@ def desktop_package_version():
 # daemon/gdm-session.c GDM_SESSION_DISPLAY_MODE_NEW_VT).
 LOGIN_SERVICE = "gdm-password"
 DISPLAY_MANAGER = pathlib.Path("/etc/systemd/system/display-manager.service")
+# In a GDM session the lock screen verifies through GDM's reauthentication
+# channel (as GNOME Shell does), so GDM's worker runs LOGIN_SERVICE's stack
+# for an unlock; the private helper's LOCK_PAM runs only without GDM.
+FAILLOCK_CONF = pathlib.Path("/etc/security/faillock.conf")
+FAILLOCK_DENY = 3
+# Linux-PAM reads a service, and each include or substack, from the first of
+# /etc/pam.d and /usr/lib/pam.d that has it (libpam/pam_handlers.c
+# _pam_open_config_file). GDM installs its services in /usr/lib/pam.d
+# (data/meson.build pam_sys_services_dir), so Marlin has no
+# /etc/pam.d/gdm-password, and one written there overrides GDM's.
+PAM_DIRS = (pathlib.Path("/etc/pam.d"), pathlib.Path("/usr/lib/pam.d"))
+
+
+def pam_service_file(service, dirs=PAM_DIRS):
+    """The file Linux-PAM reads for a service, or None."""
+    if service.startswith("/"):
+        return pathlib.Path(service) if pathlib.Path(service).is_file() else None
+    return next((root / service for root in dirs if (root / service).is_file()), None)
+
+
+def unlock_pam_services():
+    """Every PAM service an unlock can run in this guest."""
+    return [name for name in (pathlib.Path(LOCK_PAM).name, LOGIN_SERVICE) if pam_service_file(name)]
+
+
+def override_pam_service(name, text):
+    """Run `text` for a service from /etc/pam.d, which Linux-PAM reads first;
+    restore_pam_service brings back what was there, or nothing."""
+    target = PAM_DIRS[0] / name
+    if target.is_file():
+        target.rename(target.with_suffix(".vm-backup"))
+    else:
+        target.with_suffix(".vm-absent").write_text("")
+    target.write_text(text)
+
+
+def restore_pam_service(name):
+    """Undo override_pam_service; False when nothing was overridden."""
+    target = PAM_DIRS[0] / name
+    backup, absent = target.with_suffix(".vm-backup"), target.with_suffix(".vm-absent")
+    if backup.exists():
+        backup.rename(target)
+    elif absent.exists():
+        target.unlink(missing_ok=True)
+        absent.unlink()
+    else:
+        return False
+    return True
+
+
+def pam_stack_modules(service, dirs=PAM_DIRS, seen=None):
+    """(type, module) rows of a PAM service, include/substack resolved."""
+    seen = set() if seen is None else seen
+    path = pam_service_file(service, dirs)
+    if service in seen or path is None:
+        return []
+    seen.add(service)
+    rows = []
+    for raw in path.read_text().splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("@include"):
+            rows += pam_stack_modules(line.split()[1], dirs, seen)
+            continue
+        kind, _, rest = line.lstrip("-").partition(" ")
+        rest = rest.strip()
+        if rest.startswith("["):
+            control, _, rest = rest[1:].partition("]")
+        else:
+            control, _, rest = rest.partition(" ")
+        target = rest.split()[0] if rest.split() else ""
+        if control in ("include", "substack"):
+            rows += pam_stack_modules(target, dirs, seen)
+        elif target:
+            rows.append((kind, pathlib.Path(target).name))
+    return rows
+
+
+FAILLOCK_ROW = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(\S+)\s+(\S+)\s+([VI])$")
+
+
+def faillock_rows(text):
+    """`faillock --user` records: when, type, source and validity only."""
+    return [dict(zip(("when", "type", "source", "valid"), match.groups()))
+            for match in map(FAILLOCK_ROW.match, text.splitlines()) if match]
+
+
+def faillock_status():
+    rows = faillock_rows(call("faillock", "--user", OWNER.pw_name))
+    return {"user": OWNER.pw_name, "count": len(rows), "rows": rows}
+
+
+def faillock_enable():
+    """pam_faillock with deny=3 for the fixture user, from an empty tally."""
+    modules = pam_stack_modules(LOGIN_SERVICE)
+    auth = [module for kind, module in modules if kind == "auth"]
+    account = [module for kind, module in modules if kind == "account"]
+    backup = FAILLOCK_CONF.with_suffix(".vm-backup")
+    absent = FAILLOCK_CONF.with_suffix(".vm-absent")
+    if not backup.exists() and not absent.exists():
+        if FAILLOCK_CONF.exists():
+            shutil.copy2(FAILLOCK_CONF, backup)
+        else:
+            absent.write_text("")
+    FAILLOCK_CONF.write_text(f"deny = {FAILLOCK_DENY}\nunlock_time = 900\n")
+    call("faillock", "--user", OWNER.pw_name, "--reset")
+    return {"service": LOGIN_SERVICE, "deny": FAILLOCK_DENY,
+            "auth_faillock": auth.count("pam_faillock.so"),
+            "account_faillock": account.count("pam_faillock.so"),
+            **faillock_status()}
+
+
+def faillock_reset():
+    """Clear the fixture user's tally and restore faillock.conf."""
+    call("faillock", "--user", OWNER.pw_name, "--reset")
+    backup = FAILLOCK_CONF.with_suffix(".vm-backup")
+    absent = FAILLOCK_CONF.with_suffix(".vm-absent")
+    if backup.exists():
+        backup.rename(FAILLOCK_CONF)
+    elif absent.exists():
+        FAILLOCK_CONF.unlink(missing_ok=True)
+        absent.unlink()
+    return faillock_status()
+
 
 
 
@@ -288,17 +413,29 @@ def classify_pam_helpers(rows):
                and (row["exe_device"], row["exe_inode"]) == (desktop["exe_device"], desktop["exe_inode"])]
     return desktop, helpers
 
+GDM_WORKER = "gdm-session-worker"
+
+
+def gdm_reauth_workers(rows, desktop):
+    """GDM session workers started after the desktop: the reauthentication
+    workers GDM runs for the lock screen's conversations. The worker that
+    opened the session predates the compositor."""
+    return [row for row in rows if row["executable"] == GDM_WORKER and row["uid"] == 0
+            and row["_state"] not in ("Z", "X") and row["start_ticks"] >= desktop["start_ticks"]]
+
+
 
 def pam_process_snapshot():
     rows = []
     for path in pathlib.Path("/proc").iterdir():
         if path.name.isdigit():
-            # Limit command metadata reads to the original user and fixed binaries.
+            # Limit command metadata reads to the original user and fixed
+            # binaries, plus GDM's root workers and their delay children.
             try:
-                if path.stat().st_uid != OWNER.pw_uid:
-                    continue
+                uid = path.stat().st_uid
                 name = pathlib.Path(os.readlink(path / "exe")).name
-                if name not in (COMPOSITOR, "sleep"):
+                if not ((uid == OWNER.pw_uid and name in (COMPOSITOR, "sleep"))
+                        or (uid == 0 and name in (GDM_WORKER, "sleep"))):
                     continue
                 row = auth_process(int(path.name))
                 if row is not None:
@@ -328,13 +465,19 @@ def delayed_auth_state(pid, start_ticks):
         stage = "sleep-identity"
         sleep_inode = pathlib.Path("/usr/bin/sleep").stat()
         # pam_exec forks the command and calls setsid() before exec, so the
-        # delay is the helper's direct child leading its own session and group.
+        # delay is the method's direct child leading its own session and group.
+        # The method is the private helper or, in this GDM session, GDM's
+        # reauthentication worker.
         stage = "delay-ownership"
+        methods = helpers + gdm_reauth_workers(rows, desktop)
         delays = [row for row in rows if row["executable"] == "sleep" and row["_state"] not in ("Z", "X")
                   and (row["exe_device"], row["exe_inode"]) == (sleep_inode.st_dev, sleep_inode.st_ino)
-                  and any(row["uid"] == helper["uid"] and row["ppid"] == helper["pid"]
-                          and row["pgrp"] == row["pid"] and row["start_ticks"] >= helper["start_ticks"]
-                          for helper in helpers)]
+                  and any(row["uid"] == method["uid"] and row["ppid"] == method["pid"]
+                          and row["pgrp"] == row["pid"] and row["start_ticks"] >= method["start_ticks"]
+                          for method in methods)]
+        if not helpers:
+            helpers = [method for method in methods
+                       if any(delay["ppid"] == method["pid"] for delay in delays)]
         stage = "owner-read"
         owner_text = STATE.read_text()
         stage = "owner-parse"
@@ -3149,13 +3292,14 @@ print(json.dumps(result))
         call("loginctl", action, session, user=True)
         result = {"session": session, "requested": action}
     elif action == "delay-unlock":
-        service = pathlib.Path(LOCK_PAM)
-        original = service.read_text()
-        service.rename(service.with_suffix(".vm-backup"))
         # Keep the real PAM result below its 10-second authentication deadline,
         # while leaving time for the observed pending child to cross sleep.
-        # Neither credentials nor outcomes are faked.
-        service.write_text("auth required pam_exec.so /usr/bin/sleep 8\n" + original)
+        # Neither credentials nor outcomes are faked. Both stacks an unlock
+        # can run: GDM's (the lock verifies through GDM's reauthentication
+        # channel in this GDM session) and the private helper's.
+        for name in unlock_pam_services():
+            original = pam_service_file(name).read_text()
+            override_pam_service(name, "auth required pam_exec.so /usr/bin/sleep 8\n" + original)
         result = {"pam": "real stack delayed"}
     elif action == "delayed-auth-state":
         try:
@@ -3167,13 +3311,21 @@ print(json.dumps(result))
         result = auth_retirement_state(json.loads(sys.argv[2]))
     elif action == "deny-unlock":
         # Real PAM failure, not a substitute authenticator or fake daemon.
-        service = pathlib.Path(LOCK_PAM)
-        service.rename(service.with_suffix(".vm-backup"))
-        service.write_text("auth required pam_deny.so\naccount required pam_deny.so\n")
+        for name in unlock_pam_services():
+            override_pam_service(name, "auth required pam_deny.so\naccount required pam_deny.so\n")
         result = {"pam": "deny"}
     elif action == "restore-unlock":
-        pathlib.Path(LOCK_PAM + ".vm-backup").rename(LOCK_PAM)
+        restored = [name for name in (pathlib.Path(LOCK_PAM).name, LOGIN_SERVICE)
+                    if restore_pam_service(name)]
+        if not restored:
+            raise RuntimeError("no lock PAM stack backup to restore")
         result = {"pam": "restored"}
+    elif action == "faillock-enable":
+        result = faillock_enable()
+    elif action == "faillock-status":
+        result = faillock_status()
+    elif action == "faillock-reset":
+        result = faillock_reset()
     elif action == "kill-shell":
         processes = inventory()["processes"]
         for process in processes:

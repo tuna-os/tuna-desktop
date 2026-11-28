@@ -19,6 +19,7 @@ glib.workspace = true
 gio.workspace = true
 tuna-auth-prompt = { path = "../auth-prompt", version = "0.1.0", features = ["gtk"] }
 tuna-shell-control = { path = "../shell-control-schema", version = "0.1.0" }
+tuna-gdm = { path = "../gdm", version = "0.1.0" }
 # SSSD's CustomJSON auth-mechanisms requests and replies; serde for the
 # mechanisms in SSSD's order.
 serde = { version = "1", features = ["derive"] }

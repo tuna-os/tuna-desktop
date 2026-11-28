@@ -1,6 +1,6 @@
 //! Per-attempt cancellation with a wake bound only to its admitted PAM backend.
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -44,6 +44,10 @@ impl Cancellation {
     }
     pub(crate) fn fd(&self) -> Option<RawFd> {
         self.0.wake.get().map(|wake| wake.fd.as_raw_fd())
+    }
+    /// The bound wake, for a poll that waits on cancellation.
+    pub(crate) fn wake_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.0.wake.get().map(|wake| wake.fd.as_fd())
     }
     pub(crate) fn drain(&self) -> io::Result<()> {
         self.0

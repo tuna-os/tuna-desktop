@@ -279,10 +279,11 @@ def stale_sleep_auth_retirement(trace, expected, current_epoch):
 AUTH_PROCESS_KEYS = {"pid", "uid", "ppid", "pgrp", "start_ticks", "executable", "exe_device", "exe_inode"}
 
 
-def checked_auth_process(value, executable):
+def checked_auth_process(value, executable, root=False):
     if (type(value) is not dict or set(value) != AUTH_PROCESS_KEYS
             or type(value["executable"]) is not str or value["executable"] != executable
-            or not all(auth_uint(value[key]) for key in ("pid", "uid", "ppid", "pgrp", "start_ticks", "exe_inode"))
+            or not all(auth_uint(value[key]) for key in ("pid", "ppid", "pgrp", "start_ticks", "exe_inode"))
+            or not ((type(value["uid"]) is int and value["uid"] == 0) if root else auth_uint(value["uid"]))
             or type(value["exe_device"]) is not int or value["exe_device"] < 0):
         raise ValueError("original authentication process identity invalid")
     return value
@@ -301,11 +302,24 @@ def sleep_auth_helper_observation(observed, snapshot):
 
 
 def checked_auth_method(desktop, helper, delay, expected):
+    """The original PAM method: the compositor's private helper, or (when GDM
+    runs the session) GDM's root reauthentication worker; each with its
+    actual pam_exec delay child."""
     desktop = checked_auth_process(desktop, "tuna-compositor")
-    helper = checked_auth_process(helper, "tuna-compositor")
-    delay = checked_auth_process(delay, "sleep")
     if (desktop["pid"], desktop["start_ticks"]) != (expected["pid"], expected["start_ticks"]):
         raise ValueError("desktop identity changed before helper admission")
+    if type(helper) is dict and helper.get("executable") == "gdm-session-worker":
+        helper = checked_auth_process(helper, "gdm-session-worker", root=True)
+        delay = checked_auth_process(delay, "sleep", root=True)
+        # A worker GDM started for this lock, after the desktop; the session's
+        # own login worker predates it.
+        if (helper["pid"] == desktop["pid"] or helper["start_ticks"] < desktop["start_ticks"]
+                or delay["pid"] in (desktop["pid"], helper["pid"]) or delay["ppid"] != helper["pid"]
+                or delay["pgrp"] != delay["pid"] or delay["start_ticks"] < helper["start_ticks"]):
+            raise ValueError("GDM worker/delay kernel ownership differs")
+        return {"compositor": desktop, "helper": helper, "delay": delay, "attempt": expected}
+    helper = checked_auth_process(helper, "tuna-compositor")
+    delay = checked_auth_process(delay, "sleep")
     if (helper["pid"] == desktop["pid"] or helper["ppid"] != desktop["pid"] or helper["pgrp"] != helper["pid"]
             or helper["uid"] != desktop["uid"] or helper["start_ticks"] < desktop["start_ticks"]
             or (helper["exe_device"], helper["exe_inode"]) != (desktop["exe_device"], desktop["exe_inode"])
@@ -406,6 +420,75 @@ def pam_refusal_observed(records):
                 and event.get('canceled') is False and auth_uint(event.get('request'))):
             refused.add(event['request'])
     return bool(refused & shell_denied_requests('\n'.join(records)))
+
+
+def password_refusals(records):
+    """Fresh PAM refusals the shell was told of: each refused password
+    conversation request (retired unauthenticated and uncancelled, with the
+    shell's denied result) plus each single-password `Unlock` denial.
+    None for a malformed conversation record."""
+    single = sum("tuna-shell-gtk: lock command result applied=false" in line for line in records)
+    prefix = 'tuna-compositor: lock conversation '
+    refused = set()
+    for line in records:
+        if prefix not in line:
+            continue
+        try:
+            event = json.loads(line.split(prefix, 1)[1])
+        except (ValueError, TypeError):
+            return None
+        if (type(event) is dict and event.get('event') == 'retired' and event.get('service') == 'password'
+                and event.get('retired') is True and event.get('authenticated') is False
+                and event.get('canceled') is False and auth_uint(event.get('request'))):
+            refused.add(event['request'])
+    return single + len(refused & shell_denied_requests('\n'.join(records)))
+
+
+def password_queries(records):
+    """Password questions the compositor put to the shell. None for a
+    malformed conversation record."""
+    prefix = 'tuna-compositor: lock conversation '
+    queries = 0
+    for line in records:
+        if prefix not in line:
+            continue
+        try:
+            event = json.loads(line.split(prefix, 1)[1])
+        except (ValueError, TypeError):
+            return None
+        if type(event) is dict and event.get('event') == 'query' and event.get('service') == 'password':
+            queries += 1
+    return queries
+
+
+FAILLOCK_DENY = 3
+
+
+def lock_faillock_ok(observed):
+    """V-LOCK-FAILLOCK: with pam_faillock deny=3 on the login service, three
+    refused lock-screen passwords make the right one refused too, the
+    session stays locked and `faillock --user` lists exactly the three
+    failures; after `faillock --reset` the right password unlocks."""
+    try:
+        enable, status, reset = observed["enable"], observed["status"], observed["reset"]
+        problems = []
+        if enable["auth_faillock"] < 1 or enable["deny"] != FAILLOCK_DENY or enable["count"] != 0:
+            problems.append(f"faillock not enabled from an empty tally: {enable}")
+        if observed["wrong_refusals"] != [True] * FAILLOCK_DENY:
+            problems.append(f"wrong passwords not each refused: {observed['wrong_refusals']}")
+        if observed["right_refused"] is not True or observed["locked_after_right"] is not True:
+            problems.append("the right password unlocked after deny=3 failures")
+        if status["count"] != FAILLOCK_DENY:
+            problems.append(f"faillock lists {status['count']} failures, not {FAILLOCK_DENY}")
+        if reset["count"] != 0 or observed["unlocked_after_reset"] is not True:
+            problems.append("faillock --reset did not let the right password unlock")
+    except (KeyError, TypeError) as error:
+        return False, f"incomplete faillock observation: {error!r}"
+    if problems:
+        return False, "; ".join(problems)
+    return True, (f"pam_faillock deny={FAILLOCK_DENY} on {enable['service']}: three wrong lock-screen "
+                  f"passwords, then the right one is refused and the session stays locked; faillock "
+                  f"--user lists {status['count']} failures; after faillock --reset it unlocks")
 
 
 ORCA_RETIREMENT_RE = re.compile(
@@ -1490,6 +1573,97 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         qmp.type_text("tuna")
         qmp.keys("ret")
     prove_unlock_wake(qmp, agent, evidence, record, password_unlock)
+
+    # The lock screen verifies through GDM's reauthentication channel in this
+    # GDM session, as GNOME 51's does, so the login service's pam_faillock
+    # counts and enforces lock-screen failures exactly as at GDM's login.
+    # Only the first password raises the curtain: after a refusal the prompt
+    # reopens and holds typed text for the next question (authPrompt.js
+    # preemptive input), and Escape would cancel a conversation in flight.
+    faillock = {"wrong_refusals": []}
+
+    def lock_password(text, raise_curtain=False):
+        """Submit one lock-screen password; True once PAM's refusal reached the shell."""
+        offset = len(read_text(serial_path))
+        if raise_curtain:
+            qmp.keys("esc")
+            qmp.keys("ret")
+            time.sleep(1)
+        else:
+            # After a refusal the shell shows "Sorry, that didn't work" for
+            # 3 s and only then begins the next conversation (authPrompt.js
+            # _onVerificationFailed); text typed before that conversation's
+            # question is never submitted (run 46132922179: typed at 358.56,
+            # asked at 360.10).
+            await_password_query(offset)
+        qmp.keys("ctrl", "a")
+        qmp.type_text(text)
+        qmp.keys("ret")
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            refusals = password_refusals(session_records(read_text(serial_path)[offset:]))
+            if refusals is None or not agent.run("inventory")["state"]["locked"]:
+                return False
+            if refusals >= 1:
+                return True
+            time.sleep(0.3)
+        return False
+
+    def await_password_query(offset):
+        """True once the compositor asked the shell for a password after `offset`."""
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            queries = password_queries(session_records(read_text(serial_path)[offset:]))
+            if queries is None:
+                return False
+            if queries >= 1:
+                return True
+            time.sleep(0.3)
+        return False
+
+    try:
+        faillock["enable"] = agent.run("faillock-enable")
+        qmp.keys("meta_l", "l")
+        await_state(lambda value: value["state"]["locked"])
+        for attempt in range(FAILLOCK_DENY):
+            faillock["wrong_refusals"].append(lock_password("wrongpass", raise_curtain=attempt == 0))
+        faillock["right_refused"] = lock_password("tuna")
+        retry_offset = len(read_text(serial_path))
+        time.sleep(2)
+        faillock["locked_after_right"] = inventory("faillock-locked")["state"]["locked"]
+        faillock["status"] = agent.run("faillock-status")
+    finally:
+        # Later gates unlock with the fixture password: never leave a tally.
+        faillock["reset"] = agent.run("faillock-reset")
+        with open(os.path.join(evidence, "lock-faillock.json"), "w") as stream:
+            json.dump(faillock, stream, indent=2)
+    if faillock["locked_after_right"]:
+        # pam_faillock's preauth reads the tally once, as a conversation
+        # begins, and the shell begins its retry after showing the refusal:
+        # in run 46118845735 that was 0.1 s after `faillock --reset` started,
+        # so the right password was refused once more. Escape cancels the
+        # retry (authPrompt.js `cancel`: the clock comes back) and Return
+        # lifts the curtain on a conversation begun after the reset.
+        await_password_query(retry_offset)
+        qmp.keys("esc")
+        time.sleep(1)
+        offset = len(read_text(serial_path))
+        qmp.keys("ret")
+        await_password_query(offset)
+    qmp.keys("ctrl", "a")
+    qmp.type_text("tuna")
+    qmp.keys("ret")
+    try:
+        await_state(lambda value: not value["state"]["locked"], timeout=30)
+        faillock["unlocked_after_reset"] = True
+    except RuntimeError:
+        faillock["unlocked_after_reset"] = False
+    with open(os.path.join(evidence, "lock-faillock.json"), "w") as stream:
+        json.dump(faillock, stream, indent=2)
+    ok, detail = lock_faillock_ok(faillock)
+    record("V-LOCK-FAILLOCK", ok, detail + " (lifecycle/lock-faillock.json)")
+    if not ok:
+        raise RuntimeError(f"lock-screen faillock not enforced: {detail}")
 
     # Real distribution Orca owns a credential-verified bus name under the ordinary
     # session user. Settings writes trigger Tuna Desktop's consumer, not test start/stop.

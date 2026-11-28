@@ -1080,7 +1080,13 @@ fn run_parent(bin: &Path, role: &str, kind: &str) {
         .env("TUNA_LOCK_TRACE", "1")
         .env("TUNA_XWAYLAND", "0")
         .env_remove("WAYLAND_DISPLAY")
-        .env_remove("DBUS_SYSTEM_BUS_ADDRESS")
+        // No system bus unless a role brings its own: a GDM on the runner's
+        // would open a reauthentication channel and take the attempt off
+        // the private helper these roles prove.
+        .env(
+            "DBUS_SYSTEM_BUS_ADDRESS",
+            format!("unix:path={}", root.path().join("no-system-bus").display()),
+        )
         .stdout(Stdio::null())
         .stderr(log);
     match &fprintd {

@@ -62,7 +62,7 @@ use crate::xwayland::XWaylandSupervisor;
 use crate::{ClientState, State};
 
 mod aids;
-mod auth;
+pub(crate) mod auth;
 mod color;
 mod display;
 mod input_capture;

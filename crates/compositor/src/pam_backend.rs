@@ -1,4 +1,6 @@
-//! Stable creator ownership for live private PAM helpers; deadlines never retire.
+//! Stable creator ownership for live lock-screen verification: GDM's
+//! reauthentication channel when GDM runs the session
+//! ([`crate::gdm_reauth`]), else private PAM helpers; deadlines never retire.
 use crate::pam_cancel::{Cancellation, WakeFd};
 use crate::pam_helper::{
     Answer, AnswerText, Event, Identity, Refusal, Retirement, SelfImage, Style, Supervisor,
@@ -323,27 +325,34 @@ impl Backend {
             }
         }
     }
-    /// The password owner: the `tuna-lock` conversation and the legacy
-    /// single-password `Unlock` share it, one helper at a time.
+    /// The password owner: the password conversation and the legacy
+    /// single-password `Unlock` share it, one attempt at a time, on GDM's
+    /// `gdm-password` or the private helper's `tuna-lock`.
     pub fn live() -> Option<Self> {
-        Self::live_in(&LIVE)
+        Self::live_in(&LIVE, crate::gdm_reauth::Reauth::password)
     }
-    /// The fingerprint owner: the `tuna-lock-fingerprint` conversation runs
-    /// beside the password one, as GDM runs `gdm-fingerprint` beside
-    /// `gdm-password`, so it has its own stable creator and admission.
+    /// The fingerprint owner: the fingerprint conversation runs beside the
+    /// password one, as GDM runs `gdm-fingerprint` beside `gdm-password`, so
+    /// it has its own stable creator and admission.
     pub fn live_fingerprint() -> Option<Self> {
-        Self::live_in(&LIVE_FINGERPRINT)
+        Self::live_in(&LIVE_FINGERPRINT, crate::gdm_reauth::Reauth::fingerprint)
     }
-    fn live_in(cell: &'static OnceLock<Option<Backend>>) -> Option<Self> {
+    fn live_in(
+        cell: &'static OnceLock<Option<Backend>>,
+        reauth: fn(Arc<crate::gdm_reauth::Source>) -> crate::gdm_reauth::Reauth,
+    ) -> Option<Self> {
         cell.get_or_init(|| {
             let image = SelfImage::capture().ok()?;
-            Self::from_factory(Arc::new(move |identity, service, user, budget, cancel| {
-                if budget <= crate::pam::DEADLINE {
-                    image.spawn_cancellable(identity, service, user, budget, cancel)
-                } else {
-                    image.spawn_conversation(identity, service, user, budget, cancel)
-                }
-            }))
+            Self::from_factory(
+                Arc::new(move |identity, service, user, budget, cancel| {
+                    if budget <= crate::pam::DEADLINE {
+                        image.spawn_cancellable(identity, service, user, budget, cancel)
+                    } else {
+                        image.spawn_conversation(identity, service, user, budget, cancel)
+                    }
+                }),
+                Some(reauth(crate::gdm_reauth::Source::system())),
+            )
             .ok()
         })
         .clone()
@@ -357,9 +366,24 @@ impl Backend {
             + Sync
             + 'static,
     ) -> io::Result<Self> {
-        Self::from_factory(Arc::new(factory))
+        Self::from_factory(Arc::new(factory), None)
     }
-    fn from_factory(factory: Factory) -> io::Result<Self> {
+    /// Trusted Rust fixture seam: [`with_trusted_factory`](Self::with_trusted_factory)
+    /// plus GDM reauthentication from a fixture [`Source`](crate::gdm_reauth::Source).
+    #[doc(hidden)]
+    pub fn with_trusted_factory_and_reauth(
+        factory: impl Fn(Identity, String, String, Duration, Cancellation) -> io::Result<Supervisor>
+            + Send
+            + Sync
+            + 'static,
+        reauth: crate::gdm_reauth::Reauth,
+    ) -> io::Result<Self> {
+        Self::from_factory(Arc::new(factory), Some(reauth))
+    }
+    fn from_factory(
+        factory: Factory,
+        reauth: Option<crate::gdm_reauth::Reauth>,
+    ) -> io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(1);
         let state = Arc::new(AtomicU8::new(FREE));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -369,15 +393,38 @@ impl Backend {
         let owner = std::thread::Builder::new()
             .name("tuna-pam-owner".into())
             .spawn(move || {
+                use crate::gdm_reauth::Start;
                 let _guard = OwnerGuard(owner_state.clone());
                 while let Ok(command) = receiver.recv() {
                     match command {
                         Command::Shutdown => break,
                         Command::Attempt(job) => {
-                            if !run_job(*job, &factory, &owner_shutdown, &owner_state) {
-                                break;
-                            }
-                            if owner_shutdown.load(Ordering::Acquire) {
+                            // GDM verifies only the session's own user, as
+                            // the private helper does.
+                            let start = match &reauth {
+                                Some(reauth)
+                                    if crate::unlock::session_user().as_deref()
+                                        == Some(job.user.as_str()) =>
+                                {
+                                    reauth.start(&job.user)
+                                }
+                                _ => Start::Helper,
+                            };
+                            let alive = match start {
+                                Start::Gdm(conversation) => {
+                                    run_gdm_job(*job, conversation, &owner_shutdown, &owner_state)
+                                }
+                                Start::Refuse => {
+                                    // Nothing ran: the attempt retires refused.
+                                    owner_state.store(FREE, Ordering::Release);
+                                    let _ = job.reply.send(Reply::Refused(Refusal::Unavailable));
+                                    true
+                                }
+                                Start::Helper => {
+                                    run_job(*job, &factory, &owner_shutdown, &owner_state)
+                                }
+                            };
+                            if !alive || owner_shutdown.load(Ordering::Acquire) {
                                 break;
                             }
                         }
@@ -650,6 +697,106 @@ fn run_job(mut job: Job, factory: &Factory, shutdown: &AtomicBool, state: &Atomi
     }
     state.store(FREE, Ordering::Release);
     let _ = job.reply.send(Reply::Retired(false));
+    true
+}
+
+/// One attempt in GDM's session worker over its reauthentication channel:
+/// the same replies as a private helper's attempt. A relay conversation
+/// relays every message and answers GDM's questions with the runtime's
+/// fresh answers; the legacy single-password attempt answers as
+/// [`run_job`] does. Only `VerificationComplete` for this service, timely
+/// and uncancelled, authenticates. Once this thread stops reading the
+/// service (result, cancel, deadline, channel loss) nothing GDM sends can
+/// grant: an abandoned attempt retires as soon as GDM's `Cancel` returned
+/// (bounded), so it has no quarantined `Pending` phase like a helper's.
+fn run_gdm_job(
+    mut job: Job,
+    mut conversation: crate::gdm_reauth::Conversation,
+    shutdown: &AtomicBool,
+    state: &AtomicU8,
+) -> bool {
+    use crate::gdm_reauth::{Finish, Step};
+    let legacy_deadline = Instant::now() + crate::pam::DEADLINE;
+    let rounds = if job.relay.is_some() {
+        64
+    } else {
+        crate::unlock::MAX_AUTH_ROUNDS
+    };
+    let mut secret = Some(job.password);
+    let (mut secret_used, mut visible_used) = (false, false);
+    let mut sequence = 0u32;
+    let mut phase_deadline = legacy_deadline;
+    let finish = 'drive: loop {
+        if let Some(relay) = &job.relay {
+            let Ok(deadline) = relay.phase() else {
+                break None;
+            };
+            phase_deadline = deadline;
+        }
+        let Some(event) = conversation.next(&job.cancel, shutdown, phase_deadline) else {
+            break None;
+        };
+        for step in conversation.map(event) {
+            let message = match step {
+                Step::Finish(finish) => break 'drive Some(finish),
+                Step::Relay(message) => message,
+            };
+            sequence += 1;
+            if sequence as usize > rounds {
+                break 'drive None;
+            }
+            let style = message.style;
+            let answer = if let Some(relay) = &mut job.relay {
+                match relay.ask(sequence, vec![message]) {
+                    Ok(mut answers) => answers.pop().and_then(|answer| answer.text),
+                    Err(_) => break 'drive None,
+                }
+            } else {
+                if !supported_messages(std::slice::from_ref(&message), secret_used, visible_used) {
+                    break 'drive None;
+                }
+                match style {
+                    Style::Secret => {
+                        secret_used = true;
+                        secret.take().map(|mut password| password.take_answer())
+                    }
+                    Style::Visible => {
+                        visible_used = true;
+                        Some(AnswerText::new(job.user.clone()))
+                    }
+                    Style::Info | Style::Error => None,
+                }
+            };
+            if matches!(style, Style::Secret | Style::Visible) {
+                let Some(answer) = answer else {
+                    break 'drive None;
+                };
+                if conversation.answer(answer.as_str()).is_err() {
+                    break 'drive None;
+                }
+            }
+        }
+    };
+    drop(secret);
+    let Some(finish) = finish else {
+        // Nothing outlives this: no helper process waits for retirement.
+        conversation.cancel();
+        drop(conversation);
+        state.store(FREE, Ordering::Release);
+        let _ = job.reply.send(Reply::Retired(false));
+        return true;
+    };
+    let accepted = finish == Finish::Complete
+        && !job.cancel.is_canceled()
+        && !shutdown.load(Ordering::Acquire)
+        && job.relay.as_ref().is_none_or(|relay| relay.timely())
+        && Instant::now() < phase_deadline;
+    drop(conversation);
+    state.store(FREE, Ordering::Release);
+    let _ = job.reply.send(match finish {
+        Finish::Refused(refusal) => Reply::Refused(refusal),
+        _ => Reply::Retired(accepted),
+    });
     true
 }
 

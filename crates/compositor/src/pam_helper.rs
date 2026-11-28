@@ -40,7 +40,7 @@ pub enum Style {
     Error,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Message {
     pub index: u16,
@@ -65,6 +65,10 @@ pub struct AnswerText(String);
 impl AnswerText {
     pub fn new(text: String) -> Self {
         Self(text)
+    }
+    /// The answer, for a backend that forwards it (GDM's `AnswerQuery`).
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 impl std::fmt::Debug for AnswerText {

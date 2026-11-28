@@ -49,6 +49,9 @@ wayland-protocols.workspace = true
 wayland-server.workspace = true
 wayland-scanner = "=0.31.11"
 tuna-shell-control = { path = "../shell-control-schema", version = "0.1.0" }
+# GDM's reauthentication channel: the lock screen's PAM runs in GDM's
+# session worker when GDM started the session, as GNOME Shell's does.
+tuna-gdm = { path = "../gdm", version = "0.1.0" }
 tuna-output = { path = "../output", version = "0.1.0" }
 image.workspace = true
 tempfile = "3"

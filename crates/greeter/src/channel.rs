@@ -273,8 +273,10 @@ impl Greeter {
                 "no channel to GDM",
             ));
         };
+        // GDBus's default timeout, as libgdm's call leaves it.
+        let timeout = std::time::Duration::from_secs(25);
         let Some(address) =
-            reauthentication(gdm::open_reauthentication_channel(&system, user).await)?
+            reauthentication(gdm::open_reauthentication_channel(&system, user, timeout).await)?
         else {
             trace(&format!("greeter verifier user={user} channel=greeter"));
             return Ok(main);

@@ -5,6 +5,7 @@ members = [
     "crates/auth-prompt",
     "crates/backlight",
     "crates/compositor",
+    "crates/gdm",
     "crates/greeter",
     "crates/output",
     "crates/shell-control-schema",

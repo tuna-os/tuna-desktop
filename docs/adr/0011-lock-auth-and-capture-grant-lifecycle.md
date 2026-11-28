@@ -80,9 +80,28 @@ overlay with an empty window list.
   VM gate `V-NORMAL-INPUT-FAIL-CLOSED`.
 
 **PAM conversation.** The shell relays the user's answers over the control
-socket. The compositor runs the conversation in the private PAM helper
-(ADR 0010) against the `tuna-lock` service (`share/pam.d/tuna-lock`,
-which includes `login`) for `getpwuid(getuid())`.
+socket. Where PAM runs follows GNOME 51, whose unlock dialog verifies
+through GDM (`js/gdm/userVerifier.js`):
+
+- When GDM's reauthentication channel opens for the session, the compositor
+  runs the conversation in GDM's root session worker on `gdm-password`:
+  `Manager.OpenReauthenticationChannel` for `getpwuid(getuid())`, then the
+  channel's `UserVerifier` (`BeginVerificationForUser`; `Info`, `Problem`,
+  `InfoQuery` and `SecretInfoQuery` relayed, answers sent with
+  `AnswerQuery`; `Cancel` when the dialog is dismissed). Only
+  `VerificationComplete` for that service, timely and uncancelled, grants
+  (`crates/compositor/src/gdm_reauth.rs`; the GDM client in `crates/gdm` is
+  shared with the greeter).
+- In a session GDM started (logind's `Service` is a `gdm-*` service) whose
+  channel does not open, the attempt is refused; it never falls back to the
+  private helper.
+- Without GDM (nested sessions, other display managers), the compositor runs
+  the conversation in the private PAM helper (ADR 0010) against the
+  `tuna-lock` service (`share/pam.d/tuna-lock`, which includes `login`) for
+  `getpwuid(getuid())`.
+
+Both backends sit behind the same stable owner (`pam_backend::Backend`),
+so the rules below hold for either:
 
 - Every attempt is bound to its origin (control connection and request),
   attempt serial and lock epoch (`crates/compositor/src/runtime/auth.rs`;
@@ -98,18 +117,29 @@ which includes `login`) for `getpwuid(getuid())`.
   and others); `crates/compositor/tests/auth_owner_runtime.rs`
   (`actual_runtime_epoch_invalidation_and_public_sync_unlock`, run with
   `TUNA_REQUIRE_PAM_WRAPPER=1` in the CI `check` job);
-  `scripts/tuna-lock-auth-proof` in the `gtk-shell` lane. Detail:
+  `scripts/tuna-lock-auth-proof` in the `gtk-shell` lane;
+  `crates/compositor/tests/gdm_reauth.rs` against a GDM 51 fixture
+  (`gdm_reauthentication_relays_the_conversation_and_unlocks_only_on_completion`,
+  `without_gdm_the_private_helper_runs_and_a_gdm_session_never_does`,
+  `dismissing_the_lock_dialog_cancels_gdm_verification`,
+  `password_and_fingerprint_share_one_reauthentication_channel`,
+  `gdm_reauthentication_applies_pam_faillock`); VM gate `V-LOCK-FAILLOCK`
+  against GDM itself. Detail:
   [lock conversations](../security/lock-conversations.md),
   [password result ownership](../security/password-owner-epoch.md),
   [PAM conversation relay](../security/pam-conversation-relay.md).
 
 **Fingerprint through PAM (F5; fixed in #1173).** Fingerprint unlock runs
-`pam_fprintd` in the private PAM helper on its own PAM service,
-`tuna-lock-fingerprint` (`share/pam.d/tuna-lock-fingerprint`: `pam_fprintd`
-plus `login`'s account stack), as GNOME 51 runs `gdm-fingerprint`. The
-helper runs `pam_authenticate` then `pam_acct_mgmt`, so the account stack,
-`pam_faillock` and `pam_access` decide a fingerprint unlock as they decide a
-password one. The compositor asks fprintd only whether a reader and an
+`pam_fprintd` on its own PAM service: `gdm-fingerprint` in GDM's worker
+over the same reauthentication channel when GDM runs the session, otherwise
+`tuna-lock-fingerprint` in the private PAM helper
+(`share/pam.d/tuna-lock-fingerprint`: `pam_fprintd` plus `login`'s account
+stack), as GNOME 51 runs `gdm-fingerprint`. Both run `pam_authenticate` then
+`pam_acct_mgmt`, so the account stack and `pam_access` decide a fingerprint
+unlock as they decide a password one. Modules that keep root-owned state,
+such as `pam_faillock`'s tally, apply where root runs the stack, that is in
+GDM's worker and not in the private helper (L4). The
+compositor asks fprintd only whether a reader and an
 enrolled print exist and which scan type the reader has
 (`crates/compositor/src/fprintd.rs`). It enforces
 `enable-fingerprint-authentication` itself and admits three failed
@@ -150,6 +180,11 @@ clears the flag and hands the keyboard back through
   `Verification::Unretired`: the attempt is denied and the slot is
   quarantined (`Runtime::finish_unlock`). Evidence: `pam_helper.rs`
   (`private_pam_live_owned_process_is_quarantined_until_confirmed_retirement`).
+- *GDM's worker or channel.* A closed channel, `VerificationFailed`,
+  `ServiceUnavailable`, a reset or no result before the deadline denies the
+  attempt. A cancelled attempt sends GDM's `Cancel` and stops reading its
+  service before it retires, so nothing GDM sends later can grant it.
+  Evidence: `gdm_reauth.rs` (`dismissing_the_lock_dialog_cancels_gdm_verification`).
 - *Compositor.* `tuna-session` replaces itself with the compositor, so
   nothing restarts it. [INFERENCE] The session ends and its clients lose
   their display; no surface is shown unlocked. Untested.
@@ -316,11 +351,17 @@ that closes a risk below; "in progress" means a fix is still being built.
   keeps the slot busy. Before #1171 a flood of foreign lock requests could
   also leave the lock without a prompt (F3; ADR 0010 R5). All fail closed;
   logind `Unlock` or ending the session is the way out.
-- **L4. No compositor rate limit.** The compositor allows one attempt at a
-  time and nothing more. Throttling is whatever `login` includes. The helper
-  runs as the user, not root, so modules that need root, such as
-  `pam_faillock` tallies, may not apply. [INFERENCE, untested.] GNOME runs
-  `gdm-password` in GDM's root worker.
+- **L4. Rate limiting.** The compositor allows one attempt at a time and
+  adds no limit of its own; limits come from the PAM stack, as in GNOME 51.
+  In a session GDM started, the stack runs in GDM's root worker, so
+  `pam_faillock`, `pam_faildelay` and other modules with root-owned state
+  apply to unlocking as they do to logging in: VM gate `V-LOCK-FAILLOCK`
+  (`deny=3`: three wrong lock-screen passwords, then the right one is
+  refused and `faillock --user` lists the three) and
+  `gdm_reauthentication_applies_pam_faillock` (a real `pam_faillock` stack
+  behind a GDM fixture). Without GDM the private helper runs the stack as
+  the user, where such modules cannot keep their state; throttling there is
+  the stack's fail delay.
 - **L5. Revocation latency.** One 100 ms scan plus a compositor tick, and up
   to 5 s for an owner on a wedged bus. Remote grants that hold no keys wait
   for the scan after lock; their input is refused meanwhile.
@@ -378,8 +419,8 @@ that closes a risk below; "in progress" means a fix is still being built.
 ## Evidence
 
 - Tests named above, run by the CI `check` job.
-- VM gates above and `V-SUSPEND`, `V-SLEEP-*`, `V-LOCKED-HINT` in
-  `marlin-vm` ([VM lifecycle](../vm-lifecycle.md)).
+- VM gates above and `V-SUSPEND`, `V-SLEEP-*`, `V-LOCKED-HINT`,
+  `V-LOCK-FAILLOCK` in `marlin-vm` ([VM lifecycle](../vm-lifecycle.md)).
 - `portal-security` and `remote-security` lanes
   ([capture security](../capture-security.md),
   [remote desktop](../remote-desktop.md),

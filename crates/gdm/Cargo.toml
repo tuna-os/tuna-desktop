@@ -1,0 +1,13 @@
+[package]
+name = "tuna-gdm"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "GDM 51's private-channel D-Bus API (UserVerifier and Greeter), shared by Tuna Desktop's greeter and lock screen"
+
+[dependencies]
+glib.workspace = true
+gio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

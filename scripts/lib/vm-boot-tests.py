@@ -4619,10 +4619,12 @@ class DelayedAuthFailureDiagnostics(unittest.TestCase):
     SOURCE = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
 
     def observer(self, rows):
-        names = {"public_auth_identity", "classify_pam_helpers", "delayed_auth_state", "delayed_auth_error"}
+        names = {"public_auth_identity", "classify_pam_helpers", "gdm_reauth_workers",
+                 "delayed_auth_state", "delayed_auth_error"}
         nodes = [node for node in ast.parse(self.SOURCE.read_text()).body
                  if isinstance(node, ast.FunctionDef) and node.name in names]
         scope = {"OWNER": SimpleNamespace(pw_uid=1000), "COMPOSITOR": "tuna-compositor", "json": json,
+                 "GDM_WORKER": "gdm-session-worker",
                  "pam_process_snapshot": lambda: rows,
                  "pathlib": SimpleNamespace(Path=lambda _: SimpleNamespace(
                      stat=lambda: SimpleNamespace(st_dev=1, st_ino=78))),
@@ -5882,6 +5884,220 @@ class ShellMenuEndSession(unittest.TestCase):
                      "Wrong Person will be logged out automatically in 60 seconds",
                      valid["label"] + ". diary.txt"):
             self.assertFalse(lane.countdown_showing([title, countdown(text)], case, 60))
+
+
+class LockFaillock(unittest.TestCase):
+    """V-LOCK-FAILLOCK: the lock screen's password goes through GDM's worker,
+    so the login service's pam_faillock applies to it."""
+
+    GUEST = Path(__file__).resolve().parents[2] / "packaging/marlin/vm-lane/tuna-vm-lifecycle"
+
+    def guest(self, *names, **globals_):
+        tree = ast.parse(self.GUEST.read_text())
+        nodes = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in names)
+                 or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in names
+                                                        for t in n.targets))]
+        scope = {"re": re, "pathlib": __import__("pathlib"), **globals_}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(self.GUEST), "exec"), scope)
+        return scope
+
+    @staticmethod
+    def observation(**changes):
+        observed = {
+            "enable": {"service": "gdm-password", "deny": 3, "auth_faillock": 3,
+                       "account_faillock": 0, "user": "tuna-test", "count": 0, "rows": []},
+            "wrong_refusals": [True, True, True],
+            "right_refused": True,
+            "locked_after_right": True,
+            "status": {"user": "tuna-test", "count": 3, "rows": []},
+            "reset": {"user": "tuna-test", "count": 0, "rows": []},
+            "unlocked_after_reset": True,
+        }
+        observed.update(changes)
+        return observed
+
+    def test_the_gate_passes_only_when_deny_holds_and_the_tally_is_on_record(self):
+        ok, detail = lane.lock_faillock_ok(self.observation())
+        self.assertTrue(ok, detail)
+        self.assertIn("deny=3", detail)
+
+    def test_a_lock_that_accepts_the_right_password_after_three_failures_fails(self):
+        # A verifier that cannot record or read the tally (a PAM stack run
+        # as the session user): the right password unlocks, nothing listed.
+        unlocked = self.observation(right_refused=False, locked_after_right=False,
+                                    status={"user": "tuna-test", "count": 0, "rows": []})
+        ok, detail = lane.lock_faillock_ok(unlocked)
+        self.assertFalse(ok)
+        self.assertIn("the right password unlocked", detail)
+        self.assertIn("lists 0 failures", detail)
+        for broken in (
+            self.observation(enable={"service": "gdm-password", "deny": 3, "auth_faillock": 0,
+                                     "account_faillock": 0, "count": 0}),
+            self.observation(enable={"service": "gdm-password", "deny": 5, "auth_faillock": 3,
+                                     "account_faillock": 0, "count": 0}),
+            self.observation(wrong_refusals=[True, False, True]),
+            self.observation(status={"count": 2}),
+            self.observation(reset={"count": 3}),
+            self.observation(unlocked_after_reset=False),
+            {"enable": {}},
+        ):
+            self.assertFalse(lane.lock_faillock_ok(broken)[0], broken)
+
+    def test_refusals_count_pam_denials_the_shell_was_told_of(self):
+        def retired(request, canceled=False, authenticated=False):
+            return ("tuna-compositor: lock conversation " + json.dumps(
+                {"event": "retired", "service": "password", "request": request, "retired": True,
+                 "authenticated": authenticated, "canceled": canceled}))
+        denied = "tuna-shell-gtk: lock auth result service=password request={} applied=false"
+        self.assertEqual(lane.password_refusals([retired(4), denied.format(4)]), 1)
+        self.assertEqual(lane.password_refusals([retired(4)]), 0)
+        self.assertEqual(lane.password_refusals([retired(4, canceled=True), denied.format(4)]), 0)
+        self.assertEqual(lane.password_refusals([retired(4, authenticated=True), denied.format(4)]), 0)
+        self.assertEqual(lane.password_refusals(
+            ["tuna-shell-gtk: lock command result applied=false request_id=9"]), 1)
+        self.assertIsNone(lane.password_refusals(["tuna-compositor: lock conversation {"]))
+
+    def test_gdms_reauthentication_worker_is_admitted_as_the_pam_method(self):
+        expected = {"pid": 900, "start_ticks": 5000, "serial": 3, "epoch": 2,
+                    "origin": {"connection": 1, "request": 7}}
+        process = lambda **v: {"pid": 1, "uid": 1000, "ppid": 1, "pgrp": 1, "start_ticks": 1,
+                               "executable": "x", "exe_device": 1, "exe_inode": 1, **v}
+        desktop = process(pid=900, ppid=800, pgrp=900, start_ticks=5000, executable="tuna-compositor")
+        worker = process(pid=950, uid=0, ppid=700, pgrp=950, start_ticks=6000,
+                         executable="gdm-session-worker", exe_inode=7)
+        delay = process(pid=960, uid=0, ppid=950, pgrp=960, start_ticks=6100, executable="sleep")
+        admitted = lane.checked_auth_method(desktop, worker, delay, expected)
+        self.assertEqual(admitted["helper"], worker)
+        for bad_worker, bad_delay in (
+            (dict(worker, start_ticks=4000), delay),   # the session's login worker
+            (dict(worker, uid=1000), delay),           # not GDM's root worker
+            (worker, dict(delay, ppid=951)),           # not its delay
+            (worker, dict(delay, uid=1000)),
+            (worker, dict(delay, pgrp=950)),
+        ):
+            with self.assertRaises(ValueError):
+                lane.checked_auth_method(desktop, bad_worker, bad_delay, expected)
+        # The private helper keeps its exact checks.
+        helper = process(pid=910, ppid=900, pgrp=910, start_ticks=5100, executable="tuna-compositor")
+        own_delay = process(pid=911, ppid=910, pgrp=911, start_ticks=5200, executable="sleep")
+        self.assertEqual(lane.checked_auth_method(desktop, helper, own_delay, expected)["helper"], helper)
+        with self.assertRaises(ValueError):
+            lane.checked_auth_method(desktop, dict(helper, ppid=1), own_delay, expected)
+
+    def test_guest_reads_the_login_stack_through_its_includes(self):
+        with tempfile.TemporaryDirectory() as root:
+            etc, vendor = Path(root, "etc"), Path(root, "usr")
+            etc.mkdir()
+            vendor.mkdir()
+            scope = self.guest("pam_service_file", "pam_stack_modules", PAM_DIRS=(etc, vendor))
+            # GDM ships gdm-password in /usr/lib/pam.d (as on Marlin); pambase's
+            # stacks are in /etc/pam.d, which wins where both have a service.
+            (vendor / "gdm-password").write_text(
+                "auth     include        system-local-login\n"
+                "account  include        system-local-login\n"
+                "-session optional       pam_gnome_keyring.so auto_start\n")
+            (etc / "system-local-login").write_text("auth include system-login\naccount include system-login\n")
+            (etc / "system-login").write_text("auth substack system-auth\naccount include system-auth\n")
+            (vendor / "system-login").write_text("auth required pam_deny.so\n")
+            (etc / "system-auth").write_text(
+                "#%PAM-1.0\n"
+                "auth       required                    pam_faillock.so      preauth\n"
+                "-auth      [success=2 default=ignore]  pam_systemd_home.so\n"
+                "auth       [success=1 default=bad]     pam_unix.so          try_first_pass nullok\n"
+                "auth       [default=die]               pam_faillock.so      authfail\n"
+                "auth       required                    pam_faillock.so      authsucc\n"
+                "account    required                    pam_unix.so\n")
+            rows = scope["pam_stack_modules"]("gdm-password")
+            self.assertEqual(scope["pam_stack_modules"]("absent"), [])
+        auth = [module for kind, module in rows if kind == "auth"]
+        self.assertEqual(auth.count("pam_faillock.so"), 3)
+        self.assertNotIn(("auth", "pam_deny.so"), rows)
+        self.assertIn(("auth", "pam_systemd_home.so"), rows)
+        self.assertIn(("session", "pam_gnome_keyring.so"), rows)
+        self.assertIn(("account", "pam_unix.so"), rows)
+
+    def test_guest_parses_faillock_records_without_anything_else(self):
+        rows = self.guest("FAILLOCK_ROW", "faillock_rows")["faillock_rows"](
+            "tuna-test:\n"
+            "When                Type  Source                                           Valid\n"
+            "2026-11-21 00:56:25 TTY   /dev/tty2                                            V\n"
+            "2026-11-21 00:56:27 SVC   gdm-password                                         V\n"
+            "2026-11-21 00:56:29 TTY   /dev/tty2                                            I\n")
+        self.assertEqual([row["source"] for row in rows], ["/dev/tty2", "gdm-password", "/dev/tty2"])
+        self.assertEqual([row["valid"] for row in rows], ["V", "V", "I"])
+        self.assertEqual(rows[0], {"when": "2026-11-21 00:56:25", "type": "TTY",
+                                   "source": "/dev/tty2", "valid": "V"})
+
+    def test_guest_takes_only_gdm_workers_started_for_this_lock(self):
+        workers = self.guest("GDM_WORKER", "gdm_reauth_workers")["gdm_reauth_workers"]
+        desktop = {"start_ticks": 5000}
+        row = lambda **v: {"executable": "gdm-session-worker", "uid": 0, "_state": "S",
+                           "start_ticks": 6000, **v}
+        rows = [row(pid=1), row(pid=2, start_ticks=4000), row(pid=3, uid=1000),
+                row(pid=4, _state="Z"), row(pid=5, executable="sleep")]
+        self.assertEqual([r["pid"] for r in workers(rows, desktop)], [1])
+
+    def test_guest_observes_gdms_worker_running_the_delayed_stack(self):
+        observe = lambda rows: DelayedAuthFailureDiagnostics.observer(
+            SimpleNamespace(SOURCE=self.GUEST), rows)["delayed_auth_state"](600, 1500)
+        desktop = dict(pid=600, uid=1000, ppid=2, pgrp=2, start_ticks=1500,
+                       executable="tuna-compositor", exe_device=1, exe_inode=77,
+                       _marked=False, _private=False, _state="S")
+        login = dict(desktop, pid=500, uid=0, ppid=1, pgrp=500, start_ticks=1000,
+                     executable="gdm-session-worker", exe_inode=5)
+        worker = dict(login, pid=650, ppid=500, pgrp=650, start_ticks=1600)
+        delay = dict(desktop, pid=660, uid=0, ppid=650, pgrp=660, start_ticks=1650,
+                     executable="sleep", exe_inode=78)
+        public = lambda row: {k: v for k, v in row.items() if not k.startswith("_")}
+        state = observe([desktop, login, worker, delay])
+        self.assertIs(state["real_pam_delay_running"], True)
+        self.assertEqual(state["helpers"], [public(worker)])
+        self.assertEqual(state["delays"], [public(delay)])
+        # A delay under the session's login worker is not this lock's method.
+        self.assertIs(observe([desktop, login, dict(delay, ppid=500)])["real_pam_delay_running"], False)
+
+    def test_lock_pam_edits_cover_gdms_stack_and_restore_both(self):
+        source = self.GUEST.read_text()
+        for action in ("delay-unlock", "deny-unlock"):
+            branch = source.split(f'elif action == "{action}":', 1)[1].split("elif action ==", 1)[0]
+            self.assertIn("unlock_pam_services()", branch, action)
+            self.assertIn("override_pam_service(name, ", branch, action)
+        restore = source.split('elif action == "restore-unlock":', 1)[1].split("elif action ==", 1)[0]
+        self.assertIn("(pathlib.Path(LOCK_PAM).name, LOGIN_SERVICE)", restore)
+        self.assertIn("restore_pam_service(name)", restore)
+        self.assertIn("raise RuntimeError", restore)
+
+    def test_guest_overrides_a_vendor_service_through_etc_and_restores_it(self):
+        with tempfile.TemporaryDirectory() as root:
+            etc, vendor = Path(root, "etc"), Path(root, "usr")
+            etc.mkdir()
+            vendor.mkdir()
+            scope = self.guest("pam_service_file", "unlock_pam_services", "override_pam_service",
+                               "restore_pam_service", PAM_DIRS=(etc, vendor),
+                               LOCK_PAM=str(etc / "tuna-lock"), LOGIN_SERVICE="gdm-password")
+            (etc / "tuna-lock").write_text("auth include login\n")
+            (vendor / "gdm-password").write_text("auth include system-local-login\n")
+            self.assertEqual(scope["unlock_pam_services"](), ["tuna-lock", "gdm-password"])
+            for name in scope["unlock_pam_services"]():
+                scope["override_pam_service"](name, "auth required pam_deny.so\n")
+            self.assertEqual(scope["pam_service_file"]("gdm-password"), etc / "gdm-password")
+            for name in ("tuna-lock", "gdm-password"):
+                self.assertEqual((etc / name).read_text(), "auth required pam_deny.so\n")
+            self.assertEqual((vendor / "gdm-password").read_text(), "auth include system-local-login\n")
+            self.assertEqual([scope["restore_pam_service"](name) for name in ("tuna-lock", "gdm-password")],
+                             [True, True])
+            self.assertEqual((etc / "tuna-lock").read_text(), "auth include login\n")
+            self.assertEqual(scope["pam_service_file"]("gdm-password"), vendor / "gdm-password")
+            self.assertEqual(sorted(path.name for path in etc.iterdir()), ["tuna-lock"])
+            self.assertIs(scope["restore_pam_service"]("gdm-password"), False)
+
+    def test_password_queries_count_the_compositors_password_questions(self):
+        query = lambda service: "tuna-compositor: lock conversation " + json.dumps(
+            {"event": "query", "service": service, "request": 9, "secret": True})
+        self.assertEqual(lane.password_queries([query("password"), query("fingerprint")]), 1)
+        self.assertEqual(lane.password_queries(["tuna-shell-gtk: lock auth query service=password"]), 0)
+        self.assertIsNone(lane.password_queries(["tuna-compositor: lock conversation {"]))
+
 
 
 if __name__ == "__main__":

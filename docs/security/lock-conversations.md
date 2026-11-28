@@ -17,6 +17,37 @@ GDM 51 [gdm-session-worker.c](https://gitlab.gnome.org/GNOME/gdm/-/blob/51.0/dae
 and fprintd's [pam_fprintd.c](https://gitlab.freedesktop.org/libfprint/fprintd/-/blob/master/pam/pam_fprintd.c)
 with [fingerprint-strings.h](https://gitlab.freedesktop.org/libfprint/fprintd/-/blob/master/pam/fingerprint-strings.h).
 
+## Where PAM runs
+
+GNOME Shell's unlock dialog does not run PAM itself: it opens GDM's
+reauthentication channel (`Gdm.Client.open_reauthentication_channel`,
+`js/gdm/userVerifier.js`) and GDM's root session worker runs `gdm-password`
+and `gdm-fingerprint`. The compositor does the same whenever GDM's channel
+opens for the session (`crates/compositor/src/gdm_reauth.rs`, over the GDM
+client in `crates/gdm` that the greeter uses): `OpenReauthenticationChannel`
+for the session user, then `BeginVerificationForUser` on the channel's
+`UserVerifier`. GDM's `Info` and `Problem` become the relay's info and error
+messages, `InfoQuery` and `SecretInfoQuery` its visible and secret questions
+(answered with `AnswerQuery`), and only `VerificationComplete` for the
+conversation's own service, timely and uncancelled, retires it authenticated;
+`VerificationFailed` or `ServiceUnavailable` keep GDM's class (failed,
+expired, too many tries, unavailable), and a dismissed dialog sends GDM's
+`Cancel`. The password and fingerprint conversations share one channel, as
+GNOME's do. Both run on the same stable owners, Slots and epochs as below, so
+every ownership rule here holds for either backend, and the legacy
+single-password `Unlock` answers GDM's one question itself.
+
+Which backend runs is decided per attempt: GDM's channel when it opens; a
+refusal when it does not open in a session GDM started (logind's `Service`
+is a `gdm-*` service), as GNOME's unlock dialog cannot verify without it;
+otherwise (no GDM: nested sessions, other display managers) the private
+helper on `tuna-lock` and `tuna-lock-fingerprint`, unchanged. With
+`TUNA_LOCK_TRACE` each attempt logs `lock verification backend` with its
+service and backend. Tests: `crates/compositor/tests/gdm_reauth.rs` against a
+GDM 51 fixture (relay and completion, selection, cancellation, the shared
+channel, and a real `pam_faillock` stack); VM gate `V-LOCK-FAILLOCK` against
+GDM itself.
+
 ## Wire (shell protocol 0.44)
 
 `BeginVerification { service }` starts one conversation for the session's
@@ -64,16 +95,20 @@ the conversation's Slot attempt, so the VM lanes bind it the same way.
 ## Fingerprint conversation
 
 GNOME runs `gdm-fingerprint`: `pam_fprintd` plus that service's account
-stack. The compositor does the same (#1162 F5). The fingerprint conversation
-is a PAM transaction on its own service, `tuna-lock-fingerprint`
+stack. The compositor does the same (#1162 F5): through GDM's channel on
+`gdm-fingerprint` when GDM runs the session (above), otherwise as a PAM
+transaction on its own service, `tuna-lock-fingerprint`
 (`share/pam.d/tuna-lock-fingerprint`: `auth required pam_fprintd.so`,
 `account include login`, installed beside `tuna-lock`), in its own private
-helper (`Backend::live_fingerprint`, a second stable owner so it runs beside
-the password helper) on its own Slot (`MethodKind::Fingerprint`). The
-helper runs `pam_authenticate` then `pam_acct_mgmt`, so an expired or
-locked account, `pam_access` or faillock refuses a finger exactly as it
-refuses a password; a match alone never unlocks. The attempt retires only
-on its helper's retirement, like the password conversation's.
+helper. Either way it has its own stable owner (`Backend::live_fingerprint`,
+so it runs beside the password conversation) and its own Slot
+(`MethodKind::Fingerprint`). Both stacks run `pam_authenticate` then
+`pam_acct_mgmt`, so an expired or locked account or `pam_access` refuses a
+finger exactly as it refuses a password; a match alone never unlocks.
+Modules that keep root-owned state, such as `pam_faillock`'s tally, apply
+where root runs the stack: in GDM's worker, not in the private helper. The
+attempt retires only when its backend has retired, like the password
+conversation's.
 
 Before PAM runs, a probe off the loop reads
 `org.gnome.login-screen enable-fingerprint-authentication` afresh (the
