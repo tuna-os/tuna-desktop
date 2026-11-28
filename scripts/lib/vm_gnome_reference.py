@@ -237,9 +237,9 @@ def validate_payload(evidence):
                 and re.fullmatch('[0-9a-f]{64}', value.get('receipt_sha256', '')) is not None,
                 'missing actual fixed original payload receipt')
         if key in ('stock', 'current_tuna'):
-            require(type(value.get('checked_files')) is int and value['checked_files'] >= (4 if key == 'stock' else 6),
+            require(type(value.get('checked_files')) is int and value['checked_files'] >= (4 if key == 'stock' else 7),
                     'missing actual original ELF manifest checks')
-            require(key != 'current_tuna' or value['checked_files'] == 6, 'current payload is not the exact six original ELFs')
+            require(key != 'current_tuna' or value['checked_files'] == 7, 'current payload is not the exact seven original ELFs')
         else:
             require(isinstance(value.get('packages'), dict) and bool(value['packages'])
                     and all(isinstance(n, str) and isinstance(v, str) and n and v for n, v in value['packages'].items()),

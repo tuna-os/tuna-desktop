@@ -633,7 +633,8 @@ jobs:
       - run: python3 scripts/tests/test_drm_input_startup.py
       - run: scripts/ci-install-vkms
       - run: scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts
-      # D-MIRROR-DISABLE, D-LAYOUT-KEEP, D-WORKSPACES-PRIMARY, D-SCALE-MIXED:
+      # D-MIRROR-DISABLE, D-LAYOUT-KEEP, D-WORKSPACES-PRIMARY,
+      # D-WORKSPACE-SLIDE-MULTI, D-SCALE-MIXED:
       # two connectors of a vkms configfs device; the lines join drm-smoke's
       # assertions.txt, the parity ledger's input.
       - run: scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt
@@ -1165,7 +1166,7 @@ jobs:
         id: proof-binaries
         if: ${{ !cancelled() }}
         run: |
-          cargo build --locked -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host
+          cargo build --locked -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host -p tuna-x11-frames
           cargo build --locked -p tuna-compositor --example icon-probe --example shortcut-inhibit-client
       # Qualify sound gates before unrelated full-shell stages can stop them.
       - name: Prove visual bells and output-slider feedback independently
@@ -1214,6 +1215,16 @@ jobs:
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/tuna-gtk-shell-proof --grid-hover-only --artifacts gtk-shell-artifacts/grid-hover
+      # Server-side frames for X11 windows (P-WM-10): the handshake with
+      # tuna-x11-frames, real pointer input on the title bar, undecorated
+      # windows left alone and recovery from a dead frames client. The same
+      # gates as in the full proof, independently of its earlier stages.
+      - name: X11 window frames
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
+        timeout-minutes: 5
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: scripts/tuna-gtk-shell-proof --x11-frames-only --artifacts gtk-shell-artifacts/x11-frames
       # Searches with results must hand their shm buffers back (#1084):
       # the shell's GDK mappings and both processes' descriptors stay put.
       - name: Overview searches leave no shm buffers behind
@@ -1316,7 +1327,7 @@ jobs:
           [ ${#layer_shell[@]} -gt 0 ] || layer_shell=(/usr/local/lib/libgtk4-layer-shell.so*)
           [ ${#layer_shell[@]} -gt 0 ] || layer_shell=(/usr/local/lib/libgtk4-layer-shell.so)
           missing=0
-          for file in target/debug/tuna-compositor target/debug/tuna-shell-gtk target/debug/tuna-wallpaper-svg "${layer_shell[@]}"; do
+          for file in target/debug/tuna-compositor target/debug/tuna-shell-gtk target/debug/tuna-wallpaper-svg target/debug/tuna-x11-frames "${layer_shell[@]}"; do
             if [ -e "$file" ]; then
               cp "$file" gtk-shell-artifacts/bin/
             else
@@ -1676,7 +1687,7 @@ jobs:
           pkg=$(ls packaging/arch/tuna-desktop-[0-9]*.pkg.tar.zst)
           namcap "$pkg" || true
           pacman -U --noconfirm "$pkg"
-          for bin in tuna-compositor tuna-session tuna-shell-host tuna-wallpaper-svg; do "$bin" --version; done
+          for bin in tuna-compositor tuna-session tuna-shell-host tuna-wallpaper-svg tuna-x11-frames; do "$bin" --version; done
           test -f /usr/share/wayland-sessions/tuna.desktop
           # Exact temporary bridge: installed-layout proof, not an upgrade test.
           for path in /usr/share/wayland-sessions/roost.desktop /etc/pam.d/roost-lock; do  # tuna-rename: keep
