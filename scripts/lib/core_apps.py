@@ -642,9 +642,12 @@ class Desktop(NativeDesktop):
             if len(found) != 1:
                 raise RuntimeError('actual native chooser content cell not unique')
             self.click_path(picker, found[0]['path'])
+            # The grid rebinds its cell widgets as it scrolls, so the chosen
+            # file keeps its name, not its accessible path (run 46102176916:
+            # tone.ogg selected and focused under a new path).
             self.await_state('picker-actual-selected-content', lambda: self.tree(picker),
-                             lambda value: any(node['path'] == found[0]['path'] and node['selected']
-                                               for node in value['nodes']))
+                             lambda value: [node['name'] for node in cells(value) if node['selected']]
+                             == [found[0]['name']])
         return picker
 
     def _picker_listing_diagnostic(self, picker):
