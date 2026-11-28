@@ -9,13 +9,16 @@
 //! there and its success makes GDM switch to that session (user
 //! switching); `AccessDenied` sends the conversation to the greeter's own
 //! channel. Calls go out one at a time, in order, each on the channel of
-//! the begin it belongs to.
+//! the begin it belongs to. A `Cancel` on the greeter's channel holds the
+//! rest until GDM's `Reset`: gdm-manager.c resets the session from an idle
+//! after the cancel's reply (`queue_session_reset`), and that reset stops
+//! every conversation, so a begin GDM took before it would be lost.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 
-use crate::gdm::{self, Call};
+use crate::gdm::{self, Call, Signal};
 use crate::{trace, Greeter, GREETER};
 
 pub struct Channel {
@@ -33,6 +36,8 @@ pub struct Channels {
     next_id: Cell<u64>,
     /// Begins that went to a user's re-authentication channel.
     reauth: RefCell<HashSet<u64>>,
+    /// `Reset`s seen on the greeter's channel.
+    resets: Cell<u64>,
 }
 
 impl Channels {
@@ -51,22 +56,37 @@ impl Channels {
 struct Queue {
     calls: VecDeque<(Call, Option<u64>)>,
     pumping: bool,
+    /// Nothing goes out until GDM's `Reset` of a `Cancel`.
+    held: bool,
 }
 
 impl Queue {
-    /// Queue a call; whether a pump must start (none is running).
+    /// Queue a call; whether a pump must start (none is running or held).
     fn push(&mut self, call: Call, request: Option<u64>) -> bool {
         self.calls.push_back((call, request));
         !std::mem::replace(&mut self.pumping, true)
     }
 
-    /// The next call to make; `None` ends the pump.
+    /// The next call to make; `None` ends the pump. A held pump stays
+    /// owed: the release starts it again.
     fn pop(&mut self) -> Option<(Call, Option<u64>)> {
+        if self.held {
+            return None;
+        }
         let next = self.calls.pop_front();
         if next.is_none() {
             self.pumping = false;
         }
         next
+    }
+
+    fn hold(&mut self) {
+        self.held = true;
+    }
+
+    /// End the hold; whether a pump must start.
+    fn release(&mut self) -> bool {
+        std::mem::replace(&mut self.held, false)
     }
 }
 
@@ -130,6 +150,14 @@ fn after_reply(ok: bool, begin: Option<u64>, on_main: bool, chosen: Option<Strin
     }
 }
 
+/// Whether the calls after this one wait for GDM's `Reset`: a `Cancel`
+/// GDM took on the greeter's channel, unless its `Reset` already came. A
+/// re-authentication channel's cancel closes the channel instead
+/// (`on_reauthentication_cancelled`).
+fn awaits_reset(call: &Call, ok: bool, on_main: bool, reset_seen: bool) -> bool {
+    matches!(call, Call::Cancel) && ok && on_main && !reset_seen
+}
+
 /// What a closed channel was to the greeter.
 #[derive(Debug, PartialEq, Eq)]
 struct Closed {
@@ -154,7 +182,11 @@ impl Greeter {
         let weak = Rc::downgrade(self);
         let signals = gdm::subscribe(&connection, move |signal| {
             if let Some(greeter) = weak.upgrade() {
-                greeter.on_signal(signal);
+                if signal == Signal::Reset {
+                    greeter.on_reset(id);
+                } else {
+                    greeter.on_signal(signal);
+                }
             }
         });
         // `closed` may be emitted, and its handler dropped, off this
@@ -186,9 +218,12 @@ impl Greeter {
             Call::JsonReply { service, .. } => trace(&format!("greeter reply service={service}")),
             other => trace(&format!("greeter call {other:?}")),
         }
-        if !self.channels.queue.borrow_mut().push(call, request) {
-            return;
+        if self.channels.queue.borrow_mut().push(call, request) {
+            self.pump();
         }
+    }
+
+    fn pump(self: &Rc<Self>) {
         let greeter = self.clone();
         glib::spawn_future_local(async move {
             loop {
@@ -239,6 +274,7 @@ impl Greeter {
             }
         }
         let (interface, method, args) = call.wire();
+        let resets = self.channels.resets.get();
         let result = channel
             .connection
             .call_future(
@@ -255,11 +291,37 @@ impl Greeter {
         if let Err(error) = &result {
             eprintln!("tuna-greeter: {method}: {}", error.message());
         }
+        if awaits_reset(
+            &call,
+            result.is_ok(),
+            on_main,
+            self.channels.resets.get() != resets,
+        ) {
+            self.channels.queue.borrow_mut().hold();
+        }
         let chosen = self.chosen_session.borrow().clone();
         match after_reply(result.is_ok(), begin, on_main, chosen) {
             After::Nothing => {}
             After::SelectSession(session) => self.send(Call::SelectSession { session }),
             After::FailBegin(request) => self.fail_begin(request),
+        }
+    }
+
+    /// GDM reset the session on channel `id`: its begins are over, and on
+    /// the greeter's channel the calls held for it go out.
+    fn on_reset(self: &Rc<Self>, id: u64) {
+        trace("greeter reset");
+        let inputs = self.host.session_reset(id);
+        self.feed(inputs);
+        if self.channels.main_id() == Some(id) {
+            self.channels.resets.set(self.channels.resets.get() + 1);
+            self.release_calls();
+        }
+    }
+
+    fn release_calls(self: &Rc<Self>) {
+        if self.channels.queue.borrow_mut().release() {
+            self.pump();
         }
     }
 
@@ -345,6 +407,8 @@ impl Greeter {
         let inputs = self.host.channel_closed(id, true);
         self.feed(inputs);
         self.on_gdm_closed();
+        // No `Reset` comes on a closed channel.
+        self.release_calls();
         self.connect();
     }
 }
@@ -376,6 +440,46 @@ mod tests {
         assert_eq!(queue.pop(), Some((Call::GetTimedLoginDetails, None)));
         assert_eq!(queue.pop(), None);
         assert!(queue.push(Call::Cancel, None), "an ended pump starts again");
+    }
+
+    #[test]
+    fn calls_after_a_cancel_wait_for_gdms_reset() {
+        let mut queue = Queue::default();
+        assert!(queue.push(Call::Cancel, None));
+        assert_eq!(queue.pop(), Some((Call::Cancel, None)));
+        // GDM answered the cancel; its reset is still to come.
+        queue.hold();
+        assert!(
+            !queue.push(begin("mary"), Some(2)),
+            "a held pump is still owed"
+        );
+        assert_eq!(queue.pop(), None, "nothing goes out while held");
+        assert!(!queue.push(Call::GetTimedLoginDetails, None));
+        assert!(queue.release(), "the reset starts the pump again");
+        assert!(!queue.release(), "once");
+        assert_eq!(queue.pop(), Some((begin("mary"), Some(2))));
+        assert_eq!(queue.pop(), Some((Call::GetTimedLoginDetails, None)));
+        assert_eq!(queue.pop(), None);
+        assert!(queue.push(Call::Cancel, None), "an ended pump starts again");
+        assert!(!queue.release(), "a reset with nothing held pumps nothing");
+    }
+
+    #[test]
+    fn only_a_cancel_gdm_took_on_the_greeters_channel_awaits_a_reset() {
+        assert!(awaits_reset(&Call::Cancel, true, true, false));
+        assert!(
+            !awaits_reset(&Call::Cancel, true, true, true),
+            "its reset already came"
+        );
+        assert!(
+            !awaits_reset(&Call::Cancel, false, true, false),
+            "GDM refused it: no reset is queued"
+        );
+        assert!(
+            !awaits_reset(&Call::Cancel, true, false, false),
+            "a re-authentication channel closes instead"
+        );
+        assert!(!awaits_reset(&begin("mary"), true, true, false));
     }
 
     #[test]

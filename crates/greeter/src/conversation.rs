@@ -29,8 +29,10 @@
 //!   `ChoiceQuery` a choice list, and only the outstanding step may be
 //!   answered; `Info`/`Problem` become messages.
 //! - A cancel is `Cancel()`, after which GDM resets and stops every
-//!   conversation: a cancelled begin's result is its
-//!   `ConversationStopped` (at once when nothing ran).
+//!   conversation. A cancelled begin's result is its
+//!   `ConversationStopped` when its worker stopped on its own first, else
+//!   GDM's `Reset`, which ends every begin on its channel without one
+//!   (at once when nothing ran).
 //! - `_canRetry`: with a user, `allowed-failures` times, then give up.
 //!
 //! Pure: GDM calls are queued as [`Call`]s for the D-Bus layer, and GDM
@@ -646,6 +648,33 @@ impl Conversations {
         let (gone, kept): (Vec<Begun>, Vec<Begun>) = std::mem::take(&mut state.retiring)
             .into_iter()
             .partition(on);
+        state.retiring = kept;
+        owed.extend(gone);
+        owed.into_iter()
+            .map(|begun| Input::Result {
+                request: begun.request,
+                applied: false,
+            })
+            .collect()
+    }
+
+    /// GDM reset the session on `channel` (`Reset`). gdm-manager.c
+    /// answers `Cancel` with `queue_session_reset`, whose
+    /// `gdm_session_reset` emits `Reset` and then stops every conversation
+    /// at once (`stop_all_conversations` → `stop_conversation_now`, which
+    /// drops the worker's child watch), so no `ConversationStopped`
+    /// follows for a worker still running: every begin that went out on
+    /// the channel is over and denied. Begins still waiting to go out
+    /// are not GDM's yet.
+    pub fn session_reset(&self, channel: u64) -> Vec<Input> {
+        let mut state = self.state.borrow_mut();
+        let mut owed: Vec<Begun> = Vec::new();
+        if state.current.as_ref().is_some_and(|b| b.channel == channel) {
+            owed.extend(state.current.take());
+        }
+        let (gone, kept): (Vec<Begun>, Vec<Begun>) = std::mem::take(&mut state.retiring)
+            .into_iter()
+            .partition(|b| b.channel == channel);
         state.retiring = kept;
         owed.extend(gone);
         owed.into_iter()
@@ -1721,6 +1750,69 @@ mod tests {
                 user: s(USER)
             })
         );
+    }
+
+    /// GDM 51 without `gdm-switchable-auth` (run 46131762438): its
+    /// `ServiceUnavailable` comes before the begin's error, the cancel of
+    /// the soft reset reaches GDM before the stopped worker exits, and
+    /// GDM's reset kills it without `ConversationStopped`: the `Reset`
+    /// ends the begin.
+    #[test]
+    fn gdms_reset_ends_the_begins_that_went_out_on_its_channel() {
+        let c = Conversations::new(AuthPolicy::default());
+        c.set_user(Some(USER.into()));
+        let first = c.begin(AuthService::Password).unwrap();
+        c.set_channel(first, 1);
+        c.take_calls();
+        assert!(c
+            .on_signal(&Signal::ServiceUnavailable {
+                service: s(SWITCHABLE_SERVICE),
+                message: s("PAM service gdm-switchable-auth was not found"),
+            })
+            .is_empty());
+        assert_eq!(c.take_inputs(), vec![Input::Mechanisms]);
+        assert!(c.select(&c.default_mechanism().unwrap()));
+        c.take_inputs();
+        assert_eq!(c.cancel(), Some(first));
+        assert!(c.take_inputs().is_empty(), "the running one must stop");
+        assert!(c.begin_failed(first).is_empty(), "no longer current");
+        assert!(c.session_reset(2).is_empty(), "another channel's reset");
+        assert_eq!(
+            c.session_reset(1),
+            vec![Input::Result {
+                request: first,
+                applied: false
+            }]
+        );
+        let second = c.begin(AuthService::Password).unwrap();
+        assert_eq!(
+            c.take_calls(),
+            vec![
+                Call::Cancel,
+                Call::BeginVerificationForUser {
+                    service: s(PASSWORD_SERVICE),
+                    user: s(USER)
+                }
+            ]
+        );
+        assert!(
+            c.session_reset(1).is_empty(),
+            "a begin still waiting to go out is not GDM's yet"
+        );
+        c.set_channel(second, 1);
+        assert_eq!(
+            c.session_reset(1),
+            vec![Input::Result {
+                request: second,
+                applied: false
+            }],
+            "GDM resetting on its own stops the running one too"
+        );
+        assert!(c
+            .on_signal(&Signal::ConversationStopped {
+                service: s(PASSWORD_SERVICE)
+            })
+            .is_empty());
     }
 
     #[test]
