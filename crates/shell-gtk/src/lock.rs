@@ -653,9 +653,11 @@ impl LockUi {
                             .find(|s| s.curtain.active() == Page::Prompt)
                             .or_else(|| screens.first());
                         if let Some(screen) = screen {
-                            screen
-                                .message
-                                .announce(&text, gtk::AccessibleAnnouncementPriority::High);
+                            crate::accessibility::announce_at(
+                                &screen.message,
+                                &text,
+                                gtk::AccessibleAnnouncementPriority::High,
+                            );
                         }
                     }
                     Effect::ShowPrompt => {
