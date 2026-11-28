@@ -467,12 +467,6 @@ pub enum LaunchState {
     },
 }
 
-/// Spawn `entry` detached from the shell's stdio and track it.
-///
-/// Direct `argv` execution — no shell, so `Exec` field codes parsed
-/// by the crate cannot smuggle redirections or substitutions. The
-/// child is an orphan on purpose: shell restarts (001 supervision)
-/// must not take launched apps down.
 /// Session variables every launched app inherits on top of the shell's
 /// own environment (#59: `DISPLAY` once XWayland is up). Set from the
 /// compositor's `Environment` message.
@@ -537,8 +531,15 @@ pub fn application_launch_context() -> gio::AppLaunchContext {
     context
 }
 
-pub fn launch(entry: &AppEntry) -> io::Result<Launched> {
-    spawn(&entry.app_id, &entry.argv, &[])
+/// Spawn `entry` detached from the shell's stdio, returning its pid.
+///
+/// Direct `argv` execution — no shell, so `Exec` field codes parsed
+/// by the crate cannot smuggle redirections or substitutions. The
+/// child stays the shell's (no double fork, as in GNOME) and the GLib
+/// main loop reaps it when it exits ([`Launched::reap_on_exit`]); shell
+/// restarts (001 supervision) do not take launched apps down.
+pub fn launch(entry: &AppEntry) -> io::Result<u32> {
+    spawn(&entry.app_id, &entry.argv, &[]).map(Launched::reap_on_exit)
 }
 
 /// [`launch`] with `environment` added to the child's, as GNOME's
@@ -547,13 +548,13 @@ pub fn launch(entry: &AppEntry) -> io::Result<Launched> {
 pub fn launch_with_environment(
     entry: &AppEntry,
     environment: &[(String, String)],
-) -> io::Result<Launched> {
-    spawn(&entry.app_id, &entry.argv, environment)
+) -> io::Result<u32> {
+    spawn(&entry.app_id, &entry.argv, environment).map(Launched::reap_on_exit)
 }
 
 /// Run a [`DesktopAction`] of `app_id` (`launch_action`).
-pub fn launch_action(app_id: &str, action: &DesktopAction) -> io::Result<Launched> {
-    spawn(app_id, &action.argv, &[])
+pub fn launch_action(app_id: &str, action: &DesktopAction) -> io::Result<u32> {
+    spawn(app_id, &action.argv, &[]).map(Launched::reap_on_exit)
 }
 
 /// `shell_app_open_new_window` (gnome-shell 51 src/shell-app.c:574-623):
@@ -562,9 +563,9 @@ pub fn launch_action(app_id: &str, action: &DesktopAction) -> io::Result<Launche
 /// window). GNOME's middle step, a running app's exported
 /// `app.new-window` action, needs the app's D-Bus action group, which
 /// the shell does not track.
-pub fn open_new_window(entry: &AppEntry) -> io::Result<Launched> {
+pub fn open_new_window(entry: &AppEntry) -> io::Result<u32> {
     match &entry.new_window.action_argv {
-        Some(argv) => spawn(&entry.app_id, argv, &[]),
+        Some(argv) => spawn(&entry.app_id, argv, &[]).map(Launched::reap_on_exit),
         None => launch(entry),
     }
 }
@@ -593,6 +594,21 @@ fn spawn(
 }
 
 impl Launched {
+    /// Hand the child to the GLib main loop to reap when it exits, its
+    /// pid returned: gnome-shell launches with `G_SPAWN_DO_NOT_REAP_CHILD`
+    /// and `wait_pid` adds a `g_child_watch_add` that closes the pid
+    /// (gnome-shell 51 src/shell-app.c:1286-1292, :1427-1441). A launch
+    /// nobody tracks would otherwise stay a zombie of the shell after it
+    /// exits, its pid never freed.
+    pub fn reap_on_exit(mut self) -> u32 {
+        if self.child.take().is_some() {
+            if let Ok(pid) = i32::try_from(self.pid) {
+                gio::glib::child_watch_add(gio::glib::Pid(pid), |_, _| {});
+            }
+        }
+        self.pid
+    }
+
     /// Poll the child without blocking: reaps on exit.
     pub fn state(&mut self) -> LaunchState {
         let running = match self.child.as_mut().and_then(|c| c.try_wait().ok()) {
@@ -630,7 +646,7 @@ impl LaunchTracker {
 
     /// Spawn `entry` and track it for feedback.
     pub fn launch(&mut self, entry: &AppEntry) -> io::Result<u32> {
-        let launched = launch(entry)?;
+        let launched = spawn(&entry.app_id, &entry.argv, &[])?;
         let pid = launched.pid;
         let queue = self.launches.entry(entry.app_id.clone()).or_default();
         queue.push(launched);
@@ -1096,11 +1112,30 @@ Type=Application
             OsString::from(format!("printf %s \"$DRI_PRIME\" >{}", out.display())),
         ];
         launch_with_environment(&entry, &[("DRI_PRIME".to_owned(), "1".to_owned())])
-            .expect("launch")
-            .child
-            .expect("child")
-            .wait()
-            .expect("wait");
+            .expect("launch");
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(20)
+            && std::fs::read_to_string(&out).unwrap_or_default().is_empty()
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(std::fs::read_to_string(&out).expect("read"), "1");
+    }
+
+    #[test]
+    fn an_exited_launch_is_reaped() {
+        let mut entry = new_window_entry("");
+        entry.argv = vec![OsString::from("true")];
+        let pid = launch(&entry).expect("launch");
+        // gnome-shell's child watch: the exited app leaves no zombie
+        // behind once the shell's main loop runs.
+        let context = gio::glib::MainContext::default();
+        let proc = PathBuf::from(format!("/proc/{pid}"));
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(20) && proc.exists() {
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!proc.exists(), "launched pid {pid} was never reaped");
     }
 }
