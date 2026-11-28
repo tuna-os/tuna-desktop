@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="tuna_osk_input_v1">
+  <copyright>Copyright 2026 Tuna Desktop contributors. MIT licensed.</copyright>
+  <interface name="tuna_osk_input_v1" version="1">
+    <description summary="private supervised input-method virtual text">
+      Available only on the compositor-supervised IBus connection. Text events
+      are ordered with input-method-v2 focus changes on that same connection.
+      The serial is the input-method-v2 done count. Stale events and replies
+      must be discarded, never retargeted to a new field.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <request name="unhandled">
+      <description summary="one Unicode keysym declined by the engine">
+        The compositor synthesizes one press/release without re-entering the
+        input-method grab. The serial must still identify the active field.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="keysym" type="uint"/>
+    </request>
+    <event name="text">
+      <arg name="serial" type="uint"/>
+      <arg name="text" type="string"/>
+    </event>
+  </interface>
+</protocol>

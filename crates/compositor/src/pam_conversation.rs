@@ -68,6 +68,9 @@ pub struct ResponseHandle {
     cancel: Cancellation,
     submitted: bool,
     activity_pending: Arc<AtomicBool>,
+    /// Set by the worker the moment it takes this batch's `Answers` off the
+    /// queue, before it drops the wake socket's read end.
+    answers_taken: Arc<AtomicBool>,
 }
 impl ResponseHandle {
     /// Called only after an actual user input event, not on ticks, focus, a
@@ -112,10 +115,18 @@ impl ResponseHandle {
         if binding != self.binding || sequence != self.sequence || self.cancel.is_canceled() {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
+        let is_answers = matches!(input, Input::Answers(..));
         self.sender
             .try_send(input)
             .map_err(|_| io::ErrorKind::WouldBlock)?;
         if self.wake.write_all(&[1]).is_err() {
+            // The worker re-checks its queue on every loop pass, so it can take
+            // the queued answers and drop the wake socket's read end before this
+            // wake byte is written. The input was delivered; that is not a
+            // failure and must not cancel the attempt.
+            if is_answers && self.answers_taken.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             self.cancel.cancel();
             return Err(io::ErrorKind::BrokenPipe.into());
         }
@@ -275,6 +286,7 @@ impl Relay {
         write.set_nonblocking(true)?;
         let (sender, receive) = mpsc::sync_channel(2);
         let activity_pending = Arc::new(AtomicBool::new(false));
+        let answers_taken = Arc::new(AtomicBool::new(false));
         self.challenges
             .try_send(Challenge {
                 binding: self.binding,
@@ -288,11 +300,19 @@ impl Relay {
                     cancel: self.cancel.clone(),
                     submitted: false,
                     activity_pending: activity_pending.clone(),
+                    answers_taken: answers_taken.clone(),
                 },
             })
             .map_err(|_| io::ErrorKind::BrokenPipe)?;
         self.notice.signal();
-        self.wait_answers(&read, &receive, sequence, &styles, &activity_pending)
+        self.wait_answers(
+            &read,
+            &receive,
+            sequence,
+            &styles,
+            &activity_pending,
+            &answers_taken,
+        )
     }
     fn wait_answers(
         &mut self,
@@ -301,6 +321,7 @@ impl Relay {
         sequence: u32,
         styles: &[Style],
         activity_pending: &AtomicBool,
+        answers_taken: &AtomicBool,
     ) -> io::Result<Vec<Answer>> {
         use std::io::Read;
         let mut wake = read;
@@ -327,6 +348,7 @@ impl Relay {
                     continue;
                 }
                 Ok(Input::Answers(binding, incoming, answers, input_at)) => {
+                    answers_taken.store(true, Ordering::SeqCst);
                     if binding != self.binding
                         || incoming != sequence
                         || !crate::pam_helper::valid_answers(styles, &answers)
@@ -463,6 +485,7 @@ mod tests {
             cancel,
             submitted: false,
             activity_pending: Arc::new(AtomicBool::new(false)),
+            answers_taken: Arc::new(AtomicBool::new(false)),
         };
         (relay, read, receive, handle)
     }
@@ -485,6 +508,36 @@ mod tests {
                 text: None,
             },
         ]
+    }
+    #[test]
+    fn answers_consumed_before_the_wake_byte_still_submit() {
+        // The worker re-checks its queue every pass: it can take the answers,
+        // flag it and drop the wake socket's read end before submit writes its
+        // wake byte. Delivered answers are not a BrokenPipe.
+        let (_relay, read, _receive, mut handle) = fixture();
+        handle.answers_taken.store(true, Ordering::SeqCst);
+        drop(read);
+        handle
+            .send(
+                Input::Answers(binding(), 1, answers(), Instant::now()),
+                binding(),
+                1,
+            )
+            .unwrap();
+        assert!(!handle.cancel.is_canceled());
+    }
+    #[test]
+    fn unconsumed_answers_with_a_closed_wake_stay_broken_pipe() {
+        let (_relay, read, _receive, mut handle) = fixture();
+        drop(read);
+        let error = handle
+            .send(
+                Input::Answers(binding(), 1, answers(), Instant::now()),
+                binding(),
+                1,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
     #[test]
     fn explicit_policy_keeps_idle_phase_total_separate() {
@@ -524,6 +577,7 @@ mod tests {
     fn distinct_fresh_answers_and_activity_use_real_owned_socket_queue() {
         let (mut relay, read, receive, mut handle) = fixture();
         let activity = handle.activity_pending.clone();
+        let taken = handle.answers_taken.clone();
         handle.note_user_input(binding(), 1).unwrap();
         handle.note_user_input(binding(), 1).unwrap(); // coalesced, reserves answer space
         handle.submit(binding(), 1, answers()).unwrap();
@@ -534,6 +588,7 @@ mod tests {
                 1,
                 &[Style::Secret, Style::Visible, Style::Info, Style::Error],
                 &activity,
+                &taken,
             )
             .unwrap();
         let encoded = serde_json::to_string(&result).unwrap();
@@ -586,9 +641,10 @@ mod tests {
         ] {
             let (mut relay, read, receive, handle) = fixture();
             let activity = handle.activity_pending.clone();
+            let taken = handle.answers_taken.clone();
             handle.submit(binding(), 1, result).unwrap();
             assert!(relay
-                .wait_answers(&read, &receive, 1, &[Style::Info], &activity)
+                .wait_answers(&read, &receive, 1, &[Style::Info], &activity, &taken)
                 .is_err());
         }
     }
@@ -597,6 +653,7 @@ mod tests {
         for total in [false, true] {
             let (mut relay, read, receive, handle) = fixture();
             let activity = handle.activity_pending.clone();
+            let taken = handle.answers_taken.clone();
             handle.submit(binding(), 1, answers()).unwrap();
             if total {
                 Arc::get_mut(&mut relay.timing).unwrap().total_deadline = Instant::now();
@@ -609,7 +666,8 @@ mod tests {
                     &receive,
                     1,
                     &[Style::Secret, Style::Visible, Style::Info, Style::Error],
-                    &activity
+                    &activity,
+                    &taken,
                 )
                 .is_err());
         }
@@ -618,6 +676,7 @@ mod tests {
     fn queued_typed_answer_resets_idle_at_input_not_later_worker_receipt() {
         let (mut relay, read, receive, mut handle) = fixture();
         let activity = handle.activity_pending.clone();
+        let taken = handle.answers_taken.clone();
         let input_at = Instant::now() - Duration::from_secs(60);
         *relay.timing.last_input.lock().unwrap() = input_at - Duration::from_secs(10);
         assert!(handle
@@ -632,6 +691,7 @@ mod tests {
                 1,
                 &[Style::Secret, Style::Visible, Style::Info, Style::Error],
                 &activity,
+                &taken,
             )
             .unwrap();
         assert_eq!(*relay.timing.last_input.lock().unwrap(), input_at);
@@ -641,6 +701,7 @@ mod tests {
     fn info_ack_never_extends_input_idle_and_phase_never_extends_total() {
         let (mut relay, read, receive, handle) = fixture();
         let activity = handle.activity_pending.clone();
+        let taken = handle.answers_taken.clone();
         let before = *relay.timing.last_input.lock().unwrap();
         handle
             .submit(
@@ -653,7 +714,7 @@ mod tests {
             )
             .unwrap();
         relay
-            .wait_answers(&read, &receive, 1, &[Style::Info], &activity)
+            .wait_answers(&read, &receive, 1, &[Style::Info], &activity, &taken)
             .unwrap();
         assert_eq!(*relay.timing.last_input.lock().unwrap(), before);
         Arc::get_mut(&mut relay.timing).unwrap().total_deadline =
@@ -688,6 +749,7 @@ mod tests {
         for shutdown in [false, true] {
             let (mut relay, read, receive, handle) = fixture();
             let activity = handle.activity_pending.clone();
+            let taken = handle.answers_taken.clone();
             let cancel = relay.cancel.clone();
             // A fresh dedicated bound wake exposes the SAME shutdown flag that
             // production Backend::shutdown sets, without a pre-ready fd.
@@ -701,7 +763,7 @@ mod tests {
                 send.send(unsafe { libc::syscall(libc::SYS_gettid) })
                     .unwrap();
                 relay
-                    .wait_answers(&read, &receive, 1, &[Style::Secret], &activity)
+                    .wait_answers(&read, &receive, 1, &[Style::Secret], &activity, &taken)
                     .is_err()
             });
             let tid = entered.recv_timeout(Duration::from_secs(2)).unwrap();

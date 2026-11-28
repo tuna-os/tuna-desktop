@@ -40,7 +40,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Common compositor/shell development and proof runtime packages from ci.yml
-# (check, app-content, scroll-proof, grid-cancel-comparison, gtk-shell,
+# (check, desktop-proofs, gtk-shell, gtk-shell-smoke,
 # journey and orca-speech). Keep workflow installs: the image only
 # avoids repeatedly unpacking the stable baseline in each ephemeral pod.
 # Use each Ubuntu release's packages rather than pinning cross-distro ABIs.

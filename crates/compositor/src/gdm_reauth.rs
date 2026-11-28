@@ -200,9 +200,14 @@ impl Mapper {
                 self.held = None;
                 steps.push(Step::Finish(Finish::Ended));
             }
+            // The extensions' queries never come: this channel does not
+            // enable them, so GDM does not offer them to its PAM modules.
             Signal::ConversationStarted { .. }
+            | Signal::ChoiceQuery { .. }
+            | Signal::JsonRequest { .. }
             | Signal::DefaultSessionNameChanged { .. }
-            | Signal::SessionOpened { .. } => {}
+            | Signal::SessionOpened { .. }
+            | Signal::TimedLoginRequested { .. } => {}
         }
         steps
     }
@@ -220,8 +225,12 @@ fn signal_service(signal: &Signal) -> Option<&str> {
         | Signal::ServiceUnavailable { service, .. }
         | Signal::VerificationFailed { service }
         | Signal::VerificationComplete { service }
-        | Signal::SessionOpened { service, .. } => Some(service),
-        Signal::Reset | Signal::DefaultSessionNameChanged { .. } => None,
+        | Signal::SessionOpened { service, .. }
+        | Signal::ChoiceQuery { service, .. }
+        | Signal::JsonRequest { service, .. } => Some(service),
+        Signal::Reset
+        | Signal::DefaultSessionNameChanged { .. }
+        | Signal::TimedLoginRequested { .. } => None,
     }
 }
 

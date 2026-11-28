@@ -39,6 +39,15 @@
 #   cancel and drop, #1189) and G-SHELL-STABLE only.
 #   --lock-menu-only runs panel readiness, G-LOCK-WITH-MENU-OPEN and
 #   G-SHELL-STABLE only (needs pam_wrapper).
+#   --app-menu-only runs panel readiness, G-APP-MENU, G-DASH-PIN-DND,
+#   G-FAVORITES-LIVE, G-FAVORITES-IMPORT (the app-icon menu, dash
+#   drag-to-pin, live favorite-apps and the one-time import of the old
+#   favorites.json, #1182, #1183) and G-SHELL-STABLE only.
+#   --smoke-only runs the merge queue's core desktop path only: panel
+#   readiness, G-PANEL, three app windows (G-WINDOWS), the overview
+#   (G-OV-OPEN, G-OV-PICK), locking over the open date menu and quick
+#   settings and unlocking through PAM (G-LOCK-WITH-MENU-OPEN) and
+#   G-SHELL-STABLE (needs pam_wrapper).
 #   --panel-dash-only runs panel readiness, G-PANEL-LAYOUT and
 #   G-DASH-FAVORITES-RUNNING (#1198, #1199) and G-SHELL-STABLE only, at
 #   TUNA_SCALE in the proof's locale; a scale other than 1 adds
@@ -143,6 +152,8 @@
 #                    the clock, at most to a tenth of the height from the top
 #   G-NOTIFY-LOCK-LIVE arrivals and policy keys reach the locked screen at
 #                    once; unlocking brings the queued banners and sounds
+#   G-NOTIFY-WAKE    a lock-screen notification wakes the blanked locked
+#                    screen (WakeUpScreen), not with show-banners off
 #   G-NOTIFY-LOCK-MEDIA an MPRIS player lists on the lock screen with its
 #                    track and controls that reach it, by its app's policy
 #   G-NOTIFY-SOUND   banners play sound-name / sound-file as they show,
@@ -623,11 +634,13 @@ SEARCH_LEAK_ONLY=0
 WINDOW_LEAK_ONLY=0
 DND_OVERVIEW_ONLY=0
 LOCK_MENU_ONLY=0
+APP_MENU_ONLY=0
 PANEL_DASH_ONLY=0
 SOUND_ALERTS_ONLY=0
 REMOTE_ACCESS_ONLY=0
 GRID_CANCEL_ONLY=0
 FOLDER_DND_ONLY=0
+SMOKE_ONLY=0
 GRID_CANCEL_OLD_NEGATIVE=0
 GRID_CANCEL_ADMISSION=""
 COMPANIONS="${TUNA_PROOF_COMPANIONS:-$ROOT/target/debug/examples}"
@@ -672,6 +685,8 @@ while [ $# -gt 0 ]; do
         --search-leak-only) SEARCH_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --window-leak-only) WINDOW_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --lock-menu-only) LOCK_MENU_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
+        --app-menu-only) APP_MENU_ONLY=1; only_mode "$1" source-build no-media-source no-examples; shift ;;
+        --smoke-only) SMOKE_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --folder-dnd-only) FOLDER_DND_ONLY=1; only_mode "$1" no-examples; shift ;;
         --panel-dash-only) PANEL_DASH_ONLY=1; only_mode "$1" source-build no-media-source no-examples no-camera-policy; shift ;;
         --dnd-overview-only) DND_OVERVIEW_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
@@ -743,11 +758,7 @@ export XDG_STATE_HOME XDG_DATA_HOME
 # Cursor themes (#342): the proof's own first, then the system's.
 XCURSOR_PATH="$XDG_DATA_HOME/icons:$HOME/.icons:/usr/share/icons:/usr/share/pixmaps"
 export XCURSOR_PATH
-# The dash shows only the proof's own windows: pin a favourite no
-# runner has, so the host's apps (GitHub's runners now ship Firefox,
-# which GNOME's default favourites name) never reach the a11y goldens.
-mkdir -p "$XDG_DATA_HOME/tuna-shell"
-echo '["org.tuna.ProofNoFavorite.desktop"]' >"$XDG_DATA_HOME/tuna-shell/favorites.json"
+# (The dash's favourites are set with the other settings below.)
 # Launch probe for overview search: only this journey has it, and its
 # Exec leaves a marker, proving search-to-launch end to end.
 PROBE_MARKER="$ARTIFACTS/probe-marker"
@@ -900,6 +911,9 @@ cleanup() {
     if [ -n "$INHIBITOR_PID" ]; then kill "$INHIBITOR_PID" 2>/dev/null || true; fi
     if [ -n "$PERMISSIONS_PID" ]; then kill "$PERMISSIONS_PID" 2>/dev/null || true; fi
     if [ -n "$DATEMENU_STUB_PID" ]; then kill "$DATEMENU_STUB_PID" 2>/dev/null || true; fi
+    if [ -n "${AM_PIDS:-}" ]; then
+        for am_pid in $AM_PIDS; do kill "$am_pid" 2>/dev/null || true; done
+    fi
     if [ -n "$SCROLL_PROBE_PID" ]; then kill "$SCROLL_PROBE_PID" 2>/dev/null || true; fi
     if [ -n "$SET_FONTS_PID" ]; then kill "$SET_FONTS_PID" 2>/dev/null || true; fi
     if [ -n "$HOT_CORNER_PID" ]; then kill "$HOT_CORNER_PID" 2>/dev/null || true; fi
@@ -1189,6 +1203,7 @@ pass G-GRID-ON-DEMAND "no grid tiles on the window picker or after close; a held
 . "$ROOT/scripts/lib/tuna-datemenu-proof.sh"
 . "$ROOT/scripts/lib/tuna-search-leak-proof.sh"
 . "$ROOT/scripts/lib/tuna-window-leak-proof.sh"
+. "$ROOT/scripts/lib/tuna-app-menu-proof.sh"
 . "$ROOT/scripts/lib/tuna-panel-dash-proof.sh"
 . "$ROOT/scripts/lib/tuna-sound-alerts-proof.sh"
 . "$ROOT/scripts/lib/tuna-dnd-overview-proof.sh"
@@ -1364,6 +1379,17 @@ if [ -f "$ARTIFACTS/schemas/org.tuna.fixture-keybindings.gschema.xml" ]; then
     glib-compile-schemas "$ARTIFACTS/schemas"
     GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas"
     export GSETTINGS_SCHEMA_DIR
+fi
+# The dash shows only the proof's own windows: pin a favourite no
+# runner has, so the host's apps (GitHub's runners now ship Firefox,
+# which GNOME's default favourites name) never reach the a11y goldens.
+# `favorite-apps` is the dash's source; the shell only imports the old
+# pins file once, into a key still unset.
+if [ "$APP_MENU_ONLY" = 1 ]; then
+    # G-FAVORITES-IMPORT: the key stays unset and the old pins are seeded.
+    am_seed_legacy_favorites
+else
+    gsettings set org.gnome.shell favorite-apps "['org.tuna.ProofNoFavorite.desktop']"
 fi
 # Media settings are also exercised on lean hosts without gsd's schema.
 if ! gsettings list-schemas 2>/dev/null | grep -qx org.gnome.settings-daemon.plugins.media-keys; then
@@ -2388,6 +2414,72 @@ remote_access_indicator_gate() {
     pass G-REMOTE-ACCESS-INDICATOR "a granted portal share shows GNOME's orange Stop Screen Sharing button; pressing it: $(grep -h 'removed PipeWire node\|closed the app' "$ARTIFACTS/portal-indicator.log" | tr '\n' ' ')and the button hides"
 }
 
+# G-PANEL: the bar is GNOME 51's pure black strip over a desktop that is
+# not black.
+panel_strip_gate() {
+    sleep 2
+    scrot "$ARTIFACTS/01-panel.png" >/dev/null
+    # GNOME 51's top bar is pure black; the session background is not. An
+    # empty spot in the strip must be black and the desktop below must not.
+    strip="$(px "$ARTIFACTS/01-panel.png" 300 5)"
+    desk="$(px "$ARTIFACTS/01-panel.png" 300 200)"
+    [ "$strip" = "0 0 0" ] || fail G-PANEL "panel strip is '$strip', not black"
+    [ "$desk" != "0 0 0" ] || fail G-PANEL "desktop below the panel is black too"
+    pass G-PANEL "GTK panel mapped as a black top strip"
+}
+
+panel_controls_gate() {
+    for label in "Activities" "Date and Time" "System"; do
+        jq -e --arg n "$label" 'any(.[]; .name == $n)' "$ARTIFACTS/a11y-panel.json" >/dev/null ||
+            fail A11Y-PANEL "no accessible control named '$label'"
+    done
+    pass A11Y-PANEL "Activities, Date and Time, System exposed"
+}
+
+# App stages: three libadwaita windows (scripts/lib/tuna-test-window.py)
+# map, Super opens the overview with their previews, and clicking one
+# focuses it and closes the overview.
+windows_overview_gates() {
+    # One at a time, so window ids (and with them GNOME's running-app order
+    # in the dash) follow Alpha, Beta, Gamma.
+    n=0
+    for spec in Alpha:#3584e4 Beta:#2ec27e Gamma:#e66100; do
+        WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-test-window.py" \
+            "${spec%%:*}" "${spec#*:}" >"$ARTIFACTS/window-${spec%%:*}.log" 2>&1 &
+        fixture_pid=$!
+        n=$((n + 1))
+        cstate "(.windows | length) == $n" "window $n" ||
+            fail G-WINDOWS "${spec%%:*} never mapped"
+        if [ "${spec%%:*}" = Alpha ]; then
+            "$PY" "$ROOT/scripts/lib/tuna_window_menu_fixture.py" record "$CSTATE" "$ARTIFACTS/alpha-window-owner.json" "$fixture_pid" ||
+                fail G-WINDOWS "original native Alpha launch identity could not be recorded"
+        fi
+    done
+    cstate '(.windows | length) == 3' "three app windows" ||
+        fail G-WINDOWS "three libadwaita windows never mapped"
+    pass G-WINDOWS "three libadwaita windows mapped"
+    sleep 2
+    scrot "$ARTIFACTS/04-windows.png" >/dev/null
+
+    xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
+    xdotool key Super_L
+    cstate '.overview_open and (.previews | length) == 3' "overview" ||
+        fail G-OV-OPEN "Super did not open the overview with three previews"
+    pass G-OV-OPEN "Super opens the overview with three window previews"
+    sleep 1
+    scrot "$ARTIFACTS/05-overview.png" >/dev/null
+
+    beta="$(jq -r '.previews[] | select(.app_id == "tuna-test-beta") | .rect | "\(.[0] + .[2] / 2) \(.[1] + .[3] / 2)"' "$CSTATE")"
+    [ -n "$beta" ] || fail G-OV-PICK "no preview for tuna-test-beta"
+    # shellcheck disable=SC2086
+    xdotool mousemove --window "$WID" $beta click 1
+    cstate '(.overview_open | not) and .focused_app_id == "tuna-test-beta"' "pick" ||
+        fail G-OV-PICK "clicking Beta's preview did not focus it and close the overview"
+    pass G-OV-PICK "clicking a preview focuses that window and closes the overview"
+    sleep 1
+    scrot "$ARTIFACTS/06-picked.png" >/dev/null
+}
+
 # The panel is up once the shell registers on the a11y bus with its
 # controls; that also proves the accessible tree.
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-panel.json" 60 ||
@@ -2575,6 +2667,19 @@ if [ "$A11Y_FOCUS_ONLY" = 1 ]; then
     shell_stable_gate
     exit 0
 fi
+if [ "$APP_MENU_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "app menu desktop ready" ||
+        fail G-APP-MENU "desktop never became ready"
+    # Let the startup cover settle before the first overview.
+    sleep 3
+    favorites_import_proof
+    app_menu_proof
+    dash_pin_dnd_proof
+    favorites_live_proof
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
 if [ "$FOLDER_DND_ONLY" = 1 ]; then
     cstate '.active_workspace != null and .locked == false' "folder desktop ready" ||
         fail G-FOLDER-DND "desktop never became ready"
@@ -2622,6 +2727,23 @@ if [ "$DATEMENU_ONLY" = 1 ]; then
     shell_stable_gate
     exit 0
 fi
+# The merge queue's smoke (docs/ci-runners.md): the session starts, the
+# bar maps, apps show windows, the overview opens and picks one, and the
+# session locks over the bar's menus and unlocks through PAM.
+if [ "$SMOKE_ONLY" = 1 ]; then
+    [ -n "$PAM_ON" ] || fail G-LOCK-WITH-MENU-OPEN "--smoke-only needs pam_wrapper to unlock"
+    cstate '.active_workspace != null and .locked == false' "smoke desktop ready" ||
+        fail G-PANEL "desktop never became ready"
+    # The startup cover must be gone before frames are read.
+    sleep 3
+    panel_strip_gate
+    panel_controls_gate
+    windows_overview_gates
+    lock_with_menu_gate
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
 
 set --
 privacy_expected_shell="${TUNA_PROOF_SHELL_BIN:-${TUNA_PROOF_BIN_DIR:-$ROOT/target/debug}/tuna-shell-gtk}"
@@ -2636,25 +2758,13 @@ pass G-PRIVACY-PORTAL "GTK owns Lockdown; real portal denies camera and readmits
 # Return this owned startup fixture to the schema default for later stages.
 gsettings reset org.gnome.desktop.privacy disable-camera
 
-sleep 2
-scrot "$ARTIFACTS/01-panel.png" >/dev/null
-# GNOME 51's top bar is pure black; the session background is not. An
-# empty spot in the strip must be black and the desktop below must not.
-strip="$(px "$ARTIFACTS/01-panel.png" 300 5)"
-desk="$(px "$ARTIFACTS/01-panel.png" 300 200)"
-[ "$strip" = "0 0 0" ] || fail G-PANEL "panel strip is '$strip', not black"
-[ "$desk" != "0 0 0" ] || fail G-PANEL "desktop below the panel is black too"
-pass G-PANEL "GTK panel mapped as a black top strip"
+panel_strip_gate
 # The comparison slice runs old binaries that predate the transitions.
 if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     tsettled startup 0 0 || fail G-STARTUP-REVEAL "the startup cover did not fade out and settle"
     pass G-STARTUP-REVEAL "the desktop fades in from GNOME's startup cover, then nothing animates"
 fi
-for label in "Activities" "Date and Time" "System"; do
-    jq -e --arg n "$label" 'any(.[]; .name == $n)' "$ARTIFACTS/a11y-panel.json" >/dev/null ||
-        fail A11Y-PANEL "no accessible control named '$label'"
-done
-pass A11Y-PANEL "Activities, Date and Time, System exposed"
+panel_controls_gate
 
 # GNOME Settings uses escaped GFile URIs. Observe actual compositor pixels,
 # including a literal %20 filename whose double-decoded neighbour is red.
@@ -2868,7 +2978,6 @@ if [ "$GRID_CANCEL_ONLY" != 1 ]; then
     tray_ayatana_gate
 fi
 
-# App stages: three libadwaita windows (scripts/lib/tuna-test-window.py).
 # Reserving an X11 display must not launch a compatibility process. The
 # panel/calendar are already real native Wayland clients at this point.
 if command -v Xwayland >/dev/null 2>&1; then
@@ -2886,44 +2995,7 @@ if command -v Xwayland >/dev/null 2>&1; then
     fi
     pass G-X11-DEMAND "native GTK and IBus startup advertise sockets without an XWayland or XIM process"
 fi
-# One at a time, so window ids (and with them GNOME's running-app order
-# in the dash) follow Alpha, Beta, Gamma.
-n=0
-for spec in Alpha:#3584e4 Beta:#2ec27e Gamma:#e66100; do
-    WAYLAND_DISPLAY="$SOCKET_NAME" "$PY" "$ROOT/scripts/lib/tuna-test-window.py" \
-        "${spec%%:*}" "${spec#*:}" >"$ARTIFACTS/window-${spec%%:*}.log" 2>&1 &
-    fixture_pid=$!
-    n=$((n + 1))
-    cstate "(.windows | length) == $n" "window $n" ||
-        fail G-WINDOWS "${spec%%:*} never mapped"
-    if [ "${spec%%:*}" = Alpha ]; then
-        "$PY" "$ROOT/scripts/lib/tuna_window_menu_fixture.py" record "$CSTATE" "$ARTIFACTS/alpha-window-owner.json" "$fixture_pid" ||
-            fail G-WINDOWS "original native Alpha launch identity could not be recorded"
-    fi
-done
-cstate '(.windows | length) == 3' "three app windows" ||
-    fail G-WINDOWS "three libadwaita windows never mapped"
-pass G-WINDOWS "three libadwaita windows mapped"
-sleep 2
-scrot "$ARTIFACTS/04-windows.png" >/dev/null
-
-xdotool mousemove --window "$WID" $((WIDTH / 2)) $((HEIGHT / 2))
-xdotool key Super_L
-cstate '.overview_open and (.previews | length) == 3' "overview" ||
-    fail G-OV-OPEN "Super did not open the overview with three previews"
-pass G-OV-OPEN "Super opens the overview with three window previews"
-sleep 1
-scrot "$ARTIFACTS/05-overview.png" >/dev/null
-
-beta="$(jq -r '.previews[] | select(.app_id == "tuna-test-beta") | .rect | "\(.[0] + .[2] / 2) \(.[1] + .[3] / 2)"' "$CSTATE")"
-[ -n "$beta" ] || fail G-OV-PICK "no preview for tuna-test-beta"
-# shellcheck disable=SC2086
-xdotool mousemove --window "$WID" $beta click 1
-cstate '(.overview_open | not) and .focused_app_id == "tuna-test-beta"' "pick" ||
-    fail G-OV-PICK "clicking Beta's preview did not focus it and close the overview"
-pass G-OV-PICK "clicking a preview focuses that window and closes the overview"
-sleep 1
-scrot "$ARTIFACTS/06-picked.png" >/dev/null
+windows_overview_gates
 
 # Aim the real menu button through its live accessibility bounds: a fixed
 # rect offset misses when the session maximizes the window and the header
