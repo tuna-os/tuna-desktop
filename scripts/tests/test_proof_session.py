@@ -286,6 +286,29 @@ class ProofSession(unittest.TestCase):
         self.assertRegex(result, r"left behind:.*\bsleep\(\d+\)")
         self.assertEqual(with_token(self.token), [], result)
 
+    @unittest.skipUnless(HAVE_DBUS and shutil.which("gdbus"), "dbus-daemon or gdbus is not installed")
+    def test_check_leaves_helpers_of_private_bus_services_to_the_session(self):
+        services = self.dir / "share/dbus-1/services"
+        services.mkdir(parents=True)
+        # Detached from the bus like xdg-document-portal on CI; its helper's
+        # environment does not name the bus, as a setuid fusermount3's is
+        # unreadable.
+        (services / "org.tuna.ProofSessionTest.service").write_text(
+            "[D-BUS Service]\nName=org.tuna.ProofSessionTest\n"
+            f'Exec=/bin/sh -c "(env -i /bin/sleep {self.token} & exec /bin/sleep {self.token}) &"\n')
+        self.env["XDG_DATA_DIRS"] = f"{self.dir / 'share'}:{os.environ.get('XDG_DATA_DIRS', '/usr/share')}"
+        self.fake.write_text(
+            "#!/bin/sh\n"
+            "gdbus call --session --timeout 2 --dest org.tuna.ProofSessionTest --object-path / "
+            "--method org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1\n"
+            'pgrep -f "sleep $2" >"$1.activated"\n'
+            '"$4" --check; echo $? >"$1.check"\n')
+        status, result = self.finish(self.run_session("check", "--bus", extra=[str(SESSION)]))
+        self.assertEqual(status, 0, result)
+        self.assertEqual(len((self.dir / "pids.activated").read_text().split()), 2, result)
+        self.assertEqual((self.dir / "pids.check").read_text().strip(), "0", result)
+        self.assertEqual(with_token(self.token), [], result)
+
     def test_check_outside_a_session_refuses(self):
         result = subprocess.run([str(SESSION), "--check"], env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 2, result.stderr)

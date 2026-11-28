@@ -3,7 +3,10 @@
 //! three-finger swipes classify as the shell's.
 
 use std::os::fd::AsFd;
+use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
+
+use smithay::input::keyboard::xkb;
 
 use smithay::utils::{Logical, Point};
 use tuna_compositor::motion_coalesce::MotionCoalescer;
@@ -80,6 +83,7 @@ struct Client {
     /// input-method: activations and `done` count (the commit serial).
     ime_active: bool,
     ime_done: u32,
+    ime_keymap: Option<xkb::Keymap>,
     ime_unavailable: bool,
     preedits: Vec<String>,
     text_leaves: usize,
@@ -311,6 +315,24 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for Client {
                 if let (Some(vk), wayland_client::WEnum::Value(format)) = (&state.vk, format) {
                     vk.keymap(format as u32, fd.as_fd(), size);
                 }
+                // Keymap FDs are shared mappings, not streams at a promised
+                // current seek position. Read the protocol buffer at offset 0.
+                let mut bytes = vec![0; size as usize];
+                std::fs::File::from(fd)
+                    .read_exact_at(&mut bytes, 0)
+                    .unwrap();
+                let mut text = String::from_utf8(bytes).unwrap();
+                text.truncate(text.trim_end_matches('\0').len());
+                let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+                state.ime_keymap = Some(
+                    xkb::Keymap::new_from_string(
+                        &context,
+                        text,
+                        xkb::KEYMAP_FORMAT_TEXT_V1,
+                        xkb::KEYMAP_COMPILE_NO_FLAGS,
+                    )
+                    .expect("usable IM-grab keymap"),
+                );
             }
             _ => {}
         }
@@ -329,6 +351,7 @@ impl Dispatch<ZwpInputPopupSurfaceV2, ()> for Client {
         state.ime_popup_events += 1;
     }
 }
+
 impl Dispatch<ZwpRelativePointerV1, ()> for Client {
     fn event(
         state: &mut Self,
@@ -533,6 +556,63 @@ fn an_input_method_types_into_the_focused_text_field() {
     im.commit(ime.client.ime_done);
     pump(&mut comp, &mut manager, &mut [&mut app, &mut ime]);
     assert_eq!(app.client.committed, ["é"]);
+}
+
+#[test]
+fn input_method_grab_receives_live_repeat_settings_and_usable_keymaps() {
+    let mut comp = TestCompositor::new();
+    comp.state.set_output_size(1280, 800);
+    let mut manager = comp.window_manager();
+    let mut ime = connect_ime_bridge(&mut comp);
+    pump(&mut comp, &mut manager, &mut [&mut ime]);
+    let qh = ime.queue.handle();
+    let im = ime
+        .client
+        .input_method_manager
+        .as_ref()
+        .unwrap()
+        .get_input_method(ime.client.seat.as_ref().unwrap(), &qh, ());
+    let grab = im.grab_keyboard(&qh, ());
+    pump(&mut comp, &mut manager, &mut [&mut ime]);
+    let mut settings = tuna_shell_control::InputSettings {
+        repeat: true,
+        repeat_interval_ms: 50,
+        repeat_delay_ms: 350,
+        ..Default::default()
+    };
+    manager.apply_keyboard_repeat(&settings);
+    pump(&mut comp, &mut manager, &mut [&mut ime]);
+    assert_eq!(ime.client.ime_repeat_events.last(), Some(&(20, 350)));
+    settings.repeat = false;
+    manager.apply_keyboard_repeat(&settings);
+    pump(&mut comp, &mut manager, &mut [&mut ime]);
+    assert_eq!(
+        ime.client.ime_repeat_events.last(),
+        Some(&(0, 350)),
+        "disabling repeat reaches the existing grab"
+    );
+    settings.xkb_layout = "de".into();
+    manager.apply_keyboard_settings(&mut comp.state, &settings);
+    pump(&mut comp, &mut manager, &mut [&mut ime]);
+    assert_eq!(
+        ime.client
+            .ime_keymap
+            .as_ref()
+            .unwrap()
+            .key_get_syms_by_level(xkb::Keycode::new(29), 0, 0)[0]
+            .raw(),
+        u32::from('z'),
+        "the grab must interpret keys using the replacement keymap"
+    );
+    grab.release();
+    pump(&mut comp, &mut manager, &mut [&mut ime]);
+    settings.repeat = true;
+    settings.repeat_interval_ms = 33;
+    settings.repeat_delay_ms = 90;
+    manager.apply_keyboard_repeat(&settings);
+    let _replacement = im.grab_keyboard(&qh, ());
+    pump(&mut comp, &mut manager, &mut [&mut ime]);
+    assert_eq!(ime.client.ime_repeat_events.last(), Some(&(30, 90)));
 }
 
 #[test]

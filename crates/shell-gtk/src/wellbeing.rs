@@ -3076,6 +3076,90 @@ mod tests {
         );
     }
 
+    fn movement_service(now: i64) -> BreakService {
+        let mut service = BreakService::new();
+        service.manager.set_selected(
+            &[(BreakType::Movement, BreakType::Movement.defaults())],
+            now,
+        );
+        service
+    }
+
+    fn first_notice(events: &[BreakUiEvent]) -> &Notice {
+        events
+            .iter()
+            .find_map(|e| match e {
+                BreakUiEvent::Notify(n) => Some(n),
+                _ => None,
+            })
+            .expect("a notice")
+    }
+
+    #[test]
+    fn movement_break_upcoming_then_due_with_gnome_strings() {
+        // Movement defaults: interval 1800 s, upcoming notice on.
+        let mut service = movement_service(T0);
+        let events = service.poll(T0 + 1680, 0);
+        let notice = first_notice(&events);
+        assert_eq!(notice.title, "Movement Break Soon");
+        assert!(notice.allow_delay && notice.allow_skip && !notice.allow_take);
+        let events = service.poll(T0 + 1800, 0);
+        assert_eq!(service.manager.state(), BreakState::BreakDue);
+        let notice = first_notice(&events);
+        assert_eq!(notice.title, "Time for a Movement Break");
+        assert_eq!(
+            notice.body,
+            "Take a break from the device and move around for 5 minutes"
+        );
+        assert!(notice.urgent && notice.allow_delay && !notice.allow_skip && notice.allow_take);
+    }
+
+    #[test]
+    fn movement_break_completes_after_five_minutes_idle() {
+        let mut service = movement_service(T0);
+        // Idle through the due time: the break starts and fades the screen.
+        let events = service.poll(T0 + 1810, 60);
+        assert_eq!(service.manager.state(), BreakState::InBreak);
+        assert!(
+            events.contains(&BreakUiEvent::FadeScreen(true)),
+            "{events:?}"
+        );
+        assert!(
+            has_title(&events, "Movement Break in Progress"),
+            "{events:?}"
+        );
+        // Still idle 40 s in: the break is still in progress.
+        service.poll(T0 + 1840, 90);
+        assert_eq!(service.manager.state(), BreakState::InBreak);
+        // The user returns after the full 300 s: complete, unfade, sound.
+        let events = service.poll(T0 + 2120, 0);
+        assert_eq!(service.manager.state(), BreakState::Active);
+        assert!(
+            events.contains(&BreakUiEvent::FadeScreen(false)),
+            "{events:?}"
+        );
+        assert!(events.contains(&BreakUiEvent::DismissNotice), "{events:?}");
+        assert!(
+            events.contains(&BreakUiEvent::PlayCompleteSound),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn movement_break_cut_short_does_not_count_as_taken() {
+        let mut service = movement_service(T0);
+        service.poll(T0 + 1810, 60);
+        assert_eq!(service.manager.state(), BreakState::InBreak);
+        // The user comes back after about 50 s, far short of 5 minutes (an
+        // eyesight break's 20 s would have counted).
+        let events = service.poll(T0 + 1840, 0);
+        assert_ne!(service.manager.state(), BreakState::Active);
+        assert!(
+            !events.contains(&BreakUiEvent::PlayCompleteSound),
+            "{events:?}"
+        );
+    }
+
     #[test]
     fn delay_and_skip_push_the_due_time() {
         let mut service = break_service(T0);

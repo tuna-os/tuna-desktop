@@ -10,15 +10,21 @@ stderr and, when set, $GITHUB_STEP_SUMMARY. The `select-lanes` and `check`
 jobs always run and are not proof lanes. A draft pull request (--draft)
 runs no proof lane until it is marked ready for review.
 
-push, schedule and workflow_dispatch run every lane. A pull_request runs
+push, schedule and workflow_dispatch run every lane but the merge queue's
+gtk-shell-smoke, whose gates their full gtk-shell job proves. A merge group
+(merge_group) runs MERGE_QUEUE only: check plus one GTK session, the fast
+battery the queue waits for; every other lane runs on the push to main the
+group becomes. A pull_request runs
 what its changed files (`git diff --name-only HEAD^1 HEAD` on the merge
 commit, or --changed) can affect:
 
 - shared CI inputs (this script, the Cargo workspace manifests, vendored
   third-party crates, the nested-session launcher, the proof session
   helper and its preflight, and a ci.yml edit
-  outside the lane jobs or to a job that is not a lane) run every lane; with
-  --base a ci.yml edit to lane jobs runs only those lanes;
+  outside the lane jobs or to a job that is not a lane) run every lane,
+  gtk-shell-smoke included, so a change to the queue's battery is proven
+  before it reaches the queue; with --base a ci.yml edit to lane jobs runs
+  only those lanes;
 - docs and other non-runtime files (including tooling of other workflows,
   see NO_LANE) add no lane;
 - a lane's own proof script, fixtures or packaging runs that lane, and a
@@ -26,7 +32,7 @@ commit, or --changed) can affect:
   package consumer; so does a scripts/tests/ file that the lane's job runs
   (OWNED below; WorkflowSync.test_lane_run_tests_select_their_lane keeps it
   complete). Tests only the check job runs add no lane;
-- anything else (crates, share/, other scripts) runs gtk-shell plus a
+- anything else (crates, share/, other scripts) runs CORE plus a
   round-robin slice of ROTATION: K lanes starting at
   (run_number * K) mod len(ROTATION), K from --size, $CI_ROUND_ROBIN_SIZE
   or 2. Every rotated lane runs on main after merge either way. Code a lane
@@ -44,25 +50,33 @@ import sys
 
 # Selectable ci.yml proof jobs, in workflow order.
 LANES = [
-    "journey", "app-content", "scroll-proof", "drm-smoke", "hotplug",
-    "grid-cancel-comparison", "gtk-shell", "orca-speech",
+    "journey", "drm-smoke", "hotplug", "desktop-proofs", "gtk-shell",
+    "gtk-shell-smoke", "orca-speech",
     "portal-security", "remote-security", "niri-parity", "arch-package",
     "marlin-image", "marlin-vm", "parity-ledger", "docs-shots",
 ]
 
+# The merge queue's whole battery beside check: one nested GTK session
+# through the core desktop path (scripts/tuna-gtk-shell-proof
+# --smoke-only), about as long as check itself. Push, schedule and
+# dispatch never select it; a pull request does when it runs every lane or
+# edits its job.
+MERGE_QUEUE = ["gtk-shell-smoke"]
+
 # Every code change runs the GTK shell proof: it drives the compositor and
 # the preferred shell together and is what most changes touch, and its
 # scripts/tuna-lock-auth-proof covers lock authentication, fingerprint
-# included. The grid-cancel comparison proof is short and covers drag paths
-# no rotated lane does.
-CORE = ["grid-cancel-comparison", "gtk-shell"]
+# included. desktop-proofs is short: the grid-cancel comparison, which
+# covers drag paths no rotated lane does, and the app content and
+# scroll-mode strip proofs on its build.
+CORE = ["desktop-proofs", "gtk-shell"]
 
 # Interchangeable end-to-end coverage of the same build, rotated per run.
 # marlin-image is not here: ci.yml runs it on push, schedule and dispatch
 # only (it rebuilds what marlin-vm builds), so a pull request rotating it
 # would pay for arch-package and run nothing.
 ROTATION = [
-    "journey", "app-content", "scroll-proof", "drm-smoke", "hotplug", "orca-speech",
+    "journey", "drm-smoke", "hotplug", "orca-speech",
     "portal-security", "remote-security", "niri-parity", "marlin-vm",
 ]
 
@@ -75,7 +89,7 @@ NEEDS = {
     "marlin-vm": ["arch-package"],
     "parity-ledger": ["journey", "gtk-shell", "orca-speech", "drm-smoke", "hotplug", "marlin-vm",
                       "remote-security"],
-    "docs-shots": ["journey", "app-content", "scroll-proof"],
+    "docs-shots": ["journey", "desktop-proofs"],
 }
 
 # marlin-vm matrix legs; ci.yml names each leg's job and artifact after
@@ -143,11 +157,15 @@ OWNED = [
     ("scripts/tuna-scale-proof", ["gtk-shell"]),
     ("scripts/tuna-slow-portal-proof", ["gtk-shell"]),
     ("scripts/tuna-session-restore-proof", ["gtk-shell"]),
+    # G-OSK-* (the IBus source path included, #981) and their helpers.
+    ("scripts/tuna-osk-proof", ["gtk-shell"]),
+    ("scripts/lib/tuna-osk-pro*.py", ["gtk-shell"]),
     # The login screen (#1164): tuna-compositor --greeter and tuna-greeter
     # against a GDM 51 and AccountsService mock, with GDM's own
     # org.gnome.login-screen schema.
     ("scripts/tuna-greeter-proof", ["gtk-shell"]),
     ("scripts/lib/tuna-gdm-mock.py", ["gtk-shell"]),
+
     ("scripts/lib/org.gnome.login-screen.gschema.xml", ["gtk-shell"]),
     # Window motion paired with GNOME 51 (#493-#498): the gtk-shell job runs
     # these proofs on its frozen minimize build, against the distilled
@@ -175,7 +193,7 @@ OWNED = [
     ("scripts/tests/test_tuna_lock_auth_fixtures.py", ["gtk-shell"]),
     ("scripts/tests/test_wellbeing_bundle.py", ["gtk-shell"]),
     ("scripts/tests/test_wellbeing_bytecode_contract.py", ["gtk-shell"]),
-    ("scripts/tests/test_grid_cancel_*.py", ["grid-cancel-comparison"]),
+    ("scripts/tests/test_grid_cancel_*.py", ["desktop-proofs"]),
     ("scripts/tests/test_ci_install_vkms.py", ["drm-smoke"]),
     ("scripts/tests/test_colord_startup.py", ["drm-smoke"]),
     ("scripts/tests/test_drm_dual.py", ["drm-smoke"]),
@@ -203,8 +221,8 @@ OWNED = [
     # file: journey's Debian lifecycle prompts on any byte change (#899), the
     # images ship it, and the lock screen authenticates through it.
     ("share/pam.d/*", ["journey", *CORE, *PACKAGE_CONSUMERS]),
-    ("scripts/tuna-app-content", ["app-content"]),
-    ("scripts/tuna-scroll-proof", ["scroll-proof"]),
+    ("scripts/tuna-app-content", ["desktop-proofs"]),
+    ("scripts/tuna-scroll-proof", ["desktop-proofs"]),
     ("scripts/tuna-drm-smoke", ["drm-smoke"]),
     # The two-output leg the drm-smoke job runs after tuna-drm-smoke.
     ("scripts/tuna-drm-dual", ["drm-smoke"]),
@@ -414,8 +432,10 @@ def select(event, run_number, size, changed, wf_lanes=None):
     wf_lanes: lanes touched by this change's ci.yml edit (workflow_lanes);
     None treats any ci.yml edit as a shared CI input.
     """
+    if event == "merge_group":
+        return list(MERGE_QUEUE), "merge_group: the merge queue's fast battery; every lane runs on main"
     if event != "pull_request":
-        return list(LANES), f"{event}: every lane"
+        return [lane for lane in LANES if lane not in MERGE_QUEUE], f"{event}: every lane"
     chosen, reasons, code = set(), [], []
     for path in changed:
         if path == WORKFLOW and wf_lanes is not None:
