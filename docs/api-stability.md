@@ -134,7 +134,7 @@ commit. The rules for a wire change are:
   GNOME's, not ours. Deviations are bugs unless documented
   ([portal and D-Bus integration](portal-service-integration.md)).
 - **Private `org.tuna.*` interfaces**, such as `org.tuna.Screenshot`
-  (`crates/compositor/src/screenshot.rs:95`), are internal. Both sides
+  (`crates/compositor/src/screenshot.rs:99`), are internal. Both sides
   ship together and may change in any commit.
 
 ### Shared files and names

@@ -12,7 +12,7 @@ SCRIPT = (ROOT / 'scripts/tuna-auth-owner-ci-proof').read_text()
 BLOCKS = [part.split('\nPY\n', 1)[0] for part in SCRIPT.split("<<'PY'\n")[1:]]
 
 
-CONVERSATION_KEYS = ['fingerprint_unavailable_denied', 'second_password_conversation_denied', 'stale_sequence_dropped', 'distinct_answers_per_question', 'info_and_error_relayed', 'wrong_pin_denied_with_problem', 'cancel_denied_silently', 'fresh_answers_unlock']
+CONVERSATION_KEYS = ['fingerprint_unavailable_denied', 'second_password_conversation_denied', 'stale_sequence_dropped', 'distinct_answers_per_question', 'info_and_error_relayed', 'wrong_pin_denied_with_problem', 'cancel_denied_silently', 'fresh_answers_unlock', 'unlock_restores_session_intact']
 FINGERPRINT_KEYS = ['expired_account_match_denied', 'max_tries_unavailable', 'timed_out_unavailable', 'lock_budget_refuses_before_pam', 'password_unaffected', 'retry_then_match_unlocks']
 SETTING_KEYS = ['setting_off_refused_before_pam']
 
