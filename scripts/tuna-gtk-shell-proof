@@ -15,8 +15,8 @@
 #   X11 window is IconicState with _NET_WM_STATE_HIDDEN, #1078) only.
 #   --protocols-only runs panel readiness, G-WAYLAND-INFO and the Mutter 51
 #   protocol gates driven by a real client (G-XDG-WM-BASE-7,
-#   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR, G-SYNCOBJ; #364, #588)
-#   only.
+#   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR, G-SYNCOBJ,
+#   G-XWAYLAND-GRAB; #364, #588) only.
 #   --subsurface-only runs panel readiness and G-SUBSURFACE-STACKING (a
 #   window's subsurfaces stack where the client placed them) only.
 #   --grid-hover-only runs panel readiness, G-GRID-HOVER, G-GRID-REORDER,
@@ -2259,6 +2259,98 @@ syncobj_gate() {
     protocol_probe G-SYNCOBJ syncobj-unoffered
     pass G-SYNCOBJ "without timeline syncobjs the compositor refuses explicit sync as Mutter does ($syncobj_why) and no client finds wp_linux_drm_syncobj_manager_v1"
 }
+
+# G-XWAYLAND-GRAB (P-SY-09): an X11 client's XGrabKeyboard, which rootless
+# Xwayland turns into zwp_xwayland_keyboard_grab_v1, takes every key, the
+# Super key included, only when Mutter 51's meta_xwayland_grab_is_granted
+# allows it: WM_CLASS in Mutter's built-in list (remote-viewer and the
+# other viewers), the user's xwayland-grab-access-rules, or the client's
+# _XWAYLAND_MAY_GRAB_KEYBOARD. A remote viewer that grabs receives a real
+# Super tap and the overview stays shut; Super+Escape hands the shortcuts
+# back; a window outside the list grabs in vain and Super opens the
+# overview. The probe's keys are in protocol-xwayland-grab-<instance>.log.
+xgrab_start() {
+    xgrab_log="$ARTIFACTS/protocol-xwayland-grab-$1.log"
+    DISPLAY="$x11_display" "$COMPANIONS/protocol-probe" xwayland-grab "$1" "$2" --state "$CSTATE" \
+        >"$xgrab_log" 2>&1 &
+    XGRAB_PID=$!
+    xgrab_end=$(($(date +%s) + 30))
+    xgrab_window=
+    while [ -z "$xgrab_window" ]; do
+        if ! kill -0 "$XGRAB_PID" 2>/dev/null || [ "$(date +%s)" -gt "$xgrab_end" ]; then
+            kill "$XGRAB_PID" 2>/dev/null || true
+            xgrab_why="$(grep -m1 '^FAIL' "$xgrab_log" || true)"
+            fail G-XWAYLAND-GRAB "${xgrab_why:-the $1 probe never grabbed the keyboard}"
+        fi
+        sleep 0.3
+        xgrab_window="$(sed -n 's/^grabbed \([0-9][0-9]*\)$/\1/p' "$xgrab_log")"
+    done
+}
+xgrab_stop() {
+    kill "$XGRAB_PID" 2>/dev/null || true
+    cstate "(.windows | any(.app_id == \"$1\")) | not" "$1 probe gone" ||
+        fail G-XWAYLAND-GRAB "the $1 probe's window outlived it"
+}
+# The compositor's verdict ($1: granted or denied) on the probe's grab.
+xgrab_verdict() {
+    for _ in $(seq 1 50); do
+        grep -q "tuna-compositor: xwayland: keyboard grab $1 for window $xgrab_window " "$LOG" && return 0
+        sleep 0.2
+    done
+    return 1
+}
+# Tap Super; succeed once the probe's window received its release
+# (keycode 133: evdev KEY_LEFTMETA through the session's keymap).
+xgrab_super_reaches_probe() {
+    xgrab_seen="$(grep -c '^release 133$' "$xgrab_log" || true)"
+    xdotool key Super_L
+    for _ in $(seq 1 25); do
+        [ "$(grep -c '^release 133$' "$xgrab_log" || true)" -gt "$xgrab_seen" ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+# The overview stays shut for two seconds.
+xgrab_overview_stays_shut() {
+    for _ in $(seq 1 10); do
+        jq -e '.overview_open | not' "$CSTATE" >/dev/null 2>&1 || return 1
+        sleep 0.2
+    done
+}
+xgrab_overview_opens_and_closes() {
+    cstate '.overview_open' "$1" 10 || return 1
+    xdotool key Escape
+    cstate '(.overview_open | not) and .overview_progress == 0' "overview closed after $1" 10
+}
+xwayland_grab_gate() {
+    cstate '.x11_display != null' "xwayland" 30 || fail G-XWAYLAND-GRAB "XWayland display never advertised"
+    x11_display="$(jq -r '.x11_display' "$CSTATE")"
+
+    xgrab_start remote-viewer Remote-viewer
+    xgrab_verdict granted ||
+        fail G-XWAYLAND-GRAB "the compositor never granted remote-viewer's XGrabKeyboard (in Mutter's built-in list)"
+    xgrab_super_reaches_probe ||
+        fail G-XWAYLAND-GRAB "Super never reached the remote viewer holding the keyboard grab"
+    xgrab_overview_stays_shut ||
+        fail G-XWAYLAND-GRAB "Super opened the overview over the remote viewer's granted grab"
+    xgrab_restored="$(grep -c 'tuna-compositor: shortcuts restored' "$LOG" || true)"
+    xdotool key super+Escape
+    xgrab_overview_stays_shut || fail G-XWAYLAND-GRAB "Super+Escape opened the overview"
+    [ "$(grep -c 'tuna-compositor: shortcuts restored' "$LOG" || true)" -gt "$xgrab_restored" ] ||
+        fail G-XWAYLAND-GRAB "Super+Escape did not restore the shortcuts"
+    xdotool key Super_L
+    xgrab_overview_opens_and_closes "Super after Super+Escape" ||
+        fail G-XWAYLAND-GRAB "after Super+Escape, Super did not open and Escape close the overview"
+    xgrab_stop Remote-viewer
+
+    xgrab_start xterm XTerm
+    xgrab_verdict denied || fail G-XWAYLAND-GRAB "the compositor gave no verdict on xterm's XGrabKeyboard"
+    xdotool key Super_L
+    xgrab_overview_opens_and_closes "Super over a refused grab" ||
+        fail G-XWAYLAND-GRAB "Super did not open and Escape close the overview over xterm's refused grab"
+    xgrab_stop XTerm
+    pass G-XWAYLAND-GRAB "remote-viewer's XGrabKeyboard is granted (Mutter's built-in list): a real Super reaches it and the overview stays shut until Super+Escape; XTerm's is refused and Super opens the overview"
+}
 protocol_gaps_gates() {
     protocol_probe G-XDG-WM-BASE-7 xdg-wm-base-7
     pass G-XDG-WM-BASE-7 "xdg_wm_base 7: a maximized window is tiled and constrained on every edge; a version 6 bind gets the tiled states alone"
@@ -2268,6 +2360,7 @@ protocol_gaps_gates() {
     pass G-WL-FIXES "wl_fixes 1 destroys a registry and the client's connection carries on"
     background_blur_gate
     syncobj_gate
+    xwayland_grab_gate
 }
 
 # G-SUBSURFACE-STACKING: a window's subsurfaces stack where the client

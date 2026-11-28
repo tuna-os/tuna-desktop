@@ -280,8 +280,13 @@ neighbouring pixels below 16) while beside it they stay sharp (above 128),
 from `background-blur.png`. G-SYNCOBJ: the nested session's software
 renderer has no timeline syncobjs, so the compositor logs Mutter's reason
 (`explicit sync disabled: …`, one of `meta-wayland-linux-drm-syncobj.c`'s
-messages) and no client finds `wp_linux_drm_syncobj_manager_v1`. CI runs
-the slice in the `gtk-shell` job; its `protocols/assertions.txt` feeds the
+messages) and no client finds `wp_linux_drm_syncobj_manager_v1`.
+G-XWAYLAND-GRAB: an X11 probe on the session's
+Xwayland takes `XGrabKeyboard`; as WM_CLASS `remote-viewer` (Mutter's
+built-in list) its grab is granted, a real Super tap reaches it and the
+overview stays shut until Super+Escape gives the shortcuts back, while as
+`XTerm` its grab is refused and Super opens the overview. CI runs the
+slice in the `gtk-shell` job; its `protocols/assertions.txt` feeds the
 ledger.
 
 `scripts/tuna-gtk-shell-proof --dnd-overview-only --artifacts DIR` runs
