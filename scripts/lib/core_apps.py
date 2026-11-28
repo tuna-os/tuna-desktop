@@ -1200,7 +1200,8 @@ class Desktop(NativeDesktop):
             self.retain('incomplete-core-apps-matrix', {
                 'source': self.metadata, 'leg': self.leg, 'completed_actual_app_results': self._results,
                 'not_qualified_apps': sorted(set(self.assigned or ()) - completed),
-                'failure_type': type(error).__name__, 'unconfirmed_guest_child': self._uncertain,
+                'failure_type': type(error).__name__, 'failure_message': str(error)[:2000],
+                'unconfirmed_guest_child': self._uncertain,
                 'installed_signed_release_qualified': False})
         finally:
             def cleanup(domain, operation, **arguments):
