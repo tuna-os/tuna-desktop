@@ -322,6 +322,22 @@ without the unrelated earlier gates. It adds no target motion or timing
 relaxation. CI runs this slice with its freshly built compositor and shell;
 the no-post-start-motion wire tests establish the precise protocol ordering.
 
+`scripts/tuna-gtk-shell-proof --x11-frames-only --artifacts DIR` runs the X11
+frame gates of the full GTK proof alone (`G-X11-FRAME`,
+`G-X11-FRAME-ACTIONS`, `G-X11-FRAME-CSD`, `G-X11-FRAME-RECOVERY`; P-WM-10):
+real X11 clients on the session's own Xwayland, the frames client
+`tuna-x11-frames` beside the compositor, and the real pointer on the title
+bar. After them it runs `G-X11-MENU` and `G-X11-TOOLTIP` (P-SY-04: a GTK3
+program's menus and tooltip, override-redirect windows, drawn and driven
+with the real pointer) and `G-RESIZE-BORDER` (P-WM-04: a GTK4 window resized
+from the invisible border outside its edge). It needs `xclock`, `xeyes`,
+`xev` (x11-apps), `xprop` and `xwininfo` (x11-utils), GTK 3 for Python
+(gir1.2-gtk-3.0) and the distribution `gsd-xsettings`
+(gnome-settings-daemon), which publishes `button-layout` and the title-bar
+click actions to the header bars: the window manager never owns
+XSETTINGS, as Mutter does not. CI runs this slice too, with its freshly
+built binaries.
+
 `scripts/tuna-gtk-shell-proof --datemenu-only --artifacts DIR` runs the date
 menu's gates alone, the same functions the full GTK proof calls
 (`scripts/lib/tuna-datemenu-proof.sh`): `G-CAL-OPEN`, `G-CAL-EVENTS`,
@@ -808,7 +824,7 @@ drop mid-bracket. The bracket checks themselves are unchanged.
 | `gtk-shell` | `scripts/tuna-slow-portal-proof --artifacts gtk-shell-artifacts/slow-portal` | as above | On a dbus-daemon bus whose portal activation hangs, the shell owns `org.gnome.Shell` within 15 s (40 s on GTK before 4.17, whose GtkApplication always waits on the inhibit portal) and makes no GDK portal call; writes `assertions.txt` |
 | `gtk-shell-smoke` | `TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --smoke-only --artifacts gtk-shell-smoke-artifacts` | as for `gtk-shell` | The merge queue's battery: bar, app windows, overview, lock and unlock through PAM; writes `assertions.txt` |
 | `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg kmod python3-evdev python3-gi gir1.2-gtk-4.0 gsettings-desktop-schemas acl`; run `scripts/ci-install-vkms` after `apt-get update` to ensure vkms for the running kernel | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe`, seatd, uinput and the card's seat ACL (`setfacl`, which a logind seat session would grant; the DRM lease device opens its own non-master fd) |
-| `drm-smoke` | `scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt` | as above; Linux 6.19 or newer for vkms configfs (the job pins `ubuntu-26.04`) | Two connectors of a vkms configfs device: mirroring, disabling and kept layouts, workspaces on the primary only, mixed fractional/integer scale; appends to drm-smoke's `assertions.txt` |
+| `drm-smoke` | `scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt` | as above; Linux 6.19 or newer for vkms configfs (the job pins `ubuntu-26.04`) | Two connectors of a vkms configfs device: mirroring, disabling and kept layouts, workspaces on the primary only, the workspace slide per monitor, mixed fractional/integer scale; appends to drm-smoke's `assertions.txt` |
 | `hotplug` | `scripts/tuna-hotplug-stress --rounds 4 --out hotplug-artifacts` | as for `drm-smoke`, plus `libpam-wrapper colord pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools xdg-desktop-portal-gnome`; Linux 6.19+ for vkms configfs (the job pins `ubuntu-26.04`) | Connector hotplug on vkms: outputs, window re-homing, a full unplug, lock, colord and screencast gates (see [Output hotplug storm](#output-hotplug-storm)); writes `assertions.txt` |
 
 The `desktop-proofs` app content and scroll-mode strip proofs download
@@ -1082,6 +1098,15 @@ old behaviour produces:
   a hidden one at most 3/s against the compositor's 995 ms hidden-frame
   interval) are counted from the clients' heartbeats over 3 s starting
   1.5 s after each switch ends, past the callbacks owed from the slide;
+- `D-WORKSPACE-SLIDE-MULTI` (P-AN-05): with the pointer on B,
+  Super+Page_Down slides A alone. `drm_kms_readback.py --sample` reads
+  each CRTC's scanned-out framebuffer every 4 ms, so page flips are the
+  kernel's frame clock: A flips through the slide while B keeps its
+  framebuffer (nothing repainted or bled onto it), the compositor's
+  in-flight slide crosses A's width plus GNOME's 100 px spacing rather
+  than the whole desktop, and the switcher popup stays on A, the
+  primary. With an animating GTK client on B, B's flip rate during A's
+  slide stays at least 80 percent of its rate before it;
 - `D-SCALE-MIXED` (P-SY-03): a GNOME `monitors.xml` gives A a fractional
   scale and B scale 2 in the smallest mode Mutter allows both in; a GTK
   window Alt-dragged to span them gets B's scale over
@@ -1273,7 +1298,7 @@ click and key is QEMU input.
 | ID | What it asserts |
 |---|---|
 | `V-XWAYLAND` | Runs first. No Xwayland process and no X11 readiness before any X11 client, with the X display already reserved; a `GDK_BACKEND=x11` GTK 4 app (the picker's X11 caller, unarmed) then starts Xwayland on demand, the session's systemd user environment publishes the reserved `DISPLAY`, and its X11 window maps, takes focus and receives a real key and click (`app-integration/xwayland.json`) |
-| `V-PICKER` | For an X11 (`GDK_BACKEND=x11`) and a native Wayland GTK 4 caller, each opening the installed GNOME FileChooser portal (Nautilus) through its own parent handle: the caller is allocated its requested 1100x700; for OpenFile and SaveFile, cancel (Escape) and accept (type-ahead and Enter), the dialog maps as the focused transient child of the caller, horizontally centred on it; a click on the exposed parent is blocked; the portal answers 1 with no URI or 0 with the chosen file (SaveFile's file is then written by the caller); focus returns to the caller and a real key and click reach it; an unrelated bystander app receives nothing |
+| `V-PICKER` | For an X11 (`GDK_BACKEND=x11`) and a native Wayland GTK 4 caller, each opening the installed GNOME FileChooser portal (Nautilus) through its own parent handle: the caller is allocated its requested 1100x700 (the X11 caller, with no title bar of its own, is framed by `tuna-x11-frames` and its managed rectangle is that size grown by the frame's `_NET_FRAME_EXTENTS`); for OpenFile and SaveFile, cancel (Escape) and accept (type-ahead and Enter), the dialog maps as the focused transient child of the caller, horizontally centred on it; a click on the exposed parent is blocked; the portal answers 1 with no URI or 0 with the chosen file (SaveFile's file is then written by the caller); focus returns to the caller and a real key and click reach it; an unrelated bystander app receives nothing |
 | `V-INTROSPECT-SCREEN` | A session-bus client subscribed to Introspect `PropertiesChanged` sees `ScreenSize` equal the union of Mutter `GetCurrentState` logical monitors initially (1280x800), after hotplugging a 1024x768 second head, after rotating it 90° through `ApplyMonitorsConfig`, and after unplugging it, with no notification that repeats an unchanged size |
 | `V-MULTI-OUTPUT` | During V-INTROSPECT-SCREEN's hotplug: with two outputs the compositor's snapshot shows GNOME 51's one top bar across the primary output and none on the new one (GNOME's `layout.js` keeps `panelBox` on the primary monitor); a GTK window fullscreened on the new output's connector (`tuna-vm-desktop-gates --window placed`) fills it; after the unplug it survives on the remaining output, which keeps the top bar (`app-integration/multi-output.json`) |
 | `V-INTROSPECT-SANDBOX` | After installing the local Flatpak, xdg-desktop-portal-gnome's `Background.GetAppState` omits an unsandboxed client claiming the app ID `org.tuna.VmSandbox`, reports the Flatpak-sandboxed one as running or active, and drops it after it exits |

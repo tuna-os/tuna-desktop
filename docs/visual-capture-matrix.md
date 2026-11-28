@@ -151,7 +151,7 @@ state records its state observation next to its stills and clips.
 | P-AN-09 | Menu, OSD, banner, switcher transitions | stage:transitions `clip` + stage:notifications `nested` | Transition clip required | switcher-fade clip + banner stills; popover/submenu/OSD/banner/modal transitions unproven |
 | P-AN-10 | Lock, flash, wallpaper, ripple transitions | stage:system `partial` | Transition clip required | lock stills only; curtain/flash/crossfade/ripple/startup transitions unproven |
 | P-SY-11 | Clipboard kept after the copying app closes | `nonvisual` | No adequate capture | pasted bytes are checked by socketpair clients (`crates/compositor/tests/data_device.rs`); a real-app journey needs installed-image Corral |
-| P-WM-10 | Server-side frames on X11 windows | `missing-product` | No adequate capture | X11 windows map bare (walkthrough:x11); no frame exists to capture |
+| P-WM-10 | Server-side frames on X11 windows | `unproven` | No adequate capture | tuna-x11-frames frames implemented and proof-gated (G-X11-FRAME, G-X11-FRAME-ACTIONS, G-X11-FRAME-CSD, G-X11-FRAME-RECOVERY); no capture stage state shows a framed X11 window yet |
 | P-WM-11 | "Not responding" dialog | `unproven` | No adequate capture | dialog implemented; no capture state with a hung client yet |
 | P-PN-04 | World Clocks and Weather in the calendar | `missing-product` | No adequate capture | calendar popover has neither section |
 | P-NT-04 | Media players in the notification list | `missing-product` | No adequate capture | no media section on main; lock-screen and calendar media are in open PRs |
