@@ -2780,6 +2780,10 @@ def main():
     # guest agent only ever executes this lifecycle path.
     if action.startswith("app-"):
         os.execv("/usr/libexec/tuna-vm-app-integration", ["tuna-vm-app-integration", *sys.argv[1:]])
+    # Installed desktop gates (V-CURSOR, V-APP-POPOVER, V-WINDOW-BUTTONS,
+    # V-MINIMIZE-ANIMATION, V-TRAY, the V-MULTI-OUTPUT placed window).
+    if action.startswith("gates-"):
+        os.execv("/usr/libexec/tuna-vm-desktop-gates", ["tuna-vm-desktop-gates", *sys.argv[1:]])
     if action == "autotz":
         sys.path.insert(0, "/usr/libexec/tuna-native-session")
         import autotz_guest

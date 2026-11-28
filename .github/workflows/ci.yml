@@ -227,6 +227,7 @@ jobs:
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
       - run: python3 scripts/tests/test_vm_strip_image.py
       - run: python3 scripts/tests/test_vm_strip_stationary_edge.py
+      - run: python3 scripts/tests/test_vm_desktop_gates.py
       # The image policy is checked with sudo's own visudo and cvtsudoers,
       # as on the Fedora image. Ubuntu 26.04 (hosted runners for fork pull
       # requests) defaults to sudo-rs, which has no cvtsudoers and owns the
@@ -892,7 +893,7 @@ jobs:
             fi
           done
       - &gtk-shell-apt
-        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps x11-utils pipewire wireplumber pipewire-pulse gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good at-spi2-core python3-pyatspi python3-pil libnotify-bin libsecret-tools gnome-keyring gnome-settings-daemon-common gnome-settings-daemon fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libgweather-4-dev meson ninja-build libwayland-dev wayland-protocols libpam-wrapper libpam0g-dev ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 wayland-utils xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk
+        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool scrot ffmpeg jq dbus libglib2.0-bin xwayland x11-apps x11-utils pipewire wireplumber pipewire-pulse gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-good at-spi2-core python3-pyatspi python3-pil libnotify-bin libsecret-tools gnome-keyring gnome-settings-daemon-common gnome-settings-daemon fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libgweather-4-dev meson ninja-build libwayland-dev wayland-protocols libpam-wrapper libpam0g-dev ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 wayland-utils xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk fonts-noto-cjk ibus-libpinyin
       - name: Check out workflow-owned CI tooling
         uses: actions/checkout@v7.0.1
         with: *ci-tool-checkout
@@ -1198,6 +1199,13 @@ jobs:
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/tuna-gtk-shell-proof --window-leak-only --artifacts gtk-shell-artifacts/window-leak
+      # The app-icon menu and dash favorites (#1182, #1183).
+      - name: App menu and dash favorites
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
+        timeout-minutes: 8
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: scripts/tuna-gtk-shell-proof --app-menu-only --artifacts gtk-shell-artifacts/app-menu
       # A client's drag through the overview (#1189): real GTK drags open it
       # from the hot corner and the Activities button, activate a window
       # preview after 750 ms, and return to the starting workspace.
@@ -1295,10 +1303,12 @@ jobs:
       # The login screen (#1164, P-LK-03): tuna-compositor --greeter and
       # tuna-greeter against a GDM 51 and AccountsService mock on a private
       # system bus, driven through real X11 input and checked through
-      # AT-SPI. Independent of the proofs above, like the OSK proof.
+      # AT-SPI. Independent of the proofs above, like the OSK proof. The
+      # conflicting-session dialog's 60 s timeout is waited out (about 9.5
+      # minutes on a loaded workstation; 15 keeps half again as headroom).
       - name: Prove the Tuna greeter on GDM's greeter API
         if: ${{ !cancelled() }}
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: shellcheck -x scripts/tuna-greeter-proof && scripts/tuna-greeter-proof --artifacts gtk-shell-artifacts/greeter
       # Keep runnable binaries even when a later live proof assertion fails.
       # #1124: tuna-wallpaper-svg is built only by scripts/tuna-gtk-shell-proof
@@ -2287,10 +2297,12 @@ jobs:
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "commit=$PRODUCT_COMMIT"
           --meta "capture_commit=$(git rev-parse HEAD)"
-      # V-PICKER / V-INTROSPECT on their own two-head boot of the same disk:
-      # Nautilus file chooser parenting from real X11 and Wayland GTK callers,
-      # Introspect ScreenSize across virtio-gpu hotplug/rotation/unplug, and
-      # Flatpak sandbox identity through xdg-desktop-portal-gnome.
+      # V-XWAYLAND / V-PICKER / V-INTROSPECT / V-MULTI-OUTPUT on their own
+      # two-head boot of the same disk: Xwayland's on-demand start for a real
+      # X11 GTK client, Nautilus file chooser parenting from real X11 and
+      # Wayland GTK callers, Introspect ScreenSize and the top bar across
+      # virtio-gpu hotplug/rotation/unplug with a window on the unplugged
+      # output, and Flatpak sandbox identity through xdg-desktop-portal-gnome.
       - name: App-integration boot (file chooser, Introspect display size and sandbox identity)
         if: matrix.profile == 'lifecycle' && matrix.orca == 'distribution'
         # Picker (2 roles x 4 cases), Flatpak install (400 s cap) and the
@@ -2474,6 +2486,7 @@ jobs:
           --assertions ledger-in/gtk-shell/subsurface/assertions.txt
           --assertions ledger-in/gtk-shell/lock-auth/assertions.txt
           --assertions ledger-in/gtk-shell/panel-dash/assertions.txt
+          --assertions ledger-in/gtk-shell/app-menu/assertions.txt
           --assertions ledger-in/gtk-shell/protocols/assertions.txt
           --assertions ledger-in/gtk-shell/greeter/assertions.txt
           --assertions ledger-in/gtk-shell/ibus-owner/assertions.txt

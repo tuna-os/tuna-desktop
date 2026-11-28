@@ -76,6 +76,9 @@ COPY scripts/lib/gnome-brightness-proof.py /usr/libexec/tuna-brightness-proof
 COPY scripts/lib/tuna-datetime-proof.py /usr/libexec/tuna-datetime-proof
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
 COPY packaging/marlin/vm-lane/tuna-vm-shell-focus /usr/libexec/tuna-vm-shell-focus
+# Installed desktop gates: GTK fixtures and the nested proof's tray stub.
+COPY packaging/marlin/vm-lane/tuna-vm-desktop-gates /usr/libexec/tuna-vm-desktop-gates
+COPY scripts/lib/tuna-tray-item-stub.py /usr/libexec/tuna-tray-item-stub
 COPY packaging/marlin/vm-lane/tuna-vm-orca-token /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token
 COPY packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/journald.conf /usr/lib/systemd/journald.conf.d/90-tuna-vm-lane.conf
@@ -138,6 +141,7 @@ RUN mkdir -p /usr/share/tuna-vm \
     && echo 'tuna-test:tuna' | chpasswd \
     && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-fresh-accounts /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-shell-focus \
          /usr/libexec/tuna-vm-picker /usr/libexec/tuna-vm-introspect-watch /usr/libexec/tuna-vm-app-integration \
+         /usr/libexec/tuna-vm-desktop-gates \
          /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token \
     && /usr/libexec/tuna-vm-lifecycle gdm-policy \
     && printf 'TUNA_COMPOSITOR_STATE=/run/user/%s/tuna-vm-state.json\nTUNA_LOCK_TRACE=1\nTUNA_POINTER_TRACE=1\n' \
