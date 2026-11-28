@@ -1627,7 +1627,11 @@ jobs:
         with:
           key: ${{ steps.cache-platform.outputs.distro }}
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool jq dbus dbus-x11 libglib2.0-bin xwayland at-spi2-core python3-gi python3-yaml gir1.2-gtk-4.0 libnotify-bin fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libgweather-4-dev libwayland-dev wayland-protocols libpam-wrapper libpam0g-dev libgtk4-layer-shell-dev gsettings-desktop-schemas libclang-dev speech-dispatcher
+      # speech-dispatcher 0.12 always loads its espeak-ng fallback module, and
+      # ignores SIGPIPE only after module init: a missing sd_espeak-ng that
+      # exits before speechd writes INIT kills the autospawned server, so
+      # Orca starts without speech (runs 46100729124, 46118847699).
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config xvfb xdotool jq dbus dbus-x11 libglib2.0-bin xwayland at-spi2-core python3-gi python3-yaml gir1.2-gtk-4.0 libnotify-bin fonts-cantarell shellcheck libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libgweather-4-dev libwayland-dev wayland-protocols libpam-wrapper libpam0g-dev libgtk4-layer-shell-dev gsettings-desktop-schemas libclang-dev speech-dispatcher speech-dispatcher-espeak-ng
       - name: Build and install pinned native Orca
         shell: bash
         run: |
