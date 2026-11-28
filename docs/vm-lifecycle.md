@@ -162,11 +162,14 @@ can invoke `init/start/state/ack/finish/cleanup/file` on the fixed helper.
 QMP `screendump` cannot read this boot's screen: QEMU 10.2 answers it from
 `qemu_console_surface()`, which is NULL for a GL texture scanout, under every
 display backend ("no surface"). The boot therefore runs
-`-display gtk,gl=on,full-screen=on` on a 1280x800 Xvfb screen, the guest's
-scanout mode, where QEMU blits each presented scanout 1:1; every screendump
-and frame of the profile (greeter paint, `V-PANEL`, evidence frames) is an
-`x11grab` of that screen, still taken on the host after presentation. A screen
-of another size is refused rather than resampled.
+`-display gtk,gl=on,full-screen=on` on a 1280x800 Xvfb screen. The screen has
+no window manager to honour full-screen, so the lane sizes QEMU's window to it
+with `xdotool`; the gtk display hands that size to the guest as its preferred
+mode, and QEMU blits each presented scanout 1:1 (`V-DRM` requires the guest's
+lit mode to be 1280x800 here). Every screendump and frame of the profile
+(greeter paint, `V-PANEL`, evidence frames) is an `x11grab` of that screen,
+still taken on the host after presentation. A screen of another size is
+refused rather than resampled.
 
 The real unit/pixel and all 18 NV12/P010 coefficient capture cases remain
 mandatory, including all-format YUV positives, screenshot/PipeWire consumers

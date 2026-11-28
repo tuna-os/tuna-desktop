@@ -5888,6 +5888,24 @@ class VirglScanoutCapture(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text()
         self.assertIn('display = "gtk,gl=on,full-screen=on"', source)
         self.assertIn('(X11ScanoutQmp if a.profile == "colour" else baseline.Qmp)(qmp_path)', source)
+        self.assertIn('if profile == "colour":\n        fill_x11_screen(vm)', source)
+
+    def test_the_qemu_window_is_sized_to_the_screen_or_the_vm_is_retired(self):
+        calls, killed = [], []
+        vm = SimpleNamespace(kill=lambda: killed.append(True))
+        with patch.object(lane.subprocess, "run", lambda command, **_: calls.append(command)):
+            lane.fill_x11_screen(vm)
+        self.assertEqual(calls, [["xdotool", "search", "--sync", "--onlyvisible", "--name", "^QEMU",
+                                  "windowmove", "%@", "0", "0",
+                                  "windowsize", "%@", str(lane.WIDTH), str(lane.HEIGHT)]])
+        self.assertEqual(killed, [])
+
+        def never_mapped(command, **_):
+            raise subprocess.TimeoutExpired(command, 30)
+        with patch.object(lane.subprocess, "run", never_mapped), \
+                self.assertRaisesRegex(RuntimeError, "never filled the X screen"):
+            lane.fill_x11_screen(vm)
+        self.assertEqual(killed, [True])
 
 
 if __name__ == "__main__":

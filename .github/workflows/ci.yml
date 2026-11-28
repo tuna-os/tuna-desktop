@@ -2172,7 +2172,8 @@ jobs:
         if: matrix.profile == 'colour'
         # libegl-mesa0 is only the Mesa vendor ICD; QEMU's gtk,gl=on display
         # loads libglvnd's libEGL.so.1 through libepoxy, which aborts without it.
-        run: sudo apt-get install -y --no-install-recommends qemu-system-gui xvfb xauth libgl1-mesa-dri libegl-mesa0 libegl1
+        # xdotool sizes QEMU's full-screen window to the WM-less Xvfb screen.
+        run: sudo apt-get install -y --no-install-recommends qemu-system-gui xvfb xauth libgl1-mesa-dri libegl-mesa0 libegl1 xdotool
       - uses: sigstore/cosign-installer@v4.1.3
         with:
           cosign-release: v3.1.4
@@ -2436,10 +2437,10 @@ jobs:
           --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
           --meta "commit=${{ github.sha }}"
           --meta "run_id=${{ github.run_id }}"
-      # QMP screendump cannot read a virgl (GL texture) scanout; the lane reads
-      # the full-screen QEMU gtk window from this Xvfb screen instead, so the
-      # screen must be the guest's 1280x800 scanout mode (tuna-vm-lane
-      # grab_x11_scanout refuses any other size).
+      # QMP screendump cannot read a virgl (GL texture) scanout; the lane sizes
+      # QEMU's full-screen gtk window to this Xvfb screen, which the guest then
+      # drives as its mode, and reads the screen instead. The screen must be
+      # the lane's 1280x800 (tuna-vm-lane grab_x11_scanout refuses any other).
       - name: Prove all native colour DMA and production capture consumers
         if: matrix.profile == 'colour'
         env:

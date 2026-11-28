@@ -4006,15 +4006,37 @@ def native_gpu_devices(profile="lifecycle", outputs=1):
     return baseline.gpu_devices(outputs=outputs)
 
 
+def fill_x11_screen(vm):
+    """Give QEMU's full-screen gtk window the whole WIDTH x HEIGHT X screen.
+
+    gtk_window_fullscreen() only asks an EWMH window manager, and the owned
+    Xvfb screen runs none, so the window kept its first size: QEMU's 640x480
+    placeholder surface plus the menu bar it hides afterwards (ui/gtk.c
+    gd_display_init), 640x505. The gtk display hands its drawing-area size to
+    the guest as the virtio-gpu preferred mode (gd_configure ->
+    dpy_set_ui_info), so the guest compositor drove 640x505 (run
+    46095604445). With no window manager X applies another client's
+    configure request directly: this does the window manager's part, before
+    the guest kernel reads its modes."""
+    try:
+        subprocess.run(["xdotool", "search", "--sync", "--onlyvisible", "--name", "^QEMU",
+                        "windowmove", "%@", "0", "0", "windowsize", "%@", str(WIDTH), str(HEIGHT)],
+                       check=True, capture_output=True, timeout=30)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        vm.kill()
+        raise RuntimeError(f"QEMU's gtk window never filled the X screen: {error}") from error
+
+
 def grab_x11_scanout(path, fmt="ppm"):
     """Write the virgl DEV profile's presented scanout to `path` as PPM or PNG.
 
     QEMU's `-display gtk,gl=on,full-screen=on` blits the guest's GL scanout
-    over the whole owned Xvfb screen (ui/gtk-egl.c gd_egl_scanout_flush:
-    egl_fb_blit into the window framebuffer). The screen is WIDTH x HEIGHT,
-    the guest's virtio-gpu preferred mode, so the blit is 1:1 and the X
-    screen holds exactly the frame QEMU presented. A screen of any other size
-    would stretch the scanout: refused, not resampled."""
+    over its window (ui/gtk-egl.c gd_egl_scanout_flush: egl_fb_blit into the
+    window framebuffer), which fill_x11_screen sized to the whole WIDTH x
+    HEIGHT Xvfb screen; the guest takes that size as its mode, so the blit is
+    1:1 and the X screen holds exactly the frame QEMU presented. A screen of
+    any other size would stretch the scanout: refused, not resampled. V-DRM
+    requires the guest's lit mode to be WIDTH x HEIGHT on this profile."""
     if fmt not in ("ppm", "png"):
         raise ValueError(f"unsupported scanout format {fmt}")
     ffmpeg = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
@@ -4121,7 +4143,10 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
     if kvm:
         qemu[1:1] = ["-enable-kvm", "-cpu", "host"]
     log(f"booting {disk} (kvm={kvm})")
-    result = subprocess.Popen(qemu), qmp_path, serial, kvm
+    vm = subprocess.Popen(qemu)
+    if profile == "colour":
+        fill_x11_screen(vm)
+    result = vm, qmp_path, serial, kvm
     return (*result, agent_path) if guest_agent else result
 
 
@@ -4673,7 +4698,13 @@ def main():
     text = read_text(serial_path)
     drm = drm or DRM_RE.search(text)
     shell = shell or SHELL_RE.search(text)
-    record("V-DRM", bool(drm), f"DRM/KMS output lit: {drm.group(0) if drm else 'no drm: output line'}")
+    # The virgl profile's screendumps are 1:1 only at the X screen's mode
+    # (grab_x11_scanout).
+    mode_ok = (not drm or a.profile != "colour"
+               or (int(drm.group(2)), int(drm.group(3))) == (WIDTH, HEIGHT))
+    record("V-DRM", bool(drm) and mode_ok,
+           f"DRM/KMS output lit: {drm.group(0) if drm else 'no drm: output line'}"
+           + ("" if mode_ok else f", not the {WIDTH}x{HEIGHT} X screen scanned out 1:1"))
     record("V-SHELL", bool(shell) and EXHAUSTED not in text,
            "tuna-shell-gtk started under supervision" if shell
            else "no tuna-shell-gtk: keybindings line")
