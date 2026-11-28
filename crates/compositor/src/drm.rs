@@ -346,6 +346,8 @@ fn negotiate_renderable_scanout<T>(
 
 /// Shared startup/hotplug discovery. High precision is negotiated once:
 /// capable outputs retain their ten-bit swapchain even in SDR mode.
+/// `keep_mapped` is [`scanout_keep_mapped`] for this device's renderer.
+#[allow(clippy::too_many_arguments)]
 fn discover_output(
     drm: &mut DrmDevice,
     gbm: &GbmDevice<DrmDeviceFd>,
@@ -354,6 +356,7 @@ fn discover_output(
     info: &connector::Info,
     name: String,
     used: &[crtc::Handle],
+    keep_mapped: bool,
 ) -> Result<Option<DrmOutput>, String> {
     use std::os::fd::AsFd;
     let handle = info.handle();
@@ -419,7 +422,8 @@ fn discover_output(
                 GbmAllocator::new(
                     gbm.clone(),
                     GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-                ),
+                )
+                .keep_mapped(keep_mapped),
                 formats,
                 renderer
                     .egl_context()
@@ -585,6 +589,8 @@ pub struct DrmBackend {
     privacy_read_pending: Option<bool>,
     /// A setting write the runtime owes GSettings (the hotkey).
     privacy_write: Option<bool>,
+    /// Scanout buffers stay mapped for their life: OpenGL is software.
+    keep_scanout_mapped: bool,
     /// Connectors `TUNA_DEBUG_LEASE_CONNECTORS` keeps off the desktop for lease.
     lease_names: Vec<String>,
 }
@@ -698,6 +704,15 @@ pub fn fallback_scale() -> f64 {
         .unwrap_or(1.0)
 }
 
+/// Whether scanout buffers stay mapped for their life
+/// ([`GbmAllocator::keep_mapped`]): only when OpenGL (`GL_RENDERER`) is
+/// Mesa's software rasterizer. On KMS that is kms_swrast, which otherwise
+/// maps and unmaps the target for every frame it draws, faulting its pages
+/// in again each time (#503). A hardware driver may copy a buffer to map it.
+fn scanout_keep_mapped(gl_renderer: Option<&str>) -> bool {
+    gl_renderer.is_some_and(tuna_shell_control::gl::is_software_renderer)
+}
+
 impl DrmBackend {
     pub fn native_outputs(&self) -> Vec<tuna_output::NativeOutputInfo> {
         use std::os::fd::AsFd;
@@ -783,6 +798,11 @@ impl DrmBackend {
         // SAFETY: the context is current on this thread only.
         let mut renderer =
             unsafe { GlesRenderer::new(context) }.map_err(|e| err("gles")(e.to_string()))?;
+        let keep_scanout_mapped =
+            scanout_keep_mapped(crate::runtime::gl_renderer_name(&mut renderer).as_deref());
+        if keep_scanout_mapped {
+            eprintln!("tuna-compositor: drm: software rendering; scanout buffers stay mapped");
+        }
 
         let resources = drm
             .resource_handles()
@@ -818,6 +838,7 @@ impl DrmBackend {
                 &info,
                 name,
                 &used,
+                keep_scanout_mapped,
             ) {
                 Ok(Some(output)) => {
                     used.push(output.crtc);
@@ -887,6 +908,7 @@ impl DrmBackend {
             privacy: Default::default(),
             privacy_read_pending: None,
             privacy_write: None,
+            keep_scanout_mapped,
             lease_names,
         };
         // With every connector for lease there is no layout to apply.
@@ -1059,6 +1081,7 @@ impl DrmBackend {
                 &info,
                 name,
                 &used,
+                self.keep_scanout_mapped,
             ) {
                 Ok(Some(mut output)) => {
                     if let Some((_, protocol)) = protocol_outputs
@@ -2355,5 +2378,20 @@ mod tests {
         });
         assert_eq!(result, Err("SDR probe".to_owned()));
         assert_eq!(attempts, [true, false]);
+    }
+
+    #[test]
+    fn only_software_gl_keeps_scanout_buffers_mapped() {
+        assert!(scanout_keep_mapped(Some(
+            "llvmpipe (LLVM 20.1.2, 256 bits)"
+        )));
+        assert!(scanout_keep_mapped(Some("softpipe")));
+        assert!(!scanout_keep_mapped(Some(
+            "AMD Radeon Graphics (radeonsi, renoir, LLVM 20.1.2, DRM 3.61)"
+        )));
+        assert!(!scanout_keep_mapped(Some(
+            "Mesa Intel(R) Graphics (ADL GT2)"
+        )));
+        assert!(!scanout_keep_mapped(None));
     }
 }

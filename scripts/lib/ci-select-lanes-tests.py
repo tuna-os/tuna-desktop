@@ -25,15 +25,32 @@ def pr(*changed, run=0, size=2):
 
 
 class Selection(unittest.TestCase):
-    def test_main_schedule_and_dispatch_run_every_lane(self):
+    def test_main_schedule_and_dispatch_run_every_lane_but_the_queue_smoke(self):
+        # Their full gtk-shell job proves every gate the smoke does.
+        battery = [lane for lane in m.LANES if lane != "gtk-shell-smoke"]
         for event in ("push", "schedule", "workflow_dispatch"):
-            self.assertEqual(m.select(event, 7, 2, [])[0], m.LANES)
+            self.assertEqual(m.select(event, 7, 2, [])[0], battery)
 
-    def test_a_merge_group_runs_every_lane(self):
-        # The merge queue's result is what lands on main: no path selection
-        # and no round robin, whatever the queued pull requests changed.
-        for run in range(4):
-            self.assertEqual(m.select("merge_group", run, 2, ["docs/x.md"])[0], m.LANES)
+    def test_a_merge_group_runs_the_fast_battery_only(self):
+        # The queue waits for check and one GTK session, whatever the queued
+        # pull requests changed; the push to main the group becomes runs
+        # every lane.
+        self.assertEqual(m.MERGE_QUEUE, ["gtk-shell-smoke"])
+        for changed in ([], ["docs/x.md"], ["Cargo.lock", "crates/compositor/src/lib.rs"]):
+            for run in range(4):
+                self.assertEqual(m.select("merge_group", run, 2, changed)[0], ["gtk-shell-smoke"])
+
+    def test_desktop_proofs_replace_their_three_lanes(self):
+        # One job runs the grid-cancel comparison, app content and the
+        # scroll-mode strip; each proof's inputs select it.
+        for old in ("app-content", "scroll-proof", "grid-cancel-comparison"):
+            self.assertNotIn(old, m.LANES)
+        self.assertIn("desktop-proofs", m.CORE)
+        for path in ("scripts/tuna-app-content", "scripts/tuna-scroll-proof",
+                     "scripts/tests/test_grid_cancel_comparison.py"):
+            for run in (0, 4):
+                self.assertEqual(pr(path, run=run), ["desktop-proofs"], path)
+        self.assertEqual(m.NEEDS["docs-shots"], ["journey", "desktop-proofs"])
 
     def test_shared_inputs_run_every_lane(self):
         for path in (".github/workflows/ci.yml", "Cargo.lock", "Cargo.toml",
@@ -71,7 +88,7 @@ class Selection(unittest.TestCase):
         self.assertEqual(sorted(m.rotation(3, 99)), sorted(m.ROTATION))
 
     def test_owned_paths_run_their_lane_without_rotation(self):
-        self.assertEqual(pr("scripts/tuna-scroll-proof"), ["scroll-proof"])
+        self.assertEqual(pr("scripts/tuna-scroll-proof"), ["desktop-proofs"])
         # The vkms gates (D-*) live in the DRM smoke; its qualification
         # closure adds the native colour consumer (NEEDS: marlin-vm, which
         # needs arch-package).
@@ -181,7 +198,10 @@ class Selection(unittest.TestCase):
         lanes, matrix = run("--event", "pull_request", "--draft")
         self.assertEqual((lanes, matrix), ([], m.vm_matrix("pull_request", [])))
         lanes, matrix = run("--event", "push")
-        self.assertEqual((lanes, matrix), (m.LANES, m.vm_matrix("push", m.LANES)))
+        battery = [lane for lane in m.LANES if lane not in m.MERGE_QUEUE]
+        self.assertEqual((lanes, matrix), (battery, m.vm_matrix("push", battery)))
+        lanes, _ = run("--event", "merge_group")
+        self.assertEqual(lanes, ["gtk-shell-smoke"])
 
 
     def test_colour_inputs_require_native_and_capture_consumers_without_rotation(self):
@@ -247,7 +267,7 @@ class Selection(unittest.TestCase):
         for run in range(len(m.ROTATION)):
             with self.subTest(run=run):
                 self.assertEqual(pr("share/pam.d/tuna-lock", run=run), [
-                    'journey', 'grid-cancel-comparison', 'gtk-shell',
+                    'journey', 'desktop-proofs', 'gtk-shell',
                     'portal-security', 'remote-security', 'niri-parity', 'arch-package',
                     'marlin-image', 'marlin-vm'])
         # Control: other shipped runtime data still rotates journey.
@@ -266,7 +286,7 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("scripts/tests/test_notify_callback_contract.py"), ["gtk-shell"])
         self.assertEqual(pr("scripts/tests/test_native_product.py"),
                          ["arch-package", "marlin-vm"])
-        self.assertEqual(pr("scripts/tests/test_grid_cancel_proof.py"), ["grid-cancel-comparison"])
+        self.assertEqual(pr("scripts/tests/test_grid_cancel_proof.py"), ["desktop-proofs"])
         # drm-smoke's qualification closure adds the native colour consumer
         # (NEEDS: marlin-vm, which downloads arch-package).
         self.assertEqual(pr("scripts/tests/test_colord_startup.py"),
@@ -456,6 +476,14 @@ jobs:
         self.assertEqual(lanes("ci-gate"), set())
         # The journey no longer waits for check, yet its shots still feed the ledger and docs.
         self.assertEqual(lanes("journey"), {"journey", "parity-ledger", "docs-shots"})
+        # The consolidated proofs' shots feed docs-shots; the smoke feeds nothing.
+        self.assertEqual(lanes("desktop-proofs"), {"desktop-proofs", "docs-shots"})
+        self.assertEqual(lanes("gtk-shell-smoke"), {"gtk-shell-smoke"})
+        # The smoke aliases gtk-shell's apt step: editing it reruns both.
+        anchor = base.index("&gtk-shell-apt")
+        end = base.index("\n", base.index("run:", anchor))
+        self.assertEqual(m.workflow_lanes(base, base[:end] + " xterm" + base[end:]),
+                         {"gtk-shell", "gtk-shell-smoke", "parity-ledger"})
 
 
 class WorkflowSync(unittest.TestCase):
@@ -588,10 +616,11 @@ class WorkflowSync(unittest.TestCase):
         workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
         triggers = workflow.get("on", workflow.get(True))
         self.assertIn("merge_group", triggers)
-        # The gate must not be skipped for the event, and the runner choice
-        # must not send the merge group to the fork (hosted) path.
+        # The gate must not be skipped for the event, and a merge group's
+        # jobs take GitHub-hosted ubuntu-24.04 (never a self-hosted slot).
         self.assertEqual(self.jobs["ci-gate"]["if"], "${{ !cancelled() }}")
-        self.assertIn("github.event_name != 'pull_request'", self.jobs["select-lanes"]["runs-on"])
+        self.assertIn("github.event_name != 'merge_group'", self.jobs["check"]["runs-on"])
+        self.assertTrue(self.jobs["check"]["runs-on"].endswith("|| 'ubuntu-24.04' }}"))
         # Canonical media is compared with the group's base, not with a
         # pull request base or a push's previous head, neither of which a
         # merge group has.
@@ -621,6 +650,65 @@ class WorkflowSync(unittest.TestCase):
                 self.assertGreater(index, build)
                 self.assertEqual(step.get("if"),
                                  "${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}")
+
+    def test_a_merge_group_runs_only_jobs_whose_needs_it_runs(self):
+        # Every lane job is gated on its lane; on a merge group only
+        # select-lanes, check, the smoke and the gate run, and none of them
+        # waits on a job the group skips (a skipped need skips the job).
+        lanes = m.select("merge_group", 0, 2, [])[0]
+        pattern = r"contains\(fromJSON\(needs\.select-lanes\.outputs\.lanes\), '([^']+)'\)"
+        running = set()
+        for name, job in self.jobs.items():
+            gated = re.findall(pattern, str(job.get("if", "")))
+            if name not in ("select-lanes", "check", "ci-gate"):
+                self.assertTrue(gated, f"{name} runs whatever the selection")
+            if not gated or any(lane in lanes for lane in gated):
+                running.add(name)
+        self.assertEqual(running, {"select-lanes", "check", "gtk-shell-smoke", "ci-gate"})
+        for name in running - {"ci-gate"}:
+            self.assertLessEqual(set(self.needs(self.jobs[name])), running, name)
+
+    def test_the_smoke_runs_its_slice_on_gtk_shells_setup(self):
+        job = self.jobs["gtk-shell-smoke"]
+        # Beside check, so the queue waits for the longer of the two.
+        self.assertEqual(self.needs(job), ["select-lanes"])
+        runs = [str(step.get("run", "")) for step in job["steps"]]
+        self.assertTrue(any("scripts/tuna-gtk-shell-proof --smoke-only" in run for run in runs))
+        self.assertIn("--smoke-only)", (ROOT / "scripts/tuna-gtk-shell-proof").read_text())
+        gtk = self.jobs["gtk-shell"]["steps"]
+        for step in job["steps"]:
+            if "apt-get" in str(step.get("run", "")) or "Ubuntu archive" in str(step.get("name", "")):
+                self.assertIn(step, gtk)
+        cache = next(s for s in job["steps"] if "rust-cache" in str(s.get("uses", "")))
+        gtk_cache = next(s for s in gtk if "rust-cache" in str(s.get("uses", "")))
+        # rust-cache keys a job's cache `<key>-<job id>`: restore gtk-shell's.
+        self.assertEqual(cache["with"]["shared-key"], gtk_cache["with"]["key"] + "-gtk-shell")
+        self.assertEqual(cache["with"]["save-if"], "false")
+
+    def test_desktop_proofs_keep_each_proof_and_artifact(self):
+        for old in ("app-content", "scroll-proof", "grid-cancel-comparison"):
+            self.assertNotIn(old, self.jobs)
+        job = self.jobs["desktop-proofs"]
+        steps = job["steps"]
+        runs = [str(step.get("run", "")) for step in steps]
+
+        def index(command):
+            return next(i for i, run in enumerate(runs) if command in run)
+        grid = index("scripts/tuna-grid-cancel-comparison")
+        # The comparison admits a clean checkout, so it runs before the
+        # other proofs; they reuse its fixed build and run when it failed.
+        for command in ("scripts/tuna-app-content --artifacts", "scripts/tuna-scroll-proof --artifacts"):
+            step = steps[index(command)]
+            with self.subTest(command=command):
+                self.assertGreater(index(command), grid)
+                self.assertEqual(step.get("if"),
+                                 "${{ !cancelled() && steps.desktop-deps.outcome == 'success' }}")
+                self.assertEqual(step["env"]["CARGO_TARGET_DIR"], job["env"]["CARGO_TARGET_DIR"] + "/fixed")
+        self.assertLessEqual({"grid-cancel-comparison", "app-content-shots", "scroll-proof-shots"},
+                             set(m._upload_names(job)))
+        # The comparison admits only the job it runs in.
+        contract = (ROOT / "scripts/lib/grid_cancel_comparison.py").read_text()
+        self.assertIn('\nJOB = "desktop-proofs"\n', contract)
 
 
 if __name__ == "__main__":

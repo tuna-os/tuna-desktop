@@ -14,7 +14,7 @@ v4), `gh` logged in as an org admin, and `ssh karnataka` with sudo.
 | Piece | Where | What |
 | --- | --- | --- |
 | ARC controller | namespace `arc-systems`, Helm release `arc` | `gha-runner-scale-set-controller` chart; watches only `tuna-ci` |
-| Scale set `tuna-ci-24.04` | namespace `tuna-ci`, release `tuna-ci-24-04` | [values](../.github/runners/values-24.04.yaml); jobs that use `ubuntu-latest` on GitHub |
+| Scale set `tuna-ci-24.04` | namespace `tuna-ci`, release `tuna-ci-24-04` | [values](../.github/runners/values-24.04.yaml); jobs that use `ubuntu-24.04` on GitHub |
 | Scale set `tuna-ci-26.04` | namespace `tuna-ci`, release `tuna-ci-26-04` | [values](../.github/runners/values-26.04.yaml); jobs that use `ubuntu-26.04` on GitHub |
 | Runner image | node-local containerd, `localhost/tuna-ci-runner:<ubuntu>-<runner>-<stamp>` | [Containerfile](../.github/runners/image/Containerfile), built by [build-image](../.github/runners/build-image) |
 | Guard rails | [cluster.yaml](../.github/runners/cluster.yaml) | namespace, admission policy, NetworkPolicy, quota, priority class |
@@ -27,17 +27,19 @@ Both chart releases use the same chart version (0.15.1 at install).
 ## What runs where
 
 The `runs-on` of a moved job is a YAML alias (`*runner-24` / `*runner-26`)
-of the expressions anchored on `select-lanes` and `orca-speech` in
+of the expressions anchored on `check` and `journey` in
 `.github/workflows/ci.yml`. They pick the self-hosted scale set when the
 repository variable `CI_RUNNERS` is not `hosted` **and** the event is a push,
 schedule, dispatch or a pull request whose head repository is
-`tuna-os/tuna-desktop`; otherwise the original GitHub-hosted label.
+`tuna-os/tuna-desktop`; otherwise the original GitHub-hosted label. A merge
+group's `*runner-24` jobs use GitHub-hosted `ubuntu-24.04`
+([below](#what-a-merge-group-runs)).
 
 | Runner | Lanes |
 | --- | --- |
-| `tuna-ci-24.04` | select-lanes, check, app-content, scroll-proof, grid-cancel-comparison, gtk-shell, native-reference-context, parity-ledger, docs-shots, ci-gate |
+| `tuna-ci-24.04` | check, desktop-proofs, gtk-shell, gtk-shell-smoke |
 | `tuna-ci-26.04` | journey, orca-speech, portal-security, remote-security, niri-parity |
-| GitHub-hosted, always | arch-package, drm-smoke, hotplug (`ubuntu-26.04`), marlin-vm (pull requests: the primary lifecycle and automatic-timezone legs, plus the Orca 51 leg when parity-ledger runs; push, schedule and dispatch add the Orca 51 leg and both paired reference members), marlin-image (push, schedule and dispatch only), gdm51-native-package |
+| GitHub-hosted, always | arch-package, drm-smoke, hotplug (`ubuntu-26.04`), marlin-vm (pull requests: the primary lifecycle and automatic-timezone legs, plus the Orca 51 leg when parity-ledger runs; push, schedule and dispatch add the Orca 51 leg and both paired reference members), marlin-image (push, schedule and dispatch only), gdm51-native-package, and the short coordination jobs select-lanes, native-reference-context, parity-ledger, docs-shots and ci-gate (`ubuntu-24.04`) |
 
 Why the always-hosted lanes stay hosted:
 
@@ -58,6 +60,12 @@ Why the always-hosted lanes stay hosted:
   with a `packages: write` token. Publishing stays on GitHub's ephemeral VMs
   so a compromised long-lived node (or its shared image store) can never
   sign or push a release image.
+- **select-lanes, native-reference-context, parity-ledger, docs-shots and
+  ci-gate** run for seconds to a few minutes (git, Python, artifacts,
+  shellcheck, jq) but held a full runner slot. On 26-27 Nov 2026 they waited
+  35 to 131 minutes on average for a self-hosted slot while GitHub-hosted
+  jobs started at once; select-lanes gates every other job and ci-gate is
+  the required check, so that wait delayed every run and the merge queue.
 
 The required `gdm51-native-package` factory remains GitHub-hosted and feeds
 only the ordinary lifecycle images' final GDM overlay and fresh-account
@@ -76,8 +84,9 @@ runners; the same aliases can move them.
 
 ## Private GTK AT-SPI comparison dependency
 
-`grid-cancel-comparison` stages Ubuntu GTK `4.14.5+ds-0ubuntu0.10` with
-upstream commit `21d3eb76b68d6758122eddaf00b5823f9b2d7f34` using the existing
+The grid-cancel comparison in `desktop-proofs` stages Ubuntu GTK
+`4.14.5+ds-0ubuntu0.10` with upstream commit
+`21d3eb76b68d6758122eddaf00b5823f9b2d7f34` using the existing
 workflow-owned `ci-tool` action. The installer checks both Ubuntu source
 archive hashes and the patch hash; it retains the license, Ubuntu patch
 series, build options, compiler identity and runtime ELF hash/build ID.
@@ -189,23 +198,52 @@ it can affect:
   the `arch-package` consumers) wait for `check`, so a red `check` does not
   also burn hosted minutes. `check` takes about 10 minutes (run
   42332450103: `cargo test` 194 s, `maintained-media-tests` 69 s, apt 52 s).
-  The self-hosted `journey`, `app-content`, `scroll-proof` and `orca-speech`
-  run beside it; `ci-gate` still fails when `check` does.
-  `fprint-phase-proof`, `grid-cancel-comparison` and `gtk-shell` also wait
-  for `check`: they check out its `tested_sha` output.
+  The self-hosted `journey` and `orca-speech` run beside it; `ci-gate` still
+  fails when `check` does. `fprint-phase-proof`, `desktop-proofs` and
+  `gtk-shell` wait for `check`: they check out its `tested_sha` output.
+  `desktop-proofs` is one job for three short nested-session proofs that
+  share a build: the grid-cancel comparison, then `tuna-app-content` and
+  `tuna-scroll-proof` on the comparison's fixed build. Each keeps its own
+  step and artifact (`grid-cancel-comparison`, `app-content-shots`,
+  `scroll-proof-shots`), and the last two run even when an earlier proof
+  failed.
 - `scripts/ci-select-lanes` picks the lanes: docs, other non-runtime files and
   the tooling of other workflows (its `NO_LANE` list) pick none, a lane's own
   proof script picks that lane, an edit confined to some jobs of `ci.yml`
   picks those jobs' lanes plus every job that downloads their artifacts
   (derived from `needs:` and `download-artifact` in `ci.yml`: an
   `arch-package` edit also picks its package consumers, a `check` edit picks
-  `parity-ledger`), and any other code picks `gtk-shell` plus a rotating
-  slice. Shared CI inputs still pick every lane.
+  `parity-ledger`), and any other code picks `gtk-shell` and
+  `desktop-proofs` plus a rotating slice. Shared CI inputs still pick every
+  lane, `gtk-shell-smoke` included.
 - A newer push supersedes the older run (`concurrency` with
   `cancel-in-progress`, except for `main`). The superseded run queues no
   `ci-gate` ([below](#queue-supersession-and-closed-pull-requests)).
 - `marlin-tuna-nightly` qualifies the published image on schedule and
   dispatch only; dispatch it on a branch to test a change to it.
+
+## What a merge group runs
+
+The merge queue requires `ci-gate` on each merge group (ruleset 28229332).
+A group runs a fixed fast battery, not every lane: `select-lanes`, `check`
+and `gtk-shell-smoke`, which runs beside `check`. Both run on GitHub-hosted
+`ubuntu-24.04`, not the self-hosted pool: pull request runs kept every
+self-hosted slot busy, and a group's `check` waited over 40 minutes for one
+(27 Nov 2026). The
+smoke is one nested GTK session, `scripts/tuna-gtk-shell-proof
+--smoke-only`: the session starts, the bar maps (`G-PANEL`, `A11Y-PANEL`),
+three app windows map (`G-WINDOWS`), the overview opens and picks one
+(`G-OV-OPEN`, `G-OV-PICK`), and the session locks over the open date menu
+and quick settings and unlocks through PAM (`G-LOCK-WITH-MENU-OPEN`),
+then `G-SHELL-STABLE`. It restores the `gtk-shell` job's cargo cache and
+uses its apt steps (YAML anchors), so it builds only the workspace crates.
+
+A group therefore takes about as long as `check` (10 to 20 minutes) and
+holds no self-hosted slot instead of about twenty jobs. Every other lane
+runs on the push to `main` the group becomes, and nightly; push, schedule
+and dispatch never select `gtk-shell-smoke`, since their full `gtk-shell`
+job proves every gate it does. A pull request runs it when it runs every
+lane (a shared CI input) or edits its job.
 
 ## Queue supersession and closed pull requests
 
@@ -289,8 +327,14 @@ code as root inside its pod.
      (`ACTIONS_RUNNER_HOOK_JOB_STARTED`, baked into the image, out of reach
      of workflows). It fails the job before checkout unless the repository
      is `tuna-os/tuna-desktop` and the event is `push`,
-     `workflow_dispatch`, `schedule`, or `pull_request` whose head
-     repository is `tuna-os/tuna-desktop`.
+     `workflow_dispatch`, `schedule`, `pull_request` whose head
+     repository is `tuna-os/tuna-desktop`, or `merge_group` whose head ref
+     is a merge queue branch (`refs/heads/gh-readonly-queue/*`). GitHub
+     creates that ref in this repository only for a pull request a
+     maintainer put in the queue, so the code it runs has the trust of a
+     merge; a fork's pull request still never runs here on its own.
+     Changing the hook needs the image rebuilt and rolled out
+     (see the rollout steps below).
    - GitHub: the runner group `tuna-desktop-karnataka` has a single selected
      repository, and the repository requires maintainer approval before
      workflows run for **all** outside contributors' pull requests
@@ -640,7 +684,7 @@ gh variable set CI_RUNNERS -b hosted -R tuna-os/tuna-desktop
 ```
 
 Every job evaluated afterwards uses its original GitHub-hosted label
-(`ubuntu-latest` / `ubuntu-26.04`); assertions are identical on both.
+(`ubuntu-24.04` / `ubuntu-26.04`); assertions are identical on both.
 Re-run queued runs as in [Drain](#drain-maintenance-on-karnataka).
 `gh variable delete CI_RUNNERS -R tuna-os/tuna-desktop` switches back.
 
@@ -671,7 +715,7 @@ ssh karnataka 'sudo k3s ctr -n k8s.io images ls -q | grep tuna-ci-runner | xargs
 ```
 
 and replace the `*runner-24` / `*runner-26` aliases and anchors in `ci.yml`
-with `ubuntu-latest` / `ubuntu-26.04`.
+with `ubuntu-24.04` / `ubuntu-26.04`.
 
 ## Caches
 
