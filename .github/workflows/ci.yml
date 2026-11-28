@@ -227,6 +227,7 @@ jobs:
       - run: python3 scripts/tests/test_vm_strip_fixture_owner.py
       - run: python3 scripts/tests/test_vm_strip_image.py
       - run: python3 scripts/tests/test_vm_strip_stationary_edge.py
+      - run: python3 scripts/tests/test_vm_desktop_gates.py
       # The image policy is checked with sudo's own visudo and cvtsudoers,
       # as on the Fedora image. Ubuntu 26.04 (hosted runners for fork pull
       # requests) defaults to sudo-rs, which has no cvtsudoers and owns the
@@ -1187,6 +1188,13 @@ jobs:
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/tuna-gtk-shell-proof --window-leak-only --artifacts gtk-shell-artifacts/window-leak
+      # The app-icon menu and dash favorites (#1182, #1183).
+      - name: App menu and dash favorites
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
+        timeout-minutes: 8
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: scripts/tuna-gtk-shell-proof --app-menu-only --artifacts gtk-shell-artifacts/app-menu
       # A client's drag through the overview (#1189): real GTK drags open it
       # from the hot corner and the Activities button, activate a window
       # preview after 750 ms, and return to the starting workspace.
@@ -2271,10 +2279,12 @@ jobs:
           --meta "test_image_id=$(cat /mnt/vm/image-id)"
           --meta "commit=$PRODUCT_COMMIT"
           --meta "capture_commit=$(git rev-parse HEAD)"
-      # V-PICKER / V-INTROSPECT on their own two-head boot of the same disk:
-      # Nautilus file chooser parenting from real X11 and Wayland GTK callers,
-      # Introspect ScreenSize across virtio-gpu hotplug/rotation/unplug, and
-      # Flatpak sandbox identity through xdg-desktop-portal-gnome.
+      # V-XWAYLAND / V-PICKER / V-INTROSPECT / V-MULTI-OUTPUT on their own
+      # two-head boot of the same disk: Xwayland's on-demand start for a real
+      # X11 GTK client, Nautilus file chooser parenting from real X11 and
+      # Wayland GTK callers, Introspect ScreenSize and the top bar across
+      # virtio-gpu hotplug/rotation/unplug with a window on the unplugged
+      # output, and Flatpak sandbox identity through xdg-desktop-portal-gnome.
       - name: App-integration boot (file chooser, Introspect display size and sandbox identity)
         if: matrix.profile == 'lifecycle' && matrix.orca == 'distribution'
         # Picker (2 roles x 4 cases), Flatpak install (400 s cap) and the
@@ -2458,6 +2468,7 @@ jobs:
           --assertions ledger-in/gtk-shell/subsurface/assertions.txt
           --assertions ledger-in/gtk-shell/lock-auth/assertions.txt
           --assertions ledger-in/gtk-shell/panel-dash/assertions.txt
+          --assertions ledger-in/gtk-shell/app-menu/assertions.txt
           --assertions ledger-in/gtk-shell/protocols/assertions.txt
           --assertions ledger-in/gtk-shell/greeter/assertions.txt
           --assertions ledger-in/gtk-shell/ibus-owner/assertions.txt
