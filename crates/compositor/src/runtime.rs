@@ -4311,6 +4311,9 @@ impl Runtime {
             let Some((w, h, rgba)) = self.render_pixels(
                 connector.as_deref(),
                 smithay::backend::allocator::Fourcc::Abgr8888,
+                // The UI shows the frozen screen without the pointer,
+                // as GNOME's stage screenshot leaves it out.
+                false,
             ) else {
                 continue;
             };
