@@ -1589,6 +1589,13 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
             qmp.keys("esc")
             qmp.keys("ret")
             time.sleep(1)
+        else:
+            # After a refusal the shell shows "Sorry, that didn't work" for
+            # 3 s and only then begins the next conversation (authPrompt.js
+            # _onVerificationFailed); text typed before that conversation's
+            # question is never submitted (run 46132922179: typed at 358.56,
+            # asked at 360.10).
+            await_password_query(offset)
         qmp.keys("ctrl", "a")
         qmp.type_text(text)
         qmp.keys("ret")
