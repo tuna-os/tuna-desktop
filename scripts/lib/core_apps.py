@@ -991,6 +991,17 @@ class Desktop(NativeDesktop):
             raise RuntimeError('actual keyboard emission counters retired or moved backwards')
         return all(new['emitted_key_events'] > old['emitted_key_events'] for old, new in pairs)
 
+    @staticmethod
+    def _editable_buffers(tree):
+        """Each editable control's text, keyed by its place, role and name.
+
+        An accessible's object path is no identity across a lock: WebKit
+        rebuilt Epiphany's page accessibles under fresh ids while the page,
+        its payload entry and the entry's text all stayed (run 46095497198).
+        """
+        return {f"{'/'.join(map(str, node['path']))} {node['role']} {node['name']}": node['text']
+                for node in tree['nodes'] if node['editable'] and node['text'] is not None}
+
     def crosscut(self, actor, probe, restart_probe=None, ime_field=None):
         self.select(actor)
         baseline = probe(actor, 'baseline')
@@ -1023,8 +1034,7 @@ class Desktop(NativeDesktop):
         positive = self.await_state('actual-original-app-positive-emission',
             lambda: self.guest('desktop', 'app-input', actor=actor, phase='unlocked-focused'),
             lambda value: self._emission_advanced(emission_before, value))
-        buffers = {node['object_path']: node['text'] for node in self.tree(actor)['nodes']
-                   if node['editable'] and node['text'] is not None}
+        buffers = self._editable_buffers(self.tree(actor))
         self.keys('meta_l', 'l')
         self.await_state('actual-app-locked', lambda: self.state(unlocked=False),
                          lambda value: value['locked'])
@@ -1065,8 +1075,7 @@ class Desktop(NativeDesktop):
         if recovered_input != lock_before:
             raise RuntimeError('protected held input leaked to original app during actual unlock')
         self.select(actor)
-        after_buffers = {node['object_path']: node['text'] for node in self.tree(actor)['nodes']
-                         if node['editable'] and node['text'] is not None}
+        after_buffers = self._editable_buffers(self.tree(actor))
         if after_buffers != buffers:
             raise RuntimeError('original editable buffer changed/retired across locked input and unlock')
         # Seat focus is still settling from the unlock teardown here

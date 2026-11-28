@@ -1390,5 +1390,25 @@ class InstalledModulePrecedence(unittest.TestCase):
                           'geoclue_fixture': 'tuna-core-apps', 'native_session': 'tuna-native-session'})
 
 
+class EditableBufferIdentity(unittest.TestCase):
+    """Run 46095497198: WebKit rebuilt Epiphany's page accessibles under
+    fresh object paths across the lock while the payload entry and its
+    empty text stayed; buffers are keyed by place, role and name."""
+
+    def node(self, object_path, text, path=(0, 1), name='Qualification payload'):
+        return {'object_path': object_path, 'path': list(path), 'role': 'entry', 'name': name,
+                'editable': True, 'text': text}
+
+    def test_rebuilt_accessible_keeps_its_buffer(self):
+        before = core_apps.Desktop._editable_buffers({'nodes': [self.node('/a', '')]})
+        self.assertEqual(core_apps.Desktop._editable_buffers({'nodes': [self.node('/b', '')]}), before)
+
+    def test_changed_text_or_control_differs(self):
+        before = core_apps.Desktop._editable_buffers({'nodes': [self.node('/a', '')]})
+        for nodes in ([self.node('/a', 'x')], [self.node('/a', '', path=(0, 2))],
+                      [self.node('/a', '', name='Other')], []):
+            self.assertNotEqual(core_apps.Desktop._editable_buffers({'nodes': nodes}), before)
+
+
 if __name__ == '__main__':
     unittest.main()
