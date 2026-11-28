@@ -347,19 +347,18 @@ fn negotiate_renderable_scanout<T>(
 /// Shared startup/hotplug discovery. High precision is negotiated once:
 /// capable outputs retain their ten-bit swapchain even in SDR mode.
 /// `keep_mapped` is [`scanout_keep_mapped`] for this device's renderer.
-#[allow(clippy::too_many_arguments)]
 fn discover_output(
     drm: &mut DrmDevice,
     gbm: &GbmDevice<DrmDeviceFd>,
     renderer: &mut GlesRenderer,
     resources: &control::ResourceHandles,
     info: &connector::Info,
-    name: String,
     used: &[crtc::Handle],
     keep_mapped: bool,
 ) -> Result<Option<DrmOutput>, String> {
     use std::os::fd::AsFd;
     let handle = info.handle();
+    let name = lease::connector_name(info);
     let crtc_modes: Vec<_> = info
         .modes()
         .iter()
@@ -836,7 +835,6 @@ impl DrmBackend {
                 &mut renderer,
                 &resources,
                 &info,
-                name,
                 &used,
                 keep_scanout_mapped,
             ) {
@@ -1079,7 +1077,6 @@ impl DrmBackend {
                 &mut self.renderer,
                 &resources,
                 &info,
-                name,
                 &used,
                 self.keep_scanout_mapped,
             ) {

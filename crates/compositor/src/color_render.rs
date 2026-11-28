@@ -535,28 +535,47 @@ impl LutCache {
     }
 }
 
+/// What every non-colour surface draw applies on top: the tint program
+/// (`tint`), else the dim program (`brightness` below 1 with `dim`).
+#[derive(Clone, Copy)]
+pub(crate) struct Effects<'a> {
+    pub(crate) tint: Option<&'a FrameColor>,
+    pub(crate) brightness: f32,
+    pub(crate) dim: Option<&'a GlesTexProgram>,
+}
+
+/// Bind `texture` (0 unbinds) as the colour program's `lut` sampler.
+fn bind_lut(frame: &mut GlesFrame<'_, '_>, texture: u32) -> Result<(), GlesError> {
+    frame.with_context(|gl| unsafe {
+        gl.ActiveTexture(ffi::TEXTURE1);
+        gl.BindTexture(ffi::TEXTURE_2D, texture);
+        gl.ActiveTexture(ffi::TEXTURE0);
+    })
+}
+
 /// Draw `elements` front to back over their occlusion `plan` (as
 /// [`crate::occlusion::draw_planned`]), the colour-managed ones through
-/// the colour program and the rest through the tint program (`tint`),
-/// the dim program (`brightness` below 1 with `dim`) or the default one.
+/// the colour program and the rest with `effects` or the default program.
 /// `opaque` lets the rest draw their opaque regions without blending
 /// (see [`crate::occlusion::drawn_opaque_regions`]); colour-managed
 /// surfaces always blend.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_planned<E>(
     frame: &mut GlesFrame<'_, '_>,
     scale: f64,
     elements: &[E],
     plan: &[Vec<Rectangle<i32, Physical>>],
     colors: &ColorFrame,
-    tint: Option<&FrameColor>,
-    brightness: f32,
-    dim: Option<&GlesTexProgram>,
+    effects: Effects<'_>,
     opaque: bool,
 ) -> Result<(), GlesError>
 where
     E: RenderElement<GlesRenderer>,
 {
+    let Effects {
+        tint,
+        brightness,
+        dim,
+    } = effects;
     let base = |frame: &mut GlesFrame<'_, '_>| {
         if let Some(tint) = tint {
             frame.override_default_tex_program(tint.program.clone(), tint.uniforms(brightness));
@@ -603,11 +622,7 @@ where
                 frame.override_default_tex_program(program.clone(), all);
                 overridden = true;
                 if let Some(lut) = *lut {
-                    frame.with_context(|gl| unsafe {
-                        gl.ActiveTexture(ffi::TEXTURE1);
-                        gl.BindTexture(ffi::TEXTURE_2D, lut);
-                        gl.ActiveTexture(ffi::TEXTURE0);
-                    })?;
+                    bind_lut(frame, lut)?;
                 }
                 let drawn = if let Some(raw) = raw {
                     raw.with_bindings(frame, |frame| {
@@ -617,11 +632,7 @@ where
                     element.draw(frame, element.src(), geometry, &damage, &[])
                 };
                 if lut.is_some() {
-                    frame.with_context(|gl| unsafe {
-                        gl.ActiveTexture(ffi::TEXTURE1);
-                        gl.BindTexture(ffi::TEXTURE_2D, 0);
-                        gl.ActiveTexture(ffi::TEXTURE0);
-                    })?;
+                    bind_lut(frame, 0)?;
                 }
                 drawn
             }
@@ -954,13 +965,7 @@ mod tests {
             all.extend(effect_uniforms(None, 1.0));
             frame.override_default_tex_program(program, all);
             if let Some(lut) = lut {
-                frame
-                    .with_context(|gl| unsafe {
-                        gl.ActiveTexture(ffi::TEXTURE1);
-                        gl.BindTexture(ffi::TEXTURE_2D, lut);
-                        gl.ActiveTexture(ffi::TEXTURE0);
-                    })
-                    .unwrap();
+                bind_lut(&mut frame, lut).unwrap();
             }
             let draw = |frame: &mut GlesFrame<'_, '_>| {
                 frame.render_texture_from_to(

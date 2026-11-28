@@ -5339,19 +5339,14 @@ impl Runtime {
                     signal.session_closed(session_id);
                     return;
                 };
-                let hdr_available = self.hdr_capture_available(&target);
+                let offer = crate::screencast::StreamOffer {
+                    size,
+                    hdr_available: self.hdr_capture_available(&target),
+                };
                 let Some(pw) = self.pipewire.as_ref() else {
                     return;
                 };
-                match pw.start_cast(
-                    session_id,
-                    stream_id,
-                    target,
-                    monitor,
-                    size,
-                    hdr_available,
-                    signal,
-                ) {
+                match pw.start_cast(session_id, stream_id, target, monitor, offer, signal) {
                     Some(mut cast) => {
                         cast.embed_cursor = embed_cursor;
                         self.casts.push(cast);
@@ -9321,15 +9316,18 @@ fn draw_scene(
     }
     // Surfaces carry logical sizes: draw them at the output scale. The
     // wallpaper above is already sized in physical pixels.
+    let tinted = crate::color_render::Effects {
+        tint,
+        brightness: 1.0,
+        dim: None,
+    };
     crate::color_render::draw_planned(
         frame,
         scale,
         previews,
         &previews_plan,
         colors,
-        tint,
-        1.0,
-        None,
+        tinted,
         opaque,
     )
     .map_err(error)?;
@@ -9350,10 +9348,8 @@ fn draw_scene(
         frame, output, scale, scene, &over, &over_plan, tint, colors, opaque,
     )
     .map_err(error)?;
-    crate::color_render::draw_planned(
-        frame, scale, &scene.top, &top_plan, colors, tint, 1.0, None, opaque,
-    )
-    .map_err(error)?;
+    crate::color_render::draw_planned(frame, scale, &scene.top, &top_plan, colors, tinted, opaque)
+        .map_err(error)?;
     draw_planned::<GlesRenderer, _>(frame, 1.0, &fullscreen_bell, &bell_plan, opaque)
         .map_err(error)?;
     draw_planned::<GlesRenderer, _>(
@@ -9592,9 +9588,11 @@ fn draw_slots(
                 std::slice::from_ref(&scene.elements[index]),
                 visible,
                 colors,
-                tint,
-                brightness,
-                scene.dim_program.as_ref(),
+                crate::color_render::Effects {
+                    tint,
+                    brightness,
+                    dim: scene.dim_program.as_ref(),
+                },
                 opaque,
             ),
             SceneSlot::Bell(k) => draw_planned::<GlesRenderer, _>(

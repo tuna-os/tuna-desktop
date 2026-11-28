@@ -166,48 +166,56 @@ struct GlSupport {
 }
 
 impl GlSupport {
-    unsafe fn read(gl: &ffi::Gles2) -> Result<Self, GlesError> {
-        let version = gl.GetString(ffi::VERSION);
-        if version.is_null() {
-            return Err(GlesError::GLFunctionLoaderError);
-        }
-        let version = std::ffi::CStr::from_ptr(version.cast()).to_bytes();
-        let es3 = version.starts_with(b"OpenGL ES 3.");
-        // ES3 guarantees both the query and half-float linear sampling.
-        // GetString(EXTENSIONS) is deliberately not used on ES3.
-        if es3 {
-            return Ok(Self {
-                es3,
-                component_query: true,
-                half_float_linear: true,
-            });
-        }
-        let extensions = gl.GetString(ffi::EXTENSIONS);
-        if extensions.is_null() {
-            return Err(GlesError::GLFunctionLoaderError);
-        }
-        let extensions = std::ffi::CStr::from_ptr(extensions.cast()).to_bytes();
-        let has = |name: &[u8]| extensions.split(|c| *c == b' ').any(|ext| ext == name);
-        Ok(Self {
-            es3,
-            component_query: has(b"GL_EXT_color_buffer_half_float")
-                || has(b"GL_EXT_color_buffer_float"),
-            half_float_linear: has(b"GL_OES_texture_half_float")
-                && has(b"GL_OES_texture_half_float_linear"),
-        })
-    }
-
-    unsafe fn target_format(
-        self,
+    /// The format intermediates need to keep the bound scene's precision.
+    /// What the context supports is read once, into `cached`.
+    unsafe fn scene_format(
         gl: &ffi::Gles2,
+        cached: &mut Option<Self>,
         framebuffer: i32,
         rgb: bool,
     ) -> Result<TargetFormat, GlesError> {
+        let support = match *cached {
+            Some(support) => support,
+            None => {
+                let version = gl.GetString(ffi::VERSION);
+                if version.is_null() {
+                    return Err(GlesError::GLFunctionLoaderError);
+                }
+                let version = std::ffi::CStr::from_ptr(version.cast()).to_bytes();
+                let es3 = version.starts_with(b"OpenGL ES 3.");
+                // ES3 guarantees both the query and half-float linear
+                // sampling. GetString(EXTENSIONS) is deliberately not used
+                // on ES3.
+                let support = if es3 {
+                    Self {
+                        es3,
+                        component_query: true,
+                        half_float_linear: true,
+                    }
+                } else {
+                    let extensions = gl.GetString(ffi::EXTENSIONS);
+                    if extensions.is_null() {
+                        return Err(GlesError::GLFunctionLoaderError);
+                    }
+                    let extensions = std::ffi::CStr::from_ptr(extensions.cast()).to_bytes();
+                    let has = |name: &[u8]| extensions.split(|c| *c == b' ').any(|ext| ext == name);
+                    Self {
+                        es3,
+                        component_query: has(b"GL_EXT_color_buffer_half_float")
+                            || has(b"GL_EXT_color_buffer_float"),
+                        half_float_linear: has(b"GL_OES_texture_half_float")
+                            && has(b"GL_OES_texture_half_float_linear"),
+                    }
+                };
+                *cached = Some(support);
+                support
+            }
+        };
         if gl.GetError() != ffi::NO_ERROR {
             return Err(GlesError::FramebufferBindingError);
         }
         let mut component = 0;
-        if self.component_query {
+        if support.component_query {
             gl.GetFramebufferAttachmentParameteriv(
                 ffi::FRAMEBUFFER,
                 if framebuffer == 0 {
@@ -224,12 +232,12 @@ impl GlSupport {
             }
         }
         if component == ffi::FLOAT as i32 {
-            if !self.half_float_linear {
+            if !support.half_float_linear {
                 return Err(GlesError::GLExtensionNotSupported(&[
                     "GL_OES_texture_half_float_linear",
                 ]));
             }
-            Ok(if self.es3 {
+            Ok(if support.es3 {
                 TargetFormat::Rgba16F
             } else {
                 TargetFormat::Rgba16FOes
@@ -564,18 +572,12 @@ pub(crate) fn supported(frame: &mut GlesFrame<'_, '_>) -> Result<bool, GlesError
         .clone();
     let blit = frame.capabilities().contains(&Capability::Blit);
     frame.with_context(|gl| unsafe {
-        let mut cache = cache.lock().unwrap();
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut framebuffer = 0;
         gl.GetIntegerv(ffi::FRAMEBUFFER_BINDING, &mut framebuffer);
-        let support = match cache.support {
-            Some(support) => support,
-            None => {
-                let support = GlSupport::read(gl)?;
-                cache.support = Some(support);
-                support
-            }
-        };
-        let format = support.target_format(gl, framebuffer, !blit)?;
+        let format = GlSupport::scene_format(gl, &mut cache.support, framebuffer, !blit)?;
         if let Some((previous, supported)) = cache.admitted {
             if previous == format {
                 return Ok(supported);
@@ -640,15 +642,7 @@ pub(crate) fn draw_behind(
         };
         let mut framebuffer = 0;
         gl.GetIntegerv(ffi::FRAMEBUFFER_BINDING, &mut framebuffer);
-        let support = match cache.support {
-            Some(support) => support,
-            None => {
-                let support = GlSupport::read(gl)?;
-                cache.support = Some(support);
-                support
-            }
-        };
-        let format = support.target_format(gl, framebuffer, !blit)?;
+        let format = GlSupport::scene_format(gl, &mut cache.support, framebuffer, !blit)?;
         let mut viewport = [0i32; 4];
         gl.GetIntegerv(ffi::VIEWPORT, viewport.as_mut_ptr());
         let mut scissor = [0i32; 4];

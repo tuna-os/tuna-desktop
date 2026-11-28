@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{
-    ffi, GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
+    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
 };
 use smithay::backend::renderer::{Bind, Frame, Offscreen, Renderer};
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
@@ -29,20 +29,7 @@ impl HdrBuffer {
         renderer: &mut GlesRenderer,
         size: Size<i32, Physical>,
     ) -> Result<Self, String> {
-        let highp = renderer
-            .with_context(|gl| unsafe {
-                let mut range = [0; 2];
-                let mut precision = 0;
-                gl.GetShaderPrecisionFormat(
-                    ffi::FRAGMENT_SHADER,
-                    ffi::HIGH_FLOAT,
-                    range.as_mut_ptr(),
-                    &mut precision,
-                );
-                precision >= 16
-            })
-            .map_err(|error| error.to_string())?;
-        if !highp {
+        if !highp_fragments(renderer) {
             return Err("HDR requires high-precision fragment arithmetic".into());
         }
         let program = crate::color_render::final_output_program(renderer)
@@ -126,6 +113,21 @@ impl HdrBuffer {
             &self.uniforms,
         )
     }
+}
+
+/// Whether fragment shaders have `highp` floats. GLSL ES 1.00 §4.5.4
+/// defines `GL_FRAGMENT_PRECISION_HIGH` exactly when they do, and §4.5.2
+/// requires at least 16 bits of relative precision from them.
+fn highp_fragments(renderer: &mut GlesRenderer) -> bool {
+    const PROBE: &str = "#ifndef GL_FRAGMENT_PRECISION_HIGH
+#error fragment highp unavailable
+#endif
+precision highp float;
+void main() {
+    gl_FragColor = vec4(0.0);
+}
+";
+    renderer.compile_custom_pixel_shader(PROBE, &[]).is_ok()
 }
 
 #[cfg(test)]

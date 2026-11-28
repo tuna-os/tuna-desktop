@@ -184,21 +184,21 @@ impl PipeWire {
         })
     }
 
-    /// Start a stream of `width` x `height` physical pixels for one
-    /// session's stream. The node id goes to the client once PipeWire
-    /// assigns it.
-    #[allow(clippy::too_many_arguments)]
+    /// Start a stream offering `offer` for one session's stream. The node
+    /// id goes to the client once PipeWire assigns it.
     pub fn start_cast(
         &self,
         session_id: u64,
         stream_id: u64,
         target: CastTarget,
         monitor: Option<OutputSnapshot>,
-        size: (i32, i32),
-        hdr_available: bool,
+        offer: StreamOffer,
         signal: crate::mutter::CastSignals,
     ) -> Option<Cast> {
-        let (width, height) = size;
+        let StreamOffer {
+            size: (width, height),
+            hdr_available,
+        } = offer;
         let session_signal = signal.clone();
         let stream = StreamRc::new(
             self.core.clone(),
@@ -341,6 +341,12 @@ impl PipeWire {
             embed_cursor: false,
         })
     }
+}
+
+/// The physical size and HDR capability a new stream first offers.
+pub struct StreamOffer {
+    pub size: (i32, i32),
+    pub hdr_available: bool,
 }
 
 #[derive(Default)]
