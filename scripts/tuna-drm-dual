@@ -49,6 +49,7 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -241,6 +242,47 @@ class Vkms:
             sudo_sh(dual.configfs_teardown(self.path))
 
 
+CORE_PATTERN = Path("/proc/sys/kernel/core_pattern")
+
+
+def enable_cores():
+    """Core dumps of the compositor, the shell and the clients into a
+    private directory, so a crash by signal (a shell restarting with no
+    Rust panic) leaves its backtrace (see `backtraces`). Returns the
+    directory and the kernel's previous core pattern."""
+    cores = Path(tempfile.mkdtemp(prefix="tuna-drm-dual-cores-"))
+    _, hard = resource.getrlimit(resource.RLIMIT_CORE)
+    resource.setrlimit(resource.RLIMIT_CORE, (hard, hard))
+    previous = CORE_PATTERN.read_text().strip()
+    # %E: the executable's path with '!' for '/', to find its symbols.
+    subprocess.run(["sudo", "sysctl", "-qw", f"kernel.core_pattern={cores}/core.%p.%E"], check=True)
+    return cores, previous
+
+
+def backtraces(cores, out):
+    """Put the kernel's core pattern back; write every core's backtrace
+    to `backtrace-<pid>-<exe>.txt` in the artifacts (the cores are too
+    large to keep) and show the crashing thread's in the log."""
+    directory, previous = cores
+    subprocess.run(["sudo", "sysctl", "-qw", f"kernel.core_pattern={previous}"])
+    gdb = shutil.which("gdb")
+    for core in sorted(directory.glob("core.*")):
+        _, pid, exe = core.name.split(".", 2)
+        exe = exe.replace("!", "/")
+        report = out / f"backtrace-{pid}-{Path(exe).name}.txt"
+        if gdb is None:
+            report.write_text(f"{exe} (pid {pid}) dumped core; no gdb to read it\n")
+        else:
+            result = subprocess.run(
+                [gdb, "-q", "-batch", "-nx", "-iex", "set debuginfod enabled off",
+                 "-ex", "bt", "-ex", "thread apply all bt", exe, str(core)],
+                capture_output=True, text=True, timeout=300)
+            report.write_text(result.stdout + result.stderr)
+        print(f"tuna-drm-dual: {exe} (pid {pid}) crashed; backtrace in {report}", flush=True)
+        print("\n".join(report.read_text().splitlines()[:80]), flush=True)
+    shutil.rmtree(directory, ignore_errors=True)
+
+
 def run(args):
     out = Path(args.artifacts).resolve()
     if out.exists() and any(out.iterdir()):
@@ -422,6 +464,7 @@ def run(args):
     def window(name):
         return next((w for w in state().get("windows", []) if w.get("app_id") == APP_PREFIX + name), None)
 
+    cores = enable_cores()
     try:
         gate[0] = "D-MIRROR-DISABLE"
         vkms.create()
@@ -879,6 +922,7 @@ def run(args):
         except subprocess.CalledProcessError as error:
             print(f"tuna-drm-dual: vkms teardown: {error}", file=sys.stderr)
         shutil.rmtree(private, ignore_errors=True)
+        backtraces(cores, out)
     if not recorded or any(" fail " in line for line in recorded):
         raise SystemExit(f"tuna-drm-dual: failed; evidence in {out}")
     print(f"tuna-drm-dual: OK, artifacts in {out}")

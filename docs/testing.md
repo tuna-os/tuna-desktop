@@ -996,6 +996,13 @@ old behaviour produces:
 On a kernel without vkms configfs the leg fails with the running kernel
 named; `scripts/tuna-drm-smoke` alone still runs there.
 
+The leg points the kernel's core pattern at a private directory for its
+run and restores it after. A process that dies by signal (the shell
+restarting with no Rust panic, say) leaves
+`backtrace-<pid>-<executable>.txt` in the leg's artifacts: gdb's
+backtrace of every thread, the crashing one also printed in the job log.
+The cores themselves are deleted.
+
 Private colord startup failures in `D-COLORD` retain `colord-startup.txt`:
 the intended user/group, private bus and binary identity, boundary markers
 before namespace creation, tmpfs mount, privilege drop and daemon exec, the
