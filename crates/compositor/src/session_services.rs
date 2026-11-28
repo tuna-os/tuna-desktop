@@ -51,13 +51,26 @@ fn run(program: &str, args: &[String]) -> bool {
 
 /// The display environment activated services need. An empty `DISPLAY`
 /// clears a previous session's X display; the portal uses Wayland.
-fn activation_vars<'a>(socket: &'a str, desktop: &'a str) -> [(&'static str, &'a str); 4] {
-    [
+///
+/// A user session also exports its logind class, as gnome-session 51's
+/// leader exports its whole environment before starting the session:
+/// LocalSearch's `localsearch-3.service` carries
+/// `ConditionEnvironment=XDG_SESSION_CLASS=user`, so without it the
+/// indexer was skipped and Music and Files search had no index (run
+/// 46118838058). The greeter's gnome-session exports its own.
+fn activation_vars<'a>(
+    socket: &'a str,
+    desktop: &'a str,
+    session_class: Option<&'a str>,
+) -> Vec<(&'static str, &'a str)> {
+    let mut vars = vec![
         ("WAYLAND_DISPLAY", socket),
         ("XDG_CURRENT_DESKTOP", desktop),
         ("XDG_SESSION_TYPE", "wayland"),
         ("DISPLAY", ""),
-    ]
+    ];
+    vars.extend(session_class.map(|class| ("XDG_SESSION_CLASS", class)));
+    vars
 }
 
 /// systemd's user manager starts the portals and every unit-backed D-Bus
@@ -450,10 +463,13 @@ pub fn publish(socket: &str, greeter: bool) -> SessionServices {
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Tuna:GNOME".into());
+    let class = std::env::var("XDG_SESSION_CLASS").ok();
+    let class = class
+        .as_deref()
+        .filter(|value| !value.is_empty() && !greeter);
     publish_with(
-        socket,
+        &activation_vars(socket, &desktop, class),
         greeter,
-        &desktop,
         std::env::var_os("XDG_RUNTIME_DIR"),
         run,
         &HARDWARE_SESSION,
@@ -466,9 +482,8 @@ pub fn publish(socket: &str, greeter: bool) -> SessionServices {
 /// [`publish`] with its environment, utilities, hardware-session flag and
 /// session worker (`start_worker` runs [`bring_up`]) explicit.
 fn publish_with(
-    socket: &str,
+    vars: &[(&str, &str)],
     greeter: bool,
-    desktop: &str,
     runtime_dir: Option<std::ffi::OsString>,
     run: Utility,
     hardware: &'static AtomicBool,
@@ -482,9 +497,8 @@ fn publish_with(
         run,
         hardware,
     };
-    let vars = activation_vars(socket, desktop);
-    let systemd = run("systemctl", &systemd_import_args(&vars));
-    let bus = run("gdbus", &bus_import_args(&vars));
+    let systemd = run("systemctl", &systemd_import_args(vars));
+    let bus = run("gdbus", &bus_import_args(vars));
     if !systemd && !bus {
         eprintln!("tuna-compositor: session services: display environment import failed");
         return guard;
@@ -543,7 +557,7 @@ mod tests {
 
     #[test]
     fn activation_import_names_only_the_hardware_display() {
-        let vars = activation_vars("wayland-tuna", "Tuna:GNOME");
+        let vars = activation_vars("wayland-tuna", "Tuna:GNOME", None);
         let args = systemd_import_args(&vars);
         assert_eq!(
             args,
@@ -568,6 +582,20 @@ mod tests {
         assert!(bus
             .iter()
             .any(|a| a == "org.freedesktop.DBus.UpdateActivationEnvironment"));
+    }
+
+    #[test]
+    fn a_user_session_exports_its_class_for_localsearch() {
+        // localsearch-3.service: ConditionEnvironment=XDG_SESSION_CLASS=user
+        // (run 46118838058: "LocalSearch indexer skipped").
+        let vars = activation_vars("wayland-tuna", "Tuna:GNOME", Some("user"));
+        assert_eq!(
+            systemd_import_args(&vars).last().map(String::as_str),
+            Some("XDG_SESSION_CLASS=user")
+        );
+        assert!(bus_import_args(&vars)
+            .last()
+            .is_some_and(|dict| dict.ends_with("'DISPLAY': '', 'XDG_SESSION_CLASS': 'user'}")));
     }
 
     #[test]
@@ -809,9 +837,8 @@ mod tests {
     fn the_greeter_publishes_only_its_display() {
         let dir = tempfile::tempdir().unwrap();
         let guard = publish_with(
-            "wayland-tuna",
+            &activation_vars("wayland-tuna", "Tuna:GNOME", None),
             true,
-            "Tuna:GNOME",
             Some(dir.path().as_os_str().to_owned()),
             greeter_utility,
             &GREETER_HARDWARE,
@@ -823,7 +850,7 @@ mod tests {
                 .to_owned(),
             line(
                 "gdbus",
-                &bus_import_args(&activation_vars("wayland-tuna", "Tuna:GNOME")),
+                &bus_import_args(&activation_vars("wayland-tuna", "Tuna:GNOME", None)),
             ),
         ];
         assert_eq!(*GREETER_CALLS.lock().unwrap(), imported);
@@ -858,15 +885,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let worker = std::cell::Cell::new(false);
         let guard = publish_with(
-            "wayland-tuna",
+            &activation_vars("wayland-tuna", "Tuna:GNOME", Some("user")),
             false,
-            "Tuna:GNOME",
             Some(dir.path().as_os_str().to_owned()),
             user_utility,
             &USER_HARDWARE,
             |_, _| worker.set(true),
         );
         assert!(worker.get(), "the session worker starts (target, then GDM)");
+        // LocalSearch's unit is conditioned on the class (run 46118838058).
+        assert_eq!(
+            USER_CALLS.lock().unwrap().first().map(String::as_str),
+            Some(
+                "systemctl --user set-environment WAYLAND_DISPLAY=wayland-tuna \
+                 XDG_CURRENT_DESKTOP=Tuna:GNOME XDG_SESSION_TYPE=wayland DISPLAY= \
+                 XDG_SESSION_CLASS=user"
+            )
+        );
         assert_eq!(
             USER_CALLS.lock().unwrap().last().map(String::as_str),
             Some("systemctl --user --no-block start tuna-session.target")
