@@ -24,6 +24,58 @@ SHIFTED_KEYS = {'!': '1', '@': '2', '#': '3', '$': '4', '%': '5', '^': '6', '&':
 GUEST_MODULES = ('guest', 'native', 'basic', 'data', 'media', 'system', 'web', 'autotz', 'geoclue_fixture')
 
 
+def _normalize_preedit_field(crop):
+    """Return the field capture as dark ink on its light background.
+
+    Run 46118838058 broke both assumptions the isolation below relies on.
+    Connections' dark popover holds light ink on a dark field, so no
+    pixel was dark ink; the polarity is fixed by inverting a capture
+    whose dominant colour is dark. Text Editor's field is the whole text
+    view, and the engine's candidate popup (another surface, composited
+    over it) filled the crop with dark ink whose candidate row OCR'd as
+    你好吗3你4尼5呢. Glyph strokes, underlines, carets and focus rings
+    are a few pixels thick; only a foreign surface holds a 9x9 solid
+    block off the background, so every connected non-background region
+    holding one is painted out by its bounding box. Returns the
+    normalized RGB image and its background luminance.
+    """
+    from PIL import ImageDraw, ImageFilter, ImageOps
+    field = crop.convert('RGB')
+    histogram = field.convert('L').histogram()
+    background = max(range(256), key=histogram.__getitem__)
+    if background < 128:
+        field = ImageOps.invert(field)
+        background = 255 - background
+    width, height = field.size
+    foreign = field.convert('L').point(lambda value: 255 if abs(value - background) > 40 else 0)
+    mask = foreign.load()
+    core = foreign.filter(ImageFilter.MinFilter(9)).load()
+    seen = set()
+    boxes = []
+    for y in range(height):
+        for x in range(width):
+            if not core[x, y] or (x, y) in seen:
+                continue
+            seen.add((x, y))
+            stack = [(x, y)]
+            left, top, right, bottom = x, y, x, y
+            while stack:
+                px, py = stack.pop()
+                left, top = min(left, px), min(top, py)
+                right, bottom = max(right, px), max(bottom, py)
+                for nx in range(px - 1, px + 2):
+                    for ny in range(py - 1, py + 2):
+                        if 0 <= nx < width and 0 <= ny < height and (nx, ny) not in seen and mask[nx, ny]:
+                            seen.add((nx, ny))
+                            stack.append((nx, ny))
+            # Two pixels of margin take the surface's antialiased edge.
+            boxes.append((left - 2, top - 2, right + 2, bottom + 2))
+    draw = ImageDraw.Draw(field)
+    for box in boxes:
+        draw.rectangle(box, fill=(background,) * 3)
+    return field, background
+
+
 def _isolate_preedit_ink(crop):
     """Crop an IME field capture down to the composition's own ink.
 
@@ -51,6 +103,7 @@ def _isolate_preedit_ink(crop):
     """
     try:
         from PIL import Image, ImageFilter, ImageOps
+        crop, background = _normalize_preedit_field(crop)
         gray = crop.convert('L')
         width, height = gray.size
         ink = gray.load()
@@ -58,11 +111,14 @@ def _isolate_preedit_ink(crop):
         # Text and its composition underline are drawn in the neutral text
         # colour; a focus ring is the accent colour. WebKit draws its entry's
         # ring two rows below the underline, and its accent blue is darker
-        # than the 150 threshold, so the ring bottom passed for the
-        # composition underline (run 45936499585, Epiphany).
+        # than the ink threshold, so the ring bottom passed for the
+        # composition underline (run 45936499585, Epiphany). The threshold
+        # follows the background: GtkSourceView draws its composition
+        # underline at luminance 153, which a fixed 150 missed (run
+        # 46118838058, Text Editor).
         def dark(x, y):
             red, green, blue = color[x, y]
-            return ink[x, y] < 150 and max(red, green, blue) - min(red, green, blue) < 64
+            return ink[x, y] < background - 80 and max(red, green, blue) - min(red, green, blue) < 64
 
         def runs_in(line):
             runs = []

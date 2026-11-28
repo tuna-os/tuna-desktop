@@ -857,6 +857,42 @@ class PreeditInkIsolation(unittest.TestCase):
         self.assertEqual(ringed.size, (182, 60))
         self.assertEqual(list(ringed.getdata()), list(core_apps._isolate_preedit_ink(self.entry(60, 80)).getdata()))
 
+    def test_dark_theme_field_isolates_like_light(self):
+        # Run 46118838058: Connections' dark popover entry holds light ink
+        # on a dark field, which held no dark ink at all.
+        from PIL import ImageOps
+        dark = core_apps._isolate_preedit_ink(ImageOps.invert(self.entry(60, 80)))
+        self.assertIsNotNone(dark)
+        self.assertEqual(list(dark.getdata()), list(core_apps._isolate_preedit_ink(self.entry(60, 80)).getdata()))
+
+    def text_view(self, popup):
+        from PIL import Image, ImageDraw
+        image = Image.new('RGB', (200, 100), 'white')
+        image.paste(self.entry(60, 80), (0, 0))
+        if popup:
+            draw = ImageDraw.Draw(image)
+            draw.rounded_rectangle((40, 38, 190, 92), radius=6, fill=(53, 53, 53))
+            draw.text((50, 45), 'ni hao', fill='white')
+            draw.text((50, 65), '1 ab  2 abc  3 a', fill=(160, 160, 160))
+        return image
+
+    def test_candidate_popup_over_text_view_is_not_ink(self):
+        # Run 46118838058: Text Editor's field is its whole text view, and
+        # the engine's dark candidate popup composited over it OCR'd as the
+        # candidate row instead of the composition.
+        covered = core_apps._isolate_preedit_ink(self.text_view(popup=True))
+        self.assertIsNotNone(covered)
+        self.assertEqual(list(covered.getdata()),
+                         list(core_apps._isolate_preedit_ink(self.text_view(popup=False)).getdata()))
+
+    def test_light_composition_underline_is_ink(self):
+        # Run 46118838058: GtkSourceView draws the composition underline at
+        # luminance 153, just past a fixed 150 ink threshold.
+        from PIL import ImageDraw
+        image = self.entry(60, 80, underline=False)
+        ImageDraw.Draw(image).line([(60, 30), (140, 30)], fill=(153, 152, 156), width=2)
+        self.assertIsNotNone(core_apps._isolate_preedit_ink(image))
+
 
 class PickerAcceptGesture(unittest.TestCase):
     def picker_tree(self, default):
