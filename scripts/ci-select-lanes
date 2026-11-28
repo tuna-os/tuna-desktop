@@ -80,8 +80,9 @@ ROTATION = [
     "portal-security", "remote-security", "niri-parity", "marlin-vm",
 ]
 
-# Lanes that download other lanes' artifacts.
+# Qualification closure includes the required native replacement consumer.
 NEEDS = {
+    "drm-smoke": ["marlin-vm"],
     "portal-security": ["arch-package"],
     "remote-security": ["arch-package"],
     "niri-parity": ["arch-package"],
@@ -93,8 +94,9 @@ NEEDS = {
 }
 
 # marlin-vm matrix legs; ci.yml names each leg's job and artifact after
-# `artifact`. A marlin-vm run always has the primary lifecycle leg and the
-# required native automatic-timezone leg. The Orca 51 leg runs on push, schedule and
+# `artifact`. A marlin-vm run always has the primary lifecycle leg, the
+# required native automatic-timezone leg and the required native DEV virgl
+# colour leg (P-DS-03). The Orca 51 leg runs on push, schedule and
 # dispatch, and on a pull request that runs parity-ledger: the ledger cites its
 # V-ORCA-* gates from `marlin-vm-orca51/assertions.txt`, as it cites V-AUTOTZ
 # from `marlin-vm-autotz/assertions.txt`. The paired GNOME/Tuna references run
@@ -103,6 +105,7 @@ NEEDS = {
 VM_PRIMARY = [
     {"profile": "lifecycle", "orca": "distribution", "artifact": "marlin-vm"},
     {"profile": "autotz", "orca": "distribution", "artifact": "marlin-vm-autotz"},
+    {"profile": "colour", "orca": "distribution", "artifact": "native-colour"},
 ]
 VM_ORCA51 = {"profile": "lifecycle", "orca": "upstream51", "artifact": "marlin-vm-orca51"}
 VM_REFERENCES = [
@@ -224,6 +227,23 @@ OWNED = [
     ("scripts/tuna-app-content", ["desktop-proofs"]),
     ("scripts/tuna-scroll-proof", ["desktop-proofs"]),
     ("scripts/tuna-drm-smoke", ["drm-smoke"]),
+    ("scripts/tuna-color-gnome-reference-ci", ["drm-smoke"]),
+    ("scripts/tuna-color-capture-proof", ["drm-smoke", "gtk-shell", "marlin-vm"]),
+    ("scripts/lib/tuna-color-capture-shell.py", ["drm-smoke", "gtk-shell", "marlin-vm"]),
+    ("tests/color-hdr-vkms/*", ["drm-smoke"]),
+    ("tests/color-dmabuf/*", ["drm-smoke"]),
+    ("scripts/tuna-colour-build", ["marlin-vm"]),
+    ("scripts/lib/colour_vm.py", ["marlin-vm"]),
+    # colord devices, the CRTC colour state and casts also follow connector
+    # hotplug, proven only by the hotplug lane (CODE_OWNED).
+    ("crates/compositor/src/color_manager.rs", ["drm-smoke", "gtk-shell", "marlin-vm", "hotplug"]),
+    ("crates/compositor/src/color_manager/*", ["drm-smoke", "gtk-shell", "marlin-vm", "hotplug"]),
+    ("crates/compositor/src/color_*", ["drm-smoke", "gtk-shell", "marlin-vm"]),
+    ("crates/compositor/src/drm/color.rs", ["drm-smoke", "gtk-shell", "marlin-vm", "hotplug"]),
+    ("crates/compositor/src/screencast.rs", ["drm-smoke", "gtk-shell", "marlin-vm", "hotplug"]),
+    ("crates/compositor/src/screenshot.rs", ["drm-smoke", "gtk-shell", "marlin-vm"]),
+    ("crates/compositor/examples/tuna-color-*", ["drm-smoke", "gtk-shell", "marlin-vm"]),
+    ("crates/compositor/tests/color_management.rs", ["drm-smoke", "gtk-shell", "marlin-vm"]),
     # The two-output leg the drm-smoke job runs after tuna-drm-smoke.
     ("scripts/tuna-drm-dual", ["drm-smoke"]),
     ("scripts/lib/drm_dual.py", ["drm-smoke"]),

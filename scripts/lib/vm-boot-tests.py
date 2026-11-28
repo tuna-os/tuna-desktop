@@ -2424,6 +2424,15 @@ class BootApi(unittest.TestCase):
         self.assertEqual(wire, {"execute": "trace-event-set-state", "arguments": {
             "name": "virtio_gpu_cmd_set_scanout", "enable": True}})
 
+    def test_qmp_raises_connect_error_when_qemu_never_creates_its_socket(self):
+        # Run 44851956404: QEMU aborted before -qmp existed and the old loop
+        # fell through to a read on an unconnected socket (Errno 22 EINVAL).
+        with tempfile.TemporaryDirectory() as scratch, \
+                patch.object(lane.baseline.time, "sleep") as sleep:
+            with self.assertRaises(FileNotFoundError):
+                lane.baseline.Qmp(os.path.join(scratch, "qmp.sock"))
+        self.assertEqual(sleep.call_count, 99)
+
     def test_existing_four_value_performance_call_keeps_original_devices(self):
         with patch.object(lane.os.path, "exists", return_value=True), patch.object(lane.os, "access", return_value=True), patch.object(lane.subprocess, "Popen") as spawn:
             process, qmp, serial, kvm = lane.boot("disk.raw", "/out", "/scratch", 30)
@@ -4383,11 +4392,17 @@ class FixtureLoginSession(unittest.TestCase):
         # the bounded soak runs only on the published image; the native-session
         # modules (#1003) serve only the current build's `autotz` profile; the
         # app-integration helper serves only the current build's
-        # --app-integration boot (the lane refuses it with --published).
-        unused = {"Containerfile": {"/usr/libexec/tuna-soak/tuna-vm-soak"},
+        # --app-integration boot (the lane refuses it with --published); the
+        # colour consumer serves only the `colour` profile, whose
+        # Containerfile.colour layer installs it from the native colour overlay.
+        colour = "/usr/libexec/tuna-vm-colour"
+        self.assertIn("COPY native-colour-overlay/usr/ /usr/", self.fixture("Containerfile.colour"))
+        overlay = (Path(__file__).resolve().parents[2] / "scripts/tuna-colour-build").read_text()
+        self.assertIn("out / 'usr/libexec/tuna-vm-colour'", overlay)
+        unused = {"Containerfile": {"/usr/libexec/tuna-soak/tuna-vm-soak", colour},
                   "Containerfile.published": {"/usr/libexec/tuna-vm-gdm-trace",
                                               "/usr/libexec/tuna-native-session",
-                                              "/usr/libexec/tuna-vm-app-integration"}}
+                                              "/usr/libexec/tuna-vm-app-integration", colour}}
         # Orca's token-gated test presenter (orca-speech-trigger) reads the
         # runtime token this user environment generator writes.
         generator = "/usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token"
@@ -5882,6 +5897,68 @@ class ShellMenuEndSession(unittest.TestCase):
                      "Wrong Person will be logged out automatically in 60 seconds",
                      valid["label"] + ". diary.txt"):
             self.assertFalse(lane.countdown_showing([title, countdown(text)], case, 60))
+
+
+class VirglScanoutCapture(unittest.TestCase):
+    """The colour profile's screendump reads the X screen QEMU presented on."""
+
+    def grab(self, size, fmt):
+        def ffmpeg(command, **_):
+            output = command[-1]
+            if "x11grab" in command:
+                self.assertEqual(command[command.index("-i") + 1], ":7")
+                self.assertEqual(command[command.index("-draw_mouse") + 1], "0")
+                Path(output).write_bytes(b"P6\n%d %d\n255\n" % size + bytes(size[0] * size[1] * 3))
+            else:
+                self.assertEqual(command[command.index("-i") + 1], output.replace(".x11.png", ".x11.ppm"))
+                Path(output).write_bytes(b"\x89PNG")
+            return subprocess.CompletedProcess(command, 0)
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "frame." + fmt)
+        with patch.dict(os.environ, {"DISPLAY": ":7"}), patch.object(lane.subprocess, "run", ffmpeg):
+            lane.X11ScanoutQmp.cmd(object.__new__(lane.X11ScanoutQmp), "screendump", filename=path, format=fmt)
+        return path, sorted(os.listdir(directory))
+
+    def test_screendump_writes_the_requested_format_without_staging_leftovers(self):
+        path, files = self.grab((lane.WIDTH, lane.HEIGHT), "ppm")
+        self.assertEqual(lane.read_ppm(path)[:2], (lane.WIDTH, lane.HEIGHT))
+        self.assertEqual(files, ["frame.ppm"])
+        path, files = self.grab((lane.WIDTH, lane.HEIGHT), "png")
+        self.assertEqual(Path(path).read_bytes(), b"\x89PNG")
+        self.assertEqual(files, ["frame.png"])
+
+    def test_a_screen_other_than_the_scanout_mode_is_refused_not_resampled(self):
+        with self.assertRaisesRegex(RuntimeError, "stretched"):
+            self.grab((lane.WIDTH * 2, lane.HEIGHT), "png")
+
+    def test_other_commands_still_go_to_qmp(self):
+        sent = []
+        with patch.object(lane.baseline.Qmp, "cmd", lambda self, command, **args: sent.append(command)):
+            lane.X11ScanoutQmp.cmd(object.__new__(lane.X11ScanoutQmp), "send-key", keys=[])
+        self.assertEqual(sent, ["send-key"])
+
+    def test_only_the_virgl_profile_reads_the_x_screen(self):
+        source = (Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text()
+        self.assertIn('display = "gtk,gl=on,full-screen=on"', source)
+        self.assertIn('(X11ScanoutQmp if a.profile == "colour" else baseline.Qmp)(qmp_path)', source)
+        self.assertIn('if profile == "colour":\n        fill_x11_screen(vm)', source)
+
+    def test_the_qemu_window_is_sized_to_the_screen_or_the_vm_is_retired(self):
+        calls, killed = [], []
+        vm = SimpleNamespace(kill=lambda: killed.append(True))
+        with patch.object(lane.subprocess, "run", lambda command, **_: calls.append(command)):
+            lane.fill_x11_screen(vm)
+        self.assertEqual(calls, [["xdotool", "search", "--sync", "--onlyvisible", "--name", "^QEMU",
+                                  "windowmove", "%@", "0", "0",
+                                  "windowsize", "%@", str(lane.WIDTH), str(lane.HEIGHT)]])
+        self.assertEqual(killed, [])
+
+        def never_mapped(command, **_):
+            raise subprocess.TimeoutExpired(command, 30)
+        with patch.object(lane.subprocess, "run", never_mapped), \
+                self.assertRaisesRegex(RuntimeError, "never filled the X screen"):
+            lane.fill_x11_screen(vm)
+        self.assertEqual(killed, [True])
 
 
 if __name__ == "__main__":

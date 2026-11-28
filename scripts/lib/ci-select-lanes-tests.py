@@ -16,6 +16,10 @@ _spec = importlib.util.spec_from_loader(_loader.name, _loader)
 m = importlib.util.module_from_spec(_spec)
 _loader.exec_module(m)
 
+# Colour sources the selector owns outright (OWNED, no rotation).
+COLOUR_SOURCES = ("crates/compositor/src/color_manager", "crates/compositor/src/screencast.rs")
+COLOUR_LANES = ["drm-smoke", "gtk-shell", "arch-package", "marlin-vm"]
+
 def pr(*changed, run=0, size=2):
     return m.select("pull_request", run, size, list(changed))[0]
 
@@ -85,19 +89,21 @@ class Selection(unittest.TestCase):
 
     def test_owned_paths_run_their_lane_without_rotation(self):
         self.assertEqual(pr("scripts/tuna-scroll-proof"), ["desktop-proofs"])
-        # The vkms gates (D-*) live in the DRM smoke.
-        self.assertEqual(pr("scripts/tuna-drm-smoke"), ["drm-smoke"])
+        # The vkms gates (D-*) live in the DRM smoke; its qualification
+        # closure adds the native colour consumer (NEEDS: marlin-vm, which
+        # needs arch-package).
+        self.assertEqual(pr("scripts/tuna-drm-smoke"), ["drm-smoke", "arch-package", "marlin-vm"])
         # D-INPUT-AT-STARTUP's helper and its tests run in the DRM smoke.
         for path in ("scripts/lib/drm_input_startup.py", "scripts/tests/test_drm_input_startup.py"):
             for run in (0, 4, 19):
                 with self.subTest(path=path, run=run):
-                    self.assertEqual(pr(path, run=run), ["drm-smoke"])
+                    self.assertEqual(pr(path, run=run), ["drm-smoke", "arch-package", "marlin-vm"])
         # The two-output vkms leg (scripts/tuna-drm-dual) runs in drm-smoke.
         for path in ("scripts/tuna-drm-dual", "scripts/lib/drm_dual.py",
                      "scripts/lib/drm_kms_readback.py", "scripts/tests/test_drm_dual.py"):
             for run in (0, 4, 19):
                 with self.subTest(path=path, run=run):
-                    self.assertEqual(pr(path, run=run), ["drm-smoke"])
+                    self.assertEqual(pr(path, run=run), ["drm-smoke", "arch-package", "marlin-vm"])
         self.assertEqual(pr("docs/walkthrough.tsv"), ["gtk-shell"])
         self.assertEqual(pr("scripts/tuna-greeter-proof"), ["gtk-shell"])
         self.assertEqual(pr("scripts/lib/tuna-gdm-mock.py"), ["gtk-shell"])
@@ -169,19 +175,27 @@ class Selection(unittest.TestCase):
                 with self.subTest(path=path, run=run):
                     lanes = pr(path, run=run)
                     self.assertIn("hotplug", lanes)
-                    self.assertTrue(set(m.CORE + m.rotation(run, 2)) <= set(lanes))
+                    if path.startswith(COLOUR_SOURCES):
+                        # Colour inputs run their native and capture
+                        # consumers instead of the rotation (P-DS-03).
+                        self.assertTrue(set(COLOUR_LANES) <= set(lanes))
+                    else:
+                        self.assertTrue(set(m.CORE + m.rotation(run, 2)) <= set(lanes))
         # Control: other compositor code reaches hotplug only by rotation.
         self.assertNotIn("hotplug", pr("crates/compositor/src/lib.rs", run=0))
         self.assertIn("hotplug", m.ROTATION)
 
     def test_touch_fixtures_run_drm_smoke_without_rotation(self):
         # P-DS-04's emulated devices and settings are D-TOUCH/D-ORIENT's
-        # alone: an edit runs that lane, not gtk-shell plus a rotation.
+        # alone: an edit runs that lane (plus its qualification closure, the
+        # native colour consumer: NEEDS marlin-vm, which needs arch-package),
+        # not gtk-shell plus a rotation.
         for path in ("scripts/lib/tuna-uinput-touchscreen.py", "scripts/lib/tuna-touch-client.py",
                      "scripts/lib/tuna-mock-sensor-proxy.py",
                      "tests/settings/gnome51-peripherals-touchscreen.gschema.xml"):
             for run in range(len(m.ROTATION)):
-                self.assertEqual(pr(path, run=run), ["drm-smoke"], (path, run))
+                self.assertEqual(pr(path, run=run), ["drm-smoke", "arch-package", "marlin-vm"],
+                                 (path, run))
 
     def test_protocol_gate_inputs_run_the_gtk_shell_proof(self):
         # The Mutter 51 protocol gates (--protocols-only) and G-WAYLAND-INFO
@@ -196,7 +210,7 @@ class Selection(unittest.TestCase):
     def test_vm_legs_follow_the_event_and_the_ledger(self):
         def legs(event, lanes):
             return [leg["artifact"] for leg in m.vm_matrix(event, lanes)["include"]]
-        primary = ["marlin-vm", "marlin-vm-autotz"]
+        primary = ["marlin-vm", "marlin-vm-autotz", "native-colour"]
         self.assertEqual(legs("pull_request", pr("packaging/marlin/vm-lane/Containerfile")), primary)
         self.assertEqual(legs("pull_request", []), primary)
         # The ledger cites the Orca 51 leg's V-ORCA-* gates, so a pull request
@@ -221,6 +235,36 @@ class Selection(unittest.TestCase):
         lanes, _ = run("--event", "merge_group")
         self.assertEqual(lanes, ["gtk-shell-smoke"])
 
+
+    def test_colour_inputs_require_native_and_capture_consumers_without_rotation(self):
+        for path in ("crates/compositor/src/color_management.rs",
+                     "crates/compositor/src/color_render/raw.rs",
+                     "crates/compositor/src/drm/color.rs",
+                     "crates/compositor/src/screencast.rs",
+                     "crates/compositor/src/screenshot.rs",
+                     "crates/compositor/examples/tuna-color-cast-client.rs",
+                     # The D-COLOR-ICC / D-COLOR-FEEDBACK client and consumer.
+                     "crates/compositor/examples/tuna-color-pixel-client.rs",
+                     "scripts/lib/tuna-color-capture-shell.py",
+                     "crates/compositor/tests/color_management.rs",
+                     "scripts/tuna-color-capture-proof"):
+            # Hotplug-proven colour sources also run hotplug (CODE_OWNED).
+            hotplug = ["hotplug"] if path in ("crates/compositor/src/drm/color.rs",
+                                              "crates/compositor/src/screencast.rs") else []
+            self.assertEqual(pr(path, size=0),
+                             ["drm-smoke", *hotplug, "gtk-shell", "arch-package", "marlin-vm"], path)
+        for path in ("scripts/tuna-color-gnome-reference-ci",
+                     "tests/color-hdr-vkms/tuna_hdr_vkms.c",
+                     "tests/color-dmabuf/r8-import.c"):
+            selected = set(pr(path, size=0))
+            self.assertTrue({'drm-smoke', 'marlin-vm', 'arch-package'} <= selected, path)
+
+    def test_native_colour_payload_always_requires_the_existing_vm_producer(self):
+        for path in ("scripts/tuna-colour-build", "scripts/lib/colour_vm.py"):
+            for run in (0, 4, 19):
+                self.assertEqual(pr(path, run=run, size=0), ["arch-package", "marlin-vm"], path)
+        self.assertEqual(pr("packaging/marlin/vm-lane/tuna-vm-colour", size=0),
+                         ["arch-package", "marlin-image", "marlin-vm"])
 
     def test_transition_policy_and_suite_always_run_journey(self):
         for path in ('scripts/lib/transition-package-policy.py',
@@ -275,7 +319,10 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("scripts/tests/test_native_product.py"),
                          ["arch-package", "marlin-vm"])
         self.assertEqual(pr("scripts/tests/test_grid_cancel_proof.py"), ["desktop-proofs"])
-        self.assertEqual(pr("scripts/tests/test_colord_startup.py"), ["drm-smoke"])
+        # drm-smoke's qualification closure adds the native colour consumer
+        # (NEEDS: marlin-vm, which downloads arch-package).
+        self.assertEqual(pr("scripts/tests/test_colord_startup.py"),
+                         ["drm-smoke", "arch-package", "marlin-vm"])
         # Control: a test only the always-on check job runs adds no lane.
         self.assertEqual(pr("scripts/tests/test_disk_guard.py"), [])
 
@@ -304,7 +351,7 @@ class Selection(unittest.TestCase):
         for name in ("keyboard", "touchpad", "tablet"):
             for run in range(len(m.ROTATION)):
                 self.assertEqual(pr(f"scripts/lib/tuna-uinput-{name}.py", run=run),
-                                 ["drm-smoke"], name)
+                                 ["drm-smoke", "arch-package", "marlin-vm"], name)
     def test_native_desktop_driver_runs_the_vm_lane_that_drives_it(self):
         # #1013: a shared-driver change runs the VM lane whose autotz profile
         # drives it, not whatever slice the rotation picks.
@@ -328,12 +375,15 @@ class Selection(unittest.TestCase):
     def test_screenshot_screen_selectors_run_the_two_output_leg(self):
         # D-SCREENSHOT-KEYS-MULTI (scripts/tuna-drm-dual, drm-smoke) proves
         # the per-monitor screen selectors; the GTK shell proof their keys.
+        # drm-smoke's qualification closure adds the native colour consumer
+        # (NEEDS: marlin-vm, which needs arch-package).
         for path in ("crates/shell-gtk/src/screenshot_ui.rs",
                      "crates/shell-gtk/src/screenshot_screens.rs"):
             for run in range(len(m.ROTATION)):
                 with self.subTest(path=path, run=run):
                     self.assertEqual(pr(path, run=run),
-                                     ["drm-smoke", "desktop-proofs", "gtk-shell"])
+                                     ["drm-smoke", "desktop-proofs", "gtk-shell",
+                                      "arch-package", "marlin-vm"])
         # Control: the area selection's keys still rotate lanes.
         lanes = pr("crates/shell-gtk/src/screenshot_selection.rs", run=3)
         self.assertIn("gtk-shell", lanes)
@@ -366,7 +416,10 @@ jobs:
         text = self.BASE.replace("  drm-smoke: {runs-on: *runner, steps: [{run: a}]}",
                                  "  drm-smoke: {runs-on: *runner, steps: [{run: b}]}")
         self.assertEqual(m.workflow_lanes(self.BASE, text), {"drm-smoke"})
-        self.assertEqual(m.select("pull_request", 0, 2, [m.WORKFLOW], {"drm-smoke"})[0], ["drm-smoke"])
+        # Only drm-smoke's job changed; its closure still adds the native
+        # colour consumer (NEEDS).
+        self.assertEqual(m.select("pull_request", 0, 2, [m.WORKFLOW], {"drm-smoke"})[0],
+                         ["drm-smoke", "arch-package", "marlin-vm"])
 
     def test_factory_job_belongs_to_the_marlin_vm_lane(self):
         text = self.BASE.replace("  gdm51-native-package: {runs-on: *runner, steps: [{run: a}]}",
@@ -573,8 +626,9 @@ class WorkflowSync(unittest.TestCase):
         self.assertIn("scripts/ci-select-lanes --draft", step["run"])
 
     def test_parity_ledger_reads_every_vm_leg_assertion_file_it_cites(self):
-        # The ledger cites V-AUTOTZ (marlin-vm-autotz) and the Orca 51 V-ORCA-*
-        # gates (marlin-vm-orca51): each leg's artifact must be downloaded,
+        # The ledger cites V-AUTOTZ (marlin-vm-autotz), the Orca 51 V-ORCA-*
+        # gates (marlin-vm-orca51) and the native colour capture gates
+        # (native-colour): each leg's artifact must be downloaded,
         # passed with --assertions, and built whenever parity-ledger runs.
         job = self.jobs["parity-ledger"]
         self.assertIn("marlin-vm", self.needs(job))
@@ -585,9 +639,11 @@ class WorkflowSync(unittest.TestCase):
         inputs = re.findall(r"--assertions (\S+)", command)
         legs = {leg["artifact"] for leg in [*m.VM_PRIMARY, m.VM_ORCA51, *m.VM_REFERENCES]}
         read = {name for name in downloads if name in legs}
-        self.assertEqual(read, {"marlin-vm", "marlin-vm-autotz", "marlin-vm-orca51"})
+        self.assertEqual(read, {"marlin-vm", "marlin-vm-autotz", "marlin-vm-orca51", "native-colour"})
+        # The colour leg's proof writes its assertions under its own profile.
+        nested = {"native-colour": "colour/native-colour-capture/"}
         for name in read:
-            self.assertIn(f"{downloads[name]}/assertions.txt", inputs, name)
+            self.assertIn(f"{downloads[name]}/{nested.get(name, '')}assertions.txt", inputs, name)
         for lanes in (pr("docs/parity-ledger.md"), pr("scripts/tuna-ledger"), pr("Cargo.lock")):
             built = {leg["artifact"] for leg in m.vm_matrix("pull_request", lanes)["include"]}
             self.assertLessEqual(read, built, lanes)

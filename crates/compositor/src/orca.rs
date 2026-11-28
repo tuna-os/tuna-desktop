@@ -501,7 +501,7 @@ fn parent_lifetime(command: &mut Command) {
     // Its own process group, led by the unreaped child, is what stop() and
     // session-end shutdown signal (#836), never the compositor's group.
     command.process_group(0);
-    let parent = unsafe { libc::getpid() };
+    let parent = std::process::id() as libc::pid_t;
     // Only async-signal-safe libc calls run after fork. Linux clears this setting
     // for a forked child, so speech-dispatcher is not accidentally bound to us.
     unsafe {

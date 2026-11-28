@@ -2742,7 +2742,11 @@ def main():
     # V-X11-ICONIC, V-X11-RESTART).
     if action.startswith("wm-"):
         os.execv("/usr/libexec/tuna-vm-wm-gates", ["tuna-vm-wm-gates", *sys.argv[1:]])
-    if action == "autotz":
+    if action == "colour":
+        if len(sys.argv) != 4 or sys.argv[2] not in {"init", "start", "state", "ack", "finish", "cleanup", "file"}:
+            raise ValueError("colour requires one fixed operation and one JSON payload")
+        result = json.loads(call("/usr/libexec/tuna-vm-colour", sys.argv[2], sys.argv[3]))
+    elif action == "autotz":
         sys.path.insert(0, "/usr/libexec/tuna-native-session")
         import autotz_guest
         try:

@@ -723,6 +723,19 @@ impl EGLDisplay {
     #[instrument(level = "trace", skip(self), parent = &self.span, err)]
     #[profiling::function]
     pub fn create_image_from_dmabuf(&self, dmabuf: &Dmabuf) -> Result<EGLImage, Error> {
+        self.create_image_from_dmabuf_with_conversion(dmabuf, None)
+    }
+
+    /// Imports a [`Dmabuf`] as an [`EGLImage`], asking for `conversion`
+    /// when the image is sampled as YCbCr (`EGL_YUV_COLOR_SPACE_HINT_EXT`,
+    /// `EGL_SAMPLE_RANGE_HINT_EXT`; RGB formats ignore the hints).
+    #[instrument(level = "trace", skip(self), parent = &self.span, err)]
+    #[profiling::function]
+    pub fn create_image_from_dmabuf_with_conversion(
+        &self,
+        dmabuf: &Dmabuf,
+        conversion: Option<super::YuvConversion>,
+    ) -> Result<EGLImage, Error> {
         if !self.extensions.iter().any(|s| s == "EGL_KHR_image_base")
             && !self
                 .extensions
@@ -810,6 +823,22 @@ impl EGLDisplay {
                     (Into::<u64>::into(dmabuf.format().modifier) >> 32) as i32,
                 ])
             }
+        }
+
+        if let Some(conversion) = conversion {
+            out.extend([
+                ffi::egl::YUV_COLOR_SPACE_HINT_EXT as i32,
+                match conversion.color_space {
+                    super::YuvColorSpace::Rec601 => ffi::egl::ITU_REC601_EXT,
+                    super::YuvColorSpace::Rec709 => ffi::egl::ITU_REC709_EXT,
+                    super::YuvColorSpace::Rec2020 => ffi::egl::ITU_REC2020_EXT,
+                } as i32,
+                ffi::egl::SAMPLE_RANGE_HINT_EXT as i32,
+                match conversion.range {
+                    super::YuvRange::Full => ffi::egl::YUV_FULL_RANGE_EXT,
+                    super::YuvRange::Narrow => ffi::egl::YUV_NARROW_RANGE_EXT,
+                } as i32,
+            ]);
         }
 
         out.push(ffi::egl::NONE as i32);

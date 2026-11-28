@@ -333,6 +333,28 @@ impl RendererSurfaceState {
         self.buffer.as_ref()
     }
 
+    /// Damage the whole attached buffer and drop its imported textures,
+    /// although the client sent nothing new: the buffer reads differently
+    /// now (e.g. its colour state or YCbCr conversion changed), so the
+    /// next draw imports it anew. Without a buffer this does nothing.
+    ///
+    /// A `wl_shm` buffer already released by
+    /// [`RendererSurfaceState::release_imported_shm_buffer`] keeps its textures:
+    /// the client may be drawing its next frame into it, so they are the only
+    /// copy of this one. Only the damage is added.
+    pub fn invalidate_buffer(&mut self) {
+        if let Some(size) = self.buffer_dimensions {
+            self.damage.add([Rectangle::from_size(size)]);
+            let released = self
+                .buffer
+                .as_ref()
+                .is_some_and(|buffer| buffer.inner.released.load(Ordering::Relaxed));
+            if !released {
+                self.textures.clear();
+            }
+        }
+    }
+
     /// Sends `wl_buffer.release` for the attached buffer now instead of when another
     /// buffer replaces it, if it is a `wl_shm` buffer the renderer context `id` has
     /// imported. Returns whether the release was sent.

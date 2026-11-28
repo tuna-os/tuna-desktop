@@ -16,10 +16,11 @@ types the fixture password exactly as the published-flavor nightly does
 Logout must return to that GDM greeter. The ordinary two lifecycle/Orca rows
 retain five pristine boots, the default GPU, fresh-account journeys and all
 aggregate gates. These ordinary lifecycle fixtures do not change the shipped
-preview image; the independent paired DEV profiles below are separate members
-of the same existing VM producer. GDM's session worker opens a journal stream
-for `gdm-wayland-session`, forwarded to the serial port. The fixture's
-session environment comes from `environment.d`,
+preview image; the independent paired DEV profiles and the separate required
+DEV colour row below are separate members of the same existing VM producer.
+GDM's session worker opens a journal stream for `gdm-wayland-session`,
+forwarded to the serial port. The fixture's session environment comes from
+`environment.d`,
 which gdm-wayland-session imports from the user manager; the per-login Orca
 test secret comes from a user environment generator.
 The ordinary CLI profile is `--profile lifecycle` (the default); its two
@@ -143,6 +144,39 @@ row and therefore the existing aggregate CI gate. The consumer retains its
 actual original-shell AddAgent, source/provider, daemon location/timezone
 and panel-clock gates and restoration requirements. Routing implementation
 alone claims no native runtime qualification.
+
+## Required DEV virgl colour consumer
+
+Whenever `marlin-vm` is selected, its additional `native-colour` matrix member
+builds the opted-in overlay in the **same primary Arch makepkg stage**, retaining
+that build's exact source, native compiler, features, package and ELF receipts.
+The final image admission checks the original package, fixed guest helper,
+four native proof ELFs and source receipt after overlay installation.
+
+`--profile colour --require-kvm --strip-image ...` uses a separate pristine
+boot with virtio-vga-gl and an owned Xvfb/llvmpipe launcher. Ordinary rows keep
+their default GPU and repeat count. The same stock GDM login and original
+nonroot native compositor must be admitted before the finite root dispatcher
+can invoke `init/start/state/ack/finish/cleanup/file` on the fixed helper.
+
+QMP `screendump` cannot read this boot's screen: QEMU 10.2 answers it from
+`qemu_console_surface()`, which is NULL for a GL texture scanout, under every
+display backend ("no surface"). The boot therefore runs
+`-display gtk,gl=on,full-screen=on` on a 1280x800 Xvfb screen. The screen has
+no window manager to honour full-screen, so the lane sizes QEMU's window to it
+with `xdotool`; the gtk display hands that size to the guest as its preferred
+mode, and QEMU blits each presented scanout 1:1 (`V-DRM` requires the guest's
+lit mode to be 1280x800 here). Every screendump and frame of the profile
+(greeter paint, `V-PANEL`, evidence frames) is an `x11grab` of that screen,
+still taken on the host after presentation. A screen of another size is
+refused rather than resampled.
+
+The real unit/pixel and all 18 NV12/P010 coefficient capture cases remain
+mandatory, including all-format YUV positives, screenshot/PipeWire consumers
+and strict cleanup. `drm-smoke` selection also requires this native row; its
+ordinary software DRM and SDR/calibration checks remain required. Failure or
+missing evidence fails the matrix, parity ledger and aggregate gate. These
+are DEV virgl receipts, not physical-HDR or signed-release qualification.
 
 ## Pristine release-disk qualification is separate
 

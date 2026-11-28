@@ -308,6 +308,7 @@ struct ShareState {
     devices: Vec<DeviceSnapshot>,
     gamma_sizes: HashMap<String, usize>,
     sessions: Vec<CalibrationSession>,
+    monitor_generation: u64,
 }
 
 /// State shared between the colord thread, the D-Bus thread and the
@@ -370,8 +371,16 @@ impl ColorShare {
         self.changed();
     }
 
-    fn update_device(&self, connector: &str, update: impl FnOnce(&mut DeviceSnapshot)) {
+    fn update_device(
+        &self,
+        generation: u64,
+        connector: &str,
+        update: impl FnOnce(&mut DeviceSnapshot),
+    ) {
         if let Ok(mut s) = self.state.lock() {
+            if s.monitor_generation != generation {
+                return;
+            }
             if let Some(device) = s.devices.iter_mut().find(|d| d.connector == connector) {
                 update(device);
             }
@@ -379,8 +388,11 @@ impl ColorShare {
         self.changed();
     }
 
-    fn set_devices(&self, devices: Vec<DeviceSnapshot>) {
+    fn set_devices(&self, generation: u64, devices: Vec<DeviceSnapshot>) {
         if let Ok(mut s) = self.state.lock() {
+            if s.monitor_generation != generation {
+                return;
+            }
             s.devices = devices;
         }
         self.changed();
@@ -392,6 +404,37 @@ impl ColorShare {
         if let Ok(mut s) = self.state.lock() {
             s.gamma_sizes = sizes.into_iter().collect();
         }
+    }
+
+    /// A disconnected or replaced sink cannot keep controlling a new
+    /// device which later happens to use its connector name.
+    fn begin_monitor_update(&self, monitors: &[ColordMonitor], unchanged: &[&str]) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.monitor_generation = state.monitor_generation.wrapping_add(1);
+        state.gamma_sizes = monitors
+            .iter()
+            .map(|monitor| (monitor.identity.connector.clone(), monitor.gamma_lut_size))
+            .collect();
+        state
+            .sessions
+            .retain(|session| unchanged.contains(&session.connector.as_str()));
+        state
+            .devices
+            .retain(|device| unchanged.contains(&device.connector.as_str()));
+        let generation = state.monitor_generation;
+        drop(state);
+        self.changed();
+        generation
+    }
+
+    fn monitor_generation(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|state| state.monitor_generation)
+            .unwrap_or_default()
     }
 
     pub fn sessions(&self) -> Vec<CalibrationSession> {
@@ -618,10 +661,21 @@ impl WhitePoint {
 
 /// A monitor the colord thread registers, with its CRTC gamma size
 /// (Mutter generates an sRGB fallback profile only with a gamma LUT).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColordMonitor {
     pub identity: MonitorIdentity,
     pub gamma_lut_size: usize,
+}
+
+impl ColordMonitor {
+    fn same_device(&self, other: &Self) -> bool {
+        self.gamma_lut_size == other.gamma_lut_size
+            && self.identity.connector == other.identity.connector
+            && self.identity.edid_md5 == other.identity.edid_md5
+            && self.identity.vendor == other.identity.vendor
+            && self.identity.product == other.identity.product
+            && self.identity.serial == other.identity.serial
+    }
 }
 
 /// `g_get_user_data_dir ()/icc`.
@@ -786,8 +840,9 @@ pub enum Bus {
 enum Event {
     DeviceChanged(String),
     ColordOwner(bool),
-    /// The monitor set changed (`meta_color_manager_monitors_changed`).
-    MonitorsChanged(Vec<ColordMonitor>),
+    /// The monitor set changed (`meta_color_manager_monitors_changed`),
+    /// at the render loop's monitor generation.
+    MonitorsChanged(u64, Vec<ColordMonitor>),
     /// Something in the ICC store was written, renamed, touched or removed.
     StoreChanged,
     /// The store's directory went away: its changes no longer arrive.
@@ -991,6 +1046,7 @@ impl StoreWatch {
 pub struct ColordClient {
     events: std::sync::mpsc::Sender<Event>,
     thread: Option<std::thread::JoinHandle<()>>,
+    monitors: Vec<ColordMonitor>,
 }
 
 impl ColordClient {
@@ -1004,18 +1060,37 @@ impl ColordClient {
     ) -> Self {
         let (events, rx) = std::sync::mpsc::channel();
         let tx = events.clone();
+        let initial = monitors.clone();
         let thread = std::thread::Builder::new()
             .name("tuna-colord".into())
             .spawn(move || run(share, monitors, bus, icc_dir, rx, tx))
             .ok();
-        Self { events, thread }
+        Self {
+            events,
+            thread,
+            monitors: initial,
+        }
     }
 
-    /// The monitors changed (hotplug): the thread keeps the devices of
-    /// monitors still present, creates devices for new ones and deletes
-    /// those of monitors that left (`meta_color_manager_monitors_changed`).
-    pub fn monitors_changed(&self, monitors: Vec<ColordMonitor>) {
-        let _ = self.events.send(Event::MonitorsChanged(monitors));
+    /// The monitors changed (hotplug, `meta_color_manager_monitors_changed`):
+    /// reconcile actual connector discovery without disturbing unchanged
+    /// colord assignments or recreating the worker on every layout change.
+    /// The thread keeps the devices of monitors still present, creates
+    /// devices for new ones and deletes those of monitors that left.
+    pub fn update_monitors(&mut self, share: &ColorShare, monitors: Vec<ColordMonitor>) {
+        if self.monitors == monitors {
+            return;
+        }
+        let unchanged: Vec<_> = monitors
+            .iter()
+            .filter(|monitor| self.monitors.iter().any(|old| old.same_device(monitor)))
+            .map(|monitor| monitor.identity.connector.as_str())
+            .collect();
+        let generation = share.begin_monitor_update(&monitors, &unchanged);
+        let _ = self
+            .events
+            .send(Event::MonitorsChanged(generation, monitors.clone()));
+        self.monitors = monitors;
     }
 
     /// Stop the thread, deleting what it registered (`meta_color_device_dispose`).
@@ -1046,6 +1121,7 @@ struct Colord {
     /// watch, so only a scan sees it change.
     store_links: bool,
     devices: Vec<Registered>,
+    monitor_generation: u64,
 }
 
 fn error_name(e: &zbus::Error) -> Option<String> {
@@ -1101,6 +1177,7 @@ fn run(
         icc_dir,
         owned_profiles: HashMap::new(),
         store_seen: HashMap::new(),
+        monitor_generation: 0,
         store_watch: None,
         store_links: false,
         devices: monitors
@@ -1132,7 +1209,9 @@ fn run(
         };
         match event {
             Ok(Event::DeviceChanged(path)) => colord.device_changed(&path),
-            Ok(Event::MonitorsChanged(monitors)) => colord.monitors_changed(monitors),
+            Ok(Event::MonitorsChanged(generation, monitors)) => {
+                colord.update_monitors(generation, monitors)
+            }
             Ok(Event::ColordOwner(true)) => {
                 // colord restarted: every temp-scope object is gone.
                 eprintln!("tuna-compositor: colour: colord restarted, registering again");
@@ -1221,6 +1300,7 @@ fn spawn_signal_forwarders(conn: &zbus::Connection, tx: std::sync::mpsc::Sender<
 impl Colord {
     fn publish_initial(&self) {
         self.share.set_devices(
+            self.monitor_generation,
             self.devices
                 .iter()
                 .map(|r| DeviceSnapshot {
@@ -1230,6 +1310,81 @@ impl Colord {
                 })
                 .collect(),
         );
+    }
+
+    /// `meta_color_manager_monitors_changed` → `update_devices`: a
+    /// monitor still present keeps its device, a new monitor gets one
+    /// (`meta_color_device_new` → `create_cd_device`, with its EDID
+    /// device profile), and a monitor that left has its device deleted
+    /// from colord (`meta_color_device_dispose`). A replugged monitor
+    /// is created again under the same colord device id. An update the
+    /// render loop has since superseded is dropped.
+    fn update_monitors(&mut self, generation: u64, monitors: Vec<ColordMonitor>) {
+        if self.share.monitor_generation() != generation {
+            return;
+        }
+        self.monitor_generation = generation;
+        let current: Vec<&MonitorIdentity> =
+            self.devices.iter().map(|r| &r.monitor.identity).collect();
+        let update = update_devices(&current, &monitors);
+        // Remove old registrations before registering a replacement with
+        // the same connector/device id. The persistent colord mapping is
+        // retained by colord, just as it is across a compositor restart.
+        for &old in &update.removed {
+            let r = &self.devices[old];
+            eprintln!(
+                "tuna-compositor: colour: removing device {} ({})",
+                r.monitor.identity.colord_device_id(),
+                r.monitor.identity.connector
+            );
+            if let Some(path) = &r.device_path {
+                if let Err(e) = self.delete_device(path) {
+                    eprintln!(
+                        "tuna-compositor: colour: Failed to delete colord device {path}: {e}"
+                    );
+                }
+            }
+        }
+        let mut old: Vec<Option<Registered>> = std::mem::take(&mut self.devices)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let snapshots = self.share.devices();
+        let mut devices = Vec::with_capacity(monitors.len());
+        let mut published = Vec::with_capacity(monitors.len());
+        for (new, monitor) in monitors.into_iter().enumerate() {
+            let kept = update
+                .kept
+                .iter()
+                .find(|&&(_, n)| n == new)
+                .and_then(|&(o, _)| old[o].take());
+            let connector = monitor.identity.connector.clone();
+            let snapshot = kept
+                .as_ref()
+                .and_then(|_| snapshots.iter().find(|d| d.connector == connector).cloned());
+            // Discovery can revoke a sink while an older event is still
+            // queued. Re-read its existing colord registration rather than
+            // publishing an unready placeholder indefinitely.
+            let device_path = kept
+                .and_then(|r| r.device_path)
+                .filter(|_| snapshot.is_some());
+            published.push(snapshot.unwrap_or_else(|| DeviceSnapshot {
+                connector,
+                device_id: monitor.identity.colord_device_id(),
+                ..Default::default()
+            }));
+            devices.push(Registered {
+                device_path,
+                monitor,
+            });
+        }
+        self.devices = devices;
+        self.share.set_devices(self.monitor_generation, published);
+        for index in 0..self.devices.len() {
+            if self.devices[index].device_path.is_none() {
+                self.register(index);
+            }
+        }
     }
 
     fn call<B>(
@@ -1329,25 +1484,30 @@ impl Colord {
         };
         self.devices[index].device_path = Some(path.clone());
         self.share
-            .update_device(&connector, |d| d.object_path = Some(path.clone()));
+            .update_device(self.monitor_generation, &connector, |d| {
+                d.object_path = Some(path.clone())
+            });
         let device_profile = self.ensure_device_profile(&monitor);
         let error = device_profile.as_ref().err().cloned();
-        self.share.update_device(&connector, |d| {
-            d.device_profile = device_profile.ok().flatten();
-            d.error = error;
-        });
+        self.share
+            .update_device(self.monitor_generation, &connector, |d| {
+                d.device_profile = device_profile.ok().flatten();
+                d.error = error;
+            });
         self.update_assigned(index);
-        self.share.update_device(&connector, |d| d.ready = true);
+        self.share
+            .update_device(self.monitor_generation, &connector, |d| d.ready = true);
         eprintln!("tuna-compositor: colour: device {device_id} ({connector}) registered at {path}");
     }
 
     fn fail(&self, connector: &str, error: String) {
         eprintln!("tuna-compositor: colour: {error}");
         // notify_ready (FALSE) still marks the device ready.
-        self.share.update_device(connector, |d| {
-            d.error = Some(error);
-            d.ready = true;
-        });
+        self.share
+            .update_device(self.monitor_generation, connector, |d| {
+                d.error = Some(error);
+                d.ready = true;
+            });
     }
 
     /// `meta_color_store_ensure_device_profile`: generate, save and
@@ -1494,10 +1654,11 @@ impl Colord {
             .property(&path, CD_DEVICE, "Profiles")
             .unwrap_or_default();
         let Some(default) = profiles.first().map(|p| p.to_string()) else {
-            self.share.update_device(&connector, |d| {
-                d.assigned = None;
-                d.calibration = None;
-            });
+            self.share
+                .update_device(self.monitor_generation, &connector, |d| {
+                    d.assigned = None;
+                    d.calibration = None;
+                });
             return;
         };
         if self
@@ -1540,81 +1701,23 @@ impl Colord {
                         ""
                     }
                 );
-                self.share.update_device(&connector, |d| {
-                    d.assigned = Some(info);
-                    d.calibration = calibration;
-                });
+                self.share
+                    .update_device(self.monitor_generation, &connector, |d| {
+                        d.assigned = Some(info);
+                        d.calibration = calibration;
+                    });
             }
             Err(e) => {
                 // ensure_default_profile_cb: the warning keeps a NULL
                 // assigned profile.
                 eprintln!("tuna-compositor: colour: Failed to create color profile from colord profile: {e}");
-                self.share.update_device(&connector, |d| {
-                    d.assigned = None;
-                    d.calibration = None;
-                    d.error = Some(e);
-                });
+                self.share
+                    .update_device(self.monitor_generation, &connector, |d| {
+                        d.assigned = None;
+                        d.calibration = None;
+                        d.error = Some(e);
+                    });
             }
-        }
-    }
-
-    /// `meta_color_manager_monitors_changed` → `update_devices`: a
-    /// monitor still present keeps its device, a new monitor gets one
-    /// (`meta_color_device_new` → `create_cd_device`, with its EDID
-    /// device profile), and a monitor that left has its device deleted
-    /// from colord (`meta_color_device_dispose`). A replugged monitor
-    /// is created again under the same colord device id.
-    fn monitors_changed(&mut self, monitors: Vec<ColordMonitor>) {
-        let current: Vec<&MonitorIdentity> =
-            self.devices.iter().map(|r| &r.monitor.identity).collect();
-        let update = update_devices(&current, &monitors);
-        for &old in &update.removed {
-            let r = &self.devices[old];
-            eprintln!(
-                "tuna-compositor: colour: removing device {} ({})",
-                r.monitor.identity.colord_device_id(),
-                r.monitor.identity.connector
-            );
-            if let Some(path) = &r.device_path {
-                if let Err(e) = self.delete_device(path) {
-                    eprintln!(
-                        "tuna-compositor: colour: Failed to delete colord device {path}: {e}"
-                    );
-                }
-            }
-        }
-        let mut old: Vec<Option<Registered>> = std::mem::take(&mut self.devices)
-            .into_iter()
-            .map(Some)
-            .collect();
-        let snapshots = self.share.devices();
-        let mut devices = Vec::with_capacity(monitors.len());
-        let mut published = Vec::with_capacity(monitors.len());
-        for (new, monitor) in monitors.into_iter().enumerate() {
-            let kept = update
-                .kept
-                .iter()
-                .find(|&&(_, n)| n == new)
-                .and_then(|&(o, _)| old[o].take());
-            let connector = monitor.identity.connector.clone();
-            let snapshot = kept
-                .as_ref()
-                .and_then(|_| snapshots.iter().find(|d| d.connector == connector).cloned())
-                .unwrap_or_else(|| DeviceSnapshot {
-                    connector,
-                    device_id: monitor.identity.colord_device_id(),
-                    ..Default::default()
-                });
-            published.push(snapshot);
-            devices.push(Registered {
-                device_path: kept.and_then(|r| r.device_path),
-                monitor,
-            });
-        }
-        self.devices = devices;
-        self.share.set_devices(published);
-        for new in update.added {
-            self.register(new);
         }
     }
 

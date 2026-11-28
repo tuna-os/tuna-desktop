@@ -4183,6 +4183,7 @@ dependencies = [
  "libc",
  "libloading 0.9.1",
  "md-5",
+ "moxcms",
  "pipewire",
  "png",
  "rand 0.10.4",

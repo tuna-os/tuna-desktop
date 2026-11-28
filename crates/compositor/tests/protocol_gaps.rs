@@ -19,7 +19,6 @@ use wayland_client::{
         wl_registry::{self, WlRegistry},
         wl_seat::WlSeat,
         wl_subcompositor::WlSubcompositor,
-        wl_subsurface::WlSubsurface,
         wl_surface::WlSurface,
     },
     Connection, Dispatch, EventQueue, QueueHandle,
@@ -64,6 +63,9 @@ use wayland_protocols::xdg::shell::client::{
 };
 use wayland_protocols::xdg::system_bell::v1::client::xdg_system_bell_v1::XdgSystemBellV1;
 use wayland_protocols::xdg::toplevel_tag::v1::client::xdg_toplevel_tag_manager_v1::XdgToplevelTagManagerV1;
+
+#[path = "support/background_effect_boundaries.rs"]
+mod background_effect_boundaries;
 
 const ROUNDS: usize = 10;
 
@@ -324,8 +326,6 @@ wayland_client::delegate_noop!(Client: ignore WpFifoManagerV1);
 wayland_client::delegate_noop!(Client: ignore WpFifoV1);
 wayland_client::delegate_noop!(Client: ignore WpCommitTimingManagerV1);
 wayland_client::delegate_noop!(Client: ignore WpCommitTimerV1);
-wayland_client::delegate_noop!(Client: ignore WlSubcompositor);
-wayland_client::delegate_noop!(Client: ignore WlSubsurface);
 wayland_client::delegate_noop!(Client: ignore ZwpKeyboardShortcutsInhibitManagerV1);
 wayland_client::delegate_noop!(Client: ignore XdgSystemBellV1);
 wayland_client::delegate_noop!(Client: ignore XdgWmDialogV1);
@@ -343,6 +343,7 @@ struct Peer {
     queue: EventQueue<Client>,
     registry: WlRegistry,
     client: Client,
+    socket: UnixStream,
 }
 
 impl Peer {
@@ -383,6 +384,7 @@ fn compositor() -> (TestCompositor, WindowManager) {
 
 fn connect(comp: &mut TestCompositor, manager: &mut WindowManager) -> Peer {
     let (server, stream) = UnixStream::pair().unwrap();
+    let socket = stream.try_clone().unwrap();
     comp.add_client(server);
     let conn = Connection::from_socket(stream).unwrap();
     let queue = conn.new_event_queue();
@@ -392,6 +394,7 @@ fn connect(comp: &mut TestCompositor, manager: &mut WindowManager) -> Peer {
         queue,
         registry,
         client: Client::default(),
+        socket,
     };
     pump(comp, manager, &mut [&mut peer]);
     peer
@@ -1228,6 +1231,102 @@ fn pump_to_error(
     panic!("no protocol error");
 }
 
+/// Capture the typed identity before a destructor can retire its proxy.
+fn protocol_error_target<I: wayland_client::Proxy>(object: &I) -> (u32, &'static str) {
+    (object.id().protocol_id(), I::interface().name)
+}
+
+/// Decode real wl_display.error events, retaining partial socket frames.
+/// The wire carries an object ID, not its interface; callers resolve that ID
+/// against a typed target captured before the failing request.
+fn wire_display_error(events: &[u8]) -> Option<(u32, u32, String)> {
+    let word = |offset: usize| u32::from_ne_bytes(events[offset..offset + 4].try_into().unwrap());
+    let mut offset = 0;
+    while events.len() - offset >= 8 {
+        let object = word(offset);
+        let header = word(offset + 4);
+        let length = (header >> 16) as usize;
+        assert!(
+            length >= 8 && length.is_multiple_of(4),
+            "invalid Wayland frame size"
+        );
+        if length > events.len() - offset {
+            return None;
+        }
+        if object == 1 && header & 0xffff == 0 {
+            // wl_display.error(object_id, code, message): three words followed
+            // by a NUL-terminated, four-byte-padded string.
+            assert!(length >= 24, "truncated wl_display.error");
+            let object_id = word(offset + 8);
+            let code = word(offset + 12);
+            let string_len = word(offset + 16) as usize;
+            assert!(string_len > 0 && string_len <= length - 20);
+            assert_eq!(length, 20 + string_len.next_multiple_of(4));
+            let message =
+                std::ffi::CStr::from_bytes_with_nul(&events[offset + 20..offset + 20 + string_len])
+                    .expect("wl_display.error message must be NUL terminated")
+                    .to_str()
+                    .expect("wl_display.error message must be UTF-8")
+                    .to_owned();
+            return Some((object_id, code, message));
+        }
+        offset += length;
+    }
+    None
+}
+
+/// Observe errors before libwayland consumes them. Its display invalid-object
+/// errors use EINVAL, but wayland-backend only classifies EPROTO as Protocol;
+/// destroyed proxies can also lose their interface during native dispatch.
+/// Neither an I/O error nor EOF is evidence of the required protocol error.
+fn pump_to_wire_error(
+    comp: &mut TestCompositor,
+    manager: &mut WindowManager,
+    peer: &mut Peer,
+    target: (u32, &'static str),
+) -> wayland_client::backend::protocol::ProtocolError {
+    use std::io::Read;
+
+    // Reuse the canonical socket clone. No queue read/dispatch may race this
+    // observer after the malformed request or destructor has been flushed.
+    peer.queue.flush().unwrap();
+    peer.socket.set_nonblocking(true).unwrap();
+    let mut events = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    for _ in 0..ROUNDS {
+        comp.pump();
+        manager.reconcile(&mut comp.state);
+        comp.pump();
+        loop {
+            match peer.socket.read(&mut buffer) {
+                Ok(0) => panic!(
+                    "connection closed without wl_display.error ({} bytes received)",
+                    events.len()
+                ),
+                Ok(length) => {
+                    events.extend_from_slice(&buffer[..length]);
+                    if let Some((object_id, code, message)) = wire_display_error(&events) {
+                        assert_eq!(
+                            object_id, target.0,
+                            "wl_display.error must name the exact typed target {}: {}",
+                            target.1, message
+                        );
+                        return wayland_client::backend::protocol::ProtocolError {
+                            object_id,
+                            object_interface: target.1.into(),
+                            code,
+                            message,
+                        };
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("reading wl_display.error: {error}"),
+            }
+        }
+    }
+    panic!("no wl_display.error on the real client socket");
+}
+
 #[test]
 fn background_blur_regions_apply_on_commit_like_mutter() {
     let (mut comp, mut manager) = compositor();
@@ -1244,11 +1343,8 @@ fn background_blur_regions_apply_on_commit_like_mutter() {
     let compositor: WlCompositor = peer.bind(6);
     let (surface, _toplevel) = window(&mut peer, "terminal");
     pump(&mut comp, &mut manager, &mut [&mut peer]);
-    // Told at bind: blur is supported.
-    assert_eq!(
-        peer.client.background_effects,
-        Some(ext_background_effect_manager_v1::Capability::Blur.bits())
-    );
+    // A headless protocol fixture has no admitted scene framebuffer.
+    assert_eq!(peer.client.background_effects, Some(0));
     let server = comp.state.toplevels()[0].wl_surface().clone();
     assert_eq!(blur_area(&server), None, "no effect until asked");
 

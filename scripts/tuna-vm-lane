@@ -4072,21 +4072,122 @@ def run_soak(qmp, vm, agent_path, out, record, seconds, warmup, interval, revisi
 
 
 
+def native_gpu_devices(profile="lifecycle", outputs=1):
+    if profile == "colour":
+        # The colour consumer is its own boot, never the app-integration one.
+        if outputs != 1:
+            raise ValueError("virgl DEV profile has one scanout")
+        return ["-device", "pcie-root-port,id=tuna-gpu-port,chassis=1,slot=1",
+                "-device", "virtio-vga-gl,bus=tuna-gpu-port,x-pcie-pm-no-soft-reset=on,"
+                           f"xres={WIDTH},yres={HEIGHT}"]
+    # The native automatic-timezone consumer keeps the ordinary GPU topology.
+    if profile not in ("lifecycle", "autotz"):
+        raise ValueError("unknown native VM profile")
+    return baseline.gpu_devices(outputs=outputs)
+
+
+def fill_x11_screen(vm):
+    """Give QEMU's full-screen gtk window the whole WIDTH x HEIGHT X screen.
+
+    gtk_window_fullscreen() only asks an EWMH window manager, and the owned
+    Xvfb screen runs none, so the window kept its first size: QEMU's 640x480
+    placeholder surface plus the menu bar it hides afterwards (ui/gtk.c
+    gd_display_init), 640x505. The gtk display hands its drawing-area size to
+    the guest as the virtio-gpu preferred mode (gd_configure ->
+    dpy_set_ui_info), so the guest compositor drove 640x505 (run
+    46095604445). With no window manager X applies another client's
+    configure request directly: this does the window manager's part, before
+    the guest kernel reads its modes."""
+    try:
+        subprocess.run(["xdotool", "search", "--sync", "--onlyvisible", "--name", "^QEMU",
+                        "windowmove", "%@", "0", "0", "windowsize", "%@", str(WIDTH), str(HEIGHT)],
+                       check=True, capture_output=True, timeout=30)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        vm.kill()
+        raise RuntimeError(f"QEMU's gtk window never filled the X screen: {error}") from error
+
+
+def grab_x11_scanout(path, fmt="ppm"):
+    """Write the virgl DEV profile's presented scanout to `path` as PPM or PNG.
+
+    QEMU's `-display gtk,gl=on,full-screen=on` blits the guest's GL scanout
+    over its window (ui/gtk-egl.c gd_egl_scanout_flush: egl_fb_blit into the
+    window framebuffer), which fill_x11_screen sized to the whole WIDTH x
+    HEIGHT Xvfb screen; the guest takes that size as its mode, so the blit is
+    1:1 and the X screen holds exactly the frame QEMU presented. A screen of
+    any other size would stretch the scanout: refused, not resampled. V-DRM
+    requires the guest's lit mode to be WIDTH x HEIGHT on this profile."""
+    if fmt not in ("ppm", "png"):
+        raise ValueError(f"unsupported scanout format {fmt}")
+    ffmpeg = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+    staging, encoded = f"{path}.x11.ppm", f"{path}.x11.png"
+
+    def run(*arguments):
+        try:
+            subprocess.run([*ffmpeg, *arguments], check=True, capture_output=True, timeout=15)
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(f"x11grab: {error.stderr.decode(errors='replace').strip()}") from error
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("x11grab timed out") from error
+
+    run("-f", "x11grab", "-draw_mouse", "0", "-i", os.environ["DISPLAY"],
+        "-frames:v", "1", "-c:v", "ppm", "-f", "image2", "-update", "1", staging)
+    w, h, _ = read_ppm(staging)
+    if (w, h) != (WIDTH, HEIGHT):
+        raise RuntimeError(f"X screen is {w}x{h}, not the {WIDTH}x{HEIGHT} scanout: "
+                           "the GL blit would be stretched")
+    if fmt == "ppm":
+        os.replace(staging, path)
+        return
+    run("-i", staging, "-c:v", "png", "-f", "image2", "-update", "1", encoded)
+    os.unlink(staging)
+    os.replace(encoded, path)
+
+
+class X11ScanoutQmp(baseline.Qmp):
+    """QMP for the virgl DEV profile, whose screendump reads the X screen.
+
+    QEMU 10.2 qmp_screendump (ui/ui-qmp-cmds.c) takes qemu_console_surface(),
+    which ui/console.c returns only for a SCANOUT_SURFACE console. A virgl
+    scanout is SCANOUT_TEXTURE, so screendump answers "no surface" under every
+    display backend (gtk, egl-headless and dbus alike); egl-headless and dbus
+    GL also need a DRM render node the runner does not have. The gtk display
+    presents that texture on the owned Xvfb screen (grab_x11_scanout), so
+    screendumps and frames are taken there, after QEMU presented them, never
+    from inside the guest."""
+
+    def cmd(self, command, **args):
+        if command != "screendump":
+            return super().cmd(command, **args)
+        if set(args) - {"filename", "format"}:
+            raise ValueError(f"unsupported screendump arguments {sorted(args)}")
+        grab_x11_scanout(args["filename"], args.get("format", "ppm"))
+        return {}
+
+
 def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, native_relative_mouse=False,
-         observer_records=None, display_bus=None, credentials=()):
+         observer_records=None, display_bus=None, credentials=(), profile="lifecycle"):
     ovmf = next((p for p in OVMF if os.path.exists(p)), None)
     if not ovmf:
         sys.exit("tuna-vm-lane: OVMF firmware not found (install ovmf)")
     kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
     if require_kvm and not kvm:
         sys.exit("tuna-vm-lane: KVM required but /dev/kvm is not accessible; refusing emulation")
+    display = "none"
+    if profile == "colour":
+        if (not os.environ.get("DISPLAY") or os.environ.get("LIBGL_ALWAYS_SOFTWARE") != "1"
+                or os.environ.get("GALLIUM_DRIVER") != "llvmpipe"):
+            raise RuntimeError("virgl DEV profile requires its owned Xvfb/software-GL launcher")
+        # full-screen hides the menu bar and sizes the window to the X screen
+        # (grab_x11_scanout reads the presented scanout from it).
+        display = "gtk,gl=on,full-screen=on"
     qmp_path = os.path.join(scratch, "qmp.sock")
     agent_path = os.path.join(scratch, "qga.sock")
     serial = os.path.join(out, "serial.log")
     qemu = ["qemu-system-x86_64", "-machine", "q35", "-m", "6144", "-smp", "4",
             "-bios", ovmf, "-snapshot",
             "-drive", f"file={disk},format=raw,if=virtio,cache=unsafe",
-            *baseline.gpu_devices(outputs=2 if display_bus else 1),
+            *native_gpu_devices(profile, outputs=2 if display_bus else 1),
             "-device", "qemu-xhci", "-device", "usb-tablet", "-device", "usb-kbd",
             # The virtio keyboard carries multimedia evdev codes; USB's
             # boot-protocol keyboard has no consumer-control usages.
@@ -4097,7 +4198,7 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
             # The app-integration boot exposes QEMU's D-Bus display on a
             # private bus: its Console.SetUIInfo connects/disconnects the
             # second virtio-gpu scanout (real guest DRM hotplug).
-            "-display", f"dbus,addr={display_bus},gl=off" if display_bus else "none",
+            "-display", f"dbus,addr={display_bus},gl=off" if display_bus else display,
             "-serial", f"file:{serial}",
             "-qmp", f"unix:{qmp_path},server=on,wait=off",
             "-nic", "user,model=virtio-net-pci"]
@@ -4122,7 +4223,10 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
     if kvm:
         qemu[1:1] = ["-enable-kvm", "-cpu", "host"]
     log(f"booting {disk} (kvm={kvm})")
-    result = subprocess.Popen(qemu), qmp_path, serial, kvm
+    vm = subprocess.Popen(qemu)
+    if profile == "colour":
+        fill_x11_screen(vm)
+    result = vm, qmp_path, serial, kvm
     return (*result, agent_path) if guest_agent else result
 
 
@@ -4369,8 +4473,10 @@ def repeat_boots(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--profile", choices=("lifecycle", "autotz", "gnome-reference", "tuna-reference"), default="lifecycle",
-                    help="ordinary lifecycle (default), required independent native automatic-timezone consumer, or explicit paired DEV member")
+    ap.add_argument("--profile", choices=("lifecycle", "autotz", "colour", "gnome-reference", "tuna-reference"),
+                    default="lifecycle",
+                    help="ordinary lifecycle (default), required independent native automatic-timezone consumer, "
+                         "additional required DEV colour consumer, or explicit paired DEV member")
     ap.add_argument("--reference-base-evidence",
                     help="actual normal-CI raw index and successful platform cosign verification directory")
     ap.add_argument("--disk", required=True)
@@ -4414,6 +4520,10 @@ def main():
         if (not a.require_kvm or not a.strip_image or a.tour or a.boots != 1
                 or a.soak or a.fresh_accounts or a.published or a.strip_edge):
             ap.error("native autotz requires KVM, exact installed image admission and one pristine boot")
+    if a.profile == "colour":
+        if (not a.require_kvm or not a.strip_image or a.tour or a.boots != 1
+                or a.soak or a.fresh_accounts or a.published or a.strip_edge):
+            ap.error("native colour requires KVM, exact installed image admission and one pristine boot")
     if a.fresh_gdm_trace and not a.fresh_accounts:
         ap.error("--fresh-gdm-trace requires --fresh-accounts")
     if a.profile in ("gnome-reference", "tuna-reference"):
@@ -4442,8 +4552,8 @@ def main():
     if a.strip_edge and not a.strip_image:
         ap.error("--strip-edge requires exact installed image admission")
     if a.strip_image:
-        if not a.tour and a.profile != "autotz":
-            ap.error("--strip-image requires --tour lifecycle or explicit native autotz consumer")
+        if not a.tour and a.profile not in ("autotz", "colour"):
+            ap.error("--strip-image requires --tour lifecycle or explicit native autotz or colour consumer")
         with open(a.strip_image, "rb") as stream:
             raw = stream.read(1048577)
         if len(raw) > 1048576:
@@ -4489,7 +4599,7 @@ def main():
             sys.exit(f"tuna-vm-lane: the QEMU display bus never appeared at {display_socket}")
     vm, qmp_path, serial_path, kvm, agent_path = boot(os.path.abspath(a.disk), out, scratch, a.timeout, a.require_kvm,
                                                       guest_agent=True, native_relative_mouse=True,
-                                                      display_bus=display_bus)
+                                                      display_bus=display_bus, profile=a.profile)
     start = time.time()
     drm = shell = None
     elapsed = 0.0
@@ -4498,7 +4608,7 @@ def main():
     tour_serial_end = None
     manager_ready = False
     try:
-        qmp = baseline.Qmp(qmp_path)
+        qmp = (X11ScanoutQmp if a.profile == "colour" else baseline.Qmp)(qmp_path)
         try:
             login_ok = gdm_login(qmp, agent_path, out, record)
         except (OSError, RuntimeError, ValueError) as error:
@@ -4585,6 +4695,16 @@ def main():
             finally:
                 if agent is not None:
                     agent.close()
+            if a.profile == "colour":
+                try:
+                    if not manager_ready:
+                        raise RuntimeError("original installed native session owner admission failed")
+                    from colour_vm import run as run_consumer
+                    factory = lambda *, deadline=None: guest_agent.GuestAgent(agent_path, deadline=deadline)
+                    run_consumer(qmp, factory, os.path.join(out, "colour"), strip_image, owner, vm)
+                    record("V-COLOUR", True, "complete installed DEV virgl consumer; not physical HDR or signed-release qualification")
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                    record("V-COLOUR", False, str(error))
             if a.profile == "autotz":
                 try:
                     if not manager_ready:
@@ -4658,11 +4778,19 @@ def main():
     text = read_text(serial_path)
     drm = drm or DRM_RE.search(text)
     shell = shell or SHELL_RE.search(text)
-    record("V-DRM", bool(drm), f"DRM/KMS output lit: {drm.group(0) if drm else 'no drm: output line'}")
+    # The virgl profile's screendumps are 1:1 only at the X screen's mode
+    # (grab_x11_scanout).
+    mode_ok = (not drm or a.profile != "colour"
+               or (int(drm.group(2)), int(drm.group(3))) == (WIDTH, HEIGHT))
+    record("V-DRM", bool(drm) and mode_ok,
+           f"DRM/KMS output lit: {drm.group(0) if drm else 'no drm: output line'}"
+           + ("" if mode_ok else f", not the {WIDTH}x{HEIGHT} X screen scanned out 1:1"))
     record("V-SHELL", bool(shell) and EXHAUSTED not in text,
            "tuna-shell-gtk started under supervision" if shell
            else "no tuna-shell-gtk: keybindings line")
     results.setdefault("V-PANEL", (False, "session never came up, no screendump checked"))
+    if a.profile == "colour":
+        results.setdefault("V-COLOUR", (False, "native session never admitted; required colour consumer did not run"))
     if a.tour:
         from vm_desktop_gates import GATES as DESKTOP_GATES
         from vm_wm_gates import CLEANUP_GATE, GATES as WM_GATES

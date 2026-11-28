@@ -216,6 +216,9 @@ pub(crate) struct Protocols {
     pub(crate) preferred_scale: f64,
     /// Every text input's committed state, for the on-screen keyboard.
     pub(crate) text_inputs: crate::osk::TextInputs,
+    /// wp_color_manager_v1 and wp_color_representation_manager_v1
+    /// (P-DS-03, see [`crate::color_management`]).
+    pub(crate) color: crate::color_management::ColorManagement,
     /// tuna_osk_input_v1: on-screen-keyboard text for the supervised IBus
     /// bridge alone, filtered like its input-method and virtual keyboard.
     pub(crate) osk_ime: crate::osk_ime::OskIme,
@@ -298,6 +301,7 @@ impl Protocols {
             inhibitors: Vec::new(),
             preferred_scale: 1.0,
             text_inputs: crate::osk::TextInputs::default(),
+            color: crate::color_management::ColorManagement::new(dh),
             #[cfg(feature = "drm")]
             drm_lease: None,
             // Any client outside a security context may create one; a
