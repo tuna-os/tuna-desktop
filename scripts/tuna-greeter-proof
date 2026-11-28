@@ -798,8 +798,8 @@ showing B-2-password "dave" || fail G-GREETER-NOT-LISTED "the prompt does not na
 m="$(mark)"; g2="$(gmark)"
 xdotool key Escape
 gwait "$g2" "$(call Cancel)" 10 || fail G-GREETER-NOT-LISTED "Back did not cancel the conversation"
-gwait "$g2" "$(sig ConversationStopped '.args == ["gdm-password"]')" 10 ||
-    fail G-GREETER-NOT-LISTED "GDM's conversation did not stop after Cancel"
+gwait "$g2" "$(sig Reset)" 10 ||
+    fail G-GREETER-NOT-LISTED "GDM did not reset the session after Cancel"
 twait "$m" "greeter page users" 10 >/dev/null || fail G-GREETER-NOT-LISTED "Back did not return to the user list"
 sleep 0.5
 dump B-3-back

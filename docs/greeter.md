@@ -50,18 +50,33 @@ main, and the installed files of `ghcr.io/tuna-os/marlin` (image
 
 ### Integration point (chosen)
 
-Replace the vendor drop-in by name: ship
+Replace the vendor drop-in by name in `/etc`:
 `/etc/systemd/user/gnome-session@gnome-login.target.d/gnome-login.session.conf`
 with `Requires=gnome-session-basic-services.target` and
-`Requires=tuna-greeter.service`. systemd lets a drop-in in `/etc` override the
-one of the same name in `/usr/lib` (systemd.unit(5), "Drop-in files … with
-the same name"), and dependency lists cannot be emptied by another drop-in,
-so this is the only override that removes the shell. It keeps everything
-else of GDM's design: the `gnome-greeter` session, gnome-session's leader
-and `gnome-login` target, the settings daemon plugins, and GDM's own
-restart of a failed greeter. TunaOS already themes the greeter through
-`/etc/systemd/user/org.gnome.Shell@gdm.service.d/` (the Marlin image has
-`tunaos-gdm-theme.conf` there), so `/etc` is the image's existing seam.
+`Requires=tuna-greeter.service`. Drop-ins of the same name mask each other
+along the unit search path, first directory wins (systemd.unit(5); checked
+with a probe unit), and dependency lists cannot be emptied by another
+drop-in, so a same-name replacement is the only override that removes the
+shell. It keeps everything else of GDM's design: the `gnome-greeter`
+session, gnome-session's leader and `gnome-login` target, the settings
+daemon plugins, and GDM's own restart of a failed greeter.
+
+Why `/etc` and not a vendor directory: the same name under
+`/usr/lib/systemd/user` is GDM's own file (a package conflict).
+`/usr/share/systemd/user` (`$XDG_DATA_DIRS/systemd/user`) precedes
+`/usr/lib/systemd/user` and would override it, but the package would then
+switch the login screen of every system it is installed on, including the
+stock-GNOME reference fixtures (`vm-lane/Containerfile.reference`), the
+preview image and Ubuntu installs of the `.deb`. So every package format
+ships the replacement inactive, as
+`/usr/share/tuna-desktop/greeter/gnome-login.session.conf` (source
+`share/greeter/`), beside `/usr/lib/systemd/user/tuna-greeter.service`
+(`share/systemd/user/`) and `/usr/bin/tuna-greeter`. TunaOS images enable
+it: tunaOS's `tuna-greeter` hook (vendored in `vm-lane/tunaos/`) copies it
+to `/etc` after checking that it equals GDM's drop-in with only the shell
+requirement replaced, and replaces the old `tuna-gdm-theme` GNOME Shell
+stylesheet hook. GDM 48 and older (Debian trixie) start the shell through
+`session.conf` instead and keep GNOME Shell's greeter.
 
 Rejected:
 
@@ -73,7 +88,7 @@ Rejected:
 - A different `gnome-greeter.desktop`: the file belongs to the `gdm`
   package (package conflicts) and the session name is compiled into GDM.
 
-`tuna-greeter.service` (packaging slice, not in this change):
+`tuna-greeter.service` (`share/systemd/user/tuna-greeter.service`):
 
 ```ini
 [Unit]
@@ -136,7 +151,7 @@ no message bus, no bus names) and uses the object
 | `EnableExtensions(as)` | Export `UserVerifier.ChoiceList` (`SelectChoice(s service, s choice)`, signal `ChoiceQuery(s service, s prompt, a{ss} list)`) and/or `UserVerifier.CustomJSON` (`Reply`, `ReportError`, signal `Request(s service, s protocol, u version, s json)`, used for web login and passkeys). Unknown names are ignored. |
 | `BeginVerification(s service)` / `BeginVerificationForUser(s service, s user)` | Start a PAM conversation. GDM 51 refuses services with `/`, not starting with `gdm-`, or daemon-only (`gdm-autologin`, `gdm-launch-environment`). The reply waits until the worker started. |
 | `AnswerQuery(s service, s answer)` | Answer the outstanding `InfoQuery`/`SecretInfoQuery`. |
-| `Cancel()` | GDM's manager then resets the session: `Reset` is emitted, every conversation stops (`ConversationStopped` each) and the selected session and user are forgotten. |
+| `Cancel()` | Replies at once; GDM's manager then resets the session from an idle (`queue_session_reset`): `Reset` is emitted, every conversation stops at once with no `ConversationStopped` for a worker still running (`stop_all_conversations` drops its child watch), and the selected session and user are forgotten. A begin GDM takes before that reset is lost to it, so the greeter sends nothing after a `Cancel` until its `Reset`, and the `Reset` ends every begin on the channel. On a re-authentication channel the cancel closes the channel instead. |
 | signals `ConversationStarted(s)`, `ConversationStopped(s)`, `ReauthenticationStarted(i)` | |
 | signals `Info(s service, s text)`, `Problem(s service, s text)` | PAM_TEXT_INFO / PAM_ERROR_MSG and GDM's own failure text. |
 | signals `InfoQuery(s service, s query)`, `SecretInfoQuery(s service, s query)` | PAM_PROMPT_ECHO_ON / OFF. |
@@ -347,8 +362,8 @@ moved to `userVerifier.js` and the auth services):
 
 ## Proof
 
-`scripts/tuna-greeter-proof` (gtk-shell CI job) runs the real
-`tuna-compositor --greeter` nested on Xvfb with the real `tuna-greeter`;
+`scripts/tuna-greeter-proof` (gtk-shell CI job, on the source build) runs
+the real `tuna-compositor --greeter` nested on Xvfb with the real `tuna-greeter`;
 GDM's daemon, AccountsService, logind and gsd-smartcard are
 `scripts/lib/tuna-gdm-mock.py` on a private system bus (gsd-smartcard on
 the private session bus), serving the API above with GDM 51.1.1's signal
@@ -373,7 +388,15 @@ Gates: `G-GREETER-READY`, `-USER-LIST`, `-NO-SHELL`, `-NOT-LISTED`,
 `-SUPERVISION`, `-HYGIENE`. A second login screen on the same mock then
 runs with `TUNA_SESSION_KIND=hardware`: `G-GREETER-POLICY`, `-CAPS-LOCK`,
 `-POWER-MENU`, `-LIVE-USERS`, `-RECONNECT`. Nested only: no real GDM, PAM,
-SSSD, card reader, passkey, identity provider, gnome-session or DRM.
+SSSD, card reader, passkey, identity provider, gnome-session or DRM. The
+journey CI job runs the same proof against the installed `.deb`'s own binaries
+(`TUNA_PROOF_BIN_DIR=/usr/bin`, artifacts under `journey-artifacts/greeter`),
+and the parity ledger requires both runs' gates to pass.
+`scripts/check-deb-clean-install` (journey; unit suite
+`scripts/lib/deb-clean-install-tests.py`) and arch-package's installed smoke
+check the packaged layout: `tuna-greeter` runs (`--version`) beside the
+compositor, the unit and the inactive drop-in are installed, and no drop-in
+is installed at GDM's `/etc/systemd/user` path.
 
 ## Security model
 
@@ -445,4 +468,4 @@ SSSD, card reader, passkey, identity provider, gnome-session or DRM.
 | User switching: logged-in ring, return to the running session | yes | yes | G-GREETER-SWITCH-RETURN; cargo: `access_denied_verifies_on_the_greeters_channel`, `a_replaced_reauthentication_channel_is_closed_but_never_the_greeters`, `a_closed_channel_is_the_greeters_or_a_users`, `begins_for_a_user_ask_for_the_users_channel_and_the_rest_follow`, `calls_go_out_one_at_a_time_in_order`, `begins_on_the_greeters_channel_select_the_session_again`, `access_denied_is_gdms_refusal_only`, `reauthentication_channels_are_opened_for_running_sessions_only`, `users_with_a_session_are_ringed`, `only_a_return_to_an_active_login_screen_starts_over` |
 | Realmd login hint | yes | no | — |
 | Translations | yes | no | — |
-| Greeter on every variant, `org.gnome.Shell@gdm.service` gone | — | no packaging yet | V-GREETER-LIST, V-GDM-LOGIN, V-GDM-FALLBACK |
+| Greeter on every variant, `org.gnome.Shell@gdm.service` gone | — | both packages ship it inactive beside the compositor; the VM lane's tunaOS layer enables it | `check-deb-clean-install` (journey), arch-package installed smoke, journey's installed-package greeter proof, V-GREETER-TUNA; V-GREETER-LIST, V-GDM-LOGIN, V-GDM-FALLBACK |

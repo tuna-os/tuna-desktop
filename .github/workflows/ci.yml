@@ -440,7 +440,8 @@ jobs:
     # behind check: they check out its tested_sha output.)
     needs: [select-lanes]
     if: contains(fromJSON(needs.select-lanes.outputs.lanes), 'journey')
-    timeout-minutes: 60
+    # Main runs took up to 51 min before the installed greeter proof (~2 min).
+    timeout-minutes: 80
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -545,6 +546,19 @@ jobs:
           TUNA_REQUIRE_PAM_WRAPPER: "1"
           TUNA_REQUIRE_IBUS: "1"
           TUNA_REQUIRE_WAYLAND_INFO: "1"
+      # The login screen (#1164, P-LK-03) from the installed package's own
+      # binaries: /usr/bin/tuna-compositor --greeter supervises the
+      # /usr/bin/tuna-greeter beside it against the GDM 51 mock. Independent
+      # of the installed GTK session above, so it runs (and gates) even when
+      # that one already failed the job.
+      - name: Prove the installed Tuna greeter on GDM's greeter API
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: |
+          dpkg-query -S /usr/bin/tuna-compositor /usr/bin/tuna-greeter
+          scripts/tuna-greeter-proof --artifacts journey-artifacts/greeter
+        env:
+          TUNA_PROOF_BIN_DIR: /usr/bin
       # FIFOs and sockets left by the proofs make the zipper warn
       # ENTRYNOTSUPPORTED and drop them (#484); list and remove them first.
       - if: always()
@@ -1693,8 +1707,13 @@ jobs:
           pkg=$(ls packaging/arch/tuna-desktop-[0-9]*.pkg.tar.zst)
           namcap "$pkg" || true
           pacman -U --noconfirm "$pkg"
-          for bin in tuna-compositor tuna-session tuna-shell-host tuna-wallpaper-svg tuna-x11-frames; do "$bin" --version; done
+          for bin in tuna-compositor tuna-session tuna-shell-host tuna-wallpaper-svg tuna-x11-frames tuna-greeter; do "$bin" --version; done
           test -f /usr/share/wayland-sessions/tuna.desktop
+          # The login screen ships inactive: its unit and the drop-in an
+          # image copies over GDM's, never a file at GDM's own path.
+          test -f /usr/lib/systemd/user/tuna-greeter.service
+          test -f /usr/share/tuna-desktop/greeter/gnome-login.session.conf
+          test ! -e /etc/systemd/user/gnome-session@gnome-login.target.d
           # Exact temporary bridge: installed-layout proof, not an upgrade test.
           for path in /usr/share/wayland-sessions/roost.desktop /etc/pam.d/roost-lock; do  # tuna-rename: keep
             test -f "$path" && test ! -L "$path"
@@ -2494,6 +2513,7 @@ jobs:
           --assertions ledger-in/gtk-shell/greeter/assertions.txt
           --assertions ledger-in/gtk-shell/ibus-owner/assertions.txt
           --assertions ledger-in/gtk-shell/lock-idle-frames/assertions.txt
+          --assertions ledger-in/journey/greeter/assertions.txt
           --assertions ledger-in/orca-speech/assertions.txt
           --assertions ledger-in/drm-smoke/assertions.txt
           --assertions ledger-in/hotplug/assertions.txt

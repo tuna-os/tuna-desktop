@@ -3051,14 +3051,15 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     deadline = logout_started + 90
     greeter = {}
     greeter_visible = False
-    # Both lanes keep the GDM greeter frame that preceded login. tunaOS's
-    # greeter stylesheet paints the variant wallpaper, so the repainted
-    # greeter must match that frame; process startup, a black scanout or a
-    # uniform fill cannot.
+    # Both lanes keep the GDM greeter frame that preceded login. The
+    # repainted greeter must match that frame; process startup, a black
+    # scanout or a uniform fill cannot. The current build's login screen is
+    # Tuna's (#1164), so the greeter it returns to must be too.
     reference = read_ppm(os.path.join(out, "greeter-before-login.ppm"))
+    ready = greeter_ready if published else tuna_greeter_ready
     while time.monotonic() < deadline:
         greeter = agent.run("greeter")
-        if greeter_ready(greeter):
+        if ready(greeter):
             image = frame("logout-greeter")
             colors = greeter_colors(image)
             changed = difference(reference, image)
@@ -3082,7 +3083,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                   f"dialog opened")
     record("V-LOGOUT", greeter_visible and product_logout,
            f"product Log Out ({logout_how}) ends the session and returns to a painted GDM greeter surface "
-           "under active GDM, with no original compositor")
+           f"{'' if published else '(Tuna login screen, V-GREETER-TUNA) '}under active GDM, with no original compositor")
     if orca_failure:
         record("V-ORCA-LOGOUT", False, f"not exercised: Screen Reader activation failed ({orca_failure})")
     else:
@@ -3138,19 +3139,57 @@ def greeter_ready(greeter):
                     for session in greeter.get("greeter_sessions", [])))
 
 
+def greeter_tuna_ok(greeter):
+    """V-GREETER-TUNA (#1164): the active GDM greeter session's user runs one
+    `tuna-compositor --greeter`, started as tuna-greeter.service in place of
+    org.gnome.Shell@gdm.service, which supervises one tuna-greeter that draws
+    the login screen; no gnome-shell runs for any greeter user."""
+    active = [s.get("User") for s in greeter.get("greeter_sessions", [])
+              if s.get("Active") == "yes" and s.get("Service") == "gdm-launch-environment"]
+    if len(active) != 1 or active[0] in (None, "", "0"):
+        return False, f"no single active non-root GDM greeter session (users {active})"
+    uid = int(active[0])
+    if "greeter_shells" not in greeter:
+        return False, "the greeter probe reported no login-screen processes"
+    shells = [p["pid"] for p in greeter["greeter_shells"]]
+    if shells:
+        return False, f"gnome-shell runs for the greeter user (pids {shells})"
+    compositors = [p for p in greeter.get("greeter_compositors", []) if p.get("uid") == uid]
+    clients = [p for p in greeter.get("greeter_clients", []) if p.get("uid") == uid]
+    if len(compositors) != 1:
+        return False, f"greeter user {uid} runs {len(compositors)} tuna-compositor --greeter, not one"
+    compositor = compositors[0]
+    if (os.path.basename(compositor["argv"][0]) != "tuna-compositor" or "--greeter" not in compositor["argv"][1:]
+            or compositor.get("unit") != "tuna-greeter.service"):
+        return False, f"greeter compositor is not tuna-greeter.service's tuna-compositor --greeter: {compositor}"
+    if len(clients) != 1 or clients[0]["ppid"] != compositor["pid"]:
+        return False, (f"greeter compositor {compositor['pid']} does not supervise exactly one tuna-greeter "
+                       f"({[(p['pid'], p['ppid']) for p in clients]})")
+    if greeter.get("greeter_kind") != "tuna-greeter" or greeter.get("greeter_pids") != [str(clients[0]["pid"])]:
+        return False, f"the login screen is {greeter.get('greeter_kind')!r}, not tuna-greeter"
+    return True, (f"greeter user {uid}: tuna-greeter.service runs tuna-compositor --greeter "
+                  f"(pid {compositor['pid']}), which supervises tuna-greeter (pid {clients[0]['pid']}); "
+                  "no gnome-shell runs for any greeter user")
+
+
+def tuna_greeter_ready(greeter):
+    """greeter_ready, with Tuna's login screen (V-GREETER-TUNA) on the seat."""
+    return greeter_ready(greeter) and greeter_tuna_ok(greeter)[0]
+
+
 GREETER_SESSION = ["tuna", "Tuna Desktop"]
 
 
 def greeter_list_ok(greeter):
     """GDM offers each relevant session file once (GDM 51.1
-    libgdm/gdm-sessions.c), and gnome-shell 51.0 js/gdm/loginDialog.js
-    _updateSessions() adds no session choices when exactly one exists. The
-    shipped image itself must leave Tuna Desktop as that only session; the
-    fixture preselects none."""
+    libgdm/gdm-sessions.c); both login screens list exactly those sessions
+    (gnome-shell 51.0 js/gdm/loginDialog.js _updateSessions(), tuna-greeter
+    sessions.rs, libgdm's enumeration). The shipped image itself must leave
+    Tuna Desktop as that only session; the fixture preselects none."""
     sessions = greeter.get("sessions")
     if sessions != [GREETER_SESSION]:
         return False, f"GDM offers {sessions}, expected only {GREETER_SESSION}"
-    return True, f"GDM offers only {sessions}, so the greeter shows no session menu"
+    return True, f"GDM offers only {sessions}, so the greeter has no other session to choose"
 
 
 def fallback_session_ok(greeter):
@@ -3227,11 +3266,13 @@ def await_reference_login(agent, deadline, *, profile):
     return False, observed if observed and observed["session"]["started"] else None
 
 
-def gdm_login(qmp, agent_path, out, record, *, reference_profile=None):
-    """Drive the original stock GDM user list and password prompt.
+def gdm_login(qmp, agent_path, out, record, *, reference_profile=None, tuna_greeter=False):
+    """Drive the original GDM user list and password prompt.
 
     Paired DEV fixtures alone save a session choice; normal Tuna fixtures
-    still prove the shipped fallback without preselection.
+    still prove the shipped fallback without preselection. With tuna_greeter
+    the login screen must be Tuna's (V-GREETER-TUNA, #1164); the reference
+    fixtures keep GNOME Shell's.
     """
     if reference_profile not in (None, "tuna", "gnome"):
         raise ValueError("unknown native login profile")
@@ -3301,12 +3342,17 @@ def gdm_login(qmp, agent_path, out, record, *, reference_profile=None):
             record("V-GREETER-LIST", ok, detail)
             ok, detail = fallback_session_ok(greeter)
             record("V-GDM-FALLBACK", ok, detail)
-        # gnome-shell 51.0 js/gdm/loginDialog.js: _showUserList() gives the
-        # user list key focus, which moves to its first item, and activating
-        # that item begins password verification. tunaOS's GDM login gate
+            if tuna_greeter:
+                ok, detail = greeter_tuna_ok(greeter)
+                record("V-GREETER-TUNA", ok, detail)
+        # Both login screens give the user list key focus on its first item,
+        # and activating that item begins password verification: gnome-shell
+        # 51.0 js/gdm/loginDialog.js _showUserList(), and tuna-greeter's
+        # show_users(), whose rows activate on Return. tunaOS's GDM login gate
         # falls back to Tab-then-Enter and to typing the user name; so do we.
-        # Escape first returns any open prompt to the user list. Only the
-        # public fixture values reach QMP keyboard delivery.
+        # Escape first returns any open prompt to the user list (Tuna's Escape
+        # is authPrompt.js's Back). Only the public fixture values reach QMP
+        # keyboard delivery.
         for attempt, selection in enumerate((("ret",), ("tab", "ret"), ("user", "ret")), 1):
             qmp.keys("esc")
             time.sleep(2)
@@ -4259,7 +4305,8 @@ def fresh_accounts_lane(args):
         credentials=("tuna.vm.fresh-accounts=1",))
     try:
         qmp = baseline.Qmp(qmp_path)
-        journey = fresh_accounts.Journey(qmp, lambda: guest_agent.GuestAgent(agent_path), greeter_ready,
+        # Fresh accounts run on the current build, whose login screen is Tuna's.
+        journey = fresh_accounts.Journey(qmp, lambda: guest_agent.GuestAgent(agent_path), tuna_greeter_ready,
                                          out, record, gdm_trace=args.fresh_gdm_trace)
         try:
             journey.run()
@@ -4500,7 +4547,7 @@ def main():
     try:
         qmp = baseline.Qmp(qmp_path)
         try:
-            login_ok = gdm_login(qmp, agent_path, out, record)
+            login_ok = gdm_login(qmp, agent_path, out, record, tuna_greeter=not a.published)
         except (OSError, RuntimeError, ValueError) as error:
             record("V-GDM-LOGIN", False, str(error))
             login_ok = False

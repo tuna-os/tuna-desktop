@@ -54,12 +54,16 @@ def candidate_policy():
 
 class FakeGuest:
     """Stock GNOME 51 root focus ring and username/password prompts, plus
-    guest observations. Group membership and sudo authorization are separate."""
+    guest observations. Group membership and sudo authorization are separate.
+    With tuna=True the login screen is Tuna's (#1164): GtkListBox rows, then
+    "Not listed?"; Down stops at the last row, Tab from a row moves to the
+    next row or out of the list, and hover never moves keyboard focus."""
 
     def __init__(self, native=True, **faults):
         self.faults = faults
         self.native = native
         self.boot = 1
+        self.tuna = faults.get("tuna", False)
         self.records = {"tunaseeded": "[User]\nSystemAccount=false\n"}
         self.records.update(faults.get("records", {}))
         self.groups = {"tuna-test": ["tuna-test"], "tunastd": ["tunastd"],
@@ -107,10 +111,10 @@ class FakeGuest:
         users = tuple(user for user in ("tuna-test", "tunaseeded", "tunastd", "tunaadmin")
                       if user in self.initial_cached
                       or (user in fresh_accounts.JOURNEY_USERS and user in self.records))
-        return (*users, "not-listed", "a11y")
+        return (*users, "not-listed") if self.tuna else (*users, "not-listed", "a11y")
 
     def _hover(self):
-        if not self.pointer_parked:
+        if not self.pointer_parked and not self.tuna:
             self.focus = self.faults.get("hover_focus", 0) % len(self.focus_ring)
 
     def _show_list(self):
@@ -145,6 +149,24 @@ class FakeGuest:
                 self.mode, self.entry = "username", ""
             elif self.mode in ("username", "password", "a11y"):
                 self._show_list()
+        elif self.mode == "list" and self.tuna:
+            rows = len(self.focus_ring) - 1
+            if names == ("down",) and self.focus < rows - 1:
+                self.focus += 1
+            elif names == ("up",) and 0 < self.focus < rows:
+                self.focus -= 1
+            elif names == ("tab",):
+                # Past "Not listed?" nothing visible takes focus.
+                self.focus += 1
+            elif names == ("shift", "tab"):
+                self.focus = len(self.focus_ring) if self.focus == 0 else self.focus - 1
+            elif names == ("ret",) and self.focus < len(self.focus_ring):
+                actor = self.focus_ring[self.focus]
+                self.entry = ""
+                if actor == "not-listed":
+                    self.mode, self.manual_username = "username", True
+                else:
+                    self.mode, self.selected_user, self.manual_username = "password", actor, False
         elif self.mode == "list":
             if names == ("up",):
                 self.focus = max(0, self.focus - 1)
@@ -252,7 +274,8 @@ class FakeGuest:
         if action == "greeter":
             boot = self.boot if not self.faults.get("stale_boot") else 1
             ready = self.logged_in is None and not (self.boot > 1 and self.faults.get("unready_greeter"))
-            result = {"ready": ready, "boot_id": f"boot-{boot}"}
+            result = {"ready": ready, "boot_id": f"boot-{boot}",
+                      "greeter_kind": "tuna-greeter" if self.tuna else "gnome-shell"}
             if len(self.logins) == 4 and not self.reboot_requests:
                 if self.faults.get("missing_old_boot_id"):
                     result.pop("boot_id")
@@ -424,6 +447,33 @@ class JourneyTest(unittest.TestCase):
                                                       for item in (("username", user), ("password", "tuna"))])
                         self.assertEqual(len(guest.pointer_events), 6)
                         self.assertEqual(max(len(ring) for ring in guest.root_views), min(4, count + 2) + 2)
+
+    def test_tuna_login_screen_reaches_not_listed_for_every_cached_count_and_mode(self):
+        """#1164: on Tuna's login screen the journey walks Down to the last
+        row and Tabs to "Not listed?" instead of GNOME Shell's focus ring."""
+        expected = [(1, "tunastd"), (1, "tunaadmin"), (1, "tunastd"), (1, "tunaadmin"),
+                    (2, "tunastd"), (2, "tunaadmin")]
+        for count in range(1, 5):
+            for mode in ("list", "username", "password"):
+                with self.subTest(cached_users=count, mode=mode):
+                    guest = FakeGuest(tuna=True, cached_users=count, initial_mode=mode)
+                    passed, results, error, _ = journey(guest)
+                    self.assertTrue(passed, (results, error))
+                    self.assertEqual(guest.logins, expected)
+                    self.assertEqual(guest.auth_attempts, [(user, "tuna") for _, user in expected])
+                    self.assertNotIn(("shift", "tab"), guest.key_calls)
+                    self.assertNotIn(("up",), guest.key_calls)
+                    self.assertEqual(guest.key_calls.count(("tab",)), len(expected))
+
+    def test_tuna_walk_misses_not_listed_on_gnome_shell_ring(self):
+        """Falsification: the Tuna walk on GNOME Shell's ring lands on a user,
+        never on Not listed, so the journey must choose by greeter kind."""
+        guest = FakeGuest(cached_users=2)
+        guest.mode, guest.focus = "list", 0
+        for _ in range(fresh_accounts.TUNA_LIST_DOWN):
+            guest.keys("down")
+        guest.keys("tab")
+        self.assertNotEqual(guest.focus_ring[guest.focus], "not-listed")
 
     def test_cached_list_grows_after_each_first_login_record(self):
         guest = FakeGuest(cached_users=2)

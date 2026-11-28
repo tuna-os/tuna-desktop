@@ -541,15 +541,21 @@ impl Greeter {
         });
         // GNOME's menus give the key focus back to where it was when they
         // close (grabHelper.js `ungrab`): after Login Options, typing goes
-        // to the prompt again, not to the menu button.
+        // to the prompt again, not to the menu button. From GTK 4.16,
+        // `gtk_popover_popdown` gives the focus to the menu button after
+        // `closed` (`cascade_popdown`), so the prompt takes it back once
+        // the popdown has returned.
         if let Some(popover) = self.options.popover() {
             let weak = Rc::downgrade(self);
             popover.connect_closed(move |_| {
-                if let Some(greeter) = weak.upgrade() {
-                    if greeter.on_prompt() && greeter.entry.current().is_sensitive() {
-                        greeter.entry.focus();
+                let weak = weak.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(greeter) = weak.upgrade() {
+                        if greeter.on_prompt() && greeter.entry.current().is_sensitive() {
+                            greeter.entry.focus();
+                        }
                     }
-                }
+                });
             });
             // The menu opens on the checked session type, as before the
             // mechanisms got their section; they are a Tab away.

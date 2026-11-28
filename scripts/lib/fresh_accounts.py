@@ -44,6 +44,15 @@ MAX_LOGIN_ATTEMPTS = 2
 # https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/js/gdm/loginDialog.js
 # https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/src/st/st-focus-manager.c
 # https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/51.0/src/st/st-widget.c
+# Tuna's login screen (#1164, crates/greeter): Escape is Back, and the user
+# list then focuses its first row (show_users); no hover moves keyboard
+# focus. GTK 4's GtkListBox moves Down row by row and stops at the last row
+# (keynav-failed), and Tab from the last row leaves the list for the next
+# widget, "Not listed?". Eight Down presses (at most four fixture rows) and
+# one Tab therefore reach it regardless of the cached-user count.
+# https://gitlab.gnome.org/GNOME/gtk/-/blob/4.20.0/gtk/gtklistbox.c
+TUNA_GREETER = "tuna-greeter"
+TUNA_LIST_DOWN = 8
 
 NATIVE_CANDIDATE_ENV = "TUNA_VM_GDM_NATIVE_CANDIDATE"
 NATIVE_SOURCE_ENV = "TUNA_VM_GDM_NATIVE_SOURCE_SHA"
@@ -270,6 +279,7 @@ class Journey:
         self.receipts = []
         self.gdm_trace, self.trace_active = gdm_trace, False
         self.native_required = False
+        self.greeter_kind = None
 
     def _run(self, action, *args):
         if self.agent is None:
@@ -313,6 +323,7 @@ class Journey:
                 if self.greeter_ready(greeter) and (not_boot is None
                                                     or greeter.get("boot_id") not in (None, "", not_boot)):
                     self._receipt(f"{step}-greeter", greeter)
+                    self.greeter_kind = greeter.get("greeter_kind")
                     return greeter
             except (OSError, RuntimeError, ValueError):
                 pass
@@ -356,10 +367,15 @@ class Journey:
             self.sleep(1)
             self.qmp.keys("esc")
             self.sleep(1)
-            for _ in range(5):
-                self.qmp.keys("up")
-            self.qmp.keys("shift", "tab")
-            self.qmp.keys("shift", "tab")
+            if self.greeter_kind == TUNA_GREETER:
+                for _ in range(TUNA_LIST_DOWN):
+                    self.qmp.keys("down")
+                self.qmp.keys("tab")
+            else:
+                for _ in range(5):
+                    self.qmp.keys("up")
+                self.qmp.keys("shift", "tab")
+                self.qmp.keys("shift", "tab")
             self.qmp.keys("ret")
             self.sleep(2)
             self.qmp.type_text(user)

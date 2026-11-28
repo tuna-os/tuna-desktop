@@ -3,9 +3,14 @@
 # Derives from the marlin-tuna-preview image (packaging/marlin/Containerfile)
 # and gives it the published marlin:tuna login path: stock GDM with tunaOS's
 # tuna-flavor GDM steps (tunaos.toml [desktops.tuna] after_install, run in that
-# order), vendored byte-for-byte in tunaos/ from tuna-os/tunaOS d98ed1e09b61635a2a9b115ce559944e42f97d74:
+# order), vendored byte-for-byte in tunaos/ from tuna-os/tunaOS
+# d98ed1e09b61635a2a9b115ce559944e42f97d74, except tuna-greeter.sh, which
+# comes from the tunaOS change that replaces tuna-gdm-theme.sh (#1164):
 #
-#   - tuna-gdm-theme.sh: the greeter-only GNOME Shell stylesheet overlay;
+#   - tuna-greeter.sh: the Tuna login screen in place of GNOME Shell's
+#     greeter: the package's gnome-login.session.conf copied over GDM's
+#     drop-in of that name in /etc, so GDM's greeter session starts
+#     tuna-greeter.service (tuna-compositor --greeter) and no gnome-shell;
 #   - tuna-gdm-default-session.sh: [daemon] FallbackSession=tuna, with
 #     explicit empty [User] Session= in global AccountsService templates
 #     only for installed GDM 51+ with that fallback capability; legacy GDM
@@ -28,6 +33,8 @@
 #     session's stderr (tuna-compositor:, tuna-shell-gtk:) reaches the
 #     QEMU serial log the lane asserts on. The serial login prompt is
 #     masked in this test layer so it cannot overwrite journal evidence.
+#     The login screen traces its pages and user list (TUNA_GREETER_TRACE,
+#     tuna-greeter-trace.conf) to the same journal;
 #   - tuna-vm-fresh-accounts (tunaOS#4092): only when the lane passes the
 #     tuna.vm.fresh-accounts credential, record-free standard and admin
 #     accounts made with useradd at boot, plus a pre-seeded control;
@@ -78,6 +85,7 @@ COPY packaging/marlin/vm-lane/tuna-vm-orca-token /usr/lib/systemd/user-environme
 COPY packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/journald.conf /usr/lib/systemd/journald.conf.d/90-tuna-vm-lane.conf
 COPY packaging/marlin/vm-lane/kargs.toml /usr/lib/bootc/kargs.d/90-tuna-vm-lane.toml
+COPY packaging/marlin/vm-lane/tuna-greeter-trace.conf /usr/lib/systemd/user/tuna-greeter.service.d/90-tuna-vm-lane.conf
 
 COPY packaging/marlin/vm-lane/tuna-vm-health /usr/libexec/tuna-vm-health
 COPY packaging/marlin/vm-lane/tuna-vm-health.service /usr/lib/systemd/system/tuna-vm-health.service
@@ -112,18 +120,22 @@ RUN mkdir -p /usr/share/tuna-vm \
     && test "$(pacman -Q tuna-desktop)" = "$(cat /usr/share/tuna-vm/shipped-package.txt)" \
     && sed -i -E 's/^Name=Tuna Desktop \(preview\)$/Name=Tuna Desktop/' /usr/share/wayland-sessions/tuna.desktop \
     && grep -qx 'Name=Tuna Desktop' /usr/share/wayland-sessions/tuna.desktop \
-    && bash /tmp/tunaos/tuna-gdm-theme.sh \
+    && bash /tmp/tunaos/tuna-greeter.sh \
     && bash /tmp/tunaos/tuna-gdm-default-session.sh \
     && bash /tmp/tunaos/tuna-hide-other-sessions.sh \
     && rm -rf /tmp/tunaos \
     && sha256sum /usr/bin/tuna-session /usr/bin/tuna-compositor \
          /usr/bin/tuna-shell-host /usr/bin/tuna-shell-gtk \
-         /usr/bin/tuna-ibus-bridge \
+         /usr/bin/tuna-ibus-bridge /usr/bin/tuna-greeter \
          /usr/share/wayland-sessions/*.desktop /etc/pam.d/tuna-lock /etc/pam.d/tuna-lock-fingerprint \
          /usr/lib/pam.d/gdm-password /usr/lib/pam.d/gdm-launch-environment \
          /etc/gdm/custom.conf /usr/lib/systemd/system/gdm.service \
-         /etc/systemd/user/org.gnome.Shell@gdm.service.d/tunaos-gdm-theme.conf \
-         /usr/share/tunaos/gdm-theme/gnome-shell-*.css > /usr/share/tuna-vm/shipped-payload.sha256 \
+         /usr/lib/systemd/user/tuna-greeter.service \
+         /usr/lib/systemd/user/gnome-session@gnome-login.target.d/gnome-login.session.conf \
+         /etc/systemd/user/gnome-session@gnome-login.target.d/gnome-login.session.conf \
+         > /usr/share/tuna-vm/shipped-payload.sha256 \
+    && grep -qx 'Requires=tuna-greeter.service' /etc/systemd/user/gnome-session@gnome-login.target.d/gnome-login.session.conf \
+    && ! grep -q 'org.gnome.Shell' /etc/systemd/user/gnome-session@gnome-login.target.d/gnome-login.session.conf \
     && test "$(readlink -f /etc/systemd/system/display-manager.service)" = /usr/lib/systemd/system/gdm.service \
     && ! grep -Eiq '^[[:space:]]*(AutomaticLoginEnable|TimedLoginEnable)[[:space:]]*=[[:space:]]*(true|yes|y|1)[[:space:]]*$' /etc/gdm/custom.conf \
     && grep -qx 'FallbackSession=tuna' /etc/gdm/custom.conf \

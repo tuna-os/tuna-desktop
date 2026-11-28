@@ -1,0 +1,35 @@
+# Tuna Desktop's login screen (#1164, docs/greeter.md). GDM's gnome-login
+# session starts it in place of org.gnome.Shell@gdm.service once an image
+# installs share/greeter/gnome-login.session.conf over GDM's drop-in of the
+# same name. Mirrors gnome-shell 51.1's org.gnome.Shell@.service, minus the
+# extension-recovery OnFailure unit and SuccessExitStatus=1: the compositor
+# exits non-zero only when the greeter's restart budget is spent, and that
+# must end the greeter session so GDM restarts the login screen.
+[Unit]
+Description=Tuna Desktop login screen
+OnFailure=gnome-session-shutdown.target
+OnFailureJobMode=replace-irreversibly
+CollectMode=inactive-or-failed
+RefuseManualStart=on
+RefuseManualStop=on
+
+After=gnome-session-manager.target
+
+Requisite=gnome-session-initialized.target
+PartOf=gnome-session-initialized.target
+Before=gnome-session-initialized.target
+
+AssertEnvironment=XDG_SESSION_TYPE=wayland
+
+[Service]
+Slice=session.slice
+# simple, not notify: the compositor does not send READY=1 in greeter mode.
+Type=simple
+ExecStart=/usr/bin/tuna-compositor --greeter
+# The compositor publishes WAYLAND_DISPLAY (and DISPLAY with Xwayland) to the
+# manager; a stopped greeter must not leave them behind.
+ExecStopPost=-systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY
+# On Wayland the login screen cannot restart in place; GDM restarts it.
+Restart=no
+TimeoutStopSec=5
+OOMScoreAdjust=-1000

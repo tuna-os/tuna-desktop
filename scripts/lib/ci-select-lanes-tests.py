@@ -99,9 +99,9 @@ class Selection(unittest.TestCase):
                 with self.subTest(path=path, run=run):
                     self.assertEqual(pr(path, run=run), ["drm-smoke"])
         self.assertEqual(pr("docs/walkthrough.tsv"), ["gtk-shell"])
-        self.assertEqual(pr("scripts/tuna-greeter-proof"), ["gtk-shell"])
-        self.assertEqual(pr("scripts/lib/tuna-gdm-mock.py"), ["gtk-shell"])
-        self.assertEqual(pr("scripts/lib/org.gnome.login-screen.gschema.xml"), ["gtk-shell"])
+        self.assertEqual(pr("scripts/tuna-greeter-proof"), ["journey", "gtk-shell"])
+        self.assertEqual(pr("scripts/lib/tuna-gdm-mock.py"), ["journey", "gtk-shell"])
+        self.assertEqual(pr("scripts/lib/org.gnome.login-screen.gschema.xml"), ["journey", "gtk-shell"])
         # The greeter's unit tests run in check; its proof in gtk-shell.
         self.assertIn("gtk-shell", pr("crates/greeter/src/main.rs"))
         self.assertEqual(pr("packaging/marlin/vm-lane/Containerfile"),
@@ -260,6 +260,38 @@ class Selection(unittest.TestCase):
                     'marlin-image', 'marlin-vm'])
         # Control: other shipped runtime data still rotates journey.
         self.assertNotIn('journey', pr("share/applications/tuna-settings.desktop", run=1))
+
+    def test_shipped_login_screen_always_runs_journey_and_package_consumers(self):
+        # #1164: both packages and the images ship the greeter's user unit
+        # and its inactive gnome-login drop-in; journey checks the installed
+        # layout, the images copy the drop-in into place.
+        for path in ("share/systemd/user/tuna-greeter.service",
+                     "share/greeter/gnome-login.session.conf"):
+            for run in range(len(m.ROTATION)):
+                with self.subTest(path=path, run=run):
+                    self.assertEqual(pr(path, run=run), [
+                        'journey', 'desktop-proofs', 'gtk-shell',
+                        'portal-security', 'remote-security', 'niri-parity', 'arch-package',
+                        'marlin-image', 'marlin-vm'])
+        # Control: the session target beside it still rotates journey.
+        self.assertNotIn('journey', pr("share/systemd/user/tuna-session.target", run=1))
+
+    def test_package_suites_the_journey_job_runs_select_journey(self):
+        for path in ("scripts/lib/installed-deb-proof-tests.py",
+                     "scripts/lib/deb-clean-install-tests.py",
+                     "scripts/lib/release-deb-ownership-tests.py"):
+            for run in (0, 4, 19):
+                with self.subTest(path=path, run=run):
+                    self.assertEqual(pr(path, run=run), ['journey'])
+
+    def test_fresh_accounts_journey_runs_the_vm_lane(self):
+        # tuna-vm-lane --fresh-accounts imports it; its unit suite stays a
+        # check-job test.
+        for run in (0, 4, 19):
+            with self.subTest(run=run):
+                self.assertEqual(pr("scripts/lib/fresh_accounts.py", run=run),
+                                 ["arch-package", "marlin-vm"])
+        self.assertEqual(pr("scripts/tests/test_fresh_accounts.py"), [])
 
     def test_tooling_of_other_workflows_runs_no_lane(self):
         for path in ("justfile", "scripts/tuna-corral-journey", "scripts/lib/corral_raw.py",
@@ -497,6 +529,46 @@ class WorkflowSync(unittest.TestCase):
         self.assertIn('python3 scripts/lib/transition-package-policy-tests.py', commands)
         installs = [command for command in commands if 'apt-get install' in command]
         self.assertTrue(any('build-essential' in command and 'desktop-file-utils' in command for command in installs))
+
+    def test_journey_run_lib_suites_select_journey(self):
+        # A scripts/lib/*-tests.py suite the journey job runs must select
+        # journey when edited, or it first runs after merge.
+        tracked = subprocess.run(["git", "ls-files", "scripts/lib/*-tests.py"], cwd=ROOT, check=True,
+                                 capture_output=True, text=True).stdout.split()
+        commands = [step.get('run', '') for step in self.jobs['journey']['steps']]
+        run = [path for path in tracked if f'python3 {path}' in commands]
+        self.assertIn('scripts/lib/deb-clean-install-tests.py', run)
+        for path in run:
+            with self.subTest(test=path):
+                self.assertEqual(pr(path, size=0), ['journey'])
+
+    def test_journey_proves_the_installed_greeter(self):
+        # The login screen from the installed .deb's own binaries, after
+        # the install step, gating even when an earlier proof failed.
+        steps = self.jobs['journey']['steps']
+        names = [step.get('name', '') for step in steps]
+        install = names.index('Install exact Debian-format candidate and isolated companion fixtures')
+        greeter = next(i for i, step in enumerate(steps)
+                       if 'scripts/tuna-greeter-proof' in step.get('run', ''))
+        self.assertGreater(greeter, install)
+        step = steps[greeter]
+        self.assertEqual(step['env']['TUNA_PROOF_BIN_DIR'], '/usr/bin')
+        self.assertEqual(step['if'], '${{ !cancelled() }}')
+        self.assertEqual(step['timeout-minutes'], 10)
+        self.assertIn('scripts/tuna-greeter-proof --artifacts journey-artifacts/greeter', step['run'])
+        self.assertIn('dpkg-query -S /usr/bin/tuna-compositor /usr/bin/tuna-greeter', step['run'])
+        ledger = ' '.join(step.get('run', '') for step in self.jobs['parity-ledger']['steps'])
+        self.assertIn('--assertions ledger-in/journey/greeter/assertions.txt', ledger)
+        downloads = [step.get('with', {}) for step in self.jobs['parity-ledger']['steps']]
+        self.assertIn({'name': 'journey-shots', 'path': 'ledger-in/journey'}, downloads)
+
+    def test_arch_package_smoke_runs_the_installed_greeter(self):
+        smoke = next(step['run'] for step in self.jobs['arch-package']['steps']
+                     if 'pacman -U' in step.get('run', ''))
+        self.assertIn('tuna-greeter; do "$bin" --version; done', smoke)
+        self.assertIn('test -f /usr/lib/systemd/user/tuna-greeter.service', smoke)
+        self.assertIn('test -f /usr/share/tuna-desktop/greeter/gnome-login.session.conf', smoke)
+        self.assertIn('test ! -e /etc/systemd/user/gnome-session@gnome-login.target.d', smoke)
 
     def test_gate_waits_for_every_job(self):
         gate = self.jobs["ci-gate"]

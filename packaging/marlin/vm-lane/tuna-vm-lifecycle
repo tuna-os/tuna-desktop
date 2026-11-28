@@ -44,6 +44,11 @@ COMPOSITOR_COMM = COMPOSITOR[:15]  # /proc/<pid>/comm keeps 15 bytes.
 SHELL_GTK = f"{PREFIX}-shell-gtk"
 NESTED = f"{PREFIX}-nested-"
 LOCK_PAM = f"/etc/pam.d/{PREFIX}-lock"
+# The login screen (#1164): GDM's greeter session runs either GNOME Shell or
+# Tuna's greeter compositor (`tuna-compositor --greeter`, unit
+# tuna-greeter.service) supervising the tuna-greeter client.
+GREETER = f"{PREFIX}-greeter"
+GREETER_UI = ("gnome-shell", GREETER)
 
 
 def desktop_package_version():
@@ -2605,6 +2610,44 @@ def fresh_logout(name):
     return {"user": name, "terminated": ended}
 
 
+def greeter_process(pid):
+    """Fixed public identity of one greeter-user process, or None once gone."""
+    process = pathlib.Path(f"/proc/{pid}")
+    try:
+        argv = (process / "cmdline").read_bytes().split(b"\0")[:-1]
+        status = (process / "stat").read_text().rsplit(")", 1)[1].split()
+        cgroup = (process / "cgroup").read_text().strip().rsplit("/", 1)[-1]
+        uid = process.stat().st_uid
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    return {"pid": int(pid), "uid": uid, "ppid": int(status[1]),
+            "argv": [arg.decode(errors="replace") for arg in argv[:8]], "unit": cgroup}
+
+
+def greeter_processes(uids):
+    """The login screen's processes of the greeter sessions' users:
+    GNOME Shell's greeter, or Tuna's greeter compositor and its client.
+    greeter_pids names the process that draws the login screen and owns its
+    accessibility tree: tuna-greeter under the Tuna greeter, else gnome-shell."""
+    def find(uid, name):
+        found = []
+        for pid in call("pgrep", "-u", uid, "-x", name, check=False).splitlines():
+            process = greeter_process(pid)
+            if process is not None:
+                found.append(process)
+        return found
+    shells = [p for uid in uids for p in find(uid, "gnome-shell")]
+    compositors = [p for uid in uids for p in find(uid, COMPOSITOR_COMM) if "--greeter" in p["argv"][1:]]
+    clients = [p for uid in uids for p in find(uid, GREETER)]
+    kind = GREETER if compositors else ("gnome-shell" if shells else None)
+    ui = clients if kind == GREETER else shells
+    return {"greeter_kind": kind, "greeter_comm": kind,
+            "greeter_pids": [str(p["pid"]) for p in ui],
+            "greeter_uids": [p["uid"] for p in ui],
+            "greeter_shells": shells, "greeter_compositors": compositors, "greeter_clients": clients}
+
+
+
 def greeter_prompt_entries(app, Atspi, query):
     """Inspect only the showing greeter scene, not its hidden actor trees."""
     pending, visited, entries = [(app, 0)], 0, []
@@ -2635,7 +2678,7 @@ def greeter_prompt_entries(app, Atspi, query):
     return entries
 
 
-def greeter_prompt_user(pid, ticks):
+def greeter_prompt_user(pid, ticks, comm):
     """Read only role/state from the original greeter's focused entry.
 
     Never query entry names, values, text, or perform accessibility actions.
@@ -2651,7 +2694,9 @@ def greeter_prompt_user(pid, ticks):
         return (process.stat().st_uid,
                 int((process / "stat").read_text().rsplit(")", 1)[1].split()[19]),
                 (process / "comm").read_text().strip())
-    expected = (uid, ticks, "gnome-shell")
+    if comm not in GREETER_UI:
+        raise RuntimeError("greeter principal must be GNOME Shell or the Tuna greeter")
+    expected = (uid, ticks, comm)
     if uid == 0 or principal() != expected:
         raise RuntimeError("original non-root greeter principal required")
     deadline = time.monotonic() + 3
@@ -2707,7 +2752,7 @@ def greeter_prompt():
     raw = call("runuser", "-u", pwd.getpwuid(uid).pw_name, "--", "env",
                f"XDG_RUNTIME_DIR=/run/user/{uid}",
                f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
-               sys.executable, __file__, "greeter-prompt-user", str(pid), str(ticks))
+               sys.executable, __file__, "greeter-prompt-user", str(pid), str(ticks), greeter["greeter_comm"])
     return json.loads(raw)
 
 
@@ -2717,7 +2762,9 @@ FRESH_ACTIONS = {"fresh-state": fresh_state, "fresh-session": fresh_session,
 
 def main():
     if sys.argv[1] == "greeter-prompt-user":
-        print(json.dumps(greeter_prompt_user(int(sys.argv[2]), int(sys.argv[3]))))
+        if len(sys.argv) != 5:
+            raise ValueError("greeter-prompt-user takes a pid, its start ticks and its comm")
+        print(json.dumps(greeter_prompt_user(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])))
         return
     if sys.argv[1] == "background-user-diagnostics":
         print(json.dumps(background_user_diagnostics()))
@@ -3112,7 +3159,7 @@ print(json.dumps(result))
                 stat = (path / "stat").read_text().rsplit(")", 1)[1].split()
                 name = (path / "comm").read_text().strip()
                 if name in {"chvt", "python3", COMPOSITOR_COMM, "systemd-logind", "qemu-ga",
-                            "gdm", "gdm-session-wor", "gdm-wayland-ses", "gnome-shell"}:
+                            "gdm", "gdm-session-wor", "gdm-wayland-ses", "gnome-shell", GREETER}:
                     processes.append({"pid": int(path.name), "name": name, "state": stat[0],
                                       "wait_site": (path / "wchan").read_text().strip()})
             except (FileNotFoundError, PermissionError, ProcessLookupError):
@@ -3412,8 +3459,8 @@ print(json.dumps(result))
                   "desktop": [name for name in ("tuna-session", COMPOSITOR_COMM, "gnome-shell", "gnome-session-s")
                               if call("pgrep", "-u", str(OWNER.pw_uid), "-x", name, check=False)]}
     elif action == "greeter":
-        # GDM's greeter is gnome-shell in a logind greeter-class session of
-        # its own (dynamic) non-root user.
+        # GDM's greeter runs in a logind greeter-class session of its own
+        # (dynamic) non-root user: GNOME Shell, or Tuna's login screen (#1164).
         result = {"manager": DISPLAY_MANAGER.resolve().stem,
                   "boot_id": pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                   "manager_active": call("systemctl", "is-active", "gdm.service",
@@ -3432,13 +3479,10 @@ print(json.dumps(result))
             properties = dict(item.split("=", 1) for item in description.splitlines() if "=" in item)
             if properties.get("Class") == "greeter":
                 greeter_sessions.append(properties)
-        greeter_pids = [pid for uid in sorted({s.get("User", "") for s in greeter_sessions} - {""})
-                        for pid in call("pgrep", "-u", uid, "-x", "gnome-shell", check=False).splitlines()]
+        uids = sorted({s.get("User", "") for s in greeter_sessions} - {""})
         result |= {"greeter_sessions": greeter_sessions,
                    "sessions": gdm_sessions(),
-                   "fallback_session": gdm_fallback_session(),
-                   "greeter_pids": greeter_pids,
-                   "greeter_uids": [pathlib.Path(f"/proc/{pid}").stat().st_uid for pid in greeter_pids]}
+                   "fallback_session": gdm_fallback_session()} | greeter_processes(uids)
     elif action == "gdm-policy":
         # Build-time GDM template policy diagnostic (Containerfile); read-only.
         if len(sys.argv) != 2:

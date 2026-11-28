@@ -48,11 +48,12 @@ OLD_SESSION = 'usr/share/wayland-sessions/roost.desktop'
 NEW_SESSION = 'usr/share/wayland-sessions/tuna.desktop'
 OLD_BINS = ('roost-compositor', 'roost-greeter', 'roost-ibus-bridge',
             'roost-session', 'roost-shell-gtk', 'roost-shell-host')
-NEW_BINS = ('tuna-compositor', 'tuna-ibus-bridge',
+NEW_BINS = ('tuna-compositor', 'tuna-greeter', 'tuna-ibus-bridge',
             'tuna-session', 'tuna-shell-gtk', 'tuna-shell-host', 'tuna-wallpaper-svg',
             'tuna-x11-frames')
-# The released betas also shipped the greetd greeter, since removed (GDM only).
-BETA_BINS = NEW_BINS + ('tuna-greeter',)
+# The released betas shipped the greetd greeter as tuna-greeter; the candidate
+# ships GDM's Tuna login screen under the same name (#1164).
+BETA_BINS = NEW_BINS
 PAM_RULES = [['auth', 'include', 'login'], ['account', 'include', 'login']]
 DEFAULT_PAM = b'auth include login\naccount include login\n'
 ORIGINAL_BETA_OLD_PAM = b'''#%PAM-1.0
@@ -545,8 +546,11 @@ class DisposableLifecycle(unittest.TestCase):
         self.case['version_relation'] = EVIDENCE.report['version_relations']['beta-to-candidate']
         self.install(self.candidate)
         self.assert_bridge()
-        # The candidate no longer ships the greeter: dpkg removes it.
-        self.assertFalse(os.path.lexists(self.root / 'usr/bin/tuna-greeter'))
+        # The candidate's login screen replaces the beta's greetd greeter of
+        # the same name, and the beta's roost-greeter link goes with the beta.
+        greeter = self.root / 'usr/bin/tuna-greeter'
+        self.assertTrue(greeter.is_file() and not greeter.is_symlink())
+        self.assertFalse(os.path.lexists(self.root / 'usr/bin/roost-greeter'))
 
     def test_beta_administrator_modified_policy_is_preserved(self):
         self.install(self.beta)
