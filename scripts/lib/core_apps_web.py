@@ -273,8 +273,9 @@ def settings_panel(desktop, title, actor=None, result_names=None):
     """Open a real Settings result using its observed Search button, not Ctrl+F."""
     actor = actor or desktop.start("org.gnome.Settings", "Settings")
     require(actor["id"] == "org.gnome.Settings", "Settings search requires its original native actor")
-    search = control(desktop, actor, ("Search", "Search Settings"),
-                     ("push button", "button", "toggle button"))
+    # The header's search is a toggle button; GNOME 51's sidebar also
+    # holds a "Search" panel row, a plain button (run 46118838058).
+    search = control(desktop, actor, ("Search", "Search Settings"), ("toggle button",))
     desktop.click_path(actor, search["path"])
     focused = desktop.await_state("settings-native-search-focused", lambda: desktop.tree(actor),
         lambda row: any(n.get("focused") and n.get("sensitive") and

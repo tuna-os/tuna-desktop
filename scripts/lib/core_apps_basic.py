@@ -506,7 +506,7 @@ def _settings(desktop):
         desktop.click_path(actor, chosen['path'])
         desktop.await_state('settings-real-writer-positive-recovery',
             lambda: desktop.guest('basic', 'style-state'), lambda value: value['color_scheme'] == target)
-        search_button = control(desktop, actor, ('Search', 'Search Settings'), ('button', 'push button', 'toggle button'))
+        search_button = control(desktop, actor, ('Search', 'Search Settings'), ('toggle button',))
         desktop.click_path(actor, search_button['path'])
         search = unique(desktop.tree(actor), lambda node: node['focused'] and node['editable'], 'original Settings search entry')
         evidence['ime'] = desktop.ime(actor, search['name'], field_path=search['path'])
