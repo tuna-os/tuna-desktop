@@ -16,9 +16,14 @@
 //! session object relays to one verifier connection, and GNOME runs the
 //! password and fingerprint services side by side on it): the password
 //! and fingerprint backends share it through [`Source`] and each reads
-//! only its own service's signals. All D-Bus traffic runs on one private
-//! GLib thread; a backend's creator thread waits for its events, bounded
-//! by the conversation's deadlines and its cancellation.
+//! only its own service's signals. The system-bus questions (GDM's
+//! manager, logind) go over zbus, as the compositor's other system-bus
+//! clients do: GDBus serializes every connection of the process behind
+//! one lock, which GSettings' dconf worker holds while it autolaunches a
+//! session bus, so a GDBus lookup could stall an attempt for seconds
+//! where GDM does not even run. The channel's own traffic runs on one
+//! private GLib thread; a backend's creator thread waits for its events,
+//! bounded by the conversation's deadlines and its cancellation.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -29,7 +34,6 @@ use std::sync::{mpsc, Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use gio::glib;
-use gio::prelude::*;
 use tuna_gdm::{Call, Signal};
 
 use crate::pam_cancel::Cancellation;
@@ -407,14 +411,11 @@ impl Source {
     }
 
     /// Whether GDM started this session, asked of logind once it answers.
-    fn started_by_gdm(&self, dispatcher: &Dispatcher) -> bool {
+    fn started_by_gdm(&self) -> bool {
         if let Some(known) = self.started_by_gdm.lock().ok().and_then(|known| *known) {
             return known;
         }
-        let service = dispatcher
-            .run(CALL_TIMEOUT, || async { logind_service().await.ok() })
-            .flatten();
-        let Some(service) = service else {
+        let Some(service) = logind_service() else {
             return false;
         };
         let started = started_by_gdm(Some(&service));
@@ -436,20 +437,27 @@ impl Source {
         }
         let routes: Routes = Arc::default();
         let closed = Arc::new(AtomicBool::new(false));
-        let (manager, user) = (self.manager.clone(), user.to_owned());
+        let address = match self.manager.clone() {
+            None => system_channel_address(user)?,
+            Some(manager) => {
+                let user = user.to_owned();
+                dispatcher
+                    .run(2 * CALL_TIMEOUT, move || async move {
+                        let manager = tuna_gdm::connect(&manager).await.ok()?;
+                        tuna_gdm::open_reauthentication_channel(&manager, &user, CALL_TIMEOUT)
+                            .await
+                            .ok()
+                    })
+                    .flatten()?
+            }
+        };
+        if address.is_empty() {
+            return None;
+        }
         let (signal_routes, closed_routes, closed_flag) =
             (routes.clone(), routes.clone(), closed.clone());
         let (connection, subscription) = dispatcher
-            .run(3 * CALL_TIMEOUT, move || async move {
-                let bus = match manager {
-                    None => gio::bus_get_future(gio::BusType::System).await,
-                    Some(address) => tuna_gdm::connect(&address).await,
-                }
-                .ok()?;
-                let address = tuna_gdm::open_reauthentication_channel(&bus, &user, CALL_TIMEOUT)
-                    .await
-                    .ok()
-                    .filter(|address| !address.is_empty())?;
+            .run(CALL_TIMEOUT, move || async move {
                 let connection = tuna_gdm::connect(&address).await.ok()?;
                 // Subscribed on this thread, so signals dispatch here.
                 let subscription = tuna_gdm::subscribe(&connection, move |signal| {
@@ -474,46 +482,52 @@ impl Source {
     }
 }
 
-/// logind's `Service` for this process's session, found as
-/// [`crate::logind_session::current_session_path`] finds the session.
-async fn logind_service() -> Result<String, glib::Error> {
+/// One system-bus step, bounded by [`CALL_TIMEOUT`]; `None` on error or
+/// timeout.
+async fn bounded<T>(step: impl Future<Output = zbus::Result<T>>) -> Option<T> {
+    futures_lite::future::or(async { step.await.ok() }, async {
+        async_io::Timer::after(CALL_TIMEOUT).await;
+        None
+    })
+    .await
+}
+
+/// The address of the reauthentication channel GDM's manager opens for
+/// `user` in this session, as `gdm_client_open_reauthentication_channel`
+/// asks for it.
+fn system_channel_address(user: &str) -> Option<String> {
+    zbus::block_on(async {
+        let system = bounded(zbus::Connection::system()).await?;
+        let reply = bounded(system.call_method(
+            Some(tuna_gdm::MANAGER_NAME),
+            tuna_gdm::MANAGER_PATH,
+            Some(tuna_gdm::MANAGER_INTERFACE),
+            "OpenReauthenticationChannel",
+            &(user,),
+        ))
+        .await?;
+        reply.body().deserialize::<String>().ok()
+    })
+}
+
+/// logind's `Service` for this process's session, found by
+/// [`crate::logind_session::current_session_path`].
+fn logind_service() -> Option<String> {
     const LOGIND: &str = "org.freedesktop.login1";
-    let system = gio::bus_get_future(gio::BusType::System).await?;
-    let (method, args) = match std::env::var("XDG_SESSION_ID") {
-        Ok(id) if !id.is_empty() => ("GetSession", (id,).to_variant()),
-        _ => ("GetSessionByPID", (std::process::id(),).to_variant()),
-    };
-    let timeout = CALL_TIMEOUT.as_millis() as i32;
-    let reply = system
-        .call_future(
+    zbus::block_on(async {
+        let system = bounded(zbus::Connection::system()).await?;
+        let session = bounded(crate::logind_session::current_session_path(&system)).await?;
+        let reply = bounded(system.call_method(
             Some(LOGIND),
-            "/org/freedesktop/login1",
-            "org.freedesktop.login1.Manager",
-            method,
-            Some(&args),
-            glib::VariantTy::new("(o)").ok(),
-            gio::DBusCallFlags::NONE,
-            timeout,
-        )
-        .await?;
-    let path = reply.child_value(0).str().unwrap_or_default().to_owned();
-    let reply = system
-        .call_future(
-            Some(LOGIND),
-            &path,
-            "org.freedesktop.DBus.Properties",
+            &session,
+            Some("org.freedesktop.DBus.Properties"),
             "Get",
-            Some(&("org.freedesktop.login1.Session", "Service").to_variant()),
-            glib::VariantTy::new("(v)").ok(),
-            gio::DBusCallFlags::NONE,
-            timeout,
-        )
+            &("org.freedesktop.login1.Session", "Service"),
+        ))
         .await?;
-    Ok(reply
-        .child_value(0)
-        .as_variant()
-        .and_then(|service| service.str().map(str::to_owned))
-        .unwrap_or_default())
+        let service: zbus::OwnedVariant = reply.body().deserialize().ok()?;
+        String::try_from(service).ok()
+    })
 }
 
 /// One backend's reauthentication: its GDM service on a shared [`Source`].
@@ -570,7 +584,7 @@ impl Reauth {
             return Start::Refuse;
         };
         let Some(channel) = self.source.channel(dispatcher, user) else {
-            return match select(self.source.started_by_gdm(dispatcher), false) {
+            return match select(self.source.started_by_gdm(), false) {
                 Selection::Helper => Start::Helper,
                 _ => Start::Refuse,
             };
