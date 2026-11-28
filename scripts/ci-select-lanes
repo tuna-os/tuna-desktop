@@ -157,6 +157,9 @@ OWNED = [
     ("scripts/tuna-scale-proof", ["gtk-shell"]),
     ("scripts/tuna-slow-portal-proof", ["gtk-shell"]),
     ("scripts/tuna-session-restore-proof", ["gtk-shell"]),
+    # G-OSK-* (the IBus source path included, #981) and their helpers.
+    ("scripts/tuna-osk-proof", ["gtk-shell"]),
+    ("scripts/lib/tuna-osk-pro*.py", ["gtk-shell"]),
     # The login screen (#1164): tuna-compositor --greeter and tuna-greeter
     # against a GDM 51 and AccountsService mock, with GDM's own
     # org.gnome.login-screen schema.
