@@ -80,6 +80,34 @@ class FocusPoints(unittest.TestCase):
         doc["windows"].append({"id": 3, "workspace": 2, "rect": [0, 0, 1280, 800]})
         self.assertEqual(run(doc, "beneath", "1")[0], 0)
 
+    def test_the_upper_windows_resize_handles_occlude_the_lower_window(self):
+        # The full proof's layout: the upper window's input region reaches
+        # 12 px past its rectangle, where the pointer resizes it (P-WM-04).
+        doc = state(stacking=[1, 2], focused=2)
+        doc["windows"] = [
+            {"id": 1, "workspace": 1, "rect": [470, 356, 640, 420],
+             "surface_rect": [445, 331, 690, 470], "input_rect": [458, 344, 664, 444]},
+            {"id": 2, "workspace": 1, "rect": [50, 32, 640, 420],
+             "surface_rect": [25, 7, 690, 470], "input_rect": [38, 20, 664, 444]},
+        ]
+        status, printed = run(doc, "beneath", "1", "2")
+        self.assertEqual(status, 0)
+        window, x, y = map(int, printed[0].split())
+        self.assertEqual(window, 1)
+        self.assertFalse(focus_points.inside([38, 20, 664, 444], x, y), "in the upper window's handles")
+        status, printed = run(doc, "desktop", "1280", "800")
+        self.assertEqual(status, 0)
+        x, y = map(int, printed[0].split())
+        for rect in ([458, 344, 664, 444], [38, 20, 664, 444]):
+            self.assertFalse(focus_points.inside(rect, x, y))
+
+    def test_a_surface_without_an_input_region_takes_the_pointer_over_all_of_it(self):
+        window = {"id": 1, "rect": [100, 100, 400, 300], "surface_rect": [80, 80, 440, 340],
+                  "input_rect": None}
+        self.assertTrue(focus_points.takes_pointer(window, 85, 85))
+        self.assertFalse(focus_points.takes_pointer(window, 79, 85))
+        self.assertTrue(focus_points.takes_pointer({"id": 1, "rect": [100, 100, 400, 300]}, 100, 100))
+
 
 if __name__ == "__main__":
     unittest.main()

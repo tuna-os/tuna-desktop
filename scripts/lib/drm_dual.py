@@ -323,3 +323,111 @@ def frames_between(beats, start, end):
     if not before or not by_end or by_end[-1]["t"] < end - 0.3:
         return None
     return by_end[-1]["frames"] - before[-1]["frames"]
+
+
+# workspaceAnimation.js WORKSPACE_SPACING (crates/compositor/src/workspace_slide.rs).
+SLIDE_SPACING = 100
+
+
+def flips(sampled, connector, start=None, end=None):
+    """Page flips the kernel showed on `connector` between `start` and
+    `end` (CLOCK_MONOTONIC seconds): how often the framebuffer its CRTC
+    scans out changed, in drm_kms_readback.py --sample output."""
+    count, last = 0, None
+    for t, fbs in sampled["samples"]:
+        if connector not in fbs or (start is not None and t < start) or (end is not None and t > end):
+            continue
+        if last is not None and fbs[connector] != last:
+            count += 1
+        last = fbs[connector]
+    return count
+
+
+def coverage(sampled, start, end):
+    """Problems when the samples do not span `start`..`end`: a window the
+    sampler missed would read as no flips."""
+    times = [t for t, _ in sampled["samples"]]
+    if not times or times[0] > start or times[-1] < end:
+        span = f"{times[0]:.2f}..{times[-1]:.2f}" if times else "nothing"
+        return [f"the KMS samples cover {span}, not {start:.2f}..{end:.2f}"]
+    return []
+
+
+def check_slide_only_on(sampled, sliding, still, press, min_flips, window=1.0):
+    """A key switch slides `sliding` (at least `min_flips` flips within
+    `window` s of `press`) and leaves `still` untouched (no flip from
+    just before the press to the window's end): GNOME's MonitorGroup per
+    monitor, the secondary staying put with workspaces on the primary."""
+    problems = coverage(sampled, press - 0.2, press + window)
+    moved = flips(sampled, sliding, press, press + window)
+    if moved < min_flips:
+        problems.append(f"{sliding} flipped {moved} times in the {window} s after the switch (< {min_flips})")
+    redrawn = flips(sampled, still, press - 0.2, press + window)
+    if redrawn:
+        problems.append(f"{still} flipped {redrawn} times while only {sliding} slid")
+    if not any(still in fbs for _, fbs in sampled["samples"]):
+        problems.append(f"{still} was never sampled")
+    return problems
+
+
+def check_no_stall(sampled, busy, press, baseline, window=1.0, ratio=0.8, floor=20):
+    """`busy` (an output with an animating client) keeps flipping while
+    the other output slides: its rate within `window` s of `press` is at
+    least `ratio` of the `baseline` (start, end) rate, and that baseline
+    at least `floor` flips a second. Returns (problems, before, during)."""
+    before = flips(sampled, busy, *baseline) / max(baseline[1] - baseline[0], 1e-6)
+    during = flips(sampled, busy, press, press + window) / window
+    problems = coverage(sampled, baseline[0], press + window)
+    if before < floor:
+        problems.append(f"{busy} flipped {before:.1f}/s before the switch (< {floor}/s): no busy baseline")
+    if during < ratio * before:
+        problems.append(f"{busy} slowed from {before:.1f} to {during:.1f} flips/s while the other output slid")
+    return problems, before, during
+
+
+def slide_distances(in_flight):
+    """The strip distance each in-flight sample of the compositor's
+    `workspace_slide` implies: target_dx / (to_slot - position)."""
+    out = []
+    for record in in_flight:
+        if not record:
+            continue
+        gap = record["to_slot"] - record["position"]
+        if abs(gap) > 0.05:
+            out.append(abs(record["target_dx"] / gap))
+    return out
+
+
+def check_slide_distance(in_flight, primary_width, union_width):
+    """The slide crosses the primary's width plus GNOME's spacing, not the
+    whole desktop's (a per-monitor slide)."""
+    distances = slide_distances(in_flight)
+    want = primary_width + SLIDE_SPACING
+    if not distances:
+        return [f"no in-flight slide sample: {in_flight[:3]}"]
+    # target_dx is rounded to a pixel and the gap is at least 0.05.
+    off = [d for d in distances if abs(d - want) > 25]
+    if off:
+        return [f"the slide distance was {sorted(set(round(d) for d in off))}, not {want} "
+                f"(the primary's width plus {SLIDE_SPACING}; the whole desktop is {union_width} wide)"]
+    return []
+
+
+def check_popup_on(state, output, namespace="tuna-workspace-popup"):
+    """The workspace switcher popup is a layer placed on `output` (GNOME
+    shows it on the primary monitor): its origin lies on that output and
+    it overlaps that output most. The state reports the layer's
+    configured size, which can reach past the output's edge, so the whole
+    rectangle need not fit."""
+    outs = outputs(state)
+    popups = [layer for layer in state.get("layers", []) if layer.get("namespace") == namespace]
+    if not popups:
+        return [f"no {namespace} layer"]
+    problems = []
+    for layer in popups:
+        rect = layer["rect"]
+        where = output_overlapping_most(rect, state)
+        origin = output in outs and overlap([rect[0], rect[1], 1, 1], outs[output]["rect"]) == 1
+        if where != output or not origin:
+            problems.append(f"the popup at {rect} is on {where}, not {output}")
+    return problems
