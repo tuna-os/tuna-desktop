@@ -263,6 +263,47 @@ fn an_admitted_caller_reads_sandboxed_apps_and_windows_through_org_gnome_shell()
 }
 
 #[test]
+fn transient_only_apps_are_not_running_but_their_dialogs_stay_selectable_through_org_gnome_shell() {
+    // A file picker whose only windows are transient (a provider for another
+    // client's dialog) is not a running app; a dialog focused for a
+    // standalone app is attributed to that app; both stay in GetWindows.
+    let editor = window(
+        1,
+        "org.gnome.TextEditor",
+        Some("org.gnome.TextEditor"),
+        false,
+    );
+    let mut dialog = window(2, "org.gnome.TextEditor", None, true);
+    dialog.standalone = false;
+    let mut picker = window(3, "org.gnome.Nautilus", None, false);
+    picker.standalone = false;
+    let session = session(vec![editor, dialog, picker]);
+
+    let apps: Apps = call_shell(&session.client, "GetRunningApplications")
+        .unwrap()
+        .body()
+        .deserialize()
+        .unwrap();
+    assert_eq!(apps.len(), 1, "{apps:?}");
+    assert!(!apps.contains_key("org.gnome.Nautilus.desktop"));
+    assert_eq!(
+        Vec::<String>::try_from(apps["org.gnome.TextEditor.desktop"]["active-on-seats"].clone())
+            .unwrap(),
+        vec!["seat0"],
+        "the focused dialog activates its standalone app"
+    );
+
+    let windows: WindowList = call_shell(&session.client, "GetWindows")
+        .unwrap()
+        .body()
+        .deserialize()
+        .unwrap();
+    let mut ids: Vec<u64> = windows.keys().copied().collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [1, 2, 3], "transient windows remain selectable");
+}
+
+#[test]
 fn an_unadmitted_caller_is_denied_through_org_gnome_shell() {
     if let Ok(address) = std::env::var(IMPOSTOR_ADDRESS) {
         return impostor(&address, &std::env::var(IMPOSTOR_VICTIM).unwrap());
