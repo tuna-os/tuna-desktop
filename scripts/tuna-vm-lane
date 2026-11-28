@@ -444,6 +444,23 @@ def password_refusals(records):
     return single + len(refused & shell_denied_requests('\n'.join(records)))
 
 
+def password_queries(records):
+    """Password questions the compositor put to the shell. None for a
+    malformed conversation record."""
+    prefix = 'tuna-compositor: lock conversation '
+    queries = 0
+    for line in records:
+        if prefix not in line:
+            continue
+        try:
+            event = json.loads(line.split(prefix, 1)[1])
+        except (ValueError, TypeError):
+            return None
+        if type(event) is dict and event.get('event') == 'query' and event.get('service') == 'password':
+            queries += 1
+    return queries
+
+
 FAILLOCK_DENY = 3
 
 
@@ -1585,6 +1602,18 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
             time.sleep(0.3)
         return False
 
+    def await_password_query(offset):
+        """True once the compositor asked the shell for a password after `offset`."""
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            queries = password_queries(session_records(read_text(serial_path)[offset:]))
+            if queries is None:
+                return False
+            if queries >= 1:
+                return True
+            time.sleep(0.3)
+        return False
+
     try:
         faillock["enable"] = agent.run("faillock-enable")
         qmp.keys("meta_l", "l")
@@ -1592,6 +1621,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         for attempt in range(FAILLOCK_DENY):
             faillock["wrong_refusals"].append(lock_password("wrongpass", raise_curtain=attempt == 0))
         faillock["right_refused"] = lock_password("tuna")
+        retry_offset = len(read_text(serial_path))
         time.sleep(2)
         faillock["locked_after_right"] = inventory("faillock-locked")["state"]["locked"]
         faillock["status"] = agent.run("faillock-status")
@@ -1600,6 +1630,19 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         faillock["reset"] = agent.run("faillock-reset")
         with open(os.path.join(evidence, "lock-faillock.json"), "w") as stream:
             json.dump(faillock, stream, indent=2)
+    if faillock["locked_after_right"]:
+        # pam_faillock's preauth reads the tally once, as a conversation
+        # begins, and the shell begins its retry after showing the refusal:
+        # in run 46118845735 that was 0.1 s after `faillock --reset` started,
+        # so the right password was refused once more. Escape cancels the
+        # retry (authPrompt.js `cancel`: the clock comes back) and Return
+        # lifts the curtain on a conversation begun after the reset.
+        await_password_query(retry_offset)
+        qmp.keys("esc")
+        time.sleep(1)
+        offset = len(read_text(serial_path))
+        qmp.keys("ret")
+        await_password_query(offset)
     qmp.keys("ctrl", "a")
     qmp.type_text("tuna")
     qmp.keys("ret")

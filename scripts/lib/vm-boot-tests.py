@@ -6091,6 +6091,12 @@ class LockFaillock(unittest.TestCase):
             self.assertEqual(sorted(path.name for path in etc.iterdir()), ["tuna-lock"])
             self.assertIs(scope["restore_pam_service"]("gdm-password"), False)
 
+    def test_password_queries_count_the_compositors_password_questions(self):
+        query = lambda service: "tuna-compositor: lock conversation " + json.dumps(
+            {"event": "query", "service": service, "request": 9, "secret": True})
+        self.assertEqual(lane.password_queries([query("password"), query("fingerprint")]), 1)
+        self.assertEqual(lane.password_queries(["tuna-shell-gtk: lock auth query service=password"]), 0)
+        self.assertIsNone(lane.password_queries(["tuna-compositor: lock conversation {"]))
 
 
 
