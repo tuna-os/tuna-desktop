@@ -3194,6 +3194,20 @@ impl Runtime {
                     let origin = crate::popup::surface_origin(&s, w.geometry.loc);
                     Some([origin.x, origin.y, size.w, size.h])
                 }),
+                // Its mapped xdg popups (GTK 4 popovers, menus), bottom to
+                // top: each window geometry and committed buffer, in the
+                // global space. A popover's widgets report extents in the
+                // popover's own surface, not the window's.
+                "popups": self.manager.surface_of(w.id).map(|s| {
+                    let origin = crate::popup::surface_origin(&s, w.geometry.loc);
+                    crate::popup::placed_popups(&s, origin, true).iter().map(|p| {
+                        let size = crate::windows::buffer_size(&p.surface);
+                        serde_json::json!({
+                            "rect": [p.rect.loc.x, p.rect.loc.y, p.rect.size.w, p.rect.size.h],
+                            "buffer_rect": size.map(|size| [p.origin.x, p.origin.y, size.w, size.h]),
+                        })
+                    }).collect::<Vec<_>>()
+                }).unwrap_or_default(),
             })).collect::<Vec<_>>(),
             "previews": previews,
             "thumbnails": thumbnails,

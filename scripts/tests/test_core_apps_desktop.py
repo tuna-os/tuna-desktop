@@ -1207,6 +1207,32 @@ class ShadowedSurfacePointer(unittest.TestCase):
             self.desktop()._move_to(self.ACTOR, {'state': {'windows': [self.WINDOW]}, 'nodes': []},
                                     self.NO_THANKS, 0.5, 0.5)
 
+    def test_popover_widgets_are_placed_by_their_popup(self):
+        # Run 46095497198: Connections' address popover is a [0, 0, 425,
+        # 324] panel under the maximized window frame, its entry at [35, 78]
+        # of the popover, not of the window.
+        window = {'id': 1, 'rect': [0, 32, 1280, 768], 'buffer_rect': [0, 32, 1280, 768],
+                  'popups': [{'rect': [12, 70, 425, 324], 'buffer_rect': [0, 58, 449, 348]}]}
+        actor = {'id': 'org.gnome.Connections', 'window_id': 1, 'a11y_scope': '/frame'}
+        entry = {'object_path': '/entry', 'path': [0, 2, 0, 0, 1], 'role': 'text', 'bounds': [35, 78, 355, 34]}
+        header = {'object_path': '/header', 'path': [0, 0], 'role': 'panel', 'bounds': [0, 0, 1280, 47]}
+        tree = {'state': {'windows': [window]}, 'nodes': [
+            {'object_path': '/frame', 'path': [0], 'role': 'frame', 'bounds': [0, 0, 1280, 768]},
+            header,
+            {'object_path': '/popover', 'path': [0, 2], 'role': 'panel', 'bounds': [0, 0, 425, 324]},
+            {'object_path': '/box', 'path': [0, 2, 0], 'role': 'panel', 'bounds': [0, 0, 400, 300]},
+            entry]}
+        self.assertEqual(self.desktop()._field_pixels(actor, tree, entry), (47, 148, 355, 34))
+        # Widgets outside the popover stay window-relative.
+        self.assertEqual(self.desktop()._field_pixels(actor, tree, header), (0, 32, 1280, 47))
+        # A popover the size of its buffer starts at the buffer's corner.
+        window['popups'] = [{'rect': [12, 70, 401, 300], 'buffer_rect': [0, 58, 425, 324]}]
+        self.assertEqual(self.desktop()._field_pixels(actor, tree, entry), (35, 136, 355, 34))
+        # Two popups of the popover's size cannot place it.
+        window['popups'] = [{'rect': [12, 70, 425, 324], 'buffer_rect': None},
+                            {'rect': [500, 70, 425, 324], 'buffer_rect': None}]
+        with self.assertRaisesRegex(RuntimeError, 'more than one placed popup'):
+            self.desktop()._field_pixels(actor, tree, entry)
 
 class TransientDialogDismissal(unittest.TestCase):
     """Run 45936499585: start() bound Connections' focused welcome dialog

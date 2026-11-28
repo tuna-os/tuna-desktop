@@ -302,26 +302,60 @@ class Desktop(NativeDesktop):
         in an 850x650 surface (run 45936499585); Connections' welcome window
         reports a 710x601 frame, its whole surface, for a 658x549 rect (run
         44850865831). Mapping GTK 4 extents through the surface put every
-        click and field crop 25 px up and left of the drawn widget. Web
-        content is further placed by its view (`_web_document`).
+        click and field crop 25 px up and left of the drawn widget. Widgets
+        inside a popover report extents in the popover's own surface
+        (`_popover_origin`). Web content is further placed by its view
+        (`_web_document`).
         """
         window = self._window(actor, tree['state'])
         frames = [row for row in tree['nodes'] if row['object_path'] == actor.get('a11y_scope')]
         if len(frames) != 1 or frames[0]['bounds'] is None:
             raise RuntimeError('original accessible frame extents unavailable')
-        x, y, width, height = frames[0]['bounds']
-        for rect in (window['rect'], window.get('buffer_rect')):
-            if rect is not None and (rect[2], rect[3]) == (width, height):
-                left, top = rect[0] - x, rect[1] - y
-                break
+        popover = self._popover_origin(tree, window, frames[0], node)
+        if popover is not None:
+            left, top = popover
         else:
-            raise RuntimeError('accessible frame is neither the window geometry nor its surface')
+            x, y, width, height = frames[0]['bounds']
+            for rect in (window['rect'], window.get('buffer_rect')):
+                if rect is not None and (rect[2], rect[3]) == (width, height):
+                    left, top = rect[0] - x, rect[1] - y
+                    break
+            else:
+                raise RuntimeError('accessible frame is neither the window geometry nor its surface')
         web = self._web_document(tree, node)
         if web is not None:
             _, host = web
             left += host['bounds'][0]
             top += host['bounds'][1]
         return left, top
+
+    @staticmethod
+    def _popover_origin(tree, window, frame, node):
+        """Output point of a popover's (0, 0) when `node` lies in one, else None.
+
+        A GTK 4 popover is its own xdg popup surface and its widgets'
+        extents start at it: Connections' address popover is a [0, 0, 425,
+        324] panel under the window frame with its entry at [35, 78] (run
+        46095497198), nowhere near the window's (35, 78). The compositor
+        exports each window's placed popups; the outermost ancestor at the
+        origin whose size is one popup's geometry or buffer is the popover,
+        and that rectangle's corner is its (0, 0).
+        """
+        by_path = {tuple(row['path']): row for row in tree['nodes']}
+        for depth in range(len(frame['path']) + 1, len(node['path']) + 1):
+            ancestor = by_path.get(tuple(node['path'][:depth]))
+            if ancestor is None or ancestor['bounds'] is None or ancestor['bounds'][:2] != [0, 0]:
+                continue
+            size = tuple(ancestor['bounds'][2:])
+            matches = [rect for popup in window.get('popups') or ()
+                       for rect in [next((rect for rect in (popup['rect'], popup.get('buffer_rect'))
+                                          if rect is not None and tuple(rect[2:]) == size), None)]
+                       if rect is not None]
+            if len(matches) > 1:
+                raise RuntimeError('accessible popover matches more than one placed popup')
+            if matches:
+                return matches[0][0], matches[0][1]
+        return None
 
 
 
