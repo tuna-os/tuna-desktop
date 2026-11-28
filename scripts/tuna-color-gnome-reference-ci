@@ -364,16 +364,43 @@ done
                  'Service': 'gdm-launch-environment', 'Active': 'yes'}),
                 'stock GDM Wayland greeter and notified GNOME Shell')
             report['stage'] = 'gdm-paint'; save()
-            corral('key', token, 'ret')  # Emulated physical wake, not a GDM override.
+            # Emulated physical wake, not a GDM override. Escape, not Return:
+            # GNOME Shell 51 js/gdm/loginDialog.js _showUserList() gives the
+            # user list key focus on its first item, so a waking Return already
+            # begins tuna-test's verification, and a second Return then raced
+            # the password prompt and submitted it empty (run 44909063151; its
+            # gdm.png shows the selected user right after the waking Return).
+            corral('key', token, 'esc')
             screenshot('gdm')
             # Ordinary single-user GDM chooser; these are emulated physical keys,
             # not a PAM/session injection. Session verification below is mandatory.
             report['stage'] = 'gdm-password-login'; save()
-            corral('key', token, 'ret'); time.sleep(2)
-            corral('type', token, fixture_password); corral('key', token, 'ret')
-            report['session'] = wait(lambda: session_ready(
-                {'Name': 'tuna-test', 'Type': 'wayland', 'Service': 'gdm-password', 'Active': 'yes'}),
-                'ordinary GDM native Wayland login and notified GNOME Shell')
+            worker = "pgrep -f '^gdm-session-worker \\[pam/gdm-password\\]'"
+            expected_session = {'Name': 'tuna-test', 'Type': 'wayland', 'Service': 'gdm-password', 'Active': 'yes'}
+            for attempt in range(1, 4):
+                # Escape returns any open prompt to the user list; Return then
+                # activates its first (only) user.
+                corral('key', token, 'esc'); time.sleep(2)
+                corral('key', token, 'ret')
+                # The password prompt is the pam/gdm-password worker's first
+                # query; type only once that conversation exists.
+                deadline = time.monotonic() + 30
+                while ssh(worker, check=False, timeout=15).returncode and time.monotonic() < deadline:
+                    time.sleep(1)
+                time.sleep(2)
+                corral('type', token, fixture_password); corral('key', token, 'ret')
+                try:
+                    report['session'] = wait(lambda: session_ready(expected_session),
+                                             'ordinary GDM native Wayland login and notified GNOME Shell',
+                                             seconds=120)
+                    break
+                except RuntimeError:
+                    # A session that started but was not admitted is a
+                    # failure; never type the next attempt into it.
+                    started = ssh('loginctl show-user tuna-test -p Sessions --value', check=False, timeout=15)
+                    if attempt == 3 or (started.returncode == 0 and started.stdout.strip()):
+                        raise
+            report['login_attempts'] = attempt
             save()
             # Copy only compiled caller into guest /run; no compositor/session replacement.
             tool('scp', '-i', '/w/key', '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=/w/known_hosts', '-P', port,
