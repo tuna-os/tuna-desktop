@@ -71,14 +71,11 @@ RUN set -eux; \
     && test -x /usr/lib/gnome-session-ctl \
     && test -f /etc/pam.d/tuna-lock \
     && test ! -L /etc/pam.d/tuna-lock \
-    && if pacman -Qlq tuna-desktop | grep -qx /etc/pam.d/tuna-lock-fingerprint; then \
-        test -f /etc/pam.d/tuna-lock-fingerprint \
-        && test ! -L /etc/pam.d/tuna-lock-fingerprint \
-        && test "$(stat -c '%u:%g %a' /etc/pam.d/tuna-lock-fingerprint)" = '0:0 644' \
-        && test "$(pacman -Qqo /etc/pam.d/tuna-lock-fingerprint)" = tuna-desktop \
-        && test "$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' /etc/pam.d/tuna-lock-fingerprint | awk '{print $1, $2, $3}')" = "$(printf 'auth required pam_fprintd.so\naccount include login')" \
-        || exit 1; \
-      else printf 'tuna-desktop predates tuna-lock-fingerprint (perf compare builds main'\''s package); check-release-package requires it of new packages\n'; fi \
+    && test -f /etc/pam.d/tuna-lock-fingerprint \
+    && test ! -L /etc/pam.d/tuna-lock-fingerprint \
+    && test "$(stat -c '%u:%g %a' /etc/pam.d/tuna-lock-fingerprint)" = '0:0 644' \
+    && test "$(pacman -Qqo /etc/pam.d/tuna-lock-fingerprint)" = tuna-desktop \
+    && test "$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' /etc/pam.d/tuna-lock-fingerprint | awk '{print $1, $2, $3}')" = "$(printf 'auth required pam_fprintd.so\naccount include login')" \
     && for legacy in /usr/share/wayland-sessions/roost.desktop /etc/pam.d/roost-lock; do test -f "$legacy" && test ! -L "$legacy" && test "$(stat -c '%u:%g %a' "$legacy")" = '0:0 644' && test "$(pacman -Qqo "$legacy")" = tuna-desktop || exit 1; done && : 'tuna-rename: keep' \
     && grep -qx 'NoDisplay=true' /usr/share/wayland-sessions/roost.desktop && : 'tuna-rename: keep' \
     && ! grep -q '^Hidden=' /usr/share/wayland-sessions/roost.desktop && : 'tuna-rename: keep' \
