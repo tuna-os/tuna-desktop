@@ -1186,6 +1186,13 @@ jobs:
         env:
           TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/tuna-gtk-shell-proof --window-leak-only --artifacts gtk-shell-artifacts/window-leak
+      # The app-icon menu and dash favorites (#1182, #1183).
+      - name: App menu and dash favorites
+        if: ${{ !cancelled() && steps.proof-binaries.outcome == 'success' }}
+        timeout-minutes: 8
+        env:
+          TUNA_PROOF_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: scripts/tuna-gtk-shell-proof --app-menu-only --artifacts gtk-shell-artifacts/app-menu
       # A client's drag through the overview (#1189): real GTK drags open it
       # from the hot corner and the Activities button, activate a window
       # preview after 750 ms, and return to the starting workspace.
@@ -2457,6 +2464,7 @@ jobs:
           --assertions ledger-in/gtk-shell/subsurface/assertions.txt
           --assertions ledger-in/gtk-shell/lock-auth/assertions.txt
           --assertions ledger-in/gtk-shell/panel-dash/assertions.txt
+          --assertions ledger-in/gtk-shell/app-menu/assertions.txt
           --assertions ledger-in/gtk-shell/protocols/assertions.txt
           --assertions ledger-in/gtk-shell/greeter/assertions.txt
           --assertions ledger-in/gtk-shell/ibus-owner/assertions.txt

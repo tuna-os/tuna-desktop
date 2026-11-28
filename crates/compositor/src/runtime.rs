@@ -2728,13 +2728,16 @@ impl Runtime {
             if self.touch_overview_input(&input) {
                 return;
             }
+            // An open menu (an xdg popup holding the grab) takes Escape
+            // first, as GNOME's menus do: it closes the menu and the
+            // overview stays.
             if let ManagerInput::Key {
                 keycode: ESCAPE_KEYCODE,
                 pressed: true,
                 ..
             } = input
             {
-                if self.control.overview_open() {
+                if self.control.overview_open() && !self.state.popup_grab_active() {
                     self.control.set_overview(false);
                     return;
                 }
