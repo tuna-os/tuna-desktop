@@ -65,8 +65,9 @@ impl ToolFocus {
 
 impl WindowManager {
     /// The surface a tool at `pos` is over and its origin, in the order
-    /// pointer motion picks: popups, layer surfaces, then windows (none in
-    /// the overview, and never a parent blocked by its modal dialog).
+    /// pointer motion picks: popups, layer surfaces and unmanaged X11
+    /// windows, then windows (none in the overview, and never a parent
+    /// blocked by its modal dialog).
     fn tablet_target(
         &self,
         state: &State,
@@ -79,10 +80,8 @@ impl WindowManager {
         if let Some(popup) = self.popup_at(state, pos) {
             return Some((popup.surface, popup.origin.to_f64()));
         }
-        if let Some((surface, (x, y))) =
-            crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
-        {
-            return Some((surface, (f64::from(x), f64::from(y)).into()));
+        if let Some((surface, origin, _)) = self.chrome_at(state, pos) {
+            return Some((surface, origin.to_f64()));
         }
         if self.overview_open {
             return None;
@@ -115,10 +114,11 @@ impl WindowManager {
         if on_popup {
             return false;
         }
-        if let Some((surface, _)) =
-            crate::layer::topmost_layer_at(state, pos.x.floor() as i32, pos.y.floor() as i32)
-        {
-            if !self.overview_open && crate::layer::surface_takes_keyboard_on_press(&surface) {
+        if let Some((surface, _, chrome)) = self.chrome_at(state, pos) {
+            if chrome == super::Chrome::Layer
+                && !self.overview_open
+                && crate::layer::surface_takes_keyboard_on_press(&surface)
+            {
                 if let Some(keyboard) = self.keyboard.clone() {
                     keyboard.set_focus(state, Some(surface.clone()), SERIAL_COUNTER.next_serial());
                 }

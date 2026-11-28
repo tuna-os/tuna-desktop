@@ -518,6 +518,15 @@ pub fn placed_size(state: &State, surface: &WlSurface) -> Option<Size<i32, Logic
 /// Returns `None` where no mapped layer surface covers the point, so the
 /// caller falls through to window routing.
 pub fn topmost_layer_at(state: &State, x: i32, y: i32) -> Option<(WlSurface, (i32, i32))> {
+    topmost_layer_entry_at(state, x, y).map(|(surface, origin, _)| (surface, origin))
+}
+
+/// [`topmost_layer_at`] with the layer the surface is on.
+pub fn topmost_layer_entry_at(
+    state: &State,
+    x: i32,
+    y: i32,
+) -> Option<(WlSurface, (i32, i32), Layer)> {
     let placed = layer_layout(state);
     let rects: Vec<(i32, i32, i32, i32)> = placed
         .iter()
@@ -535,10 +544,7 @@ pub fn topmost_layer_at(state: &State, x: i32, y: i32) -> Option<(WlSurface, (i3
             }
         })
         .collect();
-    hit_layer_rect(&rects, x, y).map(|index| {
-        let (surface, origin, _) = &placed[index];
-        (surface.clone(), *origin)
-    })
+    hit_layer_rect(&rects, x, y).map(|index| placed[index].clone())
 }
 
 impl State {
