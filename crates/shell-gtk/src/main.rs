@@ -317,9 +317,8 @@ struct Drained {
     dwell_click: Option<tuna_shell_control::DwellClick>,
     /// Pointer accessibility timeouts for the pie timer, in order.
     pointer_timeouts: Vec<PointerTimeout>,
-    /// The compositor's on-screen keyboard updates, in order: focus, the
-    /// input-panel request, touch-mode auto-show.
-    osk: Vec<(Option<tuna_shell_control::TextFieldFocus>, bool, bool)>,
+    /// The compositor's on-screen keyboard messages, in order.
+    osk: Vec<OskUpdate>,
     /// The compositor's bottom-edge OSK drag phases, in order (wire 0.61).
     osk_gestures: Vec<tuna_shell_control::OskGesturePhase>,
     /// Drawing-tablet OSD messages, in arrival order.
@@ -329,6 +328,14 @@ struct Drained {
     /// The latest active remote access grants, when the compositor sent
     /// them (#1162 F2).
     remote_access: Option<Vec<tuna_shell_control::RemoteAccessHandle>>,
+}
+
+/// One compositor message for the on-screen keyboard.
+enum OskUpdate {
+    /// Focus, the input-panel ON request, touch-mode auto-show (0.43).
+    State(Option<tuna_shell_control::TextFieldFocus>, bool, bool),
+    /// The input-panel OFF request (0.62).
+    HidePanel,
 }
 
 /// One compositor request for the tablet OSDs (wire 0.45).
@@ -435,7 +442,8 @@ fn drain(
                 focus,
                 show,
                 touch_auto,
-            } => out.osk.push((focus, show, touch_auto)),
+            } => out.osk.push(OskUpdate::State(focus, show, touch_auto)),
+            Handled::HideInputPanel => out.osk.push(OskUpdate::HidePanel),
             Handled::OskGesture(phase) => out.osk_gestures.push(phase),
             Handled::PointerTimeout {
                 kind,
@@ -4502,8 +4510,13 @@ fn build(app: &adw::Application) {
                 screensaver.sync(authoritative_lock, lock_shown);
                 // The session keyboard never shows over the lock screen.
                 osk.set_locked(locked);
-                for (focus, show, touch_auto) in osk_updates {
-                    osk.update(focus, show, touch_auto);
+                for update in osk_updates {
+                    match update {
+                        OskUpdate::State(focus, show, touch_auto) => {
+                            osk.update(focus, show, touch_auto);
+                        }
+                        OskUpdate::HidePanel => osk.hide_panel(),
+                    }
                 }
                 for phase in osk_gestures {
                     osk.gesture(phase);

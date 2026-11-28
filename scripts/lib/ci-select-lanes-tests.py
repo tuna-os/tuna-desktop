@@ -193,6 +193,17 @@ class Selection(unittest.TestCase):
                 self.assertIn("gtk-shell", pr(path, run=run), (path, run))
         self.assertEqual(pr("scripts/tuna-wayland-info-compare"), ["gtk-shell"])
 
+    def test_input_panel_gate_inputs_run_the_gtk_shell_proof(self):
+        # G-OSK-INPUT-PANEL (--protocols-only) drives text-input v3 version
+        # 2 into the shell's keyboard: the compositor's tracking, the wire,
+        # the shell's keyboard and Smithay's text-input select gtk-shell.
+        for run in range(len(m.ROTATION)):
+            for path in ("crates/compositor/src/osk.rs",
+                         "crates/shell-control-schema/src/lib.rs",
+                         "crates/shell-gtk/src/osk_model.rs",
+                         "third-party/smithay/src/wayland/text_input/text_input_handle.rs"):
+                self.assertIn("gtk-shell", pr(path, run=run), (path, run))
+
     def test_vm_legs_follow_the_event_and_the_ledger(self):
         def legs(event, lanes):
             return [leg["artifact"] for leg in m.vm_matrix(event, lanes)["include"]]

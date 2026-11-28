@@ -25,12 +25,27 @@ use tuna_shell_control::TextFieldFocus;
 /// mutter's `CLUTTER_INPUT_CONTENT_HINT_INHIBIT_OSK`.
 pub const HINT_INHIBIT_OSK: u32 = 0x400;
 
+/// `ZWP_TEXT_INPUT_V3_SHOW_INPUT_PANEL_SINCE_VERSION`: from this version a
+/// client asks for the input panel itself instead of re-enabling.
+const SHOW_INPUT_PANEL_SINCE: u32 = 2;
+
+/// mutter's `ClutterInputPanelState` as its text input sets it
+/// (`clutter_input_focus_set_input_panel_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputPanel {
+    On,
+    Off,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct Pending {
     enable: Option<bool>,
     content: Option<(u32, u32)>,
     /// `set_cursor_rectangle`: surface-local x, y, width, height.
     cursor: Option<Option<(i32, i32, i32, i32)>>,
+    /// `show_input_panel` (true) or `hide_input_panel` (false), the last
+    /// one before `commit` (mutter's `show_panel`).
+    panel: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -52,8 +67,8 @@ struct Tracked {
 #[derive(Debug, Default)]
 pub struct TextInputs {
     tracked: Vec<Tracked>,
-    /// A focused text input was enabled again (input-panel ON).
-    show: bool,
+    /// The input-panel state the last focused commit asked for.
+    panel: Option<InputPanel>,
 }
 
 impl TextInputs {
@@ -83,12 +98,12 @@ impl TextInputs {
         let entry = &mut self.tracked[index];
         match request {
             zwp_text_input_v3::Request::Enable => {
-                // Enabling resets the field's state (the protocol's rule).
-                entry.pending = Pending {
-                    enable: Some(true),
-                    content: Some((0, 0)),
-                    cursor: Some(None),
-                };
+                // Enabling resets the field's state (the protocol's
+                // rule); a panel request made before it stands, as in
+                // mutter's text_input_enable.
+                entry.pending.enable = Some(true);
+                entry.pending.content = Some((0, 0));
+                entry.pending.cursor = Some(None);
             }
             zwp_text_input_v3::Request::Disable => entry.pending.enable = Some(false),
             zwp_text_input_v3::Request::SetContentType { hint, purpose } => {
@@ -104,6 +119,8 @@ impl TextInputs {
                 width,
                 height,
             } => entry.pending.cursor = Some(Some((*x, *y, *width, *height))),
+            zwp_text_input_v3::Request::ShowInputPanel => entry.pending.panel = Some(true),
+            zwp_text_input_v3::Request::HideInputPanel => entry.pending.panel = Some(false),
             zwp_text_input_v3::Request::Commit => {
                 entry.commits = entry.commits.wrapping_add(1);
                 let pending = std::mem::take(&mut entry.pending);
@@ -112,11 +129,16 @@ impl TextInputs {
                 if !focused {
                     return;
                 }
+                // mutter's text_input_commit_state.
+                let mut enable_panel_v1 = false;
                 match pending.enable {
-                    // Mutter: enabling an already focused version-1 text
-                    // input asks for the input panel (GTK re-enables on a
-                    // click into its field, `activate_osk`).
-                    Some(true) if entry.enabled => self.show = true,
+                    // Enabling an already focused version-1 text input
+                    // asks for the input panel (GTK re-enables on a click
+                    // into its field, `activate_osk`); version 2 asks with
+                    // show_input_panel instead.
+                    Some(true) if entry.enabled => {
+                        enable_panel_v1 = resource.version() < SHOW_INPUT_PANEL_SINCE;
+                    }
                     Some(enabled) => entry.enabled = enabled,
                     None => {}
                 }
@@ -125,6 +147,16 @@ impl TextInputs {
                 }
                 if let Some(cursor) = pending.cursor {
                     entry.cursor = cursor;
+                }
+                // Without input-method focus the panel request is dropped.
+                if !entry.enabled {
+                    return;
+                }
+                match pending.panel {
+                    Some(true) => self.panel = Some(InputPanel::On),
+                    Some(false) => self.panel = Some(InputPanel::Off),
+                    None if enable_panel_v1 => self.panel = Some(InputPanel::On),
+                    None => {}
                 }
             }
             zwp_text_input_v3::Request::Destroy => self.destroyed(resource),
@@ -144,7 +176,7 @@ impl TextInputs {
             entry.enabled = false;
             entry.pending = Pending::default();
         }
-        self.show = false;
+        self.panel = None;
     }
 
     fn active(&self, focus: Option<&WlSurface>) -> Option<&Tracked> {
@@ -168,9 +200,10 @@ impl TextInputs {
         self.active(focus)?.cursor
     }
 
-    /// Take the input-panel ON request; only a focused field may make it.
-    pub fn take_show(&mut self, focus: Option<&WlSurface>) -> bool {
-        std::mem::take(&mut self.show) && self.active(focus).is_some()
+    /// Take the pending input-panel request; only a focused field may make
+    /// it.
+    pub fn take_panel(&mut self, focus: Option<&WlSurface>) -> Option<InputPanel> {
+        self.panel.take().filter(|_| self.active(focus).is_some())
     }
 
     /// Commit `text` to the focused field (`Main.inputMethod.commit`):

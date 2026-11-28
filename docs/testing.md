@@ -289,6 +289,15 @@ overview stays shut until Super+Escape gives the shortcuts back, while as
 slice in the `gtk-shell` job; its `protocols/assertions.txt` feeds the
 ledger.
 
+G-OSK-INPUT-PANEL, in the same slice: with `screen-keyboard-enabled` on, a
+`zwp_text_input_manager_v3` version 2 field (`protocol-probe text-input-v2`)
+enabled alone opens no keyboard; `show_input_panel` and commit open the
+shell's keyboard (its `tuna-osk` layer in the state file, slid in within
+2 s), `hide_input_panel` and commit close it while the field keeps keyboard
+and input-method focus, `show_input_panel` opens it again, and
+`set_available_actions` with `none` raises `invalid_action`, as Mutter 51's
+`text_input_commit_state` and GNOME's keyboard do.
+
 `scripts/tuna-gtk-shell-proof --dnd-overview-only --artifacts DIR` runs
 G-DND-OVERVIEW (#1189), the same function the full GTK proof calls after
 G-OV-DND: a client drag through the overview as GNOME 51 handles it

@@ -16,7 +16,7 @@
 #   --protocols-only runs panel readiness, G-WAYLAND-INFO and the Mutter 51
 #   protocol gates driven by a real client (G-XDG-WM-BASE-7,
 #   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR, G-SYNCOBJ,
-#   G-XWAYLAND-GRAB; #364, #588) only.
+#   G-XWAYLAND-GRAB, G-OSK-INPUT-PANEL; #364, #588) only.
 #   --subsurface-only runs panel readiness and G-SUBSURFACE-STACKING (a
 #   window's subsurfaces stack where the client placed them) only.
 #   --grid-hover-only runs panel readiness, G-GRID-HOVER, G-GRID-REORDER,
@@ -2352,6 +2352,22 @@ xwayland_grab_gate() {
     xgrab_stop XTerm
     pass G-XWAYLAND-GRAB "remote-viewer's XGrabKeyboard is granted (Mutter's built-in list): a real Super reaches it and the overview stays shut until Super+Escape; XTerm's is refused and Super opens the overview"
 }
+
+# Text-input v3 version 2 (P-SY-09): Mutter 51's text_input_commit_state
+# turns show_input_panel and hide_input_panel into input-panel ON and OFF,
+# and GNOME's on-screen keyboard opens and closes on them while the field
+# keeps focus. The probe reads the shell's keyboard layer (tuna-osk) from
+# the state file, as tuna-osk-proof does.
+osk_input_panel_gate() {
+    gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled true
+    # GSettings' keyfile backend reaches the shell through file monitoring.
+    sleep 3
+    protocol_probe G-OSK-INPUT-PANEL text-input-v2
+    cstate 'all(.layers[]; .namespace != "tuna-osk")' "keyboard gone with the field" 5 ||
+        fail G-OSK-INPUT-PANEL "the keyboard outlived the probe's field"
+    gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled false
+    pass G-OSK-INPUT-PANEL "zwp_text_input_manager_v3 2 with the on-screen keyboard enabled: a focused field opens no keyboard until show_input_panel; hide_input_panel closes it while the field keeps focus; show_input_panel opens it again; set_available_actions([none]) raises invalid_action ($(grep '^ok zwp' "$ARTIFACTS/protocol-text-input-v2.log" | sed 's/.*: //'))"
+}
 protocol_gaps_gates() {
     protocol_probe G-XDG-WM-BASE-7 xdg-wm-base-7
     pass G-XDG-WM-BASE-7 "xdg_wm_base 7: a maximized window is tiled and constrained on every edge; a version 6 bind gets the tiled states alone"
@@ -2362,6 +2378,7 @@ protocol_gaps_gates() {
     background_blur_gate
     syncobj_gate
     xwayland_grab_gate
+    osk_input_panel_gate
 }
 
 # G-SUBSURFACE-STACKING: a window's subsurfaces stack where the client
