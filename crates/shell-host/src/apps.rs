@@ -157,6 +157,69 @@ pub fn desktop_file_exists(id: &str) -> bool {
         .any(|dir| dir.join(&file).is_file())
 }
 
+/// One `[Desktop Action]` of a desktop file: what the app menu lists
+/// (`g_desktop_app_info_list_actions`, `get_action_name`) and what
+/// `launch_action` runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopAction {
+    pub id: String,
+    /// Localized `Name`.
+    pub name: String,
+    /// The action's `Exec`, field codes dropped.
+    pub argv: Vec<OsString>,
+}
+
+/// What the app menu reads from an app's desktop file beyond its entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DesktopMenu {
+    /// The `Actions` the file lists, in order, that have a name and a
+    /// runnable `Exec`.
+    pub actions: Vec<DesktopAction>,
+    /// `PrefersNonDefaultGPU`.
+    pub prefers_non_default_gpu: bool,
+}
+
+/// The menu hints of the desktop file `<app_id>.desktop`, found as
+/// [`default_app_dirs`] order resolves it; none for an app without one.
+pub fn desktop_menu(app_id: &str) -> DesktopMenu {
+    let file = format!("{}.desktop", app_id.trim_end_matches(".desktop"));
+    default_app_dirs()
+        .into_iter()
+        .map(|dir| dir.join(&file))
+        .find(|path| path.is_file())
+        .map(|path| desktop_menu_from_file(&path))
+        .unwrap_or_default()
+}
+
+fn desktop_menu_from_file(path: &std::path::Path) -> DesktopMenu {
+    let locales: Vec<String> = LOCALES.iter().map(|s| s.to_string()).collect();
+    let Ok(entry) = CrateEntry::from_path(path, Some(&locales)) else {
+        return DesktopMenu::default();
+    };
+    let actions = entry
+        .actions()
+        .unwrap_or_default()
+        .into_iter()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .filter_map(|id| {
+            let name = entry.action_name(id, &locales)?.into_owned();
+            let argv = exec_argv(&entry, entry.action_exec(id)?)?;
+            (!name.is_empty()).then(|| DesktopAction {
+                id: id.to_owned(),
+                name,
+                argv,
+            })
+        })
+        .collect();
+    DesktopMenu {
+        actions,
+        prefers_non_default_gpu: entry
+            .desktop_entry("PrefersNonDefaultGPU")
+            .is_some_and(glib_bool),
+    }
+}
+
 fn data_dirs() -> Vec<PathBuf> {
     std::env::var_os("XDG_DATA_DIRS")
         .map(|dirs| {
@@ -475,7 +538,22 @@ pub fn application_launch_context() -> gio::AppLaunchContext {
 }
 
 pub fn launch(entry: &AppEntry) -> io::Result<Launched> {
-    spawn(&entry.app_id, &entry.argv)
+    spawn(&entry.app_id, &entry.argv, &[])
+}
+
+/// [`launch`] with `environment` added to the child's, as GNOME's
+/// discrete-GPU launch sets the variables switcheroo-control names
+/// (`apply_discrete_gpu_env`).
+pub fn launch_with_environment(
+    entry: &AppEntry,
+    environment: &[(String, String)],
+) -> io::Result<Launched> {
+    spawn(&entry.app_id, &entry.argv, environment)
+}
+
+/// Run a [`DesktopAction`] of `app_id` (`launch_action`).
+pub fn launch_action(app_id: &str, action: &DesktopAction) -> io::Result<Launched> {
+    spawn(app_id, &action.argv, &[])
 }
 
 /// `shell_app_open_new_window` (gnome-shell 51 src/shell-app.c:574-623):
@@ -486,17 +564,22 @@ pub fn launch(entry: &AppEntry) -> io::Result<Launched> {
 /// the shell does not track.
 pub fn open_new_window(entry: &AppEntry) -> io::Result<Launched> {
     match &entry.new_window.action_argv {
-        Some(argv) => spawn(&entry.app_id, argv),
+        Some(argv) => spawn(&entry.app_id, argv, &[]),
         None => launch(entry),
     }
 }
 
-fn spawn(app_id: &str, argv: &[OsString]) -> io::Result<Launched> {
+fn spawn(
+    app_id: &str,
+    argv: &[OsString],
+    environment: &[(String, String)],
+) -> io::Result<Launched> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty Exec argv"))?;
     let child = application_command(program)
         .args(args)
+        .envs(environment.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -954,5 +1037,70 @@ Type=Application
         relaunch.argv = vec![OsString::from("touch"), main.clone().into_os_string()];
         open_new_window(&relaunch).expect("launch again");
         assert!(wait(&main), "without an action the app launches again");
+    }
+
+    #[test]
+    fn the_menu_reads_actions_and_the_gpu_preference() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("org.example.Menu.desktop");
+        std::fs::write(
+            &path,
+            "[Desktop Entry]\nType=Application\nName=Menu\nExec=menu\nPrefersNonDefaultGPU=true\n\
+             Actions=new-window;private;nameless;broken;\n\n\
+             [Desktop Action new-window]\nName=New Window\nExec=menu --new-window %U\n\n\
+             [Desktop Action private]\nName=New Private Window\nName[de]=Neues privates Fenster\nExec=menu --private\n\n\
+             [Desktop Action nameless]\nExec=menu --nameless\n\n\
+             [Desktop Action broken]\nName=Broken\n",
+        )
+        .expect("write");
+        let menu = desktop_menu_from_file(&path);
+        assert!(menu.prefers_non_default_gpu);
+        // Only the actions with a name and an Exec, in the file's order.
+        let listed: Vec<(&str, &str)> = menu
+            .actions
+            .iter()
+            .map(|a| (a.id.as_str(), a.name.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("new-window", "New Window"),
+                ("private", "New Private Window")
+            ]
+        );
+        assert_eq!(
+            menu.actions[0].argv,
+            [OsString::from("menu"), OsString::from("--new-window")]
+        );
+        let plain = dir.path().join("plain.desktop");
+        std::fs::write(
+            &plain,
+            "[Desktop Entry]\nType=Application\nName=P\nExec=p\n",
+        )
+        .expect("write");
+        assert_eq!(desktop_menu_from_file(&plain), DesktopMenu::default());
+        assert_eq!(
+            desktop_menu_from_file(&dir.path().join("missing.desktop")),
+            DesktopMenu::default()
+        );
+    }
+
+    #[test]
+    fn a_launch_carries_its_environment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("env");
+        let mut entry = new_window_entry("");
+        entry.argv = vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from(format!("printf %s \"$DRI_PRIME\" >{}", out.display())),
+        ];
+        launch_with_environment(&entry, &[("DRI_PRIME".to_owned(), "1".to_owned())])
+            .expect("launch")
+            .child
+            .expect("child")
+            .wait()
+            .expect("wait");
+        assert_eq!(std::fs::read_to_string(&out).expect("read"), "1");
     }
 }

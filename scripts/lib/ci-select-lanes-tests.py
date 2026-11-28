@@ -113,6 +113,10 @@ class Selection(unittest.TestCase):
         # (#353) are sourced into it, with their pixel reader.
         for path in ("scripts/lib/tuna-sound-alerts-proof.sh", "scripts/lib/tuna-bell-pixels.py"):
             self.assertEqual(pr(path), ["journey", "gtk-shell"], path)
+        # G-OSK-* live in the OSK proof the gtk-shell job runs.
+        for path in ("scripts/tuna-osk-proof", "scripts/lib/tuna-osk-probe.py",
+                     "scripts/lib/tuna-osk-proof.py"):
+            self.assertEqual(pr(path), ["gtk-shell"], path)
         self.assertEqual(pr("scripts/lib/vm_unlock_wake.py"), ["arch-package", "marlin-vm"])
         # MP-*, WL-*, X11-* window-motion gates and the capture they pair with.
         for path in ("scripts/tuna-motion-pairing-proof", "scripts/tuna-x11-icon-geometry-proof",
@@ -124,6 +128,13 @@ class Selection(unittest.TestCase):
                           "remote-security", "arch-package", "marlin-vm", "parity-ledger"])
         self.assertEqual(pr("scripts/tuna-orca-speech-proof"), ["orca-speech"])
         self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
+        # The VM lane's host-side gate modules and V-TRAY's fixture.
+        for path in ("scripts/lib/vm_app_integration.py", "scripts/lib/vm_desktop_gates.py",
+                     "packaging/marlin/vm-lane/tuna-vm-desktop-gates"):
+            self.assertIn("marlin-vm", pr(path, size=0), path)
+        self.assertEqual(pr("scripts/lib/vm_desktop_gates.py"), ["arch-package", "marlin-vm"])
+        self.assertEqual(pr("scripts/lib/tuna-tray-item-stub.py"),
+                         ["journey", "gtk-shell", "arch-package", "marlin-vm"])
         # The GTK proof sources the top bar and dash slice; only gtk-shell
         # runs its checker (#1198, #1199).
         self.assertEqual(pr("scripts/lib/tuna-panel-dash-proof.sh"), ["journey", "gtk-shell"])

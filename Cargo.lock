@@ -4275,6 +4275,7 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-misc",
  "wayland-protocols-wlr",
+ "wayland-scanner",
  "xkbcommon 0.9.0",
  "zbus",
 ]
