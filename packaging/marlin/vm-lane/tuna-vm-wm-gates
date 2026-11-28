@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""CI-only installed window-manager gates (scripts/lib/vm_wm_gates.py).
+
+Root probe reached through tuna-vm-lifecycle's wm-* actions, plus the
+session-user clients it runs from this same file:
+
+  --x11-window ROLE NONCE DISPLAY  a plain Xlib window (no toolkit, ICCCM
+                                   input hint set, like xev in the nested
+                                   proof) counting the key presses and focus
+                                   changes the X server delivers to it
+  --x11-read DISPLAY XID           the X server's input focus and the
+                                   window's WM_STATE and _NET_WM_STATE
+  --x11-iconify DISPLAY XID        the client's own ICCCM iconify
+                                   (XIconifyWindow: WM_CHANGE_STATE IconicState)
+  --menu-observe SHELL_PID         the shell's AT-SPI tree, the window menu's
+                                   fixed row labels only
+
+Xlib is reached through ctypes (libX11 is on the image for GTK and
+Xwayland), so the probe needs no X11 utilities installed. Every action
+prints one JSON object; a failure prints {"gates_error": ...}. The probe
+never synthesizes input: the lane sends real keys and pointer events
+through QEMU. Shared session plumbing (the session's environment, process
+scans, the fixture state files' ownership rule) is the desktop gates'
+probe, loaded from /usr/libexec/tuna-vm-desktop-gates.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import select
+import signal
+import sys
+import time
+
+SELF = "/usr/libexec/tuna-vm-wm-gates"
+DESKTOP_GATES = "/usr/libexec/tuna-vm-desktop-gates"
+X11_ROLES = ("first", "again")
+NONCE = re.compile(r"[0-9a-f]{16,32}")
+DISPLAY = re.compile(r":[0-9]{1,3}")
+SCENE_KEYS = ("windows", "focused", "minimized", "above", "stacking", "outputs", "layers",
+              "overview_open", "overview_progress", "previews", "x11_ready", "x11_display", "locked")
+# GNOME 51's window menu rows (windowMenu.js), as the shell labels them.
+MENU_LABELS = ("Take Screenshot", "Hide", "Maximize", "Restore", "Move", "Resize", "Always on Top",
+               "Always on Visible Workspace", "Move to Workspace Left", "Move to Workspace Right", "Close")
+WM_STATES = {0: "Withdrawn", 1: "Normal", 3: "Iconic"}
+# X.h event types and masks.
+KEY_PRESS, FOCUS_IN, FOCUS_OUT, UNMAP_NOTIFY, MAP_NOTIFY = 2, 9, 10, 18, 19
+EVENT_MASK = (1 << 0) | (1 << 17) | (1 << 21)  # KeyPress, StructureNotify, FocusChange
+
+
+def nonce(value):
+    if not NONCE.fullmatch(value):
+        raise ValueError("invalid nonce")
+    return value
+
+
+def display_name(value):
+    if not isinstance(value, str) or not DISPLAY.fullmatch(value):
+        raise ValueError("invalid X display")
+    return value
+
+
+def x11_class(role, key):
+    return f"TunaVmWm{role.capitalize()}{key[:12]}"
+
+
+# ---- session-user X11 client (ctypes Xlib) ---------------------------------
+
+def xlib():
+    import ctypes
+    c = ctypes
+    lib = c.CDLL("libX11.so.6")
+    ulong_p = c.POINTER(c.c_ulong)
+    signatures = {
+        "XOpenDisplay": (c.c_void_p, [c.c_char_p]),
+        "XCloseDisplay": (c.c_int, [c.c_void_p]),
+        "XDefaultScreen": (c.c_int, [c.c_void_p]),
+        "XRootWindow": (c.c_ulong, [c.c_void_p, c.c_int]),
+        "XConnectionNumber": (c.c_int, [c.c_void_p]),
+        "XCreateSimpleWindow": (c.c_ulong, [c.c_void_p, c.c_ulong, c.c_int, c.c_int, c.c_uint, c.c_uint,
+                                            c.c_uint, c.c_ulong, c.c_ulong]),
+        "XStoreName": (c.c_int, [c.c_void_p, c.c_ulong, c.c_char_p]),
+        "XSetClassHint": (c.c_int, [c.c_void_p, c.c_ulong, c.c_void_p]),
+        "XSetWMHints": (c.c_int, [c.c_void_p, c.c_ulong, c.c_void_p]),
+        "XSelectInput": (c.c_int, [c.c_void_p, c.c_ulong, c.c_long]),
+        "XMapWindow": (c.c_int, [c.c_void_p, c.c_ulong]),
+        "XFlush": (c.c_int, [c.c_void_p]),
+        "XSync": (c.c_int, [c.c_void_p, c.c_int]),
+        "XPending": (c.c_int, [c.c_void_p]),
+        "XNextEvent": (c.c_int, [c.c_void_p, c.c_void_p]),
+        "XInternAtom": (c.c_ulong, [c.c_void_p, c.c_char_p, c.c_int]),
+        "XGetAtomName": (c.c_void_p, [c.c_void_p, c.c_ulong]),
+        "XFree": (c.c_int, [c.c_void_p]),
+        "XGetInputFocus": (c.c_int, [c.c_void_p, ulong_p, c.POINTER(c.c_int)]),
+        "XGetWindowProperty": (c.c_int, [c.c_void_p, c.c_ulong, c.c_ulong, c.c_long, c.c_long, c.c_int,
+                                         c.c_ulong, ulong_p, c.POINTER(c.c_int), ulong_p, ulong_p,
+                                         c.POINTER(c.c_void_p)]),
+        "XIconifyWindow": (c.c_int, [c.c_void_p, c.c_ulong, c.c_int]),
+    }
+    for name, (restype, argtypes) in signatures.items():
+        function = getattr(lib, name)
+        function.restype, function.argtypes = restype, argtypes
+    errors = []
+    # A request on a window the server already destroyed must not exit the
+    # probe (Xlib's default error handler does); count it instead.
+    handler = c.CFUNCTYPE(c.c_int, c.c_void_p, c.c_void_p)(lambda _d, _e: errors.append(1) or 0)
+    lib.XSetErrorHandler(handler)
+    return c, lib, errors, handler
+
+
+def x11_open(display):
+    c, lib, errors, handler = xlib()
+    connection = lib.XOpenDisplay(display.encode())
+    if not connection:
+        raise RuntimeError(f"cannot open X display {display}")
+    return c, lib, errors, handler, connection
+
+
+def x11_window(role, key, display):
+    """A toolkit-free X11 window, as xev is in the nested proof: the ICCCM
+    input hint set (Passive), so the window manager sets the X input focus on
+    it. Its state file holds its XID and the key presses and focus changes the
+    X server delivered, nothing else. Exits when the X server goes away."""
+    c, lib, errors, _handler, connection = x11_open(display)
+    signal.alarm(600)  # Independent lifetime cap; the probe stops it first.
+    screen = lib.XDefaultScreen(connection)
+    window = lib.XCreateSimpleWindow(connection, lib.XRootWindow(connection, screen),
+                                     0, 0, 480, 300, 0, 0, 0xFFFFFF)
+    title = f"Tuna VM WM gates {role}"
+    lib.XStoreName(connection, window, title.encode())
+
+    class ClassHint(c.Structure):
+        _fields_ = [("res_name", c.c_char_p), ("res_class", c.c_char_p)]
+
+    class WMHints(c.Structure):
+        _fields_ = [("flags", c.c_long), ("input", c.c_int), ("initial_state", c.c_int),
+                    ("icon_pixmap", c.c_ulong), ("icon_window", c.c_ulong), ("icon_x", c.c_int),
+                    ("icon_y", c.c_int), ("icon_mask", c.c_ulong), ("window_group", c.c_ulong)]
+    hint = ClassHint(b"tuna-vm-wm-gates", x11_class(role, key).encode())
+    lib.XSetClassHint(connection, window, c.byref(hint))
+    hints = WMHints(flags=1, input=1)  # InputHint, input True
+    lib.XSetWMHints(connection, window, c.byref(hints))
+    lib.XSelectInput(connection, window, EVENT_MASK)
+    lib.XMapWindow(connection, window)
+    lib.XSync(connection, 0)
+    state = {"role": role, "nonce": key, "pid": os.getpid(), "uid": os.getuid(), "display": display,
+             "xid": window, "wm_class": x11_class(role, key), "title": title, "mapped": False,
+             "keys": 0, "focus_in": 0, "focus_out": 0, "x_errors": 0}
+    path = state_path(role, key)
+
+    def publish():
+        temporary = path.with_suffix(".tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(state, stream)
+        temporary.replace(path)
+    publish()
+    event = c.create_string_buffer(192)  # sizeof(XEvent) on LP64
+    fd = lib.XConnectionNumber(connection)
+    while True:
+        select.select([fd], [], [], 0.05)
+        changed = False
+        while lib.XPending(connection):  # an X server loss ends the process here
+            lib.XNextEvent(connection, event)
+            kind = c.c_int.from_buffer_copy(event.raw[:4]).value
+            field = {KEY_PRESS: "keys", FOCUS_IN: "focus_in", FOCUS_OUT: "focus_out"}.get(kind)
+            if field:
+                state[field] += 1
+                changed = True
+            elif kind in (MAP_NOTIFY, UNMAP_NOTIFY):
+                state["mapped"] = kind == MAP_NOTIFY
+                changed = True
+        if len(errors) != state["x_errors"]:
+            state["x_errors"] = len(errors)
+            changed = True
+        if changed:
+            publish()
+
+
+def property32(c, lib, connection, window, name):
+    """A format-32 property's items, or None when the window lacks it."""
+    atom = lib.XInternAtom(connection, name.encode(), 0)
+    kind, fmt, count, after = c.c_ulong(), c.c_int(), c.c_ulong(), c.c_ulong()
+    data = c.c_void_p()
+    status = lib.XGetWindowProperty(connection, window, atom, 0, 64, 0, 0, c.byref(kind), c.byref(fmt),
+                                    c.byref(count), c.byref(after), c.byref(data))
+    try:
+        if status != 0 or fmt.value != 32 or not data.value:
+            return None
+        return list(c.cast(data, c.POINTER(c.c_ulong))[:count.value])
+    finally:
+        if data.value:
+            lib.XFree(data)
+
+
+def x11_read(display, xid):
+    """The X server's input focus (None 0, PointerRoot 1, or a window) and
+    what the window manager last told the window: WM_STATE and _NET_WM_STATE."""
+    c, lib, errors, _handler, connection = x11_open(display)
+    try:
+        focus, revert = c.c_ulong(), c.c_int()
+        lib.XGetInputFocus(connection, c.byref(focus), c.byref(revert))
+        wm_state = property32(c, lib, connection, xid, "WM_STATE")
+        net = property32(c, lib, connection, xid, "_NET_WM_STATE") or []
+        names = []
+        for atom in net:
+            pointer = lib.XGetAtomName(connection, atom)
+            if pointer:
+                names.append(c.string_at(pointer).decode())
+                lib.XFree(pointer)
+        lib.XSync(connection, 0)
+        return {"focus": focus.value, "wm_state": WM_STATES.get(wm_state[0], wm_state[0]) if wm_state else None,
+                "net_wm_state": sorted(names), "x_errors": len(errors)}
+    finally:
+        lib.XCloseDisplay(connection)
+
+
+def x11_iconify(display, xid):
+    """ICCCM 4.1.4: the client asks to be iconified with a WM_CHANGE_STATE
+    IconicState client message to the root window (XIconifyWindow)."""
+    c, lib, errors, _handler, connection = x11_open(display)
+    try:
+        sent = lib.XIconifyWindow(connection, xid, lib.XDefaultScreen(connection))
+        lib.XSync(connection, 0)
+        return {"sent": bool(sent), "x_errors": len(errors)}
+    finally:
+        lib.XCloseDisplay(connection)
+
+
+def menu_observe(shell):
+    """The window menu's rows in the shell's AT-SPI tree, by GNOME's fixed
+    labels only: role, showing, sensitive, and window-relative extents (the
+    menu is a full-output overlay layer, so its window is the output)."""
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi, GLib
+    Atspi.set_timeout(1000, 1000)
+    deadline = time.monotonic() + 8
+    desktop = Atspi.get_desktop(0)
+    apps = [desktop.get_child_at_index(i) for i in range(min(desktop.get_child_count(), 64))]
+    apps = [a for a in apps if a is not None and a.get_process_id() == shell]
+    if len(apps) != 1:
+        raise RuntimeError("the shell's accessibility root is not unique")
+    found, pending, visited = [], [(apps[0], 0)], 0
+    while pending:
+        node, depth = pending.pop()
+        visited += 1
+        if visited > 4000 or time.monotonic() > deadline:
+            raise RuntimeError("shell accessibility walk exceeded its bound")
+        try:
+            name = node.get_name() or ""
+            if name in MENU_LABELS:
+                states = node.get_state_set()
+                extents = node.get_extents(Atspi.CoordType.WINDOW)
+                found.append({"name": name, "role": node.get_role_name(), "depth": depth,
+                              "showing": states.contains(Atspi.StateType.SHOWING),
+                              "sensitive": states.contains(Atspi.StateType.SENSITIVE),
+                              "extents": [extents.x, extents.y, extents.width, extents.height]})
+            children = [node.get_child_at_index(i) for i in range(min(node.get_child_count(), 256))]
+        except GLib.Error:
+            continue  # a node that went away mid-walk (a closing menu row)
+        pending.extend((child, depth + 1) for child in children if child is not None)
+    return {"nodes": found, "visited": visited}
+
+
+# ---- root probe -------------------------------------------------------------
+
+def desktop_gates():
+    """The desktop gates' probe: session environment, process scans, the
+    session user's private state files."""
+    loader = importlib.machinery.SourceFileLoader("tuna_vm_desktop_gates", DESKTOP_GATES)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def state_path(role, key):
+    runtime = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", "/nonexistent"))
+    return runtime / f"tuna-vm-wm-x11-{role}-{key}.json"
+
+
+def root_state_path(base, role, key):
+    return base.RUNTIME / f"tuna-vm-wm-x11-{role}-{key}.json"
+
+
+def scene(base):
+    state = json.loads(base.SCENE.read_text())
+    return {key: state.get(key) for key in SCENE_KEYS}
+
+
+def parent_executable(pid):
+    stat = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    return pathlib.Path(os.readlink(f"/proc/{stat[1]}/exe")).name
+
+
+def compositor_children(base, executable):
+    """The session user's `executable` processes whose parent is the compositor."""
+    rows = []
+    for pid in base.owned_processes(executable):
+        try:
+            if parent_executable(pid) == "tuna-compositor":
+                rows.append(pid)
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+            continue
+    return rows
+
+
+def as_user(base, display, *arguments, timeout=15):
+    return json.loads(base.call_user(f"DISPLAY={display}", sys.executable, SELF, *arguments, timeout=timeout))
+
+
+def x11_fixtures(base, key):
+    result = {}
+    for role in X11_ROLES:
+        path = root_state_path(base, role, key)
+        if path.exists():
+            value = base.owned_json(path)
+            value["alive"] = base.fixture_alive(value, key)
+            result[role] = value
+    return result
+
+
+def wm_state(base, key, role=None):
+    """One observation: the X11 fixtures, the compositor's snapshot, the
+    compositor's Xwayland and XIM children, and (for `role`) what the X
+    server says about that fixture's window."""
+    fixtures = x11_fixtures(base, key)
+    result = {"fixtures": fixtures, "scene": scene(base),
+              "xwayland": compositor_children(base, "Xwayland"),
+              "xim": compositor_children(base, "ibus-x11")}
+    if role is not None:
+        fixture = fixtures.get(role)
+        if fixture is None or not fixture["alive"]:
+            raise RuntimeError(f"the {role} X11 fixture is not running")
+        result["x11"] = as_user(base, fixture["display"], "--x11-read", fixture["display"], str(fixture["xid"]))
+    return result
+
+
+def x11_start(base, role, key):
+    if role not in X11_ROLES:
+        raise ValueError("unknown X11 fixture role")
+    path = root_state_path(base, role, key)
+    if path.exists():
+        raise RuntimeError("fixture already exists")
+    display = display_name(scene(base)["x11_display"])
+    base.spawn_user(f"DISPLAY={display}", sys.executable, SELF, "--x11-window", role, key, display)
+
+    def ready():
+        if not path.exists():
+            return None
+        value = base.owned_json(path)
+        current = scene(base)
+        windows = [w for w in current["windows"] or [] if w.get("x11_window_id") == value["xid"]]
+        if not value["mapped"] or len(windows) != 1:
+            return None
+        return {"fixture": value, "window": windows[0], "scene": current}
+    return base.wait_for(ready, 45, f"the {role} X11 window never mapped in the compositor")
+
+
+def x11_iconify_root(base, role, key):
+    fixture = x11_fixtures(base, key).get(role)
+    if fixture is None or not fixture["alive"]:
+        raise RuntimeError(f"the {role} X11 fixture is not running")
+    return as_user(base, fixture["display"], "--x11-iconify", fixture["display"], str(fixture["xid"]))
+
+
+def kill_server(base):
+    """Server loss, as the nested G-X11-RESTART causes it: SIGTERM to the one
+    Xwayland the compositor owns. Returns it and the XIM helper then running."""
+    servers = compositor_children(base, "Xwayland")
+    if len(servers) != 1:
+        raise RuntimeError(f"expected one compositor-owned Xwayland, found {servers}")
+    xim = compositor_children(base, "ibus-x11")
+    os.kill(servers[0], signal.SIGTERM)
+    return {"killed": servers[0], "xim": xim}
+
+
+def menu(base):
+    return json.loads(base.call_user(sys.executable, SELF, "--menu-observe", str(base.session_shell()), timeout=20))
+
+
+def x11_sockets(base):
+    """The X display sockets and locks the session user owns (G-X11-CLEANUP):
+    the compositor reserves them at startup and removes them when it ends.
+    Another owner's (the GDM greeter's) on the same number are not the
+    session's."""
+    owned = []
+    for directory, pattern in (("/tmp/.X11-unix", r"X[0-9]+"), ("/tmp", r"\.X[0-9]+-lock")):
+        root = pathlib.Path(directory)
+        for path in sorted(root.iterdir()) if root.is_dir() else ():
+            try:
+                if re.fullmatch(pattern, path.name) and path.lstat().st_uid == base.OWNER.pw_uid:
+                    owned.append(str(path))
+            except FileNotFoundError:
+                continue
+    return {"owned": owned}
+
+
+def stop(base, key):
+    """Retire every X11 fixture of this nonce; confirm their windows are gone."""
+    stopped = []
+    xids = []
+    for role, value in x11_fixtures(base, key).items():
+        xids.append(value["xid"])
+        if value["alive"]:
+            stopped += base.terminate([value["pid"]], f"{role} X11 fixture")
+        root_state_path(base, role, key).unlink(missing_ok=True)
+
+    def remaining():
+        return [w["id"] for w in scene(base)["windows"] or [] if w.get("x11_window_id") in xids]
+    base.wait_for(lambda: not remaining(), 10, "X11 fixture windows remain after their clients exited")
+    return {"stopped": stopped, "confirmed": True, "scene": scene(base)}
+
+
+def main():
+    if len(sys.argv) == 5 and sys.argv[1] == "--x11-window":
+        if sys.argv[2] not in X11_ROLES:
+            raise ValueError("unknown X11 fixture role")
+        x11_window(sys.argv[2], nonce(sys.argv[3]), display_name(sys.argv[4]))
+        return
+    if len(sys.argv) == 4 and sys.argv[1] in ("--x11-read", "--x11-iconify"):
+        read = x11_read if sys.argv[1] == "--x11-read" else x11_iconify
+        print(json.dumps(read(display_name(sys.argv[2]), int(sys.argv[3]))))
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--menu-observe":
+        print(json.dumps(menu_observe(int(sys.argv[2]))))
+        return
+    base = desktop_gates()
+    if os.geteuid() != 0 or base.OWNER.pw_uid == 0:
+        raise RuntimeError("probe must be root and session owner must not be root")
+    action, args = sys.argv[1], sys.argv[2:]
+    if action == "wm-state":
+        result = wm_state(base, nonce(args[0]), *args[1:2])
+    elif action == "wm-x11-start":
+        result = x11_start(base, args[0], nonce(args[1]))
+    elif action == "wm-x11-iconify":
+        result = x11_iconify_root(base, args[0], nonce(args[1]))
+    elif action == "wm-x11-kill-server":
+        result = kill_server(base)
+    elif action == "wm-menu":
+        result = menu(base)
+    elif action == "wm-stop":
+        result = stop(base, nonce(args[0]))
+    elif action == "wm-x11-sockets":
+        result = x11_sockets(base)
+    else:
+        raise ValueError("unknown window-manager gates action")
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:  # one bounded line for the lane's record, no traceback
+        print(json.dumps({"gates_error": f"{type(error).__name__}: {error}"[:600]}))

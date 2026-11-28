@@ -35,6 +35,13 @@ pub enum Request {
         directory: PathBuf,
         reply: mpsc::Sender<Vec<WindowShot>>,
     },
+    /// Every output's picture for the screenshot UI's frozen screen and
+    /// its per-monitor screen selectors, each saved into `directory`
+    /// (Tuna Desktop's `ScreenshotOutputs`).
+    Outputs {
+        directory: PathBuf,
+        reply: mpsc::Sender<Vec<OutputShot>>,
+    },
     /// Authorized screenshot feedback without a new capture (the shell UI).
     Flash {
         area: [i32; 4],
@@ -54,6 +61,22 @@ pub struct WindowShot {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    pub path: PathBuf,
+}
+
+/// One output as the screenshot UI freezes it: GNOME's stage screenshot
+/// (`screenshot_stage_to_content`) cut along one `UIMonitorBin`. The
+/// rectangle is in global logical pixels; the picture holds the output's
+/// own pixels, rendered at its scale.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputShot {
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub scale: f64,
+    pub primary: bool,
     pub path: PathBuf,
 }
 
@@ -80,11 +103,13 @@ struct Service {
 }
 
 /// Tuna Desktop's own addition on the same object: the screenshot UI's window
-/// selector needs every window's picture, which GNOME Shell takes
-/// in-process (`paint_to_content`) and never writes anywhere. Only the
-/// supervised shell, GNOME Shell's in-process role, may call it, and the
-/// pictures go only to the compositor's private runtime directory
-/// ([`WINDOWS_DIR`]), the shell's stand-in for GNOME's in-memory content.
+/// selector needs every window's picture, and its per-monitor screen
+/// selectors every output's, which GNOME Shell takes in-process
+/// (`paint_to_content`, `screenshot_stage_to_content`) and never writes
+/// anywhere. Only the supervised shell, GNOME Shell's in-process role, may
+/// call it ([`admit_shell`]), and the pictures go only to the compositor's
+/// private runtime directories ([`WINDOWS_DIR`], [`OUTPUTS_DIR`]), the
+/// shell's stand-in for GNOME's in-memory content.
 struct WindowsService {
     authority: crate::capture_security::Authority,
     to_loop: calloop::channel::Sender<Request>,
@@ -95,6 +120,10 @@ struct WindowsService {
 /// One window as `ScreenshotWindows` answers it: id, title, focused,
 /// x, y, width, height, path.
 pub type WindowShotReply = (u64, String, bool, i32, i32, i32, i32, String);
+
+/// One output as `ScreenshotOutputs` answers it: name, x, y, width,
+/// height (global logical pixels), scale, primary, path.
+pub type OutputShotReply = (String, i32, i32, i32, i32, f64, bool, String);
 
 #[zbus::interface(name = "org.tuna.Screenshot")]
 impl WindowsService {
@@ -108,8 +137,12 @@ impl WindowsService {
     ) -> zbus::fdo::Result<Vec<WindowShotReply>> {
         self.authority.unlocked()?;
         let (_, caller) = self.authority.authenticate_caller(conn, &header).await?;
-        admit_windows(caller, crate::lockdown::read_save_to_disk_key)?;
-        let directory = windows_directory(Path::new(&directory), self.runtime_dir.as_deref())?;
+        admit_shell(caller, crate::lockdown::read_save_to_disk_key)?;
+        let directory = runtime_subdirectory(
+            Path::new(&directory),
+            self.runtime_dir.as_deref(),
+            WINDOWS_DIR,
+        )?;
         self.authority.unlocked()?;
         let (reply, answer) = mpsc::channel();
         self.to_loop
@@ -129,6 +162,51 @@ impl WindowsService {
                     s.y,
                     s.width,
                     s.height,
+                    s.path.to_string_lossy().into_owned(),
+                )
+            })
+            .collect())
+    }
+
+    /// `(directory) -> a(siiiidbs)`: every output's current picture, each
+    /// saved as a PNG at the output's own scale into `directory`, which
+    /// must be `$XDG_RUNTIME_DIR/`[`OUTPUTS_DIR`], with its logical
+    /// rectangle and whether it is the primary. The screenshot UI freezes
+    /// each monitor with it, as GNOME 51's stage screenshot. Only the
+    /// supervised shell, only while unlocked ([`admit_shell`]).
+    async fn screenshot_outputs(
+        &self,
+        directory: String,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<Vec<OutputShotReply>> {
+        self.authority.unlocked()?;
+        let (_, caller) = self.authority.authenticate_caller(conn, &header).await?;
+        admit_shell(caller, crate::lockdown::read_save_to_disk_key)?;
+        let directory = runtime_subdirectory(
+            Path::new(&directory),
+            self.runtime_dir.as_deref(),
+            OUTPUTS_DIR,
+        )?;
+        self.authority.unlocked()?;
+        let (reply, answer) = mpsc::channel();
+        self.to_loop
+            .send(Request::Outputs { directory, reply })
+            .map_err(|_| zbus::fdo::Error::Failed("compositor gone".into()))?;
+        let shots = answer
+            .recv_timeout(DEADLINE)
+            .map_err(|_| zbus::fdo::Error::Failed("output screenshots failed".into()))?;
+        Ok(shots
+            .into_iter()
+            .map(|s| {
+                (
+                    s.name,
+                    s.x,
+                    s.y,
+                    s.width,
+                    s.height,
+                    s.scale,
+                    s.primary,
                     s.path.to_string_lossy().into_owned(),
                 )
             })
@@ -227,19 +305,22 @@ pub fn refuse_without_disk(
     Ok(())
 }
 
-/// Who may call `ScreenshotWindows`. GNOME 51's `screenshot.js`
-/// `_createScreenshot` checks `disable-save-to-disk` before its caller
-/// allowlist, so a portal call under lockdown gets GNOME's lockdown error
-/// first ([`refuse_without_disk`]). Then only the supervised shell
-/// passes: GNOME's window selector is in-process and has no D-Bus caller.
-pub fn admit_windows(
+/// Who may call `ScreenshotWindows` and `ScreenshotOutputs`. GNOME 51's
+/// `screenshot.js` `_createScreenshot` checks `disable-save-to-disk`
+/// before its caller allowlist, so a portal call under lockdown gets
+/// GNOME's lockdown error first ([`refuse_without_disk`]). Then only the
+/// supervised shell passes: GNOME's window selector and the stage
+/// screenshot its UI freezes are in-process, with no D-Bus caller. The
+/// shell itself keeps working under lockdown, clipboard-only, as GNOME's
+/// in-process UI does.
+pub fn admit_shell(
     caller: crate::capture_security::CaptureCaller,
     save_to_disk_disabled: impl FnOnce() -> Option<bool>,
 ) -> zbus::fdo::Result<()> {
     refuse_without_disk(caller, save_to_disk_disabled)?;
     if caller != crate::capture_security::CaptureCaller::Shell {
         return Err(crate::capture_security::denied(
-            "window screenshots are the supervised shell's",
+            "the screenshot UI's pictures are the supervised shell's",
         ));
     }
     Ok(())
@@ -249,16 +330,20 @@ pub fn admit_windows(
 /// `$XDG_RUNTIME_DIR` (the shell's `screenshot_ui.rs` asks for the same).
 pub const WINDOWS_DIR: &str = "tuna-screenshot-windows";
 
-/// `requested` when it is exactly `runtime_dir`/[`WINDOWS_DIR`]: a private
+/// The only directory `ScreenshotOutputs` writes to, likewise.
+pub const OUTPUTS_DIR: &str = "tuna-screenshot-outputs";
+
+/// `requested` when it is exactly `runtime_dir`/`name`: a private
 /// per-session tmpfs directory, never a persistent location on disk.
 /// Paths are compared by component, so `..` or another directory fails.
-pub fn windows_directory(
+pub fn runtime_subdirectory(
     requested: &Path,
     runtime_dir: Option<&Path>,
+    name: &str,
 ) -> zbus::fdo::Result<PathBuf> {
     let expected = runtime_dir
         .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join(WINDOWS_DIR))
+        .map(|dir| dir.join(name))
         .ok_or_else(|| zbus::fdo::Error::Failed("XDG_RUNTIME_DIR is unset".into()))?;
     if requested != expected {
         return Err(zbus::fdo::Error::InvalidArgs(format!(
@@ -271,7 +356,7 @@ pub fn windows_directory(
 
 /// Create `directory` mode 0700 when missing and check it is a real
 /// directory (not a symlink) the compositor's user owns and nobody else
-/// can enter, so window pictures cannot be redirected out of it.
+/// can enter, so captures cannot be redirected out of it.
 pub fn private_directory(directory: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     match std::fs::DirBuilder::new().mode(0o700).create(directory) {
@@ -285,7 +370,7 @@ pub fn private_directory(directory: &Path) -> std::io::Result<()> {
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "window screenshot directory is not private",
+            "screenshot directory is not private",
         ));
     }
     Ok(())
@@ -473,51 +558,55 @@ mod tests {
     }
 
     #[test]
-    fn window_screenshots_are_the_shells_alone_and_honour_save_to_disk_lockdown() {
+    fn screenshot_ui_pictures_are_the_shells_alone_and_honour_save_to_disk_lockdown() {
         use crate::capture_security::CaptureCaller;
-        // The shell: GNOME's in-process selector, never refused, never reads.
-        assert!(admit_windows(CaptureCaller::Shell, || panic!("no read")).is_ok());
+        // The shell: GNOME's in-process UI, never refused, never reads.
+        assert!(admit_shell(CaptureCaller::Shell, || panic!("no read")).is_ok());
         // The portal under lockdown: GNOME's lockdown error comes first.
-        let err = admit_windows(CaptureCaller::Portal, || Some(true)).unwrap_err();
+        let err = admit_shell(CaptureCaller::Portal, || Some(true)).unwrap_err();
         assert!(
             err.to_string().contains("Saving to disk is disabled"),
             "{err}"
         );
-        // The portal otherwise: refused, it is not the window selector.
+        // The portal otherwise: refused, it is not the screenshot UI.
         for lockdown in [Some(false), None] {
-            let err = admit_windows(CaptureCaller::Portal, || lockdown).unwrap_err();
+            let err = admit_shell(CaptureCaller::Portal, || lockdown).unwrap_err();
             assert!(matches!(err, zbus::fdo::Error::AccessDenied(_)), "{err}");
         }
     }
 
     #[test]
-    fn window_screenshots_go_only_to_the_private_runtime_directory() {
+    fn screenshot_ui_pictures_go_only_to_their_private_runtime_directories() {
         let run = Path::new("/run/user/1000");
-        let own = run.join(WINDOWS_DIR);
-        assert_eq!(windows_directory(&own, Some(run)).unwrap(), own);
-        for requested in [
-            "/home/u/Pictures",
-            "/run/user/1000",
-            "/run/user/1000/tuna-screenshot-windows/sub",
-            "/run/user/1000/tuna-screenshot-windows/..",
-            "/run/user/1000/other/../tuna-screenshot-windows",
-            "/run/user/1001/tuna-screenshot-windows",
-            "tuna-screenshot-windows",
-            "",
-        ] {
-            assert!(
-                windows_directory(Path::new(requested), Some(run)).is_err(),
-                "{requested} accepted"
-            );
+        for (name, other) in [(WINDOWS_DIR, OUTPUTS_DIR), (OUTPUTS_DIR, WINDOWS_DIR)] {
+            let own = run.join(name);
+            assert_eq!(runtime_subdirectory(&own, Some(run), name).unwrap(), own);
+            for requested in [
+                PathBuf::from("/home/u/Pictures"),
+                run.to_owned(),
+                own.join("sub"),
+                own.join(".."),
+                run.join("other/..").join(name),
+                run.join(other),
+                Path::new("/run/user/1001").join(name),
+                PathBuf::from(name),
+                PathBuf::new(),
+            ] {
+                assert!(
+                    runtime_subdirectory(&requested, Some(run), name).is_err(),
+                    "{} accepted",
+                    requested.display()
+                );
+            }
+            // No (or a relative) runtime directory: nowhere is allowed.
+            assert!(runtime_subdirectory(&own, None, name).is_err());
+            let relative = Path::new("run");
+            assert!(runtime_subdirectory(&relative.join(name), Some(relative), name).is_err());
         }
-        // No (or a relative) runtime directory: nowhere is allowed.
-        assert!(windows_directory(&own, None).is_err());
-        let relative = Path::new("run");
-        assert!(windows_directory(&relative.join(WINDOWS_DIR), Some(relative)).is_err());
     }
 
     #[test]
-    fn window_screenshot_directory_is_private_and_never_a_symlink() {
+    fn screenshot_directories_are_private_and_never_symlinks() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join(WINDOWS_DIR);
@@ -543,11 +632,21 @@ mod tests {
         assert!(private_directory(&file).is_err());
     }
 
-    /// The real `org.tuna.Screenshot` object on a private bus: only the
-    /// supervised shell, only while unlocked, and only into the private
-    /// runtime directory reaches the compositor loop.
     #[test]
     fn screenshot_windows_over_the_bus_admits_only_the_shell_into_its_directory() {
+        over_the_bus_only_the_shell_reaches("ScreenshotWindows", WINDOWS_DIR, OUTPUTS_DIR);
+    }
+
+    #[test]
+    fn screenshot_outputs_over_the_bus_admits_only_the_shell_into_its_directory() {
+        over_the_bus_only_the_shell_reaches("ScreenshotOutputs", OUTPUTS_DIR, WINDOWS_DIR);
+    }
+
+    /// The real `org.tuna.Screenshot` object on a private bus: `method`
+    /// reaches the compositor loop only from the supervised shell, only
+    /// while unlocked, and only into `$XDG_RUNTIME_DIR/name` (not even
+    /// into `other`, the sibling method's directory).
+    fn over_the_bus_only_the_shell_reaches(method: &str, name: &str, other: &str) {
         use std::io::BufRead;
         use std::process::{Command, Stdio};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -580,7 +679,7 @@ mod tests {
         };
 
         let run = tempfile::tempdir().unwrap();
-        let own = run.path().join(WINDOWS_DIR);
+        let own = run.path().join(name);
         let authority = crate::capture_security::Authority::default();
         let (to_loop, from_dbus) = calloop::channel::channel();
         let server = connect();
@@ -594,7 +693,7 @@ mod tests {
         ))
         .unwrap();
 
-        let reached = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let reached = Arc::new(Mutex::new(Vec::<(&str, PathBuf)>::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let event_loop_thread = std::thread::spawn({
             let (reached, stop) = (reached.clone(), stop.clone());
@@ -603,12 +702,18 @@ mod tests {
                 event_loop
                     .handle()
                     .insert_source(from_dbus, move |event, _, _| {
-                        if let calloop::channel::Event::Msg(Request::Windows { directory, reply }) =
-                            event
-                        {
-                            reached.lock().unwrap().push(directory);
-                            let _ = reply.send(Vec::new());
-                        }
+                        let shot = match event {
+                            calloop::channel::Event::Msg(Request::Windows { directory, reply }) => {
+                                let _ = reply.send(Vec::new());
+                                ("ScreenshotWindows", directory)
+                            }
+                            calloop::channel::Event::Msg(Request::Outputs { directory, reply }) => {
+                                let _ = reply.send(Vec::new());
+                                ("ScreenshotOutputs", directory)
+                            }
+                            _ => return,
+                        };
+                        reached.lock().unwrap().push(shot);
                     })
                     .unwrap();
                 while !stop.load(Ordering::SeqCst) {
@@ -629,7 +734,7 @@ mod tests {
                 Some(server_name.as_str()),
                 PATH,
                 Some("org.tuna.Screenshot"),
-                "ScreenshotWindows",
+                method,
                 &(directory.to_string_lossy().as_ref(),),
             ))
         };
@@ -645,12 +750,14 @@ mod tests {
             error_name(call(&own)),
             "org.freedesktop.DBus.Error.AccessDenied"
         );
-        // The shell, but anywhere else: refused.
+        // The shell, but anywhere else: refused, and nothing created there.
         authority.publish(false, [shell.as_str()]);
+        let pictures = run.path().join("Pictures");
         for elsewhere in [
-            PathBuf::from("/home/u/Pictures"),
+            pictures.clone(),
             run.path().to_owned(),
             own.join(".."),
+            run.path().join(other),
         ] {
             assert_eq!(
                 error_name(call(&elsewhere)),
@@ -659,6 +766,7 @@ mod tests {
                 elsewhere.display()
             );
         }
+        assert!(!pictures.exists());
         // The shell while locked: denied.
         authority.publish(true, [shell.as_str()]);
         assert_eq!(
@@ -671,7 +779,7 @@ mod tests {
 
         stop.store(true, Ordering::SeqCst);
         event_loop_thread.join().unwrap();
-        assert_eq!(*reached.lock().unwrap(), vec![own]);
+        assert_eq!(*reached.lock().unwrap(), vec![(method, own)]);
     }
 
     #[test]
