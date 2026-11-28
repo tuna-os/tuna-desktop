@@ -59,8 +59,9 @@
 //!   (`State::take_security_contexts`, `ClientState::security_context`).
 //!   Such a client passes no privileged global's filter
 //!   (`ClientState::privileged`: layer-shell, the foreign toplevel list,
-//!   input-method, virtual keyboard, mutter_x11_interop) and sees neither
-//!   session-lock nor security-context itself, so it cannot nest.
+//!   input-method, virtual keyboard, tuna_osk_input_v1,
+//!   mutter_x11_interop) and sees neither session-lock nor
+//!   security-context itself, so it cannot nest.
 //! - ext-idle-notify v2: served on the idle clock of
 //!   org.gnome.Mutter.IdleMonitor, fed by the same input path
 //!   (`idle_notify.rs`).
@@ -210,6 +211,9 @@ pub(crate) struct Protocols {
     pub(crate) preferred_scale: f64,
     /// Every text input's committed state, for the on-screen keyboard.
     pub(crate) text_inputs: crate::osk::TextInputs,
+    /// tuna_osk_input_v1: on-screen-keyboard text for the supervised IBus
+    /// bridge alone, filtered like its input-method and virtual keyboard.
+    pub(crate) osk_ime: crate::osk_ime::OskIme,
     /// wp_drm_lease_device_v1 on the native backend (Mutter advertises it
     /// nowhere else); see [`crate::drm::lease`].
     #[cfg(feature = "drm")]
@@ -235,6 +239,7 @@ impl Protocols {
     pub(crate) fn new(dh: &DisplayHandle) -> Self {
         Self {
             dmabuf_state: DmabufState::new(),
+            osk_ime: crate::osk_ime::OskIme::new(dh),
             dmabuf_global: None,
             #[cfg(feature = "drm")]
             syncobj: None,

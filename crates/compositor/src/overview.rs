@@ -1970,6 +1970,24 @@ pub fn layout_with_policy(
     windows: &[OverviewWindow],
     dynamic: bool,
 ) -> OverviewLayout {
+    layout_directed(
+        output, work_top, workspaces, active, windows, dynamic, false,
+    )
+}
+
+/// [`layout_with_policy`] under the shell's text direction: with `rtl`
+/// the previous workspace peeks in on the right and the next on the
+/// left, and the thumbnails strip runs right to left, as GNOME's
+/// workspaces view and thumbnails box mirror under an RTL locale.
+pub fn layout_directed(
+    output: Rectangle<i32, Logical>,
+    work_top: i32,
+    workspaces: &[u32],
+    active: u32,
+    windows: &[OverviewWindow],
+    dynamic: bool,
+    rtl: bool,
+) -> OverviewLayout {
     let mut out = OverviewLayout {
         allow_workspace_insertion: dynamic,
         ..Default::default()
@@ -1980,9 +1998,10 @@ pub fn layout_with_policy(
         workspaces.to_vec()
     };
     let index = workspaces.iter().position(|w| *w == active).unwrap_or(0);
+    let side = if rtl { -1 } else { 1 };
     let neighbors = [
-        (index.checked_sub(1), -1),
-        (Some(index + 1).filter(|i| *i < workspaces.len()), 1),
+        (index.checked_sub(1), -side),
+        (Some(index + 1).filter(|i| *i < workspaces.len()), side),
     ];
     // No output (every monitor unplugged), or none of it below the top
     // bar: no workspaces view, nothing to lay out.
@@ -1993,7 +2012,15 @@ pub fn layout_with_policy(
     let strip = workspaces.len() >= THUMBNAILS_MIN_WORKSPACES;
     let shift = if strip { thumbnails_offset(work_h) } else { 0 };
     if strip {
-        thumbnails(&mut out, output, work_top, &workspaces, active, windows);
+        thumbnails(
+            &mut out,
+            output,
+            work_top,
+            &workspaces,
+            active,
+            windows,
+            rtl,
+        );
     }
     let active_card = card_rect(output, work_top, 0, shift);
     for (slot, offset) in neighbors {
@@ -2080,6 +2107,7 @@ fn thumbnails(
     workspaces: &[u32],
     active: u32,
     windows: &[OverviewWindow],
+    rtl: bool,
 ) {
     let work_h = (output.size.h - work_top).max(1);
     let (w, h) = thumbnail_size_for(output.size.w, work_h);
@@ -2090,8 +2118,9 @@ fn thumbnails(
         output.loc.y + (f64::from(output.size.h) * THUMBNAILS_TOP).round() as i32 + THUMBNAILS_PAD;
     let scale = f64::from(w) / f64::from(output.size.w.max(1));
     for (i, &workspace) in workspaces.iter().enumerate() {
+        let slot = if rtl { workspaces.len() - 1 - i } else { i } as i32;
         let rect = Rectangle::new(
-            (start + i as i32 * (w + THUMBNAILS_PAD), top).into(),
+            (start + slot * (w + THUMBNAILS_PAD), top).into(),
             (w, h).into(),
         );
         out.thumbnails.push(WorkspaceCard {
@@ -2261,6 +2290,22 @@ pub fn app_grid_layout_with_policy(
     windows: &[OverviewWindow],
     dynamic: bool,
 ) -> OverviewLayout {
+    app_grid_layout_directed(
+        output, work_top, workspaces, active, windows, dynamic, false,
+    )
+}
+
+/// [`app_grid_layout_with_policy`] under the shell's text direction: with
+/// `rtl` the row of workspace cards runs right to left.
+pub fn app_grid_layout_directed(
+    output: Rectangle<i32, Logical>,
+    work_top: i32,
+    workspaces: &[u32],
+    active: u32,
+    windows: &[OverviewWindow],
+    dynamic: bool,
+    rtl: bool,
+) -> OverviewLayout {
     let mut out = OverviewLayout {
         allow_workspace_insertion: dynamic,
         ..Default::default()
@@ -2283,7 +2328,8 @@ pub fn app_grid_layout_with_policy(
     let top = f64::from(output.loc.y) + (f64::from(output.size.h) * THUMBNAIL_TOP).round();
     for (i, &workspace) in shown.iter().enumerate() {
         let is_active = workspace == active;
-        let (cx, cy) = (start + i as f64 * (w + spacing) + w / 2.0, top + h / 2.0);
+        let slot = if rtl { shown.len() - 1 - i } else { i };
+        let (cx, cy) = (start + slot as f64 * (w + spacing) + w / 2.0, top + h / 2.0);
         let k = if is_active { 1.0 } else { INACTIVE_SCALE };
         let (sw, sh) = ((w * k).round(), (h * k).round());
         let rect = Rectangle::new(
@@ -2679,6 +2725,49 @@ mod tests {
         assert!(l.thumbnails.is_empty());
         assert!(thumbnail_decor(&l, BLUE).is_empty());
         assert_eq!(l.cards[0].rect.loc.y, 108);
+    }
+
+    #[test]
+    fn rtl_mirrors_neighbors_thumbnails_and_app_grid_row() {
+        let ws = [0, 1, 2, 3];
+        let x_of = |cards: &[WorkspaceCard], w| {
+            cards.iter().find(|c| c.workspace == w).unwrap().rect.loc.x
+        };
+        let ltr = layout_directed(output(), 24, &ws, 1, &[], false, false);
+        let rtl = layout_directed(output(), 24, &ws, 1, &[], false, true);
+        // The previous workspace peeks in on the left, the next on the right.
+        assert!(x_of(&ltr.cards, 0) < x_of(&ltr.cards, 1));
+        assert!(x_of(&ltr.cards, 1) < x_of(&ltr.cards, 2));
+        // Mirrored under RTL; the active card stays centered.
+        assert!(x_of(&rtl.cards, 0) > x_of(&rtl.cards, 1));
+        assert!(x_of(&rtl.cards, 1) > x_of(&rtl.cards, 2));
+        assert_eq!(x_of(&ltr.cards, 1), x_of(&rtl.cards, 1));
+        // The thumbnails strip keeps its extent but runs right to left.
+        for pair in ltr.thumbnails.windows(2) {
+            assert!(pair[0].rect.loc.x < pair[1].rect.loc.x);
+        }
+        for pair in rtl.thumbnails.windows(2) {
+            assert!(pair[0].rect.loc.x > pair[1].rect.loc.x);
+        }
+        assert_eq!(
+            ltr.thumbnails.first().unwrap().rect.loc.x,
+            rtl.thumbnails.last().unwrap().rect.loc.x
+        );
+        let grid = app_grid_layout_directed(output(), 24, &ws, 1, &[], false, true);
+        let mut by_ws: Vec<_> = grid
+            .cards
+            .iter()
+            .map(|c| (c.workspace, c.rect.loc.x))
+            .collect();
+        by_ws.sort();
+        for pair in by_ws.windows(2) {
+            assert!(pair[0].1 > pair[1].1, "app grid row runs right to left");
+        }
+        // LTR stays the default.
+        assert_eq!(
+            layout_with_policy(output(), 24, &ws, 1, &[], false).cards,
+            ltr.cards
+        );
     }
 
     #[test]
