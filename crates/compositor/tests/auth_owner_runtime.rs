@@ -1080,7 +1080,14 @@ fn run_parent(bin: &Path, role: &str, kind: &str) {
         .env("TUNA_LOCK_TRACE", "1")
         .env("TUNA_XWAYLAND", "0")
         .env_remove("WAYLAND_DISPLAY")
-        .env_remove("DBUS_SYSTEM_BUS_ADDRESS")
+        // No system bus unless a role brings its own: the runner's must not
+        // decide the backend. A GDM there that leaves the reauthentication
+        // channel request unanswered delays the private helper past every
+        // bounded observation (run 46124190148: by the 5 s call timeout).
+        .env(
+            "DBUS_SYSTEM_BUS_ADDRESS",
+            format!("unix:path={}", root.path().join("no-system-bus").display()),
+        )
         .stdout(Stdio::null())
         .stderr(log);
     match &fprintd {
