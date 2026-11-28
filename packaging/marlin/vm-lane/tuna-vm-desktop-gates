@@ -12,7 +12,13 @@ session-user GTK fixtures it launches from this same file:
   --window bystander NONCE   another client, maximized, counting presses
   --window placed NONCE CONNECTOR
                              fullscreen on the output with that connector
+  --window launched NONCE    the app the shell's own app grid launches (a
+                             fixture .desktop entry's Exec)
   --tray-observe             the shell's own AT-SPI tree, fixed tray labels only
+  --a11y-dump PID [FRAMES]   the shell's showing, named AT-SPI nodes in tree
+                             order, with role, state and window extents
+  --notify-monitor NONCE     the session bus's NotificationClosed and
+                             ActionInvoked signals, one JSON line each
 
 Every action prints one JSON object; a failure prints {"gates_error": ...}.
 The probe never synthesizes input: the lane sends real keys and pointer
@@ -38,12 +44,23 @@ SELF = "/usr/libexec/tuna-vm-desktop-gates"
 TRAY_STUB = "/usr/libexec/tuna-tray-item-stub"
 # The nested proof's StatusNotifierItem stub (scripts/lib/tuna-tray-item-stub.py).
 TRAY_TITLE, TRAY_TIP, TRAY_ROW = "Tuna Desktop Tray Probe", "Tray probe tip", "Open Probe"
-ROLES = ("main", "bystander", "placed")
+ROLES = ("main", "bystander", "placed", "launched")
 NONCE = re.compile(r"[0-9a-f]{16,32}")
+# Mutter's work-area keys, the overview's drawn state and the workspace
+# switch records the shell gates (scripts/lib/vm_shell_gates.py) read.
 SCENE_KEYS = ("windows", "focused", "minimized", "stacking", "outputs", "layers", "cursor",
               "pointer_position", "window_lifecycle", "animations_enabled", "overview_open",
               "overview_progress", "previews", "dash_icon_targets",
-              "locked", "window_outputs", "x11_ready", "x11_display", "animation_slowdown")
+              "locked", "window_outputs", "x11_ready", "x11_display", "animation_slowdown",
+              "overview_app_grid", "overview_state", "overview_search",
+              "thumbnails", "workspace_cards", "workspaces", "active_workspace",
+              "focused_app_id", "focused_rect", "session_mode", "tile_preview", "workspace_slide",
+              "motion_policy")
+# Fixed names of the app-grid fixtures and what notify-send may be handed.
+APPS_DIR = pathlib.Path(OWNER.pw_dir) / ".local" / "share" / "applications"
+PAGE_APPS = 30
+TEXT = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}")
+ACTION = re.compile(r"[a-z]{1,16}=[A-Za-z0-9 ]{1,24}")
 
 
 def nonce(value):
@@ -76,13 +93,14 @@ def window_fixture(role, key, connector=None):
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("Gdk", "4.0")
-    from gi.repository import Gio, GLib, Gtk
+    from gi.repository import Gdk, Gio, GLib, Gtk
     # A blinking caret would repaint the window under the pixel checks.
     Gtk.Settings.get_default().set_property("gtk-cursor-blink", False)
     signal.alarm(600)  # Independent lifetime cap; the probe stops it first.
     state = {"role": role, "nonce": key, "pid": os.getpid(), "uid": os.getuid(),
              "app_id": app_id(role, key), "mapped": False, "active": False, "size": [0, 0],
-             "maximized": False, "fullscreen": False, "presses": 0, "releases": 0, "keys": 0,
+             "maximized": False, "fullscreen": False, "tiled": False, "surface": [0, 0],
+             "presses": 0, "releases": 0, "keys": 0, "nav_keys": 0,
              "popover_shows": 0, "popover_hides": 0, "popover_visible": False, "minimize_requests": 0,
              "bounds": {}, "connector": connector, "connectors": [], "errors": []}
     publish = publisher(state_path(role, key), state)
@@ -171,8 +189,12 @@ def window_fixture(role, key, connector=None):
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
 
-        def key_pressed(*_):
+        def key_pressed(_controller, keyval, *_):
             state["keys"] += 1
+            # Compositor chords the lane sends (Super+arrows, Super+Page keys)
+            # consume these presses; a client counting them proves the leak.
+            if Gdk.keyval_name(keyval) in ("Up", "Down", "Left", "Right", "Page_Up", "Page_Down"):
+                state["nav_keys"] += 1
             publish()
             return False
         keys.connect("key-pressed", key_pressed)
@@ -195,10 +217,18 @@ def window_fixture(role, key, connector=None):
             publish()
         window.connect("map", mapped)
 
+        def surface_facts():
+            """The Wayland surface, shadows included, and GTK's tiled state."""
+            surface = window.get_surface()
+            if surface is None:
+                return [0, 0], False
+            return [surface.get_width(), surface.get_height()], bool(surface.get_state() & Gdk.ToplevelState.TILED)
+
         def tick(*_):
+            surface, tiled = surface_facts()
             current = {"active": window.is_active(), "size": [window.get_width(), window.get_height()],
                        "maximized": window.is_maximized(), "fullscreen": window.is_fullscreen(),
-                       "bounds": {}}
+                       "surface": surface, "tiled": tiled, "bounds": {}}
             if role == "main":
                 buttons = {css: find_button(widgets["header"], css) for css in ("minimize", "maximize", "close")}
                 for name, widget in {**widgets, **buttons}.items():
@@ -268,6 +298,77 @@ def tray_observe():
             continue  # a node that went away mid-walk (a closing menu row)
         pending.extend((child, toplevel, depth + 1) for child in children if child is not None)
     return {"nodes": found, "visited": visited}
+
+
+def a11y_dump():
+    """The shell's showing, named AT-SPI nodes in tree order: the vocabulary of
+    tests/a11y/*.txt (scripts/tuna-a11y-golden), plus the state flags and
+    window-relative extents the lane clicks by. A node that is not showing
+    hides its subtree, which keeps the walk to what is on screen. FRAMES
+    (comma separated) limits it to those top-level windows."""
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi, GLib
+    shell = int(sys.argv[2])
+    only = set(sys.argv[3].split(",")) if len(sys.argv) > 3 else None
+    Atspi.set_timeout(1000, 1000)
+    deadline = time.monotonic() + 25
+    desktop = Atspi.get_desktop(0)
+    apps = [desktop.get_child_at_index(i) for i in range(min(desktop.get_child_count(), 64))]
+    apps = [a for a in apps if a is not None and a.get_process_id() == shell]
+    if len(apps) != 1:
+        raise RuntimeError("the shell's accessibility root is not unique")
+    nodes, visited = [], 0
+    pending = [(apps[0], None, 0)]
+    while pending:
+        node, toplevel, depth = pending.pop()
+        visited += 1
+        if visited > 6000 or time.monotonic() > deadline:
+            raise RuntimeError("shell accessibility walk exceeded its bound")
+        try:
+            name = node.get_name() or ""
+            if depth == 1:
+                toplevel = name
+                if only is not None and name not in only:
+                    continue
+            states = node.get_state_set()
+            if depth >= 1 and not states.contains(Atspi.StateType.SHOWING):
+                continue
+            if depth >= 1 and name:
+                extents = node.get_extents(Atspi.CoordType.WINDOW)
+                nodes.append({"role": node.get_role_name(), "name": name, "toplevel": toplevel, "depth": depth,
+                              "description": (node.get_description() or "")[:80],
+                              "checked": states.contains(Atspi.StateType.CHECKED)
+                              or states.contains(Atspi.StateType.PRESSED),
+                              "focused": states.contains(Atspi.StateType.FOCUSED),
+                              "extents": [extents.x, extents.y, extents.width, extents.height]})
+            children = [node.get_child_at_index(i) for i in range(min(node.get_child_count(), 256))]
+        except GLib.Error:
+            continue  # a node that went away mid-walk (a closing banner or menu row)
+        pending.extend((child, toplevel, depth + 1) for child in reversed(children) if child is not None)
+    return {"nodes": nodes, "visited": visited}
+
+
+def notify_monitor(key):
+    """Session user: append the notification server's closed and action
+    signals to a private log, one JSON line each, after a `ready` line."""
+    from gi.repository import Gio, GLib
+    signal.alarm(900)  # Independent lifetime cap; the probe stops it first.
+    stream = os.fdopen(os.open(RUNTIME / f"tuna-vm-gates-notify-{key}.jsonl",
+                               os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600), "a")
+
+    def write(row):
+        stream.write(json.dumps({**row, "t": time.time()}) + "\n")
+        stream.flush()
+
+    def received(_connection, _sender, _path, _interface, name, params, *_):
+        write({"signal": name, "args": list(params.unpack())})
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    for name in ("NotificationClosed", "ActionInvoked"):
+        bus.signal_subscribe("org.freedesktop.Notifications", "org.freedesktop.Notifications", name,
+                             "/org/freedesktop/Notifications", None, Gio.DBusSignalFlags.NONE, received)
+    write({"signal": "ready"})
+    GLib.MainLoop().run()
 
 
 # ---- root probe -------------------------------------------------------------
@@ -484,6 +585,168 @@ def tray(action, key):
     raise ValueError("unknown tray action")
 
 
+def watch_layer(namespace, seconds):
+    """Poll the compositor's state file every 4 ms while the lane sends one real
+    input: each distinct rectangle of the layer-shell surface `namespace`,
+    from its first appearance until it is gone again (a workspace popup or a
+    banner, which come and go within a second or two)."""
+    if not re.fullmatch(r"tuna-[a-z-]{1,40}", namespace) or not 0 < seconds <= 15:
+        raise ValueError("invalid layer watch")
+    samples, seen, appeared, rects = [], set(), False, []
+    deadline = time.monotonic() + seconds
+    current = json.loads(SCENE.read_text())
+    while time.monotonic() < deadline:
+        try:
+            current = json.loads(SCENE.read_text())
+        except (OSError, ValueError):
+            continue  # the writer renames atomically; retry a vanished read
+        rects = [layer.get("rect") for layer in current.get("layers") or [] if layer.get("namespace") == namespace]
+        for rect in rects:
+            marker = json.dumps(rect)
+            if marker not in seen and len(samples) < 64:
+                seen.add(marker)
+                samples.append({"rect": rect, "t": time.monotonic()})
+        appeared = appeared or bool(rects)
+        if appeared and not rects:
+            break
+        time.sleep(0.004)
+    return {"namespace": namespace, "samples": samples, "gone": appeared and not rects,
+            "scene": {k: current.get(k) for k in SCENE_KEYS}}
+
+
+def a11y(frames):
+    for frame in frames:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z ]{0,23}", frame):
+            raise ValueError("invalid frame name")
+    argv = [sys.executable, SELF, "--a11y-dump", str(session_shell())]
+    if frames:
+        argv.append(",".join(frames))
+    return {**json.loads(call_user(*argv, timeout=40)), "scene": scene()}
+
+
+def ensure_user_dir(path):
+    missing = []
+    while not path.exists():
+        missing.append(path)
+        path = path.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o755)
+        os.chown(directory, OWNER.pw_uid, OWNER.pw_gid)
+
+
+def apps(action, key):
+    """Desktop entries for the app grid, in the session user's own data
+    directory as the nested proof writes them: PAGE_APPS plain apps that
+    make the grid page, and one whose Exec starts the launched fixture."""
+    pages = [APPS_DIR / f"tuna-vm-gates-{key}-page-{n:02d}.desktop" for n in range(1, PAGE_APPS + 1)]
+    launch = APPS_DIR / f"tuna-vm-gates-{key}-launch.desktop"
+    if action == "start":
+        ensure_user_dir(APPS_DIR)
+        launch_name = f"Tuna VM Gates Zlaunch {key[:8]}"
+        entries = {launch: (launch_name, f"{sys.executable} {SELF} --window launched {key}")}
+        for n, path in enumerate(pages, 1):
+            entries[path] = (f"Tuna VM Gates Page {n:02d}", "true")
+        for path, (name, command) in entries.items():
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "w") as stream:
+                stream.write(f"[Desktop Entry]\nType=Application\nName={name}\nExec={command}\nTerminal=false\n")
+            os.chown(path, OWNER.pw_uid, OWNER.pw_gid)
+        return {"launch_name": launch_name, "count": len(entries)}
+    if action == "stop":
+        removed = 0
+        for path in (*pages, launch):
+            if path.exists():
+                path.unlink()
+                removed += 1
+        return {"removed": removed}
+    raise ValueError("unknown apps action")
+
+
+def private_lines(path):
+    """A log the session user wrote, read by root only if it is theirs and private."""
+    if not path.exists():
+        return []
+    info = path.lstat()
+    if info.st_uid != OWNER.pw_uid or not path.is_file() or info.st_mode & 0o077:
+        raise RuntimeError(f"{path.name} is not the session user's private file")
+    return path.read_text().splitlines()
+
+
+def output_lines(path):
+    """A log this probe opened for a session process's stdout (root-owned)."""
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def monitor_pids(key):
+    return [pid for pid in user_pids(key)
+            if b"--notify-monitor" in pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")]
+
+
+def notify(action, key, *args):
+    """libnotify's own notify-send as the session user, and the notification
+    server's closed/action signals as a monitor on the session bus sees them."""
+    log = RUNTIME / f"tuna-vm-gates-notify-{key}.jsonl"
+    waiters = RUNTIME / f"tuna-vm-gates-notify-{key}.waiters"
+    if action == "monitor-start":
+        if log.exists():
+            raise RuntimeError("notification monitor already exists")
+        spawn_user(sys.executable, SELF, "--notify-monitor", key)
+        wait_for(lambda: any('"ready"' in line for line in private_lines(log)), 30,
+                 "the notification monitor never subscribed")
+        return {"monitor": monitor_pids(key)}
+    if action == "monitor-read":
+        return {"events": [json.loads(line) for line in private_lines(log)]}
+    if action == "send":
+        title, body, urgency, *rest = args
+        if not (TEXT.fullmatch(title) and TEXT.fullmatch(body) and urgency in ("low", "normal", "critical")):
+            raise ValueError("invalid notification")
+        argv = ["notify-send", "-a", "Tuna VM Gates", "-u", urgency, "-p"]
+        if not rest:
+            return {"id": int(call_user(*argv, title, body).splitlines()[0])}
+        if not ACTION.fullmatch(rest[0]):
+            raise ValueError("invalid notification action")
+        # With an action, notify-send waits for the user to press it: keep it
+        # running in its own process group, its stdout in a private log.
+        output = RUNTIME / f"tuna-vm-gates-send-{key}-{time.time_ns()}.log"
+        pid = spawn_user(*argv, "-w", "-A", rest[0], title, body, log=str(output))
+        with waiters.open("a") as stream:
+            stream.write(f"{pid} {output.name}\n")
+        first = wait_for(lambda: next((line for line in output_lines(output) if line.isdigit()), None), 15,
+                         "notify-send never printed the notification id")
+        return {"id": int(first), "log": output.name}
+    if action == "log":
+        name = args[0]
+        if not re.fullmatch(rf"tuna-vm-gates-send-{key}-[0-9]+\.log", name):
+            raise ValueError("invalid log name")
+        return {"lines": output_lines(RUNTIME / name)}
+    if action == "stop":
+        stopped = []
+        for line in waiters.read_text().splitlines() if waiters.exists() else []:
+            pid, name = line.split()
+            try:
+                os.killpg(int(pid), signal.SIGTERM)
+                stopped.append(int(pid))
+            except ProcessLookupError:
+                pass
+            (RUNTIME / name).unlink(missing_ok=True)
+        waiters.unlink(missing_ok=True)
+        stopped += terminate(monitor_pids(key), "notification monitor")
+        log.unlink(missing_ok=True)
+        return {"stopped": stopped}
+    raise ValueError("unknown notify action")
+
+
+def banners(action, value=None):
+    """GNOME's show-banners key: false is Do Not Disturb."""
+    if action == "set":
+        if value not in ("true", "false"):
+            raise ValueError("invalid show-banners value")
+        call_user("gsettings", "set", "org.gnome.desktop.notifications", "show-banners", value)
+    elif action != "get":
+        raise ValueError("unknown banners action")
+    return {"show-banners": call_user("gsettings", "get", "org.gnome.desktop.notifications", "show-banners")}
+
+
 def user_pids(argument):
     """The session user's processes whose argv names this nonce's file."""
     rows = []
@@ -509,18 +772,22 @@ def terminate(pids, what):
 
 
 def stop(key):
-    """Retire every fixture of this nonce and the tray stub; confirm absence."""
+    """Retire every fixture of this nonce, the tray stub, the notification
+    monitor and waiters and the app-grid entries; confirm absence."""
     stopped = []
     for role, value in fixtures(key).items():
         if value["alive"]:
             stopped += terminate([value["pid"]], f"{role} fixture")
         state_path(role, key).unlink(missing_ok=True)
     tray_stopped = tray("stop", key)["stopped"]
+    notify_stopped = notify("stop", key)["stopped"]
+    apps_removed = apps("stop", key)["removed"]
 
     def remaining():
         return [w["id"] for w in scene()["windows"] or [] if f".n{key}." in (w.get("app_id") or "")]
     wait_for(lambda: not remaining(), 10, "fixture windows remain after their clients exited")
-    return {"stopped": stopped, "tray_stopped": tray_stopped, "confirmed": True, "scene": scene()}
+    return {"stopped": stopped, "tray_stopped": tray_stopped, "notify_stopped": notify_stopped,
+            "apps_removed": apps_removed, "confirmed": True, "scene": scene()}
 
 
 def main():
@@ -529,6 +796,12 @@ def main():
         return
     if len(sys.argv) == 3 and sys.argv[1] == "--tray-observe":
         print(json.dumps(tray_observe()))
+        return
+    if len(sys.argv) in (3, 4) and sys.argv[1] == "--a11y-dump":
+        print(json.dumps(a11y_dump()))
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--notify-monitor":
+        notify_monitor(nonce(sys.argv[2]))
         return
     if os.geteuid() != 0 or OWNER.pw_uid == 0:
         raise RuntimeError("probe must be root and session owner must not be root")
@@ -543,6 +816,16 @@ def main():
         result = settings(*args)
     elif action.startswith("gates-tray-"):
         result = tray(action.removeprefix("gates-tray-"), nonce(args[0]))
+    elif action == "gates-a11y":
+        result = a11y(args)
+    elif action == "gates-watch-layer":
+        result = watch_layer(args[0], float(args[1]))
+    elif action == "gates-apps":
+        result = apps(args[0], nonce(args[1]))
+    elif action == "gates-notify":
+        result = notify(args[0], nonce(args[1]), *args[2:])
+    elif action == "gates-banners":
+        result = banners(*args)
     elif action == "gates-stop":
         result = stop(nonce(args[0]))
     else:

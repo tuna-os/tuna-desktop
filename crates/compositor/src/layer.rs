@@ -481,9 +481,6 @@ pub fn hit_layer_rect(rects: &[(i32, i32, i32, i32)], x: i32, y: i32) -> Option<
         .rposition(|(rx, ry, w, h)| x >= *rx && x < rx + w && y >= *ry && y < ry + h)
 }
 
-/// Topmost layer surface at output coordinates, with its placed origin.
-/// Returns `None` where no mapped layer surface covers the point, so the
-/// caller falls through to window routing.
 /// Whether `surface` accepts input at `local` (surface coordinates):
 /// inside its committed input region, or anywhere when it set none.
 pub fn accepts_input(surface: &WlSurface, local: (i32, i32)) -> bool {
@@ -499,6 +496,27 @@ pub fn accepts_input(surface: &WlSurface, local: (i32, i32)) -> bool {
     })
 }
 
+/// The size a placed layer surface covers on screen: its committed
+/// buffer, which is what is drawn at its [`layer_layout`] origin, as
+/// Mutter's actors are their buffer's size. The last acked configure
+/// lags a client's `set_size` by a round trip: gtk4-layer-shell maps a
+/// surface asking 200x200 before GTK has measured it
+/// (layer-surface.c `layer_surface_send_set_size`), so the workspace
+/// popup's 114x58 pill was once taken for 200x200 past the output's
+/// bottom edge. Before the first buffer, the configured size.
+pub fn placed_size(state: &State, surface: &WlSurface) -> Option<Size<i32, Logical>> {
+    crate::windows::buffer_size(surface).or_else(|| {
+        state
+            .layer_shell_state
+            .layer_surfaces()
+            .find(|handle| handle.wl_surface() == surface)
+            .and_then(|handle| handle.current_state().size)
+    })
+}
+
+/// Topmost layer surface at output coordinates, with its placed origin.
+/// Returns `None` where no mapped layer surface covers the point, so the
+/// caller falls through to window routing.
 pub fn topmost_layer_at(state: &State, x: i32, y: i32) -> Option<(WlSurface, (i32, i32))> {
     topmost_layer_entry_at(state, x, y).map(|(surface, origin, _)| (surface, origin))
 }
@@ -513,11 +531,7 @@ pub fn topmost_layer_entry_at(
     let rects: Vec<(i32, i32, i32, i32)> = placed
         .iter()
         .map(|(surface, (ox, oy), _)| {
-            let (w, h) = state
-                .layer_shell_state
-                .layer_surfaces()
-                .find(|handle| handle.wl_surface() == surface)
-                .and_then(|handle| handle.current_state().size)
+            let (w, h) = placed_size(state, surface)
                 .map(|size| (size.w, size.h))
                 .unwrap_or((0, 0));
             // A surface takes no input outside its wl_surface input

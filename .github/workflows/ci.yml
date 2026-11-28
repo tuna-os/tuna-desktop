@@ -229,6 +229,7 @@ jobs:
       - run: python3 scripts/tests/test_vm_strip_stationary_edge.py
       - run: python3 scripts/tests/test_vm_desktop_gates.py
       - run: python3 scripts/tests/test_vm_wm_gates.py
+      - run: python3 scripts/tests/test_vm_shell_gates.py
       # The image policy is checked with sudo's own visudo and cvtsudoers,
       # as on the Fedora image. Ubuntu 26.04 (hosted runners for fork pull
       # requests) defaults to sudo-rs, which has no cvtsudoers and owns the

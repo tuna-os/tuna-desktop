@@ -142,8 +142,17 @@ class Selection(unittest.TestCase):
         self.assertEqual(pr("scripts/lib/vm_wm_gates.py"), ["arch-package", "marlin-vm"])
         self.assertEqual(pr("packaging/marlin/vm-lane/tuna-vm-wm-gates"),
                          ["arch-package", "marlin-image", "marlin-vm"])
+        self.assertEqual(pr("scripts/lib/vm_shell_gates.py"), ["arch-package", "marlin-vm"])
         self.assertEqual(pr("scripts/lib/tuna-tray-item-stub.py"),
                          ["journey", "gtk-shell", "arch-package", "marlin-vm"])
+        # The goldens the nested gtk-shell proof checks are the installed V-A11Y-TREE's
+        # baseline, so editing one runs both (and the core proofs a code change runs).
+        for golden in ("panel", "overview", "quick-settings", "calendar"):
+            lanes = pr(f"tests/a11y/{golden}.txt", size=0)
+            self.assertEqual(lanes, ["desktop-proofs", "gtk-shell", "arch-package", "marlin-vm"],
+                             golden)
+        self.assertEqual(pr("packaging/marlin/vm-lane/tuna-vm-desktop-gates", size=0),
+                         ["arch-package", "marlin-image", "marlin-vm"])
         # The GTK proof sources the top bar and dash slice; only gtk-shell
         # runs its checker (#1198, #1199).
         self.assertEqual(pr("scripts/lib/tuna-panel-dash-proof.sh"), ["journey", "gtk-shell"])

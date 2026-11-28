@@ -323,9 +323,9 @@ def tray_point(observed, scene):
 # ---- the gates on a live guest ---------------------------------------------
 
 class Gates:
-    def __init__(self, qmp, agent, out, record, read_ppm):
+    def __init__(self, qmp, agent, out, record, read_ppm, name="desktop-gates"):
         self.qmp, self.agent, self.record, self.read_ppm = qmp, agent, record, read_ppm
-        self.evidence = os.path.join(out, "desktop-gates")
+        self.evidence = os.path.join(out, name)
         os.makedirs(self.evidence, exist_ok=True)
         self.key = secrets.token_hex(16)
         self.log = []

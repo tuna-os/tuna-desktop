@@ -2388,6 +2388,11 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     # unconfirmed fixture cleanup raises.
     from vm_wm_gates import run as run_wm_gates
     on_tablet("wm-gates", lambda: run_wm_gates(qmp, agent, out, record, read_ppm))
+    # Installed shell gates (P-OV-02, P-OV-05, P-OV-06, P-NT-01, P-NT-02, P-WM-02, P-WM-03,
+    # P-WM-04, P-A11Y-01): the overview, notifications, window keys, pointer drags and the
+    # AT-SPI tree on the real session, by the same QMP keyboard and tablet.
+    from vm_shell_gates import run as run_shell_gates
+    on_tablet("shell-gates", lambda: run_shell_gates(qmp, agent, out, record, read_ppm))
 
     # Capture the stable desktop after the final key OSD has disappeared.
     time.sleep(2)
@@ -4666,11 +4671,14 @@ def main():
     if a.tour:
         from vm_desktop_gates import GATES as DESKTOP_GATES
         from vm_wm_gates import CLEANUP_GATE, GATES as WM_GATES
+        from vm_shell_gates import GATES as SHELL_GATES
         for gate in DESKTOP_GATES:
             results.setdefault(gate, (False, "the lifecycle never reached the installed desktop gates"))
         for gate in WM_GATES:
             results.setdefault(gate, (False, "the lifecycle never reached the installed window-manager gates"))
         results.setdefault(CLEANUP_GATE, (False, "the lifecycle never reached its Log Out"))
+        for gate in SHELL_GATES:
+            results.setdefault(gate, (False, "the lifecycle never reached the installed shell gates"))
     if a.profile == "autotz":
         results.setdefault("V-AUTOTZ", (False, "native session never admitted; required consumer did not run"))
     if a.soak:

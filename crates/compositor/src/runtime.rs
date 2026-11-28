@@ -3277,12 +3277,7 @@ impl Runtime {
                         .panel_surfaces
                         .iter()
                         .find(|r| r.surface == *surface)?;
-                    let size = self
-                        .state
-                        .layer_shell_state
-                        .layer_surfaces()
-                        .find(|s| s.wl_surface() == surface)
-                        .and_then(|s| s.current_state().size)?;
+                    let size = crate::layer::placed_size(&self.state, surface)?;
                     Some(serde_json::json!({
                         "namespace": record.namespace,
                         "rect": [x, y, size.w, size.h],
@@ -5421,13 +5416,7 @@ impl Runtime {
         else {
             return;
         };
-        let Some(size) = self
-            .state
-            .layer_surfaces()
-            .into_iter()
-            .find(|s| *s.wl_surface() == surface)
-            .and_then(|s| s.current_state().size)
-        else {
+        let Some(size) = crate::layer::placed_size(&self.state, &surface) else {
             return;
         };
         if x >= size.w || y >= size.h {

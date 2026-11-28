@@ -107,7 +107,7 @@ COPY --chown=0:0 --chmod=0755 packaging/marlin/vm-lane/tuna-vm-admin-policy /tmp
 RUN mkdir -p /usr/share/tuna-vm \
     && pacman -Q tuna-desktop > /usr/share/tuna-vm/shipped-package.txt \
     && pacman -Q > /usr/share/tuna-vm/shipped-packages.txt \
-    && pacman -Syu --needed --noconfirm qemu-guest-agent python python-gobject python-cairo grim wtype wayland-utils gdb \
+    && pacman -Syu --needed --noconfirm qemu-guest-agent python python-gobject python-cairo grim wtype wayland-utils gdb libnotify \
     && /usr/libexec/tuna-image-kernels vm \
     && test "$(pacman -Q tuna-desktop)" = "$(cat /usr/share/tuna-vm/shipped-package.txt)" \
     && sed -i -E 's/^Name=Tuna Desktop \(preview\)$/Name=Tuna Desktop/' /usr/share/wayland-sessions/tuna.desktop \
