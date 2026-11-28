@@ -250,7 +250,17 @@ OWNED = [
     ("scripts/lib/drm_dual.py", ["drm-smoke"]),
     ("scripts/lib/drm_kms_readback.py", ["drm-smoke"]),
     ("scripts/lib/drm_input_startup.py", ["drm-smoke"]),
+    # The screenshot UI's per-monitor screen selectors: the two-output leg's
+    # D-SCREENSHOT-KEYS-MULTI proves them, the GTK shell proof its keys.
+    ("crates/shell-gtk/src/screenshot_ui.rs", [*CORE, "drm-smoke"]),
+    ("crates/shell-gtk/src/screenshot_screens.rs", [*CORE, "drm-smoke"]),
     ("scripts/lib/colord-startup.sh", ["drm-smoke"]),
+    # D-TOUCH, D-ORIENT and G-AUTOROTATE's emulated touchscreen, GTK touch
+    # client, mock iio-sensor-proxy and GNOME touchscreen schema (P-DS-04).
+    ("scripts/lib/tuna-uinput-touchscreen.py", ["drm-smoke"]),
+    ("scripts/lib/tuna-touch-client.py", ["drm-smoke"]),
+    ("scripts/lib/tuna-mock-sensor-proxy.py", ["drm-smoke"]),
+    ("tests/settings/gnome51-peripherals-touchscreen.gschema.xml", ["drm-smoke"]),
     # Sourced by the GTK shell (and journey's installed run), DRM and Orca proofs.
     ("scripts/lib/tuna-state-snapshot.sh", ["gtk-shell", "journey", "drm-smoke", "orca-speech"]),
     # The uinput keyboard, touchpad and tablet emulators tuna-drm-smoke drives.

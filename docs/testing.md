@@ -288,8 +288,13 @@ neighbouring pixels below 16) while beside it they stay sharp (above 128),
 from `background-blur.png`. G-SYNCOBJ: the nested session's software
 renderer has no timeline syncobjs, so the compositor logs Mutter's reason
 (`explicit sync disabled: …`, one of `meta-wayland-linux-drm-syncobj.c`'s
-messages) and no client finds `wp_linux_drm_syncobj_manager_v1`. CI runs
-the slice in the `gtk-shell` job; its `protocols/assertions.txt` feeds the
+messages) and no client finds `wp_linux_drm_syncobj_manager_v1`.
+G-XWAYLAND-GRAB: an X11 probe on the session's
+Xwayland takes `XGrabKeyboard`; as WM_CLASS `remote-viewer` (Mutter's
+built-in list) its grab is granted, a real Super tap reaches it and the
+overview stays shut until Super+Escape gives the shortcuts back, while as
+`XTerm` its grab is refused and Super opens the overview. CI runs the
+slice in the `gtk-shell` job; its `protocols/assertions.txt` feeds the
 ledger.
 
 `scripts/tuna-gtk-shell-proof --dnd-overview-only --artifacts DIR` runs
@@ -828,7 +833,7 @@ drop mid-bracket. The bracket checks themselves are unchanged.
 | `gtk-shell` | `scripts/tuna-slow-portal-proof --artifacts gtk-shell-artifacts/slow-portal` | as above | On a dbus-daemon bus whose portal activation hangs, the shell owns `org.gnome.Shell` within 15 s (40 s on GTK before 4.17, whose GtkApplication always waits on the inhibit portal) and makes no GDK portal call; writes `assertions.txt` |
 | `gtk-shell-smoke` | `TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --smoke-only --artifacts gtk-shell-smoke-artifacts` | as for `gtk-shell` | The merge queue's battery: bar, app windows, overview, lock and unlock through PAM; writes `assertions.txt` |
 | `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg kmod python3-evdev python3-gi gir1.2-gtk-4.0 gsettings-desktop-schemas acl`; run `scripts/ci-install-vkms` after `apt-get update` to ensure vkms for the running kernel | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe`, seatd, uinput and the card's seat ACL (`setfacl`, which a logind seat session would grant; the DRM lease device opens its own non-master fd) |
-| `drm-smoke` | `scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt` | as above; Linux 6.19 or newer for vkms configfs (the job pins `ubuntu-26.04`) | Two connectors of a vkms configfs device: mirroring, disabling and kept layouts, workspaces on the primary only, the workspace slide per monitor, mixed fractional/integer scale; appends to drm-smoke's `assertions.txt` |
+| `drm-smoke` | `scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt` | as above; Linux 6.19 or newer for vkms configfs (the job pins `ubuntu-26.04`) | Two connectors of a vkms configfs device: mirroring, disabling and kept layouts, workspaces on the primary only, the workspace slide per monitor, mixed fractional/integer scale, the screenshot UI's per-monitor screen selectors; appends to drm-smoke's `assertions.txt` |
 | `hotplug` | `scripts/tuna-hotplug-stress --rounds 4 --out hotplug-artifacts` | as for `drm-smoke`, plus `libpam-wrapper colord pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools xdg-desktop-portal-gnome`; Linux 6.19+ for vkms configfs (the job pins `ubuntu-26.04`) | Connector hotplug on vkms: outputs, window re-homing, a full unplug, lock, colord and screencast gates (see [Output hotplug storm](#output-hotplug-storm)); writes `assertions.txt` |
 
 The `desktop-proofs` app content and scroll-mode strip proofs download
@@ -1121,10 +1126,29 @@ old behaviour produces:
   window Alt-dragged to span them gets B's scale over
   `wp_fractional_scale` when it overlaps B most and A's when it overlaps
   A most, and its pointer events carry the compositor's logical pointer
-  position each time.
+  position each time;
+- `D-SCREENSHOT-KEYS-MULTI` (P-SY-10): with A at scale 1 and B at scale
+  2, a marker client painted magenta on B and the pointer on B, Print and
+  C (Screen) map one `tuna-screenshot-ui` layer over each monitor; Enter
+  saves A (GNOME 51 checks the primary's screen selector, not the
+  pointer's monitor); Right twice (no wrap-around) then Enter saves B
+  alone at its physical mode size with the marker in it; the next opening
+  keeps B; Left then Escape saves nothing, and the next Enter saves A.
+  Captures land in the leg's `pictures/` (`XDG_PICTURES_DIR`) and are
+  kept as `shot-<step>.png`. Its unit tests reject the old single-overlay
+  shapes: one overlay over either monitor only, and a Screen capture that
+  is the primary's frame whatever Right selected, B in logical pixels, or
+  the whole desktop.
 
 On a kernel without vkms configfs the leg fails with the running kernel
 named; `scripts/tuna-drm-smoke` alone still runs there.
+
+The leg points the kernel's core pattern at a private directory for its
+run and restores it after. A process that dies by signal (the shell
+restarting with no Rust panic, say) leaves
+`backtrace-<pid>-<executable>.txt` in the leg's artifacts: gdb's
+backtrace of every thread, the crashing one also printed in the job log.
+The cores themselves are deleted.
 
 Private colord startup failures in `D-COLORD` retain `colord-startup.txt`:
 the intended user/group, private bus and binary identity, boundary markers

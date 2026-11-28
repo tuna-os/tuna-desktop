@@ -638,7 +638,8 @@ impl<'a> Session<'a> {
     /// Peers older than 0.42 cannot decode `ConfirmDisplayChange`, nor
     /// older than 0.45 the tablet OSD messages, nor older than 0.48
     /// `WorkspaceProgress`, nor older than 0.49 `OverviewSwipe`, nor older
-    /// than 0.50 the close-dialog messages, and receive nothing.
+    /// than 0.50 the close-dialog messages, nor older than 0.61
+    /// `OskGesture`, and receive nothing.
     pub fn send_window_menu(&mut self, menu: &Message) -> Result<(), ControlError> {
         if matches!(menu, Message::ConfirmDisplayChange { .. }) && self.peer_minor < 42 {
             return Ok(());
@@ -665,6 +666,9 @@ impl<'a> Session<'a> {
                 | Message::ClosePadOsd { .. }
         );
         if tablet && self.peer_minor < 45 {
+            return Ok(());
+        }
+        if matches!(menu, Message::OskGesture { .. }) && self.peer_minor < 61 {
             return Ok(());
         }
         self.conn.write_frame(menu)
@@ -1504,6 +1508,7 @@ impl<'a> Session<'a> {
             | Message::HideCloseDialog { .. }
             | Message::LockScreenShown { .. }
             | Message::RemoteAccess { .. }
+            | Message::OskGesture { .. }
             | Message::Error { .. } => {
                 let _ = self.conn.write_frame(&Message::Error {
                     kind: ErrorKind::UnknownCommand,
@@ -1569,6 +1574,7 @@ fn message_kind(msg: &Message) -> &'static str {
         Message::HideCloseDialog { .. } => "HideCloseDialog",
         Message::LockScreenShown { .. } => "LockScreenShown",
         Message::RemoteAccess { .. } => "RemoteAccess",
+        Message::OskGesture { .. } => "OskGesture",
     }
 }
 
@@ -2576,6 +2582,12 @@ impl ControlHub {
             _ => {}
         }
         self.menu_queue.push(message);
+    }
+
+    /// Tell the shell how GNOME's bottom-edge OSK drag goes (wire 0.61;
+    /// older peers receive nothing).
+    pub fn queue_osk_gesture(&mut self, phase: tuna_shell_control::OskGesturePhase) {
+        self.queue_message(Message::OskGesture { phase });
     }
 
     /// Report a grabbed accelerator's press to the shell on the next poll.

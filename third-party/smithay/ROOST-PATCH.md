@@ -224,6 +224,21 @@ drm-smoke's D-LEASE leases the vkms connector through it with a real
 client. The isolated diff is retained in DRM-LEASE-PATCH.diff; the pinned
 version stays 0.7.0.
 
+Issue #345 additionally changes src/input/touch/grab.rs,
+src/input/touch/mod.rs and src/wayland/selection/data_device/device.rs
+so a touch drag-and-drop can start from any finger, as in Mutter
+(meta_wayland_seat_get_grab_info looks through every touch sequence).
+Upstream accepts only the serial of the touch grab itself, i.e. the first
+finger. TouchGrab gains sequence_start_data(serial), defaulting to None,
+and TouchHandle::sequence_start_data matches the grab's own serial or asks
+the grab; wl_data_device.start_drag uses it and starts the touch DnD from
+that sequence's slot, focus and location. Upstream's touch cancel also
+skipped every sequence whose events had been framed, so a cancel after
+wl_touch.frame (always the case with hardware) reached no client; it now
+cancels every focused sequence, still once per wl_touch for one cancel
+(meta_wayland_touch_cancel). The isolated diff is retained in
+TOUCH-SEQUENCE-API-PATCH.diff; the pinned version stays 0.7.0.
+
 Issue #495 adds `_NET_WM_ICON_GEOMETRY` to src/xwayland/xwm/mod.rs and
 surface.rs. X11Surface reads it at map and on PropertyNotify (reported as
 the new WmWindowProperty::IconGeometry) and exposes it as
@@ -571,6 +586,19 @@ crates/compositor/src/explicit_sync.rs cover every case; real socketpair
 tests in crates/compositor/tests/protocol_gaps.rs cover surface_exists,
 invalid_timeline, unsupported_buffer and no_acquire_point. The isolated
 diff is retained in DRM-SYNCOBJ-PATCH.diff; the pinned version stays 0.7.0.
+
+Issues #364 and #89 change src/xwayland/xwm/mod.rs and surface.rs: the XWM
+interns `_XWAYLAND_MAY_GRAB_KEYBOARD` and records a client message of that
+type for a known window (data.l[0] non-zero allows, zero revokes), read with
+the additive `X11Surface::xwayland_may_grab_keyboard`. This is Mutter 51's
+`xwayland-may-grab-keyboard` window property, set from the same client
+message in src/x11/events.c; `meta_xwayland_grab_is_granted` grants a
+zwp_xwayland_keyboard_grab_v1 to such a window unless a deny rule matches.
+Smithay's xwayland_keyboard_grab module is used unchanged (its global is
+already visible to the Xwayland client only); Roost overrides its grab
+handler. The real Xwayland test in crates/compositor/src/xwayland_grab.rs
+sends the message from an X11 client. The isolated diff is retained in
+XWAYLAND-MAY-GRAB-PATCH.diff; the pinned version stays 0.7.0.
 
 Issue #503 additionally changes the instanced draws of GlesFrame
 (draw_solid, render_texture, and the custom-program solid draw) in

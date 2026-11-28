@@ -182,6 +182,14 @@ class Selection(unittest.TestCase):
                 with self.subTest(path=path, run=run):
                     self.assertEqual(pr(path, run=run), ['arch-package', 'marlin-vm'])
 
+    def test_touch_fixtures_run_drm_smoke_without_rotation(self):
+        # P-DS-04's emulated devices and settings are D-TOUCH/D-ORIENT's
+        # alone: an edit runs that lane, not gtk-shell plus a rotation.
+        for path in ("scripts/lib/tuna-uinput-touchscreen.py", "scripts/lib/tuna-touch-client.py",
+                     "scripts/lib/tuna-mock-sensor-proxy.py",
+                     "tests/settings/gnome51-peripherals-touchscreen.gschema.xml"):
+            for run in range(len(m.ROTATION)):
+                self.assertEqual(pr(path, run=run), ["drm-smoke"], (path, run))
 
     def test_protocol_gate_inputs_run_the_gtk_shell_proof(self):
         # The Mutter 51 protocol gates (--protocols-only) and G-WAYLAND-INFO
@@ -398,6 +406,20 @@ class CoreApps(unittest.TestCase):
         lanes = pr("crates/compositor/src/runtime_surface_order_tests.rs", run=3)
         self.assertIn("gtk-shell", lanes)
         self.assertGreater(len(lanes), 1)
+
+    def test_screenshot_screen_selectors_run_the_two_output_leg(self):
+        # D-SCREENSHOT-KEYS-MULTI (scripts/tuna-drm-dual, drm-smoke) proves
+        # the per-monitor screen selectors; the GTK shell proof their keys.
+        for path in ("crates/shell-gtk/src/screenshot_ui.rs",
+                     "crates/shell-gtk/src/screenshot_screens.rs"):
+            for run in range(len(m.ROTATION)):
+                with self.subTest(path=path, run=run):
+                    self.assertEqual(pr(path, run=run),
+                                     ["drm-smoke", "desktop-proofs", "gtk-shell"])
+        # Control: the area selection's keys still rotate lanes.
+        lanes = pr("crates/shell-gtk/src/screenshot_selection.rs", run=3)
+        self.assertIn("gtk-shell", lanes)
+        self.assertEqual(set(m.rotation(3, 2)) - set(lanes), set())
 
     def test_pull_requests_never_rotate_the_push_only_image_lane(self):
         self.assertNotIn("marlin-image", m.ROTATION)

@@ -269,6 +269,19 @@ impl<D: SeatHandler + 'static> TouchHandle<D> {
         }
     }
 
+    /// The start data of the live touch sequence whose down carried
+    /// `serial`: the grab's own, or any further sequence the grab tracks
+    /// ([`TouchGrab::sequence_start_data`]), as Mutter accepts any touch
+    /// sequence's serial for a drag (`meta_wayland_seat_get_grab_info`).
+    pub fn sequence_start_data(&self, serial: Serial) -> Option<GrabStartData<D>> {
+        let guard = self.inner.lock().unwrap();
+        match &guard.grab {
+            GrabStatus::Active(s, g) if *s == serial => Some(g.start_data().clone()),
+            GrabStatus::Active(_, g) => g.sequence_start_data(serial),
+            _ => None,
+        }
+    }
+
     /// Calls `f` with the active grab, if any.
     pub fn with_grab<T>(&self, f: impl FnOnce(Serial, &dyn TouchGrab<D>) -> T) -> Option<T> {
         let guard = self.inner.lock().unwrap();
@@ -620,10 +633,11 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
     }
 
     fn cancel(&mut self, data: &mut D, seat: &Seat<D>, seq: Serial) {
+        // Every sequence still focused is cancelled, framed or not: the
+        // frame bookkeeping must not swallow a cancel that follows a
+        // `wl_touch.frame` (always so with real hardware). Each wl_touch
+        // still hears one cancel per `seq` (`for_each_focused_touch`).
         for state in self.focus.values_mut() {
-            if state.current.map(|c| c >= state.pending).unwrap_or(false) {
-                continue;
-            }
             state.current = Some(seq);
             if let Some((focus, _)) = state.focus.take() {
                 focus.cancel(seat, data, seq);

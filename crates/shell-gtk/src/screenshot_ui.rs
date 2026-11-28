@@ -13,8 +13,15 @@
 //! switch records the selection or the screen instead
 //! (`screencast.rs`), with GNOME's recording indicator in the panel.
 //!
+//! Screen shows GNOME's per-monitor screen selectors
+//! (`_rebuildMonitorBins`, `screenshot_screens.rs`): every output frozen
+//! on its own overlay, the others dimmed and the selected one framed in
+//! white; the primary starts selected, the arrows move between monitors
+//! and Capture saves the selected output alone, in its own pixels.
+//!
 //! Not yet: the pointer in screenshots and recordings, and one window
-//! selector per monitor (the primary one shows them all).
+//! selector per monitor (the primary one shows them all); the area
+//! selection stays on the primary monitor.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -25,6 +32,9 @@ use gtk4::{gdk, gio, glib};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::screencast::Recorder;
+use crate::screenshot_screens::{
+    layout, neighbour, parse_outputs, recording_area, selected_on_open, ShotOutput,
+};
 pub use crate::screenshot_selection::{initial_selection, Rect};
 use crate::screenshot_selection::{Direction, SelectionKeys};
 
@@ -261,6 +271,19 @@ struct PickerWindow {
     button: gtk::ToggleButton,
 }
 
+/// One monitor as the UI froze it: its output and its picture.
+struct Screen {
+    output: ShotOutput,
+    texture: gdk::Texture,
+}
+
+/// The overlay over a monitor other than the primary: its screen
+/// selector (`UIMonitorBin`), never taking the keyboard.
+struct ScreenWindow {
+    window: gtk::Window,
+    area: gtk::DrawingArea,
+}
+
 pub struct ScreenshotUi {
     window: RefCell<Option<gtk::Window>>,
     app: gtk::Application,
@@ -273,7 +296,21 @@ pub struct ScreenshotUi {
     cast: gtk::ToggleButton,
     capture: gtk::Button,
     pointer: gtk::ToggleButton,
-    frozen: RefCell<Option<gdk::Texture>>,
+    /// Every monitor, frozen on open, in the compositor's order.
+    screens: RefCell<Vec<Screen>>,
+    /// The screen the main overlay (panel, area and window selectors)
+    /// covers: the primary monitor, where GNOME puts the panel.
+    primary: Cell<usize>,
+    /// The checked screen selector.
+    selected_screen: Cell<usize>,
+    /// The hovered screen selector (`:hover` dims it less).
+    hovered_screen: Cell<Option<usize>>,
+    /// The monitors the selectors were built for and the checked one,
+    /// kept across openings as GNOME keeps its monitor bins.
+    built: RefCell<Vec<(String, Rect)>>,
+    selected_name: RefCell<Option<String>>,
+    /// The other monitors' overlays.
+    screen_windows: RefCell<Vec<ScreenWindow>>,
     /// The window selector's windows, pictured on open.
     windows: RefCell<Vec<PickerWindow>>,
     selection: Cell<Option<Rect>>,
@@ -404,7 +441,13 @@ impl ScreenshotUi {
             cast,
             capture: capture.clone(),
             pointer,
-            frozen: RefCell::new(None),
+            screens: RefCell::new(Vec::new()),
+            primary: Cell::new(0),
+            selected_screen: Cell::new(0),
+            hovered_screen: Cell::new(None),
+            built: RefCell::new(Vec::new()),
+            selected_name: RefCell::new(None),
+            screen_windows: RefCell::new(Vec::new()),
             windows: RefCell::new(Vec::new()),
             selection: Cell::new(None),
             selection_keys: Cell::new(None),
@@ -424,6 +467,7 @@ impl ScreenshotUi {
                 }
             });
         }
+        ui.add_screen_controllers(ui.canvas.upcast_ref(), None);
         for (mode, button) in &ui.types {
             let (weak, mode) = (Rc::downgrade(&ui), *mode);
             button.connect_clicked(move |_| {
@@ -464,8 +508,14 @@ impl ScreenshotUi {
             let weak = Rc::downgrade(&ui);
             drag_gesture.connect_drag_begin(move |_, x, y| {
                 let Some(ui) = weak.upgrade() else { return };
-                if ui.mode.get() != Mode::Selection {
-                    return;
+                match ui.mode.get() {
+                    Mode::Selection => {}
+                    Mode::Screen => {
+                        // A press on the primary's screen selector checks it.
+                        ui.select_screen(ui.primary.get());
+                        return;
+                    }
+                    Mode::Window => return,
                 }
                 let sel = ui.selection.get().unwrap_or(Rect {
                     x,
@@ -573,8 +623,14 @@ impl ScreenshotUi {
                             ui.describe_selection();
                             ui.canvas.queue_draw();
                             (ui.move_pointer)(selection.cursor(alt));
-                        } else if !alt && !ctrl && !shift {
-                            // `_moveFocus`: the window or screen selectors.
+                        } else if alt || ctrl || shift {
+                            // Only the plain `move-*` bindings move
+                            // between selectors.
+                        } else if ui.mode.get() == Mode::Screen {
+                            // `_moveFocus` on the screen selectors.
+                            ui.move_screen(direction);
+                        } else {
+                            // `_moveFocus` on the window selector.
                             ui.overlay.child_focus(match direction {
                                 Direction::Left => gtk::DirectionType::Left,
                                 Direction::Right => gtk::DirectionType::Right,
@@ -603,6 +659,19 @@ impl ScreenshotUi {
         }
     }
 
+    /// The checked screen selector, for screen readers and proofs.
+    fn describe_screen(&self) {
+        let screens = self.screens.borrow();
+        if let Some(screen) = screens.get(self.selected_screen.get()) {
+            let r = screen.output.rect;
+            self.canvas
+                .update_property(&[gtk::accessible::Property::Label(&format!(
+                    "Selected screen {} at x {:.0}, y {:.0}, width {:.0}, height {:.0}",
+                    screen.output.name, r.x, r.y, r.w, r.h,
+                ))]);
+        }
+    }
+
     fn set_mode(&self, mode: Mode) {
         self.mode.set(mode);
         for (m, button) in &self.types {
@@ -611,7 +680,90 @@ impl ScreenshotUi {
         for w in self.windows.borrow().iter() {
             w.button.set_visible(mode == Mode::Window);
         }
+        match mode {
+            Mode::Screen => self.describe_screen(),
+            Mode::Selection => self.describe_selection(),
+            Mode::Window => {}
+        }
+        self.queue_draw_screens();
+    }
+
+    /// Redraw every monitor's overlay.
+    fn queue_draw_screens(&self) {
         self.canvas.queue_draw();
+        for other in self.screen_windows.borrow().iter() {
+            other.area.queue_draw();
+        }
+    }
+
+    /// Check screen selector `index`, unchecking the others
+    /// (`notify::checked` in `_rebuildMonitorBins`).
+    fn select_screen(&self, index: usize) {
+        let Some(name) = self
+            .screens
+            .borrow()
+            .get(index)
+            .map(|s| s.output.name.clone())
+        else {
+            return;
+        };
+        self.selected_screen.set(index);
+        *self.selected_name.borrow_mut() = Some(name);
+        if self.mode.get() == Mode::Screen {
+            self.describe_screen();
+        }
+        self.queue_draw_screens();
+    }
+
+    /// An arrow in Screen mode: the check moves to the monitor that way
+    /// (`_moveFocus`), or stays.
+    fn move_screen(&self, direction: Direction) {
+        let rects: Vec<Rect> = self
+            .screens
+            .borrow()
+            .iter()
+            .map(|s| s.output.rect)
+            .collect();
+        if let Some(next) = neighbour(&rects, self.selected_screen.get(), direction) {
+            self.select_screen(next);
+        }
+    }
+
+    /// A screen selector's pointer handling on `widget`, the overlay of
+    /// screen `index` (`None`: the primary's main overlay, whose drag
+    /// gesture takes the press): a click checks it and hovering dims it
+    /// less, in Screen mode, as the selector buttons GNOME shows there.
+    fn add_screen_controllers(self: &Rc<Self>, widget: &gtk::Widget, index: Option<usize>) {
+        if let Some(index) = index {
+            let click = gtk::GestureClick::new();
+            let weak = Rc::downgrade(self);
+            click.connect_pressed(move |_, _, _, _| {
+                let Some(ui) = weak.upgrade() else { return };
+                if ui.mode.get() == Mode::Screen {
+                    ui.select_screen(index);
+                }
+            });
+            widget.add_controller(click);
+        }
+        let motion = gtk::EventControllerMotion::new();
+        {
+            let weak = Rc::downgrade(self);
+            motion.connect_enter(move |_, _, _| {
+                let Some(ui) = weak.upgrade() else { return };
+                ui.hovered_screen
+                    .set(Some(index.unwrap_or_else(|| ui.primary.get())));
+                ui.queue_draw_screens();
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            motion.connect_leave(move |_| {
+                let Some(ui) = weak.upgrade() else { return };
+                ui.hovered_screen.set(None);
+                ui.queue_draw_screens();
+            });
+        }
+        widget.add_controller(motion);
     }
 
     /// Switch between screenshot and screencast.
@@ -648,7 +800,7 @@ impl ScreenshotUi {
                 button.set_sensitive(!cast);
             }
         }
-        self.canvas.queue_draw();
+        self.queue_draw_screens();
     }
 
     /// Freeze the screen and show the UI.
@@ -676,33 +828,51 @@ impl ScreenshotUi {
             return;
         }
         let dir = glib::user_runtime_dir();
-        let path = dir.join("tuna-screenshot-ui.png");
+        let outputs_dir = dir.join("tuna-screenshot-outputs");
         let windows_dir = dir.join("tuna-screenshot-windows");
         let weak = Rc::downgrade(self);
         gio::bus_get(gio::BusType::Session, gio::Cancellable::NONE, move |conn| {
             let Ok(conn) = conn else { return };
-            let path2 = path.clone();
             let conn2 = conn.clone();
+            // Every monitor frozen, each in its own pixels, as GNOME's
+            // stage screenshot freezes them all.
             conn.call(
                 Some("org.gnome.Shell.Screenshot"),
                 "/org/gnome/Shell/Screenshot",
-                "org.gnome.Shell.Screenshot",
-                "Screenshot",
-                Some(&(false, false, path.to_string_lossy().as_ref()).to_variant()),
-                glib::VariantTy::new("(bs)").ok(),
+                "org.tuna.Screenshot",
+                "ScreenshotOutputs",
+                Some(&(outputs_dir.to_string_lossy().as_ref(),).to_variant()),
+                glib::VariantTy::new("(a(siiiidbs))").ok(),
                 gio::DBusCallFlags::NONE,
                 10_000,
                 gio::Cancellable::NONE,
                 move |reply| {
                     let Some(ui) = weak.upgrade() else { return };
-                    if reply.is_err() {
+                    let outputs = match reply {
+                        Ok(reply) => parse_outputs(&reply),
+                        Err(e) => {
+                            eprintln!(
+                                "tuna-shell-gtk: screenshot UI could not freeze the screen: {e}"
+                            );
+                            return;
+                        }
+                    };
+                    let screens: Vec<Screen> = outputs
+                        .into_iter()
+                        .filter_map(|output| {
+                            let texture = gdk::Texture::from_filename(&output.path).ok();
+                            let _ = std::fs::remove_file(&output.path);
+                            Some(Screen {
+                                output,
+                                texture: texture?,
+                            })
+                        })
+                        .collect();
+                    if screens.is_empty() {
                         eprintln!("tuna-shell-gtk: screenshot UI could not freeze the screen");
                         return;
                     }
-                    let texture = gdk::Texture::from_filename(&path2).ok();
-                    let _ = std::fs::remove_file(&path2);
-                    let Some(texture) = texture else { return };
-                    *ui.frozen.borrow_mut() = Some(texture);
+                    *ui.screens.borrow_mut() = screens;
                     // Every window's picture for the window selector, as
                     // GNOME takes them when the UI opens.
                     let weak = Rc::downgrade(&ui);
@@ -807,19 +977,51 @@ impl ScreenshotUi {
     }
 
     fn show(self: &Rc<Self>, cast: bool) {
-        let (w, h) = self
-            .frozen
-            .borrow()
-            .as_ref()
-            .map(|t| (t.width(), t.height()))
-            .unwrap_or((1280, 800));
-        let monitor = WidgetExt::display(&self.canvas)
+        let monitors: Vec<gdk::Monitor> = WidgetExt::display(&self.canvas)
             .monitors()
-            .item(0)
-            .and_then(|m| m.downcast::<gdk::Monitor>().ok())
-            .map(|m| m.geometry())
-            .map(|g| (g.width(), g.height()))
-            .unwrap_or((w, h));
+            .iter::<gdk::Monitor>()
+            .filter_map(Result::ok)
+            .collect();
+        let monitor_for = |name: &str| {
+            monitors
+                .iter()
+                .find(|m| m.connector().as_deref() == Some(name))
+                .cloned()
+        };
+        // The main overlay covers the primary, as GNOME's panel sits in
+        // its primary monitor bin; another monitor needs a GDK monitor
+        // to put its own overlay on.
+        let outputs: Vec<ShotOutput> = {
+            let mut screens = self.screens.borrow_mut();
+            let main = screens.iter().position(|s| s.output.primary).unwrap_or(0);
+            let mut index = 0;
+            screens.retain(|s| {
+                let keep = index == main || monitor_for(&s.output.name).is_some();
+                index += 1;
+                keep
+            });
+            screens.iter().map(|s| s.output.clone()).collect()
+        };
+        let primary = outputs.iter().position(|o| o.primary).unwrap_or(0);
+        self.primary.set(primary);
+        let selected = {
+            let previous = self.selected_name.borrow().clone();
+            selected_on_open(&self.built.borrow(), previous.as_deref(), &outputs).unwrap_or(primary)
+        };
+        self.selected_screen.set(selected);
+        *self.selected_name.borrow_mut() = outputs.get(selected).map(|o| o.name.clone());
+        *self.built.borrow_mut() = layout(&outputs);
+        self.hovered_screen.set(None);
+        let monitor = outputs
+            .get(primary)
+            .map(|o| (o.rect.w.round() as i32, o.rect.h.round() as i32))
+            .or_else(|| {
+                monitors.first().map(|m| {
+                    let g = m.geometry();
+                    (g.width(), g.height())
+                })
+            })
+            .unwrap_or((1280, 800));
         if self.selection.get().is_none_or(|r| {
             r.x < 0.0
                 || r.y < 0.0
@@ -841,6 +1043,15 @@ impl ScreenshotUi {
             f64::from(px + PANEL_W - 30),
             f64::from(py - 18),
         );
+        let others: Vec<ScreenWindow> = outputs
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| index != primary)
+            .filter_map(|(index, output)| {
+                Some(self.new_screen_window(index, output, &monitor_for(&output.name)?))
+            })
+            .collect();
+        *self.screen_windows.borrow_mut() = others;
         self.set_cast(cast);
         self.set_mode(self.mode.get());
         let window = self
@@ -848,8 +1059,72 @@ impl ScreenshotUi {
             .borrow()
             .clone()
             .unwrap_or_else(|| self.new_window());
+        if let Some(output) = outputs.get(primary) {
+            window.set_monitor(monitor_for(&output.name).as_ref());
+        }
         *self.window.borrow_mut() = Some(window.clone());
+        let others: Vec<gtk::Window> = self
+            .screen_windows
+            .borrow()
+            .iter()
+            .map(|o| o.window.clone())
+            .collect();
+        for other in others {
+            other.present();
+        }
         window.present();
+    }
+
+    /// The overlay over a monitor other than the primary: its frozen
+    /// picture and its screen selector (`UIMonitorBin`). The main overlay
+    /// keeps the keyboard; Escape there closes this one too.
+    fn new_screen_window(
+        self: &Rc<Self>,
+        index: usize,
+        output: &ShotOutput,
+        monitor: &gdk::Monitor,
+    ) -> ScreenWindow {
+        let window = gtk::Window::new();
+        window.set_application(Some(&self.app));
+        window.add_css_class("tuna-screenshot-ui");
+        window.set_title(Some("Screenshot"));
+        window.init_layer_shell();
+        window.set_layer(Layer::Overlay);
+        window.set_namespace(Some(tuna_shell_control::SCREENSHOT_NAMESPACE));
+        window.set_monitor(Some(monitor));
+        for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
+            window.set_anchor(edge, true);
+        }
+        window.set_exclusive_zone(-1);
+        window.set_keyboard_mode(KeyboardMode::None);
+        let area = gtk::DrawingArea::new();
+        area.set_accessible_role(gtk::AccessibleRole::Img);
+        area.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Screen {}",
+            output.name
+        ))]);
+        area.set_hexpand(true);
+        area.set_vexpand(true);
+        {
+            let weak = Rc::downgrade(self);
+            area.set_draw_func(move |_, cr, w, h| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.draw_other(cr, index, f64::from(w), f64::from(h));
+                }
+            });
+        }
+        self.add_screen_controllers(area.upcast_ref(), Some(index));
+        window.set_child(Some(&area));
+        // Closed from outside (its output went away): the UI closes, as
+        // through Escape.
+        let weak = Rc::downgrade(self);
+        window.connect_close_request(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.close();
+            }
+            glib::Propagation::Stop
+        });
+        ScreenWindow { window, area }
     }
 
     fn new_window(self: &Rc<Self>) -> gtk::Window {
@@ -911,9 +1186,72 @@ impl ScreenshotUi {
             window.set_child(None::<&gtk::Widget>);
             window.destroy();
         }
-        self.frozen.borrow_mut().take();
+        let others: Vec<ScreenWindow> = self.screen_windows.borrow_mut().drain(..).collect();
+        for other in others {
+            other.window.destroy();
+        }
+        self.screens.borrow_mut().clear();
         for old in self.windows.borrow_mut().drain(..) {
             self.fixed.remove(&old.button);
+        }
+    }
+
+    /// Screen `index` frozen, scaled to its overlay's logical size.
+    fn paint_frozen(&self, cr: &gtk::cairo::Context, index: usize, w: f64, h: f64) {
+        let Some(texture) = self.screens.borrow().get(index).map(|s| s.texture.clone()) else {
+            return;
+        };
+        let sx = w / f64::from(texture.width());
+        let sy = h / f64::from(texture.height());
+        cr.save().ok();
+        cr.scale(sx, sy);
+        if let Ok(surface) = texture_surface(&texture) {
+            let _ = cr.set_source_surface(&surface, 0.0, 0.0);
+            let _ = cr.paint();
+        }
+        cr.restore().ok();
+    }
+
+    /// `.screenshot-ui-screen-selector` over screen `index`: the checked
+    /// one a 2px white frame, the others dimmed to 50% black (30% while
+    /// hovered).
+    fn draw_screen_selector(&self, cr: &gtk::cairo::Context, index: usize, w: f64, h: f64) {
+        if index == self.selected_screen.get() {
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.set_line_width(2.0);
+            cr.rectangle(1.0, 1.0, w - 2.0, h - 2.0);
+            let _ = cr.stroke();
+        } else {
+            let alpha = if self.hovered_screen.get() == Some(index) {
+                0.3
+            } else {
+                0.5
+            };
+            cr.set_source_rgba(0.0, 0.0, 0.0, alpha);
+            let _ = cr.paint();
+        }
+    }
+
+    /// Another monitor's overlay: its frozen picture under its screen
+    /// selector, shaded outside the area selection (which is on the
+    /// primary) or covered by the window selector's background.
+    fn draw_other(&self, cr: &gtk::cairo::Context, index: usize, w: f64, h: f64) {
+        if self.mode.get() == Mode::Window {
+            let (r, g, b) = SELECTOR_BACKGROUND;
+            cr.set_source_rgb(r, g, b);
+            let _ = cr.paint();
+            return;
+        }
+        if !self.cast.is_active() {
+            self.paint_frozen(cr, index, w, h);
+        }
+        match self.mode.get() {
+            Mode::Selection => {
+                cr.set_source_rgba(0.0, 0.0, 0.0, 0.5);
+                let _ = cr.paint();
+            }
+            Mode::Screen => self.draw_screen_selector(cr, index, w, h),
+            Mode::Window => {}
         }
     }
 
@@ -927,19 +1265,7 @@ impl ScreenshotUi {
         }
         // Screencast mode shows the live screen through the UI.
         if !self.cast.is_active() {
-            let Some(texture) = self.frozen.borrow().clone() else {
-                return;
-            };
-            // The frozen screen, scaled to the output's logical size.
-            let sx = w / f64::from(texture.width());
-            let sy = h / f64::from(texture.height());
-            cr.save().ok();
-            cr.scale(sx, sy);
-            if let Ok(surface) = texture_surface(&texture) {
-                let _ = cr.set_source_surface(&surface, 0.0, 0.0);
-                let _ = cr.paint();
-            }
-            cr.restore().ok();
+            self.paint_frozen(cr, self.primary.get(), w, h);
         }
         match self.mode.get() {
             Mode::Selection => {
@@ -978,13 +1304,7 @@ impl ScreenshotUi {
                     let _ = cr.fill();
                 }
             }
-            Mode::Screen => {
-                // The whole screen selected: a 2px white frame.
-                cr.set_source_rgb(1.0, 1.0, 1.0);
-                cr.set_line_width(2.0);
-                cr.rectangle(1.0, 1.0, w - 2.0, h - 2.0);
-                let _ = cr.stroke();
-            }
+            Mode::Screen => self.draw_screen_selector(cr, self.primary.get(), w, h),
             Mode::Window => {}
         }
     }
@@ -997,23 +1317,21 @@ impl ScreenshotUi {
             w: f64::from(w),
             h: f64::from(h),
         };
+        let rect_of = |index: usize| self.screens.borrow().get(index).map(|s| s.output.rect);
         if self.cast.is_active() {
-            let area = match self.mode.get() {
+            let selection = match self.mode.get() {
                 Mode::Selection => match self.selection.get() {
-                    Some(sel) if sel.w >= 1.0 && sel.h >= 1.0 => sel,
+                    Some(sel) if sel.w >= 1.0 && sel.h >= 1.0 => Some(sel),
                     _ => return,
                 },
-                _ => full,
+                _ => None,
             };
+            let primary = rect_of(self.primary.get()).unwrap_or(full);
+            let selected = rect_of(self.selected_screen.get()).unwrap_or(primary);
+            let area = recording_area(selection, primary, selected);
             // Close first, so the UI is not recorded.
             self.close();
             let recorder = self.recorder.clone();
-            let area = (
-                area.x.round() as i32,
-                area.y.round() as i32,
-                area.w.round() as i32,
-                area.h.round() as i32,
-            );
             glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
                 recorder.start(Some(area), crate::screencast::TEMPLATE, None, |result| {
                     if let Err(e) = result {
@@ -1049,17 +1367,39 @@ impl ScreenshotUi {
                     None => (self.shoot_window)(),
                 }
             }
-            Mode::Screen | Mode::Selection => {
-                let Some(texture) = self.frozen.borrow().clone() else {
+            Mode::Screen => {
+                // The checked monitor alone, in its own pixels (at its
+                // scale), as `_getSelectedGeometry` cuts the stage.
+                let Some(texture) = self
+                    .screens
+                    .borrow()
+                    .get(self.selected_screen.get())
+                    .map(|s| s.texture.clone())
+                else {
                     return;
                 };
-                let crop = if self.mode.get() == Mode::Screen {
-                    full
-                } else {
-                    match self.selection.get() {
-                        Some(sel) if sel.w >= 1.0 && sel.h >= 1.0 => sel,
-                        _ => return,
-                    }
+                self.close();
+                let (tw, th) = (f64::from(texture.width()), f64::from(texture.height()));
+                let whole = Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: tw,
+                    h: th,
+                };
+                self.saved(save(&texture, whole, tw, th, saves_to_disk()));
+            }
+            Mode::Selection => {
+                let Some(texture) = self
+                    .screens
+                    .borrow()
+                    .get(self.primary.get())
+                    .map(|s| s.texture.clone())
+                else {
+                    return;
+                };
+                let crop = match self.selection.get() {
+                    Some(sel) if sel.w >= 1.0 && sel.h >= 1.0 => sel,
+                    _ => return,
                 };
                 self.close();
                 self.saved(save(
