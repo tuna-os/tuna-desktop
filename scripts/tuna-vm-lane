@@ -4006,6 +4006,63 @@ def native_gpu_devices(profile="lifecycle", outputs=1):
     return baseline.gpu_devices(outputs=outputs)
 
 
+def grab_x11_scanout(path, fmt="ppm"):
+    """Write the virgl DEV profile's presented scanout to `path` as PPM or PNG.
+
+    QEMU's `-display gtk,gl=on,full-screen=on` blits the guest's GL scanout
+    over the whole owned Xvfb screen (ui/gtk-egl.c gd_egl_scanout_flush:
+    egl_fb_blit into the window framebuffer). The screen is WIDTH x HEIGHT,
+    the guest's virtio-gpu preferred mode, so the blit is 1:1 and the X
+    screen holds exactly the frame QEMU presented. A screen of any other size
+    would stretch the scanout: refused, not resampled."""
+    if fmt not in ("ppm", "png"):
+        raise ValueError(f"unsupported scanout format {fmt}")
+    ffmpeg = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+    staging, encoded = f"{path}.x11.ppm", f"{path}.x11.png"
+
+    def run(*arguments):
+        try:
+            subprocess.run([*ffmpeg, *arguments], check=True, capture_output=True, timeout=15)
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(f"x11grab: {error.stderr.decode(errors='replace').strip()}") from error
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("x11grab timed out") from error
+
+    run("-f", "x11grab", "-draw_mouse", "0", "-i", os.environ["DISPLAY"],
+        "-frames:v", "1", "-c:v", "ppm", "-f", "image2", "-update", "1", staging)
+    w, h, _ = read_ppm(staging)
+    if (w, h) != (WIDTH, HEIGHT):
+        raise RuntimeError(f"X screen is {w}x{h}, not the {WIDTH}x{HEIGHT} scanout: "
+                           "the GL blit would be stretched")
+    if fmt == "ppm":
+        os.replace(staging, path)
+        return
+    run("-i", staging, "-c:v", "png", "-f", "image2", "-update", "1", encoded)
+    os.unlink(staging)
+    os.replace(encoded, path)
+
+
+class X11ScanoutQmp(baseline.Qmp):
+    """QMP for the virgl DEV profile, whose screendump reads the X screen.
+
+    QEMU 10.2 qmp_screendump (ui/ui-qmp-cmds.c) takes qemu_console_surface(),
+    which ui/console.c returns only for a SCANOUT_SURFACE console. A virgl
+    scanout is SCANOUT_TEXTURE, so screendump answers "no surface" under every
+    display backend (gtk, egl-headless and dbus alike); egl-headless and dbus
+    GL also need a DRM render node the runner does not have. The gtk display
+    presents that texture on the owned Xvfb screen (grab_x11_scanout), so
+    screendumps and frames are taken there, after QEMU presented them, never
+    from inside the guest."""
+
+    def cmd(self, command, **args):
+        if command != "screendump":
+            return super().cmd(command, **args)
+        if set(args) - {"filename", "format"}:
+            raise ValueError(f"unsupported screendump arguments {sorted(args)}")
+        grab_x11_scanout(args["filename"], args.get("format", "ppm"))
+        return {}
+
+
 def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, native_relative_mouse=False,
          observer_records=None, display_bus=None, credentials=(), profile="lifecycle"):
     ovmf = next((p for p in OVMF if os.path.exists(p)), None)
@@ -4019,7 +4076,9 @@ def boot(disk, out, scratch, timeout, require_kvm=False, *, guest_agent=False, n
         if (not os.environ.get("DISPLAY") or os.environ.get("LIBGL_ALWAYS_SOFTWARE") != "1"
                 or os.environ.get("GALLIUM_DRIVER") != "llvmpipe"):
             raise RuntimeError("virgl DEV profile requires its owned Xvfb/software-GL launcher")
-        display = "gtk,gl=on"
+        # full-screen hides the menu bar and sizes the window to the X screen
+        # (grab_x11_scanout reads the presented scanout from it).
+        display = "gtk,gl=on,full-screen=on"
     qmp_path = os.path.join(scratch, "qmp.sock")
     agent_path = os.path.join(scratch, "qga.sock")
     serial = os.path.join(out, "serial.log")
@@ -4444,7 +4503,7 @@ def main():
     tour_serial_end = None
     manager_ready = False
     try:
-        qmp = baseline.Qmp(qmp_path)
+        qmp = (X11ScanoutQmp if a.profile == "colour" else baseline.Qmp)(qmp_path)
         try:
             login_ok = gdm_login(qmp, agent_path, out, record)
         except (OSError, RuntimeError, ValueError) as error:

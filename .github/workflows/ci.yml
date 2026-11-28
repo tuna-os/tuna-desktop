@@ -2436,6 +2436,10 @@ jobs:
           --meta "tuna_package=$(basename arch-artifacts/tuna-desktop-[0-9]*.pkg.tar.zst)"
           --meta "commit=${{ github.sha }}"
           --meta "run_id=${{ github.run_id }}"
+      # QMP screendump cannot read a virgl (GL texture) scanout; the lane reads
+      # the full-screen QEMU gtk window from this Xvfb screen instead, so the
+      # screen must be the guest's 1280x800 scanout mode (tuna-vm-lane
+      # grab_x11_scanout refuses any other size).
       - name: Prove all native colour DMA and production capture consumers
         if: matrix.profile == 'colour'
         env:

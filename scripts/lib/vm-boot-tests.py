@@ -5846,5 +5846,49 @@ class ShellMenuEndSession(unittest.TestCase):
             self.assertFalse(lane.countdown_showing([title, countdown(text)], case, 60))
 
 
+class VirglScanoutCapture(unittest.TestCase):
+    """The colour profile's screendump reads the X screen QEMU presented on."""
+
+    def grab(self, size, fmt):
+        def ffmpeg(command, **_):
+            output = command[-1]
+            if "x11grab" in command:
+                self.assertEqual(command[command.index("-i") + 1], ":7")
+                self.assertEqual(command[command.index("-draw_mouse") + 1], "0")
+                Path(output).write_bytes(b"P6\n%d %d\n255\n" % size + bytes(size[0] * size[1] * 3))
+            else:
+                self.assertEqual(command[command.index("-i") + 1], output.replace(".x11.png", ".x11.ppm"))
+                Path(output).write_bytes(b"\x89PNG")
+            return subprocess.CompletedProcess(command, 0)
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "frame." + fmt)
+        with patch.dict(os.environ, {"DISPLAY": ":7"}), patch.object(lane.subprocess, "run", ffmpeg):
+            lane.X11ScanoutQmp.cmd(object.__new__(lane.X11ScanoutQmp), "screendump", filename=path, format=fmt)
+        return path, sorted(os.listdir(directory))
+
+    def test_screendump_writes_the_requested_format_without_staging_leftovers(self):
+        path, files = self.grab((lane.WIDTH, lane.HEIGHT), "ppm")
+        self.assertEqual(lane.read_ppm(path)[:2], (lane.WIDTH, lane.HEIGHT))
+        self.assertEqual(files, ["frame.ppm"])
+        path, files = self.grab((lane.WIDTH, lane.HEIGHT), "png")
+        self.assertEqual(Path(path).read_bytes(), b"\x89PNG")
+        self.assertEqual(files, ["frame.png"])
+
+    def test_a_screen_other_than_the_scanout_mode_is_refused_not_resampled(self):
+        with self.assertRaisesRegex(RuntimeError, "stretched"):
+            self.grab((lane.WIDTH * 2, lane.HEIGHT), "png")
+
+    def test_other_commands_still_go_to_qmp(self):
+        sent = []
+        with patch.object(lane.baseline.Qmp, "cmd", lambda self, command, **args: sent.append(command)):
+            lane.X11ScanoutQmp.cmd(object.__new__(lane.X11ScanoutQmp), "send-key", keys=[])
+        self.assertEqual(sent, ["send-key"])
+
+    def test_only_the_virgl_profile_reads_the_x_screen(self):
+        source = (Path(__file__).resolve().parents[1] / "tuna-vm-lane").read_text()
+        self.assertIn('display = "gtk,gl=on,full-screen=on"', source)
+        self.assertIn('(X11ScanoutQmp if a.profile == "colour" else baseline.Qmp)(qmp_path)', source)
+
+
 if __name__ == "__main__":
     unittest.main()
