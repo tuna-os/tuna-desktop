@@ -61,23 +61,60 @@ def desktop_package_version():
 LOGIN_SERVICE = "gdm-password"
 DISPLAY_MANAGER = pathlib.Path("/etc/systemd/system/display-manager.service")
 # In a GDM session the lock screen verifies through GDM's reauthentication
-# channel (as GNOME Shell does), so GDM's worker runs this stack for an
-# unlock; the private helper's LOCK_PAM runs only without GDM.
-GDM_PAM = f"/etc/pam.d/{LOGIN_SERVICE}"
+# channel (as GNOME Shell does), so GDM's worker runs LOGIN_SERVICE's stack
+# for an unlock; the private helper's LOCK_PAM runs only without GDM.
 FAILLOCK_CONF = pathlib.Path("/etc/security/faillock.conf")
 FAILLOCK_DENY = 3
+# Linux-PAM reads a service, and each include or substack, from the first of
+# /etc/pam.d and /usr/lib/pam.d that has it (libpam/pam_handlers.c
+# _pam_open_config_file). GDM installs its services in /usr/lib/pam.d
+# (data/meson.build pam_sys_services_dir), so Marlin has no
+# /etc/pam.d/gdm-password, and one written there overrides GDM's.
+PAM_DIRS = (pathlib.Path("/etc/pam.d"), pathlib.Path("/usr/lib/pam.d"))
+
+
+def pam_service_file(service, dirs=PAM_DIRS):
+    """The file Linux-PAM reads for a service, or None."""
+    if service.startswith("/"):
+        return pathlib.Path(service) if pathlib.Path(service).is_file() else None
+    return next((root / service for root in dirs if (root / service).is_file()), None)
 
 
 def unlock_pam_services():
-    """Every PAM stack an unlock can run in this guest."""
-    return [path for path in (pathlib.Path(LOCK_PAM), pathlib.Path(GDM_PAM)) if path.is_file()]
+    """Every PAM service an unlock can run in this guest."""
+    return [name for name in (pathlib.Path(LOCK_PAM).name, LOGIN_SERVICE) if pam_service_file(name)]
 
 
-def pam_stack_modules(service, root=pathlib.Path("/etc/pam.d"), seen=None):
+def override_pam_service(name, text):
+    """Run `text` for a service from /etc/pam.d, which Linux-PAM reads first;
+    restore_pam_service brings back what was there, or nothing."""
+    target = PAM_DIRS[0] / name
+    if target.is_file():
+        target.rename(target.with_suffix(".vm-backup"))
+    else:
+        target.with_suffix(".vm-absent").write_text("")
+    target.write_text(text)
+
+
+def restore_pam_service(name):
+    """Undo override_pam_service; False when nothing was overridden."""
+    target = PAM_DIRS[0] / name
+    backup, absent = target.with_suffix(".vm-backup"), target.with_suffix(".vm-absent")
+    if backup.exists():
+        backup.rename(target)
+    elif absent.exists():
+        target.unlink(missing_ok=True)
+        absent.unlink()
+    else:
+        return False
+    return True
+
+
+def pam_stack_modules(service, dirs=PAM_DIRS, seen=None):
     """(type, module) rows of a PAM service, include/substack resolved."""
     seen = set() if seen is None else seen
-    path = root / service
-    if service in seen or not path.is_file():
+    path = pam_service_file(service, dirs)
+    if service in seen or path is None:
         return []
     seen.add(service)
     rows = []
@@ -86,7 +123,7 @@ def pam_stack_modules(service, root=pathlib.Path("/etc/pam.d"), seen=None):
         if not line:
             continue
         if line.startswith("@include"):
-            rows += pam_stack_modules(line.split()[1], root, seen)
+            rows += pam_stack_modules(line.split()[1], dirs, seen)
             continue
         kind, _, rest = line.lstrip("-").partition(" ")
         rest = rest.strip()
@@ -96,7 +133,7 @@ def pam_stack_modules(service, root=pathlib.Path("/etc/pam.d"), seen=None):
             control, _, rest = rest.partition(" ")
         target = rest.split()[0] if rest.split() else ""
         if control in ("include", "substack"):
-            rows += pam_stack_modules(target, root, seen)
+            rows += pam_stack_modules(target, dirs, seen)
         elif target:
             rows.append((kind, pathlib.Path(target).name))
     return rows
@@ -3256,10 +3293,9 @@ print(json.dumps(result))
         # Neither credentials nor outcomes are faked. Both stacks an unlock
         # can run: GDM's (the lock verifies through GDM's reauthentication
         # channel in this GDM session) and the private helper's.
-        for service in unlock_pam_services():
-            original = service.read_text()
-            service.rename(service.with_suffix(".vm-backup"))
-            service.write_text("auth required pam_exec.so /usr/bin/sleep 8\n" + original)
+        for name in unlock_pam_services():
+            original = pam_service_file(name).read_text()
+            override_pam_service(name, "auth required pam_exec.so /usr/bin/sleep 8\n" + original)
         result = {"pam": "real stack delayed"}
     elif action == "delayed-auth-state":
         try:
@@ -3271,17 +3307,12 @@ print(json.dumps(result))
         result = auth_retirement_state(json.loads(sys.argv[2]))
     elif action == "deny-unlock":
         # Real PAM failure, not a substitute authenticator or fake daemon.
-        for service in unlock_pam_services():
-            service.rename(service.with_suffix(".vm-backup"))
-            service.write_text("auth required pam_deny.so\naccount required pam_deny.so\n")
+        for name in unlock_pam_services():
+            override_pam_service(name, "auth required pam_deny.so\naccount required pam_deny.so\n")
         result = {"pam": "deny"}
     elif action == "restore-unlock":
-        restored = []
-        for service in (pathlib.Path(LOCK_PAM), pathlib.Path(GDM_PAM)):
-            backup = service.with_suffix(".vm-backup")
-            if backup.exists():
-                backup.rename(service)
-                restored.append(service.name)
+        restored = [name for name in (pathlib.Path(LOCK_PAM).name, LOGIN_SERVICE)
+                    if restore_pam_service(name)]
         if not restored:
             raise RuntimeError("no lock PAM stack backup to restore")
         result = {"pam": "restored"}

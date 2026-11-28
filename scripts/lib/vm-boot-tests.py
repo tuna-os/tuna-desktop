@@ -5985,16 +5985,21 @@ class LockFaillock(unittest.TestCase):
             lane.checked_auth_method(desktop, dict(helper, ppid=1), own_delay, expected)
 
     def test_guest_reads_the_login_stack_through_its_includes(self):
-        scope = self.guest("pam_stack_modules")
         with tempfile.TemporaryDirectory() as root:
-            root = Path(root)
-            (root / "gdm-password").write_text(
+            etc, vendor = Path(root, "etc"), Path(root, "usr")
+            etc.mkdir()
+            vendor.mkdir()
+            scope = self.guest("pam_service_file", "pam_stack_modules", PAM_DIRS=(etc, vendor))
+            # GDM ships gdm-password in /usr/lib/pam.d (as on Marlin); pambase's
+            # stacks are in /etc/pam.d, which wins where both have a service.
+            (vendor / "gdm-password").write_text(
                 "auth     include        system-local-login\n"
                 "account  include        system-local-login\n"
                 "-session optional       pam_gnome_keyring.so auto_start\n")
-            (root / "system-local-login").write_text("auth include system-login\naccount include system-login\n")
-            (root / "system-login").write_text("auth substack system-auth\naccount include system-auth\n")
-            (root / "system-auth").write_text(
+            (etc / "system-local-login").write_text("auth include system-login\naccount include system-login\n")
+            (etc / "system-login").write_text("auth substack system-auth\naccount include system-auth\n")
+            (vendor / "system-login").write_text("auth required pam_deny.so\n")
+            (etc / "system-auth").write_text(
                 "#%PAM-1.0\n"
                 "auth       required                    pam_faillock.so      preauth\n"
                 "-auth      [success=2 default=ignore]  pam_systemd_home.so\n"
@@ -6002,9 +6007,11 @@ class LockFaillock(unittest.TestCase):
                 "auth       [default=die]               pam_faillock.so      authfail\n"
                 "auth       required                    pam_faillock.so      authsucc\n"
                 "account    required                    pam_unix.so\n")
-            rows = scope["pam_stack_modules"]("gdm-password", root)
+            rows = scope["pam_stack_modules"]("gdm-password")
+            self.assertEqual(scope["pam_stack_modules"]("absent"), [])
         auth = [module for kind, module in rows if kind == "auth"]
         self.assertEqual(auth.count("pam_faillock.so"), 3)
+        self.assertNotIn(("auth", "pam_deny.so"), rows)
         self.assertIn(("auth", "pam_systemd_home.so"), rows)
         self.assertIn(("session", "pam_gnome_keyring.so"), rows)
         self.assertIn(("account", "pam_unix.so"), rows)
@@ -6054,9 +6061,36 @@ class LockFaillock(unittest.TestCase):
         for action in ("delay-unlock", "deny-unlock"):
             branch = source.split(f'elif action == "{action}":', 1)[1].split("elif action ==", 1)[0]
             self.assertIn("unlock_pam_services()", branch, action)
+            self.assertIn("override_pam_service(name, ", branch, action)
         restore = source.split('elif action == "restore-unlock":', 1)[1].split("elif action ==", 1)[0]
-        self.assertIn("pathlib.Path(LOCK_PAM), pathlib.Path(GDM_PAM)", restore)
+        self.assertIn("(pathlib.Path(LOCK_PAM).name, LOGIN_SERVICE)", restore)
+        self.assertIn("restore_pam_service(name)", restore)
         self.assertIn("raise RuntimeError", restore)
+
+    def test_guest_overrides_a_vendor_service_through_etc_and_restores_it(self):
+        with tempfile.TemporaryDirectory() as root:
+            etc, vendor = Path(root, "etc"), Path(root, "usr")
+            etc.mkdir()
+            vendor.mkdir()
+            scope = self.guest("pam_service_file", "unlock_pam_services", "override_pam_service",
+                               "restore_pam_service", PAM_DIRS=(etc, vendor),
+                               LOCK_PAM=str(etc / "tuna-lock"), LOGIN_SERVICE="gdm-password")
+            (etc / "tuna-lock").write_text("auth include login\n")
+            (vendor / "gdm-password").write_text("auth include system-local-login\n")
+            self.assertEqual(scope["unlock_pam_services"](), ["tuna-lock", "gdm-password"])
+            for name in scope["unlock_pam_services"]():
+                scope["override_pam_service"](name, "auth required pam_deny.so\n")
+            self.assertEqual(scope["pam_service_file"]("gdm-password"), etc / "gdm-password")
+            for name in ("tuna-lock", "gdm-password"):
+                self.assertEqual((etc / name).read_text(), "auth required pam_deny.so\n")
+            self.assertEqual((vendor / "gdm-password").read_text(), "auth include system-local-login\n")
+            self.assertEqual([scope["restore_pam_service"](name) for name in ("tuna-lock", "gdm-password")],
+                             [True, True])
+            self.assertEqual((etc / "tuna-lock").read_text(), "auth include login\n")
+            self.assertEqual(scope["pam_service_file"]("gdm-password"), vendor / "gdm-password")
+            self.assertEqual(sorted(path.name for path in etc.iterdir()), ["tuna-lock"])
+            self.assertIs(scope["restore_pam_service"]("gdm-password"), False)
+
 
 
 
