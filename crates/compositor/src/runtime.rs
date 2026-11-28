@@ -3211,6 +3211,14 @@ impl Runtime {
                         })
                     }).collect::<Vec<_>>()
                 }).unwrap_or_default(),
+                // Its mapped subsurfaces, global: GTK 4 draws some popovers
+                // (Connections' address popover) in one, not an xdg popup.
+                "subsurfaces": self.manager.surface_of(w.id).map(|s| {
+                    let origin = crate::popup::surface_origin(&s, w.geometry.loc);
+                    crate::popup::placed_subsurfaces(&s, origin).iter()
+                        .map(|r| [r.loc.x, r.loc.y, r.size.w, r.size.h])
+                        .collect::<Vec<_>>()
+                }).unwrap_or_default(),
             })).collect::<Vec<_>>(),
             "previews": previews,
             "thumbnails": thumbnails,

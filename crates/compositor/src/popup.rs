@@ -96,6 +96,41 @@ pub fn popup_at(placed: &[PlacedPopup], pos: Point<f64, Logical>) -> Option<&Pla
     placed.iter().rev().find(|p| p.rect.to_f64().contains(pos))
 }
 
+/// The global rectangle of each mapped subsurface below `root` (not
+/// `root` itself), parents before children, for a root whose surface
+/// origin is `origin`. Not every toolkit popover is an xdg popup: GTK 4
+/// draws Connections' address popover in a subsurface of the toplevel.
+pub fn placed_subsurfaces(
+    root: &WlSurface,
+    origin: Point<i32, Logical>,
+) -> Vec<Rectangle<i32, Logical>> {
+    use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+    use smithay::wayland::compositor::{with_surface_tree_downward, SurfaceData, TraversalAction};
+    let view = |states: &SurfaceData| {
+        states
+            .data_map
+            .get::<RendererSurfaceStateUserData>()
+            .and_then(|data| data.lock().unwrap().view())
+    };
+    let mut placed = Vec::new();
+    with_surface_tree_downward(
+        root,
+        origin,
+        |_, states, location| match view(states) {
+            Some(view) => TraversalAction::DoChildren(*location + view.offset),
+            // Unmapped: nothing of it or below it is drawn.
+            None => TraversalAction::SkipChildren,
+        },
+        |surface, states, location| {
+            if let Some(view) = view(states).filter(|_| surface != root) {
+                placed.push(Rectangle::new(*location + view.offset, view.dst));
+            }
+        },
+        |_, _, _| true,
+    );
+    placed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

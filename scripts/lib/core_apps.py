@@ -333,26 +333,32 @@ class Desktop(NativeDesktop):
     def _popover_origin(tree, window, frame, node):
         """Output point of a popover's (0, 0) when `node` lies in one, else None.
 
-        A GTK 4 popover is its own xdg popup surface and its widgets'
-        extents start at it: Connections' address popover is a [0, 0, 425,
-        324] panel under the window frame with its entry at [35, 78] (run
-        46095497198), nowhere near the window's (35, 78). The compositor
-        exports each window's placed popups; the outermost ancestor at the
-        origin whose size is one popup's geometry or buffer is the popover,
+        A GTK 4 popover is its own surface and its widgets' extents start
+        at it: Connections' address popover is a [0, 0, 425, 324] panel
+        under the window frame with its entry at [35, 78] (run
+        46095497198), nowhere near the window's (35, 78). That surface is
+        an xdg popup or, for Connections' popover, a subsurface of the
+        toplevel: run 46102176916 exported no popup for it, and a nested
+        WAYLAND_DEBUG trace shows get_subsurface for its 410x296 buffer.
+        The compositor exports each window's placed popups and mapped
+        subsurfaces; the outermost ancestor at the origin whose size is one
+        popup's geometry or buffer, or one subsurface's, is the popover,
         and that rectangle's corner is its (0, 0).
         """
+        surfaces = [[popup['rect'], popup.get('buffer_rect')] for popup in window.get('popups') or ()]
+        surfaces += [[rect] for rect in window.get('subsurfaces') or ()]
         by_path = {tuple(row['path']): row for row in tree['nodes']}
         for depth in range(len(frame['path']) + 1, len(node['path']) + 1):
             ancestor = by_path.get(tuple(node['path'][:depth]))
             if ancestor is None or ancestor['bounds'] is None or ancestor['bounds'][:2] != [0, 0]:
                 continue
             size = tuple(ancestor['bounds'][2:])
-            matches = [rect for popup in window.get('popups') or ()
-                       for rect in [next((rect for rect in (popup['rect'], popup.get('buffer_rect'))
+            matches = [rect for rects in surfaces
+                       for rect in [next((rect for rect in rects
                                           if rect is not None and tuple(rect[2:]) == size), None)]
                        if rect is not None]
             if len(matches) > 1:
-                raise RuntimeError('accessible popover matches more than one placed popup')
+                raise RuntimeError('accessible popover matches more than one placed popup or subsurface')
             if matches:
                 return matches[0][0], matches[0][1]
         return None

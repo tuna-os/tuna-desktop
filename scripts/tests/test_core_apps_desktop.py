@@ -1235,6 +1235,25 @@ class ShadowedSurfacePointer(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'more than one placed popup'):
             self.desktop()._field_pixels(actor, tree, entry)
 
+    def test_subsurface_popover_widgets_are_placed_by_their_subsurface(self):
+        # Run 46102176916: Connections' address popover is a subsurface of
+        # the toplevel, not an xdg popup; the only exported popup is the
+        # input method's 0x0 cursor popup.
+        window = {'id': 1, 'rect': [0, 32, 1280, 768], 'buffer_rect': [0, 32, 1280, 768],
+                  'popups': [{'rect': [74, 157, 0, 0], 'buffer_rect': None}],
+                  'subsurfaces': [[0, 79, 425, 324]]}
+        actor = {'id': 'org.gnome.Connections', 'window_id': 1, 'a11y_scope': '/frame'}
+        entry = {'object_path': '/entry', 'path': [0, 2, 0, 0, 1], 'role': 'text', 'bounds': [35, 78, 355, 34]}
+        tree = {'state': {'windows': [window]}, 'nodes': [
+            {'object_path': '/frame', 'path': [0], 'role': 'frame', 'bounds': [0, 0, 1280, 768]},
+            {'object_path': '/popover', 'path': [0, 2], 'role': 'panel', 'bounds': [0, 0, 425, 324]},
+            entry]}
+        self.assertEqual(self.desktop()._field_pixels(actor, tree, entry), (35, 157, 355, 34))
+        # A popup and a subsurface of the popover's size cannot place it.
+        window['popups'].append({'rect': [500, 70, 425, 324], 'buffer_rect': None})
+        with self.assertRaisesRegex(RuntimeError, 'more than one placed popup or subsurface'):
+            self.desktop()._field_pixels(actor, tree, entry)
+
 
 class PickerRevealsOffscreenCell(unittest.TestCase):
     """Run 46095497198: Decibels' chooser built cells for twelve of the
