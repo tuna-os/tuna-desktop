@@ -76,7 +76,10 @@ TOP_EDGE_Y = 33
 # hardware and services of the machine (the comparison.md "Intended
 # differences"): these tiles show only when their service is on the bus.
 OPTIONAL_GROUPS = (
-    ("push button: Mute", "slider: Volume", "toggle button: Open sound output menu"),
+    ("push button: Mute", "slider: Volume"),
+    # The output menu button shows only with more than one output device
+    # (gnome-shell 51 volume.js:173 `menuEnabled`, quickSettings.js:353).
+    ("toggle button: Open sound output menu",),
     ("slider: Brightness",),
     ("toggle button: Wi-Fi", "toggle button: Wi-Fi Menu"),
     ("toggle button: Wired", "toggle button: Wired Menu"),

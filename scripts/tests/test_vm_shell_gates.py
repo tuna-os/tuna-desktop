@@ -88,6 +88,11 @@ class A11y(unittest.TestCase):
         self.assertEqual(shell.a11y_problems("quick-settings", no_bluetooth), [])
         no_audio = [n for n in nodes if n["name"] not in ("Mute", "Volume", "Open sound output menu")]
         self.assertEqual(shell.a11y_problems("quick-settings", no_audio), [])
+        # One output device: GNOME 51 hides the output menu button, the slider stays (volume.js:173).
+        one_output = [n for n in nodes if n["name"] != "Open sound output menu"]
+        self.assertEqual(shell.a11y_problems("quick-settings", one_output), [])
+        no_slider = [n for n in nodes if n["name"] != "Volume"]
+        self.assertTrue(shell.a11y_problems("quick-settings", no_slider))
         half = [n for n in nodes if n["name"] != "Bluetooth Menu"]
         self.assertTrue(shell.a11y_problems("quick-settings", half))
 
