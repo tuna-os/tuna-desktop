@@ -37,6 +37,14 @@ the compositor's state document:
                     overlaps B most and A's when it overlaps A most, over
                     wp_fractional_scale, and its pointer events carry the
                     compositor's logical pointer position (P-SY-03, #68)
+  D-SCREENSHOT-KEYS-MULTI with A at scale 1 and B at scale 2, Print and C
+                    (Screen) map one screenshot overlay per monitor;
+                    Enter captures the primary, not the pointer's monitor;
+                    Right twice (no wrap-around) then Enter captures B
+                    alone in its physical pixels; the next opening keeps B;
+                    Left then Escape cancels without a capture and the next
+                    Enter captures A (P-SY-10, gnome-shell 51 screenshot.js
+                    `_rebuildMonitorBins`, `_moveFocus`)
 Each assertion line ("<ID> pass|fail <detail>") is appended to FILE
 (default DIR/assertions.txt), which the parity ledger reads with
 drm-smoke's. Needs root (sudo) for modprobe, configfs, seatd, uinput and
@@ -46,6 +54,8 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -62,6 +72,9 @@ APP_PREFIX = "org.tuna.DrmDual."
 MOUSE = "Tuna dual mouse"
 KEYBOARD = "Tuna dual keyboard"
 CLIENT_SIZE = (360, 240)
+# A client painted in one colour the desktop never shows, so a capture
+# tells which monitor it holds (D-SCREENSHOT-KEYS-MULTI).
+MARKER_CLIENT = "K"
 STATE_SIG = "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})"
 # Frames per second a shown client draws at least (vkms flips at 60 Hz)
 # and a hidden one at most (HIDDEN_FRAME_INTERVAL, 995 ms).
@@ -86,6 +99,7 @@ def client_worker(name):
     its surface scale (wp_fractional_scale) and its last pointer motion
     in surface coordinates."""
     os.environ.setdefault("GSK_RENDERER", "cairo")
+    marker = name == MARKER_CLIENT
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("Gdk", "4.0")
@@ -101,8 +115,11 @@ def client_worker(name):
         area = Gtk.DrawingArea()
 
         def draw(_area, cr, _width, _height):
-            shade = (seen["frames"] % 60) / 60
-            cr.set_source_rgb(shade, 0.5, 1 - shade)
+            if marker:
+                cr.set_source_rgb(*(c / 255 for c in dual.MARKER_RGB))
+            else:
+                shade = (seen["frames"] % 60) / 60
+                cr.set_source_rgb(shade, 0.5, 1 - shade)
             cr.paint()
 
         def tick(widget, _clock):
@@ -231,6 +248,47 @@ class Vkms:
             sudo_sh(dual.configfs_teardown(self.path))
 
 
+CORE_PATTERN = Path("/proc/sys/kernel/core_pattern")
+
+
+def enable_cores():
+    """Core dumps of the compositor, the shell and the clients into a
+    private directory, so a crash by signal (a shell restarting with no
+    Rust panic) leaves its backtrace (see `backtraces`). Returns the
+    directory and the kernel's previous core pattern."""
+    cores = Path(tempfile.mkdtemp(prefix="tuna-drm-dual-cores-"))
+    _, hard = resource.getrlimit(resource.RLIMIT_CORE)
+    resource.setrlimit(resource.RLIMIT_CORE, (hard, hard))
+    previous = CORE_PATTERN.read_text().strip()
+    # %E: the executable's path with '!' for '/', to find its symbols.
+    subprocess.run(["sudo", "sysctl", "-qw", f"kernel.core_pattern={cores}/core.%p.%E"], check=True)
+    return cores, previous
+
+
+def backtraces(cores, out):
+    """Put the kernel's core pattern back; write every core's backtrace
+    to `backtrace-<pid>-<exe>.txt` in the artifacts (the cores are too
+    large to keep) and show the crashing thread's in the log."""
+    directory, previous = cores
+    subprocess.run(["sudo", "sysctl", "-qw", f"kernel.core_pattern={previous}"])
+    gdb = shutil.which("gdb")
+    for core in sorted(directory.glob("core.*")):
+        _, pid, exe = core.name.split(".", 2)
+        exe = exe.replace("!", "/")
+        report = out / f"backtrace-{pid}-{Path(exe).name}.txt"
+        if gdb is None:
+            report.write_text(f"{exe} (pid {pid}) dumped core; no gdb to read it\n")
+        else:
+            result = subprocess.run(
+                [gdb, "-q", "-batch", "-nx", "-iex", "set debuginfod enabled off",
+                 "-ex", "bt", "-ex", "thread apply all bt", exe, str(core)],
+                capture_output=True, text=True, timeout=300)
+            report.write_text(result.stdout + result.stderr)
+        print(f"tuna-drm-dual: {exe} (pid {pid}) crashed; backtrace in {report}", flush=True)
+        print("\n".join(report.read_text().splitlines()[:80]), flush=True)
+    shutil.rmtree(directory, ignore_errors=True)
+
+
 def run(args):
     out = Path(args.artifacts).resolve()
     if out.exists() and any(out.iterdir()):
@@ -260,8 +318,10 @@ def run(args):
                     "-p", "tuna-compositor", "-p", "tuna-shell-gtk"], check=True)
 
     env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET")}
+    # Captures from the shell's screenshot UI land here, not in ~/Pictures.
     env.update(XDG_RUNTIME_DIR=str(private), XDG_CONFIG_HOME=str(config),
                XDG_STATE_HOME=str(out / "state"), XDG_DATA_HOME=str(out / "data"),
+               XDG_PICTURES_DIR=str(out / "pictures"),
                GSK_RENDERER="cairo", ADW_DISABLE_PORTAL="1", LIBSEAT_BACKEND="seatd")
     # Ubuntu's gsettings-desktop-schemas has no mutter schema (dynamic and
     # primary-only workspaces, edge tiling): GNOME 51's, as drm-smoke does.
@@ -338,7 +398,9 @@ def run(args):
             wait_for(label, ok, timeout)
         except GateFailure:
             raise GateFailure(f"{label}: {'; '.join(problems)}") from None
-        shutil.copy(state_path, out / f"state-{label.replace(' ', '-')}.json")
+        # upload-artifact refuses NTFS-unsafe names (labels carry colons).
+        name = re.sub(r'[\s"*:<>?|]+', "-", label)
+        shutil.copy(state_path, out / f"state-{name}.json")
 
     def gsettings(*words):
         subprocess.run(["gsettings", "set", *words], env=env, check=True)
@@ -408,6 +470,7 @@ def run(args):
     def window(name):
         return next((w for w in state().get("windows", []) if w.get("app_id") == APP_PREFIX + name), None)
 
+    cores = enable_cores()
     try:
         gate[0] = "D-MIRROR-DISABLE"
         vkms.create()
@@ -437,7 +500,9 @@ def run(args):
             if answer != "ok":
                 raise GateFailure(f"uinput seat answered {answer!r} to {command!r}")
 
-        from gi.repository import Gio, GLib
+        import gi
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf, Gio, GLib
         dbus = Gio.DBusConnection.new_for_address_sync(
             env["DBUS_SESSION_BUS_ADDRESS"],
             Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
@@ -822,6 +887,87 @@ def run(args):
                f"monitors.xml {A} at {frac:g} ({la}x{lha} logical), {B} at 2 ({lb}x{lhb}); the GTK window took "
                f"surface scale {on_a:g} on {A}, {on_b:g} spanning mostly on {B} at {rect[:2]}, {back:g} mostly on "
                f"{A} at {rect_back[:2]}; its pointer events matched the logical pointer each time")
+
+        # D-SCREENSHOT-KEYS-MULTI: GNOME 51's per-monitor screen selectors.
+        gate[0] = "D-SCREENSHOT-KEYS-MULTI"
+        rate_a = next(m[3] for m in listed[A] if m[0] == mode_a)
+        (config / "monitors.xml").write_text(
+            '<monitors version="2"><configuration>'
+            "<logicalmonitor><x>0</x><y>0</y><scale>1</scale><primary>yes</primary>"
+            f"<monitor><monitorspec><connector>{A}</connector></monitorspec><mode><width>{wa}</width>"
+            f"<height>{ha}</height><rate>{rate_a!r}</rate></mode></monitor></logicalmonitor>"
+            f"<logicalmonitor><x>{wa}</x><y>0</y><scale>2</scale><primary>no</primary>"
+            f"<monitor><monitorspec><connector>{B}</connector></monitorspec>{mode_xml}</monitor></logicalmonitor>"
+            "</configuration></monitors>\n")
+        start_session("screenshot")
+        monitors = {A: [0, 0, wa, ha], B: [wa, 0, lb, lhb]}
+        wait_state("screenshot outputs", lambda s: dual.check_outputs(s, monitors))
+        wait_kernel("screenshot-outputs", lambda k: dual.check_extended(k, {A: size, B: f"{wm}x{hm}"}))
+        # The marker client on B, and the pointer left there: GNOME checks
+        # the primary's selector, not the pointer's monitor.
+        open_client(MARKER_CLIENT, B)
+        pos = pointer()
+        if dual.output_overlapping_most([pos[0], pos[1], 1, 1], state()) != B:
+            raise GateFailure(f"the pointer at {pos} is not on {B}")
+        shots_dir = out / "pictures/Screenshots"
+
+        def shots():
+            return set(shots_dir.glob("Screenshot From *.png")) if shots_dir.is_dir() else set()
+
+        def open_screen_mode(label):
+            # GNOME names files to the second: a new second, a new file.
+            time.sleep(1.1)
+            send("tap KEY_SYSRQ")
+            wait_state(f"{label}: Print maps the screenshot UI",
+                       lambda s: dual.check_screenshot_layers(s, monitors))
+            send("tap KEY_C")
+
+        def picture(path):
+            """(size, marker share) of a saved PNG once it reads whole."""
+            def load():
+                try:
+                    return GdkPixbuf.Pixbuf.new_from_file(str(path))
+                except GLib.Error:
+                    return None
+            pb = wait_for(f"{path.name} readable", load, 5)
+            share = dual.color_share(pb.get_pixels(), pb.get_width(), pb.get_height(),
+                                     pb.get_rowstride(), pb.get_n_channels(), dual.MARKER_RGB)
+            return (pb.get_width(), pb.get_height()), share
+
+        def capture(label, keys, expected, marker):
+            before = shots()
+            open_screen_mode(label)
+            for key in keys:
+                send(f"tap {key}")
+            new = wait_for(f"{label}: a new screenshot", lambda: shots() - before, 15)
+            wait_state(f"{label}: the screenshot UI closes", dual.check_no_screenshot_layers)
+            path = sorted(new)[-1]
+            shutil.copy(path, out / f"shot-{label}.png")
+            got, share = picture(path)
+            problems = dual.check_capture(label, got, share, expected, marker)
+            if problems:
+                raise GateFailure("; ".join(problems))
+            return f"{got[0]}x{got[1]} ({share:.0%} marker)"
+
+        shot_a, shot_b = (wa, ha), (wm, hm)
+        first = capture("primary-first", ["KEY_ENTER"], shot_a, False)
+        right = capture("right-twice", ["KEY_RIGHT", "KEY_RIGHT", "KEY_ENTER"], shot_b, True)
+        kept = capture("kept", ["KEY_ENTER"], shot_b, True)
+        before = shots()
+        open_screen_mode("cancel")
+        send("tap KEY_LEFT")
+        send("tap KEY_ESC")
+        wait_state("cancel: Escape closes the screenshot UI", dual.check_no_screenshot_layers)
+        time.sleep(2)
+        if shots() - before:
+            raise GateFailure(f"Escape saved {sorted(p.name for p in shots() - before)}")
+        left = capture("left-before-escape", ["KEY_ENTER"], shot_a, False)
+        close_clients()
+        stop_session()
+        record("D-SCREENSHOT-KEYS-MULTI", True,
+               f"{A} at 1 ({wa}x{ha}), {B} at 2 ({lb}x{lhb} logical, {wm}x{hm}): Print and C mapped one overlay "
+               f"per monitor; with the pointer on {B}, Enter saved {A} {first}; Right Right Enter saved {B} "
+               f"{right}; reopened, Enter kept {B} {kept}; Left Escape saved nothing and Enter then saved {A} {left}")
     except GateFailure as error:
         record(gate[0], False, str(error))
     except Exception as error:  # noqa: BLE001 - the harness failure is the gate's
@@ -861,6 +1007,7 @@ def run(args):
         except subprocess.CalledProcessError as error:
             print(f"tuna-drm-dual: vkms teardown: {error}", file=sys.stderr)
         shutil.rmtree(private, ignore_errors=True)
+        backtraces(cores, out)
     if not recorded or any(" fail " in line for line in recorded):
         raise SystemExit(f"tuna-drm-dual: failed; evidence in {out}")
     print(f"tuna-drm-dual: OK, artifacts in {out}")

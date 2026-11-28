@@ -133,11 +133,15 @@ class Selection(unittest.TestCase):
                           "remote-security", "arch-package", "marlin-vm", "parity-ledger"])
         self.assertEqual(pr("scripts/tuna-orca-speech-proof"), ["orca-speech"])
         self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
-        # The VM lane's host-side gate modules and V-TRAY's fixture.
+        # The VM lane's host-side gate modules, their guest probes and V-TRAY's fixture.
         for path in ("scripts/lib/vm_app_integration.py", "scripts/lib/vm_desktop_gates.py",
-                     "packaging/marlin/vm-lane/tuna-vm-desktop-gates"):
+                     "packaging/marlin/vm-lane/tuna-vm-desktop-gates", "scripts/lib/vm_wm_gates.py",
+                     "packaging/marlin/vm-lane/tuna-vm-wm-gates"):
             self.assertIn("marlin-vm", pr(path, size=0), path)
         self.assertEqual(pr("scripts/lib/vm_desktop_gates.py"), ["arch-package", "marlin-vm"])
+        self.assertEqual(pr("scripts/lib/vm_wm_gates.py"), ["arch-package", "marlin-vm"])
+        self.assertEqual(pr("packaging/marlin/vm-lane/tuna-vm-wm-gates"),
+                         ["arch-package", "marlin-image", "marlin-vm"])
         self.assertEqual(pr("scripts/lib/tuna-tray-item-stub.py"),
                          ["journey", "gtk-shell", "arch-package", "marlin-vm"])
         # The GTK proof sources the top bar and dash slice; only gtk-shell
@@ -322,6 +326,20 @@ class Selection(unittest.TestCase):
         lanes = pr("crates/compositor/src/runtime_surface_order_tests.rs", run=3)
         self.assertIn("gtk-shell", lanes)
         self.assertGreater(len(lanes), 1)
+
+    def test_screenshot_screen_selectors_run_the_two_output_leg(self):
+        # D-SCREENSHOT-KEYS-MULTI (scripts/tuna-drm-dual, drm-smoke) proves
+        # the per-monitor screen selectors; the GTK shell proof their keys.
+        for path in ("crates/shell-gtk/src/screenshot_ui.rs",
+                     "crates/shell-gtk/src/screenshot_screens.rs"):
+            for run in range(len(m.ROTATION)):
+                with self.subTest(path=path, run=run):
+                    self.assertEqual(pr(path, run=run),
+                                     ["drm-smoke", "desktop-proofs", "gtk-shell"])
+        # Control: the area selection's keys still rotate lanes.
+        lanes = pr("crates/shell-gtk/src/screenshot_selection.rs", run=3)
+        self.assertIn("gtk-shell", lanes)
+        self.assertEqual(set(m.rotation(3, 2)) - set(lanes), set())
 
     def test_pull_requests_never_rotate_the_push_only_image_lane(self):
         self.assertNotIn("marlin-image", m.ROTATION)
