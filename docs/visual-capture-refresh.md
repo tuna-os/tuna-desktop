@@ -25,7 +25,10 @@ The ordinary CI run produces:
   or elapsed startup sleep is not readiness. Retained packet timestamps,
   byte-prefix hashes and realtime/monotonic clock sandwiches bind every input
   and UI observation to actual recorded frames; a late recorder fails instead
-  of moving the journey clock.
+  of moving the journey clock. Every input and read checks the compositor's
+  process start time and executable inode; its executable bytes are hashed
+  before the journey and after the last read, since hashing the debug binary
+  takes about half a second and would eat into the one-second boundary.
 
 Each native hero needs positive evidence for its exact retained PNG, not
 merely a tag or an empty failure list. Overview and Alt-Tab reuse the existing

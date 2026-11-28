@@ -161,9 +161,10 @@ in Settings and restarting grd end the session, and a new connection works
 afterwards.
 
 Not covered: RecordVirtual (so grd's extend mode and remote login through
-GDM's headless sessions), cursor metadata (`cursor-mode` is ignored; frames
-carry no pointer, grd sends no pointer updates and the RDP client keeps its
-local pointer, so pointer shapes are not mirrored), `disable-animations`,
+GDM's headless sessions), cursor metadata (`cursor-mode` metadata is treated as hidden: embedded
+(1) draws the pointer into monitor and area frames, but hidden and metadata
+frames carry no pointer, so grd sends no pointer updates and the RDP client
+keeps its local pointer, so pointer shapes are not mirrored), `disable-animations`,
 touch, smartcard and Kerberos redirection, and physical hardware. The
 published Marlin image does not ship gnome-remote-desktop, so Settings shows
 no Remote Desktop row there.

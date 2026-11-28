@@ -85,6 +85,15 @@ impl Service {
             );
         }
     }
+
+    /// shellDBus.js relays screenShield's `wake-up-screen` as
+    /// `WakeUpScreen`; gnome-settings-daemon's power plugin answers it by
+    /// keeping the display on for a while (`handle_wake_up_screen`).
+    pub fn wake_up_screen(&self) {
+        if let Some(conn) = self.conn.borrow().as_ref() {
+            let _ = conn.emit_signal(None, PATH, NAME, "WakeUpScreen", None);
+        }
+    }
 }
 
 pub fn start(lock: Lock, active: Active) -> Rc<Service> {
