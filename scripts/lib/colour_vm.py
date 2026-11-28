@@ -59,7 +59,9 @@ def run(qmp, agent_factory, out, image, inventory, vm):
         raise RuntimeError('final installed helper differs from executing source checkout')
     expected_source = source_digest(source_files(root))
     destination = Path(out) / 'native-colour-capture'
-    destination.mkdir(mode=0o700, exist_ok=False)
+    # `out` is the lane's own colour/ subdirectory (the ledger reads
+    # colour/native-colour-capture/), which nothing else creates.
+    destination.mkdir(mode=0o700, parents=True, exist_ok=False)
     nonce = secrets.token_hex(16)
     receipt = {'schema': 1, 'scope': 'additional DEV native Arch/virgl colour import and production capture consumers',
                'nonce': nonce, 'image_admission': image, 'session_owner': owner,
