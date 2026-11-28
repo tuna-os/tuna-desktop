@@ -395,13 +395,23 @@ def _papers(desktop):
         require(_text_bytes(clipboard).decode() == expected, 'actual selected PDF copy differs from decoded source content')
         return {'actual_document': observed, 'clipboard': clipboard}
     evidence['document'] = copy_document(actor, 'initial')
+    # Papers 51's zoom toolbar is Fit Automatically, Zoom In and Zoom Out,
+    # with no percentage label left to read (run 46095497198: no node text
+    # matched "NNN%" after Zoom In). The zoom is what the user sees: the
+    # decoded paragraph's rendered extents, which grew from 576x288 to
+    # 691x346 on one Zoom In. Its size, unlike its place, is independent
+    # of the window size and scroll a restart may change.
+    def zoom(tree):
+        found = [node['bounds'][2:] for node in nodes(tree) if node['showing'] and node['role'] == 'paragraph'
+                 and node['text'] == expected and node['bounds'] is not None]
+        return found[0] if len(found) == 1 else None
+    fitted = zoom(desktop.tree(actor))
+    require(fitted is not None, 'actual decoded PDF paragraph extents unavailable before zoom')
     press(desktop, actor, 'Zoom In')
-    def zoom(current):
-        return unique(desktop.tree(current), lambda node: node.get('text') is not None
-                      and re.fullmatch(r'[0-9]+(?:[.,][0-9]+)?%', node['text']) is not None,
-                      'actual PDF zoom percentage control')['text']
-    wanted_zoom = zoom(actor)
-    evidence['zoom'] = {'actual_user_value': wanted_zoom,
+    zoomed = desktop.await_state('papers-real-zoom-in', lambda: desktop.tree(actor),
+        lambda tree: zoom(tree) is not None and all(after > before for after, before in zip(zoom(tree), fitted)))
+    wanted_zoom = zoom(zoomed)
+    evidence['zoom'] = {'fitted_rendered_size': fitted, 'actual_user_value': wanted_zoom,
                         'independent': desktop.guest('basic', 'viewer-state', relative='principal.pdf', app_id=actor['id'])}
     desktop.keys('ctrl', 'f')
     search = unique(desktop.tree(actor), lambda node: node['showing'] and node['focused'] and node['editable'],
@@ -431,7 +441,8 @@ def _papers(desktop):
         return value | {'independent_metadata': desktop.guest('basic', 'viewer-state', relative='principal.pdf', app_id=current['id']), 'files': files}
     def restarted(current, stage):
         opened = desktop.open_file(current, path, cancel_first=False)
-        require(zoom(current) == wanted_zoom, 'actual PDF document zoom did not persist across frontend restart')
+        desktop.await_state('papers-real-zoom-restored', lambda: desktop.tree(current),
+                            lambda tree: zoom(tree) == wanted_zoom)
         return {'real_reopen': opened, 'consumer': probe(current, stage)}
     evidence['crosscut'] = desktop.crosscut(actor, probe, restart_probe=restarted)
     return desktop.result(actor, 'native-PDF-content-selection-clipboard-search-IME-link-and-document-zoom-persistence', evidence,
