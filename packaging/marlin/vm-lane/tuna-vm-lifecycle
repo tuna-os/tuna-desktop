@@ -2738,6 +2738,10 @@ def main():
     # V-MINIMIZE-ANIMATION, V-TRAY, the V-MULTI-OUTPUT placed window).
     if action.startswith("gates-"):
         os.execv("/usr/libexec/tuna-vm-desktop-gates", ["tuna-vm-desktop-gates", *sys.argv[1:]])
+    # Installed window-manager gates (V-WINDOW-MENU, V-X11-INPUT-FOCUS,
+    # V-X11-ICONIC, V-X11-RESTART).
+    if action.startswith("wm-"):
+        os.execv("/usr/libexec/tuna-vm-wm-gates", ["tuna-vm-wm-gates", *sys.argv[1:]])
     if action == "core-apps":
         sys.path.insert(0, "/usr/libexec/tuna-core-apps")
         import guest as core_apps_guest
