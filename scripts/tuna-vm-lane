@@ -1161,7 +1161,7 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     buttons_reported = any("middle_emulation_available" in d for d in devices_now)
     if not buttons_reported:
         raise RuntimeError("guest does not report libinput middle-click and scroll-button state")
-    wheel_available = False
+    wheel_available = custom_available = False
     try:
         def pointer_live_matches(speed, natural, profile=None, middle=None, wheel=None):
             def matches(value):
@@ -1234,6 +1234,55 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                                                     restored_middle, restored_wheel),
                                label="pointer-live-restored")
         pointer_live.append({"restored": restored["state"]["input_devices"]})
+        # GNOME's custom acceleration curve (protocol 0.52) is mandatory on
+        # both acquisitions: the guest reports per-device availability. The
+        # curve reaches libinput as the custom profile; a curve libinput
+        # rejects leaves the device default (Mutter's
+        # set_device_accel_profile); a curve Mutter itself rejects (zero
+        # step) is replaced by Mutter's fallback curve, so the device is
+        # custom again.
+        custom_reported = any("accel_custom_available" in d for d in devices_now)
+        if not custom_reported:
+            raise RuntimeError("guest does not report custom acceleration availability")
+        def custom_mice(devices):
+            # Names are not unique: QEMU's relative and absolute VMMouse
+            # share one, but only the relative device offers acceleration.
+            return [d for d in devices
+                    if d.get("accel_custom_available") and d["kind"] == "pointer"
+                    and not d.get("trackball") and not d.get("pointing_stick")]
+        custom_names = sorted(d["name"] for d in custom_mice(devices_now))
+        if not custom_names:
+            raise RuntimeError("strict guest has no mouse offering libinput's custom acceleration profile")
+        def custom_profile(expect_custom):
+            def matches(value):
+                mice = custom_mice(value["state"].get("input_devices", []))
+                return (sorted(d["name"] for d in mice) == custom_names
+                        and all((d["accel_profile"] == "custom") is expect_custom
+                                for d in mice))
+            return matches
+        curve = agent.run("mouse-custom-accel", "0.5", "0.0,0.5,1.0,2.0")
+        custom_available = curve["available"]
+        if not custom_available:
+            raise RuntimeError("strict guest mouse schema lacks GNOME 51 custom-accel-config")
+        if not curve["stored"]:
+            raise RuntimeError("GNOME mouse custom-accel-config did not persist")
+        if not agent.run("mouse-accel", "custom")["stored"]:
+            raise RuntimeError("GNOME mouse custom acceleration profile did not persist")
+        for label, step, speeds, expect_custom in (
+                ("pointer-custom", "0.5", "0.0,0.5,1.0,2.0", True),
+                # 65 points with a negative speed: libinput refuses it.
+                ("pointer-custom-rejected", "1.0",
+                 ",".join(["-1.0"] + [f"{i}.0" for i in range(64)]), False),
+                # A zero step: Mutter's fallback curve [0.0, 1.0].
+                ("pointer-custom-fallback", "0.0", "0.0,2.0", True)):
+            if not agent.run("mouse-custom-accel", step, speeds)["stored"]:
+                raise RuntimeError(f"GNOME mouse custom-accel-config for {label} did not persist")
+            observed = await_state(custom_profile(expect_custom), label=label)
+            pointer_live.append({label: observed["state"]["input_devices"]})
+        agent.run("mouse-accel", "default")
+        agent.run("mouse-custom-accel-reset")
+        observed = await_state(custom_profile(False), label="pointer-custom-restored")
+        pointer_live.append({"pointer-custom-restored": observed["state"]["input_devices"]})
         covered = "speed/natural-scroll"
         if profiles_reported:
             covered += "/acceleration profile (flat then adaptive)"
@@ -1241,6 +1290,9 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
             covered += "/middle-click emulation"
         if wheel_available:
             covered += "/scroll-wheel emulation (button 2 with lock, then off)"
+        if custom_available:
+            covered += ("/custom acceleration curve (applied, libinput-rejected curve keeps the"
+                        " device default, Mutter fallback curve, restored)")
         record("V-POINTER-LIVE", True,
                f"GNOME mouse {covered} reach live libinput device state and restore; availability-gated per device")
     finally:
@@ -1248,6 +1300,8 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         agent.run("mouse-natural", "false")
         if profiles_reported:
             agent.run("mouse-accel", "default")
+        if custom_available:
+            agent.run("mouse-custom-accel-reset")
         if buttons_reported:
             agent.run("mouse-middle", "false")
         if wheel_available:
@@ -2294,29 +2348,39 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
              "devices": mice, "relative_inputs": corner_inputs,
              "primary_error": constraint_primary_error})
 
-    if strip_image is not None:
-        from vm_strip_acceptance import prove_installed_strip
-        if reconnect is None:
-            raise RuntimeError("installed acceptance needs independent cleanup transport")
+    def on_tablet(name, body):
         # QMP routes absolute motion to the HID tablet but buttons to the
         # current mouse handler, here the relative virtio mouse: two guest
         # devices with no mutual ordering. A press sent right after a move
         # reached libinput first and landed at the previous pointer position,
         # so the strip focus click never reached Alpha. Like one physical
-        # mouse, the tablet carries both motion and buttons for this proof.
-        strip_mouse = {"selected": select_corner_mouse(qmp, False)}
+        # mouse, the tablet carries both motion and buttons for these proofs.
+        selection = {"selected": select_corner_mouse(qmp, False)}
         try:
-            prove_installed_strip(qmp, agent, reconnect, out, strip_image, read_ppm, record, edge=strip_edge)
+            body()
         finally:
-            strip_primary = sys.exc_info()[1]
+            primary = sys.exc_info()[1]
             try:
-                strip_mouse["restored"] = restore_corner_mouse(qmp, original_mouse)
+                selection["restored"] = restore_corner_mouse(qmp, original_mouse)
             except Exception as error:
-                if strip_primary is None:
+                if primary is None:
                     raise
-                strip_mouse["restoration_error"] = str(error)
-            with open(os.path.join(evidence, "strip-input-mouse.json"), "w") as stream:
-                json.dump(strip_mouse, stream, indent=2)
+                selection["restoration_error"] = str(error)
+            with open(os.path.join(evidence, f"{name}-input-mouse.json"), "w") as stream:
+                json.dump(selection, stream, indent=2)
+
+    if strip_image is not None:
+        from vm_strip_acceptance import prove_installed_strip
+        if reconnect is None:
+            raise RuntimeError("installed acceptance needs independent cleanup transport")
+        on_tablet("strip", lambda: prove_installed_strip(qmp, agent, reconnect, out, strip_image, read_ppm,
+                                                         record, edge=strip_edge))
+
+    # Installed desktop gates (P-IN-03, P-WM-06, P-WM-05, P-AN-03, P-TR-01):
+    # real GTK clients and a StatusNotifierItem as the session user. Each
+    # gate records its own result; only unconfirmed fixture cleanup raises.
+    from vm_desktop_gates import run as run_desktop_gates
+    on_tablet("desktop-gates", lambda: run_desktop_gates(qmp, agent, out, record, read_ppm))
 
     # Capture the stable desktop after the final key OSD has disappeared.
     time.sleep(2)
@@ -4551,7 +4615,7 @@ def main():
                 try:
                     app_integration.run(qmp, lambda: guest_agent.GuestAgent(agent_path), out, record, display_bus)
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-                    for gate in ("V-PICKER", "V-INTROSPECT-SCREEN", "V-INTROSPECT-SANDBOX"):
+                    for gate in app_integration.GATES:
                         results.setdefault(gate, (False, f"app-integration failed: {error}"))
                         log(f"{gate} FAIL: app-integration failed: {error}")
         # Give activation probes a bounded chance to report before shutdown.
@@ -4573,7 +4637,7 @@ def main():
             shutil.rmtree(display_dir, ignore_errors=True)
 
     if a.app_integration:
-        for gate in ("V-PICKER", "V-INTROSPECT-SCREEN", "V-INTROSPECT-SANDBOX"):
+        for gate in app_integration.GATES:
             results.setdefault(gate, (False, "session never came up; app-integration not run"))
     text = read_text(serial_path)
     drm = drm or DRM_RE.search(text)
@@ -4583,6 +4647,10 @@ def main():
            "tuna-shell-gtk started under supervision" if shell
            else "no tuna-shell-gtk: keybindings line")
     results.setdefault("V-PANEL", (False, "session never came up, no screendump checked"))
+    if a.tour:
+        from vm_desktop_gates import GATES as DESKTOP_GATES
+        for gate in DESKTOP_GATES:
+            results.setdefault(gate, (False, "the lifecycle never reached the installed desktop gates"))
     if a.profile == "autotz":
         results.setdefault("V-AUTOTZ", (False, "native session never admitted; required consumer did not run"))
     if a.soak:

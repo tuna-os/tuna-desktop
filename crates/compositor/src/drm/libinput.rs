@@ -10,15 +10,123 @@
 //! trackballs and pointing sticks carry the udev `ID_INPUT_TRACKBALL` /
 //! `ID_INPUT_POINTINGSTICK` property on the device or its parent.
 //!
-//! What the pinned bindings (input 0.9 / input-sys 1.19) cannot express
-//! falls back to the device default and is reported unsupported in the
-//! device snapshot: custom acceleration curves, the touchpad
-//! disable-while-typing timeout, and sticky (rather than timeout) tap
-//! drag lock.
+//! Calls newer than the pinned bindings' libinput 1.19 API are resolved
+//! from the libinput the compositor runs against (custom acceleration
+//! curves, 1.23; the disable-while-typing timeout, 1.31), or passed as
+//! raw values (sticky tap drag lock, 1.27). Where the running libinput
+//! lacks one, the device keeps its default and the device snapshot
+//! reports the option unavailable.
+
+use std::ffi::CStr;
 
 use smithay::reexports::input as li;
 use smithay::reexports::input::AsRaw;
 use tuna_shell_control as shell;
+
+/// A libinput function newer than the pinned bindings, from the libinput
+/// this process runs against.
+pub(super) fn libinput_symbol(name: &CStr) -> Option<*mut libc::c_void> {
+    // SAFETY: dlsym with RTLD_DEFAULT and a NUL-terminated name only looks
+    // the symbol up in the already loaded objects.
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    (!symbol.is_null()).then_some(symbol)
+}
+
+const CONFIG_SUCCESS: u32 = li::ffi::libinput_config_status_LIBINPUT_CONFIG_STATUS_SUCCESS;
+const ACCEL_NONE: u32 = li::ffi::libinput_config_accel_profile_LIBINPUT_CONFIG_ACCEL_PROFILE_NONE;
+const ACCEL_FLAT: u32 = li::ffi::libinput_config_accel_profile_LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT;
+const ACCEL_ADAPTIVE: u32 =
+    li::ffi::libinput_config_accel_profile_LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE;
+/// `LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM` (libinput.h since 1.23).
+const ACCEL_CUSTOM: u32 = 1 << 2;
+/// `LIBINPUT_ACCEL_TYPE_MOTION` (libinput.h since 1.23).
+const ACCEL_TYPE_MOTION: u32 = 1;
+const DRAG_LOCK_DISABLED: u32 =
+    li::ffi::libinput_config_drag_lock_state_LIBINPUT_CONFIG_DRAG_LOCK_DISABLED;
+/// `LIBINPUT_CONFIG_DRAG_LOCK_ENABLED_TIMEOUT`, the bindings' `ENABLED`.
+const DRAG_LOCK_TIMEOUT: u32 =
+    li::ffi::libinput_config_drag_lock_state_LIBINPUT_CONFIG_DRAG_LOCK_ENABLED;
+/// `LIBINPUT_CONFIG_DRAG_LOCK_ENABLED_STICKY` (libinput.h since 1.27);
+/// older libinput rejects it as invalid.
+const DRAG_LOCK_STICKY: u32 = 2;
+
+type AccelCreate = unsafe extern "C" fn(u32) -> *mut libc::c_void;
+type AccelDestroy = unsafe extern "C" fn(*mut libc::c_void);
+// libinput does not write through `points` (Mutter casts away const too).
+type AccelSetPoints = unsafe extern "C" fn(*mut libc::c_void, u32, f64, usize, *const f64) -> u32;
+type AccelApply = unsafe extern "C" fn(*mut li::ffi::libinput_device, *mut libc::c_void) -> u32;
+type DwtSetTimeout = unsafe extern "C" fn(*mut li::ffi::libinput_device, u32) -> u32;
+type DwtGetTimeout = unsafe extern "C" fn(*mut li::ffi::libinput_device) -> u32;
+
+/// Whether this libinput has the custom acceleration calls (1.23).
+fn custom_accel_calls_present() -> bool {
+    [
+        c"libinput_config_accel_create",
+        c"libinput_config_accel_set_points",
+        c"libinput_device_config_accel_apply",
+        c"libinput_config_accel_destroy",
+    ]
+    .into_iter()
+    .all(|name| libinput_symbol(name).is_some())
+}
+
+/// Mutter's `set_device_accel_profile` custom branch: a motion curve
+/// applied to the device. False when libinput lacks the calls or rejects
+/// the curve, so the caller falls back to the device default.
+fn apply_custom_curve(device: &li::Device, curve: &shell::CustomAccelCurve) -> bool {
+    let (Some(create), Some(set_points), Some(apply), Some(destroy)) = (
+        libinput_symbol(c"libinput_config_accel_create"),
+        libinput_symbol(c"libinput_config_accel_set_points"),
+        libinput_symbol(c"libinput_device_config_accel_apply"),
+        libinput_symbol(c"libinput_config_accel_destroy"),
+    ) else {
+        return false;
+    };
+    // SAFETY: the symbols are libinput's own with these C signatures
+    // (libinput.h since 1.23); the config is created, used and destroyed
+    // here, `speeds` outlives the call and the device pointer is live.
+    unsafe {
+        let create: AccelCreate = std::mem::transmute(create);
+        let set_points: AccelSetPoints = std::mem::transmute(set_points);
+        let apply: AccelApply = std::mem::transmute(apply);
+        let destroy: AccelDestroy = std::mem::transmute(destroy);
+        let config = create(ACCEL_CUSTOM);
+        if config.is_null() {
+            return false;
+        }
+        let applied = set_points(
+            config,
+            ACCEL_TYPE_MOTION,
+            curve.step,
+            curve.speeds.len(),
+            curve.speeds.as_ptr(),
+        ) == CONFIG_SUCCESS
+            && apply(device.as_raw_mut(), config) == CONFIG_SUCCESS;
+        destroy(config);
+        applied
+    }
+}
+
+/// `libinput_device_config_dwt_set_timeout` (libinput 1.31); `None` when
+/// this libinput has no such call, else whether libinput accepted it.
+fn set_dwt_timeout(device: &li::Device, millis: u32) -> Option<bool> {
+    let set = libinput_symbol(c"libinput_device_config_dwt_set_timeout")?;
+    // SAFETY: libinput.h since 1.31; the device pointer is live.
+    unsafe {
+        let set: DwtSetTimeout = std::mem::transmute(set);
+        Some(set(device.as_raw_mut(), millis) == CONFIG_SUCCESS)
+    }
+}
+
+/// `libinput_device_config_dwt_get_timeout` (libinput 1.31).
+fn dwt_timeout(device: &li::Device) -> Option<u32> {
+    let get = libinput_symbol(c"libinput_device_config_dwt_get_timeout")?;
+    // SAFETY: libinput.h since 1.31; the device pointer is live.
+    unsafe {
+        let get: DwtGetTimeout = std::mem::transmute(get);
+        Some(get(device.as_raw_mut()))
+    }
+}
 
 /// Mutter's `ClutterInputCapabilities` that pick a settings family.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -78,6 +186,7 @@ pub struct TouchpadPolicy {
     pub tap_and_drag: bool,
     pub tap_and_drag_lock: bool,
     pub disable_while_typing: bool,
+    pub disable_while_typing_timeout_ms: u32,
     pub send_events: shell::SendEvents,
     pub click_method: shell::TouchpadClickMethod,
 }
@@ -103,13 +212,15 @@ pub enum ScrollPolicy {
 /// One device's libinput configuration, resolved from GNOME's settings
 /// for its [`DeviceCaps`]. `None` leaves that option alone: no GNOME key
 /// applies to the device class.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LibinputPolicy {
     pub left_handed: Option<bool>,
     pub natural_scroll: Option<bool>,
     /// GNOME's -1..1.
     pub speed: Option<f64>,
     pub accel_profile: Option<shell::PointerAccelProfile>,
+    /// The same class's `custom-accel-config`, after Mutter's fallback.
+    pub custom_accel: Option<shell::CustomAccelCurve>,
     pub middle_click_emulation: Option<bool>,
     pub touchpad: Option<TouchpadPolicy>,
     pub scroll: Option<ScrollPolicy>,
@@ -125,20 +236,32 @@ pub fn libinput_policy(
 ) -> LibinputPolicy {
     let speed = |milli: i32| f64::from(milli.clamp(-1000, 1000)) / 1000.0;
     let mouse = caps.is_mouse();
-    // Later entries win, in `apply_device_settings` order.
-    let last = |entries: &[(bool, shell::PointerAccelProfile)]| {
-        entries
-            .iter()
-            .rev()
-            .find(|(applies, _)| *applies)
-            .map(|e| e.1)
-    };
-    let accel_profile = last(&[
-        (mouse, settings.mouse_accel_profile),
-        (caps.touchpad, settings.touchpad.accel_profile),
-        (caps.trackball, settings.trackball.accel_profile),
-        (caps.pointing_stick, settings.pointing_stick.accel_profile),
-    ]);
+    // Later entries win, in `apply_device_settings` order; each class
+    // passes its own profile and curve (`update_pointer_accel_profile`).
+    let curves = &settings.custom_accel;
+    let accel = [
+        (mouse, settings.mouse_accel_profile, &curves.mouse),
+        (
+            caps.touchpad,
+            settings.touchpad.accel_profile,
+            &curves.touchpad,
+        ),
+        (
+            caps.trackball,
+            settings.trackball.accel_profile,
+            &curves.trackball,
+        ),
+        (
+            caps.pointing_stick,
+            settings.pointing_stick.accel_profile,
+            &curves.pointing_stick,
+        ),
+    ]
+    .into_iter()
+    .rev()
+    .find(|(applies, ..)| *applies);
+    let accel_profile = accel.map(|(_, profile, _)| profile);
+    let custom_accel = accel.map(|(_, _, curve)| curve.or_mutter_fallback());
     let middle_click_emulation = [
         (mouse, settings.mouse.middle_click_emulation),
         (caps.touchpad, settings.touchpad.middle_click_emulation),
@@ -193,6 +316,7 @@ pub fn libinput_policy(
             None
         },
         accel_profile,
+        custom_accel,
         middle_click_emulation,
         touchpad: caps.touchpad.then_some(TouchpadPolicy {
             tap_to_click: settings.tap_to_click,
@@ -200,6 +324,7 @@ pub fn libinput_policy(
             tap_and_drag: settings.touchpad.tap_and_drag,
             tap_and_drag_lock: settings.touchpad.tap_and_drag_lock,
             disable_while_typing: settings.disable_while_typing,
+            disable_while_typing_timeout_ms: settings.disable_while_typing_timeout_ms,
             send_events: settings.touchpad.send_events,
             click_method: settings.touchpad.click_method,
         }),
@@ -305,22 +430,25 @@ pub fn tap_button_map(
     }
 }
 
-/// Mutter's `set_device_accel_profile`: the requested profile if the
-/// device has it, else the device default. Custom curves cannot be set
-/// through the pinned bindings and take the default as well.
+/// Mutter's `set_device_accel_profile` choice: the requested profile if
+/// the device has it, else the device default. Values and the
+/// `available` mask are `libinput_config_accel_profile` bits.
 pub fn resolve_accel_profile(
     requested: shell::PointerAccelProfile,
-    available: &[li::AccelProfile],
-    default: Option<li::AccelProfile>,
-) -> Option<li::AccelProfile> {
+    available: u32,
+    default: u32,
+) -> u32 {
     let desired = match requested {
-        shell::PointerAccelProfile::Flat => Some(li::AccelProfile::Flat),
-        shell::PointerAccelProfile::Adaptive => Some(li::AccelProfile::Adaptive),
-        shell::PointerAccelProfile::Default | shell::PointerAccelProfile::Custom => None,
+        shell::PointerAccelProfile::Flat => ACCEL_FLAT,
+        shell::PointerAccelProfile::Adaptive => ACCEL_ADAPTIVE,
+        shell::PointerAccelProfile::Custom => ACCEL_CUSTOM,
+        shell::PointerAccelProfile::Default => default,
     };
-    desired
-        .filter(|profile| available.contains(profile))
-        .or(default)
+    if available & desired == 0 {
+        default
+    } else {
+        desired
+    }
 }
 
 /// Whether this touchpad counts toward Mutter's `two_finger_devices`.
@@ -357,7 +485,7 @@ pub fn apply(settings: &shell::InputSettings, device: &mut li::Device, two_finge
         apply_handedness(device, left_handed);
     }
     if let Some(profile) = policy.accel_profile {
-        apply_accel_profile(device, profile);
+        apply_accel_profile(device, profile, policy.custom_accel.as_ref());
     }
     if let Some(touchpad) = policy.touchpad {
         apply_touchpad(device, touchpad);
@@ -435,16 +563,19 @@ fn apply_touchpad(device: &mut li::Device, policy: TouchpadPolicy) {
             device,
             "tap-and-drag",
         );
-        // The bindings only name LIBINPUT_CONFIG_DRAG_LOCK_ENABLED (libinput
-        // >= 1.27 calls it ENABLED_TIMEOUT); Mutter 51 asks for STICKY.
-        report(
-            device.config_tap_set_drag_lock_enabled(policy.tap_and_drag_lock),
-            device,
-            "tap-and-drag lock",
-        );
+        apply_drag_lock(device, policy.tap_and_drag_lock);
     }
     if device.config_dwt_is_available() {
         let _ = device.config_dwt_set_enabled(policy.disable_while_typing);
+        // libinput without the call keeps its own timeout; the snapshot
+        // reports `dwt_timeout_available: false`.
+        if set_dwt_timeout(device, policy.disable_while_typing_timeout_ms) == Some(false) {
+            eprintln!(
+                "tuna-compositor: libinput: disable-while-typing timeout {} ms rejected for {}",
+                policy.disable_while_typing_timeout_ms,
+                device.name()
+            );
+        }
     }
     // libinput itself suspends a DISABLED_ON_EXTERNAL_MOUSE touchpad while
     // an external mouse is present, across mouse hotplug.
@@ -505,26 +636,75 @@ fn apply_scroll_button(device: &mut li::Device, emulation: shell::ScrollWheelEmu
     });
 }
 
-fn apply_accel_profile(device: &mut li::Device, requested: shell::PointerAccelProfile) {
-    let available = device.config_accel_profiles();
-    let selected =
-        resolve_accel_profile(requested, &available, device.config_accel_default_profile());
-    let exact = match requested {
-        shell::PointerAccelProfile::Flat => Some(li::AccelProfile::Flat),
-        shell::PointerAccelProfile::Adaptive => Some(li::AccelProfile::Adaptive),
-        shell::PointerAccelProfile::Default | shell::PointerAccelProfile::Custom => None,
+/// Mutter's `set_tap_and_drag_lock_enabled`: sticky drag lock or none.
+/// A libinput older than 1.27 has no sticky mode and rejects it; that
+/// device gets libinput's timeout drag lock, which the snapshot shows.
+fn apply_drag_lock(device: &li::Device, enabled: bool) {
+    let set = |state: u32| {
+        // SAFETY: `device` owns a live libinput_device reference; libinput
+        // validates the state value.
+        unsafe {
+            li::ffi::libinput_device_config_tap_set_drag_lock_enabled(device.as_raw_mut(), state)
+        }
     };
-    if requested == shell::PointerAccelProfile::Custom {
-        eprintln!("tuna-compositor: libinput: custom pointer acceleration is unsupported by the compositor for {}; using device default", device.name());
-    } else if exact.is_some() && selected != exact {
-        eprintln!("tuna-compositor: libinput: requested pointer acceleration profile unsupported for {}; using device default", device.name());
-    }
-    if let Some(profile) = selected {
-        report(
-            device.config_accel_set_profile(profile),
-            device,
-            "pointer acceleration profile",
+    if !enabled {
+        if set(DRAG_LOCK_DISABLED) != CONFIG_SUCCESS {
+            eprintln!(
+                "tuna-compositor: libinput: tap-and-drag lock rejected for {}",
+                device.name()
+            );
+        }
+    } else if set(DRAG_LOCK_STICKY) != CONFIG_SUCCESS {
+        eprintln!(
+            "tuna-compositor: libinput: sticky tap-and-drag lock unsupported for {}; using the timeout drag lock",
+            device.name()
         );
+        if set(DRAG_LOCK_TIMEOUT) != CONFIG_SUCCESS {
+            eprintln!(
+                "tuna-compositor: libinput: tap-and-drag lock rejected for {}",
+                device.name()
+            );
+        }
+    }
+}
+
+/// Mutter's `set_device_accel_profile`, custom curves included.
+fn apply_accel_profile(
+    device: &li::Device,
+    requested: shell::PointerAccelProfile,
+    curve: Option<&shell::CustomAccelCurve>,
+) {
+    let raw = device.as_raw_mut();
+    // SAFETY: `device` owns a live libinput_device reference.
+    let (available, default) = unsafe {
+        (
+            li::ffi::libinput_device_config_accel_get_profiles(raw),
+            li::ffi::libinput_device_config_accel_get_default_profile(raw),
+        )
+    };
+    let mut profile = resolve_accel_profile(requested, available, default);
+    if requested != shell::PointerAccelProfile::Default && profile == default {
+        let wanted = resolve_accel_profile(requested, u32::MAX, default);
+        if wanted != default {
+            eprintln!("tuna-compositor: libinput: requested pointer acceleration profile unsupported for {}; using device default", device.name());
+        }
+    }
+    if profile == ACCEL_CUSTOM && !curve.is_some_and(|curve| apply_custom_curve(device, curve)) {
+        eprintln!(
+            "tuna-compositor: libinput: custom pointer acceleration {curve:?} rejected for {}; using device default",
+            device.name()
+        );
+        profile = default;
+    }
+    if profile != ACCEL_NONE {
+        // SAFETY: as above.
+        let status = unsafe { li::ffi::libinput_device_config_accel_set_profile(raw, profile) };
+        if status != CONFIG_SUCCESS {
+            eprintln!(
+                "tuna-compositor: libinput: pointer acceleration profile rejected for {}",
+                device.name()
+            );
+        }
     }
 }
 
@@ -569,12 +749,24 @@ fn scroll_method(bits: u32) -> Option<li::ScrollMethod> {
     .find(|method| scroll_bits(*method) == bits)
 }
 
-fn accel_profile_name(profile: li::AccelProfile) -> &'static str {
+/// A `libinput_config_accel_profile` value's GNOME nick; `None` for a
+/// device without acceleration.
+fn accel_profile_name(profile: u32) -> Option<&'static str> {
     match profile {
-        li::AccelProfile::Flat => "flat",
-        li::AccelProfile::Adaptive => "adaptive",
-        _ => "unknown",
+        ACCEL_NONE => None,
+        ACCEL_FLAT => Some("flat"),
+        ACCEL_ADAPTIVE => Some("adaptive"),
+        ACCEL_CUSTOM => Some("custom"),
+        _ => Some("unknown"),
     }
+}
+
+fn accel_profile_names(profiles: u32) -> Vec<&'static str> {
+    [ACCEL_FLAT, ACCEL_ADAPTIVE, ACCEL_CUSTOM]
+        .into_iter()
+        .filter(|bit| profiles & bit != 0)
+        .filter_map(accel_profile_name)
+        .collect()
 }
 
 fn scroll_method_name(method: li::ScrollMethod) -> &'static str {
@@ -614,10 +806,17 @@ fn send_events_names(mode: li::SendEventsMode) -> Vec<&'static str> {
 pub fn device_state(device: &li::Device) -> serde_json::Value {
     let caps = DeviceCaps::of(device);
     let tapping = device.config_tap_finger_count() > 0;
-    // The bindings' getter panics on libinput >= 1.27's STICKY value, so
-    // read the raw state. `device` owns a live libinput_device reference.
-    let drag_lock =
-        unsafe { li::ffi::libinput_device_config_tap_get_drag_lock_enabled(device.as_raw_mut()) };
+    let raw = device.as_raw_mut();
+    // The bindings' getters panic on libinput >= 1.27's STICKY drag lock
+    // and drop 1.23's CUSTOM profile, so read the raw values. `device`
+    // owns a live libinput_device reference.
+    let (drag_lock, profile, profiles) = unsafe {
+        (
+            li::ffi::libinput_device_config_tap_get_drag_lock_enabled(raw),
+            li::ffi::libinput_device_config_accel_get_profile(raw),
+            li::ffi::libinput_device_config_accel_get_profiles(raw),
+        )
+    };
     let mode = device.config_send_events_mode();
     // Which of BTN_LEFT..BTN_TASK the device has: a scroll-wheel emulation
     // button is only accepted where it exists.
@@ -648,17 +847,19 @@ pub fn device_state(device: &li::Device) -> serde_json::Value {
             2 => "sticky",
             _ => "unknown",
         },
-        "tap_drag_lock_sticky_supported_by_compositor": false,
         "natural_scroll": device.config_scroll_natural_scroll_enabled(),
         "natural_available": device.config_scroll_has_natural_scroll(),
         "accel_speed": device.config_accel_speed(),
         "accel_available": device.config_accel_is_available(),
-        "accel_profile": device.config_accel_profile().map(accel_profile_name),
-        "accel_profiles": device.config_accel_profiles().into_iter().map(accel_profile_name).collect::<Vec<_>>(),
-        "accel_custom_supported_by_compositor": false,
+        "accel_profile": accel_profile_name(profile),
+        "accel_profiles": accel_profile_names(profiles),
+        // libinput lists `custom` from 1.23, alongside the calls that set it.
+        "accel_custom_available": profiles & ACCEL_CUSTOM != 0 && custom_accel_calls_present(),
         "dwt_enabled": device.config_dwt_enabled(),
         "dwt_available": device.config_dwt_is_available(),
-        "dwt_timeout_supported_by_compositor": false,
+        "dwt_timeout_ms": device.config_dwt_is_available().then(|| dwt_timeout(device)).flatten(),
+        "dwt_timeout_available": device.config_dwt_is_available()
+            && libinput_symbol(c"libinput_device_config_dwt_set_timeout").is_some(),
         "middle_emulation_enabled": device.config_middle_emulation_enabled(),
         "middle_emulation_available": device.config_middle_emulation_is_available(),
         "send_events_mode": send_events_names(mode).first().copied().unwrap_or("enabled"),
@@ -678,9 +879,16 @@ pub fn device_state(device: &li::Device) -> serde_json::Value {
 mod tests {
     use super::*;
     use shell::{
-        InputSettings, PointerAccelProfile, PointingStickScrollMethod, ScrollWheelEmulation,
-        SendEvents, TapButtonMap, TouchpadClickMethod,
+        CustomAccelCurve, InputSettings, PointerAccelProfile, PointingStickScrollMethod,
+        ScrollWheelEmulation, SendEvents, TapButtonMap, TouchpadClickMethod,
     };
+
+    fn curve(step: f64, speeds: &[f64]) -> CustomAccelCurve {
+        CustomAccelCurve {
+            step,
+            speeds: speeds.to_vec(),
+        }
+    }
 
     const MOUSE: DeviceCaps = DeviceCaps {
         pointer: true,
@@ -744,6 +952,12 @@ mod tests {
         settings.pointing_stick.speed_milli = 750;
         settings.pointing_stick.accel_profile = PointerAccelProfile::Default;
         settings.pointing_stick.scroll_method = PointingStickScrollMethod::None;
+        settings.disable_while_typing_timeout_ms = 1500;
+        settings.custom_accel.mouse = curve(0.5, &[0.0, 1.0, 2.5]);
+        settings.custom_accel.touchpad = curve(2.0, &[0.0, 4.0]);
+        settings.custom_accel.trackball = curve(0.25, &[0.0, 0.5, 1.0]);
+        // Invalid: Mutter's fallback curve.
+        settings.custom_accel.pointing_stick = curve(0.0, &[1.0]);
         settings
     }
 
@@ -754,6 +968,7 @@ mod tests {
         assert_eq!(policy.natural_scroll, Some(true));
         assert_eq!(policy.speed, Some(-0.5));
         assert_eq!(policy.accel_profile, Some(PointerAccelProfile::Adaptive));
+        assert_eq!(policy.custom_accel, Some(curve(2.0, &[0.0, 4.0])));
         assert_eq!(policy.middle_click_emulation, Some(true));
         assert_eq!(
             policy.touchpad,
@@ -763,6 +978,7 @@ mod tests {
                 tap_and_drag: false,
                 tap_and_drag_lock: true,
                 disable_while_typing: false,
+                disable_while_typing_timeout_ms: 1500,
                 send_events: SendEvents::DisabledOnExternalMouse,
                 click_method: TouchpadClickMethod::Areas,
             })
@@ -784,6 +1000,7 @@ mod tests {
         assert_eq!(policy.natural_scroll, Some(false));
         assert_eq!(policy.speed, Some(0.25));
         assert_eq!(policy.accel_profile, Some(PointerAccelProfile::Flat));
+        assert_eq!(policy.custom_accel, Some(curve(0.5, &[0.0, 1.0, 2.5])));
         assert_eq!(policy.middle_click_emulation, Some(false));
         assert_eq!(policy.touchpad, None);
         assert_eq!(
@@ -805,6 +1022,7 @@ mod tests {
         assert_eq!(policy.natural_scroll, Some(false));
         assert_eq!(policy.speed, Some(0.25));
         assert_eq!(policy.accel_profile, Some(PointerAccelProfile::Custom));
+        assert_eq!(policy.custom_accel, Some(curve(0.25, &[0.0, 0.5, 1.0])));
         assert_eq!(policy.middle_click_emulation, Some(true));
         assert_eq!(policy.touchpad, None);
         assert_eq!(
@@ -825,6 +1043,7 @@ mod tests {
         assert_eq!(policy.natural_scroll, Some(false));
         assert_eq!(policy.speed, Some(0.75));
         assert_eq!(policy.accel_profile, Some(PointerAccelProfile::Default));
+        assert_eq!(policy.custom_accel, Some(curve(1.0, &[0.0, 1.0])));
         assert_eq!(policy.middle_click_emulation, None);
         assert_eq!(policy.touchpad, None);
         assert_eq!(
@@ -843,6 +1062,7 @@ mod tests {
                 natural_scroll: None,
                 speed: None,
                 accel_profile: None,
+                custom_accel: None,
                 middle_click_emulation: None,
                 touchpad: None,
                 scroll: None,
@@ -879,6 +1099,11 @@ mod tests {
         };
         let policy = libinput_policy(&settings, both, true);
         assert_eq!(policy.accel_profile, Some(PointerAccelProfile::Default));
+        assert_eq!(
+            policy.custom_accel,
+            Some(curve(1.0, &[0.0, 1.0])),
+            "the winning class's curve rides with its profile"
+        );
         assert_eq!(policy.middle_click_emulation, Some(true));
         assert_eq!(
             policy.scroll,
@@ -961,31 +1186,41 @@ mod tests {
 
     #[test]
     fn supported_profiles_and_unsupported_fallback_use_device_default() {
-        use li::AccelProfile::{Adaptive, Flat};
-        let available = [Flat, Adaptive];
+        let (flat, adaptive, custom) = (ACCEL_FLAT, ACCEL_ADAPTIVE, ACCEL_CUSTOM);
+        let all = flat | adaptive | custom;
+        let resolve = resolve_accel_profile;
         assert_eq!(
-            resolve_accel_profile(PointerAccelProfile::Default, &available, Some(Adaptive)),
-            Some(Adaptive)
+            resolve(PointerAccelProfile::Default, all, adaptive),
+            adaptive
         );
+        assert_eq!(resolve(PointerAccelProfile::Flat, all, adaptive), flat);
+        assert_eq!(resolve(PointerAccelProfile::Adaptive, all, flat), adaptive);
+        assert_eq!(resolve(PointerAccelProfile::Custom, all, adaptive), custom);
+        // A profile the device lacks takes the device default.
         assert_eq!(
-            resolve_accel_profile(PointerAccelProfile::Flat, &available, Some(Adaptive)),
-            Some(Flat)
+            resolve(PointerAccelProfile::Flat, adaptive, adaptive),
+            adaptive
         );
+        // libinput before 1.23 lists no custom profile.
         assert_eq!(
-            resolve_accel_profile(PointerAccelProfile::Adaptive, &available, Some(Flat)),
-            Some(Adaptive)
+            resolve(PointerAccelProfile::Custom, flat | adaptive, adaptive),
+            adaptive
         );
+        // No acceleration at all.
         assert_eq!(
-            resolve_accel_profile(PointerAccelProfile::Flat, &[Adaptive], Some(Adaptive)),
-            Some(Adaptive)
+            resolve(PointerAccelProfile::Flat, 0, ACCEL_NONE),
+            ACCEL_NONE
         );
+    }
+
+    #[test]
+    fn snapshot_names_every_profile_libinput_reports() {
+        assert_eq!(accel_profile_name(ACCEL_NONE), None);
+        assert_eq!(accel_profile_name(ACCEL_CUSTOM), Some("custom"));
         assert_eq!(
-            resolve_accel_profile(PointerAccelProfile::Custom, &available, Some(Adaptive)),
-            Some(Adaptive)
+            accel_profile_names(ACCEL_FLAT | ACCEL_ADAPTIVE | ACCEL_CUSTOM),
+            ["flat", "adaptive", "custom"]
         );
-        assert_eq!(
-            resolve_accel_profile(PointerAccelProfile::Flat, &[], None),
-            None
-        );
+        assert_eq!(accel_profile_names(ACCEL_ADAPTIVE), ["adaptive"]);
     }
 }

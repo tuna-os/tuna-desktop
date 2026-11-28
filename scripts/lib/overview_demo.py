@@ -16,6 +16,11 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def inode(path):
+    info = Path(path).stat()
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
 def save(path, value):
     Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
@@ -35,6 +40,7 @@ def run(root, out, state_path, window, compositor_pid, binaries):
         raise ValueError('actual built checkout is not the workflow source')
     proc = Path('/proc') / str(compositor_pid)
     start = (proc / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+    exe_inode = inode(proc / 'exe')
     principal = {'pid': compositor_pid, 'uid': proc.stat().st_uid, 'start_ticks': int(start),
                  'exe_sha256': sha(proc / 'exe'), 'clock_domain': 'Linux /proc starttime ticks since boot'}
     if principal['exe_sha256'] != sha(binaries / 'tuna-compositor'):
@@ -72,9 +78,14 @@ def run(root, out, state_path, window, compositor_pid, binaries):
                'events': [], 'snapshots': {}, 'complete': False}
     recorder = None
     journey_begin_ns = None
-    def original():
+    def original(rehash=False):
+        # Every poll and input checks the process start time and executable
+        # inode. Hashing the debug compositor takes ~0.5 s, which once pushed
+        # the 'before' read past the 1-second input; the bytes are hashed
+        # before the journey and again after its last observation.
         if ((proc / 'stat').read_text().rsplit(')', 1)[1].split()[19] != start
-                or sha(proc / 'exe') != principal['exe_sha256']):
+                or inode(proc / 'exe') != exe_inode
+                or (rehash and sha(proc / 'exe') != principal['exe_sha256'])):
             raise RuntimeError('original nested compositor changed during recording')
     def observe(label, predicate, deadline_offset):
         end = min(journey_begin_ns + int(min(10.5, deadline_offset) * 1e9),
@@ -139,6 +150,7 @@ def run(root, out, state_path, window, compositor_pid, binaries):
         pause_until(7)
         input_action('dismiss-overview', 'key', 'Escape')
         observe('dismissed', lambda s: not s['overview_open'] and s['focused_app_id'] == 'tuna-test-beta', 10.5)
+        original(rehash=True)
         recorder.finish()
         bind_recorded_interval(actions, recorder.receipt(journey_begin_ns))
         command('ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', out / 'overview-demo.raw.mp4',
