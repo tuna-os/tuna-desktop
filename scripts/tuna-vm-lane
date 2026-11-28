@@ -2382,6 +2382,13 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
     from vm_desktop_gates import run as run_desktop_gates
     on_tablet("desktop-gates", lambda: run_desktop_gates(qmp, agent, out, record, read_ppm))
 
+    # Installed window-manager gates (P-WM-05's window menu, P-SY-04's X11
+    # focus, iconic state and server restart): a GTK client and a plain Xlib
+    # client as the session user. Each gate records its own result; only
+    # unconfirmed fixture cleanup raises.
+    from vm_wm_gates import run as run_wm_gates
+    on_tablet("wm-gates", lambda: run_wm_gates(qmp, agent, out, record, read_ppm))
+
     # Capture the stable desktop after the final key OSD has disappeared.
     time.sleep(2)
 
@@ -3019,6 +3026,12 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
         departing_orca = await_orca(True)
         with open(os.path.join(evidence, "orca-before-logout.json"), "w") as stream:
             json.dump(departing_orca, stream, indent=2)
+    # V-X11-CLEANUP: the X socket and display lock the running session owns,
+    # to be gone once Log Out has ended it.
+    try:
+        x11_sockets = agent.run("wm-x11-sockets")
+    except (OSError, RuntimeError, ValueError) as error:
+        x11_sockets = {"error": f"{type(error).__name__}: {error}"}
     logout_offset, logout_started = len(read_text(serial_path)), time.monotonic()
     # Both lanes must use the real shell menu and its session manager.
     # The existing 60 s countdown precedes the unchanged 30 s greeter bound.
@@ -3097,6 +3110,9 @@ def run_lifecycle(qmp, agent, out, serial_path, record, strip_image=None, reconn
                "hardware logout stops only session-owned Orca; no original child/bus owner survives")
         if closed_orca["owner"] is not None or closed_orca["original_alive"]:
             raise RuntimeError("Orca survived the hardware session logout")
+    # After Orca's departure probes, which read the ending session's runtime.
+    from vm_wm_gates import record_x11_cleanup
+    record_x11_cleanup(agent, x11_sockets, greeter_visible and product_logout, record, evidence)
     if not greeter_visible:
         raise RuntimeError("live GDM greeter did not paint its actual visible surface after logout")
     record("V-LIFECYCLE", True, "all lifecycle operations completed; individual assertions remain mandatory")
@@ -4649,8 +4665,12 @@ def main():
     results.setdefault("V-PANEL", (False, "session never came up, no screendump checked"))
     if a.tour:
         from vm_desktop_gates import GATES as DESKTOP_GATES
+        from vm_wm_gates import CLEANUP_GATE, GATES as WM_GATES
         for gate in DESKTOP_GATES:
             results.setdefault(gate, (False, "the lifecycle never reached the installed desktop gates"))
+        for gate in WM_GATES:
+            results.setdefault(gate, (False, "the lifecycle never reached the installed window-manager gates"))
+        results.setdefault(CLEANUP_GATE, (False, "the lifecycle never reached its Log Out"))
     if a.profile == "autotz":
         results.setdefault("V-AUTOTZ", (False, "native session never admitted; required consumer did not run"))
     if a.soak:

@@ -229,6 +229,10 @@ OWNED = [
     ("scripts/lib/drm_dual.py", ["drm-smoke"]),
     ("scripts/lib/drm_kms_readback.py", ["drm-smoke"]),
     ("scripts/lib/drm_input_startup.py", ["drm-smoke"]),
+    # The screenshot UI's per-monitor screen selectors: the two-output leg's
+    # D-SCREENSHOT-KEYS-MULTI proves them, the GTK shell proof its keys.
+    ("crates/shell-gtk/src/screenshot_ui.rs", [*CORE, "drm-smoke"]),
+    ("crates/shell-gtk/src/screenshot_screens.rs", [*CORE, "drm-smoke"]),
     ("scripts/lib/colord-startup.sh", ["drm-smoke"]),
     # D-TOUCH, D-ORIENT and G-AUTOROTATE's emulated touchscreen, GTK touch
     # client, mock iio-sensor-proxy and GNOME touchscreen schema (P-DS-04).
@@ -272,6 +276,7 @@ OWNED = [
     ("scripts/lib/vm_strip_*", ["marlin-vm"]),
     ("scripts/lib/vm_app_integration.py", ["marlin-vm"]),
     ("scripts/lib/vm_desktop_gates.py", ["marlin-vm"]),
+    ("scripts/lib/vm_wm_gates.py", ["marlin-vm"]),
     # The nested tray proof's stub, also V-TRAY's fixture in the VM images.
     ("scripts/lib/tuna-tray-item-stub.py", ["gtk-shell", "journey", "marlin-vm"]),
     # Both marlin images ship it as /usr/libexec/tuna-datetime-proof; the
