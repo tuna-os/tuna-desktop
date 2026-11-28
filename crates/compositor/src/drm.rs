@@ -1775,26 +1775,21 @@ impl DrmBackend {
                 if self.output_rects().is_empty() {
                     inputs.retain(|input| !matches!(input, ManagerInput::Motion { .. }));
                 }
-                // Rotation (#345): absolute devices report panel-native
-                // pixels; remap them into the rotated logical frame the
-                // manager works in. Touch and absolute pointers arrive
-                // as Motion here; relative motion has its own arm.
+                // Absolute devices (touchscreens, tablets in mouse mode,
+                // QEMU's usb-tablet) report a fraction of the panel, which
+                // `translate_input` spreads over its native pixels. The
+                // manager works in the global logical space: undo the
+                // rotation (#345), then the scale, then place the panel
+                // at its output's origin. Leaving the scale out put every
+                // absolute press 25 % further from the origin at 125 %
+                // (run 46095497198: Files' cell click at logical 669
+                // landed at 836, on the next cell).
                 if let Some(primary) = self.outputs.first() {
-                    if primary.transform != 0 {
-                        let (w, h) = (primary.size.w, primary.size.h);
-                        let transform = primary.transform;
-                        for input in &mut inputs {
-                            if let ManagerInput::Motion { pos, .. } = input {
-                                let (x, y) = crate::orientation::touch_point(
-                                    w,
-                                    h,
-                                    transform,
-                                    pos.x.round() as i32,
-                                    pos.y.round() as i32,
-                                );
-                                pos.x = f64::from(x);
-                                pos.y = f64::from(y);
-                            }
+                    let (size, transform) = (primary.size, primary.transform);
+                    let (scale, loc) = (primary.scale, primary.loc);
+                    for input in &mut inputs {
+                        if let ManagerInput::Motion { pos, .. } = input {
+                            *pos = panel_to_logical(*pos, size, transform, scale, loc);
                         }
                     }
                 }
@@ -1979,6 +1974,31 @@ impl DrmBackend {
     }
 }
 
+/// A panel-native absolute position (native pixels of an output's
+/// unrotated mode) to the global logical point drawn under it.
+fn panel_to_logical(
+    pos: Point<f64, Logical>,
+    size: Size<i32, Physical>,
+    transform: u32,
+    scale: f64,
+    loc: (i32, i32),
+) -> Point<f64, Logical> {
+    let (x, y) = if transform == 0 {
+        (pos.x, pos.y)
+    } else {
+        let (x, y) = crate::orientation::touch_point(
+            size.w,
+            size.h,
+            transform,
+            pos.x.round() as i32,
+            pos.y.round() as i32,
+        );
+        (f64::from(x), f64::from(y))
+    };
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    (f64::from(loc.0) + x / scale, f64::from(loc.1) + y / scale).into()
+}
+
 /// Bound nonblocking 1024-byte DRM event reads after the synchronous reset.
 /// No new frames are submitted until the old queue reaches WouldBlock.
 fn drain_reset_events(
@@ -2062,6 +2082,27 @@ mod tests {
         // Far left: onto the left edge of the first output.
         let left = clamp_to_outputs((-50.0, 10.0).into(), &outputs);
         assert_eq!(left, (0.0, 10.0).into());
+    }
+
+    #[test]
+    fn absolute_input_lands_on_the_logical_point_under_it() {
+        let panel: Size<i32, Physical> = (1280, 800).into();
+        // 100 %: the panel pixel is the logical point.
+        let same = panel_to_logical((836.0, 214.0).into(), panel, 0, 1.0, (0, 0));
+        assert_eq!(same, (836.0, 214.0).into());
+        // 125 %: the 1280x800 panel shows a 1024x640 logical output.
+        let scaled = panel_to_logical((836.25, 213.75).into(), panel, 0, 1.25, (0, 0));
+        assert_eq!(scaled, (669.0, 171.0).into());
+        let corner = panel_to_logical((1280.0, 800.0).into(), panel, 0, 1.25, (0, 0));
+        assert_eq!(corner, (1024.0, 640.0).into());
+        // A right-hand output starts at its own logical origin.
+        let placed = panel_to_logical((100.0, 50.0).into(), panel, 0, 2.0, (1920, 0));
+        assert_eq!(placed, (1970.0, 25.0).into());
+        // Rotated 90°: panel pixels rotate first, then scale.
+        let rotated = panel_to_logical((3.0, 0.0).into(), (4, 2).into(), 1, 1.0, (0, 0));
+        assert_eq!(rotated, (0.0, 0.0).into());
+        let rotated_scaled = panel_to_logical((3.0, 0.0).into(), (4, 2).into(), 3, 2.0, (0, 0));
+        assert_eq!(rotated_scaled, (0.5, 1.5).into());
     }
 
     #[test]
