@@ -49,7 +49,8 @@ NEW_SESSION = 'usr/share/wayland-sessions/tuna.desktop'
 OLD_BINS = ('roost-compositor', 'roost-greeter', 'roost-ibus-bridge',
             'roost-session', 'roost-shell-gtk', 'roost-shell-host')
 NEW_BINS = ('tuna-compositor', 'tuna-greeter', 'tuna-ibus-bridge',
-            'tuna-session', 'tuna-shell-gtk', 'tuna-shell-host', 'tuna-wallpaper-svg')
+            'tuna-session', 'tuna-shell-gtk', 'tuna-shell-host', 'tuna-wallpaper-svg',
+            'tuna-x11-frames')
 # The released betas shipped the greetd greeter as tuna-greeter; the candidate
 # ships GDM's Tuna login screen under the same name (#1164).
 BETA_BINS = NEW_BINS

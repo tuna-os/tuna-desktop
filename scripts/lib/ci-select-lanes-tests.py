@@ -106,6 +106,8 @@ class Selection(unittest.TestCase):
         self.assertIn("gtk-shell", pr("crates/greeter/src/main.rs"))
         self.assertEqual(pr("packaging/marlin/vm-lane/Containerfile"),
                          ["arch-package", "marlin-image", "marlin-vm"])
+        # The Marlin VM gates (V-*) live in the VM lane.
+        self.assertEqual(pr("scripts/tuna-vm-lane"), ["arch-package", "marlin-vm"])
         # The nested GTK gates (G-*) live in the GTK shell proof; journey
         # runs it against the installed package.
         self.assertEqual(pr("scripts/tuna-gtk-shell-proof"), ["journey", "gtk-shell"])
@@ -118,6 +120,9 @@ class Selection(unittest.TestCase):
                      "scripts/lib/tuna-osk-proof.py"):
             self.assertEqual(pr(path), ["gtk-shell"], path)
         self.assertEqual(pr("scripts/lib/vm_unlock_wake.py"), ["arch-package", "marlin-vm"])
+        # The nested GTK gates (G-*) live in the GTK shell proof; journey
+        # runs it against the installed package.
+        self.assertEqual(pr("scripts/tuna-gtk-shell-proof"), ["journey", "gtk-shell"])
         # MP-*, WL-*, X11-* window-motion gates and the capture they pair with.
         for path in ("scripts/tuna-motion-pairing-proof", "scripts/tuna-x11-icon-geometry-proof",
                      "scripts/lib/motion_pairing.py",

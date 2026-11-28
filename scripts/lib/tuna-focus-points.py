@@ -46,12 +46,22 @@ def scene(state):
     return stack, layers
 
 
+def takes_pointer(window, x, y):
+    """Whether window's input region holds (x, y). For a client-decorated
+    window it reaches past the window's rectangle into the shadow (the
+    resize handles, P-WM-04). The state bounds it by `input_rect`; a
+    surface that set no region takes input over all of `surface_rect`; a
+    window without a surface yet has only its rectangle."""
+    area = window.get("input_rect") or window.get("surface_rect") or window["rect"]
+    return inside(area, x, y)
+
+
 def topmost(stack, layers, x, y):
     """The window id under (x, y), None for no window, False over chrome."""
     if any(inside(rect, x, y) for rect in layers):
         return False
     for window in reversed(stack):
-        if inside(window["rect"], x, y):
+        if takes_pointer(window, x, y):
             return window["id"]
     return None
 

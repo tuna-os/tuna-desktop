@@ -149,6 +149,36 @@ elif mode in ('revoke', 'backend-disconnect'):
     deadline = time.monotonic() + 30
     while not out.with_suffix('.revoke').exists() and time.monotonic() < deadline: time.sleep(.01)
     if not out.with_suffix('.revoke').exists(): raise RuntimeError('runner did not revoke grant')
+elif mode == 'eis-revoke':
+    # R-EIS-REVOKE (ADR 0011 L7): a delivered libei client keeps its live
+    # connection until the compositor revokes the grant, then is told.
+    reply, fds = bus.call_with_unix_fd_list_sync('org.freedesktop.portal.Desktop', '/org/freedesktop/portal/desktop',
+        interface, 'ConnectToEIS', GLib.Variant('(oa{sv})', (session, {})), None,
+        Gio.DBusCallFlags.NONE, 30000, None, None)
+    fd = fds.get(reply.unpack()[0])
+    try:
+        process = subprocess.Popen(['/out/eis-revoke', str(fd)], pass_fds=(fd,), stdout=subprocess.PIPE)
+    finally: os.close(fd)
+    def receipt(seconds, expected, failure):
+        if not select.select([process.stdout], [], [], seconds)[0]: raise RuntimeError(failure)
+        line = process.stdout.readline()
+        if line != expected: raise RuntimeError(failure + ': ' + repr(line) + ', exit ' + str(process.poll()))
+    try:
+        receipt(15, b'libei devices resumed\n', 'libei keyboard and pointer never resumed')
+        if select.select([process.stdout], [], [], 1)[0]:
+            raise RuntimeError('the live grant dropped its libei client: ' + repr(process.stdout.readline()))
+        out.with_suffix('.active').write_text(str(node))
+        deadline = time.monotonic() + 30
+        while not out.with_suffix('.revoke').exists() and time.monotonic() < deadline: time.sleep(.01)
+        if not out.with_suffix('.revoke').exists(): raise RuntimeError('runner did not revoke grant')
+        revoked_at = time.monotonic()
+        receipt(2, b'libei disconnected\n', 'the libei client was not disconnected within 2 s of revocation')
+        if process.wait(timeout=5) != 0: raise RuntimeError('libei client exited ' + str(process.returncode))
+        print('libei client disconnected ' + str(round(time.monotonic() - revoked_at, 3)) + 's after revocation', flush=True)
+    finally:
+        if process.poll() is None: process.kill()
+        process.wait()
+        process.stdout.close()
 elif mode == 'disconnect': bus.close_sync(None)
 else: call('org.freedesktop.portal.Session', 'Close', None, session)
 deadline = time.monotonic() + 2

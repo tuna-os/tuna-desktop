@@ -29,7 +29,7 @@ M = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(M)
 # Expectations are maintained here, never imported from the policy under test.
 BINS = ('tuna-compositor', 'tuna-session', 'tuna-shell-gtk', 'tuna-shell-host',
-        'tuna-ibus-bridge', 'tuna-wallpaper-svg', 'tuna-greeter')
+        'tuna-ibus-bridge', 'tuna-wallpaper-svg', 'tuna-x11-frames', 'tuna-greeter')
 GREETER_UNIT = 'usr/lib/systemd/user/tuna-greeter.service'
 GREETER_DROP_IN = 'usr/share/tuna-desktop/greeter/gnome-login.session.conf'
 SESSION = 'usr/share/wayland-sessions/tuna.desktop'
@@ -205,13 +205,13 @@ Provides: roost
         delegates = work / 'controlled-delegates'
         delegates.mkdir()
         commands = {
-            'cargo': '''test "$*" = 'build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host -p tuna-greeter'
+            'cargo': '''test "$*" = 'build --locked --release -p tuna-compositor -p tuna-wallpaper-svg -p tuna-shell-gtk -p tuna-shell-host -p tuna-x11-frames -p tuna-greeter'
 test "$TUNA_VERSION" = '0.1.0-beta.1'
 ''',
             'git': '''test "$*" = 'describe --tags --exact-match --match v[0-9]* HEAD'
 printf '%s\\n' v0.1.0-beta.1
 ''',
-            'dpkg-shlibdeps': '''test "$*" = '-O -eusr/bin/tuna-compositor -eusr/bin/tuna-session -eusr/bin/tuna-shell-gtk -eusr/bin/tuna-shell-host -eusr/bin/tuna-ibus-bridge -eusr/bin/tuna-wallpaper-svg -eusr/bin/tuna-greeter'
+            'dpkg-shlibdeps': '''test "$*" = '-O -eusr/bin/tuna-compositor -eusr/bin/tuna-session -eusr/bin/tuna-shell-gtk -eusr/bin/tuna-shell-host -eusr/bin/tuna-ibus-bridge -eusr/bin/tuna-wallpaper-svg -eusr/bin/tuna-x11-frames -eusr/bin/tuna-greeter'
 printf '%s\\n' 'shlibs:Depends=libc6 (>= 2.34)'
 ''',
         }

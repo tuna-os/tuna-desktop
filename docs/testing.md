@@ -277,8 +277,12 @@ carries on. G-BACKGROUND-BLUR: `ext_background_effect_manager_v1` offers
 blur, and a clear window whose surface is a blur region smooths the
 one-pixel stripes of a maximized window behind it (mean step between
 neighbouring pixels below 16) while beside it they stay sharp (above 128),
-from `background-blur.png`. CI runs the slice in the `gtk-shell` job; its
-`protocols/assertions.txt` feeds the ledger.
+from `background-blur.png`. G-SYNCOBJ: the nested session's software
+renderer has no timeline syncobjs, so the compositor logs Mutter's reason
+(`explicit sync disabled: …`, one of `meta-wayland-linux-drm-syncobj.c`'s
+messages) and no client finds `wp_linux_drm_syncobj_manager_v1`. CI runs
+the slice in the `gtk-shell` job; its `protocols/assertions.txt` feeds the
+ledger.
 
 `scripts/tuna-gtk-shell-proof --dnd-overview-only --artifacts DIR` runs
 G-DND-OVERVIEW (#1189), the same function the full GTK proof calls after
@@ -313,6 +317,22 @@ held-button hover and persisted reorder assertions as the full GTK proof,
 without the unrelated earlier gates. It adds no target motion or timing
 relaxation. CI runs this slice with its freshly built compositor and shell;
 the no-post-start-motion wire tests establish the precise protocol ordering.
+
+`scripts/tuna-gtk-shell-proof --x11-frames-only --artifacts DIR` runs the X11
+frame gates of the full GTK proof alone (`G-X11-FRAME`,
+`G-X11-FRAME-ACTIONS`, `G-X11-FRAME-CSD`, `G-X11-FRAME-RECOVERY`; P-WM-10):
+real X11 clients on the session's own Xwayland, the frames client
+`tuna-x11-frames` beside the compositor, and the real pointer on the title
+bar. After them it runs `G-X11-MENU` and `G-X11-TOOLTIP` (P-SY-04: a GTK3
+program's menus and tooltip, override-redirect windows, drawn and driven
+with the real pointer) and `G-RESIZE-BORDER` (P-WM-04: a GTK4 window resized
+from the invisible border outside its edge). It needs `xclock`, `xeyes`,
+`xev` (x11-apps), `xprop` and `xwininfo` (x11-utils), GTK 3 for Python
+(gir1.2-gtk-3.0) and the distribution `gsd-xsettings`
+(gnome-settings-daemon), which publishes `button-layout` and the title-bar
+click actions to the header bars: the window manager never owns
+XSETTINGS, as Mutter does not. CI runs this slice too, with its freshly
+built binaries.
 
 `scripts/tuna-gtk-shell-proof --datemenu-only --artifacts DIR` runs the date
 menu's gates alone, the same functions the full GTK proof calls
@@ -800,7 +820,7 @@ drop mid-bracket. The bracket checks themselves are unchanged.
 | `gtk-shell` | `scripts/tuna-slow-portal-proof --artifacts gtk-shell-artifacts/slow-portal` | as above | On a dbus-daemon bus whose portal activation hangs, the shell owns `org.gnome.Shell` within 15 s (40 s on GTK before 4.17, whose GtkApplication always waits on the inhibit portal) and makes no GDK portal call; writes `assertions.txt` |
 | `gtk-shell-smoke` | `TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --smoke-only --artifacts gtk-shell-smoke-artifacts` | as for `gtk-shell` | The merge queue's battery: bar, app windows, overview, lock and unlock through PAM; writes `assertions.txt` |
 | `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg kmod python3-evdev python3-gi gir1.2-gtk-4.0 gsettings-desktop-schemas acl`; run `scripts/ci-install-vkms` after `apt-get update` to ensure vkms for the running kernel | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe`, seatd, uinput and the card's seat ACL (`setfacl`, which a logind seat session would grant; the DRM lease device opens its own non-master fd) |
-| `drm-smoke` | `scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt` | as above; Linux 6.19 or newer for vkms configfs (the job pins `ubuntu-26.04`) | Two connectors of a vkms configfs device: mirroring, disabling and kept layouts, workspaces on the primary only, mixed fractional/integer scale; appends to drm-smoke's `assertions.txt` |
+| `drm-smoke` | `scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt` | as above; Linux 6.19 or newer for vkms configfs (the job pins `ubuntu-26.04`) | Two connectors of a vkms configfs device: mirroring, disabling and kept layouts, workspaces on the primary only, the workspace slide per monitor, mixed fractional/integer scale; appends to drm-smoke's `assertions.txt` |
 | `hotplug` | `scripts/tuna-hotplug-stress --rounds 4 --out hotplug-artifacts` | as for `drm-smoke`, plus `libpam-wrapper colord pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools xdg-desktop-portal-gnome`; Linux 6.19+ for vkms configfs (the job pins `ubuntu-26.04`) | Connector hotplug on vkms: outputs, window re-homing, a full unplug, lock, colord and screencast gates (see [Output hotplug storm](#output-hotplug-storm)); writes `assertions.txt` |
 
 The `desktop-proofs` app content and scroll-mode strip proofs download
@@ -954,6 +974,84 @@ commands (`down N`, `move DX DY MS`, `hold MS`, `up`, `swipe N DX DY MS
 [PAUSE]`, `scroll`, `tap`, `click`) on stdin, in millimetres and
 milliseconds. Other phases can import `create_touchpad()` from it.
 
+`D-POINTER-SETTINGS` retains its uinput mouse, trackball, pointing stick and
+touchpad across a native compositor restart, then reads every device's
+libinput configuration again without motion or another hotplug. In
+[CI run 41175449190](https://github.com/tuna-os/tuna-desktop/actions/runs/41175449190/job/124476667615),
+defaults, live changes and replug passed with libinput 1.25, but the restarted
+session published an empty device list. Seat assignment queues startup device
+additions before the polling fd necessarily becomes readable; native setup
+now consumes those additions through the same configuration path as hotplug,
+without dispatching input or consuming a pending non-addition event. See
+[libinput's event queue API](https://wayland.freedesktop.org/libinput/doc/latest/api/group__base.html).
+The pointer launcher also closes the inherited emulator FIFO writer (FD 7),
+so a running restarted compositor cannot prevent emulator EOF during cleanup.
+`scripts/tests/test_ci_install_vkms.py` contains launcher descriptor and
+coldplug/restart contract regressions; these do not qualify native device
+behavior. [CI run 41193585314](https://github.com/tuna-os/tuna-desktop/actions/runs/41193585314/job/124520435500)
+passed the unchanged arrival, live, replug, restart and reset gates with
+libinput 1.25. The subsequent hot-corner proof requires
+`gsettings-desktop-schemas` for `org.gnome.desktop.interface`; the DRM lane
+installs that package explicitly alongside the Hebrew locale and GTK translations.
+
+At source `cabda3ce35683a093603278e37c96b3c254ec9fd`,
+[native CI run 41212048699](https://github.com/tuna-os/tuna-desktop/actions/runs/41212048699/job/124573106333)
+again passes defaults, live keys, replug, restart and reset on libinput 1.25.
+That library qualifies custom acceleration and the timeout drag-lock fallback,
+not sticky drag lock or the configurable typing timeout.
+
+A separate **headless production-consumer** receipt at that source qualifies
+the newer calls against privately staged
+[libinput 1.31.0](https://gitlab.freedesktop.org/libinput/libinput/-/tree/1.31.0),
+commit `659967488e1e66d7fb7210c6b86860c8e1e5bed4`. A small Rust consumer includes
+the production `crates/compositor/src/drm/libinput.rs` unchanged (SHA256
+`e46829cf007bced49018b9b67e746c5b31a5b1df18392215acbab33488aad6b2`) and calls
+`apply` and `device_state` on a private libinput path context with ephemeral
+uinput mouse and RMI4 touchpad devices. Both devices accept a custom curve,
+fall back to the device profile when libinput rejects negative speeds, accept
+Mutter's step-zero fallback curve, and restore their original profiles on
+reset. The touchpad reads back **sticky** drag lock and typing timeouts
+**500 → 1500 → 500 ms**, with availability required rather than skipped.
+The consumer exits 0 and retains `/proc/self/maps`, confirming the loaded
+private `libinput.so.10.13.0` (SHA256
+`262a263bb6f9347fd4766fdc9ef0aea6425d70c6a32538135a37c7b548332f29`).
+The source/binary identities, consumer source and lockfile, observations and
+stderr are retained in
+`tuna-915-cabda3ce-libinput131-headless-evidence.tar.gz` (SHA256
+`1f74b79e4bf631101e4f1dbca0d2996ae68eec3e011cd9bd68a5df8e5c146311`).
+Only generated Python caches dirtied the checkout during this receipt; tracked
+sources were unchanged. Devices are closed in `finally`; no host library,
+kernel or udev policy is installed or changed. This is an emulated,
+headless consumer test, **not** a new native graphical session, installed-image
+qualification, physical-device test or timing measurement.
+
+The next [native run 41202327855](https://github.com/tuna-os/tuna-desktop/actions/runs/41202327855/job/124540485483)
+again passed all pointer-settings gates, then failed `D-HOT-CORNER` parking:
+all six relative-motion events arrived, but the final pointer was
+`[400.0,460.0]` instead of `[60,60]`. The native input callback was copying
+the window manager's stale position back into DRM after each event while
+per-frame motion was still queued, losing accumulated relative motion.
+Like the tick path, the callback now reconciles DRM to the manager only
+after the queue drains; until then DRM retains the accumulated position.
+The six uinput commands, exact parking assertion, and pressure gates remain
+unchanged, without a timing delay workaround. The native script regressions
+cover the callback/tick ownership guards and preserve that parking sequence.
+[Native run 41207208893](https://github.com/tuna-os/tuna-desktop/actions/runs/41207208893/job/124563361107)
+then passed the exact parking assertion and the full left-to-right
+`D-HOT-CORNER` pressure, sliding, held-barrier and fullscreen checks at scale 1.25.
+
+That run next exposed an RTL-only fixture error after its opposite-corner
+negative control. The pointer reached `[758,55]`, with 132 relative-motion
+events delivered, RTL enabled, the overview closed and two prior successful
+pressure ripples. The negative control starts at y=5, but pushing upward
+against the unguarded top-left clamps to y=0. Its return route incorrectly
+added only 55 px while requiring y=60. The route now explicitly checks y=0
+after pressure and moves 60 px down; the exact final-position assertion,
+negative control and remaining pressure gates are retained. A shell-route
+regression covers this mirrored/clamped arithmetic without timing sleeps.
+Fresh native evidence is still required for that RTL route correction and
+the remainder of the DRM lane.
+
 `D-OVERVIEW-EXIT` starts a session in the overview, as a GDM login does,
 and presses Escape once on an emulated USB keyboard
 (`scripts/lib/tuna-uinput-keyboard.py`, `tap KEY...` on stdin). After
@@ -996,6 +1094,15 @@ old behaviour produces:
   a hidden one at most 3/s against the compositor's 995 ms hidden-frame
   interval) are counted from the clients' heartbeats over 3 s starting
   1.5 s after each switch ends, past the callbacks owed from the slide;
+- `D-WORKSPACE-SLIDE-MULTI` (P-AN-05): with the pointer on B,
+  Super+Page_Down slides A alone. `drm_kms_readback.py --sample` reads
+  each CRTC's scanned-out framebuffer every 4 ms, so page flips are the
+  kernel's frame clock: A flips through the slide while B keeps its
+  framebuffer (nothing repainted or bled onto it), the compositor's
+  in-flight slide crosses A's width plus GNOME's 100 px spacing rather
+  than the whole desktop, and the switcher popup stays on A, the
+  primary. With an animating GTK client on B, B's flip rate during A's
+  slide stays at least 80 percent of its rate before it;
 - `D-SCALE-MIXED` (P-SY-03): a GNOME `monitors.xml` gives A a fractional
   scale and B scale 2 in the smallest mode Mutter allows both in; a GTK
   window Alt-dragged to span them gets B's scale over
@@ -1187,7 +1294,7 @@ click and key is QEMU input.
 | ID | What it asserts |
 |---|---|
 | `V-XWAYLAND` | Runs first. No Xwayland process and no X11 readiness before any X11 client, with the X display already reserved; a `GDK_BACKEND=x11` GTK 4 app (the picker's X11 caller, unarmed) then starts Xwayland on demand, the session's systemd user environment publishes the reserved `DISPLAY`, and its X11 window maps, takes focus and receives a real key and click (`app-integration/xwayland.json`) |
-| `V-PICKER` | For an X11 (`GDK_BACKEND=x11`) and a native Wayland GTK 4 caller, each opening the installed GNOME FileChooser portal (Nautilus) through its own parent handle: the caller is allocated its requested 1100x700; for OpenFile and SaveFile, cancel (Escape) and accept (type-ahead and Enter), the dialog maps as the focused transient child of the caller, horizontally centred on it; a click on the exposed parent is blocked; the portal answers 1 with no URI or 0 with the chosen file (SaveFile's file is then written by the caller); focus returns to the caller and a real key and click reach it; an unrelated bystander app receives nothing |
+| `V-PICKER` | For an X11 (`GDK_BACKEND=x11`) and a native Wayland GTK 4 caller, each opening the installed GNOME FileChooser portal (Nautilus) through its own parent handle: the caller is allocated its requested 1100x700 (the X11 caller, with no title bar of its own, is framed by `tuna-x11-frames` and its managed rectangle is that size grown by the frame's `_NET_FRAME_EXTENTS`); for OpenFile and SaveFile, cancel (Escape) and accept (type-ahead and Enter), the dialog maps as the focused transient child of the caller, horizontally centred on it; a click on the exposed parent is blocked; the portal answers 1 with no URI or 0 with the chosen file (SaveFile's file is then written by the caller); focus returns to the caller and a real key and click reach it; an unrelated bystander app receives nothing |
 | `V-INTROSPECT-SCREEN` | A session-bus client subscribed to Introspect `PropertiesChanged` sees `ScreenSize` equal the union of Mutter `GetCurrentState` logical monitors initially (1280x800), after hotplugging a 1024x768 second head, after rotating it 90° through `ApplyMonitorsConfig`, and after unplugging it, with no notification that repeats an unchanged size |
 | `V-MULTI-OUTPUT` | During V-INTROSPECT-SCREEN's hotplug: with two outputs the compositor's snapshot shows GNOME 51's one top bar across the primary output and none on the new one (GNOME's `layout.js` keeps `panelBox` on the primary monitor); a GTK window fullscreened on the new output's connector (`tuna-vm-desktop-gates --window placed`) fills it; after the unplug it survives on the remaining output, which keeps the top bar (`app-integration/multi-output.json`) |
 | `V-INTROSPECT-SANDBOX` | After installing the local Flatpak, xdg-desktop-portal-gnome's `Background.GetAppState` omits an unsandboxed client claiming the app ID `org.tuna.VmSandbox`, reports the Flatpak-sandboxed one as running or active, and drops it after it exits |

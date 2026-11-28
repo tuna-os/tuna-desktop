@@ -19,6 +19,7 @@ A session is one long-lived compositor and a shell it supervises:
 | `tuna-ibus-bridge`, `ibus-x11` | Input methods, when IBus is installed. | the compositor |
 | `ibus-daemon` | The IBus daemon, with `--panel disable` (the shell is IBus's panel). Exactly one runs. | in a hardware session, GNOME's `IBus Daemon for GNOME` user unit (`org.freedesktop.IBus.session.GNOME.service`), which systemd stops with the session; only where that unit does not exist, and in nested sessions, the IBus bridge, as its own child, which the compositor retires at session end |
 | `Xwayland` | X11 applications, when it is installed. | the compositor |
+| `tuna-x11-frames` | Title bars for X11 windows: the part `mutter-x11-frames` plays in GNOME. An X11 client of Xwayland. | the compositor, with Xwayland |
 | `orca` | The screen reader, when it is turned on. | the compositor |
 
 Sources: `crates/compositor/src/bin/tuna-session.rs`,
@@ -149,7 +150,8 @@ for a new one (`CreateTransientDisplay`). If that fails, the shell logs
 
 The compositor and the shells print plain lines to standard error. Every line
 starts with the program's name: `tuna-compositor:`, `tuna-shell-gtk:`,
-`tuna-shell-host:`, `tuna-ibus-bridge:`. They log codes, counts and service
+`tuna-shell-host:`, `tuna-ibus-bridge:`, `tuna-x11-frames:`. They log codes,
+counts and service
 names, never window titles, typed text or passwords. There are no log levels;
 the [trace variables](environment.md#debugging-and-trace-output) add more
 output for one area at a time.
@@ -243,7 +245,7 @@ stack, like GDM's `gdm-fingerprint`.
    A source install must copy it from `share/pam.d/tuna-lock`
    ([install guide](install.md#logging-in-through-gdm)).
 2. The lock screen authenticates `$LOGNAME` (else `$USER`) from the
-   compositor's environment (`crates/compositor/src/unlock.rs:70-77`).
+   compositor's environment (`crates/compositor/src/unlock.rs:67-74`).
 3. Each attempt has 10 seconds; a PAM stack that hangs longer is treated as a
    failure (`crates/compositor/src/pam.rs:31-32`).
 4. For more detail, reproduce with `TUNA_LOCK_TRACE=1` in the compositor's
