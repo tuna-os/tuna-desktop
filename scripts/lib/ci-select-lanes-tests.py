@@ -325,6 +325,20 @@ class Selection(unittest.TestCase):
         self.assertIn("gtk-shell", lanes)
         self.assertGreater(len(lanes), 1)
 
+    def test_screenshot_screen_selectors_run_the_two_output_leg(self):
+        # D-SCREENSHOT-KEYS-MULTI (scripts/tuna-drm-dual, drm-smoke) proves
+        # the per-monitor screen selectors; the GTK shell proof their keys.
+        for path in ("crates/shell-gtk/src/screenshot_ui.rs",
+                     "crates/shell-gtk/src/screenshot_screens.rs"):
+            for run in range(len(m.ROTATION)):
+                with self.subTest(path=path, run=run):
+                    self.assertEqual(pr(path, run=run),
+                                     ["drm-smoke", "desktop-proofs", "gtk-shell"])
+        # Control: the area selection's keys still rotate lanes.
+        lanes = pr("crates/shell-gtk/src/screenshot_selection.rs", run=3)
+        self.assertIn("gtk-shell", lanes)
+        self.assertEqual(set(m.rotation(3, 2)) - set(lanes), set())
+
     def test_pull_requests_never_rotate_the_push_only_image_lane(self):
         self.assertNotIn("marlin-image", m.ROTATION)
         for run in range(len(m.ROTATION)):
