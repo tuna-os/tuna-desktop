@@ -248,8 +248,8 @@ class NativeProductTests(unittest.TestCase):
         self.assertEqual(outputs['package_path'], str(self.out / 'tuna.pkg.tar.zst'))
         self.assertEqual(outputs['product_origin_path'], str(self.out / 'selection.json'))
 
-    def test_ordinary_dispatch_and_schedule_reuse_keep_current_admission_new(self):
-        for event in ('workflow_dispatch', 'schedule'):
+    def test_ordinary_dispatch_schedule_and_merge_group_reuse_keep_current_admission_new(self):
+        for event in ('workflow_dispatch', 'schedule', 'merge_group'):
             with self.subTest(event=event), patch.dict(os.environ, {'GITHUB_EVENT_NAME': event}):
                 self.out = self.directory / ('selected-' + event)
                 selected, calls = self.choose(capsule(self.original))
