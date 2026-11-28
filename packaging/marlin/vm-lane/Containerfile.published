@@ -33,6 +33,7 @@ COPY scripts/lib/tuna-datetime-proof.py /usr/libexec/tuna-datetime-proof
 COPY packaging/marlin/vm-lane/tuna-vm-input /usr/libexec/tuna-vm-input
 COPY packaging/marlin/vm-lane/tuna-vm-shell-focus /usr/libexec/tuna-vm-shell-focus
 COPY packaging/marlin/vm-lane/tuna-vm-desktop-gates /usr/libexec/tuna-vm-desktop-gates
+COPY packaging/marlin/vm-lane/tuna-vm-wm-gates /usr/libexec/tuna-vm-wm-gates
 COPY scripts/lib/tuna-tray-item-stub.py /usr/libexec/tuna-tray-item-stub
 COPY packaging/marlin/vm-lane/tuna-vm-orca-token /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token
 COPY packaging/marlin/vm-lane/tuna-vm-gdm.tmpfiles /usr/lib/tmpfiles.d/tuna-vm-lane.conf
@@ -69,7 +70,7 @@ RUN --mount=type=bind,source=packaging/marlin/vm-lane/tuna-vm-published-pacman,t
     && useradd -M -d /home/tuna-test -s /bin/bash -U tuna-test \
     && echo 'tuna-test:tuna' | chpasswd \
     && chmod 0755 /usr/libexec/tuna-vm-lifecycle /usr/libexec/tuna-vm-input /usr/libexec/tuna-vm-shell-focus \
-         /usr/libexec/tuna-vm-desktop-gates \
+         /usr/libexec/tuna-vm-desktop-gates /usr/libexec/tuna-vm-wm-gates \
          /usr/lib/systemd/user-environment-generators/90-tuna-vm-orca-token \
          /usr/libexec/tuna-soak/tuna-vm-soak /usr/libexec/tuna-soak/tuna-frame-pacer \
     && printf 'TUNA_COMPOSITOR_STATE=/run/user/%s/tuna-vm-state.json\nTUNA_LOCK_TRACE=1\nTUNA_POINTER_TRACE=1\n' \
