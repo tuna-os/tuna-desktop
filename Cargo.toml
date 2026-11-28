@@ -13,6 +13,7 @@ members = [
     "crates/wallpaper",
     "crates/magnifier",
     "crates/wallpaper-svg",
+    "crates/x11-frames",
 ]
 
 # Pinned per ADR 0001 (docs/adr/0001-nested-backend-smithay-pin.md).
@@ -35,6 +36,9 @@ signal-hook = "0.4"
 rand = "0.10"
 gtk4 = "0.11"
 libadwaita = "0.9"
+# tuna-x11-frames: GDK's X11 connection. `xlib` gives the Xlib display
+# and the raw `xevent` signal, typed in x11-dl (already in the lockfile).
+gdk4-x11 = { version = "0.11", features = ["xlib"] }
 # GNOME's weather and locations library, as gnome-shell uses it for the
 # date menu's world clocks and weather. No version features: the oldest
 # supported library is libgweather 4.4.2 (Ubuntu 24.04).

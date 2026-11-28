@@ -291,7 +291,7 @@ sudo udevadm control --reload 2>/dev/null || true
 sudo setfacl -m "u:$(id -un):rw" "$CARD"
 
 echo "tuna-drm-smoke: building"
-cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk
+cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p tuna-compositor -p tuna-shell-host -p tuna-shell-gtk -p tuna-x11-frames
 "$ROOT/scripts/tuna-frame-pacer-build" "$ARTIFACTS/frame-pacer"
 # D-LEASE's client, built like the frame pacer from the system protocol XML.
 LEASE_PROBE="$ARTIFACTS/lease-probe/tuna-drm-lease-probe"
