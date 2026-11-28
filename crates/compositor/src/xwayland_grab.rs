@@ -559,6 +559,9 @@ mod xwayland_tests {
                 mapped.is_some()
             });
             let mapped = mapped.unwrap();
+            // The window manager grants the map (`WindowManager` does at
+            // once without a frames client); this harness has no manager.
+            mapped.set_mapped(true).unwrap();
             self.until("the X11 window's surface association", |_| {
                 mapped.wl_surface().is_some()
             });
