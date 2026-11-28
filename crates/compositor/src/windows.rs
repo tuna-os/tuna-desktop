@@ -8488,11 +8488,7 @@ impl WindowManager {
             .into_iter()
             .find(|(placed, _, _)| placed == surface)
         {
-            let size = state
-                .layer_shell_state
-                .layer_surfaces()
-                .find(|layer| layer.wl_surface() == surface)
-                .and_then(|layer| layer.current_state().size)?;
+            let size = crate::layer::placed_size(state, surface)?;
             return Some((
                 (f64::from(x), f64::from(y)).into(),
                 Rectangle::from_size(size),
