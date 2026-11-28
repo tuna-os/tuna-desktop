@@ -285,9 +285,13 @@ G-XWAYLAND-GRAB: an X11 probe on the session's
 Xwayland takes `XGrabKeyboard`; as WM_CLASS `remote-viewer` (Mutter's
 built-in list) its grab is granted, a real Super tap reaches it and the
 overview stays shut until Super+Escape gives the shortcuts back, while as
-`XTerm` its grab is refused and Super opens the overview. CI runs the
-slice in the `gtk-shell` job; its `protocols/assertions.txt` feeds the
-ledger.
+`XTerm` its grab is refused and Super opens the overview.
+G-TOPLEVEL-DRAG: a real button press in the probe's window starts a drag-and-drop with a new, unmapped toplevel
+attached through `xdg_toplevel_drag_v1` at offset (30, 15); as xdotool
+moves the pointer the window's origin is the pointer less that offset,
+and releasing over nothing sends `dnd_drop_performed` then `cancelled`
+and leaves the window where it fell. CI runs the slice in the `gtk-shell`
+job; its `protocols/assertions.txt` feeds the ledger.
 
 `scripts/tuna-gtk-shell-proof --dnd-overview-only --artifacts DIR` runs
 G-DND-OVERVIEW (#1189), the same function the full GTK proof calls after

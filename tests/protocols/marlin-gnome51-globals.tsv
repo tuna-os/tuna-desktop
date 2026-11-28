@@ -10,7 +10,7 @@ wl_shm	2	capture	match
 wl_output	4	capture	match
 zxdg_output_manager_v1	3	capture	match
 wl_data_device_manager	3	capture	match
-xdg_toplevel_drag_manager_v1	1	capture	gap:#89
+xdg_toplevel_drag_manager_v1	1	capture	match
 zwp_primary_selection_device_manager_v1	1	capture	match
 wl_subcompositor	1	capture	match
 xdg_wm_base	7	capture	match

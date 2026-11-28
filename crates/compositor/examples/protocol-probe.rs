@@ -26,6 +26,13 @@
 //!   zwp_xwayland_keyboard_grab_v1), prints `grabbed WINDOW` and then one
 //!   `press KEYCODE` / `release KEYCODE` line per key it receives until
 //!   killed; the proof presses keys and reads the compositor's verdict.
+//! - `toplevel-drag --state FILE`: maps a window and prints `ready`; on
+//!   the next real button press in it, starts a client drag-and-drop with
+//!   a new toplevel attached through xdg_toplevel_drag_v1 at offset
+//!   (30, 15) and prints `dragging`. The proof moves the pointer and reads
+//!   the attached window's place; on release (no drop target) the source
+//!   must hear `dnd_drop_performed` and then `cancelled`, as Mutter 51
+//!   sends them. Prints `dropped` and keeps the window 5 s for the proof.
 //!
 //! `--state` names the compositor state file (`TUNA_COMPOSITOR_STATE`),
 //! read for window parents and mapping.
@@ -43,9 +50,15 @@ use wayland_client::{
         wl_buffer::WlBuffer,
         wl_callback::{self, WlCallback},
         wl_compositor::WlCompositor,
+        wl_data_device::{self, WlDataDevice},
+        wl_data_device_manager::{DndAction, WlDataDeviceManager},
+        wl_data_offer::WlDataOffer,
+        wl_data_source::{self, WlDataSource},
         wl_fixes::WlFixes,
+        wl_pointer::{self, WlPointer},
         wl_region::WlRegion,
         wl_registry::{self, WlRegistry},
+        wl_seat::WlSeat,
         wl_shm::{self, WlShm},
         wl_shm_pool::WlShmPool,
         wl_surface::WlSurface,
@@ -74,6 +87,9 @@ use wayland_protocols::xdg::shell::client::{
     xdg_surface::{self, XdgSurface},
     xdg_toplevel::{self, XdgToplevel},
     xdg_wm_base::{self, XdgWmBase},
+};
+use wayland_protocols::xdg::toplevel_drag::v1::client::{
+    xdg_toplevel_drag_manager_v1::XdgToplevelDragManagerV1, xdg_toplevel_drag_v1::XdgToplevelDragV1,
 };
 
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -117,6 +133,10 @@ struct Probe {
     destroyed_imports: Vec<u32>,
     blur_capabilities: Option<u32>,
     synced: bool,
+    /// The serial of the last pointer button press.
+    press_serial: Option<u32>,
+    /// The drag source's events, by name, in arrival order.
+    source_events: Vec<&'static str>,
 }
 
 impl Probe {
@@ -689,6 +709,121 @@ fn xwayland_grab(state: &Path, instance: &str, class: &str) {
     }
 }
 
+fn toplevel_drag(state: &Path) {
+    // Mutter 51 (meta-wayland-toplevel-drag.c): a toplevel attached to a
+    // client drag follows the pointer at its offset, shown under it when
+    // attached before it maps; release without a target sends
+    // dnd_drop_performed, then cancelled.
+    let mut client = Client::connect();
+    let manager: XdgToplevelDragManagerV1 = client.bind("xdg_toplevel_drag_manager_v1", 1);
+    let seat: WlSeat = client.bind("wl_seat", 5);
+    let devices: WlDataDeviceManager = client.bind("wl_data_device_manager", 3);
+    let wm: XdgWmBase = client.bind("xdg_wm_base", 1);
+    let qh = client.qh();
+    let _pointer = seat.get_pointer(&qh, ());
+    let device = devices.get_data_device(&seat, &qh, ());
+    let tabs = client.window(
+        &wm,
+        "tuna-probe-drag-tabs",
+        Fill::Solid(0xff35_84e4),
+        (480, 320),
+    );
+    await_state(
+        &mut [&mut client],
+        state,
+        "tuna-probe-drag-tabs",
+        "the tab strip to map",
+        |_| true,
+    );
+    println!("ready");
+    client.until("a button press in the tab strip", |p| {
+        p.press_serial.is_some()
+    });
+    let serial = client.probe.press_serial.unwrap();
+    let source = devices.create_data_source(&qh, ());
+    source.offer("application/x-tuna-probe-tab".into());
+    source.set_actions(DndAction::Move);
+    let drag = manager.get_xdg_toplevel_drag(&source, &qh, ());
+    // The detached tab: attached before it maps, as browsers do.
+    let surface = client
+        .probe
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_surface(&qh, ());
+    let index = client.probe.windows.len();
+    let xdg = wm.get_xdg_surface(&surface, &qh, index);
+    let top = xdg.get_toplevel(&qh, index);
+    top.set_app_id("tuna-probe-drag-tab".into());
+    top.set_title("tuna-probe-drag-tab".into());
+    client.probe.windows.push(Window {
+        surface: surface.clone(),
+        top: top.clone(),
+        fill: Fill::Solid(0xffe0_1b24),
+        default_size: (240, 160),
+        pending_size: (0, 0),
+        pending_states: Vec::new(),
+        configures: Vec::new(),
+    });
+    drag.attach(&top, 30, 15);
+    let origin = client.probe.windows[tabs].surface.clone();
+    device.start_drag(Some(&source), &origin, None, serial);
+    surface.commit();
+    await_state(
+        &mut [&mut client],
+        state,
+        "tuna-probe-drag-tab",
+        "the attached tab to map",
+        |_| true,
+    );
+    println!("dragging");
+    let _ = std::io::stdout().flush();
+    let end = Instant::now() + Duration::from_secs(60);
+    while !client.probe.source_events.contains(&"cancelled")
+        && !client.probe.source_events.contains(&"dnd_finished")
+    {
+        if Instant::now() >= end {
+            fail(format!(
+                "the drag never ended; source heard {:?}",
+                client.probe.source_events
+            ));
+        }
+        let _ = client.queue.flush();
+        if let Some(guard) = client.queue.prepare_read() {
+            let mut fd = libc::pollfd {
+                fd: guard.connection_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd for the duration of the call.
+            if unsafe { libc::poll(&mut fd, 1, 100) } > 0 {
+                let _ = guard.read();
+            }
+        }
+        client
+            .queue
+            .dispatch_pending(&mut client.probe)
+            .unwrap_or_else(|e| fail(format!("protocol error: {e}")));
+    }
+    if client.probe.source_events != ["dnd_drop_performed", "cancelled"] {
+        fail(format!(
+            "a release without a target sent {:?}, want dnd_drop_performed then cancelled",
+            client.probe.source_events
+        ));
+    }
+    println!("ok release without a target: dnd_drop_performed, then cancelled");
+    println!("dropped");
+    let _ = std::io::stdout().flush();
+    let hold = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < hold {
+        let _ = client.queue.flush();
+        let _ = client.queue.dispatch_pending(&mut client.probe);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drag.destroy();
+    client.roundtrip();
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let state = args
@@ -712,8 +847,9 @@ fn main() {
             (Some(instance), Some(class)) => xwayland_grab(&need_state(), instance, class),
             _ => fail("xwayland-grab needs INSTANCE CLASS"),
         },
+        Some("toplevel-drag") => toplevel_drag(&need_state()),
         other => fail(format!(
-            "unknown check {other:?}: xdg-wm-base-7, xdg-foreign-v1, wl-fixes, background-blur, syncobj-unoffered, xwayland-grab"
+            "unknown check {other:?}: xdg-wm-base-7, xdg-foreign-v1, wl-fixes, background-blur, syncobj-unoffered, xwayland-grab, toplevel-drag"
         )),
     }
 }
@@ -911,3 +1047,62 @@ wayland_client::delegate_noop!(Probe: ZxdgImporterV1);
 wayland_client::delegate_noop!(Probe: ZxdgExporterV2);
 wayland_client::delegate_noop!(Probe: ZxdgImporterV2);
 wayland_client::delegate_noop!(Probe: ignore ExtBackgroundEffectSurfaceV1);
+wayland_client::delegate_noop!(Probe: XdgToplevelDragManagerV1);
+wayland_client::delegate_noop!(Probe: ignore XdgToplevelDragV1);
+wayland_client::delegate_noop!(Probe: ignore WlSeat);
+wayland_client::delegate_noop!(Probe: ignore WlDataDeviceManager);
+wayland_client::delegate_noop!(Probe: ignore WlDataOffer);
+
+impl Dispatch<WlPointer, ()> for Probe {
+    fn event(
+        probe: &mut Self,
+        _: &WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_pointer::Event::Button {
+            serial,
+            state: wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed),
+            ..
+        } = event
+        {
+            probe.press_serial = Some(serial);
+        }
+    }
+}
+
+impl Dispatch<WlDataDevice, ()> for Probe {
+    fn event(
+        _: &mut Self,
+        _: &WlDataDevice,
+        _: wl_data_device::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+
+    wayland_client::event_created_child!(Probe, WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, ()),
+    ]);
+}
+
+impl Dispatch<WlDataSource, ()> for Probe {
+    fn event(
+        probe: &mut Self,
+        _: &WlDataSource,
+        event: wl_data_source::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        probe.source_events.push(match event {
+            wl_data_source::Event::Cancelled => "cancelled",
+            wl_data_source::Event::DndDropPerformed => "dnd_drop_performed",
+            wl_data_source::Event::DndFinished => "dnd_finished",
+            _ => return,
+        });
+    }
+}
