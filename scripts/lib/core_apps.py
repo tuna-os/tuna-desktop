@@ -593,7 +593,12 @@ class Desktop(NativeDesktop):
                     break
             else:
                 raise RuntimeError('actual switcher did not restore original app focus')
-        self.tree(actor)
+        # The selected app must stay observable, but one walk can fail
+        # while its tree churns: the just-restarted Epiphany's first walk
+        # exited nonzero while its page loaded (run 46118838058). Only the
+        # node count is retained; tree() already keeps each full walk.
+        self.await_state('selected-app-observable', lambda: {'nodes': len(self.tree(actor)['nodes'])},
+                         lambda value: value['nodes'] > 0)
         return state
 
     def clipboard(self, mime='text/plain;charset=utf-8'):
