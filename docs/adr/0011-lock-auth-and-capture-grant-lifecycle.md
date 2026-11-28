@@ -330,22 +330,31 @@ that closes a risk below; "in progress" means a fix is still being built.
   [INFERENCE.] Mutter's nodes are equally open to unsandboxed clients.
 - **L7. Untested EIS revocation (G9; fixed in #1169).** No test checks that a delivered EIS
   client sees a disconnect after lock or owner loss. The code closes the
-  compositor's end.
+  compositor's end. Fixed: `remote_eis.rs`
+  (`a_delivered_eis_client_is_disconnected_when_its_grant_is_revoked`) and
+  R-EIS-REVOKE in `tests/remote-desktop-reference/run.sh`, where a real
+  libei client the GNOME 51 portal delivered hears the disconnect once the
+  grant's backend owner is lost.
 - **L8. Portal reach beyond need (G6; fixed in #1169).** `org.tuna.Screenshot.ScreenshotWindows`
   uses `Authority::admit` (`screenshot.rs`, `WindowsService::screenshot_windows`),
   so the authenticated portal, not only the shell, can save every window to
   any absolute directory. `disable-save-to-disk` does not cover it.
-  Screenshots written to disk outlive their request by design.
+  Screenshots written to disk outlive their request by design. Fixed: only
+  the shell passes; G-SCREENSHOT-WINDOWS-DENY (`scripts/tuna-gtk-shell-proof`)
+  refuses code inside the genuine portal backend that owns its name.
 - **L9. Shared limits.** Session limits are global, so one trusted caller
   can use up the pool.
 - **L10. Evidence that is not per pull request.** `marlin-vm`,
   `portal-security` and `remote-security` are rotated lanes; a change to
   `crates/compositor` alone does not select them (`scripts/ci-select-lanes`),
   and `ci-gate` accepts a skipped lane. They always run on `main` and
-  nightly (G7; accepted). The P-LK-01 ledger row cites
-  `crates/compositor/tests/unlock.rs` (`correct_password_dismisses_lock_intact`),
-  which drives `unlock::unlock_session`, a path the runtime does not use;
+  nightly (G7; accepted). The P-LK-01 ledger row cited the compositor's
+  `unlock.rs` integration test (`correct_password_dismisses_lock_intact`),
+  which drove `unlock::unlock_session`, a path the runtime does not use;
   production unlock is `Runtime::apply_verified_unlock` (G8; fixed in #1169).
+  Fixed: that test and `unlock_session` are gone, and the row cites
+  `crates/compositor/tests/auth_owner_runtime.rs`, which unlocks the actual
+  nested runtime only through `apply_verified_unlock`.
 - **L11. A drag icon above the lock (F7; fixed in #1170).** `engage_lock` does
   not cancel a client drag, and the drag icon is drawn on top of the scene
   without a lock check (`runtime.rs`, `dnd_icon_elements`). An application

@@ -16,6 +16,9 @@
 //!   offers blur; a maximized window of one-pixel stripes is mapped with a
 //!   clear window above it whose whole surface is a blur region. Prints
 //!   `ready` and keeps both open until killed; the proof samples pixels.
+//! - `syncobj-unoffered`: without a timeline-syncobj renderer device no
+//!   client finds wp_linux_drm_syncobj_manager_v1 (Mutter 51 creates the
+//!   global only after its device checks pass).
 //! - `toplevel-drag --state FILE`: maps a window and prints `ready`; on
 //!   the next real button press in it, starts a client drag-and-drop with
 //!   a new toplevel attached through xdg_toplevel_drag_v1 at offset
@@ -577,6 +580,16 @@ fn background_blur(state: &Path) {
     }
 }
 
+fn syncobj_unoffered() {
+    let client = Client::connect();
+    if let Some((_, version)) = client.probe.globals.get("wp_linux_drm_syncobj_manager_v1") {
+        fail(format!(
+            "wp_linux_drm_syncobj_manager_v1 v{version} is offered on a renderer without timeline syncobjs"
+        ));
+    }
+    println!("ok wp_linux_drm_syncobj_manager_v1 is not offered");
+}
+
 fn toplevel_drag(state: &Path) {
     // Mutter 51 (meta-wayland-toplevel-drag.c): a toplevel attached to a
     // client drag follows the pointer at its offset, shown under it when
@@ -709,9 +722,10 @@ fn main() {
         Some("xdg-foreign-v1") => xdg_foreign_v1(&need_state()),
         Some("wl-fixes") => wl_fixes(),
         Some("background-blur") => background_blur(&need_state()),
+        Some("syncobj-unoffered") => syncobj_unoffered(),
         Some("toplevel-drag") => toplevel_drag(&need_state()),
         other => fail(format!(
-            "unknown check {other:?}: xdg-wm-base-7, xdg-foreign-v1, wl-fixes, background-blur, toplevel-drag"
+            "unknown check {other:?}: xdg-wm-base-7, xdg-foreign-v1, wl-fixes, background-blur, syncobj-unoffered, toplevel-drag"
         )),
     }
 }
