@@ -11075,7 +11075,17 @@ if ! slide_settled "$slide_home" "slid back"; then
     slide_settled "$slide_home" "slid back" || fail G-WORKSPACE-SLIDE "Super+Page_Up did not slide back"
 fi
 # Twice in quick succession: the second press carries on from the drawn
-# offset and ends two workspaces over, never moving backwards.
+# offset and ends two workspaces over, never moving backwards. Dynamic
+# workspaces end at one empty workspace and Right there stays put (mutter
+# clamps, workspace.c:1312-1321), so hold enough fixed workspaces for two
+# steps over (G-WS-FIXED proves the fixed count itself).
+slide_dynamic="$(gsettings get org.gnome.mutter dynamic-workspaces)"
+slide_num="$(gsettings get org.gnome.desktop.wm.preferences num-workspaces)"
+slide_count="$(jq '.workspaces | length' "$CSTATE")"
+gsettings set org.gnome.desktop.wm.preferences num-workspaces $((slide_home + 3))
+gsettings set org.gnome.mutter dynamic-workspaces false
+cstate ".multitasking.dynamic_workspaces == false and (.workspaces | length) == $((slide_home + 3)) and .active_workspace == $slide_home" "fixed slide workspaces" ||
+    fail G-WORKSPACE-SLIDE "could not hold $((slide_home + 3)) fixed workspaces for the double press"
 anim_clock 11000
 xdotool key super+Page_Down
 slide_began $((slide_home + 1)) "first press" ||
@@ -11110,6 +11120,10 @@ while [ "$(jq -r '.active_workspace' "$CSTATE")" != "$slide_home" ]; do
     anim_clock "$slide_clock"
     cstate '.workspace_slide.in_flight == null' "stepped home" || fail G-WORKSPACE-SLIDE "the slide back did not settle"
 done
+gsettings set org.gnome.mutter dynamic-workspaces "$slide_dynamic"
+gsettings set org.gnome.desktop.wm.preferences num-workspaces "$slide_num"
+cstate ".multitasking.dynamic_workspaces == $slide_dynamic and (.workspaces | length) == $slide_count and .active_workspace == $slide_home" "slide workspaces restored" ||
+    fail G-WORKSPACE-SLIDE "could not restore the workspaces after the double press"
 # Reduced motion keeps fades: the workspaces crossfade in place.
 gsettings set org.gnome.desktop.a11y.interface reduced-motion 'reduce'
 cstate '.motion_policy == "fade-only"' "fade-only slide" ||
