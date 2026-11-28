@@ -15,8 +15,9 @@ checking the same user-visible claim on the real Marlin session:
   V-OVERVIEW-FOCUS    P-OV-06    Escape out of the overview returns keyboard
                                  focus to the window that had it, at its
                                  rectangle, for two different windows
-  V-NOTIFY            P-NT-01    notify-send shows a top-centre banner with its
-                                 action, one banner at a time, an action press
+  V-NOTIFY            P-NT-01    notify-send shows a top-centre banner, the
+                                 pointer on it shows its action and holds it,
+                                 one banner at a time, an action press
                                  reaches the app, Delete dismisses (reason 2),
                                  Escape expires (reason 1), low urgency never
                                  banners
@@ -640,8 +641,16 @@ class ShellGates(Gates):
         first, second, third, quiet = (self.title(w) for w in ("first banner", "queued", "keyboard", "low"))
         one = self.send(first, action="open=Open Probe")
         shown = self.see(lambda n: has(n, first), "no banner for notify-send", "Notifications")
-        placement = banner_problems(layer_rect(shown["scene"], "tuna-shell-banners"), output)
+        banner = layer_rect(shown["scene"], "tuna-shell-banners")
+        placement = banner_problems(banner, output)
         self.frame("notify-banner")
+        # GNOME 51's banner shows its action buttons only expanded (messageList.js:628-649), which the
+        # pointer coming onto it does, holding it there too (messageTray.js:977-997, :1105-1108).
+        self.move(banner[0] + banner[2] // 2, min(HEIGHT - 1, banner[1] + banner[3] + 120))
+        time.sleep(0.3)
+        self.move(*node_point(shown["nodes"], first, shown["scene"], "Notifications"))
+        self.see(lambda n: has(n, "Open Probe", "Notifications"), "the pointer on the banner never showed its action",
+                 "Notifications")
         two = self.send(second)
         time.sleep(1.5)
         together = self.dump("Notifications")
@@ -681,7 +690,8 @@ class ShellGates(Gates):
         self.save("notify-events.json", events)
         if problems:
             raise GateError("; ".join(problems))
-        return ("notify-send's banner shows top centre under the bar with its action, the next waits for it "
+        return ("notify-send's banner shows top centre under the bar, the pointer on it shows its action, the next "
+                "waits for it "
                 "(one banner at a time) and shows when the action press reaches the app; Super+N then Delete "
                 "dismisses (reason 2), Escape expires (reason 1); low urgency never banners "
                 "(shell-gates/notify-*.json)")

@@ -732,9 +732,11 @@ class World:
                         extents=(100 + (i % 8) * 130 + 1280 * (k - self.page), 20 + (i // 8) * 130, 96, 96))
         if self.banners():
             add("Notifications", "frame", "Notifications", extents=(0, 0) + tuple(self.BANNER[2:]))
+            # messageList.js: the action bin shows only expanded, which the pointer on the banner does.
+            expanded = inside(self.pointer, self.BANNER) and "no-hover-expand" not in self.quirks
             for note in self.banners():
                 add("Notifications", "label", note["title"], focused=self.banner_focus)
-                if note.get("action"):
+                if note.get("action") and expanded:
                     add("Notifications", "button", note["action"].split("=")[1], extents=(20, 60, 120, 30))
         return [n for n in nodes if not frames or n["toplevel"] in frames]
 
@@ -878,6 +880,7 @@ class EndToEnd(unittest.TestCase):
             "grid-no-launch": ("V-APP-GRID", "did not launch"),
             "no-edge-preview": ("V-WINDOW-MOVE-RESIZE", "no tile preview"),
             "low-banners": ("V-NOTIFY", "low-urgency"),
+            "no-hover-expand": ("V-NOTIFY", "never showed its action"),
             "focus-stays-on-empty": ("V-WORKSPACE-KEYS", "focus on None"),
         }
         for quirk, (gate, message) in cases.items():
