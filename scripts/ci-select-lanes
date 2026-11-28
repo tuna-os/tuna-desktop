@@ -286,6 +286,7 @@ OWNED = [
     ("scripts/lib/vm_strip_*", ["marlin-vm"]),
     ("scripts/lib/vm_app_integration.py", ["marlin-vm"]),
     ("scripts/lib/vm_desktop_gates.py", ["marlin-vm"]),
+    ("scripts/lib/vm_wm_gates.py", ["marlin-vm"]),
     # The nested tray proof's stub, also V-TRAY's fixture in the VM images.
     ("scripts/lib/tuna-tray-item-stub.py", ["gtk-shell", "journey", "marlin-vm"]),
     # Both marlin images ship it as /usr/libexec/tuna-datetime-proof; the
