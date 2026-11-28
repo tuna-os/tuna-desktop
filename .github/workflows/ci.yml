@@ -1290,10 +1290,12 @@ jobs:
       # The login screen (#1164, P-LK-03): tuna-compositor --greeter and
       # tuna-greeter against a GDM 51 and AccountsService mock on a private
       # system bus, driven through real X11 input and checked through
-      # AT-SPI. Independent of the proofs above, like the OSK proof.
+      # AT-SPI. Independent of the proofs above, like the OSK proof. The
+      # conflicting-session dialog's 60 s timeout is waited out (about 9.5
+      # minutes on a loaded workstation; 15 keeps half again as headroom).
       - name: Prove the Tuna greeter on GDM's greeter API
         if: ${{ !cancelled() }}
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: shellcheck -x scripts/tuna-greeter-proof && scripts/tuna-greeter-proof --artifacts gtk-shell-artifacts/greeter
       # Keep runnable binaries even when a later live proof assertion fails.
       # #1124: tuna-wallpaper-svg is built only by scripts/tuna-gtk-shell-proof
