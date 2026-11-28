@@ -30,12 +30,14 @@ threshold are unchanged. Boundary tests are not graphical qualification.
 ## Which lanes a pull request runs
 
 Every push to `main`, the nightly schedule and `workflow_dispatch` run
-every proof lane. Both `select-lanes` and `check` always run. The lightweight
-`select-lanes` job runs `scripts/ci-select-lanes`, diffs the PR against its
-base, and picks the proof lanes the change can affect:
+every proof lane but the merge queue's `gtk-shell-smoke` (see
+[Merge queue](#merge-queue)). Both `select-lanes` and `check` always run.
+The lightweight `select-lanes` job runs `scripts/ci-select-lanes`, diffs
+the PR against its base, and picks the proof lanes the change can affect:
 
 - `ci.yml`, `.github/actions/ci-tool/`, `scripts/ci-*`, `Cargo.toml`,
-  `Cargo.lock`, `third-party/` or `scripts/tuna-nested`: every lane.
+  `Cargo.lock`, `third-party/` or `scripts/tuna-nested`: every lane,
+  `gtk-shell-smoke` included.
 - most documentation, other workflows, `fuzz/` and the script self-tests: no
   proof lanes. The selector-owned documentation exceptions are
   `docs/nested-session.md` (`arch-package`), `docs/walkthrough*`
@@ -52,18 +54,19 @@ base, and picks the proof lanes the change can affect:
   and `/etc/pam.d/tuna-lock-fingerprint`): `journey`, whose disposable Debian
   lifecycle fails when `tuna-lock`'s bytes drift from the released package's,
   plus the core lanes and every package consumer.
-- anything else (crates, `share/`, other scripts): `gtk-shell` plus a
-  round-robin slice of the other end-to-end lanes, rotated by run number.
+- anything else (crates, `share/`, other scripts): `gtk-shell` and
+  `desktop-proofs` plus a round-robin slice of the other end-to-end lanes,
+  rotated by run number.
   The slice size is the repository variable `CI_ROUND_ROBIN_SIZE`
   (default 2); each push to a PR covers a different slice and `main` runs
   them all after merge.
 
 The step summary of `select-lanes` names the chosen lanes and why.
 Independent lanes start after selection, without waiting for workspace
-tests. GTK and grid comparison admission still require the
-successful current-run `check`; the ledger also consumes its test list,
-and image publication waits for it. Package and screenshot consumers still
-wait for their producing proof jobs.
+tests. GTK and grid-cancel comparison (`desktop-proofs`) admission still
+require the successful current-run `check`; the ledger also consumes its
+test list, and image publication waits for it. Package and screenshot
+consumers still wait for their producing proof jobs.
 
 `ci-gate` requires both infrastructure jobs to succeed and fails when any
 selected job fails or is cancelled. Only unselected proof lanes may be
@@ -73,19 +76,24 @@ skipped. To run every lane on a branch, dispatch `ci` on it.
 
 `ci` also runs on `merge_group`, the event GitHub raises for each merge
 queue entry: a temporary branch holding `main` plus the queued pull
-requests ahead of that entry. A merge group is not a `pull_request`, so
-`scripts/ci-select-lanes` selects every lane, the Marlin VM matrix adds the
-main-only legs, and the jobs run on the repository's own runners. Its
-`ci-gate` is the status a merge queue rule should require.
+requests ahead of that entry. A merge group is not a `pull_request`; it
+runs a fixed fast battery: `scripts/ci-select-lanes` selects only
+`gtk-shell-smoke` (its `MERGE_QUEUE`), so the group runs `select-lanes`,
+`check` and that one GTK session beside it, on the repository's own
+runners. `gtk-shell-smoke` runs `scripts/tuna-gtk-shell-proof
+--smoke-only`: session start, the bar (`G-PANEL`, `A11Y-PANEL`), three app
+windows (`G-WINDOWS`), the overview (`G-OV-OPEN`, `G-OV-PICK`), locking
+over the bar's menus and unlocking through PAM (`G-LOCK-WITH-MENU-OPEN`)
+and `G-SHELL-STABLE`. Every other lane runs on the push to `main` the group
+becomes and nightly. Its `ci-gate` is the status the merge queue rule
+requires.
 
-The trigger does nothing until a repository rule turns the queue on. Two
-things to settle when it does:
+Two things to keep in mind:
 
-- A full run takes far longer than a pull request's selected lanes. Set
-  the rule's merge-group size above one so one run lands several pull
-  requests, and check runner capacity first
-  ([ci-runners.md](ci-runners.md)): each group adds a full run to the
-  pull-request runs already queued.
+- A group takes about as long as `check`, so a group size of one is
+  affordable; see [ci-runners.md](ci-runners.md#what-a-merge-group-runs).
+  A regression only the full battery catches shows on `main` after the
+  merge, not in the queue.
 - Only `ci` reports on a merge group. `Ratchet`, `actions-security` and
   `Measured test coverage` still run on pull requests and on `main` only;
   requiring one of them from the queue without adding `merge_group` to its
@@ -774,17 +782,20 @@ drop mid-bracket. The bracket checks themselves are unchanged.
 |---|---|---|---|
 | `journey` | `scripts/tuna-journey --artifacts journey-artifacts` | `xvfb xdotool x11-apps scrot jq dbus`, Mesa EGL (`libegl1 libgl1-mesa-dri`) | Overview, search, launch from search, Escape, workspace switch, Alt+Tab; writes `assertions.txt` |
 | `journey` | `scripts/tuna-release --allow-dirty --out package-artifacts && scripts/check-release-package package-artifacts/*.deb` | as above | The Debian package builds and passes its checks |
-| `app-content` | `scripts/tuna-app-content --artifacts app-content-artifacts` | `python3-venv`; the script installs Playwright and Chromium itself | Chromium maps as a Wayland client, tiles with Super+Left, closes with Alt+F4 |
-| `scroll-proof` | `scripts/tuna-scroll-proof --artifacts scroll-proof-artifacts` | `python3-venv` | Scroll-mode strip: Super+Shift+T, Super+R, wheel scrolling, gap geometry |
+| `desktop-proofs` | `scripts/tuna-app-content --artifacts "$RUNNER_TEMP/app-content-artifacts"` | `python3-venv`; the script installs Playwright and Chromium itself | Chromium maps as a Wayland client, tiles with Super+Left, closes with Alt+F4; uploaded as `app-content-shots` |
+| `desktop-proofs` | `scripts/tuna-scroll-proof --artifacts "$RUNNER_TEMP/scroll-proof-artifacts"` | `python3-venv` | Scroll-mode strip: Super+Shift+T, Super+R, wheel scrolling, gap geometry; uploaded as `scroll-proof-shots` |
 | `gtk-shell` | `TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-artifacts` | gtk4-layer-shell (`scripts/ci-install-gtk4-layer-shell`), `xwayland pipewire wireplumber at-spi2-core python3-pyatspi fonts-cantarell ffmpeg libpam-wrapper` and the GStreamer PipeWire plugins; see the job for the full list | GTK shell panel, calendar, quick settings, overview, notifications, lock and unlock, AT-SPI trees; writes `assertions.txt` |
 | `gtk-shell` | `scripts/tuna-scale-proof --artifacts gtk-shell-artifacts/scale` | as above | The same session at 150 percent scale; writes `assertions.txt` |
 | `gtk-shell` | `scripts/tuna-slow-portal-proof --artifacts gtk-shell-artifacts/slow-portal` | as above | On a dbus-daemon bus whose portal activation hangs, the shell owns `org.gnome.Shell` within 15 s (40 s on GTK before 4.17, whose GtkApplication always waits on the inhibit portal) and makes no GDK portal call; writes `assertions.txt` |
+| `gtk-shell-smoke` | `TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --smoke-only --artifacts gtk-shell-smoke-artifacts` | as for `gtk-shell` | The merge queue's battery: bar, app windows, overview, lock and unlock through PAM; writes `assertions.txt` |
 | `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg kmod python3-evdev python3-gi gir1.2-gtk-4.0 gsettings-desktop-schemas acl`; run `scripts/ci-install-vkms` after `apt-get update` to ensure vkms for the running kernel | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe`, seatd, uinput and the card's seat ACL (`setfacl`, which a logind seat session would grant; the DRM lease device opens its own non-master fd) |
 | `drm-smoke` | `scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt` | as above; Linux 6.19 or newer for vkms configfs (the job pins `ubuntu-26.04`) | Two connectors of a vkms configfs device: mirroring, disabling and kept layouts, workspaces on the primary only, the workspace slide per monitor, mixed fractional/integer scale; appends to drm-smoke's `assertions.txt` |
 | `hotplug` | `scripts/tuna-hotplug-stress --rounds 4 --out hotplug-artifacts` | as for `drm-smoke`, plus `libpam-wrapper colord pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools xdg-desktop-portal-gnome`; Linux 6.19+ for vkms configfs (the job pins `ubuntu-26.04`) | Connector hotplug on vkms: outputs, window re-homing, a full unplug, lock, colord and screencast gates (see [Output hotplug storm](#output-hotplug-storm)); writes `assertions.txt` |
 
-`app-content` and `scroll-proof` download Playwright and Chromium into a
-temporary venv on every run, so they need network access.
+The `desktop-proofs` app content and scroll-mode strip proofs download
+Playwright and Chromium into a temporary venv on every run, so they need
+network access. In CI they reuse the grid-cancel comparison's fixed build
+(`CARGO_TARGET_DIR`, which both scripts honor).
 
 `G-GRID-PAGE-ANIM` keeps the raw frame and page-dot trace in `nested.log`
 and the matcher's combined output (including mismatch stderr) in
@@ -821,10 +832,10 @@ TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --artifacts gtk-shell-ar
 ```
 
 `--notify-lock-only` stops after panel readiness and runs just the
-lock-screen notification, media player, notification sound,
+lock-screen notification, screen wake, media player, notification sound,
 disabled-app restore, banner expansion and date-menu media gates
 (G-NOTIFY-LOCK, G-NOTIFY-LOCK-PIXELS, G-NOTIFY-LOCK-PUSH,
-G-NOTIFY-LOCK-LIVE, G-NOTIFY-LOCK-MEDIA, G-NOTIFY-SOUND,
+G-NOTIFY-LOCK-LIVE, G-NOTIFY-WAKE, G-NOTIFY-LOCK-MEDIA, G-NOTIFY-SOUND,
 G-NOTIFY-RESTORE, G-NOTIFY-EXPANDED, G-NOTIFY-CALENDAR-MEDIA); it needs
 pam_wrapper to unlock. The proof's `canberra-gtk-play` stand-in records
 every event sound the shell asks for in `canberra-calls`, and
@@ -1501,10 +1512,11 @@ cites it in the same PR.
 ## Release screenshots
 
 The `docs-shots` job runs `scripts/tuna-docs-shots collect` over the
-`journey`, `app-content` and `scroll-proof` artifacts and uploads the
-curated frames as the `docs-shots` artifact. Nothing in the repository is
-refreshed from it. The docs show the GTK shell through the
-[walkthrough](walkthrough.md), which the GTK shell proof captures.
+`journey` artifacts and the `desktop-proofs` app content and scroll-mode
+strip shots, and uploads the curated frames as the `docs-shots` artifact.
+Nothing in the repository is refreshed from it. The docs show the GTK
+shell through the [walkthrough](walkthrough.md), which the GTK shell proof
+captures.
 
 ## Pixel parity capture (not in CI)
 

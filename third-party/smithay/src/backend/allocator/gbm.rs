@@ -13,16 +13,83 @@ use crate::utils::{Buffer as BufferCoords, Size};
 use drm::buffer::PlanarBuffer;
 use gbm::BufferObject;
 pub use gbm::{BufferObjectFlags as GbmBufferFlags, Device as GbmDevice};
+use std::ffi::c_void;
 use std::os::unix::io::{AsFd, BorrowedFd};
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 /// A GBM buffer object
 #[derive(Debug)]
 pub struct GbmBuffer {
+    // Declared before `bo`: fields drop in declaration order, so the
+    // mapping is released while its buffer object still exists.
+    persistent_map: Option<PersistentMap>,
     drm_node: Option<DrmNode>,
     bo: BufferObject<()>,
     size: Size<i32, BufferCoords>,
     format: Format,
+}
+
+// `gbm.h`; the `gbm` crate links libgbm but keeps its bindings private.
+const GBM_BO_TRANSFER_READ: u32 = 1;
+extern "C" {
+    fn gbm_bo_map(
+        bo: *mut c_void,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        flags: u32,
+        stride: *mut u32,
+        map_data: *mut *mut c_void,
+    ) -> *mut c_void;
+    fn gbm_bo_unmap(bo: *mut c_void, map_data: *mut c_void);
+}
+
+/// A read mapping of a whole buffer object, held until it drops
+/// ([`GbmAllocator::keep_mapped`]).
+#[derive(Debug)]
+struct PersistentMap {
+    bo: *mut c_void,
+    map_data: *mut c_void,
+}
+
+// SAFETY: the pointers are only handed back to `gbm_bo_unmap`, once, on
+// drop; libgbm buffer objects are used from any thread, as the `Send` and
+// `Sync` `gbm::BufferObject` already relies on.
+unsafe impl Send for PersistentMap {}
+// SAFETY: as for `Send`; `&PersistentMap` exposes nothing.
+unsafe impl Sync for PersistentMap {}
+
+impl PersistentMap {
+    fn new(bo: &BufferObject<()>) -> Option<Self> {
+        use gbm::AsRaw;
+        let raw = bo.as_raw_mut().cast::<c_void>();
+        let mut stride = 0;
+        let mut map_data = std::ptr::null_mut();
+        // SAFETY: `raw` is a live buffer object; a read mapping of its
+        // whole extent never writes it back.
+        let ptr = unsafe {
+            gbm_bo_map(
+                raw,
+                0,
+                0,
+                bo.width(),
+                bo.height(),
+                GBM_BO_TRANSFER_READ,
+                &mut stride,
+                &mut map_data,
+            )
+        };
+        (!ptr.is_null()).then_some(Self { bo: raw, map_data })
+    }
+}
+
+impl Drop for PersistentMap {
+    fn drop(&mut self) {
+        // SAFETY: `map_data` came from `gbm_bo_map` on `bo`, which
+        // outlives this mapping (field order in `GbmBuffer`).
+        unsafe { gbm_bo_unmap(self.bo, self.map_data) }
+    }
 }
 
 impl PlanarBuffer for GbmBuffer {
@@ -113,6 +180,7 @@ impl GbmBuffer {
             },
         };
         Self {
+            persistent_map: None,
             drm_node,
             bo,
             size,
@@ -148,6 +216,7 @@ pub struct GbmAllocator<A: AsFd + 'static> {
     drm_node: Option<DrmNode>,
     device: GbmDevice<A>,
     default_flags: GbmBufferFlags,
+    keep_mapped: bool,
 }
 
 impl<A: AsFd + 'static> AsRef<GbmDevice<A>> for GbmAllocator<A> {
@@ -180,7 +249,23 @@ impl<A: AsFd + 'static> GbmAllocator<A> {
             drm_node,
             device,
             default_flags,
+            keep_mapped: false,
         }
+    }
+
+    /// Keep every buffer [`Allocator::create_buffer`] makes mapped for
+    /// reading until the buffer is destroyed.
+    ///
+    /// Mesa's software rendering on KMS (kms_swrast with llvmpipe) maps
+    /// a render target's dumb buffer for each frame it draws and unmaps
+    /// it afterwards (`kms_dri_sw_winsys.c`), so every frame faults in
+    /// each page it touches again. The winsys unmaps only when no map is
+    /// left, so a mapping held for the buffer's life keeps the renderer's
+    /// in place. Hardware drivers may copy a buffer to map it; keep this
+    /// off for them.
+    pub fn keep_mapped(mut self, keep: bool) -> Self {
+        self.keep_mapped = keep;
+        self
     }
 
     /// Alternative to [`Allocator::create_buffer`], if you need a one-off buffer with
@@ -245,7 +330,15 @@ impl<A: AsFd + 'static> Allocator for GbmAllocator<A> {
         fourcc: Fourcc,
         modifiers: &[Modifier],
     ) -> Result<GbmBuffer, Self::Error> {
-        self.create_buffer_with_flags(width, height, fourcc, modifiers, self.default_flags)
+        let mut buffer =
+            self.create_buffer_with_flags(width, height, fourcc, modifiers, self.default_flags)?;
+        if self.keep_mapped {
+            buffer.persistent_map = PersistentMap::new(&buffer.bo);
+            if buffer.persistent_map.is_none() {
+                warn!("gbm_bo_map failed; the buffer is mapped per use");
+            }
+        }
+        Ok(buffer)
     }
 }
 

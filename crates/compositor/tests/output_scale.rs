@@ -275,3 +275,50 @@ fn native_pressure_barrier_uses_live_logical_scale_geometry() {
     );
     assert!(triggered.is_none());
 }
+
+/// P-SY-03: 100/125/150/200 percent outputs side by side. A rectangle
+/// takes the scale of the output it overlaps most, on both sides of every
+/// boundary, and an unplugged output's neighbours keep their own scales
+/// while it comes back at its own.
+#[test]
+fn four_scales_side_by_side_resolve_per_boundary_and_survive_hotplug() {
+    let mut comp = TestCompositor::new();
+    let scales = [("A", 1.0), ("B", 1.25), ("C", 1.5), ("D", 2.0)];
+    for (name, scale) in scales {
+        comp.state
+            .add_output(name, Some(output(name, scale)), 1000, 600);
+    }
+    // add_output lays them out left to right: A 0, B 1000, C 2000, D 3000.
+    for (i, (name, scale)) in scales.iter().enumerate() {
+        let edge = i as i32 * 1000;
+        let inside = Rectangle::new((edge + 100, 50).into(), (200, 200).into());
+        assert_eq!(
+            comp.state.scale_for(inside).fractional_scale(),
+            *scale,
+            "{name}"
+        );
+        if i > 0 {
+            let (_, left) = scales[i - 1];
+            // 60 px on the left output, 140 px on this one, and the reverse.
+            let mostly_here = Rectangle::new((edge - 60, 50).into(), (200, 200).into());
+            let mostly_left = Rectangle::new((edge - 140, 50).into(), (200, 200).into());
+            assert_eq!(comp.state.scale_for(mostly_here).fractional_scale(), *scale);
+            assert_eq!(comp.state.scale_for(mostly_left).fractional_scale(), left);
+        }
+    }
+
+    // Unplug C: D keeps 200 percent at its own location, B keeps 125.
+    assert!(comp.state.remove_output("C"));
+    let on_d = Rectangle::new((3100, 50).into(), (200, 200).into());
+    let on_b = Rectangle::new((1100, 50).into(), (200, 200).into());
+    assert_eq!(comp.state.scale_for(on_d).fractional_scale(), 2.0);
+    assert_eq!(comp.state.scale_for(on_b).fractional_scale(), 1.25);
+
+    // Plug it back in: it returns at 150 percent.
+    comp.state
+        .add_output("C", Some(output("C", 1.5)), 1000, 600);
+    comp.state.set_output_location("C", (2000, 0));
+    let on_c = Rectangle::new((2100, 50).into(), (200, 200).into());
+    assert_eq!(comp.state.scale_for(on_c).fractional_scale(), 1.5);
+    assert_eq!(comp.state.scale_for(on_d).fractional_scale(), 2.0);
+}
