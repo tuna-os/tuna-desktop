@@ -197,7 +197,7 @@ sys.exit(int(os.environ['ENGINE_FAILURE']))
 
     def test_greeter_ships_beside_the_compositor_and_inactive(self):
         body, _ = self.greeter_checks()
-        self.assertIn('tuna-wallpaper-svg tuna-greeter; do', body)
+        self.assertIn('tuna-x11-frames tuna-greeter; do', body)
         self.assertIn('/usr/lib/systemd/user/tuna-greeter.service \\\n'
                       '    /usr/share/tuna-desktop/greeter/gnome-login.session.conf', body)
         result = self.run_greeter_checks()

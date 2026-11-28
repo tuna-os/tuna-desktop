@@ -261,7 +261,7 @@ fn packages_ship_the_login_screen_inactive() {
         let body = read_workspace(path);
         for token in [
             "-p tuna-greeter",
-            "tuna-wallpaper-svg tuna-greeter; do",
+            "tuna-x11-frames tuna-greeter; do",
             "share/systemd/user/tuna-greeter.service",
             "share/greeter/gnome-login.session.conf",
             unit,
