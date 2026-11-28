@@ -15,7 +15,7 @@
 use std::os::unix::io::AsFd;
 use std::os::unix::net::UnixStream;
 
-use smithay::utils::Size;
+use smithay::utils::{Point, Size};
 use tuna_compositor::{layer, windows::WindowManager, TestCompositor};
 use wayland_client::{
     protocol::{
@@ -262,6 +262,55 @@ impl Session {
         surface.damage_buffer(0, 0, width, height);
         self.buffers.push((file, pool, buffer));
     }
+}
+
+/// A GTK window: 100x72 of geometry inside a 128x100 buffer of shadow,
+/// its input region the geometry plus GTK's 12 px of resize border.
+#[test]
+fn a_press_on_gtks_invisible_border_is_the_windows() {
+    let mut s = Session::new(false);
+    let surface = s.surface();
+    let xdg = s
+        .client
+        .xdg_base
+        .as_ref()
+        .unwrap()
+        .get_xdg_surface(&surface, &s.qh, ());
+    let _toplevel = xdg.get_toplevel(&s.qh, ());
+    surface.commit();
+    s.pump(|c| c.configured);
+    xdg.set_window_geometry(14, 12, 100, 72);
+    let region = s
+        .client
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_region(&s.qh, ());
+    region.add(2, 0, 124, 96);
+    surface.set_input_region(Some(&region));
+    s.attach(&surface, 128, 100);
+    surface.commit();
+    s.roundtrip();
+    let id = s.manager.model().windows().next().expect("mapped").id;
+    let frame = s.manager.geometry(id).expect("geometry");
+    assert_eq!((frame.size.w, frame.size.h), (100, 72));
+    let (left, right, middle) = (
+        f64::from(frame.loc.x),
+        f64::from(frame.loc.x + frame.size.w),
+        f64::from(frame.loc.y + frame.size.h / 2),
+    );
+    let at = |x: f64, y: f64| s.manager.window_at(Point::from((x, y)));
+    assert_eq!(at(left + 10.0, middle), Some(id), "the geometry");
+    assert_eq!(at(right + 4.0, middle), Some(id), "the right resize border");
+    assert_eq!(at(left - 4.0, middle), Some(id), "the left resize border");
+    assert_eq!(
+        at(right + 4.0, f64::from(frame.loc.y + frame.size.h) + 4.0),
+        Some(id),
+        "the bottom-right corner's border"
+    );
+    // Shadow outside the input region, and past the buffer, pass through.
+    assert_eq!(at(right + 13.0, middle), None, "shadow outside the region");
+    assert_eq!(at(left - 15.0, middle), None, "past the buffer");
 }
 
 /// The workspace popup as gtk4-layer-shell maps it: 200x200 asked before

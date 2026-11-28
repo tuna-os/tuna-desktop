@@ -4129,18 +4129,46 @@ impl WindowManager {
             .map(|s| s.into_owned())
     }
 
-    /// Topmost window containing `pos`, if any. Only the active
-    /// workspace is hit-testable; hidden workspaces never take focus.
+    /// Topmost window under `pos`, if any. Only the active workspace is
+    /// hit-testable; hidden workspaces never take focus.
     pub fn window_at(&self, pos: Point<f64, Logical>) -> Option<u64> {
         let active = self.model.active_workspace();
         self.presentation_order().into_iter().rev().find(|id| {
             self.model.window(*id).is_some_and(|entry| {
                 (entry.workspace == active || self.on_all_workspaces(*id))
-                    && self.windows.get(id).is_some_and(|w| {
-                        !w.minimized && contains(self.shifted(*id, w.geometry), pos)
-                    })
+                    && self
+                        .windows
+                        .get(id)
+                        .is_some_and(|w| !w.minimized && self.takes_pointer_at(*id, w, pos))
             })
         })
+    }
+
+    /// Whether `pos` is on window `id`. Mutter picks the surface actor,
+    /// whose pick area is the client's input region clipped to its buffer
+    /// (mutter 51 meta-wayland-actor-surface.c:223-234,
+    /// meta-surface-actor.c:190-225): GTK's invisible resize border
+    /// outside the window geometry is the window's, the rest of its
+    /// shadow passes through. The geometry itself (and the subsurfaces
+    /// drawn in it) always is; X11 windows have only their geometry.
+    fn takes_pointer_at(&self, id: u64, w: &ManagedWindow, pos: Point<f64, Logical>) -> bool {
+        let frame = self.shifted(id, w.geometry);
+        if contains(frame, pos) {
+            return true;
+        }
+        let Some(surface) = w.surface.toplevel().map(|toplevel| toplevel.wl_surface()) else {
+            return false;
+        };
+        let Some(size) = buffer_size(surface) else {
+            return false;
+        };
+        let origin = crate::popup::surface_origin(surface, frame.loc);
+        let local = (
+            (pos.x - f64::from(origin.x)).floor() as i32,
+            (pos.y - f64::from(origin.y)).floor() as i32,
+        );
+        contains(Rectangle::from_size(size), Point::from(local).to_f64())
+            && crate::layer::accepts_input(surface, local)
     }
 
     /// Pointer motion: track the position, focus the window under the
