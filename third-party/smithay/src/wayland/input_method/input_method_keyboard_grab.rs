@@ -7,7 +7,7 @@ use wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_keyboa
     self, ZwpInputMethodKeyboardGrabV2,
 };
 use wayland_server::backend::ClientId;
-use wayland_server::Dispatch;
+use wayland_server::{Dispatch, Resource};
 
 use crate::input::{
     keyboard::{
@@ -90,6 +90,14 @@ where
             inner.grab.take()
         };
         if let Some(retiring) = retiring {
+            // Clear only the retiring resource's live-settings registration,
+            // never a replacement's: settings must not rearm a retired grab.
+            if let Some(data) = retiring.data::<InputMethodKeyboardUserData<D>>() {
+                let mut known = data.keyboard_handle.arc.known_im_grab.lock().unwrap();
+                if known.as_ref().is_some_and(|known| known.id() == retiring.id()) {
+                    *known = None;
+                }
+            }
             retiring.repeat_info(0, 0);
         }
     }
