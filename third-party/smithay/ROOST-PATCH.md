@@ -444,6 +444,23 @@ stretched and half-texel-shifted draws stay linear and filtered. The
 isolated diff is retained in UNSCALED-NEAREST-PATCH.diff; the pinned
 version stays 0.7.0.
 
+Issues #364 and #588 change src/wayland/drm_syncobj/mod.rs: a commit on a
+surface with a wp_linux_drm_syncobj_surface_v1 is checked as Mutter 51's
+meta_wayland_surface_explicit_sync_validate (meta-wayland-linux-drm-syncobj.c)
+does, and as the protocol's "if and only if" requires: a non-dmabuf buffer
+is unsupported_buffer whether or not points are set; a dmabuf without an
+acquire point is no_acquire_point (upstream let it through), then
+no_release_point; on one timeline acquire must be below release
+(conflicting_points); a point without a buffer is no_buffer (upstream
+called a lone release point no_acquire_point). Only the first error is
+posted. The check is the public pure function commit_error, with
+pending_commit_error reading it from a surface's pending state, so Roost's
+acquire-point pre-commit hook skips commits the check refuses. Unit tests in
+crates/compositor/src/explicit_sync.rs cover every case; real socketpair
+tests in crates/compositor/tests/protocol_gaps.rs cover surface_exists,
+invalid_timeline, unsupported_buffer and no_acquire_point. The isolated
+diff is retained in DRM-SYNCOBJ-PATCH.diff; the pinned version stays 0.7.0.
+
 Issue #503 additionally changes the instanced draws of GlesFrame
 (draw_solid, render_texture, and the custom-program solid draw) in
 src/backend/renderer/gles/mod.rs: each instance's rectangle is two

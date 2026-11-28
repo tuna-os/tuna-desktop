@@ -1,0 +1,333 @@
+{
+  "schema": 1,
+  "upstream": {
+    "repository": "projectbluefin/testsuite",
+    "revision": "da6a487ec6783490f042e1cad6841f54caf835f0",
+    "dependencies": {
+      "qecore": "4.19.3",
+      "behave": "1.3.3",
+      "dogtail": "2.0.3",
+      "python-uinput": "1.0.1"
+    },
+    "dependency_source": "action.yml gnome-e2e pip install line at the pinned revision"
+  },
+  "policy": {
+    "whole_scenario_retry": false,
+    "cli_only_fallback": false,
+    "start_gnome_shell": false,
+    "fake_shell_eval_provider": false,
+    "counts_as_desktop_compatibility": false
+  },
+  "dispositions": [
+    "portable",
+    "adapt",
+    "insufficient-alone",
+    "unsupported",
+    "inapplicable"
+  ],
+  "scenarios": [
+    {
+      "feature": "gnome_files.feature",
+      "scenario": "Files launches and window is accessible",
+      "upstream_tags": [
+        "retry",
+        "files",
+        "launch",
+        "sla_15s"
+      ],
+      "disposition": "portable",
+      "reason": "Real Nautilus window reached over AT-SPI in the Tuna Desktop session; retry removed."
+    },
+    {
+      "feature": "gnome_files.feature",
+      "scenario": "Home folder is in the sidebar",
+      "upstream_tags": [
+        "files",
+        "sidebar"
+      ],
+      "disposition": "portable",
+      "reason": "Real Nautilus AT-SPI sidebar query."
+    },
+    {
+      "feature": "gnome_files.feature",
+      "scenario": "Navigating to home folder shows contents",
+      "upstream_tags": [
+        "files",
+        "navigation"
+      ],
+      "disposition": "portable",
+      "reason": "Real sidebar click and listing check."
+    },
+    {
+      "feature": "gnome_files.feature",
+      "scenario": "Back button returns to previous location after navigating to Downloads",
+      "upstream_tags": [
+        "files",
+        "navigation"
+      ],
+      "disposition": "portable",
+      "reason": "Needs physical input reaching the original client; transport replaced by Tuna Desktop VM input."
+    },
+    {
+      "feature": "gnome_files.feature",
+      "scenario": "New folder dialog opens via keyboard shortcut Ctrl+Shift+N",
+      "upstream_tags": [
+        "retry",
+        "files",
+        "new_folder"
+      ],
+      "disposition": "portable",
+      "reason": "Physical key combo must reach the original Nautilus client; retry removed."
+    },
+    {
+      "feature": "gnome_files.feature",
+      "scenario": "Search bar opens via Ctrl+F",
+      "upstream_tags": [
+        "retry",
+        "files",
+        "search"
+      ],
+      "disposition": "portable",
+      "reason": "Physical key combo must reach the original Nautilus client; retry removed."
+    },
+    {
+      "feature": "gnome_files.feature",
+      "scenario": "Files closes cleanly via Ctrl+W",
+      "upstream_tags": [
+        "files",
+        "close"
+      ],
+      "disposition": "portable",
+      "reason": "Close via physical input; process exit and compositor survival verified."
+    },
+    {
+      "feature": "gnome_files.feature",
+      "scenario": "No Nautilus coredump after session start",
+      "upstream_tags": [
+        "regression",
+        "bluefin"
+      ],
+      "disposition": "adapt",
+      "reason": "Host coredump query; must run against the Tuna Desktop VM journal/coredumpctl, not the runner."
+    },
+    {
+      "feature": "gnome_settings.feature",
+      "scenario": "GNOME Settings launches and window is accessible",
+      "upstream_tags": [
+        "retry",
+        "settings",
+        "launch",
+        "sla_15s"
+      ],
+      "disposition": "portable",
+      "reason": "Real Settings window over AT-SPI; retry removed."
+    },
+    {
+      "feature": "gnome_settings.feature",
+      "scenario": "Settings sidebar is present with navigation items",
+      "upstream_tags": [
+        "settings",
+        "navigation"
+      ],
+      "disposition": "portable",
+      "reason": "Real AT-SPI sidebar query."
+    },
+    {
+      "feature": "gnome_settings.feature",
+      "scenario": "About page is accessible",
+      "upstream_tags": [
+        "settings",
+        "about"
+      ],
+      "disposition": "portable",
+      "reason": "Panel navigation only; not proof of Settings behaviour (observed-behaviour mapping tracked separately)."
+    },
+    {
+      "feature": "gnome_settings.feature",
+      "scenario": "About page shows OS information",
+      "upstream_tags": [
+        "settings",
+        "about"
+      ],
+      "disposition": "adapt",
+      "reason": "Must show Tuna/Marlin identity read from the image, not Bluefin strings."
+    },
+    {
+      "feature": "gnome_settings.feature",
+      "scenario": "Displays settings panel is accessible",
+      "upstream_tags": [
+        "settings",
+        "displays"
+      ],
+      "disposition": "insufficient-alone",
+      "reason": "Navigating a panel is not proof of behaviour; each control must be mapped to observed Tuna Desktop behaviour before this counts."
+    },
+    {
+      "feature": "gnome_settings.feature",
+      "scenario": "Wi-Fi settings panel is accessible",
+      "upstream_tags": [
+        "settings",
+        "wifi"
+      ],
+      "disposition": "insufficient-alone",
+      "reason": "Navigating a panel is not proof of behaviour; each control must be mapped to observed Tuna Desktop behaviour before this counts."
+    },
+    {
+      "feature": "gnome_settings.feature",
+      "scenario": "Privacy & Security settings panel is accessible",
+      "upstream_tags": [
+        "settings",
+        "privacy"
+      ],
+      "disposition": "insufficient-alone",
+      "reason": "Navigating a panel is not proof of behaviour; each control must be mapped to observed Tuna Desktop behaviour before this counts."
+    },
+    {
+      "feature": "gnome_settings.feature",
+      "scenario": "Notifications settings panel is accessible",
+      "upstream_tags": [
+        "settings",
+        "notifications"
+      ],
+      "disposition": "insufficient-alone",
+      "reason": "Navigating a panel is not proof of behaviour; each control must be mapped to observed Tuna Desktop behaviour before this counts."
+    },
+    {
+      "feature": "gnome_settings.feature",
+      "scenario": "Keyboard settings panel is accessible",
+      "upstream_tags": [
+        "settings",
+        "keyboard"
+      ],
+      "disposition": "insufficient-alone",
+      "reason": "Navigating a panel is not proof of behaviour; each control must be mapped to observed Tuna Desktop behaviour before this counts."
+    },
+    {
+      "feature": "gnome_settings.feature",
+      "scenario": "Power settings panel is accessible",
+      "upstream_tags": [
+        "settings",
+        "power"
+      ],
+      "disposition": "insufficient-alone",
+      "reason": "Navigating a panel is not proof of behaviour; each control must be mapped to observed Tuna Desktop behaviour before this counts."
+    },
+    {
+      "feature": "gnome_settings.feature",
+      "scenario": "Accessibility settings panel is accessible",
+      "upstream_tags": [
+        "settings",
+        "accessibility"
+      ],
+      "disposition": "insufficient-alone",
+      "reason": "Navigating a panel is not proof of behaviour; each control must be mapped to observed Tuna Desktop behaviour before this counts."
+    },
+    {
+      "feature": "gnome_settings.feature",
+      "scenario": "Settings closes cleanly via Ctrl+Q",
+      "upstream_tags": [
+        "settings",
+        "close"
+      ],
+      "disposition": "portable",
+      "reason": "Close via physical input; process exit verified."
+    },
+    {
+      "feature": "gnome_accessibility.feature",
+      "scenario": "Accessibility settings panel is reachable",
+      "upstream_tags": [
+        "retry",
+        "settings",
+        "accessibility",
+        "sla_15s"
+      ],
+      "disposition": "portable",
+      "reason": "Background step 'GNOME Shell is accessible via AT-SPI' must be replaced by Tuna Desktop compositor/GTK identity proof. Upstream @retry re-runs the whole scenario; disabled here (first failure is retained)."
+    },
+    {
+      "feature": "gnome_accessibility.feature",
+      "scenario": "High contrast mode can be toggled via gsettings",
+      "upstream_tags": [
+        "accessibility",
+        "gsettings"
+      ],
+      "disposition": "insufficient-alone",
+      "reason": "gsettings round trip is not evidence the desktop honours the setting."
+    },
+    {
+      "feature": "gnome_accessibility.feature",
+      "scenario": "Keyboard accessibility settings key is readable",
+      "upstream_tags": [
+        "accessibility",
+        "keyboard"
+      ],
+      "disposition": "insufficient-alone",
+      "reason": "Readable key is not behaviour."
+    },
+    {
+      "feature": "gnome_accessibility.feature",
+      "scenario": "AT-SPI accessibility bus is reachable from the GNOME session",
+      "upstream_tags": [
+        "accessibility",
+        "atspi"
+      ],
+      "disposition": "adapt",
+      "reason": "Must prove the bus and the real application owner in the Tuna Desktop session, not a GNOME session."
+    },
+    {
+      "feature": "gnome_accessibility.feature",
+      "scenario": "No accessibility-related journal errors after session start",
+      "upstream_tags": [
+        "accessibility",
+        "regression"
+      ],
+      "disposition": "adapt",
+      "reason": "Journal query must be bounded to the Tuna Desktop VM boot; count 0 required, empty output is a failure."
+    },
+    {
+      "feature": "orca.feature",
+      "scenario": "Orca and speech-dispatcher binaries are installed",
+      "upstream_tags": [
+        "orca",
+        "binary",
+        "a11y"
+      ],
+      "disposition": "unsupported",
+      "reason": "Uses rpm -q; Marlin is Arch/pacman. Existing Orca ownership tests stay authoritative."
+    },
+    {
+      "feature": "orca.feature",
+      "scenario": "AT-SPI accessibility bus name is registered",
+      "upstream_tags": [
+        "orca",
+        "a11y",
+        "bus"
+      ],
+      "disposition": "adapt",
+      "reason": "busctl check is weaker than owner identity; pair with real AT-SPI owner proof."
+    },
+    {
+      "feature": "orca.feature",
+      "scenario": "Screen reader toggle starts and stops Orca",
+      "upstream_tags": [
+        "orca",
+        "a11y",
+        "screen_reader",
+        "retry"
+      ],
+      "disposition": "inapplicable",
+      "reason": "Existing Orca ownership/speech/privacy tests are stronger and are kept; Upstream @retry re-runs the whole scenario; disabled here (first failure is retained)."
+    },
+    {
+      "feature": "orca.feature",
+      "scenario": "Speech Dispatcher responds to a module list request",
+      "upstream_tags": [
+        "orca",
+        "speech",
+        "retry"
+      ],
+      "disposition": "inapplicable",
+      "reason": "Exclusive speech origin is covered by existing tests; Upstream @retry re-runs the whole scenario; disabled here (first failure is retained)."
+    }
+  ]
+}
