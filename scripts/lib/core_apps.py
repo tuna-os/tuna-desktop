@@ -602,21 +602,48 @@ class Desktop(NativeDesktop):
             self.replace(picker, 'File Name', Path(path).name)
         elif not directory:
             basename = Path(path).name
+            def cells(value):
+                return [node for node in value['nodes'] if node['showing'] and node['role'] == 'table cell'
+                        and node['name'] in (basename, basename + '. File')]
+            def revealed(value):
+                # The chooser's grid builds cells only for the rows it has
+                # room for: Decibels' chooser showed twelve of the media
+                # folder's recordings and never tone.ogg below them (run
+                # 46095497198). Scroll the view, as a user would, by less
+                # than its height per read until the cell's center is in it.
+                views = [node for node in value['nodes'] if node['showing'] and node['role'] == 'table'
+                         and node['name'] == 'Content View' and node['bounds'] is not None]
+                found = cells(value)
+                if len(views) != 1:
+                    return bool(found)
+                top, height = views[0]['bounds'][1], views[0]['bounds'][3]
+                if len(found) == 1 and found[0]['bounds'] is not None:
+                    middle = found[0]['bounds'][1] + found[0]['bounds'][3] / 2
+                    if top <= middle < top + height:
+                        return True
+                    button = 'wheel-up' if middle < top else 'wheel-down'
+                elif found:
+                    return True
+                else:
+                    button = 'wheel-down'
+                self.rest_pointer(picker, value, views[0])
+                for _ in range(3):
+                    time.sleep(0.08)
+                    self.qmp.cmd('input-send-event', events=[{'type': 'btn', 'data': {'down': True, 'button': button}}])
+                    self.qmp.cmd('input-send-event', events=[{'type': 'btn', 'data': {'down': False, 'button': button}}])
+                return False
             try:
                 tree = self.await_state('picker-actual-content-cell', lambda: self.tree(picker),
-                                        lambda value: any(node['showing'] and node['role'] == 'table cell'
-                                                          and node['name'] in (basename, basename + '. File')
-                                                          for node in value['nodes']))
+                                        revealed, timeout=30)
             except TimeoutError:
                 self._picker_listing_diagnostic(picker)
                 raise
-            cells = [node for node in tree['nodes'] if node['showing'] and node['role'] == 'table cell'
-                     and node['name'] in (basename, basename + '. File')]
-            if len(cells) != 1:
+            found = cells(tree)
+            if len(found) != 1:
                 raise RuntimeError('actual native chooser content cell not unique')
-            self.click_path(picker, cells[0]['path'])
+            self.click_path(picker, found[0]['path'])
             self.await_state('picker-actual-selected-content', lambda: self.tree(picker),
-                             lambda value: any(node['path'] == cells[0]['path'] and node['selected']
+                             lambda value: any(node['path'] == found[0]['path'] and node['selected']
                                                for node in value['nodes']))
         return picker
 

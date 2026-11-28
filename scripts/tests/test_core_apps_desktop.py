@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1233,6 +1234,50 @@ class ShadowedSurfacePointer(unittest.TestCase):
                             {'rect': [500, 70, 425, 324], 'buffer_rect': None}]
         with self.assertRaisesRegex(RuntimeError, 'more than one placed popup'):
             self.desktop()._field_pixels(actor, tree, entry)
+
+
+class PickerRevealsOffscreenCell(unittest.TestCase):
+    """Run 46095497198: Decibels' chooser built cells for twelve of the
+    media folder's files and never tone.ogg below them; the view scrolls
+    until the cell's center is inside it, then the cell is clicked."""
+
+    VIEW = {'showing': True, 'role': 'table', 'name': 'Content View', 'path': [0, 1],
+            'bounds': [180, 46, 710, 436], 'selected': False}
+
+    def cell(self, top, selected=False):
+        return {'showing': True, 'role': 'table cell', 'name': 'tone.ogg. File', 'path': [0, 1, 7],
+                'bounds': [190, top, 144, 150], 'selected': selected}
+
+    def test_scrolls_down_until_the_cell_center_is_in_view(self):
+        frames = iter([[self.VIEW], [self.VIEW, self.cell(460)], [self.VIEW, self.cell(200)],
+                       [self.VIEW, self.cell(200, selected=True)]])
+        desktop = core_apps.Desktop.__new__(core_apps.Desktop)
+        desktop.fixture = '/fixture'
+        desktop.guest = lambda domain, operation, **arguments: {'files': [{'exists': True}]}
+        desktop.file_picker = lambda actor: {'id': 'picker'}
+        desktop.enter_location = lambda picker, target: None
+        desktop.tree = lambda picker: {'nodes': next(frames)}
+        wheels, clicked = [], []
+        desktop.rest_pointer = lambda picker, tree, node: None
+
+        class Qmp:
+            def cmd(self, command, events):
+                if events[0]['data']['down']:
+                    wheels.append(events[0]['data']['button'])
+        desktop.qmp = Qmp()
+        desktop.click_path = lambda picker, path: clicked.append(path)
+
+        def await_state(label, read, predicate, timeout=10):
+            while True:
+                value = read()
+                if predicate(value):
+                    return value
+        desktop.await_state = await_state
+        with mock.patch.object(core_apps.time, 'sleep'):
+            desktop._prepare_picker({'id': 'caller'}, '/fixture/media/tone.ogg')
+        self.assertEqual(wheels, ['wheel-down'] * 6)
+        self.assertEqual(clicked, [[0, 1, 7]])
+
 
 class TransientDialogDismissal(unittest.TestCase):
     """Run 45936499585: start() bound Connections' focused welcome dialog
