@@ -666,22 +666,25 @@ class ImeFieldFocusSettle(unittest.TestCase):
     stays idle (one row, zero preedit rows) while the preedit await burns
     the budget (run 41865506509 attempts 1-2).
     """
-    def rig(self, focused=False):
+    def rig(self, focused=False, web=False, text=''):
         import base64
         import tempfile
         from unittest import mock
         import types
         order = []
-        field = {'path': [1], 'name': 'Search', 'text': '', 'role': 'text',
+        field = {'path': [0, 0, 1] if web else [1], 'name': 'Search', 'text': text, 'role': 'text',
                  'editable': True, 'showing': True, 'sensitive': True, 'focused': focused}
+        # A web view hosting a document, as Epiphany's (run 45936499585).
+        page = [{'path': [0], 'role': 'panel', 'bounds': [0, 46, 100, 50]},
+                {'path': [0, 0], 'role': 'document web', 'bounds': [0, 0, 100, 50]}] if web else []
         actor = {'id': 'org.example.app', 'kind': 'app'}
         desktop = core_apps.Desktop.__new__(core_apps.Desktop)
         desktop._ime = {}
         desktop._sequence = 41
         desktop.out = Path(tempfile.mkdtemp(prefix='ime-focus-'))
         desktop.select = lambda target: None
-        desktop.tree = lambda target: {'nodes': [dict(field)], 'state': {}}
-        desktop.observe = lambda label, target: {'nodes': [dict(field)], 'state': {},
+        desktop.tree = lambda target: {'nodes': page + [dict(field)], 'state': {}}
+        desktop.observe = lambda label, target: {'nodes': page + [dict(field)], 'state': {},
                                                  'frame_path': str(desktop.out / 'frame.png')}
         desktop._field_pixels = lambda *args: (0, 0, 8, 8)
         desktop.clipboard = lambda: {'base64': base64.b64encode('你好'.encode()).decode()}
@@ -769,6 +772,27 @@ class ImeFieldFocusSettle(unittest.TestCase):
         readonly = dict(field, editable=False)
         self.assertFalse(focused(tree(readonly)))
 
+    def run_ime(self, **rig):
+        import sys
+        from unittest import mock
+        desktop, actor, field, order, pil, completed = self.rig(focused=True, **rig)
+        with mock.patch.dict(sys.modules, {'PIL': pil}), \
+             mock.patch.object(core_apps.subprocess, 'run', return_value=completed):
+            return desktop.ime(actor, field['name'], field_path=field['path'])
+
+    def test_gtk_field_text_equal_to_the_preedit_is_a_commit(self):
+        # A GTK field's accessible text excludes the composition.
+        with self.assertRaisesRegex(RuntimeError, 'already committed'):
+            self.run_ime(text='你好')
+        self.assertEqual(self.run_ime(text='')['preedit_ocr'], '你好')
+
+    def test_web_field_must_hold_exactly_the_composition(self):
+        # Run 45936499585: WebKit keeps its composition in the DOM, so
+        # Epiphany's entry read 你好 while the engine's preedit was visible.
+        self.assertEqual(self.run_ime(web=True, text='你好')['preedit_ocr'], '你好')
+        with self.assertRaisesRegex(RuntimeError, 'exact engine composition'):
+            self.run_ime(web=True, text='')
+
 
 class PreeditInkIsolation(unittest.TestCase):
     """_isolate_preedit_ink() crops an entry capture to the composition ink.
@@ -818,6 +842,19 @@ class PreeditInkIsolation(unittest.TestCase):
     def test_blank_capture_falls_back_to_whole_crop(self):
         from PIL import Image
         self.assertIsNone(core_apps._isolate_preedit_ink(Image.new('RGB', (60, 20), 'white')))
+
+    def test_accent_focus_ring_below_the_underline_is_not_ink(self):
+        # Run 45936499585: WebKit draws its entry's accent-blue focus ring
+        # two rows under the composition underline; the ring bottom, darker
+        # than the threshold, was taken for the underline and the whole
+        # entry width went to tesseract, which read "ME" for 你好.
+        from PIL import ImageDraw
+        image = self.entry(60, 80)
+        ImageDraw.Draw(image).rectangle((2, 2, 197, 33), outline=(93, 157, 233), width=2)
+        ringed = core_apps._isolate_preedit_ink(image)
+        self.assertIsNotNone(ringed)
+        self.assertEqual(ringed.size, (182, 60))
+        self.assertEqual(list(ringed.getdata()), list(core_apps._isolate_preedit_ink(self.entry(60, 80)).getdata()))
 
 
 class PickerAcceptGesture(unittest.TestCase):
@@ -974,7 +1011,8 @@ class EnterLocationCompletion(unittest.TestCase):
     LIST = [275, 59, 426, 176]
     PARKED = [797.6171875, 253.3203125]
     PICKER = {'id': 'picker', 'window_id': 33, 'a11y_scope': '/frame'}
-    FRAME = {'object_path': '/frame', 'focused': False, 'text': None, 'bounds': [0, 0, 890, 550]}
+    FRAME = {'object_path': '/frame', 'path': [0], 'role': 'frame', 'focused': False, 'text': None,
+             'bounds': [0, 0, 890, 550]}
 
     def over(self, model, bounds):
         left, top = self.WINDOW['rect'][0] + bounds[0], self.WINDOW['rect'][1] + bounds[1]
@@ -1017,8 +1055,8 @@ class EnterLocationCompletion(unittest.TestCase):
 
         def tree(window):
             text = next(scripted) if scripted is not None and model['open'] else model['text']
-            return {'nodes': [self.FRAME, {'object_path': '/entry', 'focused': model['open'], 'text': text,
-                                           'bounds': self.ENTRY}],
+            return {'nodes': [self.FRAME, {'object_path': '/entry', 'path': [0, 0], 'role': 'text',
+                                           'focused': model['open'], 'text': text, 'bounds': self.ENTRY}],
                     'state': {'windows': [self.WINDOW], 'pointer_position': list(model['pointer'])}}
         desktop.tree = tree
 
@@ -1075,11 +1113,11 @@ class EnterLocationCompletion(unittest.TestCase):
 
     def test_locked_or_unbounded_pointer_never_counts_as_resting(self):
         desktop, keys, model = self.rig()
-        node = {'bounds': self.ENTRY}
+        node = {'path': [0, 0], 'bounds': self.ENTRY}
         state = {'windows': [self.WINDOW], 'pointer_position': [480, 158]}
         tree = {'state': state, 'nodes': [self.FRAME]}
         self.assertTrue(desktop._pointer_rests_on(self.PICKER, tree, node))
-        self.assertFalse(desktop._pointer_rests_on(self.PICKER, tree, {'bounds': None}))
+        self.assertFalse(desktop._pointer_rests_on(self.PICKER, tree, {'path': [0, 0], 'bounds': None}))
         state['pointer_position'] = None
         self.assertFalse(desktop._pointer_rests_on(self.PICKER, tree, node))
 
@@ -1100,12 +1138,13 @@ class ShadowedSurfacePointer(unittest.TestCase):
     """
     WINDOW = {'id': 2, 'rect': [311, 141, 658, 549], 'buffer_rect': [285, 118, 710, 601]}
     ACTOR = {'id': 'org.gnome.Connections', 'window_id': 2, 'a11y_scope': '/gtk3'}
-    FRAME = {'object_path': '/gtk3', 'bounds': [0, 0, 710, 601]}
-    NO_THANKS = {'object_path': '/no-thanks', 'bounds': [300, 486, 109, 34]}
+    FRAME = {'object_path': '/gtk3', 'path': [0], 'role': 'frame', 'bounds': [0, 0, 710, 601]}
+    NO_THANKS = {'object_path': '/no-thanks', 'path': [0, 0], 'role': 'push button',
+                 'bounds': [300, 486, 109, 34]}
     FONTS = {'id': 'org.gnome.font-viewer', 'window_id': 1, 'a11y_scope': '/gtk4'}
     FONTS_WINDOW = {'id': 1, 'rect': [240, 116, 800, 600], 'buffer_rect': [215, 91, 850, 650]}
-    FONTS_FRAME = {'object_path': '/gtk4', 'bounds': [0, 0, 800, 600]}
-    FAMILY = {'object_path': '/family', 'bounds': [128, 95, 540, 18]}
+    FONTS_FRAME = {'object_path': '/gtk4', 'path': [0], 'role': 'frame', 'bounds': [0, 0, 800, 600]}
+    FAMILY = {'object_path': '/family', 'path': [0, 0], 'role': 'label', 'bounds': [128, 95, 540, 18]}
 
     def desktop(self):
         desktop = core_apps.Desktop.__new__(core_apps.Desktop)
@@ -1136,9 +1175,28 @@ class ShadowedSurfacePointer(unittest.TestCase):
         self.assertEqual(desktop._field_pixels(self.ACTOR, tree, self.NO_THANKS), (585, 604, 109, 34))
         nautilus = {'id': 2, 'rect': [195, 141, 890, 550], 'buffer_rect': [170, 116, 940, 600]}
         tree = {'state': {'windows': [nautilus]},
-                'nodes': [{'object_path': '/gtk3', 'bounds': [0, 0, 890, 550]}]}
-        self.assertEqual(desktop._field_pixels(self.ACTOR, tree, {'bounds': [240, 235, 393, 50]}),
+                'nodes': [{'object_path': '/gtk3', 'path': [0], 'role': 'frame', 'bounds': [0, 0, 890, 550]}]}
+        self.assertEqual(desktop._field_pixels(self.ACTOR, tree, {'path': [0, 0], 'bounds': [240, 235, 393, 50]}),
                          (435, 376, 393, 50))
+
+    def test_web_content_is_placed_by_its_view(self):
+        # Run 45936499585: Epiphany's view widget sits under the 46 px header
+        # bar; WebKit's payload entry [171, 167, 193, 24] was drawn at
+        # [299, 245] for the window geometry [128, 32].
+        epiphany = {'id': 1, 'rect': [128, 32, 1024, 768], 'buffer_rect': [103, 7, 1074, 818]}
+        actor = {'id': 'org.gnome.Epiphany', 'window_id': 1, 'a11y_scope': '/frame'}
+        entry = {'object_path': '/entry', 'path': [0, 0, 0, 0, 0, 0], 'role': 'entry',
+                 'bounds': [171, 167, 193, 24]}
+        tree = {'state': {'windows': [epiphany]}, 'nodes': [
+            {'object_path': '/frame', 'path': [0], 'role': 'frame', 'bounds': [0, 0, 1024, 768]},
+            {'object_path': '/view', 'path': [0, 0], 'role': 'panel', 'bounds': [0, 46, 1024, 722]},
+            {'object_path': '/root', 'path': [0, 0, 0], 'role': 'scroll pane', 'bounds': None},
+            {'object_path': '/doc', 'path': [0, 0, 0, 0], 'role': 'document web', 'bounds': [0, 0, 1024, 722]},
+            {'object_path': '/form', 'path': [0, 0, 0, 0, 0], 'role': 'form', 'bounds': [8, 166, 1008, 27]},
+            entry]}
+        self.assertEqual(self.desktop()._field_pixels(actor, tree, entry), (299, 245, 193, 24))
+        # Outside the document, the view's own widgets stay window-relative.
+        self.assertEqual(self.desktop()._field_pixels(actor, tree, tree['nodes'][1]), (128, 78, 1024, 722))
 
     def test_frame_matching_neither_rect_nor_surface_is_refused(self):
         window = {'id': 2, 'rect': [311, 141, 658, 549], 'buffer_rect': None}

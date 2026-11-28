@@ -54,7 +54,15 @@ def _isolate_preedit_ink(crop):
         gray = crop.convert('L')
         width, height = gray.size
         ink = gray.load()
-        dark = lambda x, y: ink[x, y] < 150  # noqa: E731
+        color = crop.convert('RGB').load()
+        # Text and its composition underline are drawn in the neutral text
+        # colour; a focus ring is the accent colour. WebKit draws its entry's
+        # ring two rows below the underline, and its accent blue is darker
+        # than the 150 threshold, so the ring bottom passed for the
+        # composition underline (run 45936499585, Epiphany).
+        def dark(x, y):
+            red, green, blue = color[x, y]
+            return ink[x, y] < 150 and max(red, green, blue) - min(red, green, blue) < 64
 
         def runs_in(line):
             runs = []
@@ -256,8 +264,34 @@ class Desktop(NativeDesktop):
             raise RuntimeError('original native surface not uniquely mapped')
         return found[0]
 
-    def _extents_origin(self, actor, tree):
-        """Output point of (0, 0) in the actor's AT-SPI window coordinates.
+    @staticmethod
+    def _web_document(tree, node):
+        """The outermost web document holding `node` and its host widget, or None.
+
+        WebKit reports a page's extents in its web view's coordinates
+        (contentsToWindow is the root view), not the window's: Epiphany's
+        document is [0, 0, 1024, 722] inside a view widget at [0, 46, 1024,
+        722] (the header bar above it), and its payload entry [171, 167,
+        193, 24] was drawn 46 px lower (run 45936499585). The host is the
+        nearest ancestor of the document with extents, the toolkit widget
+        that places the view in the window.
+        """
+        by_path = {tuple(row['path']): row for row in tree['nodes']}
+        path = node['path']
+        for depth in range(1, len(path) + 1):
+            document = by_path.get(tuple(path[:depth]))
+            if document is not None and document['role'] == 'document web':
+                break
+        else:
+            return None
+        for above in range(depth - 1, 0, -1):
+            host = by_path.get(tuple(path[:above]))
+            if host is not None and host['bounds'] is not None:
+                return document, host
+        raise RuntimeError('original web view host extents unavailable')
+
+    def _extents_origin(self, actor, tree, node):
+        """Output point of (0, 0) in the coordinates of `node`'s AT-SPI extents.
 
         `rect` is the xdg window geometry and `buffer_rect` the committed
         surface, client shadows included. The toolkit decides which of the
@@ -268,17 +302,26 @@ class Desktop(NativeDesktop):
         in an 850x650 surface (run 45936499585); Connections' welcome window
         reports a 710x601 frame, its whole surface, for a 658x549 rect (run
         44850865831). Mapping GTK 4 extents through the surface put every
-        click and field crop 25 px up and left of the drawn widget.
+        click and field crop 25 px up and left of the drawn widget. Web
+        content is further placed by its view (`_web_document`).
         """
         window = self._window(actor, tree['state'])
-        frames = [node for node in tree['nodes'] if node['object_path'] == actor.get('a11y_scope')]
+        frames = [row for row in tree['nodes'] if row['object_path'] == actor.get('a11y_scope')]
         if len(frames) != 1 or frames[0]['bounds'] is None:
             raise RuntimeError('original accessible frame extents unavailable')
         x, y, width, height = frames[0]['bounds']
         for rect in (window['rect'], window.get('buffer_rect')):
             if rect is not None and (rect[2], rect[3]) == (width, height):
-                return rect[0] - x, rect[1] - y
-        raise RuntimeError('accessible frame is neither the window geometry nor its surface')
+                left, top = rect[0] - x, rect[1] - y
+                break
+        else:
+            raise RuntimeError('accessible frame is neither the window geometry nor its surface')
+        web = self._web_document(tree, node)
+        if web is not None:
+            _, host = web
+            left += host['bounds'][0]
+            top += host['bounds'][1]
+        return left, top
 
 
 
@@ -364,7 +407,7 @@ class Desktop(NativeDesktop):
             origin = self.guest('desktop', 'shell-origin', actor=actor, path=node['path'])
             x, y = origin['x'] + bounds[0] + bounds[2] * fx, origin['y'] + bounds[1] + bounds[3] * fy
         else:
-            left, top = self._extents_origin(actor, tree)
+            left, top = self._extents_origin(actor, tree, node)
             x = left + bounds[0] + bounds[2] * fx
             y = top + bounds[1] + bounds[3] * fy
         x, y = int(x * self.scale), int(y * self.scale)
@@ -395,14 +438,14 @@ class Desktop(NativeDesktop):
         position, bounds = tree['state'].get('pointer_position'), node['bounds']
         if position is None or bounds is None:
             return False
-        origin = self._extents_origin(actor, tree)
+        origin = self._extents_origin(actor, tree, node)
         left, top = origin[0] + bounds[0], origin[1] + bounds[1]
         return left <= position[0] < left + bounds[2] and top <= position[1] < top + bounds[3]
 
     def _field_pixels(self, actor, tree, node):
         if node['bounds'] is None:
             raise RuntimeError('original actual editable field has no bounds')
-        origin_x, origin_y = self._extents_origin(actor, tree)
+        origin_x, origin_y = self._extents_origin(actor, tree, node)
         x, y, width, height = node['bounds']
         left = math.floor((origin_x + x) * self.scale)
         top = math.floor((origin_y + y) * self.scale)
@@ -776,8 +819,19 @@ class Desktop(NativeDesktop):
                        and node['focused'] and node['editable']]
             if len(current) != 1:
                 raise RuntimeError('original app lost actual IME field focus during composition')
-            if current[0]['text'] == composition['preedit']:
-                raise RuntimeError('composition was already committed instead of observed as preedit')
+            # A GTK field's accessible text excludes the composition, so
+            # equal text means the preedit was committed. A web page holds
+            # its composition in the DOM (WebKit's marked text), so the
+            # entry must read exactly the preedit: Epiphany's showed 你好
+            # while the engine's preedit was still visible (run
+            # 45936499585). Preedit delivered as commits would instead have
+            # appended each update (n, ni, nih...), and the commit below
+            # must still leave exactly the expected text.
+            if self._web_document(rendered, current[0]) is None:
+                if current[0]['text'] == composition['preedit']:
+                    raise RuntimeError('composition was already committed instead of observed as preedit')
+            elif current[0]['text'] != composition['preedit']:
+                raise RuntimeError('web field does not hold the exact engine composition')
             x, y, width, height = self._field_pixels(actor, rendered, current[0])
             from PIL import Image
             crop = self.out / f'{self._sequence + 1:05d}-original-preedit-field.png'
