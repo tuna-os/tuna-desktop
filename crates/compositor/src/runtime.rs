@@ -3481,14 +3481,15 @@ impl Runtime {
         let model = self.manager.model();
         let windows = self.manager.overview_windows();
         let dynamic = model.fixed_workspace_count().is_none();
+        let rtl = self.input_settings.right_to_left;
         self.overview_motion.resting(
             model.active_workspace(),
             self.overview_app_grid,
             |workspace, app_grid| {
                 let layout = if app_grid {
-                    crate::overview::app_grid_layout_with_policy
+                    crate::overview::app_grid_layout_directed
                 } else {
-                    crate::overview::layout_with_policy
+                    crate::overview::layout_directed
                 };
                 layout(
                     output,
@@ -3497,6 +3498,7 @@ impl Runtime {
                     workspace,
                     &windows,
                     dynamic,
+                    rtl,
                 )
             },
         )
