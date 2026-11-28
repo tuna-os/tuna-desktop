@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+"""CI-only installed desktop gates (scripts/lib/vm_desktop_gates.py).
+
+Root probe reached through tuna-vm-lifecycle's gates-* actions, plus the
+session-user GTK fixtures it launches from this same file:
+
+  --window main NONCE        a CSD window: GTK's own minimize/maximize/close
+                             title buttons, an app menu button whose popover
+                             is an xdg_popup, and a text entry; on SIGUSR1 it
+                             asks to be minimized itself (gtk_window_minimize,
+                             xdg_toplevel.set_minimized), as an app may
+  --window bystander NONCE   another client, maximized, counting presses
+  --window placed NONCE CONNECTOR
+                             fullscreen on the output with that connector
+  --tray-observe             the shell's own AT-SPI tree, fixed tray labels only
+
+Every action prints one JSON object; a failure prints {"gates_error": ...}.
+The probe never synthesizes input: the lane sends real keys and pointer
+events through QEMU (the only other trigger is the client's own minimize
+request above).
+Fixture state files (mode 0600, the session's runtime
+directory) hold counts, GTK's own state and widget bounds, nothing else.
+"""
+import json
+import os
+import pathlib
+import pwd
+import re
+import signal
+import subprocess
+import sys
+import time
+
+OWNER = pwd.getpwnam("tuna-test")
+RUNTIME = pathlib.Path(f"/run/user/{OWNER.pw_uid}")
+SCENE = RUNTIME / "tuna-vm-state.json"
+SELF = "/usr/libexec/tuna-vm-desktop-gates"
+TRAY_STUB = "/usr/libexec/tuna-tray-item-stub"
+# The nested proof's StatusNotifierItem stub (scripts/lib/tuna-tray-item-stub.py).
+TRAY_TITLE, TRAY_TIP, TRAY_ROW = "Tuna Desktop Tray Probe", "Tray probe tip", "Open Probe"
+ROLES = ("main", "bystander", "placed")
+NONCE = re.compile(r"[0-9a-f]{16,32}")
+SCENE_KEYS = ("windows", "focused", "minimized", "stacking", "outputs", "layers", "cursor",
+              "pointer_position", "window_lifecycle", "animations_enabled", "overview_open",
+              "overview_progress", "previews", "dash_icon_targets",
+              "locked", "window_outputs", "x11_ready", "x11_display", "animation_slowdown")
+
+
+def nonce(value):
+    if not NONCE.fullmatch(value):
+        raise ValueError("invalid nonce")
+    return value
+
+
+def app_id(role, key):
+    return f"org.tuna.VmGates.n{key}.{role}"
+
+
+def state_path(role, key):
+    return RUNTIME / f"tuna-vm-gates-{role}-{key}.json"
+
+
+# ---- session-user fixtures -------------------------------------------------
+
+def publisher(path, state):
+    def publish():
+        temporary = path.with_suffix(".tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(state, stream)
+        temporary.replace(path)
+    return publish
+
+
+def window_fixture(role, key, connector=None):
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gio, GLib, Gtk
+    # A blinking caret would repaint the window under the pixel checks.
+    Gtk.Settings.get_default().set_property("gtk-cursor-blink", False)
+    signal.alarm(600)  # Independent lifetime cap; the probe stops it first.
+    state = {"role": role, "nonce": key, "pid": os.getpid(), "uid": os.getuid(),
+             "app_id": app_id(role, key), "mapped": False, "active": False, "size": [0, 0],
+             "maximized": False, "fullscreen": False, "presses": 0, "releases": 0, "keys": 0,
+             "popover_shows": 0, "popover_hides": 0, "popover_visible": False, "minimize_requests": 0,
+             "bounds": {}, "connector": connector, "connectors": [], "errors": []}
+    publish = publisher(state_path(role, key), state)
+
+    def bounds_of(widget, window):
+        ok, rect = widget.compute_bounds(window)
+        if not ok or not widget.get_mapped():
+            return None
+        return [round(rect.origin.x), round(rect.origin.y), round(rect.size.width), round(rect.size.height)]
+
+    def find_button(root, css):
+        child = root.get_first_child()
+        while child is not None:
+            if isinstance(child, Gtk.Button) and child.has_css_class(css):
+                return child
+            found = find_button(child, css)
+            if found is not None:
+                return found
+            child = child.get_next_sibling()
+        return None
+
+    def activate(app):
+        window = Gtk.ApplicationWindow(application=app, title=f"Tuna VM gates {role}")
+        widgets = {}
+        if role == "main":
+            window.set_default_size(560, 360)
+            header = Gtk.HeaderBar()
+            # GTK's own window controls, as an app that shows all three asks
+            # (GNOME's default button-layout shows close only).
+            header.set_decoration_layout(":minimize,maximize,close")
+            # A painted swatch, so the open popover is unmistakable in a
+            # screendump whatever the theme's popover and window colours.
+            swatch = Gtk.DrawingArea(content_width=160, content_height=60)
+            swatch.set_draw_func(lambda _area, context, *_: (context.set_source_rgb(171 / 255, 65 / 255, 81 / 255),
+                                                             context.paint()))
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            row.append(Gtk.Label(label="Tuna VM popover row"))
+            row.append(swatch)
+            popover = Gtk.Popover()
+            popover.set_child(row)
+            menu = Gtk.MenuButton(icon_name="open-menu-symbolic", popover=popover)
+            header.pack_end(menu)
+            window.set_titlebar(header)
+
+            def shown(*_):
+                state["popover_shows"] += 1
+                state["popover_visible"] = True
+                publish()
+
+            def hidden(*_):
+                state["popover_hides"] += 1
+                state["popover_visible"] = False
+                publish()
+            popover.connect("show", shown)
+            popover.connect("hide", hidden)
+            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            body.set_margin_start(24)
+            body.set_margin_end(24)
+            body.set_margin_bottom(24)
+            # Top left, clear of the popover below the menu button.
+            label = Gtk.Label(label="Tuna VM installed desktop gates", halign=Gtk.Align.START,
+                              valign=Gtk.Align.START, margin_top=12)
+            label.set_vexpand(True)
+            entry = Gtk.Entry(placeholder_text="Tuna VM cursor probe")
+            body.append(label)
+            body.append(entry)
+            window.set_child(body)
+            widgets = {"menu": menu, "entry": entry, "header": header}
+        else:
+            window.set_default_size(640, 420)
+            window.set_child(Gtk.Label(label=f"Tuna VM gates {role}"))
+        clicks = Gtk.GestureClick()
+        clicks.set_button(0)
+        clicks.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+        def pressed(*_):
+            state["presses"] += 1
+            publish()
+
+        def released(*_):
+            state["releases"] += 1
+            publish()
+        clicks.connect("pressed", pressed)
+        clicks.connect("released", released)
+        window.add_controller(clicks)
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+        def key_pressed(*_):
+            state["keys"] += 1
+            publish()
+            return False
+        keys.connect("key-pressed", key_pressed)
+        window.add_controller(keys)
+
+        def mapped(*_):
+            state["mapped"] = True
+            if role == "placed":
+                monitors = window.get_display().get_monitors()
+                found = None
+                for index in range(monitors.get_n_items()):
+                    monitor = monitors.get_item(index)
+                    state["connectors"].append(monitor.get_connector())
+                    if monitor.get_connector() == connector:
+                        found = monitor
+                if found is None:
+                    state["errors"].append("no monitor with the requested connector")
+                else:
+                    window.fullscreen_on_monitor(found)
+            publish()
+        window.connect("map", mapped)
+
+        def tick(*_):
+            current = {"active": window.is_active(), "size": [window.get_width(), window.get_height()],
+                       "maximized": window.is_maximized(), "fullscreen": window.is_fullscreen(),
+                       "bounds": {}}
+            if role == "main":
+                buttons = {css: find_button(widgets["header"], css) for css in ("minimize", "maximize", "close")}
+                for name, widget in {**widgets, **buttons}.items():
+                    if widget is not None and name != "header":
+                        current["bounds"][name] = bounds_of(widget, window)
+            if any(state[k] != v for k, v in current.items()):
+                state.update(current)
+                publish()
+            return GLib.SOURCE_CONTINUE
+        GLib.timeout_add(50, tick)
+        if role == "main":
+            def minimize_request(*_):
+                state["minimize_requests"] += 1
+                publish()
+                window.minimize()
+                return GLib.SOURCE_CONTINUE
+            # PyGObject 3.50+ moved it to GLibUnix and deprecates the old name.
+            try:
+                gi.require_version("GLibUnix", "2.0")
+                from gi.repository import GLibUnix
+                signal_add = getattr(GLibUnix, "signal_add", None) or GLib.unix_signal_add
+            except (ValueError, ImportError):
+                signal_add = GLib.unix_signal_add
+            signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, minimize_request)
+        if role == "bystander":
+            window.maximize()
+        window.present()
+    publish()
+    application = Gtk.Application(application_id=app_id(role, key), flags=Gio.ApplicationFlags.NON_UNIQUE)
+    application.connect("activate", activate)
+    application.run([])
+
+
+def tray_observe():
+    """The shell's tray item and its menu row, by the stub's fixed labels only."""
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi, GLib
+    shell = int(sys.argv[2])
+    Atspi.set_timeout(1000, 1000)
+    deadline = time.monotonic() + 8
+    desktop = Atspi.get_desktop(0)
+    apps = [desktop.get_child_at_index(i) for i in range(min(desktop.get_child_count(), 64))]
+    apps = [a for a in apps if a is not None and a.get_process_id() == shell]
+    if len(apps) != 1:
+        raise RuntimeError("the shell's accessibility root is not unique")
+    found = []
+    pending = [(apps[0], None, 0)]
+    visited = 0
+    while pending:
+        node, toplevel, depth = pending.pop()
+        visited += 1
+        if visited > 4000 or time.monotonic() > deadline:
+            raise RuntimeError("shell accessibility walk exceeded its bound")
+        try:
+            name = node.get_name() or ""
+            if depth == 1:
+                toplevel = name
+            if name in (TRAY_TITLE, TRAY_ROW):
+                extents = node.get_extents(Atspi.CoordType.WINDOW)
+                found.append({"name": name, "role": node.get_role_name(), "toplevel": toplevel,
+                              "showing": node.get_state_set().contains(Atspi.StateType.SHOWING),
+                              "tooltip": TRAY_TIP in (node.get_description() or ""),
+                              "extents": [extents.x, extents.y, extents.width, extents.height]})
+            children = [node.get_child_at_index(i) for i in range(min(node.get_child_count(), 256))]
+        except GLib.Error:
+            continue  # a node that went away mid-walk (a closing menu row)
+        pending.extend((child, toplevel, depth + 1) for child in children if child is not None)
+    return {"nodes": found, "visited": visited}
+
+
+# ---- root probe -------------------------------------------------------------
+
+def owned_processes(executable):
+    rows = []
+    for proc in pathlib.Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if proc.stat().st_uid == OWNER.pw_uid and pathlib.Path(os.readlink(proc / "exe")).name == executable:
+                rows.append(int(proc.name))
+        except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            continue
+    return sorted(rows)
+
+
+def session_shell():
+    shells = owned_processes("tuna-shell-gtk")
+    if len(shells) != 1:
+        raise RuntimeError("one session shell is required")
+    return shells[0]
+
+
+def session_env():
+    """The session's own Wayland socket, as the shell holds it (lifecycle
+    shell_controls reads it the same way)."""
+    with open(f"/proc/{session_shell()}/environ", "rb") as stream:
+        raw = stream.read(128 * 1024)
+    displays = [entry.split(b"=", 1)[1].decode() for entry in raw.split(b"\0")
+                if entry.startswith(b"WAYLAND_DISPLAY=")]
+    if len(displays) != 1:
+        raise RuntimeError("the shell's Wayland display is not one value")
+    return [f"XDG_RUNTIME_DIR={RUNTIME}", f"DBUS_SESSION_BUS_ADDRESS=unix:path={RUNTIME}/bus",
+            f"HOME={OWNER.pw_dir}", f"WAYLAND_DISPLAY={displays[0]}", "GDK_BACKEND=wayland"]
+
+
+def spawn_user(*command, log=None):
+    output = open(log, "w") if log else subprocess.DEVNULL
+    try:
+        return subprocess.Popen(["runuser", "-u", OWNER.pw_name, "--", "env", *session_env(), *command],
+                                stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+                                start_new_session=True).pid
+    finally:
+        if log:
+            output.close()
+
+
+def call_user(*command, timeout=15):
+    return subprocess.run(["runuser", "-u", OWNER.pw_name, "--", "env", *session_env(), *command],
+                          capture_output=True, text=True, timeout=timeout, check=True).stdout.strip()
+
+
+def owned_json(path):
+    info = path.lstat()
+    if info.st_uid != OWNER.pw_uid or not path.is_file() or info.st_mode & 0o077:
+        raise RuntimeError(f"{path.name} is not the session user's private file")
+    return json.loads(path.read_text())
+
+
+def scene():
+    state = json.loads(SCENE.read_text())
+    return {key: state.get(key) for key in SCENE_KEYS}
+
+
+def wait_for(predicate, timeout, message):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.05)
+    raise RuntimeError(message)
+
+
+def fixture_alive(value, marker):
+    proc = pathlib.Path(f"/proc/{value['pid']}")
+    try:
+        if proc.stat().st_uid != OWNER.pw_uid:
+            return False
+        return marker.encode() in (proc / "cmdline").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+
+
+def fixtures(key):
+    result = {}
+    for role in ROLES:
+        path = state_path(role, key)
+        if path.exists():
+            value = owned_json(path)
+            value["alive"] = fixture_alive(value, key)
+            result[role] = value
+    return result
+
+
+def start(role, key, connector=None):
+    if role not in ROLES or (role == "placed") != (connector is not None):
+        raise ValueError("unknown fixture role")
+    if connector is not None and not re.fullmatch(r"[A-Za-z0-9-]{1,32}", connector):
+        raise ValueError("invalid connector")
+    path = state_path(role, key)
+    if path.exists():
+        raise RuntimeError("fixture already exists")
+    spawn_user(sys.executable, SELF, "--window", role, key, *([connector] if connector else []))
+
+    def ready():
+        if not path.exists():
+            return None
+        value = owned_json(path)
+        current = scene()
+        windows = [w for w in current["windows"] or [] if w.get("app_id") == value["app_id"]]
+        if not value["mapped"] or len(windows) != 1 or value["size"] == [0, 0]:
+            return None
+        if role == "main" and not all(value["bounds"].get(k) for k in ("menu", "entry", "minimize", "maximize", "close")):
+            return None
+        return {"fixture": value, "window": windows[0], "scene": current}
+    return wait_for(ready, 30, f"{role} fixture did not map with its bounds")
+
+
+def in_flight(current, effect, target):
+    """This transition's own entries in the compositor snapshot right now."""
+    if effect == "locate":
+        locate = (current.get("cursor") or {}).get("locate_pointer") or {}
+        return [locate] if locate.get("active") else []
+    life = current.get("window_lifecycle") or {}
+    entry = "minimizing" if effect == "minimize" else "restoring"
+    return [run for run in life.get(entry) or [] if run.get("window") == target]
+
+
+def watch(key, effect, target, seconds, request=None):
+    """Poll the compositor's own state file while the lane sends one real
+    input: every distinct in-flight frame of the transition it starts (a
+    window's minimize or restore, or the locate-pointer ripple), until it ends.
+    The lane sends its input once this has armed, about a second after start.
+    With `request` (a fixture role) the trigger is instead that client's own
+    minimize request, sent here once armed: the guest agent runs one action
+    at a time, so the lane cannot send it while this watch runs."""
+    if effect not in ("minimize", "unminimize", "locate") or not 0 < seconds <= 10:
+        raise ValueError("invalid watch")
+    if request is not None and (effect != "minimize" or request != "main"):
+        raise ValueError("only the main fixture asks to be minimized")
+    first = json.loads(SCENE.read_text())
+    history = (first.get("window_lifecycle") or {}).get("history") or []
+    baseline_at = max((h.get("at_ms") or 0 for h in history), default=-1)
+    baseline_count = ((first.get("cursor") or {}).get("locate_pointer") or {}).get("count")
+    if request is not None:
+        fixture = fixtures(key).get(request)
+        if not fixture or not fixture["alive"]:
+            raise RuntimeError(f"the {request} fixture is not running")
+        os.kill(fixture["pid"], signal.SIGUSR1)
+    samples, seen = [], set()
+    deadline = time.monotonic() + seconds
+    current = first
+    while time.monotonic() < deadline:
+        try:
+            current = json.loads(SCENE.read_text())
+        except (OSError, ValueError):
+            continue  # the writer renames atomically; retry a vanished read
+        flying = in_flight(current, effect, target)
+        for run in flying:
+            marker = json.dumps(run, sort_keys=True)
+            if marker not in seen and len(samples) < 256:
+                seen.add(marker)
+                samples.append({**run, "t": time.monotonic()})
+        if effect == "minimize":
+            done = any(h.get("window") == target and h.get("effect") == "minimize"
+                       and h.get("outcome") == "completed" and (h.get("at_ms") or 0) > baseline_at
+                       for h in (current.get("window_lifecycle") or {}).get("history") or [])
+        elif effect == "unminimize":
+            done = bool(samples) and not flying
+        else:
+            count = ((current.get("cursor") or {}).get("locate_pointer") or {}).get("count")
+            done = count != baseline_count and not flying
+        if done:
+            break
+        time.sleep(0.004)
+    return {"effect": effect, "target": target, "baseline_at_ms": baseline_at,
+            "baseline_locate_count": baseline_count, "samples": samples, "fixtures": fixtures(key),
+            "scene": {k: current.get(k) for k in SCENE_KEYS}}
+
+
+def settings(action, size=None, locate=None):
+    keys = (("cursor-size", size), ("locate-pointer", locate))
+    if action == "set":
+        if not (size.isdigit() and 8 <= int(size) <= 256 and locate in ("true", "false")):
+            raise ValueError("invalid cursor settings")
+        for name, value in keys:
+            call_user("gsettings", "set", "org.gnome.desktop.interface", name, value)
+    elif action != "get":
+        raise ValueError("unknown settings action")
+    return {name: call_user("gsettings", "get", "org.gnome.desktop.interface", name) for name, _ in keys}
+
+
+def tray(action, key):
+    marker = RUNTIME / f"tuna-vm-gates-tray-{key}.marker"
+    log = RUNTIME / f"tuna-vm-gates-tray-{key}.log"
+    if action == "start":
+        if log.exists():
+            raise RuntimeError("tray stub already exists")
+        spawn_user(sys.executable, TRAY_STUB, str(marker), log=str(log))
+        wait_for(lambda: "registered" in log.read_text(), 30,
+                 "the StatusNotifierItem never registered with the shell's watcher")
+        return {"registered": True, "stub": user_pids(str(marker))}
+    if action == "observe":
+        observed = json.loads(call_user(sys.executable, SELF, "--tray-observe", str(session_shell()), timeout=20))
+        return {**observed, "scene": scene(), "stub": user_pids(str(marker)),
+                "marker": marker.read_text().splitlines() if marker.exists() else []}
+    if action == "stop":
+        stopped = terminate(user_pids(str(marker)), "tray stub")
+        for path in (marker, log):
+            path.unlink(missing_ok=True)
+        return {"stopped": stopped}
+    raise ValueError("unknown tray action")
+
+
+def user_pids(argument):
+    """The session user's processes whose argv names this nonce's file."""
+    rows = []
+    for proc in pathlib.Path("/proc").iterdir():
+        try:
+            if proc.name.isdigit() and proc.stat().st_uid == OWNER.pw_uid \
+                    and argument.encode() in (proc / "cmdline").read_bytes().split(b"\0"):
+                rows.append(int(proc.name))
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+    return sorted(rows)
+
+
+def terminate(pids, what):
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    for pid in pids:
+        wait_for(lambda pid=pid: not pathlib.Path(f"/proc/{pid}").exists(), 10, f"{what} did not exit")
+    return pids
+
+
+def stop(key):
+    """Retire every fixture of this nonce and the tray stub; confirm absence."""
+    stopped = []
+    for role, value in fixtures(key).items():
+        if value["alive"]:
+            stopped += terminate([value["pid"]], f"{role} fixture")
+        state_path(role, key).unlink(missing_ok=True)
+    tray_stopped = tray("stop", key)["stopped"]
+
+    def remaining():
+        return [w["id"] for w in scene()["windows"] or [] if f".n{key}." in (w.get("app_id") or "")]
+    wait_for(lambda: not remaining(), 10, "fixture windows remain after their clients exited")
+    return {"stopped": stopped, "tray_stopped": tray_stopped, "confirmed": True, "scene": scene()}
+
+
+def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == "--window":
+        window_fixture(sys.argv[2], nonce(sys.argv[3]), *sys.argv[4:5])
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--tray-observe":
+        print(json.dumps(tray_observe()))
+        return
+    if os.geteuid() != 0 or OWNER.pw_uid == 0:
+        raise RuntimeError("probe must be root and session owner must not be root")
+    action, args = sys.argv[1], sys.argv[2:]
+    if action == "gates-start":
+        result = start(args[0], nonce(args[1]), *args[2:3])
+    elif action == "gates-state":
+        result = {"fixtures": fixtures(nonce(args[0])), "scene": scene()}
+    elif action == "gates-watch":
+        result = watch(nonce(args[0]), args[1], int(args[2]), float(args[3]), *args[4:5])
+    elif action == "gates-settings":
+        result = settings(*args)
+    elif action.startswith("gates-tray-"):
+        result = tray(action.removeprefix("gates-tray-"), nonce(args[0]))
+    elif action == "gates-stop":
+        result = stop(nonce(args[0]))
+    else:
+        raise ValueError("unknown desktop-gates action")
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:  # one bounded line for the lane's record, no traceback
+        print(json.dumps({"gates_error": f"{type(error).__name__}: {error}"[:600]}))
