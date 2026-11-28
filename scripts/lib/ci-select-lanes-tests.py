@@ -140,7 +140,7 @@ class Selection(unittest.TestCase):
         # baseline, so editing one runs both (and the core proofs a code change runs).
         for golden in ("panel", "overview", "quick-settings", "calendar"):
             lanes = pr(f"tests/a11y/{golden}.txt", size=0)
-            self.assertEqual(lanes, ["grid-cancel-comparison", "gtk-shell", "arch-package", "marlin-vm"],
+            self.assertEqual(lanes, ["desktop-proofs", "gtk-shell", "arch-package", "marlin-vm"],
                              golden)
         self.assertEqual(pr("packaging/marlin/vm-lane/tuna-vm-desktop-gates", size=0),
                          ["arch-package", "marlin-image", "marlin-vm"])
