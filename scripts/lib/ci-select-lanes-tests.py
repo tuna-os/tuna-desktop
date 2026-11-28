@@ -304,7 +304,7 @@ class Selection(unittest.TestCase):
             for run in range(len(m.ROTATION)):
                 with self.subTest(path=path, run=run):
                     self.assertEqual(pr(path, run=run),
-                                     ["drm-smoke", "grid-cancel-comparison", "gtk-shell"])
+                                     ["drm-smoke", "desktop-proofs", "gtk-shell"])
         # Control: the area selection's keys still rotate lanes.
         lanes = pr("crates/shell-gtk/src/screenshot_selection.rs", run=3)
         self.assertIn("gtk-shell", lanes)
