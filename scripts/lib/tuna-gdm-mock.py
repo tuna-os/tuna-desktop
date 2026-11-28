@@ -68,9 +68,10 @@ Conversations (gdm-session-worker.c through PAM):
                  your password now.' (Info), then 'New Password: ' and
                  'Reenter new Password: ' (SecretInfoQuery, AnswerQuery).
   Success: VerificationComplete then SessionOpened(service, cN) (gdm-session.c
-  on_opened) and a logind session cN for the user. Cancel emits Reset, then
-  ConversationStopped for each conversation, forgets the selected session and
-  closes a session opened but not started. On a re-authentication channel
+  on_opened) and a logind session cN for the user. Cancel emits Reset and
+  drops every conversation without ConversationStopped (do_reset stops them at
+  once), forgets the selected session and closes a session opened but not
+  started. On a re-authentication channel
   success switches to the user's session (logged as kind "switch"), the login
   screen's session turns inactive and the channel closes.
 
@@ -389,11 +390,12 @@ class Peer:
 
     def reset(self):
         # gdm_session_reset: Reset, then do_reset stops every conversation
-        # and forgets the selected session; an opened session that was not
+        # at once (stop_all_conversations -> stop_conversation_now drops
+        # the worker's child watch, so no ConversationStopped follows) and
+        # forgets the selected session; an opened session that was not
         # started closes with them.
         self.emit(VERIFIER_IFACE, "Reset", None, None)
-        for service in list(self.conversations):
-            self.stop_conversation(service)
+        self.conversations.clear()
         self.selected_session = None
         for session_id in self.opened.values():
             self.mock.logind.remove(session_id)
