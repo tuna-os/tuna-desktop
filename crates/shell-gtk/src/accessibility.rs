@@ -67,9 +67,39 @@ fn indicator_visible(always: bool, mut active: impl Iterator<Item = bool>) -> bo
 /// gnome-shell script follows); GTK's AT-SPI announcement is the event
 /// Orca presents for them here.
 pub fn announce(widget: &impl IsA<gtk::Accessible>, message: &str) {
-    if !message.is_empty() {
-        widget.announce(message, gtk::AccessibleAnnouncementPriority::Medium);
+    announce_at(widget, message, gtk::AccessibleAnnouncementPriority::Medium);
+}
+
+/// [`announce`] at `priority`, and only where a screen reader can hear
+/// it ([`reaches_screen_reader`]).
+pub fn announce_at(
+    widget: &impl IsA<gtk::Accessible>,
+    message: &str,
+    priority: gtk::AccessibleAnnouncementPriority,
+) {
+    if !message.is_empty() && reaches_screen_reader(widget.upcast_ref()) {
+        widget.announce(message, priority);
     }
+}
+
+/// Whether `accessible`'s AT context talks to an accessibility bus. When
+/// none answers (no at-spi2-core in the session), GTK gives every widget
+/// its test AT context instead (`gtkatcontext.c` `gtk_at_context_create`),
+/// whose class has no `announce`: `gtk_accessible_announce` then calls a
+/// NULL function (GTK 4.14 through main) and the shell dies by SIGSEGV,
+/// as drm-smoke's two-output leg saw on the screenshot banner. Without a
+/// bus no screen reader could hear the announcement anyway. With
+/// `GTK_A11Y=none` there is no context at all.
+fn reaches_screen_reader(accessible: &gtk::Accessible) -> bool {
+    use glib::translate::{from_glib_full, ToGlibPtr};
+    // `AccessibleExt::at_context` assumes a context; GTK_A11Y=none has none.
+    let context: Option<gtk::ATContext> = unsafe {
+        from_glib_full(gtk::ffi::gtk_accessible_get_at_context(
+            accessible.to_glib_none().0,
+        ))
+    };
+    let test = glib::Type::from_name("GtkTestATContext");
+    context.is_some_and(|context| test.is_none_or(|test| !context.type_().is_a(test)))
 }
 
 pub fn menu() -> gtk::MenuButton {
