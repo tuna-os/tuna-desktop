@@ -199,11 +199,27 @@ pub(crate) struct FrameSignature {
 }
 
 impl FrameSignature {
-    /// The signature of `passes`, as [`damage_region`] tracks them.
-    pub(crate) fn groups(passes: &[Vec<Tracked<'_>>]) -> Vec<Vec<ElementSignature>> {
+    /// The signature of `passes`, as [`damage_region`] tracks them, for
+    /// the elements that reach `frame`: one drawn wholly on another
+    /// output changes nothing here, so committing there does not repaint
+    /// this output (Mutter repaints a stage view only for damage within it).
+    pub(crate) fn groups(
+        passes: &[Vec<Tracked<'_>>],
+        frame: Rectangle<i32, Physical>,
+    ) -> Vec<Vec<ElementSignature>> {
         passes
             .iter()
-            .map(|pass| pass.iter().map(ElementSignature::capture).collect())
+            .map(|pass| {
+                pass.iter()
+                    .filter(|tracked| {
+                        tracked
+                            .element
+                            .geometry(tracked.scale.into())
+                            .overlaps(frame)
+                    })
+                    .map(ElementSignature::capture)
+                    .collect()
+            })
             .collect()
     }
 
@@ -476,6 +492,38 @@ mod tests {
         assert!(needs_repaint(None, &next, false));
         assert!(!needs_repaint(Some(&next), &next, false));
         assert!(needs_repaint(Some(&next), &next, true));
+    }
+
+    #[test]
+    fn commits_wholly_off_the_frame_do_not_repaint() {
+        // Two outputs side by side: a window animating on the left one
+        // sits at negative x in the right one's frame (P-AN-05).
+        let frame = rect(0, 0, 1024, 768);
+        let (away, straddling) = (Id::new(), Id::new());
+        let signature = |commit: usize| {
+            let away = solid(&away, rect(-1024, 0, 400, 300), commit);
+            let straddling = solid(&straddling, rect(-200, 0, 400, 300), commit);
+            let pass = [straddling, away];
+            FrameSignature {
+                groups: FrameSignature::groups(&[Tracked::pass(&pass, 1.0)], frame),
+                ..scene()
+            }
+        };
+        let before = signature(0);
+        assert_eq!(before.groups[0].len(), 1);
+        assert_eq!(before.groups[0][0].id, straddling);
+        assert!(needs_repaint(Some(&before), &signature(1), false));
+        let away_only = |commit: usize| FrameSignature {
+            groups: FrameSignature::groups(
+                &[Tracked::pass(
+                    &[solid(&away, rect(-1024, 0, 400, 300), commit)],
+                    1.0,
+                )],
+                frame,
+            ),
+            ..scene()
+        };
+        assert!(!needs_repaint(Some(&away_only(0)), &away_only(1), false));
     }
 
     #[test]

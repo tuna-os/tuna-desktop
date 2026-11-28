@@ -2,6 +2,7 @@
 """Read every connector's CRTC and mode straight from the kernel (P-DS-02).
 
 Usage: drm_kms_readback.py /dev/dri/cardN
+       drm_kms_readback.py --sample SECONDS INTERVAL_MS /dev/dri/cardN
 
 Prints JSON: a list of {"connector": "Virtual-1", "connection":
 "connected"|"disconnected"|"unknown", "crtc": id|null, "enabled": bool,
@@ -20,6 +21,7 @@ import fcntl
 import json
 import os
 import sys
+import time
 
 DRM_MODE_OBJECT_CRTC = 0xCCCCCCCC
 DRM_CLIENT_CAP_UNIVERSAL_PLANES = 2
@@ -235,10 +237,40 @@ def readback(path):
         os.close(fd)
 
 
+def sample(path, seconds, interval):
+    """Each lit connector's scanned-out framebuffer every `interval`
+    seconds for `seconds`: {"crtcs": {connector: crtc}, "samples":
+    [[CLOCK_MONOTONIC seconds, {connector: fb}], ...]}. A page flip
+    changes the primary plane's framebuffer, so the changes are the
+    output's frame clock as the kernel saw it."""
+    crtcs = {row["connector"]: row["crtc"] for row in readback(path) if row["crtc"] is not None}
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        samples = []
+        end = time.monotonic() + seconds
+        while True:
+            now = time.monotonic()
+            if now > end:
+                break
+            fbs = {}
+            for name, crtc_id in crtcs.items():
+                crtc = Crtc(crtc_id=crtc_id)
+                fcntl.ioctl(fd, GETCRTC, crtc)
+                fbs[name] = crtc.fb_id
+            samples.append([now, fbs])
+            time.sleep(interval)
+        return {"crtcs": crtcs, "samples": samples}
+    finally:
+        os.close(fd)
+
+
 def main():
-    if len(sys.argv) != 2:
+    if len(sys.argv) == 5 and sys.argv[1] == "--sample":
+        json.dump(sample(sys.argv[4], float(sys.argv[2]), float(sys.argv[3]) / 1000), sys.stdout)
+    elif len(sys.argv) == 2:
+        json.dump(readback(sys.argv[1]), sys.stdout)
+    else:
         raise SystemExit(__doc__)
-    json.dump(readback(sys.argv[1]), sys.stdout)
     print()
 
 

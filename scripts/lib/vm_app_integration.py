@@ -169,9 +169,28 @@ class Lane:
                 self.picker_state(role, caller_key)), 10, f"{role} caller never allocated")
             client, window = settled["client"], settled["window"]
             evidence["settled"] = settled
-            size_ok = window["rect"][2:] == [1100, 700] and client["allocation"] == [1100, 700]
+            # The X11 caller draws no title bar of its own (a GTK 4 window
+            # without a custom one), so as under Mutter the frames client
+            # frames it (P-WM-10): the managed rectangle is the requested
+            # client size grown by the frame's visible borders.
+            managed = list(window["rect"][2:])
+            if role == "x11":
+                left, right, top, bottom = window.get("x11_frame_extents") or (0, 0, 0, 0)
+                if not window.get("x11_framed") or top <= 0:
+                    failures.append(f"x11 caller not framed: framed {window.get('x11_framed')}, extents {window.get('x11_frame_extents')}")
+                managed = [managed[0] - left - right, managed[1] - top - bottom]
+                # A 1100x700 frame covers more than 80% of the 1280x768 work
+                # area, so as under Mutter (maybe_automaximize, place.c) it
+                # opens maximized: the frame fills the work area and the
+                # client fills the frame. Either that or a floating caller
+                # at the requested size passes; anything else fails.
+                work = [0, 32, TOPLEVEL[0], TOPLEVEL[1] - 32]
+                maximized = list(window["rect"]) == work
+                size_ok = managed == client["allocation"] and (managed == [1100, 700] or maximized)
+            else:
+                size_ok = managed == [1100, 700] and client["allocation"] == [1100, 700]
             if not size_ok:
-                failures.append(f"{role} caller size: managed {window['rect'][2:]}, GTK {client['allocation']}")
+                failures.append(f"{role} caller size: managed {window['rect'][2:]} (client {managed}), GTK {client['allocation']}")
             for method, outcome in PICKER_CASES:
                 case = self.picker_case(role, caller_key, bystander_key, method, outcome)
                 evidence["cases"].append(case)
