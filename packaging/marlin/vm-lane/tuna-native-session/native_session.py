@@ -336,6 +336,9 @@ def user_observe(operation, arguments):
                                 ('default', Atspi.StateType.IS_DEFAULT),
                                 ('selected', Atspi.StateType.SELECTED),
                                 ('checked', Atspi.StateType.CHECKED),
+                                # GTK 4 toggle buttons report their active
+                                # state as PRESSED, never CHECKED.
+                                ('pressed', Atspi.StateType.PRESSED),
                                 ('sensitive', Atspi.StateType.SENSITIVE)):
             row[key] = states.contains(state_type)
         if 'password' not in role:

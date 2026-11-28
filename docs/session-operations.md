@@ -62,9 +62,11 @@ the seat from logind.
 On the hardware backend the compositor then, in order
 (`crates/compositor/src/session_services.rs:281-443`):
 
-1. imports `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE` and an
-   empty `DISPLAY` into the systemd user manager and the D-Bus activation
-   environment, and logs `session services: display environment imported`;
+1. imports `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`, an
+   empty `DISPLAY` and the session's `XDG_SESSION_CLASS` (LocalSearch's
+   indexer unit is conditioned on `user`) into the systemd user manager and
+   the D-Bus activation environment, and logs `session services: display
+   environment imported`;
 2. starts `tuna-session.target` (`share/systemd/user/tuna-session.target`),
    which binds `graphical-session.target` and pulls in GNOME Settings Daemon's
    plugins through `gnome-session.target`, and logs `session services:

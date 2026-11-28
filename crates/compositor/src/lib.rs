@@ -606,8 +606,14 @@ impl State {
             return None;
         }
         let start = pointer.grab_start_data()?;
-        let (focus, _) = start.focus?;
-        (focus == *surface).then_some(start.location)
+        let (mut focus, _) = start.focus?;
+        // The press may have landed on one of the toplevel's subsurfaces,
+        // which take pointer input of their own (Mutter checks the focus
+        // surface's toplevel, meta_wayland_seat_get_grab_info).
+        while focus != *surface {
+            focus = smithay::wayland::compositor::get_parent(&focus)?;
+        }
+        Some(start.location)
     }
 
     /// The touch point still down whose `wl_touch.down` carried `serial`.

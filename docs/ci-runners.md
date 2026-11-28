@@ -37,9 +37,9 @@ group's `*runner-24` jobs use GitHub-hosted `ubuntu-24.04`
 
 | Runner | Lanes |
 | --- | --- |
-| `tuna-ci-24.04` | check, desktop-proofs, gtk-shell, gtk-shell-smoke |
+| `tuna-ci-24.04` | check, desktop-proofs, gtk-shell, gtk-shell-smoke, native-core-apps (the join of the Core legs) |
 | `tuna-ci-26.04` | journey, orca-speech, portal-security, remote-security, niri-parity |
-| GitHub-hosted, always | arch-package, drm-smoke, hotplug (`ubuntu-26.04`), marlin-vm (pull requests: the primary lifecycle and automatic-timezone legs, plus the Orca 51 leg when parity-ledger runs; push, schedule and dispatch add the Orca 51 leg and both paired reference members), marlin-image (push, schedule and dispatch only), gdm51-native-package, and the short coordination jobs select-lanes, native-reference-context, parity-ledger, docs-shots and ci-gate (`ubuntu-24.04`) |
+| GitHub-hosted, always | arch-package, drm-smoke, hotplug (`ubuntu-26.04`), marlin-vm (pull requests: the primary lifecycle and automatic-timezone legs, plus the Orca 51 leg when parity-ledger runs; push, schedule and dispatch add the Orca 51 leg and both paired reference members), core-apps-image and core-apps-leg (the native Core image and its five parallel boots, when selected), marlin-image (push, schedule and dispatch only), gdm51-native-package, and the short coordination jobs select-lanes, native-reference-context, parity-ledger, docs-shots and ci-gate (`ubuntu-24.04`) |
 
 Why the always-hosted lanes stay hosted:
 
@@ -51,11 +51,13 @@ Why the always-hosted lanes stay hosted:
   the module would expose a DRM device to the whole node.
 - **hotplug** loads `vkms` the same way and needs vkms configfs (Linux
   6.19+), so it runs on the hosted `ubuntu-26.04` image's 7.0 kernel.
-- **marlin-vm** needs more than `/dev/kvm`: it runs
+- **marlin-vm**, and the native Core `core-apps-leg` boots with it, need more
+  than `/dev/kvm`: they run
   `podman run --privileged --pid=host -v /dev:/dev … bootc install to-disk
   --via-loopback`, i.e. loop devices and a privileged container, which is
   root on the node. KVM through KubeVirt's device plugin would work, the
-  disk build would not.
+  disk build would not. `core-apps-image` builds the image those boots load
+  with the same rootful podman, so it stays beside them.
 - **marlin-image** builds the OCI image and, on `main`, pushes it to GHCR
   with a `packages: write` token. Publishing stays on GitHub's ephemeral VMs
   so a compromised long-lived node (or its shared image store) can never

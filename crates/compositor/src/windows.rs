@@ -4787,6 +4787,23 @@ impl WindowManager {
                 // The window rect is its xdg geometry; the surface origin
                 // sits up-left of it by the client-side shadow.
                 let origin = crate::popup::surface_origin(&surface, window.geometry.loc);
+                // A mapped subsurface whose input region holds the point
+                // takes it, as Mutter picks the topmost surface of the
+                // tree: GTK 4 draws Connections' address popover in a
+                // subsurface, and a press delivered to the toplevel
+                // instead lands outside the popover, which then closes.
+                // Subsurfaces with an empty input region (GTK's graphics
+                // offload) leave the point to the window as before.
+                if let Some((sub, at)) = smithay::desktop::utils::under_from_surface_tree(
+                    &surface,
+                    pos,
+                    origin,
+                    smithay::desktop::WindowSurfaceType::SUBSURFACE,
+                )
+                .filter(|(under, _)| *under != surface)
+                {
+                    return Some((sub, at.to_f64()));
+                }
                 Some((surface, (origin.x as f64, origin.y as f64).into()))
             });
         (target, Some(under))

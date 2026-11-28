@@ -67,6 +67,7 @@ mod color;
 mod display;
 mod input_capture;
 mod motion;
+mod native_keyboard_observer;
 mod orientation;
 mod osk;
 mod touch;
@@ -1467,6 +1468,7 @@ impl Runtime {
             state.note_output_global("tuna-0", global);
         }
         let manager = WindowManager::new(&mut state);
+        native_keyboard_observer::enable(&state);
         let tokens = std::rc::Rc::new(TokenStore::new());
         let control_path = control_socket_path(&session.socket_name)
             .ok_or_else(|| RuntimeError::Socket("XDG_RUNTIME_DIR is unset".to_owned()))?;
@@ -3255,6 +3257,28 @@ impl Runtime {
                         let origin = crate::popup::surface_origin(&s, w.geometry.loc);
                         Some([origin.x, origin.y, size.w, size.h])
                     }),
+                    // Its mapped xdg popups (GTK 4 popovers, menus), bottom to
+                    // top: each window geometry and committed buffer, in the
+                    // global space. A popover's widgets report extents in the
+                    // popover's own surface, not the window's.
+                    "popups": self.manager.surface_of(w.id).map(|s| {
+                        let origin = crate::popup::surface_origin(&s, w.geometry.loc);
+                        crate::popup::placed_popups(&s, origin, true).iter().map(|p| {
+                            let size = crate::windows::buffer_size(&p.surface);
+                            serde_json::json!({
+                                "rect": [p.rect.loc.x, p.rect.loc.y, p.rect.size.w, p.rect.size.h],
+                                "buffer_rect": size.map(|size| [p.origin.x, p.origin.y, size.w, size.h]),
+                            })
+                        }).collect::<Vec<_>>()
+                    }).unwrap_or_default(),
+                    // Its mapped subsurfaces, global: GTK 4 draws some popovers
+                    // (Connections' address popover) in one, not an xdg popup.
+                    "subsurfaces": self.manager.surface_of(w.id).map(|s| {
+                        let origin = crate::popup::surface_origin(&s, w.geometry.loc);
+                        crate::popup::placed_subsurfaces(&s, origin).iter()
+                            .map(|r| [r.loc.x, r.loc.y, r.size.w, r.size.h])
+                            .collect::<Vec<_>>()
+                    }).unwrap_or_default(),
                 })
             }).collect::<Vec<_>>(),
             "previews": previews,
@@ -3407,6 +3431,7 @@ impl Runtime {
             .workspace_slide()
             .snapshot(self.animation_clock.now());
         doc["transitions"] = self.transitions_diagnostics();
+        native_keyboard_observer::publish(&self.manager, &self.state, &mut doc);
         // GNOME Settings' display configuration (#340): modes, the
         // kernel's CRTC modes on hardware, pending confirmation.
         doc["display_config"] = self.display_config_diagnostics();

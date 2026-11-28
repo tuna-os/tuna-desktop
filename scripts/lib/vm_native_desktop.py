@@ -98,6 +98,7 @@ class NativeDesktop:
             deadline = min(deadline, previous)
         self._deadline = deadline
         observed = late = None
+        last_error = None
         try:
             while time.monotonic() < deadline:
                 try:
@@ -110,6 +111,17 @@ class NativeDesktop:
                         raise
                     late = error
                     break
+                except Exception as error:
+                    # One observation can fail while its subject churns
+                    # (an a11y re-render mid-walk, a bus re-registration):
+                    # the poll retries within budget instead of failing
+                    # the run on a single flapping read. Persistent
+                    # breakage still fails at the deadline, with the last
+                    # read error attached so the TimeoutError diagnoses.
+                    last_error = error
+                    observed = None
+                    time.sleep(min(0.15, max(0, deadline - time.monotonic())))
+                    continue
                 if time.monotonic() >= deadline:
                     break
                 if predicate(observed):
@@ -119,8 +131,14 @@ class NativeDesktop:
             failure = {'last_observation': observed, 'readiness_timeout_sec': timeout}
             if late is not None:
                 failure['late_observation_error'] = str(late)[:2000]
+            failure['last_read_error'] = None if last_error is None else repr(last_error)
             self.retain('failed-' + label, failure)
-            raise TimeoutError('actual readiness absolute deadline expired: ' + label) from late
+            if late is not None:
+                raise TimeoutError('actual readiness absolute deadline expired: ' + label) from late
+            if last_error is None:
+                raise TimeoutError('actual readiness absolute deadline expired: ' + label)
+            raise TimeoutError('actual readiness absolute deadline expired: ' + label
+                               + '; last read error: ' + repr(last_error)) from last_error
         finally:
             self._deadline = previous
 

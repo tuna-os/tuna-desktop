@@ -1,0 +1,162 @@
+"""unique() control-matching regressions: a container proxy and its leaf widget
+may share one name and role, which must resolve to the actionable leaf;
+genuinely distinct duplicates must still fail. Helper-validator controls only.
+"""
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'scripts' / 'lib'))
+from core_apps_web import unique
+
+
+def node(name, role, path, showing=True):
+    return {'name': name, 'role': role, 'path': list(path), 'showing': showing,
+            'sensitive': True}
+
+
+DIALOG = {'name': 'Preferences', 'role': 'dialog', 'path': [0], 'showing': True,
+          'sensitive': True, 'bounds': [0, 0, 400, 300]}
+
+
+class NestedProxyResolution(unittest.TestCase):
+    def tree(self, controls):
+        return {'nodes': [DIALOG] + controls}
+
+    def test_nested_proxy_resolves_to_leaf(self):
+        row = node('Group Digits', 'switch', [0, 1])
+        widget = node('Group Digits', 'switch', [0, 1, 0])
+        found = unique(self.tree([row, widget]),
+                       lambda n: n.get('name') == 'Group Digits' and n.get('role') == 'switch',
+                       'preference switch')
+        self.assertEqual(found['path'], [0, 1, 0])
+
+    def test_distinct_duplicates_still_fail(self):
+        first = node('Group Digits', 'switch', [0, 1])
+        second = node('Group Digits', 'switch', [0, 2])
+        with self.assertRaises(RuntimeError):
+            unique(self.tree([first, second]),
+                   lambda n: n.get('name') == 'Group Digits' and n.get('role') == 'switch',
+                   'preference switch')
+
+    def test_absent_control_still_fails(self):
+        with self.assertRaises(RuntimeError):
+            unique(self.tree([]), lambda n: n.get('role') == 'switch', 'preference switch')
+
+    def test_single_match_unchanged(self):
+        only = node('Group Digits', 'switch', [0, 1, 0])
+        found = unique(self.tree([only]),
+                       lambda n: n.get('name') == 'Group Digits' and n.get('role') == 'switch',
+                       'preference switch')
+        self.assertEqual(found['path'], [0, 1, 0])
+
+    def test_outermost_prefers_proxy_row(self):
+        row = node('Zoom to Specific Level', 'button', [0, 2, 2])
+        widget = node('Zoom to Specific Level', 'toggle button', [0, 2, 2, 0])
+        found = unique(self.tree([row, widget]),
+                       lambda n: n.get('name') == 'Zoom to Specific Level',
+                       'zoom control', outermost=True)
+        self.assertEqual(found['path'], [0, 2, 2])
+
+    def test_press_targets_proxy_row(self):
+        from core_apps_web import press
+        row = node('Zoom to Specific Level', 'button', [0, 2, 2])
+        widget = node('Zoom to Specific Level', 'toggle button', [0, 2, 2, 0])
+        calls = {}
+
+        class Desktop:
+            def tree(self, actor):
+                return {'nodes': [row, widget]}
+            def press(self, actor, name, role=None):
+                calls['press'] = (name, role)
+        press(Desktop(), {'id': 'org.gnome.Loupe'}, 'Zoom to Specific Level')
+        self.assertEqual(calls['press'], ('Zoom to Specific Level', 'button'))
+
+
+class ReplaceFieldFocus(unittest.TestCase):
+    """Run 44850865831: after the guest clipboard read (wl-clipboard maps its
+    own toplevel for keyboard focus), clicking Epiphany's still-focused entry
+    ended its focus and ctrl+a/backspace never reached it."""
+
+    def rig(self, focused, click_blurs=False):
+        entry = dict(node('Qualification payload', 'entry', [0, 1]), editable=True,
+                     text='cobalt', focused=focused)
+        log = []
+
+        class Desktop:
+            def tree(self, actor):
+                return {'nodes': [DIALOG, dict(entry)]}
+
+            def click_path(self, actor, path):
+                log.append('click')
+                entry['focused'] = not click_blurs
+
+            def keys(self, *chord):
+                log.append(chord)
+                if chord == ('backspace',) and entry['focused']:
+                    entry['text'] = ''
+
+            def type_ascii(self, text):
+                log.append(('type', text))
+
+            def await_state(self, label, read, predicate, timeout=10):
+                value = read()
+                if not predicate(value):
+                    raise TimeoutError(label)
+                log.append(label)
+                return value
+        return Desktop(), log
+
+    def test_focused_field_is_typed_into_without_a_click(self):
+        from core_apps_web import replace_field
+        desktop, log = self.rig(focused=True, click_blurs=True)
+        replace_field(desktop, {'id': 'org.gnome.Epiphany'}, '', 'Qualification payload')
+        self.assertNotIn('click', log)
+        self.assertEqual(log[0], 'actual-keyboard-field-focused')
+        self.assertEqual(log[-1], 'actual-keyboard-field')
+
+    def test_unfocused_field_is_clicked_and_must_take_focus_before_typing(self):
+        from core_apps_web import replace_field
+        desktop, log = self.rig(focused=False)
+        replace_field(desktop, {'id': 'org.gnome.Epiphany'}, '', 'Qualification payload')
+        self.assertEqual(log[:2], ['click', 'actual-keyboard-field-focused'])
+        desktop, log = self.rig(focused=False, click_blurs=True)
+        with self.assertRaises(TimeoutError):
+            replace_field(desktop, {'id': 'org.gnome.Epiphany'}, '', 'Qualification payload')
+        self.assertNotIn(('ctrl', 'a'), log)
+
+
+class LabelledRow(unittest.TestCase):
+    """Run 46133891606: Characters 51's sidebar rows are nameless list items
+    holding their category label."""
+
+    def desktop(self, *extra):
+        rows = [node('', 'list item', [0, 1, 0]), node('Recently Used', 'label', [0, 1, 0, 0, 0]),
+                node('', 'list item', [0, 1, 1]), node('Emojis', 'label', [0, 1, 1, 0, 0])]
+
+        class Desktop:
+            def tree(self, actor):
+                return {'nodes': [DIALOG] + rows + list(extra)}
+        return Desktop()
+
+    def test_row_holding_the_label_is_returned(self):
+        from core_apps_web import labelled_row
+        found = labelled_row(self.desktop(), {'id': 'org.gnome.Characters'}, 'Recently Used')
+        self.assertEqual(found['path'], [0, 1, 0])
+
+    def test_label_outside_any_row_fails(self):
+        from core_apps_web import labelled_row
+        with self.assertRaises(RuntimeError):
+            labelled_row(self.desktop(node('Search Result', 'label', [0, 2])),
+                         {'id': 'org.gnome.Characters'}, 'Search Result')
+
+    def test_duplicate_label_fails(self):
+        from core_apps_web import labelled_row
+        with self.assertRaises(RuntimeError):
+            labelled_row(self.desktop(node('Recently Used', 'label', [0, 3])),
+                         {'id': 'org.gnome.Characters'}, 'Recently Used')
+
+
+if __name__ == '__main__':
+    unittest.main()

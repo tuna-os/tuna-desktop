@@ -7,6 +7,7 @@
 //! popup_done and is not delivered to the window beneath. Conventions
 //! follow `windows.rs`: bounded pump, no sleeps.
 
+use std::os::unix::io::AsFd;
 use std::os::unix::net::UnixStream;
 
 use smithay::utils::{Logical, Point};
@@ -14,13 +15,17 @@ use tuna_compositor::windows::WindowManager;
 use tuna_compositor::TestCompositor;
 use wayland_client::{
     protocol::{
+        wl_buffer::WlBuffer,
         wl_callback::WlCallback,
         wl_compositor::WlCompositor,
         wl_display::WlDisplay,
         wl_keyboard::{Event as KeyEvent, WlKeyboard},
         wl_pointer::{Event as PointerEvent, WlPointer},
+        wl_region::WlRegion,
         wl_registry::WlRegistry,
         wl_seat::WlSeat,
+        wl_shm::{Format, WlShm},
+        wl_shm_pool::WlShmPool,
         wl_subcompositor::WlSubcompositor,
         wl_subsurface::WlSubsurface,
         wl_surface::WlSurface,
@@ -49,6 +54,7 @@ const BTN_LEFT: u32 = 0x110;
 struct Client {
     compositor: Option<WlCompositor>,
     subcompositor: Option<WlSubcompositor>,
+    shm: Option<WlShm>,
     seat: Option<WlSeat>,
     xdg_base: Option<XdgWmBase>,
     keyboard: Option<WlKeyboard>,
@@ -101,6 +107,9 @@ impl Dispatch<WlRegistry, ()> for Client {
                 }
                 "wl_subcompositor" => {
                     state.subcompositor = Some(registry.bind(name, 1, qh, ()));
+                }
+                "wl_shm" => {
+                    state.shm = Some(registry.bind(name, 1, qh, ()));
                 }
                 "wl_seat" => {
                     let seat: WlSeat = registry.bind(name, version, qh, ());
@@ -277,6 +286,10 @@ empty_dispatch!(WlCompositor);
 empty_dispatch!(WlSurface);
 empty_dispatch!(WlSubcompositor);
 empty_dispatch!(WlSubsurface);
+empty_dispatch!(WlShm);
+empty_dispatch!(WlShmPool);
+empty_dispatch!(WlBuffer);
+empty_dispatch!(WlRegion);
 empty_dispatch!(WlSeat);
 empty_dispatch!(XdgToplevel);
 empty_dispatch!(XdgPositioner);
@@ -1017,4 +1030,82 @@ fn a_subsurface_cannot_be_placed_above_or_below_itself() {
         );
         another_client_is_served(&mut f);
     }
+}
+
+/// A `wl_shm` buffer of its own pool, kept alive while attached.
+struct ShmBuffer {
+    _file: std::fs::File,
+    _pool: WlShmPool,
+    buffer: WlBuffer,
+}
+
+fn shm_buffer(f: &Fixture, width: i32, height: i32) -> ShmBuffer {
+    let stride = width * 4;
+    let file = tempfile::tempfile().unwrap();
+    file.set_len((stride * height) as u64).unwrap();
+    let qh = f.queue.handle();
+    let pool = f
+        .client
+        .shm
+        .as_ref()
+        .unwrap()
+        .create_pool(file.as_fd(), stride * height, &qh, ());
+    let buffer = pool.create_buffer(0, width, height, stride, Format::Argb8888, &qh, ());
+    ShmBuffer {
+        _file: file,
+        _pool: pool,
+        buffer,
+    }
+}
+
+/// GTK 4 draws some popovers (Connections' address popover) in a
+/// subsurface of the toplevel. The pointer enters the topmost surface of
+/// the tree whose input region holds it, as Mutter picks it: the
+/// subsurface over its own area, the toplevel elsewhere. A subsurface
+/// with an empty input region (GTK's graphics offload) leaves the point
+/// to the toplevel beneath it.
+#[test]
+fn pointer_enters_the_subsurface_taking_input_under_it() {
+    let mut f = fixture();
+    let qh = f.queue.handle();
+    let compositor = f.client.compositor.clone().unwrap();
+    let subcompositor = f.client.subcompositor.clone().unwrap();
+    let parent = shm_buffer(&f, 320, 200);
+    let popover = compositor.create_surface(&qh, ());
+    let popover_sub = subcompositor.get_subsurface(&popover, &f.toplevel_surface, &qh, ());
+    popover_sub.set_position(20, 20);
+    let popover_buffer = shm_buffer(&f, 100, 50);
+    popover.attach(Some(&popover_buffer.buffer), 0, 0);
+    popover.commit();
+    let offload = compositor.create_surface(&qh, ());
+    let offload_sub = subcompositor.get_subsurface(&offload, &f.toplevel_surface, &qh, ());
+    offload_sub.set_position(150, 20);
+    let empty = compositor.create_region(&qh, ());
+    offload.set_input_region(Some(&empty));
+    let offload_buffer = shm_buffer(&f, 100, 50);
+    offload.attach(Some(&offload_buffer.buffer), 0, 0);
+    offload.commit();
+    // Synchronized subsurfaces apply with their parent's commit.
+    f.toplevel_surface.attach(Some(&parent.buffer), 0, 0);
+    f.toplevel_surface.commit();
+    sync(&mut f);
+    sync(&mut f);
+    let (_, geometry) = f.manager.visible_windows()[0].clone();
+    f.window_origin = geometry.loc;
+
+    let enter_at = |f: &mut Fixture, x: i32, y: i32| {
+        let at = f.window_origin + Point::from((x, y));
+        f.manager.pointer_motion(&mut f.comp.state, at.to_f64(), 1);
+        sync(f);
+        f.client.pointer_entered.last().copied()
+    };
+    let toplevel = Some(f.toplevel_surface.id().protocol_id());
+    assert_eq!(enter_at(&mut f, 40, 40), Some(popover.id().protocol_id()));
+    assert_eq!(
+        enter_at(&mut f, 180, 40),
+        toplevel,
+        "an empty input region took the pointer"
+    );
+    assert_eq!(enter_at(&mut f, 40, 40), Some(popover.id().protocol_id()));
+    assert_eq!(enter_at(&mut f, 40, 150), toplevel);
 }
