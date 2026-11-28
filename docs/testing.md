@@ -277,8 +277,12 @@ carries on. G-BACKGROUND-BLUR: `ext_background_effect_manager_v1` offers
 blur, and a clear window whose surface is a blur region smooths the
 one-pixel stripes of a maximized window behind it (mean step between
 neighbouring pixels below 16) while beside it they stay sharp (above 128),
-from `background-blur.png`. CI runs the slice in the `gtk-shell` job; its
-`protocols/assertions.txt` feeds the ledger.
+from `background-blur.png`. G-SYNCOBJ: the nested session's software
+renderer has no timeline syncobjs, so the compositor logs Mutter's reason
+(`explicit sync disabled: …`, one of `meta-wayland-linux-drm-syncobj.c`'s
+messages) and no client finds `wp_linux_drm_syncobj_manager_v1`. CI runs
+the slice in the `gtk-shell` job; its `protocols/assertions.txt` feeds the
+ledger.
 
 G-OSK-INPUT-PANEL, in the same slice: with `screen-keyboard-enabled` on, a
 `zwp_text_input_manager_v3` version 2 field (`protocol-probe text-input-v2`)

@@ -339,3 +339,110 @@ pub(crate) fn start(
         })?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reis::event::{DeviceCapability as Capability, EiEvent};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Instant;
+
+    /// A delivered EIS client hears `ei_connection.disconnected`, then end
+    /// of file, once its RemoteDesktop grant is revoked: the lock and
+    /// owner-loss scan, Stop and Close all revoke by setting `stopped`.
+    /// The worker then asks the loop to end the session.
+    #[test]
+    fn a_delivered_eis_client_is_disconnected_when_its_grant_is_revoked() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let grant = RemoteGrant::new(
+            7,
+            ":1.7".into(),
+            crate::capture_security::CaptureCaller::RemoteDesktopDaemon,
+        );
+        grant.started.store(true, Ordering::SeqCst);
+        let outputs: Outputs = Arc::new(Mutex::new(vec![super::super::OutputSnapshot {
+            connector: "DP-1".into(),
+            make: String::new(),
+            model: String::new(),
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60_000,
+            x: 0,
+            y: 0,
+            scale: 1.0,
+            primary: true,
+            transform: 0,
+        }]));
+        let (to_loop, from_worker) = calloop::channel::channel();
+        start(
+            server,
+            grant.clone(),
+            3,
+            "xkb_keymap { };".into(),
+            outputs,
+            to_loop,
+        )
+        .unwrap();
+
+        let (tx, events) = mpsc::channel();
+        let client_thread = std::thread::spawn(move || {
+            let context = reis::ei::Context::new(client).unwrap();
+            let (_connection, iterator) = context
+                .handshake_blocking(
+                    "remote-eis-revocation-test",
+                    reis::ei::handshake::ContextType::Sender,
+                )
+                .unwrap();
+            for event in iterator {
+                let line = match event {
+                    Ok(EiEvent::SeatAdded(added)) => {
+                        added
+                            .seat
+                            .bind_capabilities(Capability::Keyboard | Capability::Pointer);
+                        let _ = context.flush();
+                        "seat"
+                    }
+                    Ok(EiEvent::DeviceResumed(_)) => "resumed",
+                    Ok(EiEvent::Disconnected(_)) => "disconnected",
+                    Ok(_) => continue,
+                    Err(_) => break,
+                };
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send("end of file");
+        });
+        let next = || {
+            events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("EIS client event")
+        };
+        assert_eq!(next(), "seat");
+        assert_eq!(next(), "resumed");
+        assert!(!grant.stopped.load(Ordering::SeqCst), "a live grant stays");
+
+        grant.stopped.store(true, Ordering::SeqCst);
+        assert_eq!(next(), "disconnected");
+        assert_eq!(next(), "end of file");
+        client_thread.join().unwrap();
+
+        let mut event_loop = calloop::EventLoop::<Vec<u64>>::try_new().unwrap();
+        event_loop
+            .handle()
+            .insert_source(from_worker, |event, _, stops| {
+                if let calloop::channel::Event::Msg(ToLoop::RemoteStop { session_id }) = event {
+                    stops.push(session_id);
+                }
+            })
+            .unwrap();
+        let mut stops = Vec::new();
+        let end = Instant::now() + Duration::from_secs(5);
+        while stops.is_empty() && Instant::now() < end {
+            event_loop
+                .dispatch(Some(Duration::from_millis(20)), &mut stops)
+                .unwrap();
+        }
+        assert_eq!(stops, vec![7]);
+    }
+}

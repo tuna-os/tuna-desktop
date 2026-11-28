@@ -16,6 +16,9 @@
 //!   offers blur; a maximized window of one-pixel stripes is mapped with a
 //!   clear window above it whose whole surface is a blur region. Prints
 //!   `ready` and keeps both open until killed; the proof samples pixels.
+//! - `syncobj-unoffered`: without a timeline-syncobj renderer device no
+//!   client finds wp_linux_drm_syncobj_manager_v1 (Mutter 51 creates the
+//!   global only after its device checks pass).
 //! - `text-input-v2 --state FILE`: with GNOME's on-screen keyboard enabled,
 //!   a zwp_text_input_manager_v3 version 2 field enabled alone opens no
 //!   keyboard; show_input_panel+commit opens the shell's keyboard,
@@ -591,6 +594,16 @@ fn background_blur(state: &Path) {
     }
 }
 
+fn syncobj_unoffered() {
+    let client = Client::connect();
+    if let Some((_, version)) = client.probe.globals.get("wp_linux_drm_syncobj_manager_v1") {
+        fail(format!(
+            "wp_linux_drm_syncobj_manager_v1 v{version} is offered on a renderer without timeline syncobjs"
+        ));
+    }
+    println!("ok wp_linux_drm_syncobj_manager_v1 is not offered");
+}
+
 /// The shell's on-screen keyboard layer (`tuna-osk`): its rectangle while
 /// mapped.
 fn osk_rect(session: &serde_json::Value) -> Option<serde_json::Value> {
@@ -782,9 +795,10 @@ fn main() {
         Some("xdg-foreign-v1") => xdg_foreign_v1(&need_state()),
         Some("wl-fixes") => wl_fixes(),
         Some("background-blur") => background_blur(&need_state()),
+        Some("syncobj-unoffered") => syncobj_unoffered(),
         Some("text-input-v2") => text_input_v2(&need_state()),
         other => fail(format!(
-            "unknown check {other:?}: xdg-wm-base-7, xdg-foreign-v1, wl-fixes, background-blur, text-input-v2"
+            "unknown check {other:?}: xdg-wm-base-7, xdg-foreign-v1, wl-fixes, background-blur, syncobj-unoffered, text-input-v2"
         )),
     }
 }
