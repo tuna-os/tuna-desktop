@@ -7410,6 +7410,18 @@ impl Runtime {
                 let owner = |at: &smithay::utils::Point<i32, Logical>| {
                     rects.iter().position(|r| r.contains(*at)).unwrap_or(0)
                 };
+                // What clients are owed counts per output: a frame request
+                // repaints the output drawing its surface, not every one.
+                let mut drawn_anywhere: Vec<_> =
+                    drawn.iter().map(|(surface, _)| surface.clone()).collect();
+                if locked {
+                    drawn_anywhere.extend(self.state.lock_surfaces());
+                }
+                let refresh_work = crate::frame_timing::RefreshWork {
+                    roots: &timing_roots,
+                    drawn: &drawn_anywhere,
+                    throttled: &throttled,
+                };
                 let mut queued = false;
                 let mut owed = false;
                 let mut cursor_presented = false;
@@ -7597,8 +7609,7 @@ impl Runtime {
                         .chain(lock_surface.clone())
                         .chain(presented_cursor.clone())
                         .collect();
-                    let timing_work =
-                        crate::frame_timing::pending_output_work(&timing_roots, &mine, &throttled);
+                    let timing_work = refresh_work.owed_by(&mine, index == 0);
                     if !crate::native_repaint::needs_repaint(
                         out.last_frame.as_ref(),
                         &signature,
