@@ -19,6 +19,13 @@
 //! - `syncobj-unoffered`: without a timeline-syncobj renderer device no
 //!   client finds wp_linux_drm_syncobj_manager_v1 (Mutter 51 creates the
 //!   global only after its device checks pass).
+//! - `xwayland-grab INSTANCE CLASS --state FILE` (an X11 client on
+//!   `$DISPLAY`, the session's Xwayland): maps a window with that
+//!   WM_CLASS, waits until the compositor focuses it, takes
+//!   `XGrabKeyboard` (rootless Xwayland turns that into
+//!   zwp_xwayland_keyboard_grab_v1), prints `grabbed WINDOW` and then one
+//!   `press KEYCODE` / `release KEYCODE` line per key it receives until
+//!   killed; the proof presses keys and reads the compositor's verdict.
 //! - `text-input-v2 --state FILE`: with GNOME's on-screen keyboard enabled,
 //!   a zwp_text_input_manager_v3 version 2 field enabled alone opens no
 //!   keyboard; show_input_panel+commit opens the shell's keyboard,
@@ -604,6 +611,118 @@ fn syncobj_unoffered() {
     println!("ok wp_linux_drm_syncobj_manager_v1 is not offered");
 }
 
+/// The compositor's state file as JSON.
+#[cfg(feature = "xwayland")]
+fn state_json(state: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(state).ok()?).ok()
+}
+
+/// An X11 client grabbing the keyboard as a remote viewer does:
+/// `XGrabKeyboard` on its focused window. Whether the grab holds the
+/// compositor's shortcuts is the compositor's decision; this reports the
+/// keys the window receives.
+#[cfg(feature = "xwayland")]
+fn xwayland_grab(state: &Path, instance: &str, class: &str) {
+    use smithay::reexports::x11rb::{
+        connection::Connection,
+        protocol::{
+            xproto::{
+                AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, GrabMode, GrabStatus,
+                PropMode, WindowClass,
+            },
+            Event,
+        },
+        wrapper::ConnectionExt as _,
+        CURRENT_TIME,
+    };
+    let (conn, screen) = smithay::reexports::x11rb::connect(None)
+        .unwrap_or_else(|e| fail(format!("cannot reach the session's Xwayland: {e}")));
+    fn x(what: &str, e: &dyn std::fmt::Display) -> ! {
+        fail(format!("X11 {what}: {e}"))
+    }
+    let root = &conn.setup().roots[screen];
+    let window = conn.generate_id().unwrap_or_else(|e| x("id", &e));
+    conn.create_window(
+        root.root_depth,
+        window,
+        root.root,
+        0,
+        0,
+        320,
+        200,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        root.root_visual,
+        &CreateWindowAux::new()
+            .background_pixel(0x253040)
+            .event_mask(EventMask::KEY_PRESS | EventMask::KEY_RELEASE),
+    )
+    .unwrap_or_else(|e| x("create_window", &e));
+    conn.change_property8(
+        PropMode::REPLACE,
+        window,
+        AtomEnum::WM_CLASS,
+        AtomEnum::STRING,
+        format!("{instance}\0{class}\0").as_bytes(),
+    )
+    .unwrap_or_else(|e| x("WM_CLASS", &e));
+    conn.change_property8(
+        PropMode::REPLACE,
+        window,
+        AtomEnum::WM_NAME,
+        AtomEnum::STRING,
+        format!("Tuna Grab Probe {class}").as_bytes(),
+    )
+    .unwrap_or_else(|e| x("WM_NAME", &e));
+    conn.map_window(window)
+        .unwrap_or_else(|e| x("map_window", &e));
+    conn.flush().unwrap_or_else(|e| x("flush", &e));
+    // Xwayland asks for the grab only for the surface holding keyboard
+    // focus, as a viewer grabs once the user clicked into it.
+    let end = Instant::now() + DEADLINE;
+    loop {
+        let focused = state_json(state).is_some_and(|json| {
+            json["windows"].as_array().is_some_and(|windows| {
+                windows
+                    .iter()
+                    .any(|w| w["app_id"] == class && json["focused"] == w["id"])
+            })
+        });
+        if focused {
+            break;
+        }
+        if Instant::now() >= end {
+            fail(format!("{class}'s X11 window never took focus"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let grab = conn
+        .grab_keyboard(
+            false,
+            window,
+            CURRENT_TIME,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )
+        .unwrap_or_else(|e| x("grab_keyboard", &e))
+        .reply()
+        .unwrap_or_else(|e| x("grab_keyboard reply", &e));
+    if grab.status != GrabStatus::SUCCESS {
+        fail(format!("XGrabKeyboard answered {:?}", grab.status));
+    }
+    println!("grabbed {window}");
+    let _ = std::io::stdout().flush();
+    loop {
+        match conn.wait_for_event() {
+            Ok(Event::KeyPress(key)) => println!("press {}", key.detail),
+            Ok(Event::KeyRelease(key)) => println!("release {}", key.detail),
+            Ok(_) => continue,
+            Err(e) => x("connection", &e),
+        }
+        let _ = std::io::stdout().flush();
+    }
+}
+
 /// The shell's on-screen keyboard layer (`tuna-osk`): its rectangle while
 /// mapped.
 fn osk_rect(session: &serde_json::Value) -> Option<serde_json::Value> {
@@ -796,9 +915,14 @@ fn main() {
         Some("wl-fixes") => wl_fixes(),
         Some("background-blur") => background_blur(&need_state()),
         Some("syncobj-unoffered") => syncobj_unoffered(),
+        #[cfg(feature = "xwayland")]
+        Some("xwayland-grab") => match (args.get(1), args.get(2)) {
+            (Some(instance), Some(class)) => xwayland_grab(&need_state(), instance, class),
+            _ => fail("xwayland-grab needs INSTANCE CLASS"),
+        },
         Some("text-input-v2") => text_input_v2(&need_state()),
         other => fail(format!(
-            "unknown check {other:?}: xdg-wm-base-7, xdg-foreign-v1, wl-fixes, background-blur, syncobj-unoffered, text-input-v2"
+            "unknown check {other:?}: xdg-wm-base-7, xdg-foreign-v1, wl-fixes, background-blur, syncobj-unoffered, xwayland-grab, text-input-v2"
         )),
     }
 }
