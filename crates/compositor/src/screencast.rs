@@ -207,6 +207,7 @@ impl PipeWire {
             inner,
             last_frame: None,
             sequence: 0,
+            embed_cursor: false,
         })
     }
 }
@@ -240,6 +241,9 @@ pub struct Cast {
     inner: Rc<RefCell<Inner>>,
     last_frame: Option<Instant>,
     sequence: u64,
+    /// The request asked for `cursor-mode` embedded: monitor and area
+    /// frames carry the pointer image.
+    pub embed_cursor: bool,
 }
 
 impl Cast {

@@ -170,7 +170,7 @@ pub enum Handled {
         show: bool,
         touch_auto: bool,
     },
-    /// The focused text input asked to hide the input panel (0.55,
+    /// The focused text input asked to hide the input panel (0.56,
     /// mutter's input-panel OFF); follows the `OnScreenKeyboard` update it
     /// belongs to.
     HideInputPanel,
@@ -857,6 +857,18 @@ impl ControlClient {
         self.write_message(&Message::Command {
             id,
             kind: CommandKind::RespondCloseDialog { window, response },
+        })?;
+        Ok(id)
+    }
+
+    /// Wake the locked, blanked screen for a lock-screen notification
+    /// (screenShield.js `_wakeUpScreen`, #348; 0.55). The compositor
+    /// denies it unless the session is locked.
+    pub fn wake_up_screen(&mut self) -> Result<u64, ControlError> {
+        let id = self.alloc_request_id();
+        self.write_message(&Message::Command {
+            id,
+            kind: CommandKind::WakeUpScreen,
         })?;
         Ok(id)
     }
@@ -2373,6 +2385,19 @@ mod tests {
                     kind: RemoteAccessKind::ScreenCast,
                     id: 3
                 },
+            }
+        );
+    }
+
+    #[test]
+    fn wake_up_screen_is_one_command() {
+        let (mut client, mut peer) = handshook();
+        let id = client.wake_up_screen().expect("wake");
+        assert_eq!(
+            server_read(&mut peer),
+            Message::Command {
+                id,
+                kind: CommandKind::WakeUpScreen,
             }
         );
     }

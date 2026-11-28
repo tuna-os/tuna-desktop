@@ -157,6 +157,9 @@ How one feature matches GNOME 51 and how it is proved. New notes go in
   effects.
 - [xwayland-on-demand.md](xwayland-on-demand.md) — XWayland socket
   activation.
+- [testing/bluefin-atspi-scope.md](testing/bluefin-atspi-scope.md) —
+  pinned Project Bluefin AT-SPI scenario inventory and dispositions (not a
+  pass result).
 - [testing/cursor-v1-integration.md](testing/cursor-v1-integration.md) —
   cursor qualification.
 - [testing/frame-callback-clock.md](testing/frame-callback-clock.md) —

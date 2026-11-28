@@ -85,7 +85,11 @@ before decoding.
   `CommandKind::StopRemoteAccess { kind, id }`, which revokes that grant
   permanently. Bounded by `MAX_REMOTE_ACCESS_HANDLES`,
   `MAX_REMOTE_ACCESS_TARGETS` and `MAX_TITLE_LEN`.
-- Input-panel OFF (0.55): `Message::HideInputPanel` (peers >=55 only)
+- Screen wake (0.55): `CommandKind::WakeUpScreen` lifts the idle fade off
+  the locked, blanked screen when a notification reaches the lock screen's
+  list (screenShield.js `_wakeUpScreen`); it is `Denied` while unlocked,
+  never unlocks and does not count as user activity.
+- Input-panel OFF (0.56): `Message::HideInputPanel` (peers >=56 only)
   follows the `OnScreenKeyboard` update of a text-input-v3 version 2
   client's `hide_input_panel`, so the shell's keyboard closes at once.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,

@@ -92,6 +92,10 @@ pub enum Action {
     Maximize,
     Minimize,
     Close,
+    /// Always on Top, on or off (`toggle-above`).
+    ToggleAbove,
+    /// Always on Visible Workspace, on or off (`toggle-on-all-workspaces`).
+    ToggleSticky,
     /// Mutter's half tiling (toggles back).
     TileLeft,
     TileRight,
@@ -111,13 +115,17 @@ pub enum Target {
     Last,
     Left,
     Right,
+    /// The nth workspace by index (0-based): `switch-to-workspace-N` is
+    /// N - 1. Mutter ignores an index past the last workspace.
+    Index(u32),
 }
 
 impl Target {
     /// The workspace id for this target, from `active` among `workspaces`
     /// with windows on `occupied`. GNOME's workspaces are dynamic: one
     /// empty workspace always follows the last occupied one, and that is
-    /// where Last goes; Right past the end is the next new one.
+    /// where Last goes. Right on that last workspace has nowhere to go:
+    /// mutter clamps (workspace.c:1312-1321), so it never opens another.
     pub fn resolve(self, active: u32, workspaces: &[u32], occupied: &[u32]) -> Option<u32> {
         let first = workspaces.iter().copied().min().unwrap_or(0);
         let trailing = occupied.iter().copied().max().map_or(0, |m| m + 1);
@@ -131,7 +139,8 @@ impl Target {
             Target::First => Some(first),
             Target::Last => Some(last),
             Target::Left => (active > first).then(|| active - 1),
-            Target::Right => Some(active + 1),
+            Target::Right => (active < last).then(|| active + 1),
+            Target::Index(index) => (index <= last).then_some(index),
         }
     }
 
@@ -513,6 +522,10 @@ fn specs() -> Vec<Spec> {
                 "<Control><Alt>Right",
             ],
         ),
+        // GNOME 51 binds only workspace 1 by default; 2-12 exist for
+        // the user's own accelerators.
+        wm("toggle-above", Action::ToggleAbove, vec![]),
+        wm("toggle-on-all-workspaces", Action::ToggleSticky, vec![]),
         wm(
             "move-to-workspace-1",
             Action::MoveToWorkspace(Target::First),
@@ -542,6 +555,22 @@ fn specs() -> Vec<Spec> {
             ],
         ),
     ]);
+    for n in 2..=12u32 {
+        specs.push(Spec {
+            schema: Schema::Wm,
+            key: format!("switch-to-workspace-{n}"),
+            action: Action::Workspace(Target::Index(n - 1)),
+            defaults: vec![],
+            modes: NORMAL_OVERVIEW,
+        });
+        specs.push(Spec {
+            schema: Schema::Wm,
+            key: format!("move-to-workspace-{n}"),
+            action: Action::MoveToWorkspace(Target::Index(n - 1)),
+            defaults: vec![],
+            modes: NORMAL_OVERVIEW,
+        });
+    }
     for n in 1..=9u8 {
         specs.push(Spec {
             schema: Schema::Shell,
@@ -759,13 +788,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn numbered_workspaces_2_to_12_register_unbound_and_resolve_by_index() {
+        let specs = specs();
+        for n in 2..=12u32 {
+            for (prefix, move_) in [
+                ("switch-to-workspace-", false),
+                ("move-to-workspace-", true),
+            ] {
+                let spec = specs
+                    .iter()
+                    .find(|s| s.key == format!("{prefix}{n}"))
+                    .unwrap();
+                let target = Target::Index(n - 1);
+                assert_eq!(
+                    spec.action,
+                    if move_ {
+                        Action::MoveToWorkspace(target)
+                    } else {
+                        Action::Workspace(target)
+                    }
+                );
+                assert!(spec.defaults.is_empty());
+            }
+        }
+        // Occupied 0,1 -> workspaces 0..=2 exist (one trailing empty).
+        let ws = [0, 1, 2];
+        assert_eq!(Target::Index(2).resolve(0, &ws, &[0, 1]), Some(2));
+        assert_eq!(Target::Index(3).resolve(0, &ws, &[0, 1]), None);
+        assert_eq!(Target::Index(3).destination(1, &ws, &[0, 1], None), 1);
+        assert_eq!(Target::Index(3).destination(0, &ws, &[], Some(3)), 0);
+        assert!(specs.iter().any(|s| s.key == "toggle-above"));
+        assert!(specs.iter().any(|s| s.key == "toggle-on-all-workspaces"));
+    }
+
+    #[test]
     fn workspace_targets_resolve_like_mutter() {
         let ws = [0, 1, 2];
         assert_eq!(Target::First.resolve(1, &ws, &[0, 1]), Some(0));
         assert_eq!(Target::Last.resolve(0, &ws, &[0, 1]), Some(2));
         assert_eq!(Target::Left.resolve(0, &ws, &[0]), None);
         assert_eq!(Target::Left.resolve(2, &ws, &[0]), Some(1));
-        assert_eq!(Target::Right.resolve(2, &ws, &[0]), Some(3));
+        assert_eq!(Target::Right.resolve(1, &ws, &[0]), Some(2));
+        // Right on the last workspace does not open a new one.
+        assert_eq!(Target::Right.resolve(2, &ws, &[0]), None);
+        // Occupied last workspace: the trailing empty one is still reachable.
+        assert_eq!(Target::Right.resolve(1, &[0, 1], &[0, 1]), Some(2));
+        assert_eq!(Target::Right.resolve(2, &[0, 1], &[0, 1]), None);
         // Everything on the first workspace: Last is the empty one after.
         assert_eq!(Target::Last.resolve(0, &[0], &[0]), Some(1));
     }
@@ -780,6 +848,8 @@ mod tests {
         assert_eq!(Target::Last.destination(0, &[0, 1, 2, 3], &[], Some(4)), 3);
         assert_eq!(Target::First.destination(2, &[0, 1, 2, 3], &[], Some(4)), 0);
         assert_eq!(Target::Left.destination(2, &[0, 1, 2], &[0], None), 1);
+        // Dynamic workspaces: Right past the trailing empty one stays put.
+        assert_eq!(Target::Right.destination(2, &[0, 1, 2], &[0, 1], None), 2);
     }
 
     #[test]

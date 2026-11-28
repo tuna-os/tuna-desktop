@@ -265,6 +265,39 @@ class Tests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 proof.gap_after_move(*bad)
 
+    def test_column_chord_geometry_follows_niri(self):
+        # A 616-wide column at y=48 with 736 px to share, as the proof sees it
+        # after Super+] (Beta's width and height).
+        column = {'width': 616, 'full': 736, 'y': 48}
+        found = lambda alpha, beta: {'alpha': {'rect': alpha}, 'beta': {'rect': beta}}
+        stacked = found([16, 424, 616, 360], [16, 48, 616, 360])
+        self.assertTrue(proof.column_stack(stacked, 'beta', 'alpha', **column))
+        self.assertFalse(proof.column_stack(stacked, 'alpha', 'beta', **column))
+        # Super+, puts Beta below Alpha: the same column, the other order.
+        taken = found([16, 48, 616, 360], [16, 424, 616, 360])
+        self.assertTrue(proof.column_stack(taken, 'alpha', 'beta', **column))
+        # Uneven heights (a fixed-height window) or another width are not
+        # niri's automatic split of this column.
+        self.assertFalse(proof.column_stack(found([16, 344, 616, 440], [16, 48, 616, 280]), 'beta', 'alpha', **column))
+        self.assertFalse(proof.column_stack(found([16, 424, 405, 360], [16, 48, 405, 360]), 'beta', 'alpha', **column))
+        # Super+[ and Super+. leave Alpha and Beta alone in adjacent
+        # full-height columns of the kept width, Alpha on the left.
+        apart = found([16, 48, 616, 736], [648, 48, 616, 736])
+        self.assertTrue(proof.columns_apart(apart, 'alpha', 'beta', **column))
+        self.assertFalse(proof.columns_apart(apart, 'beta', 'alpha', **column))
+        self.assertFalse(proof.columns_apart(found([16, 48, 616, 736], [664, 48, 616, 736]), 'alpha', 'beta', **column))
+        self.assertFalse(proof.columns_apart(stacked, 'alpha', 'beta', **column))
+
+    def test_every_column_chord_runs_on_actual_keys(self):
+        import inspect
+        source = inspect.getsource(proof.prove_installed_strip)
+        for keys in ("'meta_l', 'up'", "'meta_l', 'down'", "'meta_l', 'bracket_left'",
+                     "'meta_l', 'comma'", "'meta_l', 'dot'"):
+            self.assertEqual(source.count(f"chord({keys})"), 1, keys)
+        self.assertEqual(source.count("chord('meta_l', 'bracket_right')"), 3)
+        self.assertLess(source.index("capture('09-column-consume'"), source.index("chord('meta_l', 'up')"))
+        self.assertLess(source.index("column_chords = True"), source.index("capture('10-column-height'"))
+
 
 
     def test_strip_insert_mirrors_the_compositor_drop_rule(self):

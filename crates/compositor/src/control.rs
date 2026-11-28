@@ -389,6 +389,8 @@ pub struct Session<'a> {
     close_menu_unanimated: bool,
     /// Close-dialog answers `(window, response)`, drained by the hub.
     close_dialog_responses: Vec<(u64, tuna_shell_control::CloseDialogResponse)>,
+    /// An admitted `WakeUpScreen`, drained by the hub.
+    wake_up_screen: bool,
     /// The session-bus unique name the supervised shell declared over this
     /// session (`DeclareBusName`), read by [`ControlHub::shell_bus_names`].
     bus_name: Option<String>,
@@ -501,6 +503,7 @@ impl<'a> Session<'a> {
             pad_osd_closed: Vec::new(),
             close_menu_unanimated: false,
             close_dialog_responses: Vec::new(),
+            wake_up_screen: false,
             bus_name: None,
             startup_sequences: Vec::new(),
             remote_access: std::rc::Rc::default(),
@@ -605,6 +608,11 @@ impl<'a> Session<'a> {
         self.idle_timeout.take()
     }
 
+    /// Whether the shell woke the locked screen since the last call.
+    pub fn take_wake_up_screen(&mut self) -> bool {
+        std::mem::take(&mut self.wake_up_screen)
+    }
+
     /// Replace this session's lockdown policy (#357). The hub pushes
     /// its live policy here on accept and refresh; tests inject a
     /// restrictive policy to prove `Lock` denies under it.
@@ -698,7 +706,7 @@ impl<'a> Session<'a> {
     /// Send what GNOME's on-screen keyboard follows (#349). Peers older
     /// than 0.43 cannot decode it and receive nothing; an input-panel OFF
     /// request follows the update as `HideInputPanel`, only to peers of
-    /// 0.55 and newer.
+    /// 0.56 and newer.
     pub fn send_on_screen_keyboard(&mut self, osk: OskBroadcast) -> Result<(), ControlError> {
         if self.peer_minor < 43 {
             return Ok(());
@@ -708,7 +716,7 @@ impl<'a> Session<'a> {
             show: osk.panel == Some(InputPanel::On),
             touch_auto: osk.touch_auto,
         })?;
-        if osk.panel == Some(InputPanel::Off) && self.peer_minor >= 55 {
+        if osk.panel == Some(InputPanel::Off) && self.peer_minor >= 56 {
             self.conn.write_frame(&Message::HideInputPanel)?;
         }
         Ok(())
@@ -1241,6 +1249,25 @@ impl<'a> Session<'a> {
             }
             Message::Command {
                 id,
+                kind: CommandKind::WakeUpScreen,
+            } => {
+                // screenShield.js `_wakeUpScreen`: only an active shield
+                // wakes; it never unlocks.
+                let status = if self.locked.get() {
+                    self.wake_up_screen = true;
+                    CommandStatus::Applied
+                } else {
+                    CommandStatus::Denied {
+                        reason: "not locked".into(),
+                    }
+                };
+                let applied = status == CommandStatus::Applied;
+                self.conn
+                    .write_frame(&Message::CommandResult { id, status })?;
+                Ok(Handled::CommandResult { id, applied })
+            }
+            Message::Command {
+                id,
                 kind: CommandKind::DeclareBusName { unique_name },
             } => {
                 if self.peer_minor < 52 {
@@ -1729,6 +1756,7 @@ fn apply_command(
         | CommandKind::PadOsdClosed { .. }
         | CommandKind::CloseMenuUnanimated
         | CommandKind::RespondCloseDialog { .. }
+        | CommandKind::WakeUpScreen
         | CommandKind::DeclareBusName { .. }
         | CommandKind::BeginStartupSequence { .. }
         | CommandKind::StopRemoteAccess { .. }
@@ -1818,6 +1846,9 @@ pub struct PollOutcome {
     pub startup_sequences: Vec<(String, Option<String>)>,
     /// Remote access grants the shell stopped, in order (#1162 F2).
     pub remote_access_stops: Vec<(tuna_shell_control::RemoteAccessKind, u64)>,
+    /// The shell asked to wake the locked screen (a lock-screen
+    /// notification, #348).
+    pub wake_up_screen: bool,
     /// Input-source switches to make (`true` backward), in order.
     pub input_source_switches: Vec<bool>,
     /// New switcher thumbnail frames, if the shell sent any.
@@ -2688,6 +2719,7 @@ impl ControlHub {
                         .extend(std::mem::take(&mut session.pad_osd_closed));
                     outcome.close_menu_unanimated |=
                         std::mem::take(&mut session.close_menu_unanimated);
+                    outcome.wake_up_screen |= session.take_wake_up_screen();
                     outcome
                         .close_dialog_responses
                         .extend(std::mem::take(&mut session.close_dialog_responses));
