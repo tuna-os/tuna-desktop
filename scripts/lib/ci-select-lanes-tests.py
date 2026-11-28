@@ -119,6 +119,10 @@ class Selection(unittest.TestCase):
         # (#353) are sourced into it, with their pixel reader.
         for path in ("scripts/lib/tuna-sound-alerts-proof.sh", "scripts/lib/tuna-bell-pixels.py"):
             self.assertEqual(pr(path), ["journey", "gtk-shell"], path)
+        # G-OSK-* live in the OSK proof the gtk-shell job runs.
+        for path in ("scripts/tuna-osk-proof", "scripts/lib/tuna-osk-probe.py",
+                     "scripts/lib/tuna-osk-proof.py"):
+            self.assertEqual(pr(path), ["gtk-shell"], path)
         self.assertEqual(pr("scripts/lib/vm_unlock_wake.py"), ["arch-package", "marlin-vm"])
         # MP-*, WL-*, X11-* window-motion gates and the capture they pair with.
         for path in ("scripts/tuna-motion-pairing-proof", "scripts/tuna-x11-icon-geometry-proof",
