@@ -251,13 +251,16 @@ impl ProtocolVersion {
     /// `0.55` appends the shell-to-compositor `WakeUpScreen` command (a
     /// notification wakes the locked, blanked screen, #348). Positional
     /// postcard peers must ship together.
-    /// `0.56` appends text-input-v3 version 2's input-panel OFF request:
+    /// `0.56` appends GNOME's per-class `custom-accel-config` curves and the
+    /// touchpad `disable-while-typing-timeout` to InputSettings (#343).
+    /// Positional postcard peers must ship together.
+    /// `0.57` appends text-input-v3 version 2's input-panel OFF request:
     /// compositor-to-shell `HideInputPanel`, sent after the
     /// `OnScreenKeyboard` update it belongs to. Positional postcard peers
     /// must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 56,
+        minor: 57,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -1329,12 +1332,12 @@ pub enum Message {
     /// each handshake while any is active, only to peers advertising
     /// minor >= 54. At most [`MAX_REMOTE_ACCESS_HANDLES`].
     RemoteAccess { handles: Vec<RemoteAccessHandle> },
-    /// Since 0.55: the focused text input asked to hide the input panel
+    /// Since 0.57: the focused text input asked to hide the input panel
     /// (text-input-v3 version 2 `hide_input_panel`; mutter's
     /// `clutter_input_focus_set_input_panel_state (OFF)`). Follows the
     /// `OnScreenKeyboard` update it belongs to; GNOME's keyboard closes at
     /// once (`_onKeyboardStateChanged`). Sent only to peers advertising
-    /// minor >= 56.
+    /// minor >= 57.
     HideInputPanel,
 }
 
@@ -1547,6 +1550,13 @@ pub struct InputSettings {
     /// `Super_R`; empty disables it).
     #[serde(default = "default_overlay_key")]
     pub overlay_key: String,
+    /// Since 0.56: each pointer class's `custom-accel-config`, used when
+    /// that class's `accel-profile` is `custom`.
+    #[serde(default)]
+    pub custom_accel: CustomAccelConfigs,
+    /// Since 0.56: touchpad `disable-while-typing-timeout`, milliseconds.
+    #[serde(default = "default_disable_while_typing_timeout_ms")]
+    pub disable_while_typing_timeout_ms: u32,
 }
 
 /// GNOME's `GDesktopPointerAccelProfile`, shared by the mouse, touchpad,
@@ -1557,8 +1567,66 @@ pub enum PointerAccelProfile {
     Default,
     Flat,
     Adaptive,
-    /// Custom curves are not supported by the current libinput bindings.
+    /// The class's [`CustomAccelCurve`].
     Custom,
+}
+
+/// One GNOME `custom-accel-config` (`a{sv}`): its `pointer-step` (`d`) and
+/// `pointer-speeds` (`ad`) as read. A missing or mistyped entry arrives as
+/// step 0 with no speeds, which [`CustomAccelCurve::or_mutter_fallback`]
+/// replaces like any other invalid curve. Doubles compare by bit pattern,
+/// so the settings stay `Eq`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomAccelCurve {
+    pub step: f64,
+    pub speeds: Vec<f64>,
+}
+
+impl CustomAccelCurve {
+    /// Mutter 51 `update_pointer_accel_profile`: a step that is not above
+    /// zero or fewer than two speeds fall back to step 1.0 and speeds
+    /// `[0.0, 1.0]`; anything else goes to libinput as is.
+    pub fn or_mutter_fallback(&self) -> Self {
+        if self.step <= 0.0 || self.speeds.len() < 2 {
+            Self::default()
+        } else {
+            self.clone()
+        }
+    }
+}
+
+impl Default for CustomAccelCurve {
+    /// GNOME 51's `custom-accel-config` default (and Mutter's fallback).
+    fn default() -> Self {
+        Self {
+            step: 1.0,
+            speeds: vec![0.0, 1.0],
+        }
+    }
+}
+
+impl PartialEq for CustomAccelCurve {
+    fn eq(&self, other: &Self) -> bool {
+        self.step.to_bits() == other.step.to_bits()
+            && self.speeds.len() == other.speeds.len()
+            && self
+                .speeds
+                .iter()
+                .zip(&other.speeds)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+}
+
+impl Eq for CustomAccelCurve {}
+
+/// `custom-accel-config` of the mouse, touchpad, trackball and
+/// pointing-stick schemas.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomAccelConfigs {
+    pub mouse: CustomAccelCurve,
+    pub touchpad: CustomAccelCurve,
+    pub trackball: CustomAccelCurve,
+    pub pointing_stick: CustomAccelCurve,
 }
 
 impl PointerAccelProfile {
@@ -1850,6 +1918,11 @@ fn default_overlay_key() -> String {
     "Super".into()
 }
 
+/// GNOME 51's touchpad `disable-while-typing-timeout` default.
+fn default_disable_while_typing_timeout_ms() -> u32 {
+    500
+}
+
 impl Default for InputSettings {
     /// GNOME 51's defaults.
     fn default() -> Self {
@@ -1892,6 +1965,8 @@ impl Default for InputSettings {
             center_new_windows: true,
             auto_maximize: true,
             overlay_key: default_overlay_key(),
+            custom_accel: CustomAccelConfigs::default(),
+            disable_while_typing_timeout_ms: default_disable_while_typing_timeout_ms(),
         }
     }
 }
@@ -2808,6 +2883,60 @@ mod tests {
         let body = postcard::to_slice(&kind, &mut buffer).unwrap();
         assert_eq!(postcard::from_bytes::<CommandKind>(body).unwrap(), kind);
     }
+
+    #[test]
+    fn custom_accel_curves_and_dwt_timeout_survive_positional_control_wire() {
+        let curve = |step: f64, speeds: &[f64]| CustomAccelCurve {
+            step,
+            speeds: speeds.to_vec(),
+        };
+        let settings = InputSettings {
+            custom_accel: CustomAccelConfigs {
+                mouse: curve(0.5, &[0.0, 0.25, 1.5]),
+                touchpad: curve(2.0, &[0.0, 3.0]),
+                trackball: curve(0.0, &[]),
+                pointing_stick: curve(f64::NAN, &[1.0, f64::INFINITY]),
+            },
+            disable_while_typing_timeout_ms: 1700,
+            ..Default::default()
+        };
+        let mut buffer = [0u8; 1024];
+        let body = postcard::to_slice(&settings, &mut buffer).unwrap();
+        let decoded: InputSettings = postcard::from_bytes(body).unwrap();
+        assert_eq!(decoded, settings);
+        assert_eq!(decoded.disable_while_typing_timeout_ms, 1700);
+        assert_ne!(
+            decoded.custom_accel.mouse,
+            curve(0.5, &[0.0, 0.25, 1.25]),
+            "every speed takes part in equality"
+        );
+        // GNOME 51's defaults.
+        let defaults = InputSettings::default();
+        assert_eq!(defaults.disable_while_typing_timeout_ms, 500);
+        assert_eq!(defaults.custom_accel.touchpad, curve(1.0, &[0.0, 1.0]));
+    }
+
+    #[test]
+    fn custom_accel_falls_back_like_mutter_51() {
+        let curve = |step: f64, speeds: &[f64]| CustomAccelCurve {
+            step,
+            speeds: speeds.to_vec(),
+        };
+        let fallback = curve(1.0, &[0.0, 1.0]);
+        // `pointer-step` must be above zero and `pointer-speeds` needs two points.
+        for invalid in [
+            curve(0.0, &[0.0, 1.0, 2.0]),
+            curve(-1.0, &[0.0, 1.0]),
+            curve(0.5, &[3.0]),
+            curve(0.0, &[]),
+        ] {
+            assert_eq!(invalid.or_mutter_fallback(), fallback, "{invalid:?}");
+        }
+        // Anything else is passed through for libinput to judge.
+        for valid in [curve(0.5, &[0.0, 0.5]), curve(f64::NAN, &[0.0, 1.0])] {
+            assert_eq!(valid.or_mutter_fallback(), valid);
+        }
+    }
     #[test]
     fn secrets_never_reach_debug_output() {
         let kind = CommandKind::Unlock {
@@ -2819,11 +2948,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_56() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 56));
-        // A 0.55 shell still negotiates; a newer minor does not.
-        assert!(ProtocolVersion::new(0, 55).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 57).is_compatible_with(&CURRENT_VERSION));
+    fn current_version_is_0_57() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 57));
+        // A 0.56 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 56).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 58).is_compatible_with(&CURRENT_VERSION));
     }
 
     fn remote_access_handle(targets: Vec<RemoteAccessTarget>) -> RemoteAccessHandle {

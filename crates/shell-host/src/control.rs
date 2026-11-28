@@ -170,7 +170,7 @@ pub enum Handled {
         show: bool,
         touch_auto: bool,
     },
-    /// The focused text input asked to hide the input panel (0.56,
+    /// The focused text input asked to hide the input panel (0.57,
     /// mutter's input-panel OFF); follows the `OnScreenKeyboard` update it
     /// belongs to.
     HideInputPanel,

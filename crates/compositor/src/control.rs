@@ -706,7 +706,7 @@ impl<'a> Session<'a> {
     /// Send what GNOME's on-screen keyboard follows (#349). Peers older
     /// than 0.43 cannot decode it and receive nothing; an input-panel OFF
     /// request follows the update as `HideInputPanel`, only to peers of
-    /// 0.56 and newer.
+    /// 0.57 and newer.
     pub fn send_on_screen_keyboard(&mut self, osk: OskBroadcast) -> Result<(), ControlError> {
         if self.peer_minor < 43 {
             return Ok(());
@@ -716,7 +716,7 @@ impl<'a> Session<'a> {
             show: osk.panel == Some(InputPanel::On),
             touch_auto: osk.touch_auto,
         })?;
-        if osk.panel == Some(InputPanel::Off) && self.peer_minor >= 56 {
+        if osk.panel == Some(InputPanel::Off) && self.peer_minor >= 57 {
             self.conn.write_frame(&Message::HideInputPanel)?;
         }
         Ok(())
