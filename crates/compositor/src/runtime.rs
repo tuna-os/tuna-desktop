@@ -969,6 +969,9 @@ pub struct Runtime {
     /// source in `launch`).
     #[cfg(feature = "drm")]
     strip_release_held: Option<ManagerInput>,
+    /// Explicit-sync acquire points holding commits (#364).
+    #[cfg(feature = "drm")]
+    acquire_waits: crate::explicit_sync::AcquireWaits,
     /// XWayland server client awaiting its `Ready` event, after
     /// which the X11 window manager starts against it (xwayland
     /// feature only).
@@ -1404,11 +1407,16 @@ impl Runtime {
                             rt.on_tablet_input(event);
                         }
                         rt.pad_osd_tick();
-                        // The window manager has the final say (a locked
-                        // pointer stays put): the drawn cursor follows it.
-                        let pos = rt.manager.pointer_pos();
-                        if let Backend::Drm(drm) = &mut rt.backend {
-                            drm.set_pointer(pos);
+                        // The manager has the final say (a locked pointer
+                        // stays put), but only after queued motion reaches it.
+                        // Until then DRM owns the accumulated position; using
+                        // the stale manager position would lose relative moves
+                        // delivered before the next frame.
+                        if !rt.motion_queue.pending() {
+                            let pos = rt.manager.pointer_pos();
+                            if let Backend::Drm(drm) = &mut rt.backend {
+                                drm.set_pointer(pos);
+                            }
                         }
                     })
                     .map_err(|e| RuntimeError::Loop(e.to_string()))?;
@@ -1554,6 +1562,8 @@ impl Runtime {
 
         // linux-dmabuf lists exactly what this renderer imports (#89),
         // with feedback naming the renderer's device as Mutter's does.
+        // Explicit sync follows when that renderer's device has timeline
+        // syncobjs, on whichever backend, as Mutter decides it (#364).
         let mut backend = backend;
         let mut state = state;
         {
@@ -1573,6 +1583,11 @@ impl Runtime {
                 ),
             };
             state.enable_dmabuf(formats, main_device);
+            #[cfg(feature = "drm")]
+            state.enable_explicit_sync(match &mut backend {
+                Backend::Winit(winit) => crate::explicit_sync::probe(winit.renderer()),
+                Backend::Drm(drm) => crate::explicit_sync::probe(&drm.renderer),
+            });
         }
         // On software GL the shell draws with cairo. Telling it here saves
         // it a GL context of its own made only to read GL_RENDERER, which
@@ -1816,6 +1831,8 @@ impl Runtime {
             frame_owed: false,
             #[cfg(feature = "drm")]
             strip_release_held: None,
+            #[cfg(feature = "drm")]
+            acquire_waits: Default::default(),
             #[cfg(feature = "xwayland")]
             pending_x11_client: None,
             #[cfg(feature = "xwayland")]
@@ -3140,6 +3157,8 @@ impl Runtime {
                 "mouse": self.input_settings.mouse,
                 "trackball": self.input_settings.trackball,
                 "pointing_stick": self.input_settings.pointing_stick,
+                "custom_accel": self.input_settings.custom_accel,
+                "disable_while_typing_timeout_ms": self.input_settings.disable_while_typing_timeout_ms,
             },
             "locked": self.is_locked(),
             // Administrative lockdown backstop (#357): the live
@@ -3449,6 +3468,9 @@ impl Runtime {
         doc["pointer_fullscreen_blocked"] = serde_json::json!(
             (!self.is_locked()).then(|| self.manager.fullscreen_at(self.manager.pointer_pos()))
         );
+        // GTK's default text direction as the shell reports it: the side
+        // GNOME's hot corner and pressure barrier take (#336).
+        doc["right_to_left"] = serde_json::Value::Bool(self.input_settings.right_to_left);
         // Live libinput device configuration (#343): beside the macro,
         // which is already at its recursion limit.
         // Keep this unlocked drag observation outside the large scene macro.
@@ -4215,7 +4237,7 @@ impl Runtime {
         &mut self,
         directory: &std::path::Path,
     ) -> Vec<crate::screenshot::WindowShot> {
-        if self.is_locked() || std::fs::create_dir_all(directory).is_err() {
+        if self.is_locked() || crate::screenshot::private_directory(directory).is_err() {
             return Vec::new();
         }
         let size = self.state.primary_size();
@@ -5851,6 +5873,19 @@ impl Runtime {
             format_args!("site=pre_render ok={}", flushed.is_ok()),
         );
         flushed.map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+        // Commits held for an explicit-sync acquire point wait on the loop.
+        #[cfg(feature = "drm")]
+        {
+            let queued = self.state.take_acquire_waits();
+            self.acquire_waits.watch(
+                &self.loop_handle,
+                queued,
+                |runtime: &mut Runtime, id, surface| {
+                    runtime.acquire_waits.signalled(id);
+                    crate::explicit_sync::acquired(&mut runtime.state, surface);
+                },
+            );
+        }
         self.manager.reconcile(&mut self.state);
         crate::grid_trace::stage(&self.state, "reconciled");
         // mutter's startup_sequence_timeout: the busy cursor ends with
