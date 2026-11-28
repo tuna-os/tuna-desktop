@@ -45,6 +45,10 @@
 #   cancel and drop, #1189) and G-SHELL-STABLE only.
 #   --lock-menu-only runs panel readiness, G-LOCK-WITH-MENU-OPEN and
 #   G-SHELL-STABLE only (needs pam_wrapper).
+#   --app-menu-only runs panel readiness, G-APP-MENU, G-DASH-PIN-DND,
+#   G-FAVORITES-LIVE, G-FAVORITES-IMPORT (the app-icon menu, dash
+#   drag-to-pin, live favorite-apps and the one-time import of the old
+#   favorites.json, #1182, #1183) and G-SHELL-STABLE only.
 #   --smoke-only runs the merge queue's core desktop path only: panel
 #   readiness, G-PANEL, three app windows (G-WINDOWS), the overview
 #   (G-OV-OPEN, G-OV-PICK), locking over the open date menu and quick
@@ -651,6 +655,7 @@ SEARCH_LEAK_ONLY=0
 WINDOW_LEAK_ONLY=0
 DND_OVERVIEW_ONLY=0
 LOCK_MENU_ONLY=0
+APP_MENU_ONLY=0
 PANEL_DASH_ONLY=0
 SOUND_ALERTS_ONLY=0
 REMOTE_ACCESS_ONLY=0
@@ -702,6 +707,7 @@ while [ $# -gt 0 ]; do
         --search-leak-only) SEARCH_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --window-leak-only) WINDOW_LEAK_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --lock-menu-only) LOCK_MENU_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
+        --app-menu-only) APP_MENU_ONLY=1; only_mode "$1" source-build no-media-source no-examples; shift ;;
         --smoke-only) SMOKE_ONLY=1; only_mode "$1" no-media-source no-examples; shift ;;
         --folder-dnd-only) FOLDER_DND_ONLY=1; only_mode "$1" no-examples; shift ;;
         --panel-dash-only) PANEL_DASH_ONLY=1; only_mode "$1" source-build no-media-source no-examples no-camera-policy; shift ;;
@@ -774,11 +780,7 @@ export XDG_STATE_HOME XDG_DATA_HOME
 # Cursor themes (#342): the proof's own first, then the system's.
 XCURSOR_PATH="$XDG_DATA_HOME/icons:$HOME/.icons:/usr/share/icons:/usr/share/pixmaps"
 export XCURSOR_PATH
-# The dash shows only the proof's own windows: pin a favourite no
-# runner has, so the host's apps (GitHub's runners now ship Firefox,
-# which GNOME's default favourites name) never reach the a11y goldens.
-mkdir -p "$XDG_DATA_HOME/tuna-shell"
-echo '["org.tuna.ProofNoFavorite.desktop"]' >"$XDG_DATA_HOME/tuna-shell/favorites.json"
+# (The dash's favourites are set with the other settings below.)
 # Launch probe for overview search: only this journey has it, and its
 # Exec leaves a marker, proving search-to-launch end to end.
 PROBE_MARKER="$ARTIFACTS/probe-marker"
@@ -931,6 +933,9 @@ cleanup() {
     if [ -n "$INHIBITOR_PID" ]; then kill "$INHIBITOR_PID" 2>/dev/null || true; fi
     if [ -n "$PERMISSIONS_PID" ]; then kill "$PERMISSIONS_PID" 2>/dev/null || true; fi
     if [ -n "$DATEMENU_STUB_PID" ]; then kill "$DATEMENU_STUB_PID" 2>/dev/null || true; fi
+    if [ -n "${AM_PIDS:-}" ]; then
+        for am_pid in $AM_PIDS; do kill "$am_pid" 2>/dev/null || true; done
+    fi
     if [ -n "$SCROLL_PROBE_PID" ]; then kill "$SCROLL_PROBE_PID" 2>/dev/null || true; fi
     if [ -n "$SET_FONTS_PID" ]; then kill "$SET_FONTS_PID" 2>/dev/null || true; fi
     if [ -n "$HOT_CORNER_PID" ]; then kill "$HOT_CORNER_PID" 2>/dev/null || true; fi
@@ -1223,6 +1228,7 @@ pass G-GRID-ON-DEMAND "no grid tiles on the window picker or after close; a held
 . "$ROOT/scripts/lib/tuna-datemenu-proof.sh"
 . "$ROOT/scripts/lib/tuna-search-leak-proof.sh"
 . "$ROOT/scripts/lib/tuna-window-leak-proof.sh"
+. "$ROOT/scripts/lib/tuna-app-menu-proof.sh"
 . "$ROOT/scripts/lib/tuna-panel-dash-proof.sh"
 . "$ROOT/scripts/lib/tuna-sound-alerts-proof.sh"
 . "$ROOT/scripts/lib/tuna-dnd-overview-proof.sh"
@@ -1398,6 +1404,17 @@ if [ -f "$ARTIFACTS/schemas/org.tuna.fixture-keybindings.gschema.xml" ]; then
     glib-compile-schemas "$ARTIFACTS/schemas"
     GSETTINGS_SCHEMA_DIR="$ARTIFACTS/schemas"
     export GSETTINGS_SCHEMA_DIR
+fi
+# The dash shows only the proof's own windows: pin a favourite no
+# runner has, so the host's apps (GitHub's runners now ship Firefox,
+# which GNOME's default favourites name) never reach the a11y goldens.
+# `favorite-apps` is the dash's source; the shell only imports the old
+# pins file once, into a key still unset.
+if [ "$APP_MENU_ONLY" = 1 ]; then
+    # G-FAVORITES-IMPORT: the key stays unset and the old pins are seeded.
+    am_seed_legacy_favorites
+else
+    gsettings set org.gnome.shell favorite-apps "['org.tuna.ProofNoFavorite.desktop']"
 fi
 # Media settings are also exercised on lean hosts without gsd's schema.
 if ! gsettings list-schemas 2>/dev/null | grep -qx org.gnome.settings-daemon.plugins.media-keys; then
@@ -2685,6 +2702,19 @@ if [ "$A11Y_FOCUS_ONLY" = 1 ]; then
     a11y_focus_ring_proof
     if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_transient_stable_proof; fi
     if [ "$INSTALLED_PACKAGE" = 0 ]; then a11y_menu_restart_proof; fi
+    grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
+    shell_stable_gate
+    exit 0
+fi
+if [ "$APP_MENU_ONLY" = 1 ]; then
+    cstate '.active_workspace != null and .locked == false' "app menu desktop ready" ||
+        fail G-APP-MENU "desktop never became ready"
+    # Let the startup cover settle before the first overview.
+    sleep 3
+    favorites_import_proof
+    app_menu_proof
+    dash_pin_dnd_proof
+    favorites_live_proof
     grep -q panicked "$LOG" && fail G-NOPANIC "panic in nested log"
     shell_stable_gate
     exit 0

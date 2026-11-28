@@ -98,7 +98,9 @@ pub(crate) fn test_dispatch_guard() -> TestDispatchGuard {
 
 mod accessibility;
 mod anim_clock;
+mod app_favorites;
 mod app_integration;
+mod app_menu;
 mod audio_selection;
 mod audio_state;
 mod background_settings;
@@ -174,6 +176,7 @@ mod shell_dbus;
 mod shortcut_consent;
 mod sound_feedback;
 mod switcher;
+mod switcheroo;
 #[cfg(test)]
 mod test_settings;
 mod thunderbolt;
@@ -210,7 +213,6 @@ const A11Y_INTERFACE_SCHEMA: &str = "org.gnome.desktop.a11y.interface";
 const NOTIFICATIONS_SCHEMA: &str = "org.gnome.desktop.notifications";
 const COLOR_SCHEMA: &str = "org.gnome.settings-daemon.plugins.color";
 const SESSION_SCHEMA: &str = "org.gnome.desktop.session";
-const SHELL_SCHEMA: &str = "org.gnome.shell";
 const SCREENSAVER_SCHEMA: &str = "org.gnome.desktop.screensaver";
 
 fn release_version() -> &'static str {
@@ -545,6 +547,27 @@ impl overview::OverviewActions for ShellActions {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn window_title(&self, id: u64) -> String {
+        self.0
+            .borrow()
+            .control
+            .as_ref()
+            .and_then(|c| {
+                c.model()
+                    .windows()
+                    .iter()
+                    .find(|w| w.id == id)
+                    .map(|w| w.title.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    fn close_window(&self, id: u64) {
+        if let Some(control) = self.0.borrow_mut().control.as_mut() {
+            let _ = control.close_window(id);
+        }
     }
 
     fn set_app_grid(&self, active: bool) {
@@ -2917,36 +2940,32 @@ fn build(app: &adw::Application) {
     std::mem::forget(wall_clock);
 
     // Overview search, dash, and app grid (#54, #57).
-    let favorites = {
-        let pinned = tuna_shell_host::favorites::Favorites::system()
-            .ids()
-            .to_vec();
-        // Tuna Desktop's own pins first, then the user's GNOME dash
-        // (org.gnome.shell favorite-apps, #63), then GNOME's defaults.
-        let gnome: Vec<String> = settings(SHELL_SCHEMA)
-            .map(|s| {
-                s.strv("favorite-apps")
-                    .iter()
-                    .map(|v| v.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !pinned.is_empty() {
-            pinned
-        } else if !gnome.is_empty() {
-            gnome
-        } else {
-            logic::DEFAULT_FAVORITES
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect()
-        }
-    };
-    let dash_apps = favorites.clone();
+    let favorites = app_favorites::AppFavorites::new(apps.clone());
+    // appFavorites.js `_showNotification`: pinning and unpinning say so,
+    // with an Undo.
+    {
+        let notices = notify.clone();
+        favorites.set_notifier(Rc::new(move |summary, undo| {
+            let Some(id) = notices.post_with_actions(
+                "System",
+                "emblem-system-symbolic",
+                &summary,
+                "",
+                &[("undo".to_owned(), "Undo".to_owned())],
+                tuna_shell_host::notifications::Urgency::Normal,
+                None,
+            ) else {
+                return;
+            };
+            notices.on_notification_action(id, "undo", undo);
+        }));
+    }
+    let dash_favorites = favorites.clone();
     let overview_ui = overview::OverviewUi::new(
         app.upcast_ref(),
         apps.clone(),
         favorites,
+        switcheroo::Switcheroo::new(),
         Rc::new(ShellActions(shell.clone())),
     );
     let switcher_ui = switcher::SwitcherUi::new(app.upcast_ref(), apps.clone());
@@ -3325,7 +3344,7 @@ fn build(app: &adw::Application) {
                     }
                 };
                 let dash_entry = |n: u8| {
-                    let id = dash_apps.get(usize::from(n) - 1)?;
+                    let id = dash_favorites.ids().get(usize::from(n) - 1)?.clone();
                     let id = id.trim_end_matches(".desktop");
                     apps.get().entry(id).cloned()
                 };

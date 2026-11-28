@@ -227,6 +227,17 @@ This matches Mutter 51's initial-focus path:
 [attaching the drag handler immediately invalidates focus](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-input.c#L288-L325),
 and [drag focus sends the destination its offer while restricting source-less drags to the origin client](https://github.com/GNOME/mutter/blob/51.0/src/wayland/meta-wayland-data-device.c#L337-L397).
 
+`scripts/tuna-gtk-shell-proof --app-menu-only --artifacts DIR` runs
+G-FAVORITES-IMPORT, G-APP-MENU, G-DASH-PIN-DND and G-FAVORITES-LIVE (#1182,
+#1183): the old `tuna-shell/favorites.json` pins, seeded before the shell
+starts with `favorite-apps` unset, imported once into the key and shown in the
+dash; the app-icon
+menu from a right click, a long press and Shift+F10 or Menu (rows pressed
+through AT-SPI, GPU rows from a switcheroo-control stub on the private system
+bus, App Details from a GNOME Software stub), pinning by dragging from the
+grid, reordering and unpinning on Show Apps with real pointer drags, and
+`gsettings set favorite-apps` reaching the dash without a restart.
+
 The GTK proof's focused slices (`--*-only`) run one at a time. A new slice
 adds its usage line above `# end of --help` in the script's header (`--help`
 prints up to that line) and one case arm that calls `only_mode` with its flag
@@ -1191,8 +1202,10 @@ click and key is QEMU input.
 
 | ID | What it asserts |
 |---|---|
+| `V-XWAYLAND` | Runs first. No Xwayland process and no X11 readiness before any X11 client, with the X display already reserved; a `GDK_BACKEND=x11` GTK 4 app (the picker's X11 caller, unarmed) then starts Xwayland on demand, the session's systemd user environment publishes the reserved `DISPLAY`, and its X11 window maps, takes focus and receives a real key and click (`app-integration/xwayland.json`) |
 | `V-PICKER` | For an X11 (`GDK_BACKEND=x11`) and a native Wayland GTK 4 caller, each opening the installed GNOME FileChooser portal (Nautilus) through its own parent handle: the caller is allocated its requested 1100x700 (the X11 caller, with no title bar of its own, is framed by `tuna-x11-frames` and its managed rectangle is that size grown by the frame's `_NET_FRAME_EXTENTS`); for OpenFile and SaveFile, cancel (Escape) and accept (type-ahead and Enter), the dialog maps as the focused transient child of the caller, horizontally centred on it; a click on the exposed parent is blocked; the portal answers 1 with no URI or 0 with the chosen file (SaveFile's file is then written by the caller); focus returns to the caller and a real key and click reach it; an unrelated bystander app receives nothing |
 | `V-INTROSPECT-SCREEN` | A session-bus client subscribed to Introspect `PropertiesChanged` sees `ScreenSize` equal the union of Mutter `GetCurrentState` logical monitors initially (1280x800), after hotplugging a 1024x768 second head, after rotating it 90° through `ApplyMonitorsConfig`, and after unplugging it, with no notification that repeats an unchanged size |
+| `V-MULTI-OUTPUT` | During V-INTROSPECT-SCREEN's hotplug: with two outputs the compositor's snapshot shows GNOME 51's one top bar across the primary output and none on the new one (GNOME's `layout.js` keeps `panelBox` on the primary monitor); a GTK window fullscreened on the new output's connector (`tuna-vm-desktop-gates --window placed`) fills it; after the unplug it survives on the remaining output, which keeps the top bar (`app-integration/multi-output.json`) |
 | `V-INTROSPECT-SANDBOX` | After installing the local Flatpak, xdg-desktop-portal-gnome's `Background.GetAppState` omits an unsandboxed client claiming the app ID `org.tuna.VmSandbox`, reports the Flatpak-sandboxed one as running or active, and drops it after it exits |
 
 The artifact (`marlin-vm`) holds `serial.log`, `tuna-lines.log` (every
