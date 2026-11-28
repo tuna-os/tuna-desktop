@@ -8,16 +8,13 @@
 //! silent.
 //!
 //! Unlock authenticates only: on success the pending conversation is
-//! cancelled (nothing starts — this session is already running) and the
-//! compositor-owned flag clears, restoring the intact session on the next
-//! hub poll. Failures — bad credentials, authenticator errors, transport
-//! drops, endless prompts — all collapse to [`UnlockOutcome::Denied`],
-//! which carries no detail by construction. Secrets are never logged and
-//! authenticator text never surfaces.
-
-use crate::control::ControlHub;
-use crate::lock::SessionLock;
-use crate::overlay::Overlay;
+//! cancelled (nothing starts — this session is already running). Nothing
+//! here touches lock state: the runtime alone clears the lock, through
+//! `Runtime::apply_verified_unlock` and its epoch-checked grant. Failures
+//! — bad credentials, authenticator errors, transport drops, endless
+//! prompts — all collapse to [`UnlockOutcome::Denied`], which carries no
+//! detail by construction. Secrets are never logged and authenticator
+//! text never surfaces.
 
 /// Upper bound on authenticator prompt rounds per unlock attempt. An
 /// authenticator that keeps prompting (misconfiguration or abuse) denies
@@ -171,43 +168,6 @@ pub fn session_user() -> Option<String> {
             .to_str()
             .ok()
             .map(str::to_owned)
-    }
-}
-
-/// Apply one unlock attempt to the compositor-owned lock state: verify
-/// `password` for `user` through `client`, and on success clear the
-/// idle flag plus the hub mirror (the next poll restores the intact
-/// session) and drop the lock surface. Returns whether the session is
-/// unlocked afterwards.
-///
-/// An already-unlocked session returns true without contacting the
-/// authenticator — nothing is protected, so no credential is needed.
-/// Failures touch nothing: the flag, the hub mirror, and the surface
-/// stay exactly as they were, silently.
-pub fn unlock_session(
-    lock: &mut SessionLock,
-    hub: &ControlHub,
-    overlay: &mut Overlay,
-    now_ms: u64,
-    user: &str,
-    password: &str,
-    client: &mut impl UnlockClient,
-) -> bool {
-    if !lock.is_locked() && !hub.is_locked() {
-        return true;
-    }
-    if matches!(
-        attempt_unlock(client, user, password),
-        UnlockOutcome::Unlocked
-    ) {
-        // Restart the idle accumulator at now so the session does not
-        // relock on the next tick; the hub poll carries the restore.
-        lock.unlock(now_ms);
-        hub.set_locked(false);
-        overlay.hide();
-        true
-    } else {
-        false
     }
 }
 

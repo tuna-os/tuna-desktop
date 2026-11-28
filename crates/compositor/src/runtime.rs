@@ -4225,7 +4225,7 @@ impl Runtime {
         &mut self,
         directory: &std::path::Path,
     ) -> Vec<crate::screenshot::WindowShot> {
-        if self.is_locked() || std::fs::create_dir_all(directory).is_err() {
+        if self.is_locked() || crate::screenshot::private_directory(directory).is_err() {
             return Vec::new();
         }
         let size = self.state.primary_size();
