@@ -42,7 +42,7 @@
 
 use std::collections::BTreeSet;
 use std::os::fd::{AsFd, OwnedFd};
-use std::sync::{Arc, Mutex, Weak as ArcWeak};
+use std::sync::{Arc, Mutex, PoisonError, Weak as ArcWeak};
 
 use smithay::{
     backend::allocator::Fourcc,
@@ -241,7 +241,8 @@ pub(crate) fn damage_changed(surface: &WlSurface) {
                 .data_map
                 .get::<smithay::backend::egl::YuvConversionHint>()
             {
-                *hint.0.lock().unwrap() = yuv_conversion(coefficients);
+                *hint.0.lock().unwrap_or_else(PoisonError::into_inner) =
+                    yuv_conversion(coefficients);
             }
             if changed {
                 if let Some(renderer) =
@@ -249,7 +250,10 @@ pub(crate) fn damage_changed(surface: &WlSurface) {
                         .data_map
                         .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
                 {
-                    renderer.lock().unwrap().invalidate_buffer();
+                    renderer
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .invalidate_buffer();
                 }
             }
         },
@@ -307,7 +311,7 @@ fn with_objects<R>(surface: &WlSurface, f: impl FnOnce(&mut SurfaceObjects) -> R
         let objects = states
             .data_map
             .get_or_insert_threadsafe(SurfaceObjectsData::default);
-        let mut objects = objects.lock().unwrap();
+        let mut objects = objects.lock().unwrap_or_else(PoisonError::into_inner);
         f(&mut objects)
     })
 }
@@ -442,7 +446,7 @@ enum Description {
 
 impl ImageDescription {
     fn ready_state(&self) -> Option<Arc<ColorState>> {
-        match &*self.0.lock().unwrap() {
+        match &*self.0.lock().unwrap_or_else(PoisonError::into_inner) {
             Description::Ready { state, .. } => Some(state.clone()),
             _ => None,
         }
@@ -463,25 +467,19 @@ fn set_ready(
         let id = state.protocols.color.v1_id(&color);
         resource.ready(id);
     }
-    *resource
-        .data::<ImageDescription>()
-        .unwrap()
-        .0
-        .lock()
-        .unwrap() = Description::Ready {
-        state: color,
-        has_info,
-    };
+    if let Some(data) = resource.data::<ImageDescription>() {
+        *data.0.lock().unwrap_or_else(PoisonError::into_inner) = Description::Ready {
+            state: color,
+            has_info,
+        };
+    }
 }
 
 /// `meta_wayland_image_description_set_failed`.
 fn set_failed(resource: &WpImageDescriptionV1, cause: image_desc::Cause, message: &str) {
-    *resource
-        .data::<ImageDescription>()
-        .unwrap()
-        .0
-        .lock()
-        .unwrap() = Description::Failed;
+    if let Some(data) = resource.data::<ImageDescription>() {
+        *data.0.lock().unwrap_or_else(PoisonError::into_inner) = Description::Failed;
+    }
     resource.failed(cause, message.to_owned());
 }
 
@@ -786,7 +784,13 @@ impl State {
                 if states
                     .data_map
                     .get::<SurfaceObjectsData>()
-                    .is_some_and(|objects| objects.lock().unwrap().representation.is_some())
+                    .is_some_and(|objects| {
+                        objects
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .representation
+                            .is_some()
+                    })
                 {
                     represented.push(surface.clone());
                 }
@@ -860,7 +864,7 @@ fn has_feedback(surface: &WlSurface) -> bool {
             .is_some_and(|objects| {
                 objects
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(PoisonError::into_inner)
                     .feedback
                     .iter()
                     .any(Resource::is_alive)
@@ -1249,7 +1253,7 @@ impl Dispatch<WpImageDescriptionCreatorIccV1, IccCreator> for State {
                 offset,
                 length,
             } => {
-                let mut file = data.0.lock().unwrap();
+                let mut file = data.0.lock().unwrap_or_else(PoisonError::into_inner);
                 if file.is_some() {
                     resource.post_error(
                         creator_icc::Error::AlreadySet,
@@ -1264,7 +1268,7 @@ impl Dispatch<WpImageDescriptionCreatorIccV1, IccCreator> for State {
                 *file = Some((icc_profile, offset, length));
             }
             creator_icc::Request::Create { image_description } => {
-                let file = data.0.lock().unwrap().take();
+                let file = data.0.lock().unwrap_or_else(PoisonError::into_inner).take();
                 let object = init.init(image_description, ImageDescription::default());
                 let Some((fd, offset, length)) = file else {
                     resource.post_error(
@@ -1350,7 +1354,7 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsCreator> for State {
         init: &mut DataInit<'_, Self>,
     ) {
         use creator_params::Error as E;
-        let mut settings = data.0.lock().unwrap();
+        let mut settings = data.0.lock().unwrap_or_else(PoisonError::into_inner);
         match request {
             creator_params::Request::Create { image_description } => {
                 let object = init.init(image_description, ImageDescription::default());
@@ -1520,7 +1524,7 @@ impl Dispatch<WpImageDescriptionV1, ImageDescription> for State {
         init: &mut DataInit<'_, Self>,
     ) {
         if let image_desc::Request::GetInformation { information } = request {
-            let described = match &*data.0.lock().unwrap() {
+            let described = match &*data.0.lock().unwrap_or_else(PoisonError::into_inner) {
                 Description::Ready { state, has_info } => Some((state.clone(), *has_info)),
                 _ => None,
             };

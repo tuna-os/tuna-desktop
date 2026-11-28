@@ -409,7 +409,10 @@ impl ColorShare {
     /// A disconnected or replaced sink cannot keep controlling a new
     /// device which later happens to use its connector name.
     fn begin_monitor_update(&self, monitors: &[ColordMonitor], unchanged: &[&str]) -> u64 {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.monitor_generation = state.monitor_generation.wrapping_add(1);
         state.gamma_sizes = monitors
             .iter()

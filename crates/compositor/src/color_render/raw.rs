@@ -100,26 +100,22 @@ pub(super) fn raw_planes(
     renderer: &mut GlesRenderer,
     dmabuf: &Dmabuf,
 ) -> Result<Rc<RawPlanes>, GlesError> {
-    if !identity_ycbcr_supported(dmabuf) {
+    let Some((layout, planes, _)) =
+        raw_layout(dmabuf.format().code).filter(|_| identity_ycbcr_supported(dmabuf))
+    else {
         return Err(GlesError::UnsupportedPixelLayout);
-    }
-    renderer
-        .egl_context()
-        .user_data()
-        .insert_if_missing(RawCache::default);
+    };
     {
         let cache = renderer
             .egl_context()
             .user_data()
-            .get::<RawCache>()
-            .unwrap();
+            .get_or_insert(RawCache::default);
         let mut cache = cache.0.borrow_mut();
         cache.retain(|weak, _| weak.upgrade().is_some());
         if let Some(raw) = cache.get(&dmabuf.weak()) {
             return Ok(raw.clone());
         }
     }
-    let (layout, planes, _) = raw_layout(dmabuf.format().code).unwrap();
     let mut views = Vec::with_capacity(planes.len());
     let mut textures = Vec::with_capacity(planes.len());
     for &(index, format, hsub, vsub) in planes {
@@ -129,19 +125,18 @@ pub(super) fn raw_planes(
             Modifier::Linear,
             dmabuf.flags(),
         );
-        let fd = dmabuf
-            .handles()
-            .nth(index)
-            .unwrap()
+        let (Some(handle), Some(offset), Some(stride)) = (
+            dmabuf.handles().nth(index),
+            dmabuf.offsets().nth(index),
+            dmabuf.strides().nth(index),
+        ) else {
+            return Err(GlesError::UnsupportedPixelLayout);
+        };
+        let fd = handle
             .try_clone_to_owned()
             .map_err(|_| GlesError::UnsupportedPixelLayout)?;
-        view.add_plane(
-            fd,
-            0,
-            dmabuf.offsets().nth(index).unwrap(),
-            dmabuf.strides().nth(index).unwrap(),
-        );
-        let view = view.build().unwrap();
+        view.add_plane(fd, 0, offset, stride);
+        let view = view.build().ok_or(GlesError::UnsupportedPixelLayout)?;
         textures.push(renderer.import_dmabuf_raw(&view)?);
         views.push(view);
     }
@@ -153,8 +148,7 @@ pub(super) fn raw_planes(
     renderer
         .egl_context()
         .user_data()
-        .get::<RawCache>()
-        .unwrap()
+        .get_or_insert(RawCache::default)
         .0
         .borrow_mut()
         .insert(dmabuf.weak(), raw.clone());
