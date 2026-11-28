@@ -814,7 +814,14 @@ impl CandidatePopup {
                 match code {
                     // DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER / ALREADY_OWNER.
                     Ok(Some(1 | 4)) => {
-                        eprintln!("tuna-shell-gtk: IBus panel: owns {PANEL_NAME} on the IBus bus");
+                        // One write: eprintln! writes each format piece
+                        // separately, and the IBus bridge shares this
+                        // stderr, so its lines could split the proof's
+                        // marker (journey run 40988329984).
+                        let line = format!(
+                            "tuna-shell-gtk: IBus panel: owns {PANEL_NAME} on the IBus bus\n"
+                        );
+                        eprint!("{line}");
                     }
                     Ok(code) => {
                         eprintln!("tuna-shell-gtk: IBus panel: {PANEL_NAME} not owned ({code:?})")

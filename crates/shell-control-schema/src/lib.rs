@@ -253,14 +253,17 @@ impl ProtocolVersion {
     /// postcard peers must ship together.
     /// `0.56` appends GNOME's per-class `custom-accel-config` curves and the
     /// touchpad `disable-while-typing-timeout` to InputSettings (#343).
+    /// `0.61` (provisional: 0.57-0.60 are reserved for other open
+    /// changes) appends GNOME's bottom-edge OSK drag: compositor-to-shell
+    /// `OskGesture` (`ShellEdgeDragGesture` progress, activate, cancel).
     /// Positional postcard peers must ship together.
-    /// `0.57` appends text-input-v3 version 2's input-panel OFF request:
+    /// `0.62` appends text-input-v3 version 2's input-panel OFF request:
     /// compositor-to-shell `HideInputPanel`, sent after the
     /// `OnScreenKeyboard` update it belongs to. Positional postcard peers
     /// must ship together.
     pub const CURRENT: Self = Self {
         major: 0,
-        minor: 57,
+        minor: 62,
     };
 
     /// Build a version explicitly (handy for `Hello` probes in tests).
@@ -1332,12 +1335,16 @@ pub enum Message {
     /// each handshake while any is active, only to peers advertising
     /// minor >= 54. At most [`MAX_REMOTE_ACCESS_HANDLES`].
     RemoteAccess { handles: Vec<RemoteAccessHandle> },
-    /// Since 0.57: the focused text input asked to hide the input panel
+    /// Since 0.61: the touchscreen bottom-edge drag (gnome-shell's
+    /// `KeyboardManager` bottom drag gesture) progressed, completed or
+    /// was cancelled. Sent only to peers advertising minor >= 61.
+    OskGesture { phase: OskGesturePhase },
+    /// Since 0.62: the focused text input asked to hide the input panel
     /// (text-input-v3 version 2 `hide_input_panel`; mutter's
     /// `clutter_input_focus_set_input_panel_state (OFF)`). Follows the
     /// `OnScreenKeyboard` update it belongs to; GNOME's keyboard closes at
     /// once (`_onKeyboardStateChanged`). Sent only to peers advertising
-    /// minor >= 57.
+    /// minor >= 62.
     HideInputPanel,
 }
 
@@ -1357,6 +1364,21 @@ pub const MAX_OVERVIEW_STATE: u32 = 2 * OVERVIEW_STATE_SCALE;
 /// The longest [`Message::OverviewSwipe`] settle: a minute, far past
 /// GNOME's swipe ceiling times any sane slow-down factor.
 pub const MAX_OVERVIEW_SETTLE_US: u32 = 60_000_000;
+
+/// A phase of the bottom-edge OSK drag (`ShellEdgeDragGesture`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum OskGesturePhase {
+    /// `progress`: vertical distance in logical pixels from the begin point.
+    Progress { distance: f64 },
+    /// `end`: dragged past the threshold; open the keyboard.
+    Activate,
+    /// `cancel`: the drag ended early.
+    Cancel,
+}
+
+// `Message` is `Eq`; decoding rejects a non-finite `distance` as
+// malformed, so reflexivity holds for every decoded message.
+impl Eq for OskGesturePhase {}
 
 /// The click a hover (dwell) makes: GNOME's dwell click types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2648,6 +2670,12 @@ fn validate_titles(msg: &Message) -> Result<(), DecodeError> {
                 }
             }
         }
+        Message::OskGesture {
+            phase: OskGesturePhase::Progress { distance },
+        } if !distance.is_finite() => {
+            return Err(DecodeError::Malformed(postcard::Error::SerdeDeCustom));
+        }
+        Message::OskGesture { .. } => {}
     }
     Ok(())
 }
@@ -2948,11 +2976,11 @@ mod tests {
     }
 
     #[test]
-    fn current_version_is_0_57() {
-        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 57));
-        // A 0.56 shell still negotiates; a newer minor does not.
-        assert!(ProtocolVersion::new(0, 56).is_compatible_with(&CURRENT_VERSION));
-        assert!(!ProtocolVersion::new(0, 58).is_compatible_with(&CURRENT_VERSION));
+    fn current_version_is_0_62() {
+        assert_eq!(CURRENT_VERSION, ProtocolVersion::new(0, 62));
+        // A 0.61 shell still negotiates; a newer minor does not.
+        assert!(ProtocolVersion::new(0, 61).is_compatible_with(&CURRENT_VERSION));
+        assert!(!ProtocolVersion::new(0, 63).is_compatible_with(&CURRENT_VERSION));
     }
 
     fn remote_access_handle(targets: Vec<RemoteAccessTarget>) -> RemoteAccessHandle {
@@ -4189,6 +4217,34 @@ mod on_screen_keyboard_wire_tests {
     }
 
     #[test]
+    fn osk_gesture_roundtrips_and_sits_last() {
+        for phase in [
+            OskGesturePhase::Progress { distance: 42.5 },
+            OskGesturePhase::Activate,
+            OskGesturePhase::Cancel,
+        ] {
+            let message = Message::OskGesture { phase };
+            assert_eq!(decode_frame(&encode_frame(&message)).unwrap(), message);
+        }
+        let nan = Message::OskGesture {
+            phase: OskGesturePhase::Progress { distance: f64::NAN },
+        };
+        assert!(matches!(
+            decode_frame(&encode_frame(&nan)),
+            Err(DecodeError::Malformed(_))
+        ));
+        let index = |message: &Message| encode_frame(message)[4];
+        assert_eq!(
+            index(&Message::OskGesture {
+                phase: OskGesturePhase::Cancel,
+            }),
+            index(&Message::RemoteAccess {
+                handles: Vec::new(),
+            }) + 1
+        );
+    }
+
+    #[test]
     fn osk_commit_decode_rejects_oversized_text_and_modifiers() {
         for input in [
             OskInput::Commit {
@@ -4734,18 +4790,13 @@ mod input_panel_wire_tests {
     use super::*;
 
     #[test]
-    fn hide_input_panel_follows_the_0_54_remote_access_and_round_trips() {
-        let mut buffer = [0_u8; 64];
-        let remote = postcard::to_slice(
-            &Message::RemoteAccess {
-                handles: Vec::new(),
-            },
-            &mut buffer,
-        )
-        .unwrap()[0];
+    fn hide_input_panel_follows_the_0_61_osk_gesture_and_round_trips() {
+        let gesture = encode_frame(&Message::OskGesture {
+            phase: OskGesturePhase::Cancel,
+        })[4];
         let frame = encode_frame(&Message::HideInputPanel);
         // A bare variant tag after the length prefix: nothing else rides.
-        assert_eq!(&frame[4..], &[remote + 1]);
+        assert_eq!(&frame[4..], &[gesture + 1]);
         assert_eq!(decode_frame(&frame).unwrap(), Message::HideInputPanel);
         // The 0.43 update keeps its positional shape for older shells.
         let update = Message::OnScreenKeyboard {

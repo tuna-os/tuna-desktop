@@ -174,6 +174,15 @@ class Selection(unittest.TestCase):
         self.assertNotIn("hotplug", pr("crates/compositor/src/lib.rs", run=0))
         self.assertIn("hotplug", m.ROTATION)
 
+    def test_touch_fixtures_run_drm_smoke_without_rotation(self):
+        # P-DS-04's emulated devices and settings are D-TOUCH/D-ORIENT's
+        # alone: an edit runs that lane, not gtk-shell plus a rotation.
+        for path in ("scripts/lib/tuna-uinput-touchscreen.py", "scripts/lib/tuna-touch-client.py",
+                     "scripts/lib/tuna-mock-sensor-proxy.py",
+                     "tests/settings/gnome51-peripherals-touchscreen.gschema.xml"):
+            for run in range(len(m.ROTATION)):
+                self.assertEqual(pr(path, run=run), ["drm-smoke"], (path, run))
+
     def test_protocol_gate_inputs_run_the_gtk_shell_proof(self):
         # The Mutter 51 protocol gates (--protocols-only) and G-WAYLAND-INFO
         # run in the gtk-shell job: their client and references select it.

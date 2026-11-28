@@ -47,10 +47,11 @@ use tuna_shell_control::{
 
 use super::libinput::libinput_symbol;
 use super::libwacom::{Libwacom, WacomInfo};
+use crate::input_mapper::{stage_size, InputIdentity, Monitor};
 use crate::tablet::{
     map_tool_button, stylus_pressure, stylus_settings_path, tablet_settings_path, ButtonAction,
-    DeviceMapping, EraserButtonMode, Mapping, Monitor, PressureCurve, StylusSettings, TabletEvent,
-    TabletIdentity, TabletSettings, ToolAxes, ToolButton, BTN_STYLUS3,
+    DeviceMapping, EraserButtonMode, Mapping, PressureCurve, StylusSettings, TabletEvent,
+    TabletSettings, ToolAxes, ToolButton, BTN_STYLUS3,
 };
 use crate::tablet_actions::{
     cycle_monitor, feature_directions, feature_label, group_switch_osd, mode_switch_label,
@@ -78,7 +79,7 @@ struct CurrentTool {
 struct TabletDevice {
     device: li::Device,
     desc: TabletDescriptor,
-    identity: TabletIdentity,
+    identity: InputIdentity,
     vendor: u32,
     product: u32,
     path: String,
@@ -344,7 +345,7 @@ impl Tablets {
             let desc = TabletDescriptor::from(device);
             let mut tablet = TabletDevice {
                 device: device.clone(),
-                identity: TabletIdentity {
+                identity: InputIdentity {
                     name: device.name().to_owned(),
                     size_mm: device.size(),
                 },
@@ -352,7 +353,7 @@ impl Tablets {
                 vendor,
                 product,
                 mapping: DeviceMapping::new(
-                    &TabletIdentity {
+                    &InputIdentity {
                         name: device.name().to_owned(),
                         size_mm: device.size(),
                     },
@@ -574,7 +575,7 @@ impl Tablets {
         relative: bool,
         monitors: &[Monitor],
     ) -> Point<f64, Logical> {
-        let stage = crate::tablet::stage_size(monitors);
+        let stage = stage_size(monitors);
         if stage.0 <= 0.0 || stage.1 <= 0.0 {
             return tablet.pos;
         }
@@ -1196,7 +1197,7 @@ impl Tablets {
                 "libwacom": t.wacom.as_ref().map(|w| &w.name),
                 "mapping": format!("{:?}", t.mapping.mode).to_lowercase(),
                 "output": t.mapped_to,
-                "keep_aspect_ratio": t.mapping.output_ratio,
+                "keep_aspect_ratio": t.mapping.absolute.output_ratio,
                 "area": t.applied.as_ref().map(|s| s.area.clone()),
                 "left_handed": t.applied.as_ref().map(|s| s.left_handed),
                 "calibration": t.device.config_calibration_matrix(),

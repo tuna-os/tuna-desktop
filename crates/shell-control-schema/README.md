@@ -89,7 +89,7 @@ before decoding.
   the locked, blanked screen when a notification reaches the lock screen's
   list (screenShield.js `_wakeUpScreen`); it is `Denied` while unlocked,
   never unlocks and does not count as user activity.
-- Input-panel OFF (0.57): `Message::HideInputPanel` (peers >=57 only)
+- Input-panel OFF (0.62): `Message::HideInputPanel` (peers >=62 only)
   follows the `OnScreenKeyboard` update of a text-input-v3 version 2
   client's `hide_input_panel`, so the shell's keyboard closes at once.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
