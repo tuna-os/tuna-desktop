@@ -231,7 +231,9 @@ def _characters(desktop):
     prior = desktop.clipboard()
     desktop.keys("ctrl", "f")
     replace_field(desktop, actor, "tuna-no-unicode-result-" + desktop.nonce)
-    evidence["negative"] = content(desktop, actor, "characters-negative-search", "No Results", "Try a different search.")
+    # Characters 51 renders its empty-search status page as "No Results" /
+    # "Try a different search", with no trailing period (run 46102176916).
+    evidence["negative"] = content(desktop, actor, "characters-negative-search", "No Results", "Try a different search")
     require(desktop.clipboard()["base64"] == prior["base64"], "negative Characters search changed actual clipboard")
     search = field(desktop, actor)
     evidence["ime"] = desktop.ime(actor, search["name"], field_path=search["path"])
