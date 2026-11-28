@@ -167,7 +167,7 @@ start. They have no effect on an installed session.
 | `TUNA_MEDIA_FIXTURE_ROOT`, `TUNA_MEDIA_BARRIER_HELPER` | Fixture directory and helper script for `scripts/tuna-media-completion-proof`. | `crates/shell-gtk/src/media_keys.rs:537`, `crates/shell-gtk/src/media_keys.rs:662` |
 | `TUNA_NATIVE_NODE`, `TUNA_NATIVE_SERIAL`, `TUNA_NATIVE_COOKIE`, `TUNA_NATIVE_MUTED`, `TUNA_NATIVE_EXPECTED` | Inputs to the PipeWire privacy test's child process. | `crates/shell-gtk/src/privacy.rs:1725-1730` |
 | `TUNA_A11Y_TEST_SCHEMA_DIR`, `TUNA_A11Y_RECEIPT` | Schema fixture and receipt file for `scripts/tuna-gtk-accessibility-proof`. | `crates/shell-gtk/src/accessibility.rs:381`, `crates/shell-gtk/src/accessibility.rs:439` |
-| `TUNA_SCREENSHOT_LIFECYCLE_RECEIPT` | Receipt file the screenshot UI test writes when it passes. | `crates/shell-gtk/src/screenshot_ui.rs:1141-1146` |
+| `TUNA_SCREENSHOT_LIFECYCLE_RECEIPT` | Receipt file the screenshot UI test writes when it passes. | `crates/shell-gtk/src/screenshot_ui.rs:1657-1663` |
 | `TUNA_XIM_PROBE_OWNER_FIXTURE`, `TUNA_XIM_PROBE_PID_FILE` | IBus XIM ownership test fixture. | `crates/compositor/src/ime.rs:391-402` |
 | `GSETTINGS_BACKEND` | Two shell tests check for `memory`. | `crates/shell-gtk/src/accessibility.rs:286`, `crates/shell-gtk/src/lockdown.rs:499` |
 | `DBUS_SESSION_BUS_ADDRESS`, `WAYLAND_DISPLAY`, `WAYLAND_SOCKET` | The admitted GTK tests check that they run on a private session bus and X display, with no Wayland connection. | `crates/shell-gtk/src/notify.rs:1892-1895`, `crates/shell-gtk/src/osd.rs:400-405` |
