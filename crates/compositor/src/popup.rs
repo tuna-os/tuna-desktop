@@ -110,7 +110,11 @@ pub fn placed_subsurfaces(
         states
             .data_map
             .get::<RendererSurfaceStateUserData>()
-            .and_then(|data| data.lock().unwrap().view())
+            .and_then(|data| {
+                data.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .view()
+            })
     };
     let mut placed = Vec::new();
     with_surface_tree_downward(
