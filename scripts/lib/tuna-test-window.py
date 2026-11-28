@@ -108,8 +108,14 @@ def build(loop):
         GLib.timeout_add(1500, lambda: menu.popup() or False)
 
 
-# Distinct app ids let journeys target each window (xdg_toplevel app_id).
-GLib.set_prgname(os.environ.get("TUNA_TEST_APP_ID") or "tuna-test-" + TITLE.lower())
+# Distinct app ids let journeys target each window (xdg_toplevel app_id);
+# TUNA_TEST_APP_ID or TUNA_TEST_PRGNAME gives several windows (distinct
+# titles) one app.
+GLib.set_prgname(
+    os.environ.get("TUNA_TEST_APP_ID")
+    or os.environ.get("TUNA_TEST_PRGNAME")
+    or "tuna-test-" + TITLE.lower()
+)
 Adw.init()
 main_loop = GLib.MainLoop()
 build(main_loop)

@@ -47,10 +47,27 @@ source-only floor is never described as a measured native version.
 **Golden test.** `crates/compositor/tests/protocols.rs` asserts the exact
 list and versions an ordinary client sees (`EXPECTED`), that the
 supervised shell's connection sees exactly that plus `SHELL_ONLY`
-(layer-shell, the foreign toplevel list), and that a client inside a
-`wp_security_context_v1` sees `EXPECTED` less `SANDBOX_HIDDEN` (session
-lock, security context). Adding or dropping a protocol updates the test
-and this page together.
+(layer-shell, the foreign toplevel list), that the compositor's own IBus
+bridge connection sees exactly `EXPECTED` plus `IME_BRIDGE_ONLY`
+(input-method, virtual keyboard, `tuna_osk_input_v1`), and that a client
+inside a `wp_security_context_v1` sees `EXPECTED` less `SANDBOX_HIDDEN`
+(session lock, security context) and none of the shell's or the bridge's
+globals. Adding or dropping a protocol updates the test and this page
+together.
+
+The compositor additionally advertises `tuna_osk_input_v1` version 1 only to
+its supervised IBus bridge, never ordinary clients. This private virtual-text
+transport shares the bridge's input-method-v2 event order and owner-checked
+done epoch; stale fallback replies cannot type into a new field or the locked
+session. It does not extend the public shell control schema or grant virtual
+keyboard access to another client (`crates/compositor/src/osk_ime.rs`,
+`crates/compositor/protocols/tuna-osk-input-v1.xml`). Its filter is the one
+every privileged global shares (`ClientState::privileged` on the bridge
+flag), so a client inside a security context is refused it whatever else it
+is. The ordinary-client global golden therefore remains unchanged and the
+global is listed in `IME_BRIDGE_ONLY`; real socket tests additionally reject
+a guessed private-global bind from an ordinary client and from a client
+inside a security context (`crates/compositor/src/osk_ime_tests.rs`).
 
 ## Advertised by Tuna Desktop
 
@@ -94,7 +111,7 @@ and this page together.
 | wl_fixes | 1 | `destroy_registry` destroys the registry as Mutter does: the client's id is freed and that registry hears no more globals |
 | ext_background_effect_manager_v1 | 1 | capabilities `blur` at bind; one effect object per surface (`background_effect_exists`), `set_blur_region` double-buffered on commit, NULL removes it, `surface_destroyed` once the surface is gone; destroying the object unsets the region on the next commit (meta-wayland-background-effect.c). Drawn as Mutter 51's meta-background-effect.c and clutter-blur.c: the scene beneath the surface, clipped to the surface and its region, blurred (separable gaussian, sigma = radius / 2, radius 24 logical px times the surface's scale, downscaled by powers of two while sigma > 6 and both sides > 256 px), saturation 1.25 and 0.015 grain, at the surface's opacity, under its content; a repaint touching the sample area (region + 2 × radius) repaints all of it, and windows beneath an opaque blurred window still draw there. Not applied to overview previews or Alt+Tab thumbnails (Mutter also blurs behind clones) |
 | wp_drm_lease_device_v1 | 1 | native DRM backend only, as Mutter (`meta-wayland-drm-lease.c`): one global for the session's DRM device, advertised even with nothing to lease; absent nested and headless, so the golden list does not include it. A connected connector is for lease when the kernel marks it `non-desktop` (VR headsets) or `TUNA_DEBUG_LEASE_CONNECTORS` names it (Mutter's `MUTTER_DEBUG_LEASE_CONNECTORS`: colon-separated connector names; the `MUTTER_` name is not read, so a value set for GNOME cannot take a monitor off Tuna Desktop). Such a connector is never a desktop output; when every connected connector is for lease the session starts with no monitor, as Mutter runs. A lease takes per connector a CRTC no desktop output or other lease uses, its primary plane and, when there is one, its cursor plane, else `finished` (`meta-drm-lease.c` `find_resources_to_lease`); leased connectors are withdrawn and offered again when the client destroys the lease or closes the lease fd (the kernel's lease uevent; `update_leases`). Connector hotplug (udev change events) offers and withdraws connectors for lease, ending a lease whose connector went away (`update_connectors`); desktop outputs still do not follow hotplug, and vkms cannot hotplug, so no proof covers this path. A VT switch withdraws every connector and ends every lease, and activation offers them again. Clients get a non-master fd the compositor opens on the card itself, as Mutter does (the session user needs logind's uaccess ACL on the card); a binding that cannot get one stays pending without events until the session is next activated (Mutter's pending resources). Mutter's monitors.xml `for-lease` option and lease devices for a second GPU are not implemented. Vendored Smithay changes: `third-party/smithay/DRM-LEASE-PATCH.diff`. drm-smoke D-LEASE proves advertisement, the empty case and real leases on vkms; leasing to a real headset is hardware-only |
-| wp_security_context_manager_v1 | 1 | a sandbox engine (Flatpak) creates a listener; every client accepted on it joins the display tagged with the context (sandbox engine, app id, instance id: `ClientState::security_context`) until the engine closes the context's close fd. Such a client is refused every privileged global whatever else it is (layer-shell, the foreign toplevel list, input-method, virtual keyboard, `mutter_x11_interop`: `ClientState::privileged`), does not see the session lock, and does not see this manager, so it cannot nest. The published `sandboxed-app-id` stays the one read from the live peer, not the engine's claim (#1046) |
+| wp_security_context_manager_v1 | 1 | a sandbox engine (Flatpak) creates a listener; every client accepted on it joins the display tagged with the context (sandbox engine, app id, instance id: `ClientState::security_context`) until the engine closes the context's close fd. Such a client is refused every privileged global whatever else it is (layer-shell, the foreign toplevel list, input-method, virtual keyboard, `tuna_osk_input_v1`, `mutter_x11_interop`: `ClientState::privileged`), does not see the session lock, and does not see this manager, so it cannot nest. The published `sandboxed-app-id` stays the one read from the live peer, not the engine's claim (#1046) |
 | ext_idle_notifier_v1 | 2 | idle and resumed from the clock org.gnome.Mutter.IdleMonitor keeps: every timestamped input event restarts it, and the notifications are checked on the same loop tick and deadline. `get_idle_notification` honours the idle inhibitors the idle lock honours (zwp_idle_inhibitor_v1 and org.gnome.SessionManager's idle flag): it never idles while one is held, an idle one resumes when one appears, and its timeout restarts when the last goes. `get_input_idle_notification` counts input alone (`crates/compositor/src/idle_notify.rs`, #1046) |
 | wp_content_type_manager_v1 | 1 | the hint is kept per surface and applied on commit (`protocols::surface_content_type`); recorded for future VRR and frame scheduling, nothing acts on it yet (#1046) |
 | ext_foreign_toplevel_list_v1 | 1 | the supervised shell's alone, like layer-shell: window titles and app ids are published only to the shell and the portal picker (`docs/security-model.md`), so every other registry omits it and a blind bind is a protocol error. A handle per window in the window model, native and X11 alike, with its title and app id (empty when unknown), updated when either changes and `closed` when the window unmaps (#1046) |
