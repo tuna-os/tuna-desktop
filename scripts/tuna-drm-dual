@@ -26,6 +26,12 @@ the compositor's state document:
                     false both hide; a window dragged from B onto A lands on
                     the active workspace (P-WM-08, mutter
                     meta_window_on_all_workspaces_changed)
+  D-WORKSPACE-SLIDE-MULTI with the pointer on B, Super+Page_Down slides A
+                    alone: A's CRTC flips through the slide while B's keeps
+                    its framebuffer (kernel readback, drm_kms_readback.py
+                    --sample), the slide crosses A's width plus GNOME's
+                    spacing, and the popup stays on A; with an animating
+                    client on B, B's flip rate holds while A slides (P-AN-05)
   D-SCALE-MIXED     monitors.xml gives A a fractional scale and B scale 2; a
                     GTK window dragged to span both gets B's scale when it
                     overlaps B most and A's when it overlaps A most, over
@@ -680,6 +686,85 @@ def run(args):
                f"workspaces only on the primary: Super+Page_Down hid {A}'s window and kept {B}'s shown "
                f"(frames in 3 s {sticky_rates}); on every output both hid ({every_rates}); a window carried "
                f"from {B} onto {A} stayed on the workspace it was carried on")
+
+        # D-WORKSPACE-SLIDE-MULTI: a key switch slides the primary alone,
+        # with the kernel's page flips per CRTC as the frame clock.
+        gate[0] = "D-WORKSPACE-SLIDE-MULTI"
+        start_session("slide")
+        slide_outputs = dual.outputs(state())
+        primary_w = slide_outputs[A]["rect"][2]
+        union_w = max(o["rect"][0] + o["rect"][2] for o in slide_outputs.values())
+        open_client("Q", A)
+        rect_b = slide_outputs[B]["rect"]
+        # The pointer on B's bare wallpaper: GNOME still slides the primary
+        # and shows the popup there.
+        point_to(rect_b[0] + rect_b[2] * 0.8, rect_b[1] + rect_b[3] * 0.8, 10)
+        time.sleep(1)
+
+        def sampled_switch(keys, label, seconds, lead):
+            """Sample every CRTC's framebuffer while `keys` switch
+            workspace; also the compositor's in-flight slide and every
+            state showing the popup."""
+            sampler = subprocess.Popen(
+                ["sudo", sys.executable, str(ROOT / "scripts/lib/drm_kms_readback.py"),
+                 "--sample", str(seconds), "4", current["card"]],
+                stdout=subprocess.PIPE, stderr=(out / f"kms-sample-{label}.log").open("w"), text=True)
+            time.sleep(lead)
+            before = state()["active_workspace"]
+            press = time.monotonic()
+            send(f"tap {keys}")
+            in_flight, popup_states = [], []
+            while time.monotonic() < press + 1.0:
+                s = state()
+                flight = s.get("workspace_slide", {}).get("in_flight")
+                if flight:
+                    in_flight.append(flight)
+                if any(layer.get("namespace") == "tuna-workspace-popup" for layer in s.get("layers", [])):
+                    popup_states.append(s)
+                time.sleep(0.005)
+            text, _ = sampler.communicate(timeout=seconds + 15)
+            if sampler.returncode != 0:
+                raise GateFailure(f"{label}: the KMS sampler failed; see kms-sample-{label}.log")
+            (out / f"kms-sample-{label}.json").write_text(text)
+            (out / f"slide-{label}.json").write_text(json.dumps(in_flight))
+            wait_for(f"{label}: the workspace changes and the slide ends",
+                     lambda: (s := state()).get("active_workspace") != before
+                     and s.get("workspace_slide", {}).get("in_flight") is None, 10)
+            return press, json.loads(text), in_flight, popup_states
+
+        press, sampled, in_flight, popup_states = sampled_switch(
+            "KEY_LEFTMETA+KEY_PAGEDOWN", "idle-secondary", 2.5, 1.0)
+        problems = dual.check_slide_only_on(sampled, A, B, press, 5)
+        problems += dual.check_slide_distance(in_flight, primary_w, union_w)
+        if not popup_states:
+            problems.append("no state showed the workspace switcher popup")
+        for s in popup_states:
+            problems += dual.check_popup_on(s, A)
+        if problems:
+            raise GateFailure("pointer on the secondary, B idle: " + "; ".join(dict.fromkeys(problems)))
+        slid = dual.flips(sampled, A, press, press + 1.0)
+        distance = round(sum(dual.slide_distances(in_flight)) / len(dual.slide_distances(in_flight)))
+        switch("KEY_LEFTMETA+KEY_PAGEUP", "back home")
+        # B busy: an animating client there (on every workspace) must
+        # keep its frame clock while A slides.
+        open_client("R", B)
+        time.sleep(1)
+        press, sampled, in_flight, _ = sampled_switch(
+            "KEY_LEFTMETA+KEY_PAGEDOWN", "busy-secondary", 3.5, 1.8)
+        problems, before, during = dual.check_no_stall(sampled, B, press, (press - 1.15, press - 0.05))
+        busy_slid = dual.flips(sampled, A, press, press + 1.0)
+        if busy_slid < 5:
+            problems.append(f"{A} flipped {busy_slid} times while {B} was busy (< 5)")
+        if problems:
+            raise GateFailure("B busy: " + "; ".join(problems))
+        switch("KEY_LEFTMETA+KEY_PAGEUP", "back home again")
+        close_clients()
+        stop_session()
+        record("D-WORKSPACE-SLIDE-MULTI", True,
+               f"Super+Page_Down with the pointer on {B}: {A} flipped {slid} times in 1 s while {B}'s CRTC kept "
+               f"its framebuffer (kernel readback), the slide crossed {distance} px ({A} {primary_w} + "
+               f"{dual.SLIDE_SPACING}, desktop {union_w}), the popup stayed on {A}; with an animating client on "
+               f"{B} it kept {during:.0f} flips/s ({before:.0f} before) while {A} slid ({busy_slid} flips)")
 
         # D-SCALE-MIXED: a fractional and an integer output side by side.
         gate[0] = "D-SCALE-MIXED"

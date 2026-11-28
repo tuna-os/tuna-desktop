@@ -804,7 +804,7 @@ drop mid-bracket. The bracket checks themselves are unchanged.
 | `gtk-shell` | `scripts/tuna-slow-portal-proof --artifacts gtk-shell-artifacts/slow-portal` | as above | On a dbus-daemon bus whose portal activation hangs, the shell owns `org.gnome.Shell` within 15 s (40 s on GTK before 4.17, whose GtkApplication always waits on the inhibit portal) and makes no GDK portal call; writes `assertions.txt` |
 | `gtk-shell-smoke` | `TUNA_REQUIRE_PAM_WRAPPER=1 scripts/tuna-gtk-shell-proof --smoke-only --artifacts gtk-shell-smoke-artifacts` | as for `gtk-shell` | The merge queue's battery: bar, app windows, overview, lock and unlock through PAM; writes `assertions.txt` |
 | `drm-smoke` | `scripts/tuna-drm-smoke --artifacts drm-smoke-artifacts` | `seatd jq ffmpeg kmod python3-evdev python3-gi gir1.2-gtk-4.0 gsettings-desktop-schemas acl`; run `scripts/ci-install-vkms` after `apt-get update` to ensure vkms for the running kernel | Hardware backend on the vkms virtual KMS device; needs `sudo` for `modprobe`, seatd, uinput and the card's seat ACL (`setfacl`, which a logind seat session would grant; the DRM lease device opens its own non-master fd) |
-| `drm-smoke` | `scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt` | as above; Linux 6.19 or newer for vkms configfs (the job pins `ubuntu-26.04`) | Two connectors of a vkms configfs device: mirroring, disabling and kept layouts, workspaces on the primary only, mixed fractional/integer scale; appends to drm-smoke's `assertions.txt` |
+| `drm-smoke` | `scripts/tuna-drm-dual --artifacts drm-smoke-artifacts/dual --assertions drm-smoke-artifacts/assertions.txt` | as above; Linux 6.19 or newer for vkms configfs (the job pins `ubuntu-26.04`) | Two connectors of a vkms configfs device: mirroring, disabling and kept layouts, workspaces on the primary only, the workspace slide per monitor, mixed fractional/integer scale; appends to drm-smoke's `assertions.txt` |
 | `hotplug` | `scripts/tuna-hotplug-stress --rounds 4 --out hotplug-artifacts` | as for `drm-smoke`, plus `libpam-wrapper colord pipewire wireplumber gstreamer1.0-pipewire gstreamer1.0-tools xdg-desktop-portal-gnome`; Linux 6.19+ for vkms configfs (the job pins `ubuntu-26.04`) | Connector hotplug on vkms: outputs, window re-homing, a full unplug, lock, colord and screencast gates (see [Output hotplug storm](#output-hotplug-storm)); writes `assertions.txt` |
 
 The `desktop-proofs` app content and scroll-mode strip proofs download
@@ -1078,6 +1078,15 @@ old behaviour produces:
   a hidden one at most 3/s against the compositor's 995 ms hidden-frame
   interval) are counted from the clients' heartbeats over 3 s starting
   1.5 s after each switch ends, past the callbacks owed from the slide;
+- `D-WORKSPACE-SLIDE-MULTI` (P-AN-05): with the pointer on B,
+  Super+Page_Down slides A alone. `drm_kms_readback.py --sample` reads
+  each CRTC's scanned-out framebuffer every 4 ms, so page flips are the
+  kernel's frame clock: A flips through the slide while B keeps its
+  framebuffer (nothing repainted or bled onto it), the compositor's
+  in-flight slide crosses A's width plus GNOME's 100 px spacing rather
+  than the whole desktop, and the switcher popup stays on A, the
+  primary. With an animating GTK client on B, B's flip rate during A's
+  slide stays at least 80 percent of its rate before it;
 - `D-SCALE-MIXED` (P-SY-03): a GNOME `monitors.xml` gives A a fractional
   scale and B scale 2 in the smallest mode Mutter allows both in; a GTK
   window Alt-dragged to span them gets B's scale over
