@@ -628,9 +628,12 @@ jobs:
       # D-TABLET and D-TOUCHPAD-SWIPE: python3-evdev drives the uinput
       # tablet and clickpad, the GTK 4 clients need PyGObject, the GTK
       # shell links gtk4-layer-shell, and gsettings-desktop-schemas holds
-      # GNOME's touchpad and interface settings.
+      # GNOME's touchpad and interface settings (the hot-corner policy
+      # among them).
+      # D-HOT-CORNER-RTL: the he_IL.UTF-8 locale and GTK 4's Hebrew
+      # translations (which give GTK its right-to-left default direction).
       # D-LEASE: acl grants the card's seat ACL (setfacl).
-      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config libwayland-dev wayland-protocols seatd jq ffmpeg shellcheck kmod dbus libglib2.0-bin libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libgweather-4-dev python3-gi gir1.2-gtk-4.0 python3-evdev libwacom-common meson ninja-build colord gsettings-desktop-schemas acl
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libxkbcommon-dev libxkbcommon-x11-dev libegl1 libgl1-mesa-dri libgbm1 pkg-config libwayland-dev wayland-protocols seatd jq ffmpeg shellcheck kmod dbus libglib2.0-bin libglib2.0-dev libgtk-4-dev libfontconfig1-dev librsvg2-common libpipewire-0.3-dev libadwaita-1-dev libgweather-4-dev python3-gi gir1.2-gtk-4.0 python3-evdev libwacom-common meson ninja-build colord language-pack-he-base language-pack-gnome-he-base gsettings-desktop-schemas acl
       - name: Check out workflow-owned CI tooling
         uses: actions/checkout@v7.0.1
         with: *ci-tool-checkout
@@ -1306,10 +1309,12 @@ jobs:
       # The login screen (#1164, P-LK-03): tuna-compositor --greeter and
       # tuna-greeter against a GDM 51 and AccountsService mock on a private
       # system bus, driven through real X11 input and checked through
-      # AT-SPI. Independent of the proofs above, like the OSK proof.
+      # AT-SPI. Independent of the proofs above, like the OSK proof. The
+      # conflicting-session dialog's 60 s timeout is waited out (about 9.5
+      # minutes on a loaded workstation; 15 keeps half again as headroom).
       - name: Prove the Tuna greeter on GDM's greeter API
         if: ${{ !cancelled() }}
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: shellcheck -x scripts/tuna-greeter-proof && scripts/tuna-greeter-proof --artifacts gtk-shell-artifacts/greeter
       # Keep runnable binaries even when a later live proof assertion fails.
       # #1124: tuna-wallpaper-svg is built only by scripts/tuna-gtk-shell-proof
