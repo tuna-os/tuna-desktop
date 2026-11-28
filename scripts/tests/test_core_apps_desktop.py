@@ -973,7 +973,8 @@ class EnterLocationCompletion(unittest.TestCase):
     ENTRY = [259, 0, 442, 34]
     LIST = [275, 59, 426, 176]
     PARKED = [797.6171875, 253.3203125]
-    PICKER = {'id': 'picker', 'window_id': 33}
+    PICKER = {'id': 'picker', 'window_id': 33, 'a11y_scope': '/frame'}
+    FRAME = {'object_path': '/frame', 'focused': False, 'text': None, 'bounds': [0, 0, 890, 550]}
 
     def over(self, model, bounds):
         left, top = self.WINDOW['rect'][0] + bounds[0], self.WINDOW['rect'][1] + bounds[1]
@@ -1016,7 +1017,8 @@ class EnterLocationCompletion(unittest.TestCase):
 
         def tree(window):
             text = next(scripted) if scripted is not None and model['open'] else model['text']
-            return {'nodes': [{'focused': model['open'], 'text': text, 'bounds': self.ENTRY}],
+            return {'nodes': [self.FRAME, {'object_path': '/entry', 'focused': model['open'], 'text': text,
+                                           'bounds': self.ENTRY}],
                     'state': {'windows': [self.WINDOW], 'pointer_position': list(model['pointer'])}}
         desktop.tree = tree
 
@@ -1075,23 +1077,35 @@ class EnterLocationCompletion(unittest.TestCase):
         desktop, keys, model = self.rig()
         node = {'bounds': self.ENTRY}
         state = {'windows': [self.WINDOW], 'pointer_position': [480, 158]}
-        self.assertTrue(desktop._pointer_rests_on(self.PICKER, {'state': state}, node))
-        self.assertFalse(desktop._pointer_rests_on(self.PICKER, {'state': state}, {'bounds': None}))
+        tree = {'state': state, 'nodes': [self.FRAME]}
+        self.assertTrue(desktop._pointer_rests_on(self.PICKER, tree, node))
+        self.assertFalse(desktop._pointer_rests_on(self.PICKER, tree, {'bounds': None}))
         state['pointer_position'] = None
-        self.assertFalse(desktop._pointer_rests_on(self.PICKER, {'state': state}, node))
+        self.assertFalse(desktop._pointer_rests_on(self.PICKER, tree, node))
 
 
 class ShadowedSurfacePointer(unittest.TestCase):
-    """Accessible extents are surface-relative; `rect` is the window geometry.
+    """AT-SPI window coordinates start where the toolkit's frame does.
 
-    Run 44850865831: Connections' welcome window had rect [311, 141, 658,
-    549] inside a 710x601 surface (client shadow, geometry at [26, 23]).
-    Adding No Thanks' bounds [300, 486, 109, 34] to the rect put the click at
-    [665, 644], below the button drawn at [585, 604, 109, 34].
+    GTK 3 (Connections, run 44850865831): the frame is the whole 710x601
+    surface around the 658x549 rect [311, 141] (client shadow, geometry at
+    [26, 23]); adding No Thanks' bounds [300, 486, 109, 34] to the rect put
+    the click at [665, 644], below the button drawn at [585, 604, 109, 34].
+
+    GTK 4 (Fonts and Nautilus, run 45936499585): the frame is the window
+    geometry. Mapping through the 850x650 surface put Fonts' click on the
+    family value [128, 95, 540, 18] 25 px up and left, onto the row title,
+    so Ctrl+C copied nothing; Nautilus' preedit crop missed its field by the
+    same 25 px.
     """
     WINDOW = {'id': 2, 'rect': [311, 141, 658, 549], 'buffer_rect': [285, 118, 710, 601]}
-    ACTOR = {'id': 'org.gnome.Connections', 'window_id': 2}
-    NO_THANKS = {'bounds': [300, 486, 109, 34]}
+    ACTOR = {'id': 'org.gnome.Connections', 'window_id': 2, 'a11y_scope': '/gtk3'}
+    FRAME = {'object_path': '/gtk3', 'bounds': [0, 0, 710, 601]}
+    NO_THANKS = {'object_path': '/no-thanks', 'bounds': [300, 486, 109, 34]}
+    FONTS = {'id': 'org.gnome.font-viewer', 'window_id': 1, 'a11y_scope': '/gtk4'}
+    FONTS_WINDOW = {'id': 1, 'rect': [240, 116, 800, 600], 'buffer_rect': [215, 91, 850, 650]}
+    FONTS_FRAME = {'object_path': '/gtk4', 'bounds': [0, 0, 800, 600]}
+    FAMILY = {'object_path': '/family', 'bounds': [128, 95, 540, 18]}
 
     def desktop(self):
         desktop = core_apps.Desktop.__new__(core_apps.Desktop)
@@ -1104,21 +1118,35 @@ class ShadowedSurfacePointer(unittest.TestCase):
         desktop.qmp = Qmp()
         return desktop
 
-    def test_click_lands_on_the_drawn_button(self):
-        x, y, _ = self.desktop()._move_to(self.ACTOR, {'state': {'windows': [self.WINDOW]}},
-                                          self.NO_THANKS, 0.5, 0.5)
+    def test_gtk3_click_lands_on_the_drawn_button(self):
+        tree = {'state': {'windows': [self.WINDOW]}, 'nodes': [self.FRAME, self.NO_THANKS]}
+        x, y, _ = self.desktop()._move_to(self.ACTOR, tree, self.NO_THANKS, 0.5, 0.5)
         self.assertTrue(585 <= x < 585 + 109 and 604 <= y < 604 + 34, (x, y))
 
-    def test_pointer_rest_and_field_pixels_use_the_surface_origin(self):
+    def test_gtk4_click_lands_on_the_drawn_label(self):
+        tree = {'state': {'windows': [self.FONTS_WINDOW]}, 'nodes': [self.FONTS_FRAME, self.FAMILY]}
+        x, y, _ = self.desktop()._move_to(self.FONTS, tree, self.FAMILY, 0.5, 0.5)
+        self.assertEqual((x, y), (240 + 128 + 270, 116 + 95 + 9))
+
+    def test_pointer_rest_and_field_pixels_use_the_frame_origin(self):
         desktop = self.desktop()
         state = {'windows': [self.WINDOW], 'pointer_position': [640, 620]}
-        self.assertTrue(desktop._pointer_rests_on(self.ACTOR, {'state': state}, self.NO_THANKS))
-        self.assertEqual(desktop._field_pixels(self.ACTOR, state, self.NO_THANKS), (585, 604, 109, 34))
+        tree = {'state': state, 'nodes': [self.FRAME]}
+        self.assertTrue(desktop._pointer_rests_on(self.ACTOR, tree, self.NO_THANKS))
+        self.assertEqual(desktop._field_pixels(self.ACTOR, tree, self.NO_THANKS), (585, 604, 109, 34))
+        nautilus = {'id': 2, 'rect': [195, 141, 890, 550], 'buffer_rect': [170, 116, 940, 600]}
+        tree = {'state': {'windows': [nautilus]},
+                'nodes': [{'object_path': '/gtk3', 'bounds': [0, 0, 890, 550]}]}
+        self.assertEqual(desktop._field_pixels(self.ACTOR, tree, {'bounds': [240, 235, 393, 50]}),
+                         (435, 376, 393, 50))
 
-    def test_missing_buffer_rect_is_refused(self):
+    def test_frame_matching_neither_rect_nor_surface_is_refused(self):
         window = {'id': 2, 'rect': [311, 141, 658, 549], 'buffer_rect': None}
         with self.assertRaises(RuntimeError):
-            self.desktop()._move_to(self.ACTOR, {'state': {'windows': [window]}},
+            self.desktop()._move_to(self.ACTOR, {'state': {'windows': [window]}, 'nodes': [self.FRAME]},
+                                    self.NO_THANKS, 0.5, 0.5)
+        with self.assertRaises(RuntimeError):
+            self.desktop()._move_to(self.ACTOR, {'state': {'windows': [self.WINDOW]}, 'nodes': []},
                                     self.NO_THANKS, 0.5, 0.5)
 
 

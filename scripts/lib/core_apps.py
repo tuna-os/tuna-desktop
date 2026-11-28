@@ -256,20 +256,29 @@ class Desktop(NativeDesktop):
             raise RuntimeError('original native surface not uniquely mapped')
         return found[0]
 
-    def _surface_origin(self, actor, state):
-        """Output point of the window's surface origin.
+    def _extents_origin(self, actor, tree):
+        """Output point of (0, 0) in the actor's AT-SPI window coordinates.
 
-        Accessible extents are surface-relative, while `rect` is the xdg
-        window geometry, which client-side shadows push inside the surface;
-        `buffer_rect` is the committed buffer, shadows included. Connections'
-        welcome window reports a 710x601 frame for a 658x549 rect, and
-        rect-relative clicks landed 26 px right of and 23 px below No Thanks
-        (run 44850865831).
+        `rect` is the xdg window geometry and `buffer_rect` the committed
+        surface, client shadows included. The toolkit decides which of the
+        two its window coordinates start at, and the actor's own frame shows
+        it: GTK 4 sums widget bounds up to the GtkWindow, whose border box
+        is the window geometry (gtk_at_spi_translate_coordinates_from_
+        accessible), so Fonts' frame is [0, 0, 800, 600] for an 800x600 rect
+        in an 850x650 surface (run 45936499585); Connections' welcome window
+        reports a 710x601 frame, its whole surface, for a 658x549 rect (run
+        44850865831). Mapping GTK 4 extents through the surface put every
+        click and field crop 25 px up and left of the drawn widget.
         """
-        buffer = self._window(actor, state).get('buffer_rect')
-        if buffer is None:
-            raise RuntimeError('original native surface buffer unavailable')
-        return buffer[0], buffer[1]
+        window = self._window(actor, tree['state'])
+        frames = [node for node in tree['nodes'] if node['object_path'] == actor.get('a11y_scope')]
+        if len(frames) != 1 or frames[0]['bounds'] is None:
+            raise RuntimeError('original accessible frame extents unavailable')
+        x, y, width, height = frames[0]['bounds']
+        for rect in (window['rect'], window.get('buffer_rect')):
+            if rect is not None and (rect[2], rect[3]) == (width, height):
+                return rect[0] - x, rect[1] - y
+        raise RuntimeError('accessible frame is neither the window geometry nor its surface')
 
 
 
@@ -355,7 +364,7 @@ class Desktop(NativeDesktop):
             origin = self.guest('desktop', 'shell-origin', actor=actor, path=node['path'])
             x, y = origin['x'] + bounds[0] + bounds[2] * fx, origin['y'] + bounds[1] + bounds[3] * fy
         else:
-            left, top = self._surface_origin(actor, tree['state'])
+            left, top = self._extents_origin(actor, tree)
             x = left + bounds[0] + bounds[2] * fx
             y = top + bounds[1] + bounds[3] * fy
         x, y = int(x * self.scale), int(y * self.scale)
@@ -386,14 +395,14 @@ class Desktop(NativeDesktop):
         position, bounds = tree['state'].get('pointer_position'), node['bounds']
         if position is None or bounds is None:
             return False
-        origin = self._surface_origin(actor, tree['state'])
+        origin = self._extents_origin(actor, tree)
         left, top = origin[0] + bounds[0], origin[1] + bounds[1]
         return left <= position[0] < left + bounds[2] and top <= position[1] < top + bounds[3]
 
-    def _field_pixels(self, actor, state, node):
+    def _field_pixels(self, actor, tree, node):
         if node['bounds'] is None:
             raise RuntimeError('original actual editable field has no bounds')
-        origin_x, origin_y = self._surface_origin(actor, state)
+        origin_x, origin_y = self._extents_origin(actor, tree)
         x, y, width, height = node['bounds']
         left = math.floor((origin_x + x) * self.scale)
         top = math.floor((origin_y + y) * self.scale)
@@ -769,7 +778,7 @@ class Desktop(NativeDesktop):
                 raise RuntimeError('original app lost actual IME field focus during composition')
             if current[0]['text'] == composition['preedit']:
                 raise RuntimeError('composition was already committed instead of observed as preedit')
-            x, y, width, height = self._field_pixels(actor, rendered['state'], current[0])
+            x, y, width, height = self._field_pixels(actor, rendered, current[0])
             from PIL import Image
             crop = self.out / f'{self._sequence + 1:05d}-original-preedit-field.png'
             with Image.open(rendered['frame_path']) as frame:
