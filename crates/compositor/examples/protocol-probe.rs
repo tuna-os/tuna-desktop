@@ -16,6 +16,9 @@
 //!   offers blur; a maximized window of one-pixel stripes is mapped with a
 //!   clear window above it whose whole surface is a blur region. Prints
 //!   `ready` and keeps both open until killed; the proof samples pixels.
+//! - `syncobj-unoffered`: without a timeline-syncobj renderer device no
+//!   client finds wp_linux_drm_syncobj_manager_v1 (Mutter 51 creates the
+//!   global only after its device checks pass).
 //!
 //! `--state` names the compositor state file (`TUNA_COMPOSITOR_STATE`),
 //! read for window parents and mapping.
@@ -557,6 +560,16 @@ fn background_blur(state: &Path) {
     }
 }
 
+fn syncobj_unoffered() {
+    let client = Client::connect();
+    if let Some((_, version)) = client.probe.globals.get("wp_linux_drm_syncobj_manager_v1") {
+        fail(format!(
+            "wp_linux_drm_syncobj_manager_v1 v{version} is offered on a renderer without timeline syncobjs"
+        ));
+    }
+    println!("ok wp_linux_drm_syncobj_manager_v1 is not offered");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let state = args
@@ -574,8 +587,9 @@ fn main() {
         Some("xdg-foreign-v1") => xdg_foreign_v1(&need_state()),
         Some("wl-fixes") => wl_fixes(),
         Some("background-blur") => background_blur(&need_state()),
+        Some("syncobj-unoffered") => syncobj_unoffered(),
         other => fail(format!(
-            "unknown check {other:?}: xdg-wm-base-7, xdg-foreign-v1, wl-fixes, background-blur"
+            "unknown check {other:?}: xdg-wm-base-7, xdg-foreign-v1, wl-fixes, background-blur, syncobj-unoffered"
         )),
     }
 }
