@@ -96,7 +96,7 @@ pam_receipt=json.loads((out/'runtime-pam/success.json').read_text())
 for key in ['closed_origin_canceled_retired','origin_loss_wakes_private_pam_without_fixture_release','fresh_origin_success','held_self_path_replaced']:assert pam_receipt[key] is True
 assert pam_receipt['compositor_sha256']==r['executables'][r['compositor']],'actual PAM main image differs'
 conversation=json.loads((out/'runtime-conversation/success.json').read_text())
-for key in ['fingerprint_unavailable_denied','second_password_conversation_denied','stale_sequence_dropped','distinct_answers_per_question','info_and_error_relayed','wrong_pin_denied_with_problem','cancel_denied_silently','fresh_answers_unlock']:assert conversation[key] is True,key
+for key in ['fingerprint_unavailable_denied','second_password_conversation_denied','stale_sequence_dropped','distinct_answers_per_question','info_and_error_relayed','wrong_pin_denied_with_problem','cancel_denied_silently','fresh_answers_unlock','unlock_restores_session_intact']:assert conversation[key] is True,key
 assert conversation['compositor_sha256']==r['executables'][r['compositor']],'actual conversation main image differs'
 fingerprint=json.loads((out/'runtime-fingerprint/success.json').read_text())
 for key in ['expired_account_match_denied','max_tries_unavailable','timed_out_unavailable','lock_budget_refuses_before_pam','password_unaffected','retry_then_match_unlocks']:assert fingerprint[key] is True,key

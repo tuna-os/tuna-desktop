@@ -277,7 +277,11 @@ carries on. G-BACKGROUND-BLUR: `ext_background_effect_manager_v1` offers
 blur, and a clear window whose surface is a blur region smooths the
 one-pixel stripes of a maximized window behind it (mean step between
 neighbouring pixels below 16) while beside it they stay sharp (above 128),
-from `background-blur.png`. G-XWAYLAND-GRAB: an X11 probe on the session's
+from `background-blur.png`. G-SYNCOBJ: the nested session's software
+renderer has no timeline syncobjs, so the compositor logs Mutter's reason
+(`explicit sync disabled: …`, one of `meta-wayland-linux-drm-syncobj.c`'s
+messages) and no client finds `wp_linux_drm_syncobj_manager_v1`.
+G-XWAYLAND-GRAB: an X11 probe on the session's
 Xwayland takes `XGrabKeyboard`; as WM_CLASS `remote-viewer` (Mutter's
 built-in list) its grab is granted, a real Super tap reaches it and the
 overview stays shut until Super+Escape gives the shortcuts back, while as

@@ -15,8 +15,8 @@
 #   X11 window is IconicState with _NET_WM_STATE_HIDDEN, #1078) only.
 #   --protocols-only runs panel readiness, G-WAYLAND-INFO and the Mutter 51
 #   protocol gates driven by a real client (G-XDG-WM-BASE-7,
-#   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR, G-XWAYLAND-GRAB; #364,
-#   #588) only.
+#   G-XDG-FOREIGN-V1, G-WL-FIXES, G-BACKGROUND-BLUR, G-SYNCOBJ,
+#   G-XWAYLAND-GRAB; #364, #588) only.
 #   --subsurface-only runs panel readiness and G-SUBSURFACE-STACKING (a
 #   window's subsurfaces stack where the client placed them) only.
 #   --grid-hover-only runs panel readiness, G-GRID-HOVER, G-GRID-REORDER,
@@ -2201,6 +2201,26 @@ BLUR
         fail G-BACKGROUND-BLUR "the probe's windows outlived it"
     pass G-BACKGROUND-BLUR "ext_background_effect_manager_v1 offers blur and a blur region smooths one-pixel stripes behind a clear window (mean step $1) while beside it they stay sharp ($2)"
 }
+# Explicit sync (P-SY-09): Mutter 51 creates wp_linux_drm_syncobj_manager_v1
+# only after its device checks pass (meta-wayland-linux-drm-syncobj.c). The
+# nested session's software renderer has no timeline syncobjs: the
+# compositor must give Mutter's reason, in Mutter's words, and no client
+# may find the global.
+syncobj_gate() {
+    syncobj_why="$(grep -m1 'tuna-compositor: explicit sync disabled: ' "$LOG" | sed 's/.*explicit sync disabled: //')"
+    case "$syncobj_why" in
+        "Missing 'EGL_ANDROID_native_fence_sync'" | \
+        "Failed to find EGL device to initialize linux-drm-syncobj-v1" | \
+        "Failed to open DRM device "* | \
+        "Failed to check DRM syncobj timeline capability" | \
+        "drmSyncobjEventfd failed: linux-drm-syncobj requires eventfd support") ;;
+        "") fail G-SYNCOBJ "the compositor gave no explicit-sync verdict" ;;
+        *) fail G-SYNCOBJ "explicit-sync verdict '$syncobj_why' is none of Mutter's" ;;
+    esac
+    protocol_probe G-SYNCOBJ syncobj-unoffered
+    pass G-SYNCOBJ "without timeline syncobjs the compositor refuses explicit sync as Mutter does ($syncobj_why) and no client finds wp_linux_drm_syncobj_manager_v1"
+}
+
 # G-XWAYLAND-GRAB (P-SY-09): an X11 client's XGrabKeyboard, which rootless
 # Xwayland turns into zwp_xwayland_keyboard_grab_v1, takes every key, the
 # Super key included, only when Mutter 51's meta_xwayland_grab_is_granted
@@ -2300,6 +2320,7 @@ protocol_gaps_gates() {
     protocol_probe G-WL-FIXES wl-fixes
     pass G-WL-FIXES "wl_fixes 1 destroys a registry and the client's connection carries on"
     background_blur_gate
+    syncobj_gate
     xwayland_grab_gate
 }
 
@@ -11843,7 +11864,51 @@ reply="$(gdbus call --session --dest org.gnome.Shell.Screenshot \
     fail G-SCREENSHOT-DENY "untrusted Screenshot accepted: $reply"
 case "$reply" in *AccessDenied*) ;; *) fail G-SCREENSHOT-DENY "unexpected denial: $reply" ;; esac
 [ ! -f "$ARTIFACTS/untrusted.png" ] || fail G-SCREENSHOT-DENY "denied capture wrote a file"
-pass G-SCREENSHOT-DENY "direct Screenshot requires trusted desktop identity"
+# ScreenshotWindows (ADR 0011 L8) stands in for GNOME Shell's in-process
+# window selector: the shell alone may call it, even for the one private
+# directory it writes to.
+windows_dir="$XDG_RUNTIME_DIR/tuna-screenshot-windows"
+windows_before="$(find "$windows_dir" -type f 2>/dev/null | wc -l)"
+reply="$(gdbus call --session --dest org.gnome.Shell.Screenshot \
+    --object-path /org/gnome/Shell/Screenshot \
+    --method org.tuna.Screenshot.ScreenshotWindows "$windows_dir" 2>&1)" &&
+    fail G-SCREENSHOT-DENY "untrusted ScreenshotWindows accepted: $reply"
+case "$reply" in *AccessDenied*) ;; *) fail G-SCREENSHOT-DENY "unexpected ScreenshotWindows denial: $reply" ;; esac
+pass G-SCREENSHOT-DENY "direct Screenshot and ScreenshotWindows require trusted desktop identity"
+
+# G-SCREENSHOT-WINDOWS-DENY (ADR 0011 L8, #1169): the installed portal
+# backend, a trusted capture identity, may not take window screenshots
+# either. Code inside the genuine xdg-desktop-portal-gnome executable owning
+# the portal's bus name (ADR 0010 F1) is what the compositor authenticates
+# as the portal: the control shows that identity passes Screenshot, so the
+# refusal is ScreenshotWindows's own.
+PORTAL_BACKEND=/usr/libexec/xdg-desktop-portal-gnome
+[ -x "$PORTAL_BACKEND" ] || PORTAL_BACKEND=/usr/lib/xdg-desktop-portal-gnome
+[ -x "$PORTAL_BACKEND" ] || fail G-SCREENSHOT-WINDOWS-DENY "installed GNOME portal backend missing"
+probe_gio_flags="$(pkg-config --cflags --libs gio-2.0)" || fail G-SCREENSHOT-WINDOWS-DENY "gio-2.0 development files are required"
+# pkg-config returns separate compiler arguments. This script is POSIX sh
+# (no arrays), so xargs splits them onto the compiler command line.
+printf '%s\n' "$probe_gio_flags" | xargs cc -Wall -Wextra -Werror -shared -fPIC -o "$ARTIFACTS/identity-probe.so" \
+    "$ROOT/scripts/lib/tuna-service-identity-probe.c" ||
+    fail G-SCREENSHOT-WINDOWS-DENY "could not build the identity probe"
+portal_probe() {
+    rm -f "$ARTIFACTS/portal-probe-$1.txt"
+    TUNA_PROBE_OUT="$ARTIFACTS/portal-probe-$1.txt" TUNA_PROBE_NAME=org.freedesktop.impl.portal.desktop.gnome \
+        TUNA_PROBE_DEST=org.gnome.Shell.Screenshot TUNA_PROBE_PATH=/org/gnome/Shell/Screenshot \
+        TUNA_PROBE_METHOD="$2" TUNA_PROBE_ARGS="$3" LD_PRELOAD="$ARTIFACTS/identity-probe.so" \
+        "$PORTAL_BACKEND" >"$ARTIFACTS/portal-probe-$1.log" 2>&1 ||
+        fail G-SCREENSHOT-WINDOWS-DENY "the probe did not run inside $PORTAL_BACKEND: $(tail -3 "$ARTIFACTS/portal-probe-$1.log")"
+}
+portal_probe control org.gnome.Shell.Screenshot.Screenshot "(false, false, '$ARTIFACTS/portal-probe-control.png')"
+if ! { grep -q '^accepted (true, ' "$ARTIFACTS/portal-probe-control.txt" && [ -s "$ARTIFACTS/portal-probe-control.png" ]; }; then
+    fail G-SCREENSHOT-WINDOWS-DENY "the portal identity was not admitted to Screenshot: $(cat "$ARTIFACTS/portal-probe-control.txt")"
+fi
+portal_probe windows org.tuna.Screenshot.ScreenshotWindows "('$windows_dir',)"
+grep -q '^error org.freedesktop.DBus.Error.AccessDenied ' "$ARTIFACTS/portal-probe-windows.txt" ||
+    fail G-SCREENSHOT-WINDOWS-DENY "the portal identity took window screenshots: $(cat "$ARTIFACTS/portal-probe-windows.txt")"
+[ "$(find "$windows_dir" -type f 2>/dev/null | wc -l)" = "$windows_before" ] ||
+    fail G-SCREENSHOT-WINDOWS-DENY "a refused ScreenshotWindows wrote window pictures"
+pass G-SCREENSHOT-WINDOWS-DENY "the installed portal's identity takes a Screenshot but is refused ScreenshotWindows ($(cut -d' ' -f3- "$ARTIFACTS/portal-probe-windows.txt"))"
 
 open_qs
 "$PY" "$ROOT/scripts/lib/tuna-a11y-dump.py" tuna-shell-gtk "$ARTIFACTS/a11y-shot.json" 20 \

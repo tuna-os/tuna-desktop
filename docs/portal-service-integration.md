@@ -52,7 +52,7 @@ GNOME settings daemons call.
 
 ## How a compositor service is wired
 
-Every compositor service has the same shape; `screenshot.rs:255-294` is
+Every compositor service has the same shape; `screenshot.rs:321-367` is
 the smallest complete example, and `mutter.rs:1211-1405` the largest.
 
 1. **Own thread, own connection.** `start()` spawns a named thread. The
@@ -71,7 +71,7 @@ the smallest complete example, and `mutter.rs:1211-1405` the largest.
    registered with `insert_source` (`runtime.rs:1219-1308`).
 4. **Bound every reply.** A method that needs an answer from the event
    loop passes a `std::sync::mpsc` sender with the request and waits with
-   `recv_timeout` (`screenshot.rs:19`, `112-118`). If the loop is gone, the
+   `recv_timeout` (`screenshot.rs:19`, `114-120`). If the loop is gone, the
    method returns `Failed`. It never waits forever.
 5. **Authorize per call, from the message header.** Take
    `#[zbus(header)]` and `#[zbus(connection)]` and decide using the bus's
@@ -178,10 +178,10 @@ graphical target.
 
 | Situation | Required behaviour | Example |
 |---|---|---|
-| No session bus | Log once, leave the service off, keep the session running | `mutter.rs:1282-1286`, `screenshot.rs:275-279` |
+| No session bus | Log once, leave the service off, keep the session running | `mutter.rs:1282-1286`, `screenshot.rs:348-352` |
 | Name already owned (nested under GNOME, a real daemon) | Log `… is taken; … off`. Do not queue for the name. Features that depend on it stay off. | `mutter.rs:1288-1338` |
 | Daemon absent or stuck | Bounded asynchronous call. Hide the affected UI. Never block the main loop or the compositor. | `services.rs:1-16`, `29` |
-| Event loop does not answer | `recv_timeout`, then `Failed` | `screenshot.rs:112-118` |
+| Event loop does not answer | `recv_timeout`, then `Failed` | `screenshot.rs:114-120` |
 | Caller disconnects | Revoke grants and drop its objects. Inhibitors are removed when the caller's name vanishes. | `mutter.rs:1339-1392`, `session_manager.rs:1-30` |
 | Locked session | Deny or return the documented locked result. Revoke live capture. | `capture_security.rs:170-204`, `runtime.rs:1661-1687` |
 | Portal activation on dbus-daemon | Do not let the shell trigger portal activation during startup | `shell-gtk/src/portal_opt_out.rs` |
