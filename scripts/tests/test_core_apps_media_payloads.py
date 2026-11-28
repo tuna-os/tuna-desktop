@@ -195,6 +195,39 @@ class MediaFileBoundaryControls(unittest.TestCase):
             guest._cleanup(self.c)
 
 
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg and ffprobe")
+class VideoControlEncodes(unittest.TestCase):
+    """The guest's exact ffmpeg command produces the VP8/Vorbis control."""
+
+    def test_prepare_video_encodes_an_opaque_vp8_control(self):
+        # Run 45936499585: the overlay negotiated yuva420p, libvpx refused
+        # alpha with auto_alt_ref and ffmpeg exited 234 before any packet.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "media").mkdir()
+            state = {"schema": 1, "music_dir": str(home / "Music/Tuna-core-n"),
+                     "pictures": str(home / "Pictures/Camera"), "old_photos": [], "permission": None,
+                     **{key: False for key in ("vivid_owned", "vivid_bound", "audio_stopped",
+                                               "index_stopped", "camera_stopped", "permission_owned",
+                                               "restored")},
+                     "sane_owned": True}
+
+            def user(args, timeout, check=True):
+                # Two seconds of the same graph instead of 180 keeps this fast.
+                args = [arg.replace("d=180", "d=2") for arg in args]
+                return subprocess.run(args, capture_output=True, text=True, check=check, timeout=timeout)
+
+            c = mock.Mock(home=home, nonce="n", path=lambda rel: home / rel,
+                          read_control=lambda name: state, user=user)
+            result = guest._prepare_video(c)
+            video = result["video"]
+            formats = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v",
+                                      "-show_entries", "stream=pix_fmt", "-of", "csv=p=0", video],
+                                     capture_output=True, text=True, check=True).stdout.split()
+        self.assertEqual({s["codec_name"] for s in result["encoded_metadata"]["streams"]}, {"vp8", "vorbis"})
+        self.assertEqual(formats, ["yuv420p"])
+
+
 class MonitorPayloadControls(unittest.TestCase):
     def tone(self, *frequencies):
         return [round(32767 * .18 * sum(math.sin(2 * math.pi * f * i / 48000)

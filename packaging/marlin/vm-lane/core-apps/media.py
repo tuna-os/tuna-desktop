@@ -337,7 +337,11 @@ def _prepare_video(c):
              "drawbox=x=432:y=0:w=108:h=360:c=magenta:t=fill,"
              "drawbox=x=540:y=0:w=108:h=360:c=cyan:t=fill[base];"
              "color=c=white:s=48x48:r=15:d=180[box];"
-             "[base][box]overlay=x=mod(t*81\\,594):y=220[out]")
+             # Without an explicit opaque format, overlay negotiates yuva420p
+             # with libvpx, whose encoder then refuses to open
+             # ("Transparency encoding with auto_alt_ref does not work") and
+             # ffmpeg exits 234 (-EINVAL) before writing a packet.
+             "[base][box]overlay=x=mod(t*81\\,594):y=220,format=yuv420p[out]")
     c.user(["ffmpeg", "-nostdin", "-v", "error", "-filter_complex", graph,
             "-f", "lavfi", "-i", "aevalsrc=0.18*sin(2*PI*997*t)+0.18*sin(2*PI*1499*t):s=48000:d=180",
             "-map", "[out]", "-map", "0:a", "-c:v", "libvpx", "-deadline", "realtime",
