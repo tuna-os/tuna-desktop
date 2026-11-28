@@ -481,14 +481,18 @@ def dispatch(operation, arguments, context):
         draw.text((16, 16), 'Tuna Core Apps ' + context.nonce, fill='white')
         image.save(context.path('principal.png'))
         paragraph = 'Tuna Core Apps actual PDF content\n' + context.nonce + '\nOpen actual controlled link'
+        # The page and its URI annotation (PDF user space, origin bottom
+        # left), declared so a consumer can click the link where it renders.
+        media_box, link_rect = [0, 0, 640, 320], [40, 160, 240, 180]
         stream = (f'BT /F1 12 Tf 40 220 Td (Tuna Core Apps actual PDF content) Tj '
                   f'0 -22 Td ({context.nonce}) Tj 0 -32 Td (Open actual controlled link) Tj ET').encode()
         objects = [b'<< /Type /Catalog /Pages 2 0 R >>',
                    b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-                   b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 640 320] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [6 0 R] >>',
+                   (f'<< /Type /Page /Parent 2 0 R /MediaBox [{" ".join(map(str, media_box))}] '
+                    f'/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [6 0 R] >>').encode(),
                    b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
                    b'<< /Length ' + str(len(stream)).encode() + b' >>\nstream\n' + stream + b'\nendstream',
-                   (f'<< /Type /Annot /Subtype /Link /Rect [40 160 240 180] /Border [0 0 1] '
+                   (f'<< /Type /Annot /Subtype /Link /Rect [{" ".join(map(str, link_rect))}] /Border [0 0 1] '
                     f'/A << /S /URI /URI ({endpoint["url"]}) >> >>').encode()]
         pdf, offsets = bytearray(b'%PDF-1.4\n'), [0]
         for index, obj in enumerate(objects, 1):
@@ -511,7 +515,7 @@ def dispatch(operation, arguments, context):
         return {'png': {'sha256': digest(context.path('principal.png')), 'size': [480, 320],
                         'quadrants': colors},
                 'pdf': {'sha256': digest(context.path('principal.pdf')), 'text': paragraph,
-                        'link': endpoint['url']},
+                        'link': endpoint['url'], 'media_box': media_box, 'link_rect': link_rect},
                 'font': {'filename': font.name, 'sha256': digest(font)},
                 'portal_monitor': monitor_identity,
                 'web': {'prepared': prepared_web, 'endpoint': endpoint}}

@@ -422,8 +422,32 @@ def _papers(desktop):
     desktop.keys('ctrl', 'a')
     desktop.keys('backspace')
     desktop.keys('esc')
-    link = unique(desktop.tree(actor), lambda node: node['role'] == 'link', 'actual PDF URI annotation')
-    desktop.press(actor, link['name'], role='link')
+    # Papers 51 exposes a page only as accessible text, with no link object
+    # for its URI annotation (run 46102176916: no 'link' node). A user
+    # follows the link by clicking it where the page draws it: the fixture's
+    # /Link /Rect, mapped through the rendered page's extents, inside the
+    # document view the page scrolls in. A click while text is selected
+    # only clears the selection (pps-view.c button release), and the copy
+    # above left the whole page selected: a click on blank page clears it.
+    pdf = desktop.inventory['content_controls']['pdf']
+    _, _, page_width, page_height = pdf['media_box']
+    def click_page(label, pdf_x, pdf_y):
+        current = desktop.tree(actor)
+        page = unique(current, lambda node: node['showing'] and node['role'] == 'paragraph'
+                      and node['text'] == expected and node['bounds'] is not None, 'actual decoded PDF page')
+        fx, fy = pdf_x / page_width, 1 - pdf_y / page_height
+        x, y = page['bounds'][0] + page['bounds'][2] * fx, page['bounds'][1] + page['bounds'][3] * fy
+        view = unique(current, lambda node: node['role'] == 'document text'
+                      and node['path'] == page['path'][:len(node['path'])], 'actual PDF document view')
+        require(view['bounds'] is not None and view['bounds'][0] <= x < view['bounds'][0] + view['bounds'][2]
+                and view['bounds'][1] <= y < view['bounds'][1] + view['bounds'][3],
+                'actual PDF ' + label + ' is scrolled outside the document view')
+        desktop.click_at(actor, page['path'], fx, fy)
+        return {'page': page, 'view': view, 'pdf_point': [pdf_x, pdf_y], 'point': [x, y]}
+    left, bottom, right, top = pdf['link_rect']
+    evidence['link_click'] = {'media_box': pdf['media_box'], 'link_rect': pdf['link_rect'],
+                              'selection_clear': click_page('blank page', page_width / 2, bottom / 2),
+                              'link': click_page('URI annotation', (left + right) / 2, (bottom + top) / 2)}
     browser = desktop.await_state('papers-real-link-consumer',
         lambda: desktop.guest('desktop', 'discover', app_id='org.gnome.Epiphany'),
         lambda value: value.get('pid') is not None)
