@@ -77,29 +77,29 @@ pub fn announce_at(
     message: &str,
     priority: gtk::AccessibleAnnouncementPriority,
 ) {
-    if !message.is_empty() && reaches_screen_reader(widget.upcast_ref()) {
+    if !message.is_empty() && reaches_screen_reader() {
         widget.announce(message, priority);
     }
 }
 
-/// Whether `accessible`'s AT context talks to an accessibility bus. When
+/// Whether the shell's AT contexts talk to an accessibility bus. When
 /// none answers (no at-spi2-core in the session), GTK gives every widget
 /// its test AT context instead (`gtkatcontext.c` `gtk_at_context_create`),
 /// whose class has no `announce`: `gtk_accessible_announce` then calls a
 /// NULL function (GTK 4.14 through main) and the shell dies by SIGSEGV,
 /// as drm-smoke's two-output leg saw on the screenshot banner. Without a
-/// bus no screen reader could hear the announcement anyway. With
-/// `GTK_A11Y=none` there is no context at all.
-fn reaches_screen_reader(accessible: &gtk::Accessible) -> bool {
-    use glib::translate::{from_glib_full, ToGlibPtr};
-    // `AccessibleExt::at_context` assumes a context; GTK_A11Y=none has none.
-    let context: Option<gtk::ATContext> = unsafe {
-        from_glib_full(gtk::ffi::gtk_accessible_get_at_context(
-            accessible.to_glib_none().0,
-        ))
-    };
-    let test = glib::Type::from_name("GtkTestATContext");
-    context.is_some_and(|context| test.is_none_or(|test| !context.type_().is_a(test)))
+/// bus no screen reader could hear the announcement anyway.
+///
+/// `GTK_A11Y=none` gives widgets no context at all, and a widget in
+/// destruction answers none either, where `AccessibleExt::at_context`
+/// assumes one; so the backend is read from a fresh probe widget, which
+/// GTK hands the same backend as every other widget on the display.
+fn reaches_screen_reader() -> bool {
+    if std::env::var("GTK_A11Y").is_ok_and(|backend| backend.eq_ignore_ascii_case("none")) {
+        return false;
+    }
+    let context = gtk::Label::new(None).at_context();
+    glib::Type::from_name("GtkTestATContext").is_none_or(|test| !context.type_().is_a(test))
 }
 
 pub fn menu() -> gtk::MenuButton {
