@@ -516,7 +516,11 @@ def _settings(desktop):
             actual = desktop.guest('basic', 'style-state')
             require(actual['color_scheme'] == target, 'actual Settings user preference did not persist')
             selected = control(desktop, current, labels, ('toggle button', 'radio button', 'button', 'push button'))
-            require(selected['checked'] or selected['selected'], 'native Settings selected style differs from independent preference')
+            # Settings 51's style choices are GTK 4 toggle buttons, whose
+            # active state is AT-SPI PRESSED (run 46133891606: Dark held
+            # neither CHECKED nor SELECTED with prefer-dark written).
+            require(selected['checked'] or selected['selected'] or selected['pressed'],
+                    'native Settings selected style differs from independent preference')
             return {'native_style': desktop.observe('settings-' + stage, current), 'selected': selected,
                     'actual_writer_and_preferences': actual, 'chosen_style': wanted_name}
         def restarted(current, stage):

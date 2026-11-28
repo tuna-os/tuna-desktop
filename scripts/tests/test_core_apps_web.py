@@ -127,5 +127,36 @@ class ReplaceFieldFocus(unittest.TestCase):
         self.assertNotIn(('ctrl', 'a'), log)
 
 
+class LabelledRow(unittest.TestCase):
+    """Run 46133891606: Characters 51's sidebar rows are nameless list items
+    holding their category label."""
+
+    def desktop(self, *extra):
+        rows = [node('', 'list item', [0, 1, 0]), node('Recently Used', 'label', [0, 1, 0, 0, 0]),
+                node('', 'list item', [0, 1, 1]), node('Emojis', 'label', [0, 1, 1, 0, 0])]
+
+        class Desktop:
+            def tree(self, actor):
+                return {'nodes': [DIALOG] + rows + list(extra)}
+        return Desktop()
+
+    def test_row_holding_the_label_is_returned(self):
+        from core_apps_web import labelled_row
+        found = labelled_row(self.desktop(), {'id': 'org.gnome.Characters'}, 'Recently Used')
+        self.assertEqual(found['path'], [0, 1, 0])
+
+    def test_label_outside_any_row_fails(self):
+        from core_apps_web import labelled_row
+        with self.assertRaises(RuntimeError):
+            labelled_row(self.desktop(node('Search Result', 'label', [0, 2])),
+                         {'id': 'org.gnome.Characters'}, 'Search Result')
+
+    def test_duplicate_label_fails(self):
+        from core_apps_web import labelled_row
+        with self.assertRaises(RuntimeError):
+            labelled_row(self.desktop(node('Recently Used', 'label', [0, 3])),
+                         {'id': 'org.gnome.Characters'}, 'Recently Used')
+
+
 if __name__ == '__main__':
     unittest.main()

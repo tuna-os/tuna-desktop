@@ -243,7 +243,12 @@ def _document(desktop, actor, expected, label):
 def _editor(desktop):
     actor = desktop.start("org.gnome.TextEditor", "Text Editor")
     evidence = {}
-    desktop.keys("ctrl", "n")
+    # Text Editor 51 restores the previous session's documents (the Files
+    # default-handler journey's) and binds Ctrl+N to a new window: in run
+    # 46133891606 the new draft opened as window 10 while the actor's
+    # window kept the restored non-ASCII document. Ctrl+T is its new tab,
+    # an empty draft in the actor's own window.
+    desktop.keys("ctrl", "t")
     evidence["original_editor_ime"] = ime(desktop, actor, field(desktop, actor, document=True))
     original_row = files(desktop, "principal.txt")[0]
     original = base64.b64decode(original_row["base64"], validate=True)
@@ -268,7 +273,7 @@ def _editor(desktop):
     desktop.keys("ctrl", "a")
     desktop.keys("ctrl", "c")
     evidence["copied_known_utf8"] = clip(desktop, original_buffer.encode("utf-8"))
-    desktop.keys("ctrl", "n")
+    desktop.keys("ctrl", "t")
     desktop.keys("ctrl", "v")
     _document(desktop, actor, original_buffer, "editor-real-clipboard-UTF8-consumer")
     desktop.keys("ctrl", "end")

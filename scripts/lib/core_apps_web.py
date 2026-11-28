@@ -91,6 +91,22 @@ def press(desktop, actor, names, roles=None):
     return desktop.press(actor, node["name"], role=node["role"])
 
 
+def labelled_row(desktop, actor, label):
+    """The sensitive list row whose own content shows the unique `label`.
+
+    Characters 51's sidebar rows are nameless list items holding their
+    category label (run 46133891606: "Recently Used" is a label child of
+    an unnamed list item), so the row is found through the label it draws.
+    """
+    tree = desktop.tree(actor)
+    shown = nodes(tree)
+    text = unique(tree, lambda n: n.get("name") == label and n.get("role") == "label", "label " + label)
+    rows = [n for n in shown if n.get("role") in ("list item", "row") and n.get("sensitive")
+            and text["path"][:len(n["path"])] == n["path"]]
+    require(len(rows) == 1, f"expected one actual row holding {label}, observed {len(rows)}")
+    return rows[0]
+
+
 def field(desktop, actor, name=None):
     return unique(desktop.tree(actor), lambda n: n.get("role") in ("text", "entry", "search box", "spin button")
                   and n.get("editable") and n.get("text") is not None and n.get("sensitive")
@@ -245,7 +261,7 @@ def _characters(desktop):
     evidence["copy"] = clipboard_text(desktop, "☃")
     desktop.keys("esc")
     desktop.keys("esc")
-    recent = control(desktop, actor, "Recently Used", ("list item", "row"))
+    recent = labelled_row(desktop, actor, "Recently Used")
     desktop.click_path(actor, recent["path"])
     state = desktop.guest("web", "state", app=actor["id"])
     require("☃" in state["values"]["recent-characters"], "actual Unicode selection did not persist Recent Characters")
@@ -261,7 +277,7 @@ def _characters(desktop):
         desktop.keys("esc")
         return {"recent_ui": row, "rendered_exact_codepoint": dialog, "recent_exact_unicode": saved, "clipboard": copied}
     def restarted(current, stage):
-        recent = control(desktop, current, "Recently Used", ("list item", "row"))
+        recent = labelled_row(desktop, current, "Recently Used")
         desktop.click_path(current, recent["path"])
         return probe(current, stage)
     evidence["crosscut"] = desktop.crosscut(actor, probe, restart_probe=restarted)

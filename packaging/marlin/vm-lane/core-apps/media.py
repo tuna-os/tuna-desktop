@@ -530,7 +530,9 @@ def _library(c):
     _require(service.is_file(), "installed indexer D-Bus activation identity missing")
     if shutil.which("tinysparql") is None:
         raise MediaUnavailable("installed TinySPARQL reader unavailable")
-    result = c.user(["tinysparql", "sparql", "--dbus-service", INDEX_BUS, "--query", query])
+    # TinySPARQL 3.8 renamed tracker3's `sparql` subcommand to `query`
+    # (src/cli/tracker-main.c): `tinysparql sparql` exits 1 as unknown.
+    result = c.user(["tinysparql", "query", "--dbus-service", INDEX_BUS, "--query", query])
     expected = str(Path(_state(c)["music_dir"]) / "native-control.ogg")
     return {"owner": owner, "query": query, "rows": result.stdout,
             "matches_metadata": all(s in result.stdout for s in
