@@ -126,7 +126,7 @@ Exact implementation source `88aa154950603ca5d60efc0d678b5a349c557fcc` was compi
 - All nonignored GTK unit tests: **122 passed**, two graphical tests deliberately ignored by this invocation. Log: `/tmp/tuna-v1-a11y-qualified-unit-tests.log`.
 - Actual graphical accessibility test: **1 passed** in 18.82 seconds. Artifacts: `/tmp/tuna-v1-a11y-proof-qualified`. Checks include each available boolean row's setting-to-widget and widget-to-setting directions, indicator visibility, ten-row structure, Large Text reset/1.25, one-second/default/forever focus, existing visible windows, inherited transient visibility, and pointer-style focus clearing.
 - Strict GTK lint: `cargo clippy -p tuna-shell-gtk --all-targets -- -D warnings` passed. Log: `/tmp/tuna-v1-a11y-clippy.log`.
-- Shellcheck, shell syntax, Rust formatting, and the 429-key settings inventory check passed.
+- Shellcheck, shell syntax, Rust formatting, and the 428-key settings inventory check passed.
 
 The manifest records host GTK **4.14.5**, private display/session/accessibility bus identities and mode 0700 runtime. `owned-accessibility.json` confirms retained pidfds and verified exit for the private registry and bus daemon; the runtime directory was removed. The newer native GTK property branch is source-reviewed and compiled but was not exercised on this host. The remaining qualification scope above applies; this is a partial P-A11Y-05 receipt.
 
