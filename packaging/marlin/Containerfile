@@ -90,6 +90,12 @@ RUN set -eux; \
     && cat /tmp/tuna-calendar.ldd \
     && ! grep -q 'not found' /tmp/tuna-calendar.ldd \
     && rm -f /tmp/tuna-calendar.ldd \
+    && test -x /usr/lib/gnome-shell-portal-helper \
+    && test "$(pacman -Qqo /usr/lib/gnome-shell-portal-helper)" = gnome-shell \
+    && grep -qx 'Name=org.gnome.Shell.PortalHelper' /usr/share/dbus-1/services/org.gnome.Shell.PortalHelper.service \
+    && ldd /usr/lib/gnome-shell-portal-helper >/tmp/tuna-portal.ldd \
+    && ! grep -q 'not found' /tmp/tuna-portal.ldd \
+    && rm -f /tmp/tuna-portal.ldd \
     && test -f /usr/share/xdg-desktop-portal/tuna-portals.conf \
     && test "$(pacman -Qqo /usr/share/xdg-desktop-portal/tuna-portals.conf)" = tuna-desktop \
     && test "$(pacman -Qqo /usr/share/xdg-desktop-portal/portals/tuna.portal)" = tuna-desktop \

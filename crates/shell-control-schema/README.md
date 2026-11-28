@@ -85,6 +85,10 @@ before decoding.
   `CommandKind::StopRemoteAccess { kind, id }`, which revokes that grant
   permanently. Bounded by `MAX_REMOTE_ACCESS_HANDLES`,
   `MAX_REMOTE_ACCESS_TARGETS` and `MAX_TITLE_LEN`.
+- Screen wake (0.55): `CommandKind::WakeUpScreen` lifts the idle fade off
+  the locked, blanked screen when a notification reaches the lock screen's
+  list (screenShield.js `_wakeUpScreen`); it is `Denied` while unlocked,
+  never unlocks and does not count as user activity.
 - Messages: `Message`, `StateOp`, `CommandKind`, `CommandStatus`,
   `ErrorKind`.
 - State types: `WindowInfo`, `WorkspaceInfo`, `OutputInfo`, `PreviewInfo`,
@@ -103,9 +107,11 @@ before decoding.
   `MODE_*` constants.
 
 Its dependencies are `postcard`, `serde` and `tuna-output`. Schema tests
-are inline in `src/lib.rs` and in `tests/protocol_schema_tests.rs`; the
+are inline in `src/lib.rs` and in
+`crates/shell-control-schema/tests/protocol_schema_tests.rs`; the
 envelope's tests, including the check that `src/framing.rs` stays
-message-agnostic, are in `tests/framing_tests.rs`.
+message-agnostic, are in
+`crates/shell-control-schema/tests/framing_tests.rs`.
 
 ## Dependents
 

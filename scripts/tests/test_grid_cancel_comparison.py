@@ -113,6 +113,12 @@ class Identity(unittest.TestCase):
         run = dict(self.run, event="schedule")
         self.assertEqual(contract.validate_identity(run, self.jobs, self.commit, self.sha, 100, 1, "schedule", self.sha, self.sha)["job_id"], 200)
 
+    def test_merge_group_event_admitted(self):
+        # The merge queue builds gh-readonly-queue/* in this repository: the run's head_sha is the
+        # queue commit that GITHUB_SHA and the checkout also carry.
+        run = dict(self.run, event="merge_group")
+        self.assertEqual(contract.validate_identity(run, self.jobs, self.commit, self.sha, 100, 1, "merge_group", self.sha, self.sha)["job_id"], 200)
+
     def test_unsupported_event_rejected(self):
         run = dict(self.run, event="fork")
         with self.assertRaises(ValueError):

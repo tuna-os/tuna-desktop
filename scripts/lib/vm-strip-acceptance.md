@@ -17,6 +17,10 @@ follow stacking, so the focus click leaves Alpha last; after strip enable, actua
 Super+Shift+arrow column moves carry it, one observed slot at a time, until Beta
 is its right neighbor. Endpoint captures
 are not kernel presentation or completed-action latency measurements.
+Between the column consume and height captures, uncaptured endpoints walk
+niri's remaining column chords on actual keys (V-STRIP-COLUMN-CHORDS):
+Super+Up/Down inside the shared column, Super+[ expel left, Super+, take the
+next column's top window, Super+. send the bottom one right, Super+] consume.
 
 This source does not yet establish the full issue #582 acceptance: stacked rows,
 all cross-workspace/output behavior, offscreen drag edge scrolling, and installed
