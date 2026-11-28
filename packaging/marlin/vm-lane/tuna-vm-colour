@@ -40,6 +40,15 @@ def process(pid):
             'uid': path.stat().st_uid, 'executable': os.readlink(path / 'exe'),
             'sha256': digest(path / 'exe')}
 
+def holds_kms_node(pid):
+    for fd in Path('/proc', str(pid), 'fd').iterdir():
+        try:
+            if re.fullmatch('/dev/dri/card[0-9]+', os.readlink(fd)):
+                return True
+        except FileNotFoundError:
+            continue  # Closed while listing.
+    return False
+
 def save(directory, state):
     temporary = directory / 'state.pending'
     temporary.write_text(json.dumps(state))
@@ -60,8 +69,10 @@ def owner_alive(state):
     try:
         if select.select([fd], [], [], 0)[0] or process(owner['pid']) != owner:
             raise RuntimeError('original native session compositor changed')
-        command = Path('/proc', str(owner['pid']), 'cmdline').read_bytes().split(b'\0')
-        if b'--backend=drm' not in command and not any(command[i:i+2] == [b'--backend', b'drm'] for i in range(len(command)-1)):
+        # tuna-session starts the compositor without --backend; it selects
+        # DRM itself. The DRM host holds the KMS primary node it took from
+        # logind; a nested compositor presents through its host instead.
+        if not holds_kms_node(owner['pid']):
             raise RuntimeError('original session is not the actual DRM host')
         socket_info = Path(state['host_socket']).stat()
         if (not stat.S_ISSOCK(socket_info.st_mode) or socket_info.st_ino != state['host_socket_inode']
@@ -120,7 +131,10 @@ def initialize(value, directory):
         raise RuntimeError('original installed compositor differs from admission')
     runtime = Path('/run/user', str(owner['uid']))
     environment = dict(part.split(b'=', 1) for part in Path('/proc', str(owner['pid']), 'environ').read_bytes().split(b'\0') if b'=' in part)
-    sockets = [p for p in runtime.glob('wayland-*') if stat.S_ISSOCK(p.stat().st_mode)]
+    # The session socket is named by the compositor (tuna-nested-<pid>), not
+    # wayland-N; every Wayland listening socket has its `<name>.lock` sibling.
+    sockets = [p for p in runtime.iterdir() if stat.S_ISSOCK(p.lstat().st_mode)
+               and p.with_name(p.name + '.lock').is_file()]
     nodes = list(Path('/dev/dri').glob('renderD*'))
     if len(sockets) != 1 or len(nodes) != 1 or not Path('/dev/dma_heap/system').is_char_device():
         raise RuntimeError('one real host Wayland socket/render node and actual system DMA heap required')
