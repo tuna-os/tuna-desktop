@@ -212,6 +212,9 @@ pub enum ToLoop {
         stream_id: u64,
         grant: Arc<AtomicBool>,
         target: CastTarget,
+        /// The request's `cursor-mode` was embedded: the frames carry the
+        /// pointer image.
+        embed_cursor: bool,
         /// The monitor a `RecordMonitor` stream was created for, as
         /// Mutter's MetaStreamMonitor holds its MetaMonitor.
         monitor: Option<OutputSnapshot>,
@@ -1011,6 +1014,8 @@ struct Stream {
     /// Recorded with `is-recording` (mutter's
     /// `META_SCREEN_CAST_FLAG_IS_RECORDING`).
     recording: bool,
+    /// `cursor-mode` was [`CURSOR_MODE_EMBEDDED`].
+    embed_cursor: bool,
     /// Mutter's `meta_stream_is_started`.
     started: Arc<AtomicBool>,
     owner: String,
@@ -1049,13 +1054,17 @@ fn session_owner(
     }
 }
 
+/// Mutter's `MetaScreenCastCursorMode`: hidden (the default), drawn into
+/// the frames, or sent as stream metadata.
+pub(crate) const CURSOR_MODE_EMBEDDED: u32 = 1;
+
 #[derive(Debug, DeserializeDict, Type)]
 #[zbus(signature = "dict")]
 struct RecordWindowProperties {
     #[zbus(rename = "window-id")]
     window_id: Option<u64>,
     #[zbus(rename = "cursor-mode")]
-    _cursor_mode: Option<u32>,
+    cursor_mode: Option<u32>,
     #[zbus(rename = "is-recording")]
     is_recording: Option<bool>,
 }
@@ -1064,7 +1073,7 @@ struct RecordWindowProperties {
 #[zbus(signature = "dict")]
 struct RecordMonitorProperties {
     #[zbus(rename = "cursor-mode")]
-    _cursor_mode: Option<u32>,
+    cursor_mode: Option<u32>,
     #[zbus(rename = "is-recording")]
     is_recording: Option<bool>,
 }
@@ -1291,6 +1300,7 @@ impl Session {
             server,
             StreamSource::Monitor(output, mapping_id),
             properties.is_recording.unwrap_or(false),
+            properties.cursor_mode,
         )
         .await
     }
@@ -1318,6 +1328,7 @@ impl Session {
             server,
             StreamSource::Area((x, y, width, height)),
             properties.is_recording.unwrap_or(false),
+            properties.cursor_mode,
         )
         .await
     }
@@ -1342,8 +1353,13 @@ impl Session {
             .and_then(|w| w.iter().find(|w| w.id == id).cloned())
             .ok_or_else(|| fdo::Error::Failed("no such window".into()))?;
         let recording = properties.is_recording.unwrap_or(false);
-        self.add_stream(server, StreamSource::Window(window), recording)
-            .await
+        self.add_stream(
+            server,
+            StreamSource::Window(window),
+            recording,
+            properties.cursor_mode,
+        )
+        .await
     }
 
     #[zbus(signal)]
@@ -1362,7 +1378,9 @@ impl Session {
         server: &ObjectServer,
         source: StreamSource,
         recording: bool,
+        cursor_mode: Option<u32>,
     ) -> fdo::Result<OwnedObjectPath> {
+        let embed_cursor = cursor_mode == Some(CURSOR_MODE_EMBEDDED);
         if self
             .streams
             .lock()
@@ -1380,6 +1398,7 @@ impl Session {
             id,
             source,
             recording,
+            embed_cursor,
             started: Arc::new(AtomicBool::new(false)),
             owner: self.owner.clone(),
             authority: self.authority.clone(),
@@ -1481,6 +1500,7 @@ impl Stream {
                 stream_id: self.id,
                 grant: self.stopped.clone(),
                 target: self.source.target(),
+                embed_cursor: self.embed_cursor,
                 monitor: match &self.source {
                     StreamSource::Monitor(output, _) => Some(output.clone()),
                     StreamSource::Window(_) | StreamSource::Area(..) => None,
