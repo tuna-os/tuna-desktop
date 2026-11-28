@@ -250,6 +250,22 @@ def gap_after_move(gap, step):
 STRIP_GAP = 16
 
 
+def column_stack(found, top, bottom, *, width, full, y):
+    """`top` above `bottom` in one strip column `width` wide at `y`, the two
+    sharing the column's `full` height evenly (niri's automatic heights)."""
+    a, b = found[top]['rect'], found[bottom]['rect']
+    return (a[0] == b[0] and a[2] == b[2] == width and a[1] == y
+            and b[1] == a[1] + a[3] + STRIP_GAP and a[3] + STRIP_GAP + b[3] == full
+            and abs(a[3] - b[3]) <= 1)
+
+
+def columns_apart(found, left, right, *, width, full, y):
+    """`left` and `right` alone in adjacent full-height columns, each `width` wide."""
+    a, b = found[left]['rect'], found[right]['rect']
+    return (a[1] == b[1] == y and a[3] == b[3] == full and a[2] == b[2] == width
+            and b[0] == a[0] + a[2] + STRIP_GAP)
+
+
 def remaining_columns(sample, found, mover):
     """Actual strip columns of the mover's workspace without the mover.
 
@@ -680,6 +696,7 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
     primary = None
     endpoint_sequence = 0
     button_down = False
+    column_chords = False
 
     def guest(action, *args, budget=12):
         remaining = min(budget, deadline - time.monotonic())
@@ -1125,15 +1142,40 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
                 or returned['inventory']['state']['focused'] != lone['alpha']['id']):
             raise RuntimeError('consume control is not a focused Alpha left of Beta')
         chord('meta_l', 'bracket_right')
+        column = {'width': lone['beta']['rect'][2], 'full': full, 'y': lone['beta']['rect'][1]}
+        def focused(sample, found, role):
+            return sample['inventory']['state']['focused'] == found[role]['id']
         def shared(sample, found):
-            alpha, beta = found['alpha']['rect'], found['beta']['rect']
-            return (alpha[0] == beta[0] and alpha[2] == beta[2] == lone['beta']['rect'][2]
-                    and beta[1] == lone['beta']['rect'][1]
-                    and alpha[1] == beta[1] + beta[3] + STRIP_GAP
-                    and beta[3] + STRIP_GAP + alpha[3] == full and abs(alpha[3] - beta[3]) <= 1
-                    and sample['inventory']['state']['focused'] == found['alpha']['id'])
+            return column_stack(found, 'beta', 'alpha', **column) and focused(sample, found, 'alpha')
         consumed = ready('scroll', returned, extra=shared)
         capture('09-column-consume', consumed)
+        # The rest of niri's column chords (P-WM-07). Super+Up/Down walk
+        # focus inside the shared column and move nothing; a focus change
+        # need not repaint, so no newer render is required.
+        chord('meta_l', 'up')
+        ready('scroll', extra=lambda sample, found: (
+            column_stack(found, 'beta', 'alpha', **column) and focused(sample, found, 'beta')))
+        chord('meta_l', 'down')
+        walked = ready('scroll', extra=shared)
+        # Super+[ expels the shared, focused Alpha into a new column on the
+        # left with the column's width; both are full height again.
+        chord('meta_l', 'bracket_left')
+        def alpha_left(sample, found):
+            return columns_apart(found, 'alpha', 'beta', **column) and focused(sample, found, 'alpha')
+        expelled = ready('scroll', walked, extra=alpha_left)
+        # Super+, takes the next column's top window, Beta, to the bottom of
+        # the focused column.
+        chord('meta_l', 'comma')
+        taken = ready('scroll', expelled, extra=lambda sample, found: (
+            column_stack(found, 'alpha', 'beta', **column) and focused(sample, found, 'alpha')))
+        # Super+. sends the focused column's bottom window, Beta, out to a new
+        # column on the right; focus stays on Alpha.
+        chord('meta_l', 'dot')
+        sent = ready('scroll', taken, extra=alpha_left)
+        # Super+] again: the lone Alpha joins Beta's column, as above.
+        chord('meta_l', 'bracket_right')
+        consumed = ready('scroll', sent, extra=shared)
+        column_chords = True
         # Real GTK bottom-right grip of the top window (Beta): its bottom
         # edge is the boundary inside the column, so dragging it up gives
         # Beta a fixed height and Alpha the rest (niri set-window-height).
@@ -1262,6 +1304,11 @@ def prove_installed_strip(qmp, agent, reconnect, out, image, read_ppm, record, *
                 if cleanup_agent is not None and cleanup_agent is not agent:
                     cleanup_agent.close()
         (destination / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    # Proven by its own endpoints even when a later strip step fails.
+    record('V-STRIP-COLUMN-CHORDS', column_chords,
+           'Super+Up/Down walk focus inside a shared column; Super+[ expels left, Super+, takes the next '
+           "column's top window, Super+. sends the bottom one right, Super+] consumes back; widths and "
+           'heights per niri' if column_chords else 'installed strip failed before the column chords completed')
     if primary is not None:
         record('V-STRIP-INSTALLED', False, 'actual installed strip input/identity/pixels/cleanup failed; receipt retained')
         raise primary

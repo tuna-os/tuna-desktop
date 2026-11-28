@@ -134,6 +134,13 @@ class Selection(unittest.TestCase):
                           "remote-security", "arch-package", "marlin-vm", "parity-ledger"])
         self.assertEqual(pr("scripts/tuna-orca-speech-proof"), ["orca-speech"])
         self.assertEqual(pr("scripts/lib/tuna-orca-speech.py"), ["orca-speech"])
+        # The VM lane's host-side gate modules and V-TRAY's fixture.
+        for path in ("scripts/lib/vm_app_integration.py", "scripts/lib/vm_desktop_gates.py",
+                     "packaging/marlin/vm-lane/tuna-vm-desktop-gates"):
+            self.assertIn("marlin-vm", pr(path, size=0), path)
+        self.assertEqual(pr("scripts/lib/vm_desktop_gates.py"), ["arch-package", "marlin-vm"])
+        self.assertEqual(pr("scripts/lib/tuna-tray-item-stub.py"),
+                         ["journey", "gtk-shell", "arch-package", "marlin-vm"])
         # The GTK proof sources the top bar and dash slice; only gtk-shell
         # runs its checker (#1198, #1199).
         self.assertEqual(pr("scripts/lib/tuna-panel-dash-proof.sh"), ["journey", "gtk-shell"])
